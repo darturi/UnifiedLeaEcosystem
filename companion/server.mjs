@@ -322,6 +322,18 @@ async function routeRequest(request, response, state) {
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/settings") {
+    sendJson(response, 200, {
+      ok: true,
+      workspacePath: state.settings.workspacePath || "",
+      leaRepoPath: state.settings.leaRepoPath || "",
+      leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
+      leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
+      leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS
+    });
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/settings/workspace") {
     const payload = await readBodyJson(request);
     const workspacePath = String(payload.workspacePath || "");
@@ -616,18 +628,18 @@ function shellQuote(value) {
 
 async function getTheoremStatus({ workspacePath, overleafProjectId = "unknown", theoremLabel, theoremText, cache, jobs = {} }) {
   const target = buildFormalizationTarget({ workspacePath, overleafProjectId, theoremLabel });
-  const activeJob = findActiveJob(jobs, target.jobKey);
-  if (activeJob) {
-    return buildJobResponse({ job: activeJob, status: "in_progress", target });
-  }
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
 
   const relativePath = target.relativePath;
   const absolutePath = target.absolutePath;
   const cacheKey = buildCacheKey({ workspacePath, theoremLabel, theoremText });
   const cached = cache[cacheKey];
+  const activeJob = findActiveJob(jobs, target.jobKey);
 
   if (!existsSync(absolutePath)) {
+    if (activeJob) {
+      return buildJobResponse({ job: activeJob, status: "in_progress", target });
+    }
     if (failedJob) {
       return {
         ...buildJobResponse({ job: failedJob, status: "failed", target }),
@@ -655,6 +667,9 @@ async function getTheoremStatus({ workspacePath, overleafProjectId = "unknown", 
 
   const content = await fs.readFile(absolutePath, "utf8");
   if (/\bsorry\b|admit\b/.test(content)) {
+    if (activeJob) {
+      return buildJobResponse({ job: activeJob, status: "in_progress", target });
+    }
     if (failedJob) {
       return {
         ...buildJobResponse({ job: failedJob, status: "failed", target }),

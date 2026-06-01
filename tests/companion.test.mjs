@@ -316,6 +316,44 @@ test("statuses report active Lea jobs as in progress", async () => {
   assert.equal(statuses.body.statuses.active_status_test.status, "in_progress");
 });
 
+test("statuses report formalized when active job has already written a complete file", async () => {
+  const workspace = await makeWorkspace();
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState(workspace, {
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    spawnImpl: makeHangingSpawn([]),
+    commandExists: () => true
+  });
+
+  await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "active_complete_test",
+    theoremText: "A theorem."
+  }, state);
+
+  const filePath = path.join(
+    workspace,
+    "Formalization",
+    "Overleaf",
+    "project-1",
+    "active_complete_test.lean"
+  );
+  await fs.writeFile(filePath, "theorem active_complete_test : True := by\n  trivial\n", "utf8");
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "active_complete_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.active_complete_test.status, "formalized");
+  assert.equal(
+    statuses.body.statuses.active_complete_test.leanStatement,
+    "theorem active_complete_test : True"
+  );
+});
+
 test("formalize rejects missing OpenAI key", async () => {
   const workspace = await makeWorkspace();
   const leaRepo = await makeLeaRepo();
