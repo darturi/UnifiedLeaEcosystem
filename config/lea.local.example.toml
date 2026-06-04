@@ -1,0 +1,12 @@
+# Copy this file to config/lea.local.toml and fill in one provider key.
+
+provider = "gemini"
+model = "gemini-3.1-pro-preview"
+max_turns = 20
+lea_root = "external/lea-prover"
+
+# google_api_key = "..."
+# anthropic_api_key = "..."
+# openai_api_key = "..."
+# openai_base_url = "..."
+

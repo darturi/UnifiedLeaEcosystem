@@ -1,0 +1,137 @@
+import { useMemo } from 'react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { CodeStep } from '../api';
+import { diffForStep } from '../codeDiff';
+
+export function CodeViewer({
+  codeSteps,
+  isPaused,
+  currentStepIndex,
+  onStepChange,
+}: {
+  codeSteps: CodeStep[];
+  isPaused: boolean;
+  currentStepIndex: number;
+  onStepChange: (index: number) => void;
+}) {
+  const safeIndex = Math.min(Math.max(currentStepIndex, 0), Math.max(codeSteps.length - 1, 0));
+  const currentStep = codeSteps[safeIndex];
+  const canNavigate = codeSteps.length > 1;
+
+  const diffedLines = useMemo(() => {
+    return diffForStep(codeSteps, safeIndex);
+  }, [codeSteps, safeIndex]);
+
+  const handlePrevious = () => {
+    if (safeIndex > 0) {
+      onStepChange(safeIndex - 1);
+    }
+  };
+
+  const handleNext = () => {
+    if (safeIndex < codeSteps.length - 1) {
+      onStepChange(safeIndex + 1);
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full bg-background border-l border-border">
+      <div className="p-4 border-b border-border">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-foreground">Lean Code</h2>
+          {canNavigate && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handlePrevious}
+                disabled={safeIndex === 0}
+                className="p-1 rounded hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ChevronLeft className="w-5 h-5" />
+              </button>
+              <span className="text-sm text-muted-foreground whitespace-nowrap">
+                Step {safeIndex + 1} of {codeSteps.length}
+              </span>
+              <button
+                onClick={handleNext}
+                disabled={safeIndex === codeSteps.length - 1}
+                className="p-1 rounded hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <ChevronRight className="w-5 h-5" />
+              </button>
+            </div>
+          )}
+        </div>
+        {currentStep && (
+          <div className="mt-2 space-y-1">
+            <p className="text-sm text-muted-foreground truncate">
+              {currentStep.turn ? `Turn ${currentStep.turn} · ` : ''}
+              {currentStep.path}
+            </p>
+            {currentStep.summary && (
+              <p className="text-xs text-muted-foreground">
+                {currentStep.summary}
+              </p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 overflow-auto p-4">
+        {!currentStep ? (
+          <div className="h-full flex items-center justify-center text-center text-muted-foreground">
+            Lean code will appear here as Lea edits files.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {currentStep.kind === 'no_code' && (
+              <div className="rounded-md border border-border bg-accent px-3 py-2 text-sm text-accent-foreground">
+                {currentStep.summary || 'No Lean file changes in this step.'}
+              </div>
+            )}
+            {diffedLines.length === 0 ? (
+              <div className="rounded-md bg-muted p-4 text-sm text-muted-foreground">
+                No Lean code has been written yet.
+              </div>
+            ) : (
+              <pre className="bg-muted p-2 rounded-md text-sm font-mono overflow-x-auto">
+                <code>
+                  {diffedLines.map((item, index) => (
+                    <div
+                      key={index}
+                      className={`grid grid-cols-[1ch_3ch_3ch_max-content] gap-x-2 px-1 ${
+                        item.kind === 'added'
+                          ? 'bg-green-500/20 text-foreground'
+                          : item.kind === 'removed'
+                          ? 'bg-red-500/15 text-foreground'
+                          : 'text-foreground'
+                      }`}
+                    >
+                      <span className={item.kind === 'added' ? 'text-green-700' : item.kind === 'removed' ? 'text-red-700' : 'text-muted-foreground'}>
+                        {item.kind === 'added' ? '+' : item.kind === 'removed' ? '-' : ' '}
+                      </span>
+                      <span className="text-right text-muted-foreground select-none">
+                        {item.oldLineNumber ?? ''}
+                      </span>
+                      <span className="text-right text-muted-foreground select-none">
+                        {item.newLineNumber ?? ''}
+                      </span>
+                      <span className="whitespace-pre">{item.line || ' '}</span>
+                    </div>
+                  ))}
+                </code>
+              </pre>
+            )}
+          </div>
+        )}
+      </div>
+
+      {!isPaused && currentStep && safeIndex === codeSteps.length - 1 && (
+        <div className="p-4 border-t border-border bg-accent">
+          <p className="text-sm text-accent-foreground">
+            Showing latest code. Use the arrows to review earlier edits.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
