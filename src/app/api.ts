@@ -15,6 +15,9 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   created_at: string;
+  is_live_terminal_summary?: boolean;
+  live_started_after_assistant_steps?: number;
+  live_started_after_code_steps?: number;
 }
 
 export interface CodeStep {
@@ -30,9 +33,20 @@ export interface CodeStep {
   created_at: string;
 }
 
+export interface StatusEvent {
+  id: string;
+  session_id?: string;
+  run_id?: string;
+  step_number?: number | null;
+  status?: string | null;
+  message: string;
+  created_at: string;
+}
+
 export interface SessionDetail extends SessionSummary {
   messages: ChatMessage[];
   code_steps: CodeStep[];
+  status_events: StatusEvent[];
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {

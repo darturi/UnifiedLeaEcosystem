@@ -1,15 +1,102 @@
 from pathlib import Path
 from queue import Queue
 
-from app.config import LeaConfig
-from app.runner import (
-    RunnerContext,
-    _emit_file_snapshot,
-    _emit_no_code_step,
-    _parse_tool_call,
-    _resolve_lea_path,
-)
+import pytest
+
+import app.runner as runner
 from app import db, store
+from app.config import LeaConfig
+from app.runner import RunnerContext, _emit_file_snapshot, _emit_no_code_step, _resolve_lea_path, run_lea
+
+
+@pytest.fixture(autouse=True)
+def event_log_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "RAW_EVENT_LOG_DIR", tmp_path / "event-logs")
+
+
+class FakeLeaApiClient:
+    def __init__(self, events=None, status=None, transcript=None, transcript_error=None, fail_start=None):
+        self.events = events or []
+        self.status = status or {"status": "completed"}
+        self.transcript = transcript
+        self.transcript_error = transcript_error
+        self.fail_start = fail_start
+        self.cancelled = []
+        self.transcript_requests = []
+
+    def start_run(self, task):
+        if self.fail_start:
+            raise self.fail_start
+        return {"run_id": "api-run-1"}
+
+    def stream_events(self, api_run_id, from_seq=0, timeout=None):
+        yield from self.events
+
+    def get_run(self, api_run_id):
+        return self.status
+
+    def get_transcript(self, api_run_id, transcript_url=None):
+        self.transcript_requests.append((api_run_id, transcript_url))
+        if self.transcript_error:
+            raise self.transcript_error
+        return self.transcript
+
+    def cancel_run(self, api_run_id):
+        self.cancelled.append(api_run_id)
+        return {"ok": True}
+
+
+def make_config(tmp_path, **overrides):
+    return LeaConfig(
+        model=overrides.get("model", "o4-mini"),
+        max_turns=overrides.get("max_turns", 2),
+        lea_api_base_url=overrides.get("lea_api_base_url", "http://127.0.0.1:8000"),
+        lea_api_key=overrides.get("lea_api_key"),
+        lea_root=overrides.get("lea_root", tmp_path / "lea"),
+        lea_job_timeout_seconds=overrides.get("lea_job_timeout_seconds", 900),
+    )
+
+
+def make_context(tmp_path, client):
+    db.DB_PATH = tmp_path / "test.sqlite3"
+    db.init_db()
+    session = store.create_session("demo")
+    run = store.create_run(session["id"], "o4-mini", None, 2)
+    return RunnerContext(
+        session_id=session["id"],
+        run_id=run["id"],
+        task="demo",
+        config=make_config(tmp_path),
+        events=Queue(),
+        client=client,
+    )
+
+
+def drain_events(queue):
+    items = []
+    while not queue.empty():
+        items.append(queue.get_nowait())
+    return items
+
+
+def test_success_without_code_events_emits_no_code_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(runner, "RAW_EVENT_LOG_DIR", tmp_path / "event-logs")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert detail["code_steps"][0]["kind"] == "no_code"
+    assert "did not expose a readable Lean file" in detail["code_steps"][0]["summary"]
+    assert any(event["type"] == "code_step" and event["payload"]["kind"] == "no_code" for event in events)
+    assert (tmp_path / "event-logs" / f"{context.run_id}.jsonl").exists()
 
 
 def test_snapshot_emits_code_step_for_lean_write(tmp_path, monkeypatch):
@@ -21,30 +108,28 @@ def test_snapshot_emits_code_step_for_lean_write(tmp_path, monkeypatch):
     proof.write_text("theorem demo : True := by\n  trivial")
 
     session = store.create_session("demo")
-    run = store.create_run(session["id"], "gpt-4o", "openai", 2)
-    events: Queue = Queue()
+    run = store.create_run(session["id"], "o4-mini", None, 2)
     context = RunnerContext(
         session_id=session["id"],
         run_id=run["id"],
         task="demo",
-        config=LeaConfig(provider="openai", model="gpt-4o", max_turns=2, lea_root=lea_root),
-        events=events,
+        config=make_config(tmp_path, lea_root=lea_root),
+        events=Queue(),
     )
 
     _emit_file_snapshot(context=context, path=proof, emitted=set())
 
-    item = events.get_nowait()
+    item = context.events.get_nowait()
+    status_item = context.events.get_nowait()
     detail = store.session_detail(session["id"])
 
     assert item["type"] == "code_step"
     assert item["payload"]["path"] == "workspace/proofs/demo.lean"
+    assert status_item["type"] == "status"
+    assert status_item["payload"]["status"] == "code_step"
+    assert status_item["payload"]["step_number"] == item["payload"]["step_number"]
     assert detail["code_steps"][0]["code"].startswith("theorem demo")
-
-
-def test_parse_tool_call_for_write_file():
-    parsed = _parse_tool_call("  -> write_file({'path': 'proofs/demo.lean', 'content': 'abc'})")
-
-    assert parsed == ("write_file", {"path": "proofs/demo.lean", "content": "abc"})
+    assert detail["status_events"][0]["step_number"] == item["payload"]["step_number"]
 
 
 def test_resolve_lea_paths(tmp_path):
@@ -67,12 +152,12 @@ def test_duplicate_snapshot_suppression(tmp_path, monkeypatch):
     proof.write_text("theorem demo : True := by\n  trivial")
 
     session = store.create_session("demo")
-    run = store.create_run(session["id"], "gpt-4o", "openai", 2)
+    run = store.create_run(session["id"], "o4-mini", None, 2)
     context = RunnerContext(
         session_id=session["id"],
         run_id=run["id"],
         task="demo",
-        config=LeaConfig(provider="openai", model="gpt-4o", max_turns=2, lea_root=lea_root),
+        config=make_config(tmp_path, lea_root=lea_root),
         events=Queue(),
     )
     emitted = set()
@@ -87,17 +172,15 @@ def test_duplicate_snapshot_suppression(tmp_path, monkeypatch):
 def test_no_code_turn_emits_timeline_step(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    lea_root = tmp_path / "lea"
 
     session = store.create_session("demo")
-    run = store.create_run(session["id"], "gpt-4o", "openai", 2)
-    events: Queue = Queue()
+    run = store.create_run(session["id"], "o4-mini", None, 2)
     context = RunnerContext(
         session_id=session["id"],
         run_id=run["id"],
         task="demo",
-        config=LeaConfig(provider="openai", model="gpt-4o", max_turns=2, lea_root=lea_root),
-        events=events,
+        config=make_config(tmp_path),
+        events=Queue(),
     )
 
     step = _emit_no_code_step(
@@ -108,11 +191,679 @@ def test_no_code_turn_emits_timeline_step(tmp_path, monkeypatch):
         latest_code="theorem demo : True := by\n  trivial",
     )
 
-    item = events.get_nowait()
+    item = context.events.get_nowait()
+    status_item = context.events.get_nowait()
     detail = store.session_detail(session["id"])
 
     assert item["type"] == "code_step"
+    assert status_item["type"] == "status"
+    assert status_item["payload"]["step_number"] == item["payload"]["step_number"]
     assert step["kind"] == "no_code"
     assert step["turn"] == 3
     assert "no tool calls" in step["summary"]
     assert detail["code_steps"][0]["kind"] == "no_code"
+
+
+def test_api_text_events_emit_assistant_delta_and_final_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "text_delta", "text": "hello "},
+            {"seq": 1, "type": "text_delta", "text": "world"},
+            {"seq": 2, "type": "finished", "reason": "completed"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    detail = store.session_detail(context.session_id)
+
+    assert [event["payload"]["text"] for event in events if event["type"] == "assistant_delta"] == ["hello ", "world"]
+    assert detail["messages"][-1]["role"] == "assistant"
+    assert detail["messages"][-1]["content"] == "hello world"
+    assert store.get_run(context.run_id)["status"] == "success"
+    assert events[-1]["type"] == "done"
+    assert events[-1]["payload"]["status"] == "success"
+
+
+def test_assistant_text_delta_events_emit_assistant_delta_and_final_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "assistant_text_delta", "text": "hello "},
+            {"seq": 1, "type": "assistant_text_delta", "text": "api"},
+            {"seq": 2, "type": "finished", "reason": "completed"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    detail = store.session_detail(context.session_id)
+
+    assert [event["payload"]["text"] for event in events if event["type"] == "assistant_delta"] == ["hello ", "api"]
+    assert detail["messages"][-1]["content"] == "hello api"
+
+
+def test_success_persists_intermediate_assistant_text_before_final_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "assistant_text_delta", "text": "I will prove this by induction."},
+            {
+                "seq": 1,
+                "type": "finished",
+                "reason": "completed",
+                "final_text": "The proof has been formalized and verified.",
+            },
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    persisted = detail["messages"]
+    assert store.get_run(context.run_id)["status"] == "success"
+    assert persisted[-2]["role"] == "assistant"
+    assert persisted[-2]["content"] == "I will prove this by induction."
+    assert persisted[-1]["role"] == "assistant"
+    assert persisted[-1]["content"] == "The proof has been formalized and verified."
+
+
+def test_tool_calls_split_streamed_assistant_text_into_turn_messages(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "turn_started", "turn": 1},
+            {"seq": 1, "type": "assistant_text_delta", "text": "First I sketch the induction proof."},
+            {"seq": 2, "type": "tool_called", "name": "lean_check", "args": {"path": "proof.lean"}},
+            {"seq": 3, "type": "tool_resulted", "name": "lean_check", "content": "error"},
+            {"seq": 4, "type": "turn_started", "turn": 2},
+            {"seq": 5, "type": "assistant_text_delta", "text": "Now I adjust the inductive step."},
+            {"seq": 6, "type": "finished", "reason": "completed", "final_text": "The proof is complete."},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assistant_messages = [message["content"] for message in detail["messages"] if message["role"] == "assistant"]
+    assert assistant_messages == [
+        "First I sketch the induction proof.",
+        "Now I adjust the inductive step.",
+        "The proof is complete.",
+    ]
+
+
+def test_new_turn_splits_streamed_assistant_text_without_tool_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "turn_started", "turn": 1},
+            {"seq": 1, "type": "assistant_text_delta", "text": "First turn."},
+            {"seq": 2, "type": "turn_started", "turn": 2},
+            {"seq": 3, "type": "assistant_text_delta", "text": "Second turn."},
+            {"seq": 4, "type": "finished", "reason": "completed", "final_text": "Done."},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assistant_messages = [message["content"] for message in detail["messages"] if message["role"] == "assistant"]
+    assert assistant_messages == ["First turn.", "Second turn.", "Done."]
+
+
+def test_transcript_recovers_intermediate_assistant_text_when_deltas_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "finished",
+                "reason": "completed",
+                "text": "The proof is complete.",
+                "transcript_url": "/v1/runs/api-run-1/transcript",
+            },
+        ],
+        transcript={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "First I set up an induction proof."},
+                        {"type": "tool_call", "name": "write_file", "args": {}},
+                    ],
+                }
+            ]
+        },
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    persisted = detail["messages"]
+    assert persisted[-2]["role"] == "assistant"
+    assert persisted[-2]["content"] == "First I set up an induction proof."
+    assert persisted[-1]["content"] == "The proof is complete."
+
+
+def test_api_code_events_create_code_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "code_step",
+                "path": "workspace/proofs/demo.lean",
+                "code": "theorem demo : True := by\n  trivial",
+                "turn": 1,
+            },
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/demo.lean"
+    assert detail["code_steps"][0]["turn"] == 1
+    assert detail["code_steps"][0]["code"].startswith("theorem demo")
+
+
+def test_nested_write_file_tool_call_creates_code_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_call",
+                "payload": {
+                    "name": "write_file",
+                    "args": {
+                        "path": "workspace/proofs/nested.lean",
+                        "content": "theorem nested : True := by\n  trivial",
+                    },
+                    "turn": 2,
+                },
+            },
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/nested.lean"
+    assert detail["code_steps"][0]["code"].startswith("theorem nested")
+
+
+def test_tool_called_write_file_creates_code_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {
+                    "path": "workspace/proofs/api_tool.lean",
+                    "content": "theorem api_tool : True := by\n  trivial",
+                },
+            },
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/api_tool.lean"
+    assert detail["code_steps"][0]["code"].startswith("theorem api_tool")
+
+
+def test_terminal_transcript_recovers_missed_write_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "finished",
+                "reason": "completed",
+                "text": "done",
+                "transcript_url": "/v1/runs/api-run-1/transcript",
+            },
+        ],
+        transcript={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_call",
+                            "name": "write_file",
+                            "args": {
+                                "path": "workspace/proofs/from_transcript.lean",
+                                "content": "theorem from_transcript : True := by\n  trivial",
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert client.transcript_requests == [("api-run-1", "/v1/runs/api-run-1/transcript")]
+    assert len(detail["code_steps"]) == 1
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/from_transcript.lean"
+    assert detail["code_steps"][0]["code"].startswith("theorem from_transcript")
+
+
+def test_terminal_transcript_dedupes_live_write_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    tool_call = {
+        "type": "tool_called",
+        "name": "write_file",
+        "args": {
+            "path": "workspace/proofs/dedupe.lean",
+            "content": "theorem dedupe : True := by\n  trivial",
+        },
+    }
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, **tool_call},
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        transcript={"messages": [{"role": "assistant", "content": [{**tool_call, "type": "tool_call"}]}]},
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert len(detail["code_steps"]) == 1
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/dedupe.lean"
+
+
+def test_transcript_fetch_failure_falls_back_to_no_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        transcript_error=RuntimeError("transcript unavailable"),
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert store.get_run(context.run_id)["status"] == "success"
+    assert detail["code_steps"][0]["kind"] == "no_code"
+    assert any(
+        event["type"] == "status" and event["payload"]["status"] == "transcript_fetch_failed"
+        for event in events
+    )
+
+
+def test_api_path_only_code_event_reads_workspace_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "demo.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem demo : True := by\n  trivial")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "file_written", "path": "workspace/proofs/demo.lean"},
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["code"].startswith("theorem demo")
+
+
+def test_lean_check_path_snapshots_readable_checked_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "checked.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem checked : True := by\n  trivial")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "lean_check",
+                "args": {"path": "workspace/proofs/checked.lean"},
+            },
+            {
+                "seq": 1,
+                "type": "tool_resulted",
+                "name": "lean_check",
+                "content": "workspace/proofs/checked.lean:2:2: error: No goals to be solved",
+            },
+            {"seq": 2, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert len(detail["code_steps"]) == 1
+    assert detail["code_steps"][0]["kind"] == "code"
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/checked.lean"
+    assert detail["code_steps"][0]["code"].startswith("theorem checked")
+
+
+def test_tool_result_status_strings_do_not_create_code_steps(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "edit_file",
+                "args": {"path": "workspace/proofs/demo.lean", "old_string": "a", "new_string": "b"},
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "edit_file", "content": "OK"},
+            {
+                "seq": 2,
+                "type": "tool_called",
+                "name": "lean_check",
+                "args": {"path": "workspace/proofs/demo.lean"},
+            },
+            {
+                "seq": 3,
+                "type": "tool_resulted",
+                "name": "lean_check",
+                "content": "workspace/proofs/demo.lean:1:1: error: expected token",
+            },
+            {"seq": 4, "type": "finished", "reason": "max_turns", "final_text": "max turns"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    code_steps = detail["code_steps"]
+    assert len(code_steps) == 1
+    assert code_steps[0]["kind"] == "no_code"
+    assert all(step["code"] not in {"OK", "workspace/proofs/demo.lean:1:1: error: expected token"} for step in code_steps)
+
+
+def test_successful_edit_file_result_snapshots_readable_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "edited.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem edited : True := by\n  trivial")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "edit_file",
+                "args": {
+                    "path": "workspace/proofs/edited.lean",
+                    "old_string": "sorry",
+                    "new_string": "trivial",
+                },
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "edit_file", "content": "OK"},
+            {"seq": 2, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert len(detail["code_steps"]) == 1
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/edited.lean"
+    assert detail["code_steps"][0]["code"].startswith("theorem edited")
+
+
+def test_failed_edit_file_result_emits_status_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "edit_file",
+                "args": {"path": "workspace/proofs/demo.lean", "old_string": "a", "new_string": "b"},
+            },
+            {
+                "seq": 1,
+                "type": "tool_resulted",
+                "name": "edit_file",
+                "content": "Error: old_string not found in file.",
+            },
+            {"seq": 2, "type": "finished", "reason": "max_turns", "final_text": "max turns"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert len(detail["code_steps"]) == 1
+    assert detail["code_steps"][0]["kind"] == "no_code"
+    assert not any(event["type"] == "code_step" and event["payload"]["code"].startswith("Error:") for event in events)
+
+
+def test_path_drift_between_write_and_lean_check_emits_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    written_path = str(tmp_path / "api_a" / "workspace" / "proofs" / "demo.lean")
+    checked_path = str(tmp_path / "api_b" / "workspace" / "proofs" / "demo.lean")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {"path": written_path, "content": "theorem drift : True := by\n  trivial"},
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "write_file", "content": f"Wrote 37 bytes to {written_path}"},
+            {
+                "seq": 2,
+                "type": "tool_called",
+                "name": "lean_check",
+                "args": {"path": checked_path},
+            },
+            {
+                "seq": 3,
+                "type": "tool_resulted",
+                "name": "lean_check",
+                "content": f"{checked_path}:1:1: error: expected token",
+            },
+            {"seq": 4, "type": "finished", "reason": "max_turns", "final_text": "max turns"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    log_text = (tmp_path / "event-logs" / f"{context.run_id}.jsonl").read_text()
+    assert any(event["type"] == "status" and event["payload"]["status"] == "path_drift" for event in events)
+    assert "path_drift" in log_text
+
+
+def test_max_turns_regression_keeps_only_valid_code_steps(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    root_a = tmp_path / "LeaAgentAPI_Dev" / "lea-prover"
+    root_b = tmp_path / "lea-prover"
+    proof_a = root_a / "workspace" / "proofs" / "sum_first_n_odds.lean"
+    proof_a.parent.mkdir(parents=True)
+    proof_a.write_text("import Mathlib.Data.Nat.Basic\n\ntheorem existing : True := by\n  trivial")
+    path_a = str(proof_a)
+    path_b = str(root_b / "workspace" / "proofs" / "sum_first_n_odds.lean")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {
+                    "path": path_a,
+                    "content": "import Mathlib.Data.Nat.Basic\n\ntheorem first : True := by\n  trivial",
+                },
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "write_file", "content": f"Wrote 68 bytes to {path_a}"},
+            {"seq": 2, "type": "tool_called", "name": "lean_check", "args": {"path": path_a}},
+            {"seq": 3, "type": "tool_resulted", "name": "lean_check", "content": f"{path_a}:4:36: error: expected token"},
+            {
+                "seq": 4,
+                "type": "tool_called",
+                "name": "edit_file",
+                "args": {"path": path_a, "old_string": "import Mathlib.Data.Nat.Basic", "new_string": "import Mathlib.Tactic"},
+            },
+            {"seq": 5, "type": "tool_resulted", "name": "edit_file", "content": "OK"},
+            {"seq": 6, "type": "tool_called", "name": "lean_check", "args": {"path": path_b}},
+            {"seq": 7, "type": "tool_resulted", "name": "lean_check", "content": f"{path_b}:1:1: error: expected token"},
+            {"seq": 8, "type": "finished", "reason": "max_turns", "final_text": "max turns"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    codes = [step["code"] for step in detail["code_steps"]]
+    assert store.get_run(context.run_id)["status"] == "max_turns"
+    assert len(detail["code_steps"]) == 2
+    assert all(code and not code.startswith(("OK", "Wrote ", "Error:")) for code in codes)
+    assert not any(step["path"] == "Lea.lean" for step in detail["code_steps"])
+    assert any(event["type"] == "status" and event["payload"]["status"] == "path_drift" for event in events)
+
+
+def test_final_run_status_artifact_creates_code_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        status={
+            "status": "completed",
+            "artifacts": [
+                {
+                    "path": "workspace/proofs/final_artifact.lean",
+                    "content": "theorem final_artifact : True := by\n  trivial",
+                }
+            ],
+        },
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert len(detail["code_steps"]) == 1
+    assert detail["code_steps"][0]["path"] == "workspace/proofs/final_artifact.lean"
+    assert detail["code_steps"][0]["code"].startswith("theorem final_artifact")
+
+
+def test_final_text_lean_filename_snapshots_readable_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "twelve_times_ten.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem twelve_times_ten : 12 * 10 = 120 := by\n  norm_num")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "finished",
+                "reason": "completed",
+                "final_text": "The file `twelve_times_ten.lean` contains the formal proof.",
+            },
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["path"] == "twelve_times_ten.lean"
+    assert "twelve_times_ten" in detail["code_steps"][0]["code"]
+
+
+def test_api_failure_marks_run_failed_and_emits_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "error", "message": "proof failed"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    assert store.get_run(context.run_id)["status"] == "failed"
+    assert any(event["type"] == "error" and event["payload"]["message"] == "proof failed" for event in events)
+    assert events[-1]["type"] == "done"
+    assert events[-1]["payload"]["status"] == "failed"
+
+
+def test_api_failure_persists_partial_assistant_text_before_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "assistant_text_delta", "text": "**Attempt 1**\n"},
+            {"seq": 1, "type": "assistant_text_delta", "text": "- trying `norm_num`"},
+            {"seq": 2, "type": "error", "message": "proof failed"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    persisted = detail["messages"]
+    assert persisted[-2]["role"] == "assistant"
+    assert persisted[-2]["content"] == "**Attempt 1**\n- trying `norm_num`"
+    assert persisted[-1]["role"] == "system"
+    assert persisted[-1]["content"] == "proof failed"
+
+
+def test_max_turns_persists_partial_assistant_text_before_system_notice(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "assistant_text_delta", "text": "I will try induction.\n"},
+            {"seq": 1, "type": "assistant_text_delta", "text": "The base case is straightforward."},
+            {"seq": 2, "type": "finished", "reason": "max_turns", "text": "Error: max turns reached."},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    persisted = detail["messages"]
+    assert store.get_run(context.run_id)["status"] == "max_turns"
+    assert persisted[-2]["role"] == "assistant"
+    assert persisted[-2]["content"] == "I will try induction.\nThe base case is straightforward."
+    assert persisted[-1]["role"] == "system"
+    assert persisted[-1]["content"] == "Error: max turns reached."

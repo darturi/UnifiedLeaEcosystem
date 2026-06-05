@@ -1,41 +1,69 @@
 from pathlib import Path
 
-from app.config import apply_provider_env, load_config
+import pytest
+
+from app.config import load_config
 
 
-def test_load_config_defaults_relative_lea_root(tmp_path):
+def test_load_config_defaults_to_local_lea_api(tmp_path):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text("")
+
+    config = load_config(config_path)
+
+    assert config.lea_api_base_url == "http://127.0.0.1:8000"
+    assert config.model == "gemini/gemini-3.1-pro-preview"
+    assert config.max_turns is None
+    assert config.lea_api_key is None
+    assert config.lea_root == Path(__file__).resolve().parents[2] / "external" / "lea-prover"
+    assert config.narrate_tool_steps is False
+
+
+def test_load_config_honors_api_settings(tmp_path):
     config_path = tmp_path / "lea.local.toml"
     config_path.write_text(
         """
-        provider = "openai"
-        model = "gpt-4o"
+        lea_api_base_url = "http://localhost:8123/"
+        lea_api_key = "test-key"
+        model = "o4-mini"
         max_turns = 7
+        lea_job_timeout_seconds = 45
         lea_root = "external/lea-prover"
-        openai_api_key = "test-key"
+        google_api_key = "google-secret"
+        anthropic_api_key = "anthropic-secret"
+        openai_api_key = "openai-secret"
+        openai_base_url = "https://openai.example/v1"
+        narrate_tool_steps = true
         """
     )
 
     config = load_config(config_path)
 
-    assert config.provider == "openai"
-    assert config.model == "gpt-4o"
+    assert config.lea_api_base_url == "http://localhost:8123"
+    assert config.lea_api_key == "test-key"
+    assert config.model == "o4-mini"
     assert config.max_turns == 7
+    assert config.lea_job_timeout_seconds == 45
+    assert isinstance(config.lea_root, Path)
     assert config.lea_root.name == "lea-prover"
-    assert config.openai_api_key == "test-key"
+    assert config.google_api_key == "google-secret"
+    assert config.anthropic_api_key == "anthropic-secret"
+    assert config.openai_api_key == "openai-secret"
+    assert config.openai_base_url == "https://openai.example/v1"
+    assert config.narrate_tool_steps is True
 
 
-def test_apply_provider_env_sets_configured_keys(monkeypatch, tmp_path):
+def test_load_config_rejects_invalid_api_base_url(tmp_path):
     config_path = tmp_path / "lea.local.toml"
-    config_path.write_text(
-        """
-        model = "claude-sonnet-4-20250514"
-        anthropic_api_key = "anthropic-test"
-        """
-    )
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config_path.write_text('lea_api_base_url = "file:///tmp/lea"\n')
 
-    apply_provider_env(load_config(config_path))
+    with pytest.raises(ValueError, match="lea_api_base_url"):
+        load_config(config_path)
 
-    assert Path(load_config(config_path).lea_root).name == "lea-prover"
-    assert __import__("os").environ["ANTHROPIC_API_KEY"] == "anthropic-test"
 
+def test_load_config_rejects_non_boolean_narration_flag(tmp_path):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('narrate_tool_steps = "false"\n')
+
+    with pytest.raises(ValueError, match="narrate_tool_steps"):
+        load_config(config_path)

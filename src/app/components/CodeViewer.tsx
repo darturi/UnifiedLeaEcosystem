@@ -38,9 +38,9 @@ export function CodeViewer({
     <div className="flex flex-col h-full bg-background border-l border-border">
       <div className="p-4 border-b border-border">
         <div className="flex items-center justify-between gap-3">
-          <h2 className="text-foreground">Lean Code</h2>
+          <h2 className="shrink-0 text-foreground">Lean Code</h2>
           {canNavigate && (
-            <div className="flex items-center gap-2">
+            <div className="flex shrink-0 items-center gap-2">
               <button
                 onClick={handlePrevious}
                 disabled={safeIndex === 0}
@@ -63,7 +63,7 @@ export function CodeViewer({
         </div>
         {currentStep && (
           <div className="mt-2 space-y-1">
-            <p className="text-sm text-muted-foreground truncate">
+            <p className="break-all text-sm text-muted-foreground">
               {currentStep.turn ? `Turn ${currentStep.turn} · ` : ''}
               {currentStep.path}
             </p>
@@ -93,12 +93,12 @@ export function CodeViewer({
                 No Lean code has been written yet.
               </div>
             ) : (
-              <pre className="bg-muted p-2 rounded-md text-sm font-mono overflow-x-auto">
+              <pre className="overflow-x-hidden rounded-md bg-muted p-2 font-mono text-sm">
                 <code>
                   {diffedLines.map((item, index) => (
                     <div
                       key={index}
-                      className={`grid grid-cols-[1ch_3ch_3ch_max-content] gap-x-2 px-1 ${
+                      className={`grid grid-cols-[1ch_3ch_minmax(0,1fr)] gap-x-2 px-1 ${
                         item.kind === 'added'
                           ? 'bg-green-500/20 text-foreground'
                           : item.kind === 'removed'
@@ -110,12 +110,9 @@ export function CodeViewer({
                         {item.kind === 'added' ? '+' : item.kind === 'removed' ? '-' : ' '}
                       </span>
                       <span className="text-right text-muted-foreground select-none">
-                        {item.oldLineNumber ?? ''}
+                        {item.kind === 'removed' ? item.oldLineNumber ?? '' : item.newLineNumber ?? ''}
                       </span>
-                      <span className="text-right text-muted-foreground select-none">
-                        {item.newLineNumber ?? ''}
-                      </span>
-                      <span className="whitespace-pre">{item.line || ' '}</span>
+                      <span className="whitespace-pre-wrap break-words">{item.line || ' '}</span>
                     </div>
                   ))}
                 </code>

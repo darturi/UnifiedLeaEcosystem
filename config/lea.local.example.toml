@@ -1,12 +1,24 @@
-# Copy this file to config/lea.local.toml and fill in one provider key.
+# Copy this file to config/lea.local.toml.
 
-provider = "gemini"
-model = "gemini-3.1-pro-preview"
+# By default, npm run dev starts the bundled Lea API from external/lea-prover.
+# Keep this URL unless you intentionally want to use an external Lea API.
+lea_api_base_url = "http://127.0.0.1:8000"
+
+# Optional: set this if LEA_API_KEYS is enabled for the Lea API.
+# lea_api_key = "..."
+
+model = "gemini/gemini-3.1-pro-preview"
 max_turns = 20
+lea_job_timeout_seconds = 900
 lea_root = "external/lea-prover"
+narrate_tool_steps = true
 
+# Provider credentials can also be exported in your shell. If set here, npm run
+# dev passes them only to the bundled Lea API process.
 # google_api_key = "..."
 # anthropic_api_key = "..."
 # openai_api_key = "..."
 # openai_base_url = "..."
 
+# lea_root points to the directory that Lea API file paths are relative to.
+# For bundled local mode, external/lea-prover is the expected value.

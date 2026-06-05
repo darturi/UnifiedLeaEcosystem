@@ -132,6 +132,27 @@ def add_code_step(
     return row_to_dict(inserted)
 
 
+def add_status_event(
+    session_id: str,
+    run_id: str,
+    message: str,
+    status: str | None = None,
+    step_number: int | None = None,
+) -> dict:
+    now = utc_now()
+    event_id = str(uuid4())
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into status_events (id, session_id, run_id, step_number, status, message, created_at)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, session_id, run_id, step_number, status, message, now),
+        )
+        row = conn.execute("select * from status_events where id = ?", (event_id,)).fetchone()
+    return row_to_dict(row)
+
+
 def session_detail(session_id: str) -> dict | None:
     session = get_session(session_id)
     if not session:
@@ -145,8 +166,13 @@ def session_detail(session_id: str) -> dict | None:
             "select * from code_steps where session_id = ? order by step_number asc",
             (session_id,),
         ).fetchall()
+        status_events = conn.execute(
+            "select * from status_events where session_id = ? order by created_at asc",
+            (session_id,),
+        ).fetchall()
     return {
         **session,
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [row_to_dict(row) for row in code_steps],
+        "status_events": [row_to_dict(row) for row in status_events],
     }

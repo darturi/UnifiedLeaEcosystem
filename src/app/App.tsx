@@ -7,16 +7,11 @@ import {
   ChatMessage,
   CodeStep,
   SessionSummary,
+  StatusEvent,
   createRun,
   getSession,
   listSessions,
 } from './api';
-
-interface StatusLogItem {
-  id: string;
-  message: string;
-  created_at: string;
-}
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -25,10 +20,18 @@ export default function App() {
   const [codeSteps, setCodeSteps] = useState<CodeStep[]>([]);
   const [isPaused, setIsPaused] = useState(false);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [activeTimelineStepIndex, setActiveTimelineStepIndex] = useState<number | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string>();
-  const [statusLog, setStatusLog] = useState<StatusLogItem[]>([]);
+  const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const codeStepCountRef = useRef(0);
+  const activeTimelineStepIndexRef = useRef<number | null>(null);
+
+  const setActiveTimelineStep = (stepIndex: number | null) => {
+    activeTimelineStepIndexRef.current = stepIndex;
+    setActiveTimelineStepIndex(stepIndex);
+  };
 
   const refreshSessions = async () => {
     const loaded = await listSessions();
@@ -48,7 +51,21 @@ export default function App() {
     setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
+    setStatusEvents(detail.status_events || []);
+    codeStepCountRef.current = detail.code_steps.length;
     setCurrentStepIndex(Math.max(0, detail.code_steps.length - 1));
+    setActiveTimelineStep(null);
+  };
+
+  const reconcileSession = async (sessionId: string) => {
+    const detail = await getSession(sessionId);
+    setSelectedSessionId(detail.id);
+    setMessages(detail.messages);
+    setCodeSteps(detail.code_steps);
+    setStatusEvents(detail.status_events || []);
+    codeStepCountRef.current = detail.code_steps.length;
+    setCurrentStepIndex(Math.max(0, detail.code_steps.length - 1));
+    setActiveTimelineStep(null);
   };
 
   const selectedSession = useMemo(
@@ -75,13 +92,18 @@ export default function App() {
       const run = await createRun(content, selectedSessionId);
       setSelectedSessionId(run.session_id);
       appendMessage(run.message);
-      setStatusLog([
+      setStatusEvents([
         {
           id: `submitted-${run.run_id}`,
+          session_id: run.session_id,
+          run_id: run.run_id,
+          step_number: null,
+          status: 'submitted',
           message: 'Submitted theorem to backend.',
           created_at: new Date().toISOString(),
         },
       ]);
+      setActiveTimelineStep(null);
       setIsRunning(true);
 
       const nextSessions = await refreshSessions();
@@ -104,6 +126,12 @@ export default function App() {
                 : message,
             );
           }
+          const assistantStepCount = current.filter(
+            (message) =>
+              message.role === 'assistant' &&
+              !message.is_live_terminal_summary,
+          ).length;
+          setActiveTimelineStep(assistantStepCount);
           return [
             ...current,
             {
@@ -113,6 +141,8 @@ export default function App() {
               role: 'assistant',
               content: payload.text,
               created_at: new Date().toISOString(),
+              live_started_after_assistant_steps: assistantStepCount,
+              live_started_after_code_steps: codeStepCountRef.current,
             },
           ];
         });
@@ -121,11 +151,29 @@ export default function App() {
       source.addEventListener('message', (event) => {
         const payload = JSON.parse((event as MessageEvent).data) as ChatMessage;
         setMessages((current) => {
-          const withoutLive = current.filter((message) => message.id !== liveAssistantId);
+          const liveMessage = current.find((message) => message.id === liveAssistantId);
+          const shouldReplaceLive =
+            payload.role === 'assistant' &&
+            !!liveMessage &&
+            (payload.content.includes(liveMessage.content) ||
+              liveMessage.content.includes(payload.content));
+          const withoutLive =
+            shouldReplaceLive
+              ? current.filter((message) => message.id !== liveAssistantId)
+              : current;
           if (withoutLive.some((message) => message.id === payload.id)) {
             return withoutLive;
           }
-          return [...withoutLive, payload];
+          return [
+            ...withoutLive,
+            shouldReplaceLive && liveMessage
+              ? {
+                  ...payload,
+                  live_started_after_assistant_steps: liveMessage.live_started_after_assistant_steps,
+                  live_started_after_code_steps: liveMessage.live_started_after_code_steps,
+                }
+              : payload,
+          ];
         });
       });
 
@@ -136,19 +184,33 @@ export default function App() {
             return current;
           }
           const next = [...current, payload];
+          codeStepCountRef.current = next.length;
           setCurrentStepIndex(next.length - 1);
+          setActiveTimelineStep(payload.step_number - 1);
           return next;
         });
       });
 
       source.addEventListener('status', (event) => {
         const payload = JSON.parse((event as MessageEvent).data);
-        setStatusLog((current) => [
-          ...current.slice(-9),
+        const payloadStepNumber =
+          Number.isInteger(payload.step_number) && payload.step_number > 0
+            ? payload.step_number
+            : null;
+        const activeStepNumber =
+          activeTimelineStepIndexRef.current === null
+            ? null
+            : activeTimelineStepIndexRef.current + 1;
+        setStatusEvents((current) => [
+          ...current,
           {
-            id: `${run.run_id}-${current.length}-${Date.now()}`,
+            id: payload.id || `${run.run_id}-${current.length}-${Date.now()}`,
+            session_id: payload.session_id || run.session_id,
+            run_id: payload.run_id || run.run_id,
+            step_number: payloadStepNumber || activeStepNumber,
+            status: payload.status || null,
             message: payload.message || payload.status || 'Lea status update',
-            created_at: new Date().toISOString(),
+            created_at: payload.created_at || new Date().toISOString(),
           },
         ]);
       });
@@ -165,16 +227,20 @@ export default function App() {
         eventSourceRef.current = null;
         source.close();
         setIsRunning(false);
+        setActiveTimelineStep(null);
+        await reconcileSession(run.session_id);
         await refreshSessions();
       });
 
-      source.onerror = () => {
+      source.onerror = async () => {
         if (eventSourceRef.current !== source || source.readyState === EventSource.CLOSED) {
           return;
         }
         eventSourceRef.current = null;
         source.close();
         setIsRunning(false);
+        setActiveTimelineStep(null);
+        reconcileSession(run.session_id).catch(() => undefined);
         setError('Lost connection to the Lea backend.');
       };
       return true;
@@ -197,8 +263,10 @@ export default function App() {
               setSelectedSessionId(undefined);
               setMessages([]);
               setCodeSteps([]);
-              setStatusLog([]);
+              codeStepCountRef.current = 0;
+              setStatusEvents([]);
               setCurrentStepIndex(0);
+              setActiveTimelineStep(null);
               setError(undefined);
             }}
           />
@@ -212,11 +280,16 @@ export default function App() {
             isPaused={isPaused}
             isRunning={isRunning}
             messages={messages}
-            statusLog={statusLog}
+            codeSteps={codeSteps}
+            sessionStatus={selectedSession?.status}
+            statusEvents={statusEvents}
             onSubmit={handleSubmit}
+            onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}
             theoremName={title}
             currentStepIndex={currentStepIndex}
+            activeTimelineStepIndex={activeTimelineStepIndex}
+            codeStepCount={codeSteps.length}
           />
         </Panel>
 

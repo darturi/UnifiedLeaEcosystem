@@ -69,7 +69,7 @@ def create_run(request: RunRequest) -> dict:
     else:
         session = store.create_session(message)
 
-    run = store.create_run(session["id"], config.model, config.provider, config.max_turns)
+    run = store.create_run(session["id"], config.model, None, config.max_turns)
     user_message = store.add_message(session["id"], "user", message, run["id"])
     return {
         "session_id": session["id"],
@@ -127,4 +127,3 @@ async def run_events(run_id: str) -> StreamingResponse:
                 break
 
     return StreamingResponse(stream_events(), media_type="text/event-stream")
-

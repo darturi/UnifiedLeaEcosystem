@@ -1,13 +1,10 @@
 [project]
 name = "lea-interface-server"
 version = "0.1.0"
-description = "Local FastAPI bridge between the Lea UI and Lea prover."
+description = "Local FastAPI adapter between the Lea UI and Lea API."
 requires-python = ">=3.11"
 dependencies = [
-  "anthropic>=0.96.0",
   "fastapi>=0.115.0",
-  "google-genai>=1.70.0",
-  "openai>=2.32.0",
   "uvicorn[standard]>=0.32.0",
   "pydantic>=2.8.0",
 ]

@@ -74,6 +74,16 @@ def init_db() -> None:
                 turn integer,
                 created_at text not null
             );
+
+            create table if not exists status_events (
+                id text primary key,
+                session_id text not null references sessions(id),
+                run_id text not null references runs(id),
+                step_number integer,
+                status text,
+                message text not null,
+                created_at text not null
+            );
             """
         )
         columns = {

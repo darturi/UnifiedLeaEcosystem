@@ -17,6 +17,13 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
         summary="Turn 2: no tool calls and no Lean file changes.",
         turn=2,
     )
+    status_event = store.add_status_event(
+        session["id"],
+        run["id"],
+        "Captured Lean file update: workspace/proofs/test.lean",
+        status="code_step",
+        step_number=step["step_number"],
+    )
 
     detail = store.session_detail(session["id"])
 
@@ -27,3 +34,6 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["kind"] == "no_code"
     assert detail["code_steps"][0]["summary"].startswith("Turn 2")
     assert detail["code_steps"][0]["turn"] == 2
+    assert detail["status_events"][0]["id"] == status_event["id"]
+    assert detail["status_events"][0]["step_number"] == 1
+    assert detail["status_events"][0]["status"] == "code_step"

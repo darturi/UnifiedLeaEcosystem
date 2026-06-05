@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-import os
+import json
 import re
-import subprocess
-import sys
+import socket
 import time
-import ast
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from threading import Lock
 from typing import Any
 
-from .config import LeaConfig, apply_provider_env
 from . import store
+from .config import ROOT, LeaConfig
+from .lea_api_client import LeaApiClient, LeaApiError
 
 
 active_run_lock = Lock()
+RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+WRITE_TOOL_NAMES = {"write_file", "edit_file"}
+PATH_KEYS = ("path", "file", "file_path", "relative_path", "filename", "name")
+CODE_KEYS = ("code", "content", "source", "text")
 
 
 @dataclass
@@ -27,6 +29,22 @@ class RunnerContext:
     task: str
     config: LeaConfig
     events: Queue[dict[str, Any]]
+    client: LeaApiClient | None = None
+
+
+@dataclass
+class ToolTracker:
+    last_write_or_edit_path: str | None = None
+    pending_write_path: str | None = None
+    pending_write_had_content: bool = False
+    pending_edit_path: str | None = None
+    pending_lean_check_path: str | None = None
+    last_lean_check_path: str | None = None
+    drift_warnings: set[tuple[str, str]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.drift_warnings is None:
+            self.drift_warnings = set()
 
 
 def emit(events: Queue[dict[str, Any]], event_type: str, payload: dict[str, Any]) -> None:
@@ -34,51 +52,53 @@ def emit(events: Queue[dict[str, Any]], event_type: str, payload: dict[str, Any]
 
 
 def log_status(context: RunnerContext, message: str, **payload: Any) -> None:
-    data = {"message": message, **payload}
+    status = payload.get("status")
+    step_number = payload.get("step_number")
+    event = store.add_status_event(
+        context.session_id,
+        context.run_id,
+        message,
+        status=str(status) if status is not None else None,
+        step_number=int(step_number) if isinstance(step_number, int) else None,
+    )
+    data = {**event, **payload, "message": message}
     print(f"[lea-run:{context.run_id}] {message}", flush=True)
     emit(context.events, "status", data)
 
 
-@contextmanager
-def working_directory(path: Path):
-    previous = Path.cwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(previous)
+def _log_api_frame(context: RunnerContext, api_run_id: str, frame: dict[str, Any]) -> None:
+    RAW_EVENT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = RAW_EVENT_LOG_DIR / f"{context.run_id}.jsonl"
+    preview = _truncate_for_log(frame)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "api_run_id": api_run_id,
+                    "local_run_id": context.run_id,
+                    "seq": _seq(frame),
+                    "type": _event_type(frame),
+                    "payload": preview,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
 
 
-def _load_lea_modules(config: LeaConfig):
-    lea_root = config.lea_root.resolve()
-    if not lea_root.exists():
-        raise FileNotFoundError(f"Lea root not found: {lea_root}")
-    if str(lea_root) not in sys.path:
-        sys.path.insert(0, str(lea_root))
-
-    from lea.agent import DEFAULT_MODEL
-    from lea.prompt import load_system_prompt
-    from lea.providers import Done, TextDelta, ToolCall, Usage, _ToolMeta, detect_provider, stream
-    from lea.tools import TOOL_HANDLERS, TOOLS_SCHEMA
-
-    return {
-        "DEFAULT_MODEL": DEFAULT_MODEL,
-        "load_system_prompt": load_system_prompt,
-        "Done": Done,
-        "TextDelta": TextDelta,
-        "ToolCall": ToolCall,
-        "Usage": Usage,
-        "_ToolMeta": _ToolMeta,
-        "detect_provider": detect_provider,
-        "stream": stream,
-        "TOOL_HANDLERS": TOOL_HANDLERS,
-        "TOOLS_SCHEMA": TOOLS_SCHEMA,
-    }
+def _truncate_for_log(value: Any, limit: int = 2000) -> Any:
+    text = json.dumps(value, ensure_ascii=False, default=str)
+    if len(text) <= limit:
+        return value
+    return {"truncated": True, "preview": text[:limit]}
 
 
-def _relative_path(path: str, lea_root: Path) -> str:
-    lea_root = lea_root.resolve()
+def _relative_path(path: str, lea_root: Path | None) -> str:
     candidate = Path(path).expanduser()
+    if lea_root is None:
+        return str(candidate)
+
+    lea_root = lea_root.resolve()
     if not candidate.is_absolute():
         candidate = (lea_root / candidate).resolve()
     else:
@@ -89,9 +109,9 @@ def _relative_path(path: str, lea_root: Path) -> str:
         return str(candidate)
 
 
-def _resolve_lea_path(path: str, lea_root: Path) -> Path:
+def _resolve_lea_path(path: str, lea_root: Path | None) -> Path:
     candidate = Path(path).expanduser()
-    if candidate.is_absolute():
+    if candidate.is_absolute() or lea_root is None:
         return candidate.resolve()
     return (lea_root / candidate).resolve()
 
@@ -100,25 +120,30 @@ def _emit_file_snapshot(
     *,
     context: RunnerContext,
     path: Path,
-    emitted: set[tuple[Path, int, int]],
+    emitted: set[tuple[str, int, int]],
 ) -> dict[str, Any] | None:
     if not path.exists() or path.suffix != ".lean":
         return None
     stat = path.stat()
-    emitted_key = (path.resolve(), stat.st_mtime_ns, stat.st_size)
+    emitted_key = (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
     if emitted_key in emitted:
         return None
     emitted.add(emitted_key)
     step = store.add_code_step(
         context.session_id,
         context.run_id,
-        _relative_path(str(path), context.config.lea_root.resolve()),
+        _relative_path(str(path), context.config.lea_root),
         path.read_text(),
         kind="code",
         turn=getattr(context, "current_turn", None),
     )
     emit(context.events, "code_step", step)
-    log_status(context, f"Captured Lean file update: {step['path']}", status="code_step")
+    log_status(
+        context,
+        f"Captured Lean file update: {step['path']}",
+        status="code_step",
+        step_number=step["step_number"],
+    )
     return step
 
 
@@ -145,266 +170,534 @@ def _emit_no_code_step(
         turn=turn,
     )
     emit(context.events, "code_step", step)
-    log_status(context, summary, status="no_code_step", turn=turn)
+    log_status(context, summary, status="no_code_step", turn=turn, step_number=step["step_number"])
     return step
 
 
-def _snapshot_if_lean_file(
-    *,
-    tool_name: str,
-    args: dict,
-    result: str,
-    context: RunnerContext,
-) -> None:
-    if tool_name not in {"write_file", "edit_file"}:
-        return
-    path_arg = args.get("path")
-    if not path_arg or not str(path_arg).endswith(".lean"):
-        return
-    if result.startswith("Error:"):
-        return
-
-    file_path = _resolve_lea_path(str(path_arg), context.config.lea_root.resolve())
-    if not file_path.exists():
-        return
-
-    code = file_path.read_text()
-    step = store.add_code_step(context.session_id, context.run_id, _relative_path(str(file_path), context.config.lea_root.resolve()), code)
-    emit(context.events, "code_step", step)
-
-
-def _proof_files(lea_root: Path) -> dict[Path, tuple[int, int]]:
-    proof_root = lea_root / "workspace" / "proofs"
-    if not proof_root.exists():
-        return {}
-    files: dict[Path, tuple[int, int]] = {}
-    for path in proof_root.rglob("*.lean"):
-        stat = path.stat()
-        files[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
-    return files
-
-
-def _emit_changed_proof_files(
-    *,
-    context: RunnerContext,
-    before: dict[Path, tuple[int, int]],
-    emitted: set[tuple[Path, int, int]],
-) -> tuple[dict[Path, tuple[int, int]], list[dict[str, Any]]]:
-    current = _proof_files(context.config.lea_root.resolve())
-    steps = []
-    for path, signature in current.items():
-        if before.get(path) == signature:
-            continue
-        emitted_key = (path, signature[0], signature[1])
-        if emitted_key in emitted:
-            continue
-        step = _emit_file_snapshot(context=context, path=path, emitted=emitted)
-        if step:
-            steps.append(step)
-    return current, steps
-
-
-def _parse_tool_call(line: str) -> tuple[str, dict[str, Any]] | None:
-    stripped = line.strip()
-    if not stripped.startswith("-> "):
-        return None
-    match = re.match(r"->\s+([a-zA-Z_][a-zA-Z0-9_]*)\((.*)\)\s*$", stripped)
-    if not match:
-        return None
-    try:
-        args = ast.literal_eval(match.group(2))
-    except (SyntaxError, ValueError):
-        return None
-    if not isinstance(args, dict):
-        return None
-    return match.group(1), args
-
-
-def _run_lea_subprocess(context: RunnerContext) -> None:
-    model = context.config.model
-    provider = context.config.provider
-    if not provider:
-        lea = _load_lea_modules(context.config)
-        provider = lea["detect_provider"](model)
-
-    env = os.environ.copy()
-    apply_provider_env(context.config)
-    env.update(os.environ)
-    lea_root = context.config.lea_root.resolve()
-    env["PYTHONPATH"] = os.pathsep.join([str(lea_root), env.get("PYTHONPATH", "")]).strip(os.pathsep)
-
-    args = [
-        "uv",
-        "run",
-        "python",
-        "-m",
-        "lea.cli",
-        "-p",
-        provider,
-        "-m",
-        model,
-    ]
-    if context.config.max_turns:
-        args.extend(["--max-turns", str(context.config.max_turns)])
-    args.append(context.task)
-
-    store.update_run(context.run_id, "running")
-    store.touch_session(context.session_id, "running")
-    log_status(
-        context,
-        f"Starting Lea subprocess with provider={provider}, model={model}, max_turns={context.config.max_turns or 'unlimited'}",
-        status="running",
-        provider=provider,
-        model=model,
-        max_turns=context.config.max_turns,
-    )
-    log_status(context, "$ " + " ".join(args), status="command")
-
-    before = _proof_files(lea_root)
-    emitted: set[tuple[Path, int, int]] = set()
-    process = subprocess.Popen(
-        args,
-        cwd=lea_root,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    assistant_buffer: list[str] = []
-    final_text_lines: list[str] = []
-    current_turn: int | None = None
-    turn_had_tool_call = False
-    turn_had_code_step = False
-    latest_code = ""
-    latest_path: str | None = None
-    pending_snapshot_path: Path | None = None
-    assert process.stdout is not None
-
-    def finish_turn() -> None:
-        nonlocal turn_had_code_step
-        if current_turn is None or turn_had_code_step:
-            return
-        _emit_no_code_step(
-            context=context,
-            turn=current_turn,
-            had_tool_call=turn_had_tool_call,
-            latest_path=latest_path,
-            latest_code=latest_code,
-        )
-        turn_had_code_step = True
-
-    while True:
-        line = process.stdout.readline()
-        if line:
-            assistant_buffer.append(line)
-            turn_match = re.match(r"--- turn (\d+) ---", line.strip())
-            if turn_match:
-                finish_turn()
-                current_turn = int(turn_match.group(1))
-                setattr(context, "current_turn", current_turn)
-                turn_had_tool_call = False
-                turn_had_code_step = False
-                pending_snapshot_path = None
-            parsed_tool = _parse_tool_call(line)
-            if parsed_tool and parsed_tool[0] in {"write_file", "edit_file"}:
-                turn_had_tool_call = True
-                path_arg = parsed_tool[1].get("path")
-                if isinstance(path_arg, str) and path_arg.endswith(".lean"):
-                    pending_snapshot_path = _resolve_lea_path(path_arg, lea_root)
-            elif parsed_tool:
-                turn_had_tool_call = True
-            _emit_lea_cli_line(
-                context=context,
-                line=line,
-                current_turn=current_turn,
-                final_text_lines=final_text_lines,
-            )
-            if line.strip().startswith("<- ") and pending_snapshot_path:
-                if not line.strip().startswith("<- Error:"):
-                    step = _emit_file_snapshot(context=context, path=pending_snapshot_path, emitted=emitted)
-                    if step:
-                        turn_had_code_step = True
-                        latest_path = step["path"]
-                        latest_code = step["code"]
-                pending_snapshot_path = None
-            print(f"[lea-run:{context.run_id}] {line.rstrip()}", flush=True)
-        before, poll_steps = _emit_changed_proof_files(context=context, before=before, emitted=emitted)
-        if poll_steps:
-            turn_had_code_step = True
-            latest_path = poll_steps[-1]["path"]
-            latest_code = poll_steps[-1]["code"]
-        if not line and process.poll() is not None:
-            break
-        if not line:
-            time.sleep(0.2)
-
-    before, poll_steps = _emit_changed_proof_files(context=context, before=before, emitted=emitted)
-    if poll_steps:
-        turn_had_code_step = True
-        latest_path = poll_steps[-1]["path"]
-        latest_code = poll_steps[-1]["code"]
-    finish_turn()
-    output = "".join(assistant_buffer).strip()
-    final_text = "\n".join(dict.fromkeys(final_text_lines)).strip()
-    if final_text:
-        message = store.add_message(context.session_id, "assistant", final_text, context.run_id)
-        emit(context.events, "message", message)
-
-    code = process.returncode or 0
-    status = "success" if code == 0 and "OK" in output else "failed"
-    store.update_run(context.run_id, status, final_text=final_text or output or f"Lea exited with {code}")
-    store.touch_session(context.session_id, status)
-    emit(context.events, "done", {"status": status, "exit_code": code})
-
-
-def _emit_chat_message(context: RunnerContext, role: str, content: str) -> None:
+def _emit_chat_message(context: RunnerContext, role: str, content: str) -> dict[str, Any]:
     message = store.add_message(context.session_id, role, content, context.run_id)
     emit(context.events, "message", message)
+    return message
 
 
-def _shorten(value: str, limit: int = 1000) -> str:
-    if len(value) <= limit:
+def _flush_assistant_turn(
+    context: RunnerContext,
+    chunks: list[str],
+    persisted_texts: list[str],
+) -> dict[str, Any] | None:
+    text = "".join(chunks).strip()
+    chunks.clear()
+    if not text:
+        return None
+    if persisted_texts and persisted_texts[-1] == text:
+        return None
+    persisted_texts.append(text)
+    return _emit_chat_message(context, "assistant", text)
+
+
+def _event_type(frame: dict[str, Any]) -> str:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("type") or candidate.get("event") or candidate.get("kind")
+        if isinstance(value, str) and value:
+            return value.strip().lower()
+    return ""
+
+
+def _text_delta(frame: dict[str, Any]) -> str | None:
+    kind = _event_type(frame)
+    if kind in {"assistant_delta", "assistant_text_delta", "text_delta", "delta", "token", "assistant_text"}:
+        return _first_string(frame, "text", "delta", "content", "message")
+    if kind in {
+        "status",
+        "tool_call",
+        "tool_called",
+        "tool_result",
+        "tool_resulted",
+        "turn_started",
+        "usage_updated",
+        "finished",
+        "done",
+        "completed",
+        "error",
+    }:
+        return None
+    return _first_string(frame, "text_delta", "assistant_delta")
+
+
+def _status_message(frame: dict[str, Any]) -> str | None:
+    kind = _event_type(frame)
+    if kind in {
+        "status",
+        "progress",
+        "tool_call",
+        "tool_called",
+        "tool_result",
+        "tool_resulted",
+        "turn_started",
+        "usage_updated",
+        "started",
+    }:
+        return _first_string(frame, "message", "status", "name", "tool", "text")
+    return None
+
+
+def _terminal_status(frame: dict[str, Any]) -> str | None:
+    kind = _event_type(frame)
+    if kind in {"finished", "done", "completed"}:
+        reason = str(frame.get("reason") or frame.get("status") or "").lower()
+        if reason in {"max_turns", "max-turns"}:
+            return "max_turns"
+        if reason in {"failed", "error", "cancelled", "canceled"}:
+            return "failed"
+        return "success"
+    if kind in {"failed", "cancelled", "canceled"}:
+        return "failed"
+    if kind == "error":
+        return "failed"
+    return None
+
+
+def _final_text(frame: dict[str, Any]) -> str | None:
+    direct = _first_string_from(frame, "final_text", "summary", "message", "text")
+    if direct:
+        return direct
+    for candidate in _walk_dicts(frame):
+        value = _first_string_from(candidate, "final_text", "summary", "message", "text")
+        if value:
+            return value
+    return None
+
+
+def _first_string(frame: dict[str, Any], *keys: str) -> str | None:
+    for candidate in _walk_dicts(frame):
+        for key in keys:
+            value = candidate.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _usage(frame: dict[str, Any]) -> tuple[int | None, int | None]:
+    for candidate in _walk_dicts(frame):
+        usage = candidate.get("usage") if isinstance(candidate.get("usage"), dict) else candidate
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+        if isinstance(input_tokens, int | float) or isinstance(output_tokens, int | float):
+            return (
+                int(input_tokens) if isinstance(input_tokens, int | float) else None,
+                int(output_tokens) if isinstance(output_tokens, int | float) else None,
+            )
+    return None, None
+
+
+def _seq(frame: dict[str, Any]) -> int | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("seq")
+        if isinstance(value, int):
+            return int(value)
+    return None
+
+
+def _walk_dicts(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            found.append(item)
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return found
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
         return value
-    return value[:limit] + "\n... (truncated)"
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
-def _emit_lea_cli_line(
+def _tool_name(candidate: dict[str, Any]) -> str:
+    function = candidate.get("function") if isinstance(candidate.get("function"), dict) else {}
+    value = (
+        candidate.get("tool_name")
+        or candidate.get("tool")
+        or candidate.get("name")
+        or candidate.get("function_name")
+        or function.get("name")
+    )
+    return str(value or "").strip()
+
+
+def _tool_args(candidate: dict[str, Any]) -> dict[str, Any]:
+    function = candidate.get("function") if isinstance(candidate.get("function"), dict) else {}
+    for key in ("args", "arguments", "input", "parameters", "params"):
+        parsed = _as_dict(candidate.get(key))
+        if parsed:
+            return parsed
+    parsed = _as_dict(function.get("arguments"))
+    return parsed
+
+
+def _primary_event_dict(frame: dict[str, Any]) -> dict[str, Any]:
+    return frame.get("payload") if isinstance(frame.get("payload"), dict) else frame
+
+
+def _code_payloads(frame: dict[str, Any]) -> list[tuple[str, str, int | None]]:
+    payloads: list[tuple[str, str, int | None]] = []
+
+    for candidate in _walk_dicts(frame):
+        kind = str(candidate.get("type") or candidate.get("event") or candidate.get("kind") or "").strip().lower()
+        tool_name = _tool_name(candidate)
+        args = _tool_args(candidate)
+        path = _first_string_from(args, *PATH_KEYS) or _first_string_from(candidate, *PATH_KEYS)
+        code = _first_string_from(args, *CODE_KEYS) or _first_string_from(candidate, *CODE_KEYS)
+        turn = candidate.get("turn") or args.get("turn")
+        is_tool_result = kind in {"tool_result", "tool_resulted"}
+        is_tool_call = kind in {"tool_call", "tool_called"}
+        is_file_event = kind in {
+            "code_step",
+            "file_snapshot",
+            "file_written",
+            "file_created",
+            "file_updated",
+            "artifact",
+            "artifact_created",
+        }
+
+        if is_tool_result:
+            continue
+
+        is_write_tool_call = kind == "write_file" or (is_tool_call and tool_name == "write_file")
+        is_implicit_artifact = (
+            not kind
+            and path
+            and code
+            and _looks_like_lean_path(path)
+            and _looks_like_lean_code(code)
+        )
+
+        if is_write_tool_call or is_file_event or is_implicit_artifact:
+            if not path and not code:
+                continue
+            if path and not _looks_like_lean_path(path):
+                continue
+            if is_write_tool_call and not code:
+                continue
+            payloads.append((path or "Lea.lean", code or "", int(turn) if isinstance(turn, int) else None))
+
+    return _dedupe_code_payloads(payloads)
+
+
+def _first_string_from(mapping: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _looks_like_lean_path(path: str) -> bool:
+    return str(path).strip().endswith(".lean")
+
+
+def _looks_like_lean_code(code: str) -> bool:
+    stripped = code.lstrip()
+    if stripped.startswith(("import ", "theorem ", "example ", "lemma ", "def ", "/--", "--")):
+        return True
+    return "\n" in code and any(token in code for token in (" := by", " by\n", "theorem ", "example "))
+
+
+def _dedupe_code_payloads(payloads: list[tuple[str, str, int | None]]) -> list[tuple[str, str, int | None]]:
+    seen: set[tuple[str, str]] = set()
+    deduped: list[tuple[str, str, int | None]] = []
+    for path, code, turn in payloads:
+        key = (path, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((path, code, turn))
+    return deduped
+
+
+def _emit_code_payload(
     *,
     context: RunnerContext,
-    line: str,
-    current_turn: int | None,
-    final_text_lines: list[str],
+    frame: dict[str, Any],
+    emitted: set[tuple[str, int, int]],
+    emitted_payloads: set[tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    payloads = _code_payloads(frame)
+    steps: list[dict[str, Any]] = []
+
+    for path, code, turn in payloads:
+        if not code and path:
+            file_path = _resolve_lea_path(path, context.config.lea_root)
+            step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
+            if step:
+                if emitted_payloads is not None:
+                    emitted_payloads.add((step["path"], step["code"]))
+                steps.append(step)
+            continue
+
+        relative_path = _relative_path(path, context.config.lea_root)
+        payload_key = (relative_path, code)
+        if emitted_payloads is not None:
+            if payload_key in emitted_payloads:
+                continue
+            emitted_payloads.add(payload_key)
+
+        step = store.add_code_step(
+            context.session_id,
+            context.run_id,
+            relative_path,
+            code,
+            kind="code",
+            turn=turn,
+        )
+        emit(context.events, "code_step", step)
+        log_status(
+            context,
+            f"Captured Lean file update: {step['path']}",
+            status="code_step",
+            step_number=step["step_number"],
+        )
+        steps.append(step)
+
+    return steps
+
+
+def _track_tool_frame(
+    *,
+    context: RunnerContext,
+    api_run_id: str,
+    frame: dict[str, Any],
+    tracker: ToolTracker,
+    emitted: set[tuple[str, int, int]],
+    emitted_payloads: set[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    event = _primary_event_dict(frame)
+    kind = _event_type(event)
+    tool_name = _tool_name(event)
+    args = _tool_args(event)
+    path = _first_string_from(args, *PATH_KEYS) or _first_string_from(event, *PATH_KEYS)
+    steps: list[dict[str, Any]] = []
+
+    if kind in {"tool_call", "tool_called"}:
+        if tool_name in WRITE_TOOL_NAMES and path:
+            tracker.last_write_or_edit_path = path
+            if tool_name == "write_file":
+                tracker.pending_write_path = path
+                tracker.pending_write_had_content = bool(_first_string_from(args, *CODE_KEYS))
+            else:
+                tracker.pending_edit_path = path
+        elif tool_name == "lean_check" and path:
+            tracker.pending_lean_check_path = path
+            tracker.last_lean_check_path = path
+            _emit_path_drift_if_needed(context, api_run_id, tracker, checked_path=path)
+        return steps
+
+    if kind not in {"tool_result", "tool_resulted"}:
+        return steps
+
+    content = _first_string_from(event, "content", "preview") or ""
+    succeeded = _tool_result_succeeded(content)
+    if tool_name == "write_file":
+        if succeeded and tracker.pending_write_path and not tracker.pending_write_had_content:
+            file_path = _resolve_lea_path(tracker.pending_write_path, context.config.lea_root)
+            step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
+            if step:
+                emitted_payloads.add((step["path"], step["code"]))
+                steps.append(step)
+        tracker.pending_write_path = None
+        tracker.pending_write_had_content = False
+    elif tool_name == "edit_file":
+        if succeeded and tracker.pending_edit_path:
+            file_path = _resolve_lea_path(tracker.pending_edit_path, context.config.lea_root)
+            step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
+            if step:
+                emitted_payloads.add((step["path"], step["code"]))
+                steps.append(step)
+        tracker.pending_edit_path = None
+    elif tool_name == "lean_check":
+        if tracker.pending_lean_check_path:
+            file_path = _resolve_lea_path(tracker.pending_lean_check_path, context.config.lea_root)
+            step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
+            if step:
+                emitted_payloads.add((step["path"], step["code"]))
+                steps.append(step)
+        tracker.pending_lean_check_path = None
+
+    return steps
+
+
+def _tool_result_succeeded(content: str) -> bool:
+    stripped = content.strip()
+    return bool(stripped) and not stripped.lower().startswith("error:")
+
+
+def _emit_path_drift_if_needed(
+    context: RunnerContext,
+    api_run_id: str,
+    tracker: ToolTracker,
+    *,
+    checked_path: str,
 ) -> None:
-    stripped = line.strip()
-    if not stripped:
+    written_path = tracker.last_write_or_edit_path
+    if not written_path:
+        return
+    written_root = _proof_root_key(written_path)
+    checked_root = _proof_root_key(checked_path)
+    if not written_root or not checked_root or written_root == checked_root:
         return
 
-    turn_match = re.match(r"--- turn (\d+) ---", stripped)
-    if turn_match:
-        _emit_chat_message(context, "system", f"Turn {turn_match.group(1)}")
+    key = (written_root, checked_root)
+    assert tracker.drift_warnings is not None
+    if key in tracker.drift_warnings:
         return
+    tracker.drift_warnings.add(key)
 
-    if stripped.startswith("-> "):
-        label = f"Turn {current_turn}: tool call" if current_turn else "Tool call"
-        _emit_chat_message(context, "system", f"{label}\n{_shorten(stripped)}")
-        return
+    message = f"Path drift detected: wrote {written_path} but checked {checked_path}."
+    payload = {
+        "type": "path_drift",
+        "message": message,
+        "written_path": written_path,
+        "checked_path": checked_path,
+    }
+    _log_api_frame(context, api_run_id, payload)
+    log_status(
+        context,
+        message,
+        status="path_drift",
+        written_path=written_path,
+        checked_path=checked_path,
+    )
 
-    if stripped.startswith("<- "):
-        label = f"Turn {current_turn}: tool result" if current_turn else "Tool result"
-        _emit_chat_message(context, "system", f"{label}\n{_shorten(stripped)}")
-        return
 
-    if stripped.startswith("--- ") and "tokens" in stripped:
-        _emit_chat_message(context, "system", stripped)
-        return
+def _proof_root_key(path: str) -> str | None:
+    normalized = str(Path(path).expanduser())
+    marker = "/workspace/proofs/"
+    if marker in normalized:
+        return normalized.split(marker, 1)[0]
+    if normalized.endswith(".lean"):
+        return str(Path(normalized).parent)
+    return None
 
-    if stripped.startswith("Building ") or stripped.startswith("Built ") or stripped.startswith("Installed ") or stripped.startswith("Uninstalled "):
-        log_status(context, stripped, status="lea_setup")
-        return
 
-    final_text_lines.append(stripped)
+def _reconcile_terminal_artifacts(
+    *,
+    context: RunnerContext,
+    run_status: dict[str, Any] | None,
+    transcript: Any,
+    final_text: str | None,
+    emitted: set[tuple[str, int, int]],
+    emitted_payloads: set[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    if run_status:
+        steps.extend(
+            _emit_code_payload(
+                context=context,
+                frame=run_status,
+                emitted=emitted,
+                emitted_payloads=emitted_payloads,
+            )
+        )
+    if transcript is not None:
+        transcript_frame = {"type": "transcript", "transcript": transcript}
+        steps.extend(
+            _emit_code_payload(
+                context=context,
+                frame=transcript_frame,
+                emitted=emitted,
+                emitted_payloads=emitted_payloads,
+            )
+        )
+
+    for filename in _lean_filenames_from_text(final_text or ""):
+        file_path = _resolve_lea_path(filename, context.config.lea_root)
+        if file_path.exists() and file_path.suffix == ".lean":
+            payload_key = (_relative_path(str(file_path), context.config.lea_root), file_path.read_text())
+            if payload_key in emitted_payloads:
+                continue
+        step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
+        if step:
+            emitted_payloads.add((step["path"], step["code"]))
+            steps.append(step)
+    return steps
+
+
+def _lean_filenames_from_text(text: str) -> list[str]:
+    matches = re.findall(r"[`'\"]?([A-Za-z0-9_./ -]+\.lean)[`'\"]?", text)
+    return [match.strip() for match in matches if match.strip()]
+
+
+def _assistant_text_from_transcript(transcript: Any) -> str:
+    for candidate in _walk_dicts(transcript):
+        if candidate.get("role") != "assistant":
+            continue
+        content = candidate.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            chunks = [
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+            ]
+            text = "\n\n".join(chunk.strip() for chunk in chunks if chunk.strip()).strip()
+            if text:
+                return text
+    return ""
+
+
+def _emit_terminal_no_code_step(context: RunnerContext, api_run_id: str | None) -> dict[str, Any]:
+    detail = (
+        "Lea API completed, but it did not expose a readable Lean file or code artifact."
+        " Configure lea_root to the API workspace, or enable code/file events in the Lea API."
+    )
+    step = store.add_code_step(
+        context.session_id,
+        context.run_id,
+        "No Lean artifact exposed",
+        "",
+        kind="no_code",
+        summary=detail,
+        turn=None,
+    )
+    emit(context.events, "code_step", step)
+    log_status(
+        context,
+        detail,
+        status="no_code_step",
+        api_run_id=api_run_id,
+        step_number=step["step_number"],
+    )
+    return step
+
+
+def _api_run_status_to_local(status: str | None) -> str | None:
+    normalized = str(status or "").lower()
+    if normalized in {"completed", "success", "succeeded"}:
+        return "success"
+    if normalized in {"max_turns", "max-turns"}:
+        return "max_turns"
+    if normalized in {"failed", "error", "cancelled", "canceled"}:
+        return "failed"
+    return None
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError | socket.timeout) or "timed out" in str(exc).lower()
 
 
 def run_lea(context: RunnerContext) -> None:
@@ -415,191 +708,210 @@ def run_lea(context: RunnerContext) -> None:
         emit(context.events, "done", {"status": "failed"})
         return
 
+    api_run_id: str | None = None
+    client = context.client or LeaApiClient(context.config)
+    assistant_chunks: list[str] = []
+    assistant_turn_chunks: list[str] = []
+    persisted_assistant_texts: list[str] = []
+    final_text: str | None = None
+    last_seq = -1
+    emitted_files: set[tuple[str, int, int]] = set()
+    emitted_payloads: set[tuple[str, str]] = set()
+    terminal_status: str | None = None
+    terminal_error: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    code_step_emitted = False
+    terminal_run_status: dict[str, Any] | None = None
+    terminal_transcript: Any = None
+    transcript_url: str | None = None
+    tool_tracker = ToolTracker()
+
     try:
-        _run_lea_subprocess(context)
-        return
-
-        apply_provider_env(context.config)
-        lea = _load_lea_modules(context.config)
-        model = context.config.model or lea["DEFAULT_MODEL"]
-        provider_name = context.config.provider or lea["detect_provider"](model)
-        total_usage = lea["Usage"]()
-        messages: list[dict[str, Any]] = [{"role": "user", "content": context.task}]
-        last_lean_check_ok = False
-
         store.update_run(context.run_id, "running")
         store.touch_session(context.session_id, "running")
         log_status(
             context,
-            f"Starting Lea with provider={provider_name}, model={model}, max_turns={context.config.max_turns or 'unlimited'}",
+            f"Starting Lea API run at {context.config.lea_api_base_url}",
             status="running",
-            provider=provider_name,
-            model=model,
+            model=context.config.model,
             max_turns=context.config.max_turns,
         )
 
-        with working_directory(context.config.lea_root):
-            system = lea["load_system_prompt"]("default")
-            turn = 0
-            while True:
-                turn += 1
-                if context.config.max_turns and turn > context.config.max_turns:
-                    final_text = "Error: max turns reached without completing the proof."
-                    store.add_message(context.session_id, "system", final_text, context.run_id)
-                    store.update_run(
-                        context.run_id,
-                        "max_turns",
-                        final_text=final_text,
-                        input_tokens=total_usage.input_tokens,
-                        output_tokens=total_usage.output_tokens,
-                    )
-                    store.touch_session(context.session_id, "max_turns")
-                    emit(context.events, "message", {"role": "system", "content": final_text})
-                    emit(context.events, "done", {"status": "max_turns"})
-                    return
+        run = client.start_run(context.task)
+        api_run_id = str(run["run_id"])
+        log_status(context, f"Lea API run started: {api_run_id}", status="api_run_started", api_run_id=api_run_id)
 
-                log_status(context, f"Turn {turn}: calling model", status="calling_model", turn=turn)
-                assistant_parts: list[dict[str, Any]] = []
-                current_text = ""
-                tool_calls: list[dict[str, Any]] = []
+        started = time.monotonic()
+        attempts = 0
+        while terminal_status is None and attempts < 2:
+            attempts += 1
+            timeout = max(1.0, context.config.lea_job_timeout_seconds - (time.monotonic() - started))
+            for frame in client.stream_events(api_run_id, from_seq=last_seq + 1, timeout=timeout):
+                _log_api_frame(context, api_run_id, frame)
+                seq = _seq(frame)
+                if seq is not None:
+                    last_seq = max(last_seq, seq)
 
-                for event in lea["stream"](
-                    model,
-                    system,
-                    messages,
-                    lea["TOOLS_SCHEMA"],
-                    provider_name,
-                ):
-                    if isinstance(event, lea["TextDelta"]):
-                        current_text += event.text
-                        emit(context.events, "assistant_delta", {"text": event.text})
-                    elif isinstance(event, lea["ToolCall"]):
-                        if current_text:
-                            assistant_parts.append({"type": "text", "text": current_text})
-                            current_text = ""
-                        tool_calls.append(
-                            {
-                                "name": event.name,
-                                "args": event.args,
-                                "id": None,
-                                "raw_part": event.raw_part,
-                            }
-                        )
-                        log_status(
-                            context,
-                            f"Turn {turn}: model requested {event.name}",
-                            status="tool_call",
-                            turn=turn,
-                            tool=event.name,
-                            args=event.args,
-                        )
-                    elif isinstance(event, lea["_ToolMeta"]):
-                        if tool_calls:
-                            tool_calls[-1]["id"] = event.tool_use_id
-                    elif isinstance(event, lea["Done"]):
-                        total_usage.input_tokens += event.usage.input_tokens
-                        total_usage.output_tokens += event.usage.output_tokens
+                frame_type = _event_type(frame)
+                if frame_type == "turn_started":
+                    _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
 
-                    if current_text:
-                        assistant_parts.append({"type": "text", "text": current_text})
+                delta = _text_delta(frame)
+                if delta:
+                    assistant_chunks.append(delta)
+                    assistant_turn_chunks.append(delta)
+                    emit(context.events, "assistant_delta", {"text": delta})
 
-                for tool_call in tool_calls:
-                    assistant_parts.append(
-                        {
-                            "type": "tool_call",
-                            "name": tool_call["name"],
-                            "args": tool_call["args"],
-                            "id": tool_call["id"],
-                            "raw_part": tool_call.get("raw_part"),
-                        }
-                    )
+                if frame_type in {"tool_call", "tool_called"}:
+                    _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
 
-                messages.append({"role": "assistant", "content": assistant_parts})
+                frame_steps = _emit_code_payload(
+                    context=context,
+                    frame=frame,
+                    emitted=emitted_files,
+                    emitted_payloads=emitted_payloads,
+                )
+                if frame_steps:
+                    code_step_emitted = True
 
-                assistant_text = "".join(
-                    part["text"] for part in assistant_parts if part.get("type") == "text"
-                ).strip()
-                if assistant_text:
-                    message = store.add_message(
-                        context.session_id,
-                        "assistant",
-                        assistant_text,
-                        context.run_id,
-                    )
-                    emit(context.events, "message", message)
+                tracked_steps = _track_tool_frame(
+                    context=context,
+                    api_run_id=api_run_id,
+                    frame=frame,
+                    tracker=tool_tracker,
+                    emitted=emitted_files,
+                    emitted_payloads=emitted_payloads,
+                )
+                if tracked_steps:
+                    frame_steps.extend(tracked_steps)
+                    code_step_emitted = True
 
-                if not tool_calls:
-                    final_text = assistant_text or "(no response)"
-                    status = "success" if last_lean_check_ok else "failed"
-                    store.update_run(
-                        context.run_id,
-                        status,
-                        final_text=final_text,
-                        input_tokens=total_usage.input_tokens,
-                        output_tokens=total_usage.output_tokens,
-                    )
-                    store.touch_session(context.session_id, status)
-                    emit(
-                        context.events,
-                        "done",
-                        {
-                            "status": status,
-                            "input_tokens": total_usage.input_tokens,
-                            "output_tokens": total_usage.output_tokens,
-                        },
-                    )
-                    return
+                message = _status_message(frame)
+                if message:
+                    status_payload: dict[str, Any] = {"status": _event_type(frame) or "status"}
+                    if frame_steps:
+                        status_payload["step_number"] = frame_steps[-1]["step_number"]
+                    log_status(context, message, **status_payload)
 
-                tool_results: list[dict[str, Any]] = []
-                for tool_call in tool_calls:
-                    handler = lea["TOOL_HANDLERS"].get(tool_call["name"])
-                    if not handler:
-                        result = f"Error: unknown tool '{tool_call['name']}'"
-                    else:
-                        try:
-                            result = handler(tool_call["args"])
-                        except Exception as exc:
-                            result = (
-                                f"Error: tool '{tool_call['name']}' raised "
-                                f"{type(exc).__name__}: {exc}"
-                            )
+                frame_input_tokens, frame_output_tokens = _usage(frame)
+                input_tokens = frame_input_tokens if frame_input_tokens is not None else input_tokens
+                output_tokens = frame_output_tokens if frame_output_tokens is not None else output_tokens
 
-                    if tool_call["name"] == "lean_check":
-                        last_lean_check_ok = result.startswith("OK")
+                terminal_status = _terminal_status(frame)
+                if terminal_status is not None:
+                    final_text = _final_text(frame) or final_text
+                    transcript_url = _first_string(frame, "transcript_url") or transcript_url
+                    if terminal_status == "failed" and _event_type(frame) == "error":
+                        terminal_error = final_text or "Lea API reported an error."
+                    break
 
-                    _snapshot_if_lean_file(
-                        tool_name=tool_call["name"],
-                        args=tool_call["args"],
-                        result=result,
-                        context=context,
-                    )
+            if terminal_status is None:
+                terminal_run_status = client.get_run(api_run_id)
+                _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
+                terminal_status = _api_run_status_to_local(terminal_run_status.get("status"))
+                final_text = _final_text(terminal_run_status) or final_text
+                transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
+                if terminal_status is None:
+                    log_status(context, f"Resuming Lea API stream from seq {last_seq + 1}.", status="stream_resume")
 
-                    log_status(
-                        context,
-                        f"Turn {turn}: {tool_call['name']} returned {result[:120]}",
-                        status="tool_result",
-                        turn=turn,
-                        tool=tool_call["name"],
-                        preview=result[:500],
-                    )
+        if terminal_status is None:
+            terminal_status = "failed"
+            final_text = final_text or "Lea API stream ended before a terminal event."
 
-                    tool_result = {
-                        "type": "tool_result",
-                        "tool_name": tool_call["name"],
-                        "content": result,
-                    }
-                    if tool_call["id"]:
-                        tool_result["tool_use_id"] = tool_call["id"]
-                        tool_result["tool_call_id"] = tool_call["id"]
-                    tool_results.append(tool_result)
+        final_text = final_text or "".join(assistant_chunks).strip()
+        if api_run_id:
+            try:
+                terminal_run_status = client.get_run(api_run_id)
+                _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
+                transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
+            except Exception as status_exc:
+                log_status(
+                    context,
+                    f"Could not fetch final Lea API run status: {status_exc}",
+                    status="status_fetch_failed",
+                )
 
-                messages.append({"role": "user", "content": tool_results})
+            try:
+                terminal_transcript = client.get_transcript(api_run_id, transcript_url=transcript_url)
+                _log_api_frame(context, api_run_id, {"type": "transcript", "transcript": terminal_transcript})
+            except Exception as transcript_exc:
+                log_status(
+                    context,
+                    f"Could not fetch final Lea API transcript: {transcript_exc}",
+                    status="transcript_fetch_failed",
+                )
+
+        if _reconcile_terminal_artifacts(
+            context=context,
+            run_status=terminal_run_status,
+            transcript=terminal_transcript,
+            final_text=final_text,
+            emitted=emitted_files,
+            emitted_payloads=emitted_payloads,
+        ):
+            code_step_emitted = True
+
+        if terminal_status in {"success", "max_turns"} and not code_step_emitted:
+            _emit_terminal_no_code_step(context, api_run_id)
+
+        _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+        assistant_text = "".join(assistant_chunks).strip()
+        if not persisted_assistant_texts and not assistant_text and terminal_transcript is not None:
+            transcript_assistant_text = _assistant_text_from_transcript(terminal_transcript)
+            if transcript_assistant_text:
+                _emit_chat_message(context, "assistant", transcript_assistant_text)
+                persisted_assistant_texts.append(transcript_assistant_text)
+        terminal_notice = terminal_error or (final_text if terminal_status == "max_turns" else None)
+
+        if final_text and final_text not in persisted_assistant_texts:
+            _emit_chat_message(context, "system" if terminal_notice else "assistant", final_text)
+        if terminal_status == "failed":
+            emit(context.events, "error", {"message": terminal_error or final_text or "Lea API run failed."})
+
+        store.update_run(
+            context.run_id,
+            terminal_status,
+            final_text=final_text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        store.touch_session(context.session_id, terminal_status)
+        emit(
+            context.events,
+            "done",
+            {
+                "status": terminal_status,
+                "api_run_id": api_run_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+        )
     except Exception as exc:
+        if api_run_id and _is_timeout(exc):
+            try:
+                client.cancel_run(api_run_id)
+            except Exception as cancel_exc:
+                log_status(context, f"Failed to cancel Lea API run {api_run_id}: {cancel_exc}", status="cancel_failed")
+        elif api_run_id and isinstance(exc, LeaApiError):
+            try:
+                run_status = client.get_run(api_run_id)
+                mapped_status = _api_run_status_to_local(run_status.get("status"))
+                if mapped_status:
+                    final_text = _final_text(run_status) or str(exc)
+                    store.update_run(context.run_id, mapped_status, final_text=final_text)
+                    store.touch_session(context.session_id, mapped_status)
+                    emit(context.events, "error", {"message": final_text})
+                    emit(context.events, "done", {"status": mapped_status, "api_run_id": api_run_id})
+                    return
+            except Exception:
+                pass
+
         message = f"{type(exc).__name__}: {exc}"
         store.add_message(context.session_id, "system", message, context.run_id)
         store.update_run(context.run_id, "failed", final_text=message)
         store.touch_session(context.session_id, "failed")
         emit(context.events, "error", {"message": message})
-        emit(context.events, "done", {"status": "failed"})
+        emit(context.events, "done", {"status": "failed", "api_run_id": api_run_id})
     finally:
         active_run_lock.release()
