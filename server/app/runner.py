@@ -10,6 +10,7 @@ from queue import Queue
 from threading import Lock
 from typing import Any
 
+from . import settings as settings_service
 from . import store
 from .config import ROOT, LeaConfig
 from .lea_api_client import LeaApiClient, LeaApiError
@@ -834,6 +835,8 @@ def _api_run_status_to_local(status: str | None) -> str | None:
         return "success"
     if normalized in {"max_turns", "max-turns"}:
         return "max_turns"
+    if normalized in {"max_spend", "max-spend", "spend_limit", "spend-limit"}:
+        return "max_spend"
     if normalized in {"failed", "error", "cancelled", "canceled"}:
         return "failed"
     return None
@@ -977,12 +980,26 @@ def run_lea(context: RunnerContext) -> None:
                         output_tokens = (output_tokens or 0) + frame_output_tokens
                     if frame_cost_usd is not None:
                         cost_usd = (cost_usd or 0.0) + frame_cost_usd
+                    if settings_service.spend_limit_reached(context.config.max_spend_usd, cost_usd):
+                        terminal_status = "max_spend"
+                        final_text = "Max spend limit reached. Lea run was cancelled."
+                        log_status(context, final_text, status="max_spend", api_run_id=api_run_id)
+                        try:
+                            client.cancel_run(api_run_id)
+                        except Exception as cancel_exc:
+                            log_status(
+                                context,
+                                f"Failed to cancel Lea API run {api_run_id}: {cancel_exc}",
+                                status="cancel_failed",
+                            )
+                        break
                 else:
                     input_tokens = _merge_usage_total(input_tokens, frame_input_tokens)
                     output_tokens = _merge_usage_total(output_tokens, frame_output_tokens)
                     cost_usd = _merge_cost_total(cost_usd, frame_cost_usd)
 
-                terminal_status = _terminal_status(frame)
+                if terminal_status is None:
+                    terminal_status = _terminal_status(frame)
                 if terminal_status is not None:
                     final_text = _final_text(frame) or final_text
                     transcript_url = _first_string(frame, "transcript_url") or transcript_url
@@ -1056,7 +1073,7 @@ def run_lea(context: RunnerContext) -> None:
             if transcript_assistant_text:
                 _emit_chat_message(context, "assistant", transcript_assistant_text)
                 persisted_assistant_texts.append(transcript_assistant_text)
-        terminal_notice = terminal_error or (final_text if terminal_status == "max_turns" else None)
+        terminal_notice = terminal_error or (final_text if terminal_status in {"max_turns", "max_spend"} else None)
 
         if final_text and final_text not in persisted_assistant_texts:
             _emit_chat_message(context, "system" if terminal_notice else "assistant", final_text)

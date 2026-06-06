@@ -14,6 +14,7 @@ from .config import load_config
 from .db import init_db
 from .lea_api_client import LeaApiClient, LeaApiError
 from .runner import RunnerContext, run_lea
+from . import settings as settings_service
 from . import store
 
 
@@ -38,6 +39,19 @@ class ApprovalDecisionRequest(BaseModel):
     feedback: str | None = None
 
 
+class ApiKeyUpdateRequest(BaseModel):
+    value: str | None = None
+    clear: bool = False
+
+
+class SettingsRequest(BaseModel):
+    model: str | None = None
+    permission_tier: str | None = None
+    max_turns: int | None = None
+    max_spend_usd: float | None = None
+    api_keys: dict[str, ApiKeyUpdateRequest] | None = None
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -58,6 +72,21 @@ def stats() -> dict:
     return store.usage_stats()
 
 
+@app.get("/api/settings")
+def settings() -> dict:
+    return settings_service.settings_payload()
+
+
+@app.put("/api/settings")
+def update_settings(request: SettingsRequest) -> dict:
+    try:
+        return settings_service.update_settings(request.dict(exclude_unset=True))
+    except settings_service.SettingsValidationError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc), "field": exc.field}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @app.get("/api/sessions/{session_id}")
 def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)
@@ -73,6 +102,8 @@ def create_run(request: RunRequest) -> dict:
         raise HTTPException(status_code=400, detail="Message is required")
 
     config = load_config()
+    if settings_service.spend_limit_reached(config.max_spend_usd):
+        raise HTTPException(status_code=402, detail="Max spend limit has been reached.")
     if request.session_id:
         session = store.get_session(request.session_id)
         if not session:

@@ -50,6 +50,7 @@ def make_config(tmp_path, **overrides):
     return LeaConfig(
         model=overrides.get("model", "o4-mini"),
         max_turns=overrides.get("max_turns", 2),
+        max_spend_usd=overrides.get("max_spend_usd"),
         lea_api_base_url=overrides.get("lea_api_base_url", "http://127.0.0.1:8000"),
         lea_api_key=overrides.get("lea_api_key"),
         lea_root=overrides.get("lea_root", tmp_path / "lea"),
@@ -70,6 +71,29 @@ def make_context(tmp_path, client):
         events=Queue(),
         client=client,
     )
+
+
+def test_runner_cancels_when_max_spend_is_reached(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 10, "output_tokens": 5, "cost": 0.02},
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        status={"status": "cancelled"},
+    )
+    context = make_context(tmp_path, client)
+    context.config = make_config(tmp_path, max_spend_usd=0.01)
+
+    run_lea(context)
+
+    run = store.get_run(context.run_id)
+    events = drain_events(context.events)
+    assert client.cancelled == ["api-run-1"]
+    assert run["status"] == "max_spend"
+    assert run["final_text"] == "Max spend limit reached. Lea run was cancelled."
+    assert abs(run["cost_usd"] - 0.02) < 1e-9
+    assert events[-1]["payload"]["status"] == "max_spend"
 
 
 def drain_events(queue):

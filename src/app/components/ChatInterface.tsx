@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Send, Pause, Play, BarChart3, Loader2 } from 'lucide-react';
+import { Send, Pause, Play, BarChart3, Loader2, Settings } from 'lucide-react';
 import { ApprovalDecision, ChatMessage, CodeStep, PendingApproval, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -17,6 +17,7 @@ export function ChatInterface({
   onStepSelect,
   onTogglePause,
   onOpenStats,
+  onOpenSettings,
   onSubmitApproval,
   theoremName,
   currentStepIndex,
@@ -40,6 +41,7 @@ export function ChatInterface({
   onStepSelect: (stepIndex: number) => void;
   onTogglePause: () => void;
   onOpenStats: () => void;
+  onOpenSettings: () => void;
   theoremName: string;
   currentStepIndex: number;
   activeTimelineStepIndex: number | null;
@@ -121,7 +123,7 @@ export function ChatInterface({
   const terminalClass =
     sessionStatus === 'success'
       ? 'border border-green-500/30 bg-green-500/15 text-foreground'
-      : sessionStatus === 'failed' || sessionStatus === 'max_turns'
+      : sessionStatus === 'failed' || sessionStatus === 'max_turns' || sessionStatus === 'max_spend'
       ? 'border border-destructive/30 bg-destructive/10 text-foreground'
       : 'bg-muted text-muted-foreground';
 
@@ -166,6 +168,16 @@ export function ChatInterface({
           >
             <BarChart3 className="w-4 h-4" />
             Statistics
+          </button>
+          <button
+            onClick={onOpenSettings}
+            className={[
+              'flex items-center gap-2 rounded-md bg-secondary px-3 py-2',
+              'text-secondary-foreground transition-opacity hover:opacity-90',
+            ].join(' ')}
+          >
+            <Settings className="w-4 h-4" />
+            Settings
           </button>
         </div>
       </div>

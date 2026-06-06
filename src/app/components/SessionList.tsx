@@ -18,6 +18,7 @@ export function SessionList({
         return <CheckCircle className="w-4 h-4 text-green-600" />;
       case 'failed':
       case 'max_turns':
+      case 'max_spend':
         return <XCircle className="w-4 h-4 text-destructive" />;
       case 'running':
         return <Circle className="w-4 h-4 text-muted-foreground animate-pulse" />;
@@ -73,4 +74,3 @@ export function SessionList({
     </div>
   );
 }
-

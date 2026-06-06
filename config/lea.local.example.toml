@@ -9,6 +9,7 @@ lea_api_base_url = "http://127.0.0.1:8000"
 
 model = "gemini/gemini-3.1-pro-preview"
 max_turns = 20
+max_spend_usd = 25.0
 lea_job_timeout_seconds = 900
 lea_root = "external/lea-prover"
 narrate_tool_steps = true

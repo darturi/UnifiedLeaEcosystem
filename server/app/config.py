@@ -14,6 +14,7 @@ class LeaConfig:
     model: str
     max_turns: int | None
     lea_api_base_url: str
+    max_spend_usd: float | None = None
     lea_api_key: str | None = None
     lea_root: Path | None = None
     lea_job_timeout_seconds: int = 900
@@ -46,12 +47,18 @@ def load_config(path: Path | None = None) -> LeaConfig:
     permission_tier = data.get("permission_tier", "none")
     if not isinstance(permission_tier, str):
         raise ValueError("permission_tier must be a string")
-    if permission_tier not in {"none", "theorem_translation"}:
-        raise ValueError("permission_tier must be one of: none, theorem_translation")
+    if permission_tier not in {"none", "theorem_translation", "stepwise"}:
+        raise ValueError("permission_tier must be one of: none, theorem_translation, stepwise")
+    max_spend_usd = data.get("max_spend_usd")
+    if max_spend_usd is not None:
+        max_spend_usd = float(max_spend_usd)
+        if max_spend_usd < 0:
+            raise ValueError("max_spend_usd must be greater than or equal to 0")
 
     return LeaConfig(
         model=data.get("model", "gemini/gemini-3.1-pro-preview"),
         max_turns=int(max_turns) if max_turns is not None else None,
+        max_spend_usd=max_spend_usd,
         lea_api_base_url=_normalize_base_url(data.get("lea_api_base_url", "http://127.0.0.1:8000")),
         lea_api_key=data.get("lea_api_key"),
         lea_root=resolved_lea_root,

@@ -1,5 +1,6 @@
-export type SessionStatus = 'running' | 'success' | 'failed' | 'max_turns';
+export type SessionStatus = 'running' | 'success' | 'failed' | 'max_turns' | 'max_spend';
 export type ApprovalDecision = 'accept' | 'reject';
+export type PermissionTier = 'none' | 'theorem_translation' | 'stepwise';
 
 export interface PendingApproval {
   type: 'approval_requested';
@@ -136,6 +137,36 @@ export interface UsageStats {
   models: UsageModelStats[];
 }
 
+export interface ModelOption {
+  value: string;
+  label: string;
+  family: 'openai' | 'anthropic' | 'google' | string;
+}
+
+export interface ApiKeyStatus {
+  configured: boolean;
+  last4?: string | null;
+}
+
+export interface AppSettings {
+  model: string;
+  permission_tier: PermissionTier;
+  max_turns?: number | null;
+  max_spend_usd?: number | null;
+  current_spend_usd: number;
+  api_keys: Record<'openai' | 'anthropic' | 'google', ApiKeyStatus>;
+  model_options: ModelOption[];
+  permission_tiers: { value: PermissionTier; label: string }[];
+}
+
+export interface SettingsUpdate {
+  model?: string;
+  permission_tier?: PermissionTier;
+  max_turns?: number | null;
+  max_spend_usd?: number | null;
+  api_keys?: Partial<Record<'openai' | 'anthropic' | 'google', { value?: string; clear?: boolean }>>;
+}
+
 export async function listSessions(): Promise<SessionSummary[]> {
   const response = await fetch('/api/sessions');
   if (!response.ok) {
@@ -157,6 +188,35 @@ export async function getUsageStats(): Promise<UsageStats> {
   const response = await fetch('/api/stats');
   if (!response.ok) {
     throw new Error(`Failed to load statistics: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  const response = await fetch('/api/settings');
+  if (!response.ok) {
+    throw new Error(`Failed to load settings: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function saveSettings(update: SettingsUpdate): Promise<AppSettings> {
+  const response = await fetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    const message =
+      typeof detail.detail === 'string'
+        ? detail.detail
+        : detail.detail?.message || `Failed to save settings: ${response.statusText}`;
+    const error = new Error(message);
+    if (detail.detail?.field) {
+      (error as Error & { field?: string }).field = detail.detail.field;
+    }
+    throw error;
   }
   return response.json();
 }

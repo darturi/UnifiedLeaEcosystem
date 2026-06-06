@@ -70,6 +70,26 @@ def test_stats_endpoint_returns_usage_rollups(tmp_path, monkeypatch):
     assert body["models"][0]["cost_usd"] == 0.03
 
 
+def test_run_endpoint_blocks_when_max_spend_reached(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(
+            model="o4-mini",
+            max_turns=2,
+            max_spend_usd=0,
+            lea_api_base_url="http://127.0.0.1:8000",
+        ),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main.create_run(main.RunRequest(message="prove True"))
+
+    assert exc.value.status_code == 402
+
+
 def test_approval_endpoint_forwards_decision_to_upstream_run(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

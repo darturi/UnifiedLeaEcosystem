@@ -4,6 +4,7 @@ import { SessionList } from './components/SessionList';
 import { ChatInterface } from './components/ChatInterface';
 import { CodeViewer } from './components/CodeViewer';
 import { StatsPage } from './components/StatsPage';
+import { SettingsPage } from './components/SettingsPage';
 import { timelineStepCount } from './stepTimeline.mjs';
 import {
   ChatMessage,
@@ -34,7 +35,7 @@ export default function App() {
   const [approvalError, setApprovalError] = useState<string>();
   const [error, setError] = useState<string>();
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
-  const [view, setView] = useState<'main' | 'stats'>('main');
+  const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
   const eventSourceRef = useRef<EventSource | null>(null);
   const codeStepCountRef = useRef(0);
   const activeTimelineStepIndexRef = useRef<number | null>(null);
@@ -368,6 +369,9 @@ export default function App() {
   if (view === 'stats') {
     return <StatsPage onBack={() => setView('main')} />;
   }
+  if (view === 'settings') {
+    return <SettingsPage onBack={() => setView('main')} />;
+  }
 
   return (
     <div className="size-full">
@@ -411,6 +415,7 @@ export default function App() {
             onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}
             onOpenStats={() => setView('stats')}
+            onOpenSettings={() => setView('settings')}
             theoremName={title}
             currentStepIndex={currentStepIndex}
             activeTimelineStepIndex={activeTimelineStepIndex}
