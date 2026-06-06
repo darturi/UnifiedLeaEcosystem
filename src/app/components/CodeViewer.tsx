@@ -5,22 +5,48 @@ import { diffForStep } from '../codeDiff';
 
 export function CodeViewer({
   codeSteps,
+  timelineStepCount,
   isPaused,
+  isRunning,
   currentStepIndex,
   onStepChange,
 }: {
   codeSteps: CodeStep[];
+  timelineStepCount: number;
   isPaused: boolean;
+  isRunning: boolean;
   currentStepIndex: number;
   onStepChange: (index: number) => void;
 }) {
-  const safeIndex = Math.min(Math.max(currentStepIndex, 0), Math.max(codeSteps.length - 1, 0));
-  const currentStep = codeSteps[safeIndex];
-  const canNavigate = codeSteps.length > 1;
+  const totalSteps = Math.max(timelineStepCount, codeSteps.length);
+  const safeIndex = Math.min(Math.max(currentStepIndex, 0), Math.max(totalSteps - 1, 0));
+  const exactCodeStep = codeSteps.find((step) => step.step_number === safeIndex + 1);
+  const currentStep =
+    exactCodeStep ||
+    [...codeSteps].reverse().find((step) => step.step_number <= safeIndex + 1);
+  const currentCodeStepIndex = currentStep
+    ? codeSteps.findIndex((step) => step.id === currentStep.id)
+    : -1;
+  const hasCodeChangeForTimelineStep = !!exactCodeStep;
+  const canNavigate = totalSteps > 1;
 
   const diffedLines = useMemo(() => {
-    return diffForStep(codeSteps, safeIndex);
-  }, [codeSteps, safeIndex]);
+    if (!currentStep) {
+      return [];
+    }
+    if (!hasCodeChangeForTimelineStep) {
+      return currentStep.code
+        .split('\n')
+        .filter((_, index, lines) => !(index === lines.length - 1 && lines[index] === ''))
+        .map((line, index) => ({
+          kind: 'unchanged' as const,
+          line,
+          oldLineNumber: index + 1,
+          newLineNumber: index + 1,
+        }));
+    }
+    return diffForStep(codeSteps, currentCodeStepIndex);
+  }, [codeSteps, currentStep, currentCodeStepIndex, hasCodeChangeForTimelineStep]);
 
   const handlePrevious = () => {
     if (safeIndex > 0) {
@@ -29,7 +55,7 @@ export function CodeViewer({
   };
 
   const handleNext = () => {
-    if (safeIndex < codeSteps.length - 1) {
+    if (safeIndex < totalSteps - 1) {
       onStepChange(safeIndex + 1);
     }
   };
@@ -49,11 +75,11 @@ export function CodeViewer({
                 <ChevronLeft className="w-5 h-5" />
               </button>
               <span className="text-sm text-muted-foreground whitespace-nowrap">
-                Step {safeIndex + 1} of {codeSteps.length}
+                Step {safeIndex + 1} of {totalSteps}
               </span>
               <button
                 onClick={handleNext}
-                disabled={safeIndex === codeSteps.length - 1}
+                disabled={safeIndex === totalSteps - 1}
                 className="p-1 rounded hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <ChevronRight className="w-5 h-5" />
@@ -72,6 +98,11 @@ export function CodeViewer({
                 {currentStep.summary}
               </p>
             )}
+            {currentStep && !hasCodeChangeForTimelineStep && (
+              <p className="text-xs text-muted-foreground">
+                No Lean file changes were captured for this step; showing the latest available snapshot.
+              </p>
+            )}
           </div>
         )}
       </div>
@@ -83,9 +114,11 @@ export function CodeViewer({
           </div>
         ) : (
           <div className="space-y-3">
-            {currentStep.kind === 'no_code' && (
+            {(currentStep.kind === 'no_code' || !hasCodeChangeForTimelineStep) && (
               <div className="rounded-md border border-border bg-accent px-3 py-2 text-sm text-accent-foreground">
-                {currentStep.summary || 'No Lean file changes in this step.'}
+                {currentStep.kind === 'no_code'
+                  ? currentStep.summary || 'No Lean file changes in this step.'
+                  : 'No Lean file changes in this step.'}
               </div>
             )}
             {diffedLines.length === 0 ? (
@@ -122,10 +155,12 @@ export function CodeViewer({
         )}
       </div>
 
-      {!isPaused && currentStep && safeIndex === codeSteps.length - 1 && (
+      {!isPaused && currentStep && safeIndex === totalSteps - 1 && (
         <div className="p-4 border-t border-border bg-accent">
           <p className="text-sm text-accent-foreground">
-            Showing latest code. Use the arrows to review earlier edits.
+            {isRunning
+              ? 'Lea is still working. Use the arrows to review available steps.'
+              : 'Showing latest code. Use the arrows to review earlier steps.'}
           </p>
         </div>
       )}

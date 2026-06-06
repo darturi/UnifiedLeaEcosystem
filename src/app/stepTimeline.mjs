@@ -120,3 +120,13 @@ export function buildStepTimeline({ messages, codeSteps, statusEvents, terminalM
 export function codeStepFallbackContent(step) {
   return fallbackSummaryForCodeStep(step);
 }
+
+export function timelineStepCount({ messages, codeSteps, terminalMessageId }) {
+  let assistantStepCount = 0;
+  for (const message of messages) {
+    if (isAssistantStepMessage(message, terminalMessageId)) {
+      assistantStepCount += 1;
+    }
+  }
+  return Math.max(assistantStepCount, codeSteps.length);
+}

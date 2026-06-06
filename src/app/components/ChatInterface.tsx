@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Send, Pause, Play, BarChart3 } from 'lucide-react';
+import { Send, Pause, Play, BarChart3, Loader2 } from 'lucide-react';
 import { ChatMessage, CodeStep, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -18,7 +18,6 @@ export function ChatInterface({
   theoremName,
   currentStepIndex,
   activeTimelineStepIndex,
-  codeStepCount,
 }: {
   error?: string;
   isPaused: boolean;
@@ -33,7 +32,6 @@ export function ChatInterface({
   theoremName: string;
   currentStepIndex: number;
   activeTimelineStepIndex: number | null;
-  codeStepCount: number;
 }) {
   const [input, setInput] = useState('');
   const [showStats, setShowStats] = useState(false);
@@ -57,7 +55,6 @@ export function ChatInterface({
       }),
     [messages, codeSteps, statusEvents, terminalMessageId],
   );
-  const canSelectCompletedSteps = !isRunning && !!sessionStatus && sessionStatus !== 'running';
   const highlightedStepIndex =
     isRunning && activeTimelineStepIndex !== null
       ? activeTimelineStepIndex
@@ -121,7 +118,15 @@ export function ChatInterface({
   return (
     <div className="flex flex-col h-full bg-background">
       <div className="p-4 border-b border-border flex items-center justify-between gap-3">
-        <h2 className="text-foreground truncate">{theoremName}</h2>
+        <div className="min-w-0 flex items-center gap-3">
+          <h2 className="truncate text-foreground">{theoremName}</h2>
+          {isRunning && (
+            <div className="flex shrink-0 items-center gap-2 rounded-md bg-accent px-2 py-1 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Lea is working
+            </div>
+          )}
+        </div>
         <div className="flex items-center gap-2">
           <button
             onClick={onTogglePause}
@@ -211,7 +216,7 @@ export function ChatInterface({
           const stepIndex = item.stepIndex;
           const step = item.codeStep;
           const message = item.message;
-          const isSelectableStep = canSelectCompletedSteps && stepIndex < codeStepCount;
+          const isSelectableStep = stepIndex < timeline.stepItems.length;
           const isActiveStep = stepIndex === highlightedStepIndex;
           const activeStepClass = isActiveStep
             ? 'ring-2 ring-foreground ring-offset-2 ring-offset-background bg-muted/80'
@@ -238,7 +243,10 @@ export function ChatInterface({
                   }}
                 >
                   <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-foreground/70">
-                    Step {item.stepNumber}
+                    <span>Step {item.stepNumber}</span>
+                    {isRunning && isActiveStep && (
+                      <Loader2 className="ml-2 inline h-3.5 w-3.5 animate-spin align-[-2px]" />
+                    )}
                   </div>
                   <MarkdownMessage content={content} />
                   <p className="text-xs opacity-70 mt-2">

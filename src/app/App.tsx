@@ -3,6 +3,7 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { SessionList } from './components/SessionList';
 import { ChatInterface } from './components/ChatInterface';
 import { CodeViewer } from './components/CodeViewer';
+import { timelineStepCount } from './stepTimeline.mjs';
 import {
   ChatMessage,
   CodeStep,
@@ -33,6 +34,27 @@ export default function App() {
     setActiveTimelineStepIndex(stepIndex);
   };
 
+  const terminalMessageIdForDetail = (
+    detail: { messages: ChatMessage[]; status?: string },
+  ) => {
+    if (!detail.status || detail.status === 'running') {
+      return null;
+    }
+    const terminalMessage = [...detail.messages]
+      .reverse()
+      .find((message) => message.role === 'assistant' || message.role === 'system');
+    return terminalMessage?.id ?? null;
+  };
+
+  const lastTimelineStepIndex = (detail: { messages: ChatMessage[]; code_steps: CodeStep[]; status?: string }) => {
+    const count = timelineStepCount({
+      messages: detail.messages,
+      codeSteps: detail.code_steps,
+      terminalMessageId: terminalMessageIdForDetail(detail),
+    });
+    return Math.max(0, count - 1);
+  };
+
   const refreshSessions = async () => {
     const loaded = await listSessions();
     setSessions(loaded);
@@ -53,7 +75,7 @@ export default function App() {
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
     codeStepCountRef.current = detail.code_steps.length;
-    setCurrentStepIndex(Math.max(0, detail.code_steps.length - 1));
+    setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
   };
 
@@ -64,7 +86,7 @@ export default function App() {
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
     codeStepCountRef.current = detail.code_steps.length;
-    setCurrentStepIndex(Math.max(0, detail.code_steps.length - 1));
+    setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
   };
 
@@ -74,6 +96,24 @@ export default function App() {
   );
 
   const title = selectedSession?.title || 'New theorem session';
+  const selectedTerminalMessageId = useMemo(() => {
+    if (isRunning || !selectedSession?.status || selectedSession.status === 'running') {
+      return null;
+    }
+    const terminalMessage = [...messages]
+      .reverse()
+      .find((message) => message.role === 'assistant' || message.role === 'system');
+    return terminalMessage?.id ?? null;
+  }, [isRunning, messages, selectedSession?.status]);
+  const currentTimelineStepCount = useMemo(
+    () =>
+      timelineStepCount({
+        messages,
+        codeSteps,
+        terminalMessageId: selectedTerminalMessageId,
+      }),
+    [messages, codeSteps, selectedTerminalMessageId],
+  );
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((current) => {
@@ -185,7 +225,7 @@ export default function App() {
           }
           const next = [...current, payload];
           codeStepCountRef.current = next.length;
-          setCurrentStepIndex(next.length - 1);
+          setCurrentStepIndex(payload.step_number - 1);
           setActiveTimelineStep(payload.step_number - 1);
           return next;
         });
@@ -289,7 +329,6 @@ export default function App() {
             theoremName={title}
             currentStepIndex={currentStepIndex}
             activeTimelineStepIndex={activeTimelineStepIndex}
-            codeStepCount={codeSteps.length}
           />
         </Panel>
 
@@ -298,7 +337,12 @@ export default function App() {
         <Panel defaultSize={30} minSize={20} maxSize={50}>
           <CodeViewer
             codeSteps={codeSteps}
+            timelineStepCount={Math.max(
+              currentTimelineStepCount,
+              activeTimelineStepIndex === null ? 0 : activeTimelineStepIndex + 1,
+            )}
             isPaused={isPaused}
+            isRunning={isRunning}
             currentStepIndex={currentStepIndex}
             onStepChange={setCurrentStepIndex}
           />
