@@ -3,6 +3,7 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import { SessionList } from './components/SessionList';
 import { ChatInterface } from './components/ChatInterface';
 import { CodeViewer } from './components/CodeViewer';
+import { StatsPage } from './components/StatsPage';
 import { timelineStepCount } from './stepTimeline.mjs';
 import {
   ChatMessage,
@@ -25,6 +26,7 @@ export default function App() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string>();
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
+  const [view, setView] = useState<'main' | 'stats'>('main');
   const eventSourceRef = useRef<EventSource | null>(null);
   const codeStepCountRef = useRef(0);
   const activeTimelineStepIndexRef = useRef<number | null>(null);
@@ -291,6 +293,10 @@ export default function App() {
     }
   };
 
+  if (view === 'stats') {
+    return <StatsPage onBack={() => setView('main')} />;
+  }
+
   return (
     <div className="size-full">
       <PanelGroup direction="horizontal">
@@ -326,6 +332,7 @@ export default function App() {
             onSubmit={handleSubmit}
             onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}
+            onOpenStats={() => setView('stats')}
             theoremName={title}
             currentStepIndex={currentStepIndex}
             activeTimelineStepIndex={activeTimelineStepIndex}

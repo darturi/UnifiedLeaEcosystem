@@ -290,6 +290,17 @@ def _usage(frame: dict[str, Any]) -> tuple[int | None, int | None]:
     return None, None
 
 
+def _cost(frame: dict[str, Any]) -> float | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("cost")
+        if isinstance(value, int | float):
+            return float(value)
+        value = candidate.get("cost_usd")
+        if isinstance(value, int | float):
+            return float(value)
+    return None
+
+
 def _seq(frame: dict[str, Any]) -> int | None:
     for candidate in _walk_dicts(frame):
         value = candidate.get("seq")
@@ -721,6 +732,7 @@ def run_lea(context: RunnerContext) -> None:
     terminal_error: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cost_usd: float | None = None
     code_step_emitted = False
     terminal_run_status: dict[str, Any] | None = None
     terminal_transcript: Any = None
@@ -795,8 +807,18 @@ def run_lea(context: RunnerContext) -> None:
                     log_status(context, message, **status_payload)
 
                 frame_input_tokens, frame_output_tokens = _usage(frame)
-                input_tokens = frame_input_tokens if frame_input_tokens is not None else input_tokens
-                output_tokens = frame_output_tokens if frame_output_tokens is not None else output_tokens
+                frame_cost_usd = _cost(frame)
+                if frame_type == "usage_updated":
+                    if frame_input_tokens is not None:
+                        input_tokens = (input_tokens or 0) + frame_input_tokens
+                    if frame_output_tokens is not None:
+                        output_tokens = (output_tokens or 0) + frame_output_tokens
+                    if frame_cost_usd is not None:
+                        cost_usd = (cost_usd or 0.0) + frame_cost_usd
+                else:
+                    input_tokens = frame_input_tokens if frame_input_tokens is not None else input_tokens
+                    output_tokens = frame_output_tokens if frame_output_tokens is not None else output_tokens
+                    cost_usd = frame_cost_usd if frame_cost_usd is not None else cost_usd
 
                 terminal_status = _terminal_status(frame)
                 if terminal_status is not None:
@@ -810,6 +832,11 @@ def run_lea(context: RunnerContext) -> None:
                 terminal_run_status = client.get_run(api_run_id)
                 _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
                 terminal_status = _api_run_status_to_local(terminal_run_status.get("status"))
+                status_input_tokens, status_output_tokens = _usage(terminal_run_status)
+                input_tokens = status_input_tokens if status_input_tokens is not None else input_tokens
+                output_tokens = status_output_tokens if status_output_tokens is not None else output_tokens
+                status_cost_usd = _cost(terminal_run_status)
+                cost_usd = status_cost_usd if status_cost_usd is not None else cost_usd
                 final_text = _final_text(terminal_run_status) or final_text
                 transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
                 if terminal_status is None:
@@ -824,6 +851,11 @@ def run_lea(context: RunnerContext) -> None:
             try:
                 terminal_run_status = client.get_run(api_run_id)
                 _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
+                status_input_tokens, status_output_tokens = _usage(terminal_run_status)
+                input_tokens = status_input_tokens if status_input_tokens is not None else input_tokens
+                output_tokens = status_output_tokens if status_output_tokens is not None else output_tokens
+                status_cost_usd = _cost(terminal_run_status)
+                cost_usd = status_cost_usd if status_cost_usd is not None else cost_usd
                 transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
             except Exception as status_exc:
                 log_status(
@@ -875,6 +907,7 @@ def run_lea(context: RunnerContext) -> None:
             final_text=final_text,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cost_usd=cost_usd,
         )
         store.touch_session(context.session_id, terminal_status)
         emit(
@@ -885,6 +918,7 @@ def run_lea(context: RunnerContext) -> None:
                 "api_run_id": api_run_id,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
             },
         )
     except Exception as exc:
@@ -899,7 +933,16 @@ def run_lea(context: RunnerContext) -> None:
                 mapped_status = _api_run_status_to_local(run_status.get("status"))
                 if mapped_status:
                     final_text = _final_text(run_status) or str(exc)
-                    store.update_run(context.run_id, mapped_status, final_text=final_text)
+                    status_input_tokens, status_output_tokens = _usage(run_status)
+                    status_cost_usd = _cost(run_status)
+                    store.update_run(
+                        context.run_id,
+                        mapped_status,
+                        final_text=final_text,
+                        input_tokens=status_input_tokens,
+                        output_tokens=status_output_tokens,
+                        cost_usd=status_cost_usd,
+                    )
                     store.touch_session(context.session_id, mapped_status)
                     emit(context.events, "error", {"message": final_text})
                     emit(context.events, "done", {"status": mapped_status, "api_run_id": api_run_id})

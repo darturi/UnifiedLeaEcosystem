@@ -97,6 +97,13 @@ def init_db() -> None:
         if "turn" not in columns:
             conn.execute("alter table code_steps add column turn integer")
 
+        run_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(runs)").fetchall()
+        }
+        if "cost_usd" not in run_columns:
+            conn.execute("alter table runs add column cost_usd real not null default 0")
+
 
 def row_to_dict(row: sqlite3.Row) -> dict:
     return {key: row[key] for key in row.keys()}

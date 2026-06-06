@@ -6,6 +6,17 @@ export interface SessionSummary {
   status: SessionStatus;
   created_at: string;
   updated_at: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  message_count: number;
+  run_count: number;
+  models: string[];
+  primary_model?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  duration_seconds: number;
 }
 
 export interface ChatMessage {
@@ -49,6 +60,47 @@ export interface SessionDetail extends SessionSummary {
   status_events: StatusEvent[];
 }
 
+export interface UsageSessionSummary extends SessionSummary {}
+
+export interface UsageGlobalStats {
+  session_count: number;
+  message_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  average_tokens_per_session: number;
+  average_cost_per_session: number;
+  average_messages_per_session: number;
+}
+
+export interface UsageDailyPoint {
+  day: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  run_count: number;
+  session_count: number;
+}
+
+export interface UsageModelStats {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  run_count: number;
+  session_count: number;
+}
+
+export interface UsageStats {
+  sessions: UsageSessionSummary[];
+  global: UsageGlobalStats;
+  daily: UsageDailyPoint[];
+  models: UsageModelStats[];
+}
+
 export async function listSessions(): Promise<SessionSummary[]> {
   const response = await fetch('/api/sessions');
   if (!response.ok) {
@@ -62,6 +114,14 @@ export async function getSession(sessionId: string): Promise<SessionDetail> {
   const response = await fetch(`/api/sessions/${sessionId}`);
   if (!response.ok) {
     throw new Error(`Failed to load session: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function getUsageStats(): Promise<UsageStats> {
+  const response = await fetch('/api/stats');
+  if (!response.ok) {
+    throw new Error(`Failed to load statistics: ${response.statusText}`);
   }
   return response.json();
 }

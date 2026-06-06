@@ -50,6 +50,23 @@ def test_run_endpoint_streams_react_compatible_events(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["path"] == "workspace/proofs/demo.lean"
 
 
+def test_stats_endpoint_returns_usage_rollups(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    session = store.create_session("stats endpoint")
+    run = store.create_run(session["id"], "o4-mini", None, 2)
+    store.add_message(session["id"], "user", "prove True", run["id"])
+    store.update_run(run["id"], "success", input_tokens=50, output_tokens=20, cost_usd=0.03)
+
+    body = main.stats()
+
+    assert body["global"]["session_count"] == 1
+    assert body["global"]["total_tokens"] == 70
+    assert body["sessions"][0]["primary_model"] == "o4-mini"
+    assert body["models"][0]["cost_usd"] == 0.03
+
+
 async def _read_stream(iterator):
     chunks = []
     async for chunk in iterator:

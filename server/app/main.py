@@ -47,6 +47,11 @@ def sessions() -> dict:
     return {"sessions": store.list_sessions()}
 
 
+@app.get("/api/stats")
+def stats() -> dict:
+    return store.usage_stats()
+
+
 @app.get("/api/sessions/{session_id}")
 def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)

@@ -15,6 +15,7 @@ export function ChatInterface({
   onSubmit,
   onStepSelect,
   onTogglePause,
+  onOpenStats,
   theoremName,
   currentStepIndex,
   activeTimelineStepIndex,
@@ -29,12 +30,12 @@ export function ChatInterface({
   onSubmit: (content: string) => Promise<boolean>;
   onStepSelect: (stepIndex: number) => void;
   onTogglePause: () => void;
+  onOpenStats: () => void;
   theoremName: string;
   currentStepIndex: number;
   activeTimelineStepIndex: number | null;
 }) {
   const [input, setInput] = useState('');
-  const [showStats, setShowStats] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const terminalMessageId = useMemo(() => {
     if (isRunning || !sessionStatus || sessionStatus === 'running') {
@@ -148,7 +149,7 @@ export function ChatInterface({
             )}
           </button>
           <button
-            onClick={() => setShowStats(!showStats)}
+            onClick={onOpenStats}
             className={[
               'flex items-center gap-2 rounded-md bg-secondary px-3 py-2',
               'text-secondary-foreground transition-opacity hover:opacity-90',
@@ -280,12 +281,6 @@ export function ChatInterface({
         {isSubmitting && !isRunning && (
           <div className="text-sm text-muted-foreground">
             Submitting to Lea...
-          </div>
-        )}
-
-        {showStats && (
-          <div className="rounded-md bg-accent p-3 text-sm text-accent-foreground">
-            Statistics are decorative in this version.
           </div>
         )}
 

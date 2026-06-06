@@ -228,6 +228,51 @@ def test_api_text_events_emit_assistant_delta_and_final_message(tmp_path, monkey
     assert events[-1]["payload"]["status"] == "success"
 
 
+def test_usage_updated_events_accumulate_tokens_and_cost(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 100, "output_tokens": 40, "cost": 0.003},
+            {"seq": 1, "type": "usage_updated", "input_tokens": 25, "output_tokens": 10, "cost": 0.001},
+            {"seq": 2, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        status={"status": "completed"},
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    run = store.get_run(context.run_id)
+    events = drain_events(context.events)
+    assert run["input_tokens"] == 125
+    assert run["output_tokens"] == 50
+    assert abs(run["cost_usd"] - 0.004) < 1e-9
+    assert events[-1]["payload"]["cost_usd"] == 0.004
+
+
+def test_terminal_run_status_cost_overrides_partial_usage(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 10, "output_tokens": 5, "cost": 0.001},
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ],
+        status={
+            "status": "completed",
+            "usage": {"input_tokens": 80, "output_tokens": 20},
+            "cost": 0.012,
+        },
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    run = store.get_run(context.run_id)
+    assert run["input_tokens"] == 80
+    assert run["output_tokens"] == 20
+    assert abs(run["cost_usd"] - 0.012) < 1e-9
+
+
 def test_assistant_text_delta_events_emit_assistant_delta_and_final_message(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     client = FakeLeaApiClient(
