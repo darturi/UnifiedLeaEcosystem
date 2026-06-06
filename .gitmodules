@@ -1,4 +1,4 @@
 [submodule "external/lea-prover"]
 	path = external/lea-prover
-	url = https://github.com/shaswatpatel123/lea-prover.git
+	url = https://github.com/darturi/lea-prover.git
 	branch = lea_api
