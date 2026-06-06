@@ -36,6 +36,7 @@ def make_config(**overrides):
         lea_root=overrides.get("lea_root"),
         lea_job_timeout_seconds=overrides.get("lea_job_timeout_seconds", 900),
         narrate_tool_steps=overrides.get("narrate_tool_steps", False),
+        permission_tier=overrides.get("permission_tier", "none"),
     )
 
 
@@ -60,7 +61,7 @@ def test_start_run_posts_task_config_and_bearer_auth():
     assert seen["body"] == {
         "task": "prove True",
         "config": {
-            "agent": {"max_turns": 5, "narrate_tool_steps": False},
+            "agent": {"max_turns": 5, "narrate_tool_steps": False, "permission_tier": "none"},
             "model": {"name": "o4-mini"},
         },
     }
@@ -75,7 +76,25 @@ def test_start_run_sends_narration_flag_even_without_max_turns():
 
     LeaApiClient(make_config(max_turns=None, narrate_tool_steps=True), transport=transport).start_run("task")
 
-    assert seen["body"]["config"]["agent"] == {"narrate_tool_steps": True}
+    assert seen["body"]["config"]["agent"] == {
+        "narrate_tool_steps": True,
+        "permission_tier": "none",
+    }
+
+
+def test_start_run_sends_permission_tier():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"run_id": "api-1"}).encode("utf-8"))
+
+    LeaApiClient(
+        make_config(permission_tier="theorem_translation"),
+        transport=transport,
+    ).start_run("task")
+
+    assert seen["body"]["config"]["agent"]["permission_tier"] == "theorem_translation"
 
 
 def test_start_run_omits_bearer_auth_when_key_missing():
@@ -134,6 +153,45 @@ def test_cancel_run_posts_cancel_endpoint():
     assert seen == {
         "url": "http://lea-api.test/v1/runs/api-1/cancel",
         "method": "POST",
+    }
+
+
+def test_resolve_approval_posts_accept_decision():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["method"] = request.get_method()
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+    result = LeaApiClient(make_config(), transport=transport).resolve_approval("api-1", "ap-1", "accept")
+
+    assert result == {"ok": True}
+    assert seen == {
+        "url": "http://lea-api.test/v1/runs/api-1/approvals/ap-1",
+        "method": "POST",
+        "body": {"decision": "accept"},
+    }
+
+
+def test_resolve_approval_posts_reject_feedback():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+    LeaApiClient(make_config(), transport=transport).resolve_approval(
+        "api-1",
+        "ap-1",
+        "reject",
+        "quantify over naturals",
+    )
+
+    assert seen["body"] == {
+        "decision": "reject",
+        "feedback": "quantify over naturals",
     }
 
 

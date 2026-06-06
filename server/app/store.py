@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
-from .db import connect, row_to_dict, utc_now
+from typing import Any
+
+from .db import ROOT, connect, row_to_dict, utc_now
+
+
+RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
 
 
 def create_session(title: str) -> dict:
@@ -112,10 +118,29 @@ def update_run(
         )
 
 
+def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update runs set api_run_id = ?, updated_at = ? where id = ?",
+            (api_run_id, now, run_id),
+        )
+
+
+def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None:
+    now = utc_now()
+    value = json.dumps(pending_approval) if pending_approval is not None else None
+    with connect() as conn:
+        conn.execute(
+            "update runs set pending_approval = ?, updated_at = ? where id = ?",
+            (value, now, run_id),
+        )
+
+
 def get_run(run_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
-    return row_to_dict(row) if row else None
+    return _normalize_run(row_to_dict(row)) if row else None
 
 
 def add_message(session_id: str, role: str, content: str, run_id: str | None = None) -> dict:
@@ -184,6 +209,68 @@ def add_status_event(
     return row_to_dict(row)
 
 
+def replace_run_usage_breakdown(run_id: str, rows: list[dict[str, Any]]) -> None:
+    now = utc_now()
+    with connect() as conn:
+        run = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+        if not run:
+            return
+        run_dict = row_to_dict(run)
+        session_id = str(run_dict["session_id"])
+        run_ids = [
+            str(row["id"])
+            for row in conn.execute(
+                "select id from runs where session_id = ? order by created_at asc, id asc",
+                (session_id,),
+            ).fetchall()
+        ]
+        run_number = run_ids.index(run_id) + 1 if run_id in run_ids else 1
+        conn.execute("delete from run_usage_breakdown where run_id = ?", (run_id,))
+        for index, row in enumerate(rows, start=1):
+            conn.execute(
+                """
+                insert into run_usage_breakdown (
+                    id, session_id, run_id, run_number, ordinal, phase, label, turn, candidate,
+                    input_tokens, output_tokens, cost_usd, event_count, created_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row.get("id") or uuid4()),
+                    session_id,
+                    run_id,
+                    run_number,
+                    int(row.get("ordinal") or index),
+                    str(row.get("phase") or "unattributed"),
+                    str(row.get("label") or "Unattributed usage"),
+                    _optional_int(row.get("turn")),
+                    _optional_int(row.get("candidate")),
+                    int(row.get("input_tokens") or 0),
+                    int(row.get("output_tokens") or 0),
+                    float(row.get("cost_usd") or 0),
+                    int(row.get("event_count") or 0),
+                    str(row.get("created_at") or now),
+                ),
+            )
+
+
+def usage_breakdown_for_session(session_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select *
+            from run_usage_breakdown
+            where session_id = ?
+            order by run_number asc, ordinal asc, created_at asc
+            """,
+            (session_id,),
+        ).fetchall()
+    persisted = [_normalize_usage_breakdown_row(row_to_dict(row)) for row in rows]
+    if persisted:
+        return persisted
+    return _usage_breakdown_from_raw_logs(session_id)
+
+
 def session_detail(session_id: str) -> dict | None:
     session = get_session(session_id)
     if not session:
@@ -222,6 +309,16 @@ def session_detail(session_id: str) -> dict | None:
             "select * from status_events where session_id = ? order by created_at asc",
             (session_id,),
         ).fetchall()
+        active_run = conn.execute(
+            """
+            select *
+            from runs
+            where session_id = ? and status in ('pending', 'running')
+            order by updated_at desc, created_at desc
+            limit 1
+            """,
+            (session_id,),
+        ).fetchone()
     usage = _normalize_usage_session(
         {
             **(row_to_dict(usage_row) if usage_row else {}),
@@ -237,6 +334,8 @@ def session_detail(session_id: str) -> dict | None:
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [row_to_dict(row) for row in code_steps],
         "status_events": [row_to_dict(row) for row in status_events],
+        "usage_breakdown": usage_breakdown_for_session(session_id),
+        "active_run": _normalize_run(row_to_dict(active_run)) if active_run else None,
     }
 
 
@@ -329,6 +428,28 @@ def _normalize_usage_model(row: dict) -> dict:
     return row
 
 
+def _normalize_usage_breakdown_row(row: dict) -> dict:
+    for key in ("run_number", "ordinal", "input_tokens", "output_tokens", "event_count"):
+        row[key] = int(row.get(key) or 0)
+    row["turn"] = _optional_int(row.get("turn"))
+    row["candidate"] = _optional_int(row.get("candidate"))
+    row["cost_usd"] = float(row.get("cost_usd") or 0)
+    row["total_tokens"] = int(row["input_tokens"]) + int(row["output_tokens"])
+    return row
+
+
+def _normalize_run(row: dict) -> dict:
+    raw_pending = row.get("pending_approval")
+    if isinstance(raw_pending, str) and raw_pending:
+        try:
+            row["pending_approval"] = json.loads(raw_pending)
+        except json.JSONDecodeError:
+            row["pending_approval"] = None
+    else:
+        row["pending_approval"] = None
+    return row
+
+
 def _duration_seconds(started_at: str | None, ended_at: str | None) -> int:
     if not started_at or not ended_at:
         return 0
@@ -340,3 +461,232 @@ def _duration_seconds(started_at: str | None, ended_at: str | None) -> int:
     except ValueError:
         return 0
     return max(0, int((ended - started).total_seconds()))
+
+
+def _usage_breakdown_from_raw_logs(session_id: str) -> list[dict]:
+    with connect() as conn:
+        runs = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                select id, input_tokens, output_tokens, cost_usd
+                from runs
+                where session_id = ?
+                order by created_at asc, id asc
+                """,
+                (session_id,),
+            ).fetchall()
+        ]
+    rows: list[dict] = []
+    for run_number, run in enumerate(runs, start=1):
+        log_path = RAW_EVENT_LOG_DIR / f"{run['id']}.jsonl"
+        if not log_path.exists():
+            continue
+        run_rows, totals = _usage_breakdown_from_log(log_path, run_number)
+        input_total = max(int(run.get("input_tokens") or 0), int(totals.get("input_tokens") or 0))
+        output_total = max(int(run.get("output_tokens") or 0), int(totals.get("output_tokens") or 0))
+        cost_total = max(float(run.get("cost_usd") or 0), float(totals.get("cost_usd") or 0))
+        _append_unattributed_usage(run_rows, input_total, output_total, cost_total, run_number)
+        for ordinal, row in enumerate(run_rows, start=1):
+            row["ordinal"] = ordinal
+        rows.extend(_normalize_usage_breakdown_row(row) for row in run_rows)
+    return rows
+
+
+def _usage_breakdown_from_log(path, run_number: int) -> tuple[list[dict], dict[str, float | int]]:
+    rows: list[dict] = []
+    current_turn: int | None = None
+    totals: dict[str, float | int] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else frame
+            frame_type = str(frame.get("type") or _event_type(payload)).lower()
+            if frame_type == "turn_started":
+                current_turn = _first_int(payload, "turn")
+            if frame_type == "approval_requested":
+                candidate = _first_int(payload, "candidate")
+                preflight = _last_unlabeled_preflight(rows)
+                if preflight is not None and candidate is not None:
+                    preflight["candidate"] = candidate
+                    preflight["label"] = f"Theorem translation preflight candidate {candidate}"
+
+            input_tokens, output_tokens = _frame_usage(payload)
+            cost_usd = _frame_cost(payload)
+            if frame_type == "usage_updated":
+                _add_usage_breakdown_event(rows, run_number, current_turn, input_tokens, output_tokens, cost_usd)
+            elif frame_type in {"finished", "run_status"}:
+                totals["input_tokens"] = max(int(totals["input_tokens"]), input_tokens or 0)
+                totals["output_tokens"] = max(int(totals["output_tokens"]), output_tokens or 0)
+                totals["cost_usd"] = max(float(totals["cost_usd"]), cost_usd or 0.0)
+    return rows, totals
+
+
+def _add_usage_breakdown_event(
+    rows: list[dict],
+    run_number: int,
+    current_turn: int | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cost_usd: float | None,
+) -> None:
+    if not input_tokens and not output_tokens and not cost_usd:
+        return
+    if current_turn is None:
+        row = _last_unlabeled_preflight(rows)
+        if row is None:
+            row = _new_usage_breakdown_row(
+                run_number=run_number,
+                phase="theorem_translation",
+                label="Theorem translation preflight",
+                turn=None,
+                candidate=None,
+            )
+            rows.append(row)
+    else:
+        row = next(
+            (
+                item for item in rows
+                if item.get("run_number") == run_number
+                and item.get("phase") == "proof_turn"
+                and item.get("turn") == current_turn
+            ),
+            None,
+        )
+        if row is None:
+            row = _new_usage_breakdown_row(
+                run_number=run_number,
+                phase="proof_turn",
+                label=f"Turn {current_turn}",
+                turn=current_turn,
+                candidate=None,
+            )
+            rows.append(row)
+    row["input_tokens"] += int(input_tokens or 0)
+    row["output_tokens"] += int(output_tokens or 0)
+    row["cost_usd"] += float(cost_usd or 0)
+    row["event_count"] += 1
+
+
+def _append_unattributed_usage(
+    rows: list[dict],
+    input_total: int,
+    output_total: int,
+    cost_total: float,
+    run_number: int,
+) -> None:
+    input_seen = sum(int(row.get("input_tokens") or 0) for row in rows)
+    output_seen = sum(int(row.get("output_tokens") or 0) for row in rows)
+    cost_seen = sum(float(row.get("cost_usd") or 0) for row in rows)
+    input_delta = max(0, input_total - input_seen)
+    output_delta = max(0, output_total - output_seen)
+    cost_delta = max(0.0, cost_total - cost_seen)
+    if not input_delta and not output_delta and cost_delta < 0.000000001:
+        return
+    row = _new_usage_breakdown_row(
+        run_number=run_number,
+        phase="unattributed",
+        label="Unattributed usage",
+        turn=None,
+        candidate=None,
+    )
+    row["input_tokens"] = input_delta
+    row["output_tokens"] = output_delta
+    row["cost_usd"] = cost_delta
+    rows.append(row)
+
+
+def _new_usage_breakdown_row(
+    *,
+    run_number: int,
+    phase: str,
+    label: str,
+    turn: int | None,
+    candidate: int | None,
+) -> dict:
+    return {
+        "id": str(uuid4()),
+        "run_number": run_number,
+        "ordinal": 0,
+        "phase": phase,
+        "label": label,
+        "turn": turn,
+        "candidate": candidate,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "event_count": 0,
+        "created_at": utc_now(),
+    }
+
+
+def _last_unlabeled_preflight(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    row = rows[-1]
+    if row.get("phase") == "theorem_translation" and row.get("candidate") is None:
+        return row
+    return None
+
+
+def _event_type(frame: dict[str, Any]) -> str:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("type") or candidate.get("event") or candidate.get("kind")
+        if isinstance(value, str) and value:
+            return value.strip().lower()
+    return ""
+
+
+def _frame_usage(frame: dict[str, Any]) -> tuple[int | None, int | None]:
+    for candidate in _walk_dicts(frame):
+        usage = candidate.get("usage") if isinstance(candidate.get("usage"), dict) else candidate
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+        if isinstance(input_tokens, int | float) or isinstance(output_tokens, int | float):
+            return (
+                int(input_tokens) if isinstance(input_tokens, int | float) else None,
+                int(output_tokens) if isinstance(output_tokens, int | float) else None,
+            )
+    return None, None
+
+
+def _frame_cost(frame: dict[str, Any]) -> float | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("cost")
+        if isinstance(value, int | float):
+            return float(value)
+        value = candidate.get("cost_usd")
+        if isinstance(value, int | float):
+            return float(value)
+    return None
+
+
+def _first_int(frame: dict[str, Any], key: str) -> int | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    return int(value) if isinstance(value, int | float) else None
+
+
+def _walk_dicts(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            found.append(item)
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return found

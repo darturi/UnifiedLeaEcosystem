@@ -43,6 +43,8 @@ def init_db() -> None:
                 id text primary key,
                 session_id text not null references sessions(id),
                 status text not null,
+                api_run_id text,
+                pending_approval text,
                 model text not null,
                 provider text,
                 max_turns integer,
@@ -84,6 +86,23 @@ def init_db() -> None:
                 message text not null,
                 created_at text not null
             );
+
+            create table if not exists run_usage_breakdown (
+                id text primary key,
+                session_id text not null references sessions(id),
+                run_id text not null references runs(id),
+                run_number integer not null,
+                ordinal integer not null,
+                phase text not null,
+                label text not null,
+                turn integer,
+                candidate integer,
+                input_tokens integer not null default 0,
+                output_tokens integer not null default 0,
+                cost_usd real not null default 0,
+                event_count integer not null default 0,
+                created_at text not null
+            );
             """
         )
         columns = {
@@ -103,6 +122,10 @@ def init_db() -> None:
         }
         if "cost_usd" not in run_columns:
             conn.execute("alter table runs add column cost_usd real not null default 0")
+        if "api_run_id" not in run_columns:
+            conn.execute("alter table runs add column api_run_id text")
+        if "pending_approval" not in run_columns:
+            conn.execute("alter table runs add column pending_approval text")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:

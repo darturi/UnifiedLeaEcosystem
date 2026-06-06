@@ -8,11 +8,15 @@ import { timelineStepCount } from './stepTimeline.mjs';
 import {
   ChatMessage,
   CodeStep,
+  ApprovalDecision,
+  PendingApproval,
   SessionSummary,
+  SessionDetail,
   StatusEvent,
   createRun,
   getSession,
   listSessions,
+  submitApproval,
 } from './api';
 
 export default function App() {
@@ -24,6 +28,10 @@ export default function App() {
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [activeTimelineStepIndex, setActiveTimelineStepIndex] = useState<number | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  const [currentRunId, setCurrentRunId] = useState<string>();
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
+  const [isSubmittingApproval, setIsSubmittingApproval] = useState(false);
+  const [approvalError, setApprovalError] = useState<string>();
   const [error, setError] = useState<string>();
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
   const [view, setView] = useState<'main' | 'stats'>('main');
@@ -64,14 +72,25 @@ export default function App() {
   };
 
   useEffect(() => {
-    refreshSessions().catch((err) => setError(err.message));
+    const restoreInitialSession = async () => {
+      const loaded = await refreshSessions();
+      const savedSessionId = window.localStorage.getItem('lea:selectedSessionId');
+      const savedSession = savedSessionId
+        ? loaded.find((session) => session.id === savedSessionId)
+        : undefined;
+      const activeSession = loaded.find((session) => session.status === 'running');
+      const sessionToRestore = savedSession || activeSession;
+      if (sessionToRestore) {
+        await loadSession(sessionToRestore.id);
+      }
+    };
+    restoreInitialSession().catch((err) => setError(err.message));
     return () => {
       eventSourceRef.current?.close();
     };
   }, []);
 
-  const loadSession = async (sessionId: string) => {
-    const detail = await getSession(sessionId);
+  const applySessionDetail = (detail: SessionDetail) => {
     setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
@@ -79,17 +98,21 @@ export default function App() {
     codeStepCountRef.current = detail.code_steps.length;
     setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
+    setCurrentRunId(detail.active_run?.id);
+    setPendingApproval(detail.active_run?.pending_approval || undefined);
+    setIsRunning(Boolean(detail.active_run));
+    setApprovalError(undefined);
+  };
+
+  const loadSession = async (sessionId: string) => {
+    const detail = await getSession(sessionId);
+    applySessionDetail(detail);
+    window.localStorage.setItem('lea:selectedSessionId', detail.id);
   };
 
   const reconcileSession = async (sessionId: string) => {
     const detail = await getSession(sessionId);
-    setSelectedSessionId(detail.id);
-    setMessages(detail.messages);
-    setCodeSteps(detail.code_steps);
-    setStatusEvents(detail.status_events || []);
-    codeStepCountRef.current = detail.code_steps.length;
-    setCurrentStepIndex(lastTimelineStepIndex(detail));
-    setActiveTimelineStep(null);
+    applySessionDetail(detail);
   };
 
   const selectedSession = useMemo(
@@ -128,11 +151,14 @@ export default function App() {
 
   const handleSubmit = async (content: string): Promise<boolean> => {
     setError(undefined);
+    setApprovalError(undefined);
+    setPendingApproval(undefined);
     eventSourceRef.current?.close();
 
     try {
       const run = await createRun(content, selectedSessionId);
       setSelectedSessionId(run.session_id);
+      setCurrentRunId(run.run_id);
       appendMessage(run.message);
       setStatusEvents([
         {
@@ -257,6 +283,22 @@ export default function App() {
         ]);
       });
 
+      source.addEventListener('approval_requested', (event) => {
+        const payload = JSON.parse((event as MessageEvent).data) as PendingApproval;
+        setPendingApproval(payload);
+        setApprovalError(undefined);
+      });
+
+      source.addEventListener('approval_resolved', (event) => {
+        const payload = JSON.parse((event as MessageEvent).data) as {
+          approval_id?: string;
+        };
+        setPendingApproval((current) =>
+          current?.approval_id === payload.approval_id ? undefined : current,
+        );
+        setApprovalError(undefined);
+      });
+
       source.addEventListener('error', (event) => {
         const data = (event as MessageEvent).data;
         if (data) {
@@ -269,6 +311,9 @@ export default function App() {
         eventSourceRef.current = null;
         source.close();
         setIsRunning(false);
+        setCurrentRunId(undefined);
+        setPendingApproval(undefined);
+        setApprovalError(undefined);
         setActiveTimelineStep(null);
         await reconcileSession(run.session_id);
         await refreshSessions();
@@ -281,6 +326,8 @@ export default function App() {
         eventSourceRef.current = null;
         source.close();
         setIsRunning(false);
+        setCurrentRunId(undefined);
+        setPendingApproval(undefined);
         setActiveTimelineStep(null);
         reconcileSession(run.session_id).catch(() => undefined);
         setError('Lost connection to the Lea backend.');
@@ -288,8 +335,33 @@ export default function App() {
       return true;
     } catch (err) {
       setIsRunning(false);
+      setCurrentRunId(undefined);
       setError(err instanceof Error ? err.message : 'Unable to start Lea.');
       return false;
+    }
+  };
+
+  const handleSubmitApproval = async (
+    decision: ApprovalDecision,
+    feedback?: string,
+  ): Promise<void> => {
+    if (!currentRunId || !pendingApproval || isSubmittingApproval) {
+      return;
+    }
+    setIsSubmittingApproval(true);
+    setApprovalError(undefined);
+    try {
+      await submitApproval(
+        currentRunId,
+        pendingApproval.approval_id,
+        decision,
+        decision === 'reject' ? feedback : undefined,
+      );
+      setPendingApproval(undefined);
+    } catch (err) {
+      setApprovalError(err instanceof Error ? err.message : 'Unable to submit approval.');
+    } finally {
+      setIsSubmittingApproval(false);
     }
   };
 
@@ -313,6 +385,11 @@ export default function App() {
               setStatusEvents([]);
               setCurrentStepIndex(0);
               setActiveTimelineStep(null);
+              setCurrentRunId(undefined);
+              setPendingApproval(undefined);
+              setApprovalError(undefined);
+              setIsRunning(false);
+              window.localStorage.removeItem('lea:selectedSessionId');
               setError(undefined);
             }}
           />
@@ -330,12 +407,16 @@ export default function App() {
             sessionStatus={selectedSession?.status}
             statusEvents={statusEvents}
             onSubmit={handleSubmit}
+            onSubmitApproval={handleSubmitApproval}
             onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}
             onOpenStats={() => setView('stats')}
             theoremName={title}
             currentStepIndex={currentStepIndex}
             activeTimelineStepIndex={activeTimelineStepIndex}
+            pendingApproval={pendingApproval}
+            isSubmittingApproval={isSubmittingApproval}
+            approvalError={approvalError}
           />
         </Panel>
 

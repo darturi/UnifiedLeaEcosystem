@@ -20,6 +20,19 @@ RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
 WRITE_TOOL_NAMES = {"write_file", "edit_file"}
 PATH_KEYS = ("path", "file", "file_path", "relative_path", "filename", "name")
 CODE_KEYS = ("code", "content", "source", "text")
+APPROVAL_KEYS = (
+    "type",
+    "approval_id",
+    "tier",
+    "candidate",
+    "lean_code",
+    "theorem_name",
+    "check_result",
+    "decision",
+    "feedback",
+    "seq",
+    "schema_version",
+)
 
 
 @dataclass
@@ -45,6 +58,94 @@ class ToolTracker:
     def __post_init__(self) -> None:
         if self.drift_warnings is None:
             self.drift_warnings = set()
+
+
+@dataclass
+class UsageBreakdownCollector:
+    current_turn: int | None = None
+    rows: list[dict[str, Any]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.rows is None:
+            self.rows = []
+
+    def notice_turn(self, frame: dict[str, Any]) -> None:
+        self.current_turn = _first_int(frame, "turn")
+
+    def notice_approval(self, frame: dict[str, Any]) -> None:
+        candidate = _first_int(frame, "candidate")
+        preflight = self._last_unlabeled_preflight()
+        if preflight is not None and candidate is not None:
+            preflight["candidate"] = candidate
+            preflight["label"] = f"Theorem translation preflight candidate {candidate}"
+
+    def add_usage(self, input_tokens: int | None, output_tokens: int | None, cost_usd: float | None) -> None:
+        if not input_tokens and not output_tokens and not cost_usd:
+            return
+        if self.current_turn is None:
+            row = self._last_unlabeled_preflight()
+            if row is None:
+                row = self._new_row("theorem_translation", "Theorem translation preflight", None, None)
+                self.rows.append(row)
+        else:
+            row = next(
+                (
+                    item for item in self.rows
+                    if item.get("phase") == "proof_turn" and item.get("turn") == self.current_turn
+                ),
+                None,
+            )
+            if row is None:
+                row = self._new_row("proof_turn", f"Turn {self.current_turn}", self.current_turn, None)
+                self.rows.append(row)
+        row["input_tokens"] += int(input_tokens or 0)
+        row["output_tokens"] += int(output_tokens or 0)
+        row["cost_usd"] += float(cost_usd or 0)
+        row["event_count"] += 1
+
+    def final_rows(
+        self,
+        input_total: int | None,
+        output_total: int | None,
+        cost_total: float | None,
+    ) -> list[dict[str, Any]]:
+        rows = [dict(row) for row in self.rows]
+        input_seen = sum(int(row.get("input_tokens") or 0) for row in rows)
+        output_seen = sum(int(row.get("output_tokens") or 0) for row in rows)
+        cost_seen = sum(float(row.get("cost_usd") or 0) for row in rows)
+        input_delta = max(0, int(input_total or 0) - input_seen)
+        output_delta = max(0, int(output_total or 0) - output_seen)
+        cost_delta = max(0.0, float(cost_total or 0) - cost_seen)
+        if input_delta or output_delta or cost_delta >= 0.000000001:
+            row = self._new_row("unattributed", "Unattributed usage", None, None)
+            row["input_tokens"] = input_delta
+            row["output_tokens"] = output_delta
+            row["cost_usd"] = cost_delta
+            rows.append(row)
+        for ordinal, row in enumerate(rows, start=1):
+            row["ordinal"] = ordinal
+        return rows
+
+    def _last_unlabeled_preflight(self) -> dict[str, Any] | None:
+        if not self.rows:
+            return None
+        row = self.rows[-1]
+        if row.get("phase") == "theorem_translation" and row.get("candidate") is None:
+            return row
+        return None
+
+    @staticmethod
+    def _new_row(phase: str, label: str, turn: int | None, candidate: int | None) -> dict[str, Any]:
+        return {
+            "phase": phase,
+            "label": label,
+            "turn": turn,
+            "candidate": candidate,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "event_count": 0,
+        }
 
 
 def emit(events: Queue[dict[str, Any]], event_type: str, payload: dict[str, Any]) -> None:
@@ -247,7 +348,7 @@ def _terminal_status(frame: dict[str, Any]) -> str | None:
         reason = str(frame.get("reason") or frame.get("status") or "").lower()
         if reason in {"max_turns", "max-turns"}:
             return "max_turns"
-        if reason in {"failed", "error", "cancelled", "canceled"}:
+        if reason in {"failed", "error", "cancelled", "canceled", "theorem_translation_failed"}:
             return "failed"
         return "success"
     if kind in {"failed", "cancelled", "canceled"}:
@@ -277,6 +378,14 @@ def _first_string(frame: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _first_int(frame: dict[str, Any], key: str) -> int | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
 def _usage(frame: dict[str, Any]) -> tuple[int | None, int | None]:
     for candidate in _walk_dicts(frame):
         usage = candidate.get("usage") if isinstance(candidate.get("usage"), dict) else candidate
@@ -299,6 +408,22 @@ def _cost(frame: dict[str, Any]) -> float | None:
         if isinstance(value, int | float):
             return float(value)
     return None
+
+
+def _merge_usage_total(current: int | None, incoming: int | None) -> int | None:
+    if incoming is None:
+        return current
+    if current is None:
+        return incoming
+    return max(current, incoming)
+
+
+def _merge_cost_total(current: float | None, incoming: float | None) -> float | None:
+    if incoming is None:
+        return current
+    if current is None:
+        return incoming
+    return max(current, incoming)
 
 
 def _seq(frame: dict[str, Any]) -> int | None:
@@ -361,6 +486,13 @@ def _tool_args(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def _primary_event_dict(frame: dict[str, Any]) -> dict[str, Any]:
     return frame.get("payload") if isinstance(frame.get("payload"), dict) else frame
+
+
+def _approval_payload(frame: dict[str, Any], frame_type: str) -> dict[str, Any]:
+    event = _primary_event_dict(frame)
+    payload = {key: event[key] for key in APPROVAL_KEYS if key in event}
+    payload["type"] = frame_type
+    return payload
 
 
 def _code_payloads(frame: dict[str, Any]) -> list[tuple[str, str, int | None]]:
@@ -738,6 +870,7 @@ def run_lea(context: RunnerContext) -> None:
     terminal_transcript: Any = None
     transcript_url: str | None = None
     tool_tracker = ToolTracker()
+    usage_breakdown = UsageBreakdownCollector()
 
     try:
         store.update_run(context.run_id, "running")
@@ -752,6 +885,7 @@ def run_lea(context: RunnerContext) -> None:
 
         run = client.start_run(context.task)
         api_run_id = str(run["run_id"])
+        store.set_run_api_run_id(context.run_id, api_run_id)
         log_status(context, f"Lea API run started: {api_run_id}", status="api_run_started", api_run_id=api_run_id)
 
         started = time.monotonic()
@@ -766,7 +900,34 @@ def run_lea(context: RunnerContext) -> None:
                     last_seq = max(last_seq, seq)
 
                 frame_type = _event_type(frame)
+                if frame_type == "approval_requested":
+                    usage_breakdown.notice_approval(frame)
+                    _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+                    payload = _approval_payload(frame, frame_type)
+                    store.set_run_pending_approval(context.run_id, payload)
+                    emit(context.events, "approval_requested", payload)
+                    candidate = payload.get("candidate")
+                    candidate_suffix = f" candidate {candidate}" if candidate is not None else ""
+                    log_status(
+                        context,
+                        f"Waiting for theorem translation approval{candidate_suffix}.",
+                        status="approval_requested",
+                    )
+                    continue
+                if frame_type == "approval_resolved":
+                    payload = _approval_payload(frame, frame_type)
+                    store.set_run_pending_approval(context.run_id, None)
+                    emit(context.events, "approval_resolved", payload)
+                    decision = payload.get("decision") or "resolved"
+                    log_status(
+                        context,
+                        f"Theorem translation {decision}.",
+                        status="approval_resolved",
+                    )
+                    continue
+
                 if frame_type == "turn_started":
+                    usage_breakdown.notice_turn(frame)
                     _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
 
                 delta = _text_delta(frame)
@@ -809,6 +970,7 @@ def run_lea(context: RunnerContext) -> None:
                 frame_input_tokens, frame_output_tokens = _usage(frame)
                 frame_cost_usd = _cost(frame)
                 if frame_type == "usage_updated":
+                    usage_breakdown.add_usage(frame_input_tokens, frame_output_tokens, frame_cost_usd)
                     if frame_input_tokens is not None:
                         input_tokens = (input_tokens or 0) + frame_input_tokens
                     if frame_output_tokens is not None:
@@ -816,9 +978,9 @@ def run_lea(context: RunnerContext) -> None:
                     if frame_cost_usd is not None:
                         cost_usd = (cost_usd or 0.0) + frame_cost_usd
                 else:
-                    input_tokens = frame_input_tokens if frame_input_tokens is not None else input_tokens
-                    output_tokens = frame_output_tokens if frame_output_tokens is not None else output_tokens
-                    cost_usd = frame_cost_usd if frame_cost_usd is not None else cost_usd
+                    input_tokens = _merge_usage_total(input_tokens, frame_input_tokens)
+                    output_tokens = _merge_usage_total(output_tokens, frame_output_tokens)
+                    cost_usd = _merge_cost_total(cost_usd, frame_cost_usd)
 
                 terminal_status = _terminal_status(frame)
                 if terminal_status is not None:
@@ -833,10 +995,10 @@ def run_lea(context: RunnerContext) -> None:
                 _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
                 terminal_status = _api_run_status_to_local(terminal_run_status.get("status"))
                 status_input_tokens, status_output_tokens = _usage(terminal_run_status)
-                input_tokens = status_input_tokens if status_input_tokens is not None else input_tokens
-                output_tokens = status_output_tokens if status_output_tokens is not None else output_tokens
+                input_tokens = _merge_usage_total(input_tokens, status_input_tokens)
+                output_tokens = _merge_usage_total(output_tokens, status_output_tokens)
                 status_cost_usd = _cost(terminal_run_status)
-                cost_usd = status_cost_usd if status_cost_usd is not None else cost_usd
+                cost_usd = _merge_cost_total(cost_usd, status_cost_usd)
                 final_text = _final_text(terminal_run_status) or final_text
                 transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
                 if terminal_status is None:
@@ -852,10 +1014,10 @@ def run_lea(context: RunnerContext) -> None:
                 terminal_run_status = client.get_run(api_run_id)
                 _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
                 status_input_tokens, status_output_tokens = _usage(terminal_run_status)
-                input_tokens = status_input_tokens if status_input_tokens is not None else input_tokens
-                output_tokens = status_output_tokens if status_output_tokens is not None else output_tokens
+                input_tokens = _merge_usage_total(input_tokens, status_input_tokens)
+                output_tokens = _merge_usage_total(output_tokens, status_output_tokens)
                 status_cost_usd = _cost(terminal_run_status)
-                cost_usd = status_cost_usd if status_cost_usd is not None else cost_usd
+                cost_usd = _merge_cost_total(cost_usd, status_cost_usd)
                 transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
             except Exception as status_exc:
                 log_status(
@@ -909,6 +1071,11 @@ def run_lea(context: RunnerContext) -> None:
             output_tokens=output_tokens,
             cost_usd=cost_usd,
         )
+        store.replace_run_usage_breakdown(
+            context.run_id,
+            usage_breakdown.final_rows(input_tokens, output_tokens, cost_usd),
+        )
+        store.set_run_pending_approval(context.run_id, None)
         store.touch_session(context.session_id, terminal_status)
         emit(
             context.events,
@@ -935,14 +1102,22 @@ def run_lea(context: RunnerContext) -> None:
                     final_text = _final_text(run_status) or str(exc)
                     status_input_tokens, status_output_tokens = _usage(run_status)
                     status_cost_usd = _cost(run_status)
+                    merged_input_tokens = _merge_usage_total(input_tokens, status_input_tokens)
+                    merged_output_tokens = _merge_usage_total(output_tokens, status_output_tokens)
+                    merged_cost_usd = _merge_cost_total(cost_usd, status_cost_usd)
                     store.update_run(
                         context.run_id,
                         mapped_status,
                         final_text=final_text,
-                        input_tokens=status_input_tokens,
-                        output_tokens=status_output_tokens,
-                        cost_usd=status_cost_usd,
+                        input_tokens=merged_input_tokens,
+                        output_tokens=merged_output_tokens,
+                        cost_usd=merged_cost_usd,
                     )
+                    store.replace_run_usage_breakdown(
+                        context.run_id,
+                        usage_breakdown.final_rows(merged_input_tokens, merged_output_tokens, merged_cost_usd),
+                    )
+                    store.set_run_pending_approval(context.run_id, None)
                     store.touch_session(context.session_id, mapped_status)
                     emit(context.events, "error", {"message": final_text})
                     emit(context.events, "done", {"status": mapped_status, "api_run_id": api_run_id})
@@ -953,6 +1128,11 @@ def run_lea(context: RunnerContext) -> None:
         message = f"{type(exc).__name__}: {exc}"
         store.add_message(context.session_id, "system", message, context.run_id)
         store.update_run(context.run_id, "failed", final_text=message)
+        store.replace_run_usage_breakdown(
+            context.run_id,
+            usage_breakdown.final_rows(input_tokens, output_tokens, cost_usd),
+        )
+        store.set_run_pending_approval(context.run_id, None)
         store.touch_session(context.session_id, "failed")
         emit(context.events, "error", {"message": message})
         emit(context.events, "done", {"status": "failed", "api_run_id": api_run_id})

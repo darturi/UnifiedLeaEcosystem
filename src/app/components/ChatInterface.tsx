@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import { Send, Pause, Play, BarChart3, Loader2 } from 'lucide-react';
-import { ChatMessage, CodeStep, SessionStatus, StatusEvent } from '../api';
+import { ApprovalDecision, ChatMessage, CodeStep, PendingApproval, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
+import { TheoremApprovalPanel } from './TheoremApprovalPanel';
 
 export function ChatInterface({
   error,
@@ -16,18 +17,26 @@ export function ChatInterface({
   onStepSelect,
   onTogglePause,
   onOpenStats,
+  onSubmitApproval,
   theoremName,
   currentStepIndex,
   activeTimelineStepIndex,
+  pendingApproval,
+  isSubmittingApproval,
+  approvalError,
 }: {
   error?: string;
   isPaused: boolean;
   isRunning: boolean;
+  pendingApproval?: PendingApproval;
+  isSubmittingApproval: boolean;
+  approvalError?: string;
   messages: ChatMessage[];
   codeSteps: CodeStep[];
   sessionStatus?: SessionStatus;
   statusEvents: StatusEvent[];
   onSubmit: (content: string) => Promise<boolean>;
+  onSubmitApproval: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
   onStepSelect: (stepIndex: number) => void;
   onTogglePause: () => void;
   onOpenStats: () => void;
@@ -211,6 +220,15 @@ export function ChatInterface({
               ))}
             </div>
           </div>
+        )}
+
+        {pendingApproval && (
+          <TheoremApprovalPanel
+            approval={pendingApproval}
+            isSubmitting={isSubmittingApproval}
+            error={approvalError}
+            onSubmit={onSubmitApproval}
+          />
         )}
 
         {timeline.stepItems.map((item) => {

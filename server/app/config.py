@@ -22,6 +22,7 @@ class LeaConfig:
     openai_api_key: str | None = None
     openai_base_url: str | None = None
     narrate_tool_steps: bool = False
+    permission_tier: str = "none"
 
 
 def load_config(path: Path | None = None) -> LeaConfig:
@@ -42,6 +43,11 @@ def load_config(path: Path | None = None) -> LeaConfig:
     narrate_tool_steps = data.get("narrate_tool_steps", False)
     if not isinstance(narrate_tool_steps, bool):
         raise ValueError("narrate_tool_steps must be a boolean")
+    permission_tier = data.get("permission_tier", "none")
+    if not isinstance(permission_tier, str):
+        raise ValueError("permission_tier must be a string")
+    if permission_tier not in {"none", "theorem_translation"}:
+        raise ValueError("permission_tier must be one of: none, theorem_translation")
 
     return LeaConfig(
         model=data.get("model", "gemini/gemini-3.1-pro-preview"),
@@ -55,6 +61,7 @@ def load_config(path: Path | None = None) -> LeaConfig:
         openai_api_key=data.get("openai_api_key"),
         openai_base_url=data.get("openai_base_url"),
         narrate_tool_steps=narrate_tool_steps,
+        permission_tier=permission_tier,
     )
 
 

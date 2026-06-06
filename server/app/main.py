@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from .config import load_config
 from .db import init_db
+from .lea_api_client import LeaApiClient, LeaApiError
 from .runner import RunnerContext, run_lea
 from . import store
 
@@ -30,6 +31,11 @@ app.add_middleware(
 class RunRequest(BaseModel):
     message: str
     session_id: str | None = None
+
+
+class ApprovalDecisionRequest(BaseModel):
+    decision: str
+    feedback: str | None = None
 
 
 @app.on_event("startup")
@@ -81,6 +87,33 @@ def create_run(request: RunRequest) -> dict:
         "run_id": run["id"],
         "message": user_message,
     }
+
+
+@app.post("/api/runs/{run_id}/approvals/{approval_id}")
+def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionRequest) -> dict:
+    if request.decision not in {"accept", "reject"}:
+        raise HTTPException(status_code=422, detail="decision must be 'accept' or 'reject'")
+    feedback = request.feedback.strip() if request.feedback is not None else None
+    if request.decision == "reject" and not feedback:
+        raise HTTPException(status_code=422, detail="feedback is required when rejecting an approval")
+
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    api_run_id = run.get("api_run_id")
+    if not api_run_id:
+        raise HTTPException(status_code=409, detail="Run is not ready for approval")
+
+    try:
+        return LeaApiClient(load_config()).resolve_approval(
+            str(api_run_id),
+            approval_id,
+            request.decision,
+            feedback if request.decision == "reject" else None,
+        )
+    except LeaApiError as exc:
+        status_code = exc.status if exc.status in {400, 401, 403, 404, 409, 422} else 502
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
 
 def sse(event_type: str, payload: dict) -> str:

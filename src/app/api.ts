@@ -1,4 +1,15 @@
 export type SessionStatus = 'running' | 'success' | 'failed' | 'max_turns';
+export type ApprovalDecision = 'accept' | 'reject';
+
+export interface PendingApproval {
+  type: 'approval_requested';
+  approval_id: string;
+  tier: 'theorem_translation';
+  candidate: number;
+  lean_code: string;
+  theorem_name?: string | null;
+  check_result?: string | null;
+}
 
 export interface SessionSummary {
   id: string;
@@ -54,10 +65,34 @@ export interface StatusEvent {
   created_at: string;
 }
 
+export interface UsageBreakdownRow {
+  id: string;
+  session_id?: string;
+  run_id?: string;
+  run_number: number;
+  ordinal: number;
+  phase: 'theorem_translation' | 'proof_turn' | 'unattributed' | string;
+  label: string;
+  turn?: number | null;
+  candidate?: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  event_count: number;
+  created_at?: string;
+}
+
 export interface SessionDetail extends SessionSummary {
   messages: ChatMessage[];
   code_steps: CodeStep[];
   status_events: StatusEvent[];
+  usage_breakdown: UsageBreakdownRow[];
+  active_run?: {
+    id: string;
+    status: string;
+    pending_approval?: PendingApproval | null;
+  } | null;
 }
 
 export interface UsageSessionSummary extends SessionSummary {}
@@ -141,4 +176,25 @@ export async function createRun(message: string, sessionId?: string): Promise<{
     throw new Error(detail.detail || `Failed to create run: ${response.statusText}`);
   }
   return response.json();
+}
+
+export async function submitApproval(
+  runId: string,
+  approvalId: string,
+  decision: ApprovalDecision,
+  feedback?: string,
+): Promise<void> {
+  const body: { decision: ApprovalDecision; feedback?: string } = { decision };
+  if (feedback !== undefined) {
+    body.feedback = feedback;
+  }
+  const response = await fetch(`/api/runs/${runId}/approvals/${approvalId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || `Failed to submit approval: ${response.statusText}`);
+  }
 }

@@ -20,7 +20,14 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { UsageSessionSummary, UsageStats, getUsageStats } from '../api';
+import {
+  SessionDetail,
+  UsageBreakdownRow,
+  UsageSessionSummary,
+  UsageStats,
+  getSession,
+  getUsageStats,
+} from '../api';
 
 const INPUT_COLOR = '#6366f1';
 const OUTPUT_COLOR = '#22d3ee';
@@ -207,7 +214,9 @@ function SessionListPane({
   );
 }
 
-function SessionDetailPane({ session }: { session?: UsageSessionSummary }) {
+type StatsSessionDetail = UsageSessionSummary & { usage_breakdown?: UsageBreakdownRow[] };
+
+function SessionDetailPane({ session }: { session?: StatsSessionDetail }) {
   if (!session) {
     return (
       <section className="flex min-h-0 flex-col border-r border-border">
@@ -292,9 +301,76 @@ function SessionDetailPane({ session }: { session?: UsageSessionSummary }) {
               <Row label="Recorded total" value={fmtCost(session.cost_usd)} accent={MONEY_COLOR} />
             </div>
           </div>
+
+          <TurnCostBreakdown rows={session.usage_breakdown || []} runCount={session.run_count} />
         </div>
       </div>
     </section>
+  );
+}
+
+function TurnCostBreakdown({
+  rows,
+  runCount,
+}: {
+  rows: UsageBreakdownRow[];
+  runCount: number;
+}) {
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-border p-4">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-[0.65rem] uppercase tracking-widest text-muted-foreground">
+          Turn cost breakdown
+        </span>
+        {rows.length > 0 && (
+          <span className="font-mono text-[0.65rem] text-muted-foreground">
+            {rows.length} rows
+          </span>
+        )}
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="rounded-md bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+          No turn-level cost events recorded for this session.
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-md border border-border">
+          <div className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-2 border-b border-border bg-muted/50 px-3 py-2 font-mono text-[0.6rem] uppercase tracking-widest text-muted-foreground">
+            <span>Step</span>
+            <span className="text-right">In</span>
+            <span className="text-right">Out</span>
+            <span className="text-right">Cost</span>
+          </div>
+          <div className="divide-y divide-border">
+            {rows.map((row) => {
+              const label = runCount > 1 ? `Run ${row.run_number} · ${row.label}` : row.label;
+              return (
+                <div
+                  key={`${row.run_id || row.run_number}-${row.ordinal}-${row.phase}`}
+                  className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-2 px-3 py-2"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm text-foreground">{label}</div>
+                    <div className="font-mono text-[0.65rem] text-muted-foreground">
+                      {fmtNumber(row.total_tokens)} tok
+                    </div>
+                  </div>
+                  <span className="self-center text-right font-mono text-xs text-muted-foreground">
+                    {fmtNumber(row.input_tokens)}
+                  </span>
+                  <span className="self-center text-right font-mono text-xs text-muted-foreground">
+                    {fmtNumber(row.output_tokens)}
+                  </span>
+                  <span className="self-center text-right font-mono text-xs" style={{ color: MONEY_COLOR }}>
+                    {fmtCost(row.cost_usd)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -500,6 +576,7 @@ function ChartBlock({ title, children }: { title: string; children: React.ReactN
 
 export function StatsPage({ onBack }: { onBack: () => void }) {
   const [stats, setStats] = useState<UsageStats>();
+  const [sessionDetails, setSessionDetails] = useState<Record<string, SessionDetail>>({});
   const [selectedId, setSelectedId] = useState<string>();
   const [error, setError] = useState<string>();
   const [isLoading, setIsLoading] = useState(true);
@@ -531,7 +608,29 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
     };
   }, []);
 
-  const selectedSession = stats?.sessions.find((session) => session.id === selectedId);
+  useEffect(() => {
+    if (!selectedId || sessionDetails[selectedId]) {
+      return;
+    }
+    let cancelled = false;
+    getSession(selectedId)
+      .then((detail) => {
+        if (!cancelled) {
+          setSessionDetails((current) => ({ ...current, [detail.id]: detail }));
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Unable to load session usage breakdown.');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, sessionDetails]);
+
+  const selectedSummary = stats?.sessions.find((session) => session.id === selectedId);
+  const selectedSession = selectedId ? sessionDetails[selectedId] || selectedSummary : undefined;
 
   return (
     <div className="flex size-full flex-col bg-background text-foreground">

@@ -1,4 +1,5 @@
 import sqlite3
+import json
 
 from app import db, store
 
@@ -38,6 +39,12 @@ def test_init_db_adds_cost_column_to_existing_runs_table(tmp_path, monkeypatch):
     with sqlite3.connect(db_path) as conn:
         columns = [row[1] for row in conn.execute("pragma table_info(runs)").fetchall()]
     assert "cost_usd" in columns
+    assert "api_run_id" in columns
+    assert "pending_approval" in columns
+    with sqlite3.connect(db_path) as conn:
+        usage_columns = [row[1] for row in conn.execute("pragma table_info(run_usage_breakdown)").fetchall()]
+    assert "phase" in usage_columns
+    assert "cost_usd" in usage_columns
 
 
 def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
@@ -46,6 +53,17 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
 
     session = store.create_session("Prove 2 + 2 = 4")
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.set_run_api_run_id(run["id"], "api-run-1")
+    store.set_run_pending_approval(
+        run["id"],
+        {
+            "type": "approval_requested",
+            "approval_id": "ap-1",
+            "tier": "theorem_translation",
+            "candidate": 1,
+            "lean_code": "theorem t : True := by sorry",
+        },
+    )
     message = store.add_message(session["id"], "user", "Prove 2 + 2 = 4", run["id"])
     step = store.add_code_step(
         session["id"],
@@ -68,6 +86,9 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
 
     assert detail is not None
     assert detail["messages"][0]["id"] == message["id"]
+    assert store.get_run(run["id"])["api_run_id"] == "api-run-1"
+    assert detail["active_run"]["id"] == run["id"]
+    assert detail["active_run"]["pending_approval"]["approval_id"] == "ap-1"
     assert detail["code_steps"][0]["id"] == step["id"]
     assert detail["code_steps"][0]["step_number"] == 1
     assert detail["code_steps"][0]["kind"] == "no_code"
@@ -76,6 +97,85 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
     assert detail["status_events"][0]["id"] == status_event["id"]
     assert detail["status_events"][0]["step_number"] == 1
     assert detail["status_events"][0]["status"] == "code_step"
+    assert detail["usage_breakdown"] == []
+
+
+def test_run_usage_breakdown_persists_in_session_detail(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    session = store.create_session("Usage rows")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.replace_run_usage_breakdown(
+        run["id"],
+        [
+            {
+                "phase": "theorem_translation",
+                "label": "Theorem translation preflight candidate 1",
+                "candidate": 1,
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cost_usd": 0.001,
+                "event_count": 1,
+            },
+            {
+                "phase": "proof_turn",
+                "label": "Turn 1",
+                "turn": 1,
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "cost_usd": 0.01,
+                "event_count": 2,
+            },
+        ],
+    )
+
+    detail = store.session_detail(session["id"])
+
+    assert [row["label"] for row in detail["usage_breakdown"]] == [
+        "Theorem translation preflight candidate 1",
+        "Turn 1",
+    ]
+    assert detail["usage_breakdown"][0]["total_tokens"] == 15
+    assert detail["usage_breakdown"][1]["turn"] == 1
+
+
+def test_usage_breakdown_falls_back_to_raw_event_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(store, "RAW_EVENT_LOG_DIR", tmp_path / "logs")
+    db.init_db()
+
+    session = store.create_session("Raw log usage")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.RAW_EVENT_LOG_DIR.mkdir()
+    log_path = store.RAW_EVENT_LOG_DIR / f"{run['id']}.jsonl"
+    frames = [
+        {"type": "usage_updated", "payload": {"type": "usage_updated", "input_tokens": 10, "output_tokens": 5, "cost": 0.001}},
+        {"type": "approval_requested", "payload": {"type": "approval_requested", "candidate": 1}},
+        {"type": "turn_started", "payload": {"type": "turn_started", "turn": 1}},
+        {"type": "usage_updated", "payload": {"type": "usage_updated", "input_tokens": 100, "output_tokens": 25, "cost": 0.01}},
+        {"type": "usage_updated", "payload": {"type": "usage_updated", "input_tokens": 20, "output_tokens": 10, "cost": 0.002}},
+        {
+            "type": "finished",
+            "payload": {
+                "type": "finished",
+                "usage": {"input_tokens": 140, "output_tokens": 45},
+                "cost": 0.015,
+            },
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(frame) for frame in frames))
+
+    detail = store.session_detail(session["id"])
+
+    assert [row["label"] for row in detail["usage_breakdown"]] == [
+        "Theorem translation preflight candidate 1",
+        "Turn 1",
+        "Unattributed usage",
+    ]
+    assert detail["usage_breakdown"][1]["input_tokens"] == 120
+    assert detail["usage_breakdown"][1]["event_count"] == 2
+    assert detail["usage_breakdown"][2]["input_tokens"] == 10
 
 
 def test_session_usage_rollups_include_multiple_runs(tmp_path, monkeypatch):

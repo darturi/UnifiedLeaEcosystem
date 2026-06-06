@@ -17,6 +17,7 @@ def test_load_config_defaults_to_local_lea_api(tmp_path):
     assert config.lea_api_key is None
     assert config.lea_root == Path(__file__).resolve().parents[2] / "external" / "lea-prover"
     assert config.narrate_tool_steps is False
+    assert config.permission_tier == "none"
 
 
 def test_load_config_honors_api_settings(tmp_path):
@@ -34,6 +35,7 @@ def test_load_config_honors_api_settings(tmp_path):
         openai_api_key = "openai-secret"
         openai_base_url = "https://openai.example/v1"
         narrate_tool_steps = true
+        permission_tier = "theorem_translation"
         """
     )
 
@@ -51,6 +53,7 @@ def test_load_config_honors_api_settings(tmp_path):
     assert config.openai_api_key == "openai-secret"
     assert config.openai_base_url == "https://openai.example/v1"
     assert config.narrate_tool_steps is True
+    assert config.permission_tier == "theorem_translation"
 
 
 def test_load_config_rejects_invalid_api_base_url(tmp_path):
@@ -66,4 +69,12 @@ def test_load_config_rejects_non_boolean_narration_flag(tmp_path):
     config_path.write_text('narrate_tool_steps = "false"\n')
 
     with pytest.raises(ValueError, match="narrate_tool_steps"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_permission_tier(tmp_path):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('permission_tier = "stepwise"\n')
+
+    with pytest.raises(ValueError, match="permission_tier"):
         load_config(config_path)

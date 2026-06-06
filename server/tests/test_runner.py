@@ -228,6 +228,50 @@ def test_api_text_events_emit_assistant_delta_and_final_message(tmp_path, monkey
     assert events[-1]["payload"]["status"] == "success"
 
 
+def test_approval_events_are_forwarded_and_api_run_id_is_stored(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "approval_requested",
+                "approval_id": "ap-1",
+                "tier": "theorem_translation",
+                "candidate": 1,
+                "lean_code": "import Mathlib\n\ntheorem demo : True := by\n  sorry",
+                "theorem_name": "demo",
+                "check_result": "warning: declaration uses 'sorry'",
+                "schema_version": "1",
+            },
+            {
+                "seq": 1,
+                "type": "approval_resolved",
+                "approval_id": "ap-1",
+                "decision": "accept",
+                "feedback": None,
+                "schema_version": "1",
+            },
+            {"seq": 2, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    run = store.get_run(context.run_id)
+    approvals = [event for event in events if event["type"] == "approval_requested"]
+    resolved = [event for event in events if event["type"] == "approval_resolved"]
+    statuses = [event["payload"]["status"] for event in events if event["type"] == "status"]
+
+    assert run["api_run_id"] == "api-run-1"
+    assert approvals[0]["payload"]["approval_id"] == "ap-1"
+    assert approvals[0]["payload"]["lean_code"].startswith("import Mathlib")
+    assert resolved[0]["payload"]["decision"] == "accept"
+    assert "approval_requested" in statuses
+    assert "approval_resolved" in statuses
+
+
 def test_usage_updated_events_accumulate_tokens_and_cost(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     client = FakeLeaApiClient(
@@ -271,6 +315,89 @@ def test_terminal_run_status_cost_overrides_partial_usage(tmp_path, monkeypatch)
     assert run["input_tokens"] == 80
     assert run["output_tokens"] == 20
     assert abs(run["cost_usd"] - 0.012) < 1e-9
+
+
+def test_smaller_terminal_usage_does_not_erase_streamed_preflight_cost(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 30, "output_tokens": 15, "cost": 0.003},
+            {
+                "seq": 1,
+                "type": "finished",
+                "reason": "theorem_translation_failed",
+                "text": "Error: theorem translation failed",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "cost": 0.0,
+            },
+        ],
+        status={
+            "status": "completed",
+            "result": {
+                "reason": "theorem_translation_failed",
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "cost": 0.0,
+            },
+        },
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    run = store.get_run(context.run_id)
+    events = drain_events(context.events)
+    assert run["status"] == "failed"
+    assert run["input_tokens"] == 30
+    assert run["output_tokens"] == 15
+    assert abs(run["cost_usd"] - 0.003) < 1e-9
+    assert events[-1]["payload"]["status"] == "failed"
+    assert events[-1]["payload"]["cost_usd"] == 0.003
+
+
+def test_runner_persists_turn_usage_breakdown(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 10, "output_tokens": 5, "cost": 0.001},
+            {
+                "seq": 1,
+                "type": "approval_requested",
+                "candidate": 1,
+                "approval_id": "ap-1",
+                "tier": "theorem_translation",
+                "lean_code": "theorem demo : True := by sorry",
+            },
+            {"seq": 2, "type": "approval_resolved", "approval_id": "ap-1", "decision": "accept"},
+            {"seq": 3, "type": "turn_started", "turn": 1},
+            {"seq": 4, "type": "usage_updated", "input_tokens": 100, "output_tokens": 25, "cost": 0.01},
+            {"seq": 5, "type": "usage_updated", "input_tokens": 20, "output_tokens": 10, "cost": 0.002},
+            {
+                "seq": 6,
+                "type": "finished",
+                "reason": "completed",
+                "final_text": "done",
+                "usage": {"input_tokens": 140, "output_tokens": 45},
+                "cost": 0.015,
+            },
+        ],
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    rows = detail["usage_breakdown"]
+    assert [row["label"] for row in rows] == [
+        "Theorem translation preflight candidate 1",
+        "Turn 1",
+        "Unattributed usage",
+    ]
+    assert rows[0]["candidate"] == 1
+    assert rows[1]["turn"] == 1
+    assert rows[1]["input_tokens"] == 120
+    assert rows[1]["event_count"] == 2
+    assert rows[2]["input_tokens"] == 10
+    assert abs(rows[2]["cost_usd"] - 0.002) < 1e-9
 
 
 def test_assistant_text_delta_events_emit_assistant_delta_and_final_message(tmp_path, monkeypatch):

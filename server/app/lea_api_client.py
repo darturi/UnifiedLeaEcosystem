@@ -11,7 +11,9 @@ from .config import LeaConfig
 
 
 class LeaApiError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,25 @@ class LeaApiClient:
         response = self._json_request(f"/v1/runs/{api_run_id}/cancel", method="POST")
         return response.body if isinstance(response.body, dict) else None
 
+    def resolve_approval(
+        self,
+        api_run_id: str,
+        approval_id: str,
+        decision: str,
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"decision": decision}
+        if feedback is not None:
+            body["feedback"] = feedback
+        response = self._json_request(
+            f"/v1/runs/{api_run_id}/approvals/{approval_id}",
+            method="POST",
+            body=body,
+        )
+        if not isinstance(response.body, dict):
+            raise LeaApiError("Lea API returned a non-object approval response.")
+        return response.body
+
     def stream_events(
         self,
         api_run_id: str,
@@ -72,7 +93,7 @@ class LeaApiClient:
                 yield from parse_sse_lines(response)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise LeaApiError(f"Lea API stream returned HTTP {exc.code}: {detail}") from exc
+            raise LeaApiError(f"Lea API stream returned HTTP {exc.code}: {detail}", status=exc.code) from exc
 
     def _json_request(self, path: str, *, method: str = "GET", body: dict[str, Any] | None = None) -> LeaApiResponse:
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -85,7 +106,7 @@ class LeaApiClient:
                 return LeaApiResponse(status=getattr(response, "status", 200), body=payload)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise LeaApiError(f"Lea API returned HTTP {exc.code}: {detail}") from exc
+            raise LeaApiError(f"Lea API returned HTTP {exc.code}: {detail}", status=exc.code) from exc
 
     def _request(
         self,
@@ -106,12 +127,16 @@ class LeaApiClient:
             "agent": {
                 "max_turns": self.config.max_turns,
                 "narrate_tool_steps": self.config.narrate_tool_steps,
+                "permission_tier": self.config.permission_tier,
             },
         }
         if self.config.model:
             config["model"] = {"name": self.config.model}
         if self.config.max_turns is None:
-            config["agent"] = {"narrate_tool_steps": self.config.narrate_tool_steps}
+            config["agent"] = {
+                "narrate_tool_steps": self.config.narrate_tool_steps,
+                "permission_tier": self.config.permission_tier,
+            }
         return config
 
 

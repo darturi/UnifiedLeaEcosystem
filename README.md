@@ -42,6 +42,8 @@ Edit `config/lea.local.toml` and set `model`, `max_turns`, and one provider key 
 
 Set `narrate_tool_steps = true` to ask the bundled Lea agent to emit short Markdown/LaTeX progress summaries before it calls tools. This keeps step narration inside Lea rather than synthesizing it in the UI adapter.
 
+Set `permission_tier = "theorem_translation"` to pause each run for approval of the checked top-level Lean theorem skeleton before proof search starts. Use `permission_tier = "none"` to disable approval prompts.
+
 The default config uses the bundled Lea API at `http://127.0.0.1:8000` and resolves Lean file paths relative to the submodule:
 
 ```toml
