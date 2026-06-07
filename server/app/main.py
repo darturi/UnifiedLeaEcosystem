@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from queue import Empty, Queue
 from threading import Thread
 
@@ -19,6 +20,7 @@ from . import store
 
 
 app = FastAPI(title="Lea Interface API")
+logger = logging.getLogger("lea-interface.settings")
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,8 +84,10 @@ def update_settings(request: SettingsRequest) -> dict:
     try:
         return settings_service.update_settings(request.dict(exclude_unset=True))
     except settings_service.SettingsValidationError as exc:
+        logger.warning("Settings validation failed: field=%s message=%s", exc.field, str(exc))
         raise HTTPException(status_code=422, detail={"message": str(exc), "field": exc.field}) from exc
     except ValueError as exc:
+        logger.warning("Settings update failed: %s", str(exc))
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

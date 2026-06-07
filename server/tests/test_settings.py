@@ -1,3 +1,7 @@
+import json
+from io import BytesIO
+import urllib.error
+
 from app import db
 from app import settings as settings_service
 
@@ -27,7 +31,7 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
 
 def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
-    monkeypatch.setattr(settings_service, "_verify_api_key_credentials", lambda family, value, config: None)
+    monkeypatch.setattr(settings_service, "_verify_api_key_credentials", lambda family, value, config, model=None: None)
     db.init_db()
     config_path = tmp_path / "lea.local.toml"
     config_path.write_text(
@@ -112,6 +116,99 @@ def test_update_settings_rejects_malformed_api_key(tmp_path, monkeypatch):
         raise AssertionError("Expected SettingsValidationError")
 
 
+def test_update_settings_allows_anthropic_prefix_then_defers_to_provider_verification(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    seen = {}
+
+    def verify_key(family, value, config, model=None):
+        seen["family"] = family
+        seen["value"] = value
+        seen["model"] = model
+
+    monkeypatch.setattr(settings_service, "_verify_api_key_credentials", verify_key)
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text(
+        """
+        model = "gpt-4o"
+        max_turns = 12
+        """
+    )
+
+    settings_service.update_settings(
+        {
+            "model": "claude-sonnet-4-6",
+            "api_keys": {"anthropic": {"value": "sk-ant-api03-test.value/with+chars"}},
+        },
+        config_path,
+    )
+
+    assert seen == {
+        "family": "anthropic",
+        "value": "sk-ant-api03-test.value/with+chars",
+        "model": "claude-sonnet-4-6",
+    }
+    assert 'anthropic_api_key = "sk-ant-api03-test.value/with+chars"' in config_path.read_text()
+
+
+def test_anthropic_verification_uses_messages_endpoint_with_selected_model(tmp_path):
+    request = settings_service._provider_verification_request(
+        "anthropic",
+        "sk-ant-api03-test",
+        settings_service.load_config(tmp_path / "missing.toml"),
+        "claude-sonnet-4-6",
+    )
+
+    assert request is not None
+    assert request.full_url == "https://api.anthropic.com/v1/messages"
+    assert request.get_method() == "POST"
+    assert request.headers["X-api-key"] == "sk-ant-api03-test"
+    assert request.headers["Anthropic-version"] == "2023-06-01"
+    assert request.headers["Content-type"] == "application/json"
+    body = json.loads(request.data.decode("utf-8"))
+    assert body == {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+
+
+def test_anthropic_model_error_is_reported_as_model_error(monkeypatch):
+    body = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "model: claude-missing does not exist",
+            }
+        }
+    ).encode("utf-8")
+
+    def fail_with_model_error(request, timeout=None, context=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            400,
+            "Bad Request",
+            {},
+            BytesIO(body),
+        )
+
+    monkeypatch.setattr(settings_service.urllib.request, "urlopen", fail_with_model_error)
+
+    try:
+        settings_service._verify_api_key_credentials(
+            "anthropic",
+            "sk-ant-api03-test",
+            settings_service.load_config(),
+            "claude-missing",
+        )
+    except settings_service.SettingsValidationError as exc:
+        assert exc.field == "model"
+        assert "Anthropic rejected the selected model" in str(exc)
+        assert "claude-missing" in str(exc)
+    else:
+        raise AssertionError("Expected SettingsValidationError")
+
+
 def test_update_settings_rejects_provider_rejected_api_key(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
@@ -123,7 +220,7 @@ def test_update_settings_rejects_provider_rejected_api_key(tmp_path, monkeypatch
         """
     )
 
-    def reject_key(family, value, config):
+    def reject_key(family, value, config, model=None):
         raise settings_service.SettingsValidationError(
             "The OpenAI API key was rejected by the provider.",
             "api_keys.openai",

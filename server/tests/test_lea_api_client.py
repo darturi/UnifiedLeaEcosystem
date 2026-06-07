@@ -37,6 +37,9 @@ def make_config(**overrides):
         lea_job_timeout_seconds=overrides.get("lea_job_timeout_seconds", 900),
         narrate_tool_steps=overrides.get("narrate_tool_steps", False),
         permission_tier=overrides.get("permission_tier", "none"),
+        anthropic_api_key=overrides.get("anthropic_api_key"),
+        openai_api_key=overrides.get("openai_api_key"),
+        google_api_key=overrides.get("google_api_key"),
     )
 
 
@@ -95,6 +98,28 @@ def test_start_run_sends_permission_tier():
     ).start_run("task")
 
     assert seen["body"]["config"]["agent"]["permission_tier"] == "theorem_translation"
+
+
+def test_start_run_sends_selected_provider_key_as_model_kwarg():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"run_id": "api-1"}).encode("utf-8"))
+
+    LeaApiClient(
+        make_config(
+            model="claude-sonnet-4-6",
+            anthropic_api_key="sk-ant-secret",
+            openai_api_key="sk-openai-secret",
+        ),
+        transport=transport,
+    ).start_run("task")
+
+    assert seen["body"]["config"]["model"] == {
+        "name": "claude-sonnet-4-6",
+        "model_kwargs": {"api_key": "sk-ant-secret"},
+    }
 
 
 def test_start_run_omits_bearer_auth_when_key_missing():

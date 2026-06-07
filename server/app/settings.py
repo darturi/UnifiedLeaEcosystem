@@ -4,6 +4,8 @@ import re
 import socket
 import urllib.error
 import urllib.request
+import json
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,7 @@ MODEL_OPTIONS = [
 MODEL_FAMILY_BY_VALUE = {str(option["value"]): str(option["family"]) for option in MODEL_OPTIONS}
 KEY_VALIDATORS = {
     "openai": re.compile(r"^sk-[A-Za-z0-9_-]{8,}$"),
-    "anthropic": re.compile(r"^sk-ant-[A-Za-z0-9_-]{8,}$"),
+    "anthropic": re.compile(r"^sk-ant-.+"),
     "google": re.compile(r"^AIza[A-Za-z0-9_-]{20,}$"),
 }
 
@@ -131,7 +133,12 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
             value = str(value).strip()
             if value:
                 _validate_api_key_format(family, value)
-                _verify_api_key_credentials(family, value, current_config)
+                _verify_api_key_credentials(
+                    family,
+                    value,
+                    current_config,
+                    str(updates.get("model", current_config.model)),
+                )
                 updates[field] = value
 
     _validate_selected_model_has_key(current_config, updates)
@@ -192,25 +199,36 @@ def _validate_api_key_format(family: str, value: str) -> None:
         )
 
 
-def _verify_api_key_credentials(family: str, value: str, config: LeaConfig) -> None:
-    request = _provider_verification_request(family, value, config)
+def _verify_api_key_credentials(
+    family: str,
+    value: str,
+    config: LeaConfig,
+    model: str | None = None,
+) -> None:
+    request = _provider_verification_request(family, value, config, model)
     if request is None:
         return
     try:
-        with urllib.request.urlopen(request, timeout=6) as response:
+        with urllib.request.urlopen(request, timeout=6, context=_ssl_context()) as response:
             if response.status >= 400:
                 raise SettingsValidationError(
                     f"Could not verify the {_provider_label(family)} API key.",
                     f"api_keys.{family}",
                 )
     except urllib.error.HTTPError as exc:
+        detail = _http_error_detail(exc)
         if exc.code in {401, 403}:
             raise SettingsValidationError(
-                f"The {_provider_label(family)} API key was rejected by the provider.",
+                _provider_auth_error_message(family, detail),
                 f"api_keys.{family}",
             ) from exc
+        if family == "anthropic" and _looks_like_model_error(detail):
+            raise SettingsValidationError(
+                f"Anthropic rejected the selected model: {detail}",
+                "model",
+            ) from exc
         raise SettingsValidationError(
-            f"Could not verify the {_provider_label(family)} API key. Provider returned HTTP {exc.code}.",
+            f"Could not verify the {_provider_label(family)} API key. Provider returned HTTP {exc.code}: {detail}",
             f"api_keys.{family}",
         ) from exc
     except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
@@ -224,6 +242,7 @@ def _provider_verification_request(
     family: str,
     value: str,
     config: LeaConfig,
+    model: str | None = None,
 ) -> urllib.request.Request | None:
     if family == "openai":
         base_url = (config.openai_base_url or "https://api.openai.com/v1").rstrip("/")
@@ -233,13 +252,22 @@ def _provider_verification_request(
             method="GET",
         )
     if family == "anthropic":
+        body = json.dumps(
+            {
+                "model": _anthropic_verification_model(model),
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }
+        ).encode("utf-8")
         return urllib.request.Request(
-            "https://api.anthropic.com/v1/models",
+            "https://api.anthropic.com/v1/messages",
+            data=body,
             headers={
                 "x-api-key": value,
                 "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
             },
-            method="GET",
+            method="POST",
         )
     if family == "google":
         return urllib.request.Request(
@@ -247,6 +275,56 @@ def _provider_verification_request(
             method="GET",
         )
     return None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def _anthropic_verification_model(model: str | None) -> str:
+    if model and _model_family(model) == "anthropic":
+        return model
+    return "claude-sonnet-4-6"
+
+
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    raw = exc.read().decode("utf-8", errors="replace").strip()
+    if not raw:
+        return exc.reason or "no response body"
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:500]
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        message = error.get("message")
+        error_type = error.get("type")
+        if message and error_type:
+            return f"{error_type}: {message}"
+        if message:
+            return str(message)
+    return raw[:500]
+
+
+def _provider_auth_error_message(family: str, detail: str) -> str:
+    if detail and detail != "no response body":
+        return f"The {_provider_label(family)} API key was rejected by the provider: {detail}"
+    return f"The {_provider_label(family)} API key was rejected by the provider."
+
+
+def _looks_like_model_error(detail: str) -> bool:
+    normalized = detail.lower()
+    return "model" in normalized and (
+        "not found" in normalized
+        or "does not exist" in normalized
+        or "invalid" in normalized
+        or "not supported" in normalized
+    )
 
 
 def _provider_label(family: str) -> str:

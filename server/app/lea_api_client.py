@@ -132,12 +132,36 @@ class LeaApiClient:
         }
         if self.config.model:
             config["model"] = {"name": self.config.model}
+            model_kwargs = self._provider_model_kwargs()
+            if model_kwargs:
+                config["model"]["model_kwargs"] = model_kwargs
         if self.config.max_turns is None:
             config["agent"] = {
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
             }
         return config
+
+    def _provider_model_kwargs(self) -> dict[str, str]:
+        family = _model_family(self.config.model)
+        if family == "anthropic" and self.config.anthropic_api_key:
+            return {"api_key": self.config.anthropic_api_key}
+        if family == "openai" and self.config.openai_api_key:
+            return {"api_key": self.config.openai_api_key}
+        if family == "google" and self.config.google_api_key:
+            return {"api_key": self.config.google_api_key}
+        return {}
+
+
+def _model_family(model: str | None) -> str | None:
+    normalized = str(model or "").lower()
+    if normalized.startswith(("claude-", "anthropic/")):
+        return "anthropic"
+    if normalized.startswith(("gpt-", "o1", "o3", "o4", "openai/")):
+        return "openai"
+    if normalized.startswith(("gemini", "google/")):
+        return "google"
+    return None
 
 
 def parse_sse_lines(response: Any) -> Iterable[dict[str, Any]]:

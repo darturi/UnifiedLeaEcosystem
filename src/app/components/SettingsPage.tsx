@@ -48,7 +48,7 @@ const PERMISSION_DETAILS: Record<PermissionTier, { title: string; description: s
 type ApiKeyFamily = (typeof MODEL_FAMILIES)[number]['key'];
 const API_KEY_PATTERNS: Record<ApiKeyFamily, RegExp> = {
   openai: /^sk-[A-Za-z0-9_-]{8,}$/,
-  anthropic: /^sk-ant-[A-Za-z0-9_-]{8,}$/,
+  anthropic: /^sk-ant-.+/,
   google: /^AIza[A-Za-z0-9_-]{20,}$/,
 };
 
