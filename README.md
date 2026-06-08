@@ -32,7 +32,7 @@ cp config/lea.local.example.toml config/lea.local.toml
 npm run setup:api
 ```
 
-`npm run setup:api` installs the Python services, downloads the pinned Mathlib build cache, and builds the bundled Lean workspace. This can take a while on the first run, but it prevents the first proof check from compiling Mathlib during `lean_check`.
+`npm run setup:api` installs the Python services and downloads the pinned Mathlib build cache. This can take a while on the first run, but it prevents the first proof check from compiling Mathlib during `lean_check`.
 
 If cloning from scratch, this is equivalent:
 
@@ -85,7 +85,7 @@ curl -I http://127.0.0.1:5173/
 
 If the submodule is missing, run `git submodule update --init --recursive`.
 
-If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A failing `Lean workspace Mathlib cache` check means the first check is compiling Mathlib locally; rerun `npm run setup:api` and wait for the Lean workspace build to finish.
+If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A failing `Lean workspace Mathlib cache` check means the first check is compiling Mathlib locally; rerun `npm run setup:api` and wait for the cache download to finish.
 
 ## Data
 

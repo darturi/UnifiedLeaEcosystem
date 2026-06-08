@@ -35,6 +35,9 @@ ensure(
 run("Installing UI adapter dependencies", ["uv", "sync"], path.join(root, "server"));
 run("Installing bundled Lea API dependencies", ["uv", "sync", "--extra", "api"], path.join(root, "external", "lea-prover"));
 run("Downloading Lean workspace cache", ["lake", "exe", "cache", "get"], path.join(root, "external", "lea-prover", "workspace"));
-run("Building Lean workspace", ["lake", "build"], path.join(root, "external", "lea-prover", "workspace"));
+ensure(
+  "external/lea-prover/workspace/.lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean",
+  "Lean Mathlib cache is missing after cache download.",
+);
 
 console.log("[setup] Done.");
