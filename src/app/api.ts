@@ -10,6 +10,17 @@ export interface PendingApproval {
   lean_code: string;
   theorem_name?: string | null;
   check_result?: string | null;
+  session_id?: string;
+  run_id?: string;
+}
+
+export interface ApprovalEvent extends PendingApproval {
+  id: string;
+  session_id?: string;
+  run_id?: string;
+  decision?: 'accept' | 'reject' | string | null;
+  feedback?: string | null;
+  resolved_at?: string | null;
 }
 
 export interface SessionSummary {
@@ -88,6 +99,7 @@ export interface SessionDetail extends SessionSummary {
   messages: ChatMessage[];
   code_steps: CodeStep[];
   status_events: StatusEvent[];
+  approval_events: ApprovalEvent[];
   usage_breakdown: UsageBreakdownRow[];
   active_run?: {
     id: string;

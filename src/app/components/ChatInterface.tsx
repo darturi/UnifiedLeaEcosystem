@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Send, Pause, Play, BarChart3, Loader2, Settings } from 'lucide-react';
-import { ApprovalDecision, ChatMessage, CodeStep, PendingApproval, SessionStatus, StatusEvent } from '../api';
+import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw } from 'lucide-react';
+import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
@@ -12,6 +12,7 @@ export function ChatInterface({
   messages,
   codeSteps,
   statusEvents,
+  approvalEvents,
   sessionStatus,
   onSubmit,
   onStepSelect,
@@ -19,6 +20,7 @@ export function ChatInterface({
   onOpenStats,
   onOpenSettings,
   onSubmitApproval,
+  onRetry,
   theoremName,
   currentStepIndex,
   activeTimelineStepIndex,
@@ -36,7 +38,9 @@ export function ChatInterface({
   codeSteps: CodeStep[];
   sessionStatus?: SessionStatus;
   statusEvents: StatusEvent[];
+  approvalEvents: ApprovalEvent[];
   onSubmit: (content: string) => Promise<boolean>;
+  onRetry: (content: string) => Promise<boolean>;
   onSubmitApproval: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
   onStepSelect: (stepIndex: number) => void;
   onTogglePause: () => void;
@@ -48,6 +52,7 @@ export function ChatInterface({
 }) {
   const [input, setInput] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRetrying, setIsRetrying] = useState(false);
   const terminalMessageId = useMemo(() => {
     if (isRunning || !sessionStatus || sessionStatus === 'running') {
       return null;
@@ -57,24 +62,78 @@ export function ChatInterface({
       .find((message) => message.role === 'assistant' || message.role === 'system');
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, sessionStatus]);
-  const timeline = useMemo(
-    () =>
-      buildStepTimeline({
-        messages,
-        codeSteps,
-        statusEvents,
-        terminalMessageId,
-      }),
-    [messages, codeSteps, statusEvents, terminalMessageId],
-  );
+  const runSections = useMemo(() => {
+    const runIds: string[] = [];
+    const runTimes = new Map<string, number>();
+    const addRun = (runId?: string | null, createdAt?: string | null) => {
+      if (!runId) {
+        return;
+      }
+      if (!runIds.includes(runId)) {
+        runIds.push(runId);
+      }
+      const parsed = Date.parse(createdAt || '');
+      if (Number.isFinite(parsed)) {
+        runTimes.set(runId, Math.min(runTimes.get(runId) ?? parsed, parsed));
+      }
+    };
+
+    messages.forEach((message) => addRun(message.run_id, message.created_at));
+    codeSteps.forEach((step) => addRun(step.run_id, step.created_at));
+    statusEvents.forEach((event) => addRun(event.run_id, event.created_at));
+    approvalEvents.forEach((approval) => addRun(approval.run_id, approval.resolved_at));
+    addRun(pendingApproval?.run_id);
+
+    runIds.sort((a, b) => (runTimes.get(a) ?? 0) - (runTimes.get(b) ?? 0));
+
+    let stepOffset = 0;
+    return runIds.map((runId, index) => {
+      const runMessages = messages.filter((message) => message.run_id === runId);
+      const runCodeSteps = codeSteps.filter((step) => step.run_id === runId);
+      const runStatusEvents = statusEvents.filter((event) => event.run_id === runId);
+      const runApprovals = approvalEvents.filter(
+        (approval) => approval.run_id === runId && approval.approval_id !== pendingApproval?.approval_id,
+      );
+      const runPendingApproval = pendingApproval?.run_id === runId ? pendingApproval : undefined;
+      const runSystemTerminal = [...runMessages].reverse().find((message) => message.role === 'system');
+      const runTerminalMessageId =
+        terminalMessageId && runMessages.some((message) => message.id === terminalMessageId)
+          ? terminalMessageId
+          : runSystemTerminal?.id ?? null;
+      const sectionTimeline = buildStepTimeline({
+        messages: runMessages,
+        codeSteps: runCodeSteps,
+        statusEvents: runStatusEvents,
+        terminalMessageId: runTerminalMessageId,
+      });
+      const section = {
+        id: runId,
+        attemptNumber: index + 1,
+        stepOffset,
+        timeline: sectionTimeline,
+        approvals: runApprovals,
+        pendingApproval: runPendingApproval,
+      };
+      stepOffset += sectionTimeline.stepItems.length;
+      return section;
+    });
+  }, [messages, codeSteps, statusEvents, approvalEvents, pendingApproval, terminalMessageId]);
   const highlightedStepIndex =
-    isRunning && activeTimelineStepIndex !== null
-      ? activeTimelineStepIndex
-      : currentStepIndex;
+    isRunning ? activeTimelineStepIndex : currentStepIndex;
+  const lastUserMessage = useMemo(
+    () => [...messages].reverse().find((message) => message.role === 'user'),
+    [messages],
+  );
+  const canRetry =
+    Boolean(lastUserMessage) &&
+    !isRunning &&
+    !isSubmitting &&
+    !isRetrying &&
+    (sessionStatus === 'failed' || sessionStatus === 'max_turns' || sessionStatus === 'max_spend');
 
   const submitInput = async () => {
     const content = input.trim();
-    if (!content || isRunning || isSubmitting) {
+    if (!content || isRunning || isSubmitting || isRetrying) {
       return;
     }
     setIsSubmitting(true);
@@ -83,6 +142,16 @@ export function ChatInterface({
       setInput('');
     }
     setIsSubmitting(false);
+  };
+
+  const retryLastQuery = async () => {
+    const content = lastUserMessage?.content.trim();
+    if (!content || !canRetry) {
+      return;
+    }
+    setIsRetrying(true);
+    await onRetry(content);
+    setIsRetrying(false);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -126,6 +195,112 @@ export function ChatInterface({
       : sessionStatus === 'failed' || sessionStatus === 'max_turns' || sessionStatus === 'max_spend'
       ? 'border border-destructive/30 bg-destructive/10 text-foreground'
       : 'bg-muted text-muted-foreground';
+
+  const renderMessageBubble = (message: ChatMessage) => {
+    const isUser = message.role === 'user';
+    const isSystem = message.role === 'system';
+    const baseMessageClass = isUser
+      ? 'bg-primary text-primary-foreground'
+      : isSystem
+      ? 'bg-accent text-accent-foreground'
+      : 'bg-muted text-muted-foreground';
+
+    return (
+      <div
+        key={message.id}
+        className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}
+      >
+        <div
+          className={`max-w-[80%] rounded-lg p-4 transition-all ${baseMessageClass}`}
+        >
+          {isUser ? (
+            <p className="whitespace-pre-wrap">{message.content}</p>
+          ) : (
+            <MarkdownMessage content={message.content} />
+          )}
+          <p className="text-xs opacity-70 mt-2">
+            {new Date(message.created_at).toLocaleTimeString()}
+          </p>
+        </div>
+      </div>
+    );
+  };
+
+  const renderGlobalLogs = (logs: StatusEvent[], label = 'Run setup') => {
+    if (logs.length === 0) {
+      return null;
+    }
+    return (
+      <div className="rounded-md bg-accent/70 p-3 text-xs leading-relaxed text-muted-foreground">
+        <div className="mb-1 font-semibold uppercase tracking-wide text-foreground/70">
+          {label}
+        </div>
+        <div className="space-y-1">
+          {logs.map((item: StatusEvent) => (
+            <div key={item.id}>
+              {new Date(item.created_at).toLocaleTimeString()} - {item.message}
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderStepItem = (item: any, globalStepIndex: number) => {
+    const step = item.codeStep;
+    const message = item.message;
+    const isActiveStep = globalStepIndex === highlightedStepIndex;
+    const activeStepClass = isActiveStep
+      ? 'ring-2 ring-foreground ring-offset-2 ring-offset-background bg-muted/80'
+      : '';
+    const content =
+      message?.content ||
+      (step ? codeStepFallbackContent(step) : 'Lea is preparing this step.');
+    const createdAt = message?.created_at || step?.created_at || new Date().toISOString();
+    const selectableIndex =
+      step && Number.isInteger(step.step_number) ? step.step_number - 1 : globalStepIndex;
+
+    return (
+      <div key={item.id} className="flex justify-start">
+        <div className="flex w-full flex-col gap-2 md:flex-row md:items-start">
+          <div
+            className={`max-w-[80%] cursor-pointer rounded-lg bg-muted p-4 text-muted-foreground transition-all hover:ring-2 hover:ring-foreground/40 md:max-w-[66%] ${activeStepClass}`}
+            onClick={() => onStepSelect(selectableIndex)}
+          >
+            <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-foreground/70">
+              <span>Step {item.stepNumber}</span>
+              {isRunning && isActiveStep && (
+                <Loader2 className="ml-2 inline h-3.5 w-3.5 animate-spin align-[-2px]" />
+              )}
+            </div>
+            <MarkdownMessage content={content} />
+            <p className="text-xs opacity-70 mt-2">
+              {new Date(createdAt).toLocaleTimeString()}
+            </p>
+          </div>
+          {renderLogList(item.logs)}
+        </div>
+      </div>
+    );
+  };
+
+  const renderTerminalMessage = (message: ChatMessage) => {
+    const isSystem = message.role === 'system';
+    const baseMessageClass = isSystem
+      ? 'bg-accent text-accent-foreground'
+      : terminalClass;
+
+    return (
+      <div key={message.id} className="flex justify-start">
+        <div className={`max-w-[80%] rounded-lg p-4 transition-all ${baseMessageClass}`}>
+          <MarkdownMessage content={message.content} />
+          <p className="text-xs opacity-70 mt-2">
+            {new Date(message.created_at).toLocaleTimeString()}
+          </p>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="flex flex-col h-full bg-background">
@@ -189,124 +364,50 @@ export function ChatInterface({
           </div>
         )}
 
-        {timeline.userAndSystemMessages.map((message: ChatMessage) => {
-          const isUser = message.role === 'user';
-          const isSystem = message.role === 'system';
-          const baseMessageClass = isUser
-            ? 'bg-primary text-primary-foreground'
-            : isSystem
-            ? 'bg-accent text-accent-foreground'
-            : 'bg-muted text-muted-foreground';
-
-          return (
-            <div
-              key={message.id}
-              className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}
-            >
-              <div
-                className={`max-w-[80%] rounded-lg p-4 transition-all ${baseMessageClass}`}
-              >
-                {isUser ? (
-                  <p className="whitespace-pre-wrap">{message.content}</p>
-                ) : (
-                  <MarkdownMessage content={message.content} />
-                )}
-                <p className="text-xs opacity-70 mt-2">
-                  {new Date(message.created_at).toLocaleTimeString()}
-                </p>
+        {runSections.map((section) => (
+          <div key={section.id} className="space-y-4">
+            {section.attemptNumber > 1 && (
+              <div className="flex items-center gap-3 py-2">
+                <div className="h-px flex-1 bg-border" />
+                <span className="shrink-0 rounded-md border border-border bg-background px-2 py-1 font-mono text-[0.65rem] uppercase tracking-widest text-muted-foreground">
+                  Attempt {section.attemptNumber}
+                </span>
+                <div className="h-px flex-1 bg-border" />
               </div>
-            </div>
-          );
-        })}
+            )}
 
-        {timeline.globalLogs.length > 0 && (
-          <div className="rounded-md bg-accent/70 p-3 text-xs leading-relaxed text-muted-foreground">
-            <div className="mb-1 font-semibold uppercase tracking-wide text-foreground/70">
-              Run setup
-            </div>
-            <div className="space-y-1">
-              {timeline.globalLogs.map((item: StatusEvent) => (
-                <div key={item.id}>
-                  {new Date(item.created_at).toLocaleTimeString()} - {item.message}
-                </div>
-              ))}
-            </div>
+            {section.timeline.userAndSystemMessages.map((message: ChatMessage) =>
+              renderMessageBubble(message),
+            )}
+
+            {renderGlobalLogs(section.timeline.globalLogs)}
+
+            {section.approvals.map((approval) => (
+              <TheoremApprovalPanel
+                key={approval.id}
+                approval={approval}
+                resolved={Boolean(approval.decision)}
+              />
+            ))}
+
+            {section.pendingApproval && (
+              <TheoremApprovalPanel
+                approval={section.pendingApproval}
+                isSubmitting={isSubmittingApproval}
+                error={approvalError}
+                onSubmit={onSubmitApproval}
+              />
+            )}
+
+            {section.timeline.stepItems.map((item: any) =>
+              renderStepItem(item, section.stepOffset + item.stepIndex),
+            )}
+
+            {section.timeline.terminalMessages.map((message: ChatMessage) =>
+              renderTerminalMessage(message),
+            )}
           </div>
-        )}
-
-        {pendingApproval && (
-          <TheoremApprovalPanel
-            approval={pendingApproval}
-            isSubmitting={isSubmittingApproval}
-            error={approvalError}
-            onSubmit={onSubmitApproval}
-          />
-        )}
-
-        {timeline.stepItems.map((item) => {
-          const stepIndex = item.stepIndex;
-          const step = item.codeStep;
-          const message = item.message;
-          const isSelectableStep = stepIndex < timeline.stepItems.length;
-          const isActiveStep = stepIndex === highlightedStepIndex;
-          const activeStepClass = isActiveStep
-            ? 'ring-2 ring-foreground ring-offset-2 ring-offset-background bg-muted/80'
-            : '';
-          const selectableStepClass = isSelectableStep
-            ? 'cursor-pointer hover:ring-2 hover:ring-foreground/40'
-            : '';
-          const content =
-            message?.content ||
-            (step ? codeStepFallbackContent(step) : 'Lea is preparing this step.');
-          const createdAt = message?.created_at || step?.created_at || new Date().toISOString();
-
-          return (
-            <div key={item.id} className="flex justify-start">
-              <div
-                className="flex w-full flex-col gap-2 md:flex-row md:items-start"
-              >
-                <div
-                  className={`max-w-[80%] rounded-lg bg-muted p-4 text-muted-foreground transition-all md:max-w-[66%] ${activeStepClass} ${selectableStepClass}`}
-                  onClick={() => {
-                    if (isSelectableStep) {
-                      onStepSelect(stepIndex);
-                    }
-                  }}
-                >
-                  <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-foreground/70">
-                    <span>Step {item.stepNumber}</span>
-                    {isRunning && isActiveStep && (
-                      <Loader2 className="ml-2 inline h-3.5 w-3.5 animate-spin align-[-2px]" />
-                    )}
-                  </div>
-                  <MarkdownMessage content={content} />
-                  <p className="text-xs opacity-70 mt-2">
-                    {new Date(createdAt).toLocaleTimeString()}
-                  </p>
-                </div>
-                {renderLogList(item.logs)}
-              </div>
-            </div>
-          );
-        })}
-
-        {timeline.terminalMessages.map((message: ChatMessage) => {
-          const isSystem = message.role === 'system';
-          const baseMessageClass = isSystem
-            ? 'bg-accent text-accent-foreground'
-            : terminalClass;
-
-          return (
-            <div key={message.id} className="flex justify-start">
-              <div className={`max-w-[80%] rounded-lg p-4 transition-all ${baseMessageClass}`}>
-                <MarkdownMessage content={message.content} />
-                <p className="text-xs opacity-70 mt-2">
-                  {new Date(message.created_at).toLocaleTimeString()}
-                </p>
-              </div>
-            </div>
-          );
-        })}
+        ))}
 
         {isSubmitting && !isRunning && (
           <div className="text-sm text-muted-foreground">
@@ -315,13 +416,43 @@ export function ChatInterface({
         )}
 
         {error && (
-          <div className="rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive">
-            {error}
+          <div className="flex flex-col gap-3 rounded-md border border-destructive bg-destructive/10 p-3 text-sm text-destructive">
+            <div>{error}</div>
+            {canRetry && (
+              <button
+                type="button"
+                onClick={retryLastQuery}
+                className={[
+                  'inline-flex w-fit items-center gap-2 rounded-md bg-primary px-3 py-2',
+                  'text-primary-foreground transition-opacity hover:opacity-90',
+                  'disabled:cursor-not-allowed disabled:opacity-50',
+                ].join(' ')}
+              >
+                <RotateCcw className="h-4 w-4" />
+                Retry
+              </button>
+            )}
           </div>
         )}
       </div>
 
       <div className="p-4 border-t border-border">
+        {canRetry && !error && (
+          <div className="mb-3 flex justify-end">
+            <button
+              type="button"
+              onClick={retryLastQuery}
+              className={[
+                'inline-flex items-center gap-2 rounded-md border border-border bg-secondary px-3 py-2',
+                'text-sm text-secondary-foreground transition-opacity hover:opacity-90',
+                'disabled:cursor-not-allowed disabled:opacity-50',
+              ].join(' ')}
+            >
+              <RotateCcw className="h-4 w-4" />
+              Retry
+            </button>
+          </div>
+        )}
         <form onSubmit={handleSubmit} className="flex items-end gap-2">
           <textarea
             value={input}
@@ -337,7 +468,7 @@ export function ChatInterface({
           />
           <button
             type="submit"
-            disabled={isRunning || isSubmitting}
+            disabled={isRunning || isSubmitting || isRetrying}
             className={[
               'flex items-center gap-2 rounded-md bg-primary px-4 py-2',
               'text-primary-foreground transition-opacity hover:opacity-90',
@@ -345,7 +476,7 @@ export function ChatInterface({
             ].join(' ')}
           >
             <Send className="w-4 h-4" />
-            {isSubmitting ? 'Sending' : 'Send'}
+            {isSubmitting || isRetrying ? 'Sending' : 'Send'}
           </button>
         </form>
       </div>

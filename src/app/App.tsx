@@ -10,6 +10,7 @@ import {
   ChatMessage,
   CodeStep,
   ApprovalDecision,
+  ApprovalEvent,
   PendingApproval,
   SessionSummary,
   SessionDetail,
@@ -35,6 +36,7 @@ export default function App() {
   const [approvalError, setApprovalError] = useState<string>();
   const [error, setError] = useState<string>();
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
+  const [approvalEvents, setApprovalEvents] = useState<ApprovalEvent[]>([]);
   const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
   const eventSourceRef = useRef<EventSource | null>(null);
   const codeStepCountRef = useRef(0);
@@ -96,11 +98,20 @@ export default function App() {
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
+    setApprovalEvents(detail.approval_events || []);
     codeStepCountRef.current = detail.code_steps.length;
     setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
     setCurrentRunId(detail.active_run?.id);
-    setPendingApproval(detail.active_run?.pending_approval || undefined);
+    setPendingApproval(
+      detail.active_run?.pending_approval
+        ? {
+            ...detail.active_run.pending_approval,
+            session_id: detail.id,
+            run_id: detail.active_run.id,
+          }
+        : undefined,
+    );
     setIsRunning(Boolean(detail.active_run));
     setApprovalError(undefined);
   };
@@ -161,7 +172,8 @@ export default function App() {
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       appendMessage(run.message);
-      setStatusEvents([
+      setStatusEvents((current) => [
+        ...current,
         {
           id: `submitted-${run.run_id}`,
           session_id: run.session_id,
@@ -184,6 +196,7 @@ export default function App() {
       eventSourceRef.current = source;
 
       let liveAssistantId = `live-${run.run_id}`;
+      let sawTerminalEvent = false;
       source.addEventListener('assistant_delta', (event) => {
         const payload = JSON.parse((event as MessageEvent).data);
         setMessages((current) => {
@@ -285,22 +298,57 @@ export default function App() {
       });
 
       source.addEventListener('approval_requested', (event) => {
-        const payload = JSON.parse((event as MessageEvent).data) as PendingApproval;
+        const payload = {
+          ...(JSON.parse((event as MessageEvent).data) as PendingApproval),
+          session_id: run.session_id,
+          run_id: run.run_id,
+        };
         setPendingApproval(payload);
+        setApprovalEvents((current) => {
+          if (current.some((item) => item.approval_id === payload.approval_id)) {
+            return current;
+          }
+          return [
+            ...current,
+            {
+              ...payload,
+              id: `${run.run_id}:${payload.approval_id}`,
+              session_id: run.session_id,
+              run_id: run.run_id,
+              decision: null,
+              feedback: null,
+              resolved_at: null,
+            },
+          ];
+        });
         setApprovalError(undefined);
       });
 
       source.addEventListener('approval_resolved', (event) => {
         const payload = JSON.parse((event as MessageEvent).data) as {
           approval_id?: string;
+          decision?: string;
+          feedback?: string | null;
         };
+        setApprovalEvents((current) =>
+          current.map((item) =>
+            item.approval_id === payload.approval_id
+              ? {
+                  ...item,
+                  decision: payload.decision || 'resolved',
+                  feedback: payload.feedback || null,
+                  resolved_at: new Date().toISOString(),
+                }
+              : item,
+          ),
+        );
         setPendingApproval((current) =>
           current?.approval_id === payload.approval_id ? undefined : current,
         );
         setApprovalError(undefined);
       });
 
-      source.addEventListener('error', (event) => {
+      source.addEventListener('run_error', (event) => {
         const data = (event as MessageEvent).data;
         if (data) {
           const payload = JSON.parse(data);
@@ -309,6 +357,7 @@ export default function App() {
       });
 
       source.addEventListener('done', async () => {
+        sawTerminalEvent = true;
         eventSourceRef.current = null;
         source.close();
         setIsRunning(false);
@@ -324,14 +373,27 @@ export default function App() {
         if (eventSourceRef.current !== source || source.readyState === EventSource.CLOSED) {
           return;
         }
+        if (sawTerminalEvent) {
+          eventSourceRef.current = null;
+          source.close();
+          return;
+        }
         eventSourceRef.current = null;
         source.close();
         setIsRunning(false);
         setCurrentRunId(undefined);
         setPendingApproval(undefined);
         setActiveTimelineStep(null);
-        reconcileSession(run.session_id).catch(() => undefined);
-        setError('Lost connection to the Lea backend.');
+        try {
+          const detail = await getSession(run.session_id);
+          applySessionDetail(detail);
+          await refreshSessions();
+          if (detail.active_run || detail.status === 'running') {
+            setError('Lost connection to the Lea backend.');
+          }
+        } catch {
+          setError('Lost connection to the Lea backend.');
+        }
       };
       return true;
     } catch (err) {
@@ -387,6 +449,7 @@ export default function App() {
               setCodeSteps([]);
               codeStepCountRef.current = 0;
               setStatusEvents([]);
+              setApprovalEvents([]);
               setCurrentStepIndex(0);
               setActiveTimelineStep(null);
               setCurrentRunId(undefined);
@@ -410,7 +473,9 @@ export default function App() {
             codeSteps={codeSteps}
             sessionStatus={selectedSession?.status}
             statusEvents={statusEvents}
+            approvalEvents={approvalEvents}
             onSubmit={handleSubmit}
+            onRetry={handleSubmit}
             onSubmitApproval={handleSubmitApproval}
             onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}

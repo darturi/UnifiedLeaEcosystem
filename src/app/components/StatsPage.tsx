@@ -316,6 +316,13 @@ function TurnCostBreakdown({
   rows: UsageBreakdownRow[];
   runCount: number;
 }) {
+  const rowsByRun = rows.reduce((groups, row) => {
+    const key = row.run_number || 1;
+    groups.set(key, [...(groups.get(key) || []), row]);
+    return groups;
+  }, new Map<number, UsageBreakdownRow[]>());
+  const groupedRows = [...rowsByRun.entries()].sort(([a], [b]) => a - b);
+
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-border p-4">
       <div className="flex items-center justify-between gap-3">
@@ -335,40 +342,56 @@ function TurnCostBreakdown({
         </div>
       ) : (
         <div className="overflow-hidden rounded-md border border-border">
-          <div className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-2 border-b border-border bg-muted/50 px-3 py-2 font-mono text-[0.6rem] uppercase tracking-widest text-muted-foreground">
-            <span>Step</span>
-            <span className="text-right">In</span>
-            <span className="text-right">Out</span>
-            <span className="text-right">Cost</span>
-          </div>
-          <div className="divide-y divide-border">
-            {rows.map((row) => {
-              const label = runCount > 1 ? `Run ${row.run_number} · ${row.label}` : row.label;
-              return (
-                <div
-                  key={`${row.run_id || row.run_number}-${row.ordinal}-${row.phase}`}
-                  className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-2 px-3 py-2"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-sm text-foreground">{label}</div>
-                    <div className="font-mono text-[0.65rem] text-muted-foreground">
-                      {fmtNumber(row.total_tokens)} tok
-                    </div>
+          {groupedRows.map(([runNumber, runRows], groupIndex) => {
+            const runInputTokens = runRows.reduce((total, row) => total + row.input_tokens, 0);
+            const runOutputTokens = runRows.reduce((total, row) => total + row.output_tokens, 0);
+            const runCost = runRows.reduce((total, row) => total + row.cost_usd, 0);
+            return (
+              <div key={runNumber} className={groupIndex > 0 ? 'border-t border-border' : ''}>
+                {runCount > 1 && (
+                  <div className="flex items-center justify-between gap-3 bg-muted/60 px-3 py-2">
+                    <span className="font-mono text-[0.65rem] uppercase tracking-widest text-foreground">
+                      Run {runNumber}
+                    </span>
+                    <span className="shrink-0 font-mono text-[0.65rem] text-muted-foreground">
+                      {fmtNumber(runInputTokens + runOutputTokens)} tok - {fmtCost(runCost)}
+                    </span>
                   </div>
-                  <span className="self-center text-right font-mono text-xs text-muted-foreground">
-                    {fmtNumber(row.input_tokens)}
-                  </span>
-                  <span className="self-center text-right font-mono text-xs text-muted-foreground">
-                    {fmtNumber(row.output_tokens)}
-                  </span>
-                  <span className="self-center text-right font-mono text-xs" style={{ color: MONEY_COLOR }}>
-                    {fmtCost(row.cost_usd)}
-                  </span>
+                )}
+                <div className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-2 border-b border-border bg-muted/40 px-3 py-2 font-mono text-[0.6rem] uppercase tracking-widest text-muted-foreground">
+                  <span>Step</span>
+                  <span className="text-right">In</span>
+                  <span className="text-right">Out</span>
+                  <span className="text-right">Cost</span>
                 </div>
-              );
-            })}
+                <div className="divide-y divide-border">
+                  {runRows.map((row) => (
+                    <div
+                      key={`${row.run_id || row.run_number}-${row.ordinal}-${row.phase}`}
+                      className="grid grid-cols-[minmax(0,1fr)_5rem_5rem_5rem] gap-2 px-3 py-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm text-foreground">{row.label}</div>
+                        <div className="font-mono text-[0.65rem] text-muted-foreground">
+                          {fmtNumber(row.total_tokens)} tok
+                        </div>
+                      </div>
+                      <span className="self-center text-right font-mono text-xs text-muted-foreground">
+                        {fmtNumber(row.input_tokens)}
+                      </span>
+                      <span className="self-center text-right font-mono text-xs text-muted-foreground">
+                        {fmtNumber(row.output_tokens)}
+                      </span>
+                      <span className="self-center text-right font-mono text-xs" style={{ color: MONEY_COLOR }}>
+                        {fmtCost(row.cost_usd)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
           </div>
-        </div>
       )}
     </div>
   );

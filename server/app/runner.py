@@ -218,12 +218,18 @@ def _resolve_lea_path(path: str, lea_root: Path | None) -> Path:
     return (lea_root / candidate).resolve()
 
 
+def _is_proposal_path(path: str | Path) -> bool:
+    return ".lea_proposals" in Path(path).parts
+
+
 def _emit_file_snapshot(
     *,
     context: RunnerContext,
     path: Path,
     emitted: set[tuple[str, int, int]],
 ) -> dict[str, Any] | None:
+    if _is_proposal_path(path):
+        return None
     if not path.exists() or path.suffix != ".lean":
         return None
     stat = path.stat()
@@ -368,6 +374,19 @@ def _final_text(frame: dict[str, Any]) -> str | None:
         if value:
             return value
     return None
+
+
+def _display_terminal_text(status: str | None, final_text: str | None) -> str | None:
+    if not final_text:
+        return final_text
+    if status == "failed" and "theorem translation failed" in final_text.lower():
+        attempts = re.search(r"after\s+(\d+)\s+attempts", final_text, re.IGNORECASE)
+        attempt_text = f" after {attempts.group(1)} attempts" if attempts else ""
+        return (
+            f"The theorem translation preflight failed{attempt_text}. "
+            "Lea could not produce a Lean statement that typechecked. You can retry this request."
+        )
+    return final_text
 
 
 def _first_string(frame: dict[str, Any], *keys: str) -> str | None:
@@ -584,6 +603,8 @@ def _emit_code_payload(
     steps: list[dict[str, Any]] = []
 
     for path, code, turn in payloads:
+        if path and _is_proposal_path(path):
+            continue
         if not code and path:
             file_path = _resolve_lea_path(path, context.config.lea_root)
             step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
@@ -842,6 +863,17 @@ def _api_run_status_to_local(status: str | None) -> str | None:
     return None
 
 
+def _api_run_terminal_status(run_status: dict[str, Any]) -> str | None:
+    result = run_status.get("result")
+    if isinstance(result, dict):
+        reason = str(result.get("reason") or "").lower()
+        if reason in {"theorem_translation_failed", "failed", "error"}:
+            return "failed"
+        if reason in {"max_turns", "max-turns"}:
+            return "max_turns"
+    return _api_run_status_to_local(run_status.get("status"))
+
+
 def _is_timeout(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError | socket.timeout) or "timed out" in str(exc).lower()
 
@@ -850,7 +882,7 @@ def run_lea(context: RunnerContext) -> None:
     if not active_run_lock.acquire(blocking=False):
         store.update_run(context.run_id, "failed", final_text="Another Lea run is already active.")
         store.touch_session(context.session_id, "failed")
-        emit(context.events, "error", {"message": "Another Lea run is already active."})
+        emit(context.events, "run_error", {"message": "Another Lea run is already active."})
         emit(context.events, "done", {"status": "failed"})
         return
 
@@ -1010,7 +1042,7 @@ def run_lea(context: RunnerContext) -> None:
             if terminal_status is None:
                 terminal_run_status = client.get_run(api_run_id)
                 _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
-                terminal_status = _api_run_status_to_local(terminal_run_status.get("status"))
+                terminal_status = _api_run_terminal_status(terminal_run_status)
                 status_input_tokens, status_output_tokens = _usage(terminal_run_status)
                 input_tokens = _merge_usage_total(input_tokens, status_input_tokens)
                 output_tokens = _merge_usage_total(output_tokens, status_output_tokens)
@@ -1073,12 +1105,15 @@ def run_lea(context: RunnerContext) -> None:
             if transcript_assistant_text:
                 _emit_chat_message(context, "assistant", transcript_assistant_text)
                 persisted_assistant_texts.append(transcript_assistant_text)
-        terminal_notice = terminal_error or (final_text if terminal_status in {"max_turns", "max_spend"} else None)
+        terminal_notice = terminal_error or (
+            final_text if terminal_status in {"failed", "max_turns", "max_spend"} else None
+        )
+        display_text = _display_terminal_text(terminal_status, terminal_error or final_text)
 
-        if final_text and final_text not in persisted_assistant_texts:
-            _emit_chat_message(context, "system" if terminal_notice else "assistant", final_text)
+        if display_text and display_text not in persisted_assistant_texts:
+            _emit_chat_message(context, "system" if terminal_notice else "assistant", display_text)
         if terminal_status == "failed":
-            emit(context.events, "error", {"message": terminal_error or final_text or "Lea API run failed."})
+            emit(context.events, "run_error", {"message": display_text or "Lea API run failed."})
 
         store.update_run(
             context.run_id,
@@ -1114,7 +1149,7 @@ def run_lea(context: RunnerContext) -> None:
         elif api_run_id and isinstance(exc, LeaApiError):
             try:
                 run_status = client.get_run(api_run_id)
-                mapped_status = _api_run_status_to_local(run_status.get("status"))
+                mapped_status = _api_run_terminal_status(run_status)
                 if mapped_status:
                     final_text = _final_text(run_status) or str(exc)
                     status_input_tokens, status_output_tokens = _usage(run_status)
@@ -1136,7 +1171,7 @@ def run_lea(context: RunnerContext) -> None:
                     )
                     store.set_run_pending_approval(context.run_id, None)
                     store.touch_session(context.session_id, mapped_status)
-                    emit(context.events, "error", {"message": final_text})
+                    emit(context.events, "run_error", {"message": final_text})
                     emit(context.events, "done", {"status": mapped_status, "api_run_id": api_run_id})
                     return
             except Exception:
@@ -1151,7 +1186,7 @@ def run_lea(context: RunnerContext) -> None:
         )
         store.set_run_pending_approval(context.run_id, None)
         store.touch_session(context.session_id, "failed")
-        emit(context.events, "error", {"message": message})
+        emit(context.events, "run_error", {"message": message})
         emit(context.events, "done", {"status": "failed", "api_run_id": api_run_id})
     finally:
         active_run_lock.release()

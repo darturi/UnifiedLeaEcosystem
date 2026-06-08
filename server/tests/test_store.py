@@ -178,6 +178,51 @@ def test_usage_breakdown_falls_back_to_raw_event_log(tmp_path, monkeypatch):
     assert detail["usage_breakdown"][2]["input_tokens"] == 10
 
 
+def test_session_detail_includes_approval_events_from_raw_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(store, "RAW_EVENT_LOG_DIR", tmp_path / "logs")
+    db.init_db()
+
+    session = store.create_session("Approval history")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.RAW_EVENT_LOG_DIR.mkdir()
+    log_path = store.RAW_EVENT_LOG_DIR / f"{run['id']}.jsonl"
+    frames = [
+        {
+            "type": "approval_requested",
+            "payload": {
+                "type": "approval_requested",
+                "approval_id": "ap-1",
+                "tier": "theorem_translation",
+                "candidate": 1,
+                "lean_code": "theorem demo : True := by\n  trivial",
+                "theorem_name": "demo",
+                "check_result": "warning",
+            },
+        },
+        {
+            "type": "approval_resolved",
+            "payload": {
+                "type": "approval_resolved",
+                "approval_id": "ap-1",
+                "decision": "reject",
+                "feedback": "Use a stronger statement.",
+            },
+        },
+    ]
+    log_path.write_text("\n".join(json.dumps(frame) for frame in frames))
+
+    detail = store.session_detail(session["id"])
+
+    assert len(detail["approval_events"]) == 1
+    approval = detail["approval_events"][0]
+    assert approval["approval_id"] == "ap-1"
+    assert approval["candidate"] == 1
+    assert approval["lean_code"].startswith("theorem demo")
+    assert approval["decision"] == "reject"
+    assert approval["feedback"] == "Use a stronger statement."
+
+
 def test_session_usage_rollups_include_multiple_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

@@ -156,6 +156,32 @@ def test_snapshot_emits_code_step_for_lean_write(tmp_path, monkeypatch):
     assert detail["status_events"][0]["step_number"] == item["payload"]["step_number"]
 
 
+def test_snapshot_ignores_theorem_translation_proposals(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    proposal = lea_root / "workspace" / "proofs" / ".lea_proposals" / "candidate.lean"
+    proposal.parent.mkdir(parents=True)
+    proposal.write_text("import Mathlib\n\ntheorem demo : True := by\n  sorry")
+
+    session = store.create_session("demo")
+    run = store.create_run(session["id"], "o4-mini", None, 2)
+    context = RunnerContext(
+        session_id=session["id"],
+        run_id=run["id"],
+        task="demo",
+        config=make_config(tmp_path, lea_root=lea_root),
+        events=Queue(),
+    )
+
+    step = _emit_file_snapshot(context=context, path=proposal, emitted=set())
+    detail = store.session_detail(session["id"])
+
+    assert step is None
+    assert detail["code_steps"] == []
+    assert context.events.empty()
+
+
 def test_resolve_lea_paths(tmp_path):
     lea_root = tmp_path / "lea"
     repo_relative = _resolve_lea_path("proofs/demo.lean", lea_root)
@@ -343,6 +369,12 @@ def test_terminal_run_status_cost_overrides_partial_usage(tmp_path, monkeypatch)
 
 def test_smaller_terminal_usage_does_not_erase_streamed_preflight_cost(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    noisy_failure = (
+        "Error: theorem translation failed: TheoremTranslationError: theorem translation failed "
+        "to typecheck after 3 attempts.\n\n"
+        "Attempt 1 candidate:\nimport Mathlib\n\n"
+        "Attempt 1 diagnostics:\nerror: unexpected token 'in'; expected ','"
+    )
     client = FakeLeaApiClient(
         events=[
             {"seq": 0, "type": "usage_updated", "input_tokens": 30, "output_tokens": 15, "cost": 0.003},
@@ -350,7 +382,7 @@ def test_smaller_terminal_usage_does_not_erase_streamed_preflight_cost(tmp_path,
                 "seq": 1,
                 "type": "finished",
                 "reason": "theorem_translation_failed",
-                "text": "Error: theorem translation failed",
+                "text": noisy_failure,
                 "usage": {"input_tokens": 0, "output_tokens": 0},
                 "cost": 0.0,
             },
@@ -369,13 +401,61 @@ def test_smaller_terminal_usage_does_not_erase_streamed_preflight_cost(tmp_path,
     run_lea(context)
 
     run = store.get_run(context.run_id)
+    detail = store.session_detail(context.session_id)
     events = drain_events(context.events)
     assert run["status"] == "failed"
     assert run["input_tokens"] == 30
     assert run["output_tokens"] == 15
     assert abs(run["cost_usd"] - 0.003) < 1e-9
+    assert run["final_text"] == noisy_failure
+    assert detail["messages"][-1]["role"] == "system"
+    assert detail["messages"][-1]["content"] == (
+        "The theorem translation preflight failed after 3 attempts. "
+        "Lea could not produce a Lean statement that typechecked. You can retry this request."
+    )
+    assert any(
+        event["type"] == "run_error"
+        and event["payload"]["message"] == detail["messages"][-1]["content"]
+        for event in events
+    )
     assert events[-1]["payload"]["status"] == "failed"
     assert events[-1]["payload"]["cost_usd"] == 0.003
+
+
+def test_completed_api_status_with_theorem_translation_failure_maps_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    noisy_failure = (
+        "Error: theorem translation failed: TheoremTranslationError: theorem translation failed "
+        "to typecheck after 3 attempts."
+    )
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "usage_updated", "input_tokens": 30, "output_tokens": 15, "cost": 0.003},
+        ],
+        status={
+            "status": "completed",
+            "result": {
+                "reason": "theorem_translation_failed",
+                "text": noisy_failure,
+                "usage": {"input_tokens": 30, "output_tokens": 15},
+                "cost": 0.003,
+            },
+        },
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    run = store.get_run(context.run_id)
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert run["status"] == "failed"
+    assert run["final_text"] == noisy_failure
+    assert detail["messages"][-1]["content"] == (
+        "The theorem translation preflight failed after 3 attempts. "
+        "Lea could not produce a Lean statement that typechecked. You can retry this request."
+    )
+    assert events[-1]["payload"]["status"] == "failed"
 
 
 def test_runner_persists_turn_usage_breakdown(tmp_path, monkeypatch):
@@ -1017,7 +1097,7 @@ def test_api_failure_marks_run_failed_and_emits_error(tmp_path, monkeypatch):
 
     events = drain_events(context.events)
     assert store.get_run(context.run_id)["status"] == "failed"
-    assert any(event["type"] == "error" and event["payload"]["message"] == "proof failed" for event in events)
+    assert any(event["type"] == "run_error" and event["payload"]["message"] == "proof failed" for event in events)
     assert events[-1]["type"] == "done"
     assert events[-1]["payload"]["status"] == "failed"
 

@@ -1,23 +1,28 @@
 import { useState } from 'react';
 import { Check, X } from 'lucide-react';
-import { ApprovalDecision, PendingApproval } from '../api';
+import { ApprovalDecision, ApprovalEvent, PendingApproval } from '../api';
 
 export function TheoremApprovalPanel({
   approval,
   isSubmitting,
   error,
   onSubmit,
+  resolved,
 }: {
-  approval: PendingApproval;
-  isSubmitting: boolean;
+  approval: PendingApproval | ApprovalEvent;
+  isSubmitting?: boolean;
   error?: string;
-  onSubmit: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
+  onSubmit?: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
+  resolved?: boolean;
 }) {
   const [feedback, setFeedback] = useState('');
   const [showFeedback, setShowFeedback] = useState(false);
   const trimmedFeedback = feedback.trim();
 
   const reject = async () => {
+    if (!onSubmit) {
+      return;
+    }
     if (!showFeedback) {
       setShowFeedback(true);
       return;
@@ -27,18 +32,28 @@ export function TheoremApprovalPanel({
     }
     await onSubmit('reject', trimmedFeedback);
   };
+  const decision = 'decision' in approval ? approval.decision : null;
 
   return (
-    <div className="rounded-md border border-primary/30 bg-accent/70 p-4 text-foreground">
+    <div className={`rounded-md border p-4 text-foreground ${resolved ? 'border-border bg-muted/70' : 'border-primary/30 bg-accent/70'}`}>
       <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div className="text-sm font-semibold">Review theorem translation</div>
+          <div className="text-sm font-semibold">
+            {resolved ? 'Theorem translation reviewed' : 'Review theorem translation'}
+          </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {approval.theorem_name || 'Unnamed theorem'} · Candidate {approval.candidate}
           </div>
         </div>
-        <div className="shrink-0 rounded-md bg-background px-2 py-1 text-xs text-muted-foreground">
-          {approval.tier}
+        <div className="flex shrink-0 flex-wrap gap-2">
+          {decision && (
+            <div className={`rounded-md px-2 py-1 text-xs ${decision === 'accept' ? 'bg-green-500/15 text-green-700' : 'bg-destructive/10 text-destructive'}`}>
+              {decision === 'accept' ? 'Accepted' : decision === 'reject' ? 'Rejected' : decision}
+            </div>
+          )}
+          <div className="rounded-md bg-background px-2 py-1 text-xs text-muted-foreground">
+            {approval.tier}
+          </div>
         </div>
       </div>
 
@@ -75,12 +90,22 @@ export function TheoremApprovalPanel({
         </div>
       )}
 
+      {resolved && 'feedback' in approval && approval.feedback && (
+        <div className="mt-3 rounded-md border border-border bg-background p-3 text-xs text-muted-foreground">
+          <div className="mb-1 font-semibold uppercase tracking-wide text-foreground/70">
+            Rejection feedback
+          </div>
+          <p className="whitespace-pre-wrap">{approval.feedback}</p>
+        </div>
+      )}
+
       {error && (
         <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
           {error}
         </div>
       )}
 
+      {!resolved && onSubmit && (
       <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:justify-end">
         <button
           type="button"
@@ -107,6 +132,7 @@ export function TheoremApprovalPanel({
           Accept
         </button>
       </div>
+      )}
     </div>
   );
 }

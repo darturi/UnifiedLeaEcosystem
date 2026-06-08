@@ -334,6 +334,7 @@ def session_detail(session_id: str) -> dict | None:
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [row_to_dict(row) for row in code_steps],
         "status_events": [row_to_dict(row) for row in status_events],
+        "approval_events": approval_events_for_session(session_id),
         "usage_breakdown": usage_breakdown_for_session(session_id),
         "active_run": _normalize_run(row_to_dict(active_run)) if active_run else None,
     }
@@ -491,6 +492,67 @@ def _usage_breakdown_from_raw_logs(session_id: str) -> list[dict]:
             row["ordinal"] = ordinal
         rows.extend(_normalize_usage_breakdown_row(row) for row in run_rows)
     return rows
+
+
+def approval_events_for_session(session_id: str) -> list[dict]:
+    with connect() as conn:
+        runs = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                select id
+                from runs
+                where session_id = ?
+                order by created_at asc, id asc
+                """,
+                (session_id,),
+            ).fetchall()
+        ]
+    approvals: list[dict] = []
+    for run in runs:
+        log_path = RAW_EVENT_LOG_DIR / f"{run['id']}.jsonl"
+        if not log_path.exists():
+            continue
+        approvals.extend(_approval_events_from_log(log_path, run["id"], session_id))
+    return approvals
+
+
+def _approval_events_from_log(path, run_id: str, session_id: str) -> list[dict]:
+    approvals: dict[str, dict] = {}
+    order: list[str] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else frame
+            frame_type = str(frame.get("type") or _event_type(payload)).lower()
+            approval_id = str(payload.get("approval_id") or "")
+            if not approval_id:
+                continue
+            if frame_type == "approval_requested":
+                if approval_id not in approvals:
+                    order.append(approval_id)
+                approvals[approval_id] = {
+                    "id": f"{run_id}:{approval_id}",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "approval_id": approval_id,
+                    "tier": payload.get("tier"),
+                    "candidate": _optional_int(payload.get("candidate")),
+                    "lean_code": str(payload.get("lean_code") or ""),
+                    "theorem_name": payload.get("theorem_name"),
+                    "check_result": payload.get("check_result"),
+                    "decision": None,
+                    "feedback": None,
+                    "resolved_at": None,
+                }
+            elif frame_type == "approval_resolved" and approval_id in approvals:
+                approvals[approval_id]["decision"] = payload.get("decision") or "resolved"
+                approvals[approval_id]["feedback"] = payload.get("feedback")
+                approvals[approval_id]["resolved_at"] = payload.get("created_at")
+    return [approvals[approval_id] for approval_id in order if approval_id in approvals]
 
 
 def _usage_breakdown_from_log(path, run_number: int) -> tuple[list[dict], dict[str, float | int]]:
