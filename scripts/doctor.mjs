@@ -57,6 +57,24 @@ checks.push(check(
   existsSync(path.join(root, "external", "lea-prover", ".venv", "bin", "python")),
   "run npm run setup:api if missing",
 ));
+checks.push(check(
+  "Lean workspace Mathlib cache",
+  existsSync(path.join(
+    root,
+    "external",
+    "lea-prover",
+    "workspace",
+    ".lake",
+    "packages",
+    "mathlib",
+    ".lake",
+    "build",
+    "lib",
+    "lean",
+    "Mathlib.olean",
+  )),
+  "run npm run setup:api; otherwise the first lean_check may compile Mathlib for several minutes",
+));
 
 const configPath = path.join(root, "config", "lea.local.toml");
 let leaApiUrl = "http://127.0.0.1:8000";
