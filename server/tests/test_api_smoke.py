@@ -70,6 +70,67 @@ def test_stats_endpoint_returns_usage_rollups(tmp_path, monkeypatch):
     assert body["models"][0]["cost_usd"] == 0.03
 
 
+def test_project_crud_and_run_selection(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(
+            model="o4-mini",
+            max_turns=2,
+            lea_api_base_url="http://127.0.0.1:8000",
+            lea_root=tmp_path / "lea",
+        ),
+    )
+
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="Epsilon"))
+    assert project["path"] == "workspace/projects/epsilon.md"
+    assert main.projects()["projects"][0]["slug"] == "epsilon"
+
+    created = main.create_run(main.RunRequest(message="prove True", project_id=project["id"]))
+    detail = store.session_detail(created["session_id"])
+
+    assert detail["project"]["slug"] == "epsilon"
+    assert detail["active_run"]["project_id"] == project["id"]
+
+
+def test_run_events_builds_project_payload(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    project_file = lea_root / "workspace" / "projects" / "epsilon.md"
+    project_file.parent.mkdir(parents=True)
+    project_file.write_text("# Project epsilon\n")
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(
+            model="o4-mini",
+            max_turns=2,
+            lea_api_base_url="http://127.0.0.1:8000",
+            lea_root=lea_root,
+        ),
+    )
+    seen = {}
+
+    def fake_run_lea(context):
+        seen["project"] = context.project
+        store.update_run(context.run_id, "success", final_text="done")
+        store.touch_session(context.session_id, "success")
+        context.events.put({"type": "done", "payload": {"status": "success"}})
+
+    monkeypatch.setattr(main, "run_lea", fake_run_lea)
+
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="Epsilon"))
+    created = main.create_run(main.RunRequest(message="prove True", project_id=project["id"]))
+    response = asyncio.run(main.run_events(created["run_id"]))
+    asyncio.run(_read_stream(response.body_iterator))
+
+    assert seen["project"]["project_id"] == "epsilon"
+    assert seen["project"]["project_context"] == "# Project epsilon\n"
+
+
 def test_run_endpoint_blocks_when_max_spend_reached(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

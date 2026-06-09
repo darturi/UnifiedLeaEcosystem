@@ -33,8 +33,18 @@ def init_db() -> None:
             """
             create table if not exists sessions (
                 id text primary key,
+                project_id text references projects(id),
                 title text not null,
                 status text not null,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            create table if not exists projects (
+                id text primary key,
+                slug text not null unique,
+                title text not null,
+                path text not null,
                 created_at text not null,
                 updated_at text not null
             );
@@ -42,6 +52,7 @@ def init_db() -> None:
             create table if not exists runs (
                 id text primary key,
                 session_id text not null references sessions(id),
+                project_id text references projects(id),
                 status text not null,
                 api_run_id text,
                 pending_approval text,
@@ -126,6 +137,15 @@ def init_db() -> None:
             conn.execute("alter table runs add column api_run_id text")
         if "pending_approval" not in run_columns:
             conn.execute("alter table runs add column pending_approval text")
+        if "project_id" not in run_columns:
+            conn.execute("alter table runs add column project_id text references projects(id)")
+
+        session_columns = {
+            row["name"]
+            for row in conn.execute("pragma table_info(sessions)").fetchall()
+        }
+        if "project_id" not in session_columns:
+            conn.execute("alter table sessions add column project_id text references projects(id)")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:

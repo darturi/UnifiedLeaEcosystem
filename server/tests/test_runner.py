@@ -103,7 +103,7 @@ def drain_events(queue):
     return items
 
 
-def test_success_without_code_events_emits_no_code_step(tmp_path, monkeypatch):
+def test_success_without_code_events_fails_and_emits_no_code_step(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     monkeypatch.setattr(runner, "RAW_EVENT_LOG_DIR", tmp_path / "event-logs")
     client = FakeLeaApiClient(
@@ -120,6 +120,10 @@ def test_success_without_code_events_emits_no_code_step(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["kind"] == "no_code"
     assert "did not expose a readable Lean file" in detail["code_steps"][0]["summary"]
     assert any(event["type"] == "code_step" and event["payload"]["kind"] == "no_code" for event in events)
+    assert store.get_run(context.run_id)["status"] == "failed"
+    assert detail["status"] == "failed"
+    assert events[-1]["payload"]["status"] == "failed"
+    assert "no readable Lean file or code artifact" in detail["messages"][-1]["content"]
     assert (tmp_path / "event-logs" / f"{context.run_id}.jsonl").exists()
 
 
@@ -260,7 +264,16 @@ def test_api_text_events_emit_assistant_delta_and_final_message(tmp_path, monkey
         events=[
             {"seq": 0, "type": "text_delta", "text": "hello "},
             {"seq": 1, "type": "text_delta", "text": "world"},
-            {"seq": 2, "type": "finished", "reason": "completed"},
+            {
+                "seq": 2,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {"path": "workspace/proofs/demo.lean", "content": "theorem demo : True := by\n  trivial"},
+            },
+            {"seq": 3, "type": "tool_resulted", "name": "write_file", "content": "Wrote 37 bytes"},
+            {"seq": 4, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 5, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 6, "type": "finished", "reason": "completed"},
         ]
     )
     context = make_context(tmp_path, client)
@@ -510,7 +523,16 @@ def test_assistant_text_delta_events_emit_assistant_delta_and_final_message(tmp_
         events=[
             {"seq": 0, "type": "assistant_text_delta", "text": "hello "},
             {"seq": 1, "type": "assistant_text_delta", "text": "api"},
-            {"seq": 2, "type": "finished", "reason": "completed"},
+            {
+                "seq": 2,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {"path": "workspace/proofs/demo.lean", "content": "theorem demo : True := by\n  trivial"},
+            },
+            {"seq": 3, "type": "tool_resulted", "name": "write_file", "content": "Wrote 37 bytes"},
+            {"seq": 4, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 5, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 6, "type": "finished", "reason": "completed"},
         ]
     )
     context = make_context(tmp_path, client)
@@ -531,6 +553,15 @@ def test_success_persists_intermediate_assistant_text_before_final_summary(tmp_p
             {"seq": 0, "type": "assistant_text_delta", "text": "I will prove this by induction."},
             {
                 "seq": 1,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {"path": "workspace/proofs/demo.lean", "content": "theorem demo : True := by\n  trivial"},
+            },
+            {"seq": 2, "type": "tool_resulted", "name": "write_file", "content": "Wrote 37 bytes"},
+            {"seq": 3, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 4, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {
+                "seq": 5,
                 "type": "finished",
                 "reason": "completed",
                 "final_text": "The proof has been formalized and verified.",
@@ -557,13 +588,16 @@ def test_tool_calls_split_streamed_assistant_text_into_turn_messages(tmp_path, m
             {"seq": 0, "type": "turn_started", "turn": 1},
             {"seq": 1, "type": "assistant_text_delta", "text": "First I sketch the induction proof."},
             {"seq": 2, "type": "tool_called", "name": "lean_check", "args": {"path": "proof.lean"}},
-            {"seq": 3, "type": "tool_resulted", "name": "lean_check", "content": "error"},
+            {"seq": 3, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
             {"seq": 4, "type": "turn_started", "turn": 2},
             {"seq": 5, "type": "assistant_text_delta", "text": "Now I adjust the inductive step."},
             {"seq": 6, "type": "finished", "reason": "completed", "final_text": "The proof is complete."},
         ]
     )
     context = make_context(tmp_path, client)
+    proof = context.config.lea_root / "proof.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem demo : True := by\n  trivial")
 
     run_lea(context)
 
@@ -584,7 +618,16 @@ def test_new_turn_splits_streamed_assistant_text_without_tool_call(tmp_path, mon
             {"seq": 1, "type": "assistant_text_delta", "text": "First turn."},
             {"seq": 2, "type": "turn_started", "turn": 2},
             {"seq": 3, "type": "assistant_text_delta", "text": "Second turn."},
-            {"seq": 4, "type": "finished", "reason": "completed", "final_text": "Done."},
+            {
+                "seq": 4,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {"path": "workspace/proofs/demo.lean", "content": "theorem demo : True := by\n  trivial"},
+            },
+            {"seq": 5, "type": "tool_resulted", "name": "write_file", "content": "Wrote 37 bytes"},
+            {"seq": 6, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 7, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 8, "type": "finished", "reason": "completed", "final_text": "Done."},
         ]
     )
     context = make_context(tmp_path, client)
@@ -602,6 +645,15 @@ def test_transcript_recovers_intermediate_assistant_text_when_deltas_missing(tmp
         events=[
             {
                 "seq": 0,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {"path": "workspace/proofs/demo.lean", "content": "theorem demo : True := by\n  trivial"},
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "write_file", "content": "Wrote 37 bytes"},
+            {"seq": 2, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 3, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {
+                "seq": 4,
                 "type": "finished",
                 "reason": "completed",
                 "text": "The proof is complete.",
@@ -775,7 +827,7 @@ def test_terminal_transcript_dedupes_live_write_file(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["path"] == "workspace/proofs/dedupe.lean"
 
 
-def test_transcript_fetch_failure_falls_back_to_no_code(tmp_path, monkeypatch):
+def test_transcript_fetch_failure_falls_back_to_failed_no_code(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     client = FakeLeaApiClient(
         events=[
@@ -789,12 +841,36 @@ def test_transcript_fetch_failure_falls_back_to_no_code(tmp_path, monkeypatch):
 
     detail = store.session_detail(context.session_id)
     events = drain_events(context.events)
-    assert store.get_run(context.run_id)["status"] == "success"
+    assert store.get_run(context.run_id)["status"] == "failed"
     assert detail["code_steps"][0]["kind"] == "no_code"
+    assert events[-1]["payload"]["status"] == "failed"
     assert any(
         event["type"] == "status" and event["payload"]["status"] == "transcript_fetch_failed"
         for event in events
     )
+
+
+def test_completed_run_with_code_but_no_successful_lean_check_is_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "demo.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem demo : True := by\n  trivial")
+    client = FakeLeaApiClient(
+        events=[
+            {"seq": 0, "type": "file_written", "path": "workspace/proofs/demo.lean"},
+            {"seq": 1, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert store.get_run(context.run_id)["status"] == "failed"
+    assert detail["status"] == "failed"
+    assert events[-1]["payload"]["status"] == "failed"
+    assert "no successful lean_check was observed" in detail["messages"][-1]["content"]
 
 
 def test_api_path_only_code_event_reads_workspace_file(tmp_path, monkeypatch):
@@ -847,6 +923,124 @@ def test_lean_check_path_snapshots_readable_checked_file(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["kind"] == "code"
     assert detail["code_steps"][0]["path"] == "workspace/proofs/checked.lean"
     assert detail["code_steps"][0]["code"].startswith("theorem checked")
+
+
+def test_completed_run_with_failing_lean_check_is_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "broken.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem broken : True := by\n  exact False.elim")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "lean_check",
+                "args": {"path": "workspace/proofs/broken.lean"},
+            },
+            {
+                "seq": 1,
+                "type": "tool_resulted",
+                "name": "lean_check",
+                "content": "workspace/proofs/broken.lean:2:8: error: Application type mismatch",
+            },
+            {
+                "seq": 2,
+                "type": "project_entry_updated",
+                "project_id": "epsilon",
+                "theorem_name": "broken",
+                "entry_action": "created",
+            },
+            {"seq": 3, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    run = store.get_run(context.run_id)
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert run["status"] == "failed"
+    assert detail["status"] == "failed"
+    assert events[-1]["payload"]["status"] == "failed"
+    assert any(event["type"] == "run_error" for event in events)
+    assert detail["messages"][-1]["role"] == "system"
+    assert "most recent lean_check failed" in detail["messages"][-1]["content"]
+
+
+def test_completed_run_after_unchecked_write_is_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "unchecked.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem unchecked : True := by\n  trivial")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "lean_check",
+                "args": {"path": "workspace/proofs/unchecked.lean"},
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {
+                "seq": 2,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {
+                    "path": "workspace/proofs/unchecked.lean",
+                    "content": "theorem unchecked : True := by\n  exact False.elim",
+                },
+            },
+            {"seq": 3, "type": "tool_resulted", "name": "write_file", "content": "Wrote 49 bytes"},
+            {"seq": 4, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    events = drain_events(context.events)
+    assert store.get_run(context.run_id)["status"] == "failed"
+    assert detail["status"] == "failed"
+    assert events[-1]["payload"]["status"] == "failed"
+    assert "changed a Lean file after the most recent lean_check" in detail["messages"][-1]["content"]
+
+
+def test_successful_final_lean_check_allows_completed_run_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    proof = tmp_path / "lea" / "workspace" / "proofs" / "verified.lean"
+    proof.parent.mkdir(parents=True)
+    proof.write_text("theorem verified : True := by\n  trivial")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "tool_called",
+                "name": "write_file",
+                "args": {
+                    "path": "workspace/proofs/verified.lean",
+                    "content": "theorem verified : True := by\n  trivial",
+                },
+            },
+            {"seq": 1, "type": "tool_resulted", "name": "write_file", "content": "Wrote 37 bytes"},
+            {
+                "seq": 2,
+                "type": "tool_called",
+                "name": "lean_check",
+                "args": {"path": "workspace/proofs/verified.lean"},
+            },
+            {"seq": 3, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 4, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    assert store.get_run(context.run_id)["status"] == "success"
+    assert drain_events(context.events)[-1]["payload"]["status"] == "success"
 
 
 def test_tool_result_status_strings_do_not_create_code_steps(tmp_path, monkeypatch):

@@ -30,11 +30,13 @@ class LeaApiClient:
         self.config = config
         self.transport = transport or (lambda request, timeout=None: urlopen(request, timeout=timeout))
 
-    def start_run(self, task: str) -> dict[str, Any]:
+    def start_run(self, task: str, project: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = {
             "task": task,
             "config": self._run_config(),
         }
+        if project is not None:
+            payload["project"] = project
         response = self._json_request("/v1/runs", method="POST", body=payload)
         if not isinstance(response.body, dict) or not response.body.get("run_id"):
             raise LeaApiError("Lea API did not return a run_id.")

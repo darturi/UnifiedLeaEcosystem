@@ -100,6 +100,27 @@ def test_start_run_sends_permission_tier():
     assert seen["body"]["config"]["agent"]["permission_tier"] == "theorem_translation"
 
 
+def test_start_run_sends_project_payload():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"run_id": "api-1"}).encode("utf-8"))
+
+    LeaApiClient(make_config(), transport=transport).start_run(
+        "task",
+        project={
+            "project_id": "epsilon",
+            "project_path": "workspace/projects/epsilon.md",
+            "project_context": "# Project epsilon",
+            "record_on_success": True,
+        },
+    )
+
+    assert seen["body"]["project"]["project_id"] == "epsilon"
+    assert seen["body"]["project"]["project_path"] == "workspace/projects/epsilon.md"
+
+
 def test_start_run_sends_selected_provider_key_as_model_kwarg():
     seen = {}
 

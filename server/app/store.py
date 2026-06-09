@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from uuid import uuid4
 
 from typing import Any
@@ -9,15 +10,16 @@ from .db import ROOT, connect, row_to_dict, utc_now
 
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 
 
-def create_session(title: str) -> dict:
+def create_session(title: str, project_id: str | None = None) -> dict:
     now = utc_now()
     session_id = str(uuid4())
     with connect() as conn:
         conn.execute(
-            "insert into sessions (id, title, status, created_at, updated_at) values (?, ?, ?, ?, ?)",
-            (session_id, title[:120] or "Untitled theorem", "running", now, now),
+            "insert into sessions (id, project_id, title, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
+            (session_id, project_id, title[:120] or "Untitled theorem", "running", now, now),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
     return row_to_dict(row)
@@ -65,11 +67,16 @@ def list_sessions() -> list[dict]:
                     limit 1
                 ) as primary_model,
                 group_concat(distinct r.model) as models,
+                p.id as project_id,
+                p.slug as project_slug,
+                p.title as project_title,
+                p.path as project_path,
                 s.created_at as started_at,
                 s.updated_at as ended_at,
                 max(0, cast((julianday(s.updated_at) - julianday(s.created_at)) * 86400 as integer)) as duration_seconds
             from sessions s
             left join runs r on r.session_id = s.id
+            left join projects p on p.id = s.project_id
             group by s.id
             order by s.updated_at desc
             limit 100
@@ -78,19 +85,86 @@ def list_sessions() -> list[dict]:
     return [_normalize_usage_session(row_to_dict(row)) for row in rows]
 
 
-def create_run(session_id: str, model: str, provider: str | None, max_turns: int | None) -> dict:
+def create_run(
+    session_id: str,
+    model: str,
+    provider: str | None,
+    max_turns: int | None,
+    project_id: str | None = None,
+) -> dict:
     now = utc_now()
     run_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into runs (id, session_id, status, model, provider, max_turns, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+            insert into runs (id, session_id, project_id, status, model, provider, max_turns, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, session_id, "pending", model, provider, max_turns, now, now),
+            (run_id, session_id, project_id, "pending", model, provider, max_turns, now, now),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
     return row_to_dict(row)
+
+
+def list_projects() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("select * from projects order by updated_at desc, title asc").fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_project(project_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+    slug = validate_project_slug(slug)
+    now = utc_now()
+    project_id = str(uuid4())
+    project_title = (title or slug).strip() or slug
+    project_path = path or f"workspace/projects/{slug}.md"
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into projects (id, slug, title, path, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, slug, project_title, project_path, now, now),
+        )
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def update_project(project_id: str, title: str | None = None, path: str | None = None) -> dict | None:
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+        if not row:
+            return None
+        current = row_to_dict(row)
+        conn.execute(
+            """
+            update projects
+            set title = ?, path = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                (title if title is not None else current["title"]).strip() or current["title"],
+                path if path is not None else current["path"],
+                now,
+                project_id,
+            ),
+        )
+        updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(updated)
+
+
+def validate_project_slug(slug: str) -> str:
+    value = str(slug or "").strip()
+    if not PROJECT_SLUG_RE.fullmatch(value):
+        raise ValueError("Project slug must be 1-80 characters using letters, numbers, '_' or '-'.")
+    return value
 
 
 def update_run(
@@ -319,6 +393,12 @@ def session_detail(session_id: str) -> dict | None:
             """,
             (session_id,),
         ).fetchone()
+        project = None
+        if session.get("project_id"):
+            project = conn.execute(
+                "select * from projects where id = ?",
+                (session["project_id"],),
+            ).fetchone()
     usage = _normalize_usage_session(
         {
             **(row_to_dict(usage_row) if usage_row else {}),
@@ -337,6 +417,7 @@ def session_detail(session_id: str) -> dict | None:
         "approval_events": approval_events_for_session(session_id),
         "usage_breakdown": usage_breakdown_for_session(session_id),
         "active_run": _normalize_run(row_to_dict(active_run)) if active_run else None,
+        "project": row_to_dict(project) if project else None,
     }
 
 

@@ -25,6 +25,10 @@ export interface ApprovalEvent extends PendingApproval {
 
 export interface SessionSummary {
   id: string;
+  project_id?: string | null;
+  project_slug?: string | null;
+  project_title?: string | null;
+  project_path?: string | null;
   title: string;
   status: SessionStatus;
   created_at: string;
@@ -106,6 +110,16 @@ export interface SessionDetail extends SessionSummary {
     status: string;
     pending_approval?: PendingApproval | null;
   } | null;
+  project?: Project | null;
+}
+
+export interface Project {
+  id: string;
+  slug: string;
+  title: string;
+  path: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface UsageSessionSummary extends SessionSummary {}
@@ -204,6 +218,28 @@ export async function getUsageStats(): Promise<UsageStats> {
   return response.json();
 }
 
+export async function listProjects(): Promise<Project[]> {
+  const response = await fetch('/api/projects');
+  if (!response.ok) {
+    throw new Error(`Failed to load projects: ${response.statusText}`);
+  }
+  const data = await response.json();
+  return data.projects;
+}
+
+export async function createProject(input: { slug?: string; title?: string; path?: string }): Promise<Project> {
+  const response = await fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || `Failed to create project: ${response.statusText}`);
+  }
+  return response.json();
+}
+
 export async function getSettings(): Promise<AppSettings> {
   const response = await fetch('/api/settings');
   if (!response.ok) {
@@ -233,7 +269,7 @@ export async function saveSettings(update: SettingsUpdate): Promise<AppSettings>
   return response.json();
 }
 
-export async function createRun(message: string, sessionId?: string): Promise<{
+export async function createRun(message: string, sessionId?: string, projectId?: string): Promise<{
   session_id: string;
   run_id: string;
   message: ChatMessage;
@@ -241,7 +277,7 @@ export async function createRun(message: string, sessionId?: string): Promise<{
   const response = await fetch('/api/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, session_id: sessionId }),
+    body: JSON.stringify({ message, session_id: sessionId, project_id: projectId }),
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));

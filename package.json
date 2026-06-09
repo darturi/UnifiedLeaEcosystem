@@ -7,6 +7,7 @@
     "build": "vite build",
     "dev": "node scripts/dev.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "reset:local": "node scripts/reset-local-state.mjs",
     "test:frontend": "node --test src/app/*.test.mjs",
     "setup:api": "node scripts/setup-api.mjs",
     "setup:agent": "cd external/lea-prover && uv sync --extra api",

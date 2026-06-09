@@ -56,6 +56,11 @@ export function SessionList({
                   <p className="text-xs text-muted-foreground mt-1">
                     {new Date(session.updated_at).toLocaleTimeString()}
                   </p>
+                  {session.project_title && (
+                    <p className="mt-1 truncate text-xs text-muted-foreground">
+                      {session.project_title}
+                    </p>
+                  )}
                 </div>
               </div>
             </button>

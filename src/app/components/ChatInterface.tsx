@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw } from 'lucide-react';
-import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, SessionStatus, StatusEvent } from '../api';
+import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus } from 'lucide-react';
+import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
@@ -27,6 +27,10 @@ export function ChatInterface({
   pendingApproval,
   isSubmittingApproval,
   approvalError,
+  projects,
+  selectedProjectId,
+  onProjectChange,
+  onCreateProject,
 }: {
   error?: string;
   isPaused: boolean;
@@ -34,6 +38,10 @@ export function ChatInterface({
   pendingApproval?: PendingApproval;
   isSubmittingApproval: boolean;
   approvalError?: string;
+  projects: Project[];
+  selectedProjectId?: string;
+  onProjectChange: (projectId: string | undefined) => void;
+  onCreateProject: (title: string) => Promise<Project>;
   messages: ChatMessage[];
   codeSteps: CodeStep[];
   sessionStatus?: SessionStatus;
@@ -53,6 +61,8 @@ export function ChatInterface({
   const [input, setInput] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
+  const [newProjectTitle, setNewProjectTitle] = useState('');
+  const [isCreatingProject, setIsCreatingProject] = useState(false);
   const terminalMessageId = useMemo(() => {
     if (isRunning || !sessionStatus || sessionStatus === 'running') {
       return null;
@@ -163,6 +173,20 @@ export function ChatInterface({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       void submitInput();
+    }
+  };
+
+  const createProjectFromInput = async () => {
+    const title = newProjectTitle.trim();
+    if (!title || isCreatingProject) {
+      return;
+    }
+    setIsCreatingProject(true);
+    try {
+      await onCreateProject(title);
+      setNewProjectTitle('');
+    } finally {
+      setIsCreatingProject(false);
     }
   };
 
@@ -453,6 +477,47 @@ export function ChatInterface({
             </button>
           </div>
         )}
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <select
+            value={selectedProjectId || ''}
+            onChange={(event) => onProjectChange(event.target.value || undefined)}
+            disabled={isRunning}
+            className="h-9 rounded-md border border-border bg-input-background px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+          >
+            <option value="">No project</option>
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.title}
+              </option>
+            ))}
+          </select>
+          <input
+            value={newProjectTitle}
+            onChange={(event) => setNewProjectTitle(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault();
+                void createProjectFromInput();
+              }
+            }}
+            disabled={isRunning || isCreatingProject}
+            placeholder="New project"
+            className="h-9 w-40 rounded-md border border-border bg-input-background px-3 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+          <button
+            type="button"
+            onClick={createProjectFromInput}
+            disabled={isRunning || isCreatingProject || !newProjectTitle.trim()}
+            className={[
+              'inline-flex h-9 items-center gap-2 rounded-md bg-secondary px-3 text-sm',
+              'text-secondary-foreground transition-opacity hover:opacity-90',
+              'disabled:cursor-not-allowed disabled:opacity-50',
+            ].join(' ')}
+          >
+            {isCreatingProject ? <Loader2 className="h-4 w-4 animate-spin" /> : <FolderPlus className="h-4 w-4" />}
+            Create
+          </button>
+        </div>
         <form onSubmit={handleSubmit} className="flex items-end gap-2">
           <textarea
             value={input}

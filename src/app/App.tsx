@@ -15,8 +15,11 @@ import {
   SessionSummary,
   SessionDetail,
   StatusEvent,
+  Project,
+  createProject,
   createRun,
   getSession,
+  listProjects,
   listSessions,
   submitApproval,
 } from './api';
@@ -38,6 +41,8 @@ export default function App() {
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
   const [approvalEvents, setApprovalEvents] = useState<ApprovalEvent[]>([]);
   const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const eventSourceRef = useRef<EventSource | null>(null);
   const codeStepCountRef = useRef(0);
   const activeTimelineStepIndexRef = useRef<number | null>(null);
@@ -74,9 +79,16 @@ export default function App() {
     return loaded;
   };
 
+  const refreshProjects = async () => {
+    const loaded = await listProjects();
+    setProjects(loaded);
+    return loaded;
+  };
+
   useEffect(() => {
     const restoreInitialSession = async () => {
       const loaded = await refreshSessions();
+      await refreshProjects();
       const savedSessionId = window.localStorage.getItem('lea:selectedSessionId');
       const savedSession = savedSessionId
         ? loaded.find((session) => session.id === savedSessionId)
@@ -99,6 +111,7 @@ export default function App() {
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
     setApprovalEvents(detail.approval_events || []);
+    setSelectedProjectId(detail.project?.id || detail.project_id || undefined);
     codeStepCountRef.current = detail.code_steps.length;
     setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
@@ -168,7 +181,7 @@ export default function App() {
     eventSourceRef.current?.close();
 
     try {
-      const run = await createRun(content, selectedSessionId);
+      const run = await createRun(content, selectedSessionId, selectedProjectId);
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       appendMessage(run.message);
@@ -456,6 +469,7 @@ export default function App() {
               setPendingApproval(undefined);
               setApprovalError(undefined);
               setIsRunning(false);
+              setSelectedProjectId(undefined);
               window.localStorage.removeItem('lea:selectedSessionId');
               setError(undefined);
             }}
@@ -487,6 +501,21 @@ export default function App() {
             pendingApproval={pendingApproval}
             isSubmittingApproval={isSubmittingApproval}
             approvalError={approvalError}
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            onProjectChange={setSelectedProjectId}
+            onCreateProject={async (title) => {
+              const slug = title
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9_-]+/g, '-')
+                .replace(/^-+|-+$/g, '')
+                || 'project';
+              const project = await createProject({ title, slug });
+              await refreshProjects();
+              setSelectedProjectId(project.id);
+              return project;
+            }}
           />
         </Panel>
 
