@@ -111,6 +111,7 @@ export interface SessionDetail extends SessionSummary {
     pending_approval?: PendingApproval | null;
   } | null;
   project?: Project | null;
+  project_theorem?: ProjectTheoremEntry | null;
 }
 
 export interface Project {
@@ -120,6 +121,31 @@ export interface Project {
   path: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface ProjectTheoremEntry {
+  name: string;
+  proof_path: string;
+  module_name?: string | null;
+}
+
+export interface ProjectUnassignmentMove {
+  from_path: string;
+  to_path: string;
+  from_module?: string | null;
+  to_module?: string | null;
+}
+
+export interface ProjectUnassignmentCheck {
+  status: 'safe';
+  theorem: ProjectTheoremEntry;
+  planned_move: ProjectUnassignmentMove;
+}
+
+export interface ProjectUnassignmentResult {
+  status: 'unassigned';
+  theorem: ProjectTheoremEntry;
+  move: ProjectUnassignmentMove;
 }
 
 export interface UsageSessionSummary extends SessionSummary {}
@@ -240,6 +266,34 @@ export async function createProject(input: { slug?: string; title?: string; path
   return response.json();
 }
 
+export async function checkProjectTheoremUnassignment(
+  projectId: string,
+  theoremName: string,
+): Promise<ProjectUnassignmentCheck> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/theorems/${encodeURIComponent(theoremName)}/unassignment-check`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to check project unassignment: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function unassignProjectTheorem(
+  projectId: string,
+  theoremName: string,
+): Promise<ProjectUnassignmentResult> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/theorems/${encodeURIComponent(theoremName)}/unassign`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to unassign project theorem: ${response.statusText}`));
+  }
+  return response.json();
+}
+
 export async function getSettings(): Promise<AppSettings> {
   const response = await fetch('/api/settings');
   if (!response.ok) {
@@ -305,4 +359,15 @@ export async function submitApproval(
     const detail = await response.json().catch(() => ({}));
     throw new Error(detail.detail || `Failed to submit approval: ${response.statusText}`);
   }
+}
+
+async function errorMessage(response: Response, fallback: string): Promise<string> {
+  const detail = await response.json().catch(() => ({}));
+  if (typeof detail.detail === 'string') {
+    return detail.detail;
+  }
+  if (detail.detail?.message) {
+    return detail.detail.message;
+  }
+  return fallback;
 }

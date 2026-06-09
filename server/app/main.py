@@ -15,6 +15,12 @@ from pydantic import BaseModel
 from .config import load_config
 from .db import init_db
 from .lea_api_client import LeaApiClient, LeaApiError
+from .project_unassignment import (
+    ProjectUnassignmentError,
+    check_project_theorem_unassignment,
+    project_theorem_for_proof_path,
+    unassign_project_theorem,
+)
 from .runner import RunnerContext, run_lea
 from . import settings as settings_service
 from . import store
@@ -104,6 +110,30 @@ def project_detail(project_id: str) -> dict:
     return project
 
 
+@app.post("/api/projects/{project_id}/theorems/{theorem_name}/unassignment-check")
+def project_theorem_unassignment_check(project_id: str, theorem_name: str) -> dict:
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return check_project_theorem_unassignment(project, load_config(), theorem_name)
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/api/projects/{project_id}/theorems/{theorem_name}/unassign")
+def project_theorem_unassign(project_id: str, theorem_name: str) -> dict:
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return unassign_project_theorem(project, load_config(), theorem_name)
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+
+
 @app.put("/api/projects/{project_id}")
 def update_project(project_id: str, request: ProjectRequest) -> dict:
     project = store.update_project(project_id, title=request.title, path=request.path)
@@ -134,6 +164,7 @@ def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Session not found")
+    detail["project_theorem"] = _project_theorem_for_session(detail)
     return detail
 
 
@@ -274,3 +305,22 @@ def _project_payload(project_id: str | None, config) -> dict | None:
         "project_context": context,
         "record_on_success": True,
     }
+
+
+def _project_theorem_for_session(detail: dict) -> dict | None:
+    project = detail.get("project")
+    if not project:
+        return None
+    code_steps = detail.get("code_steps") or []
+    proof_path = None
+    for step in reversed(code_steps):
+        if step.get("kind", "code") == "code" and str(step.get("path") or "").endswith(".lean"):
+            proof_path = str(step["path"])
+            break
+    if not proof_path:
+        return None
+    try:
+        return project_theorem_for_proof_path(project, load_config(), proof_path)
+    except Exception:
+        logger.debug("Unable to resolve project theorem for session %s", detail.get("id"), exc_info=True)
+        return None

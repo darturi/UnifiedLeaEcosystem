@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 import app.main as main
+import app.project_unassignment as project_unassignment
 from app import db, store
 from app.config import LeaConfig
 
@@ -93,6 +94,101 @@ def test_project_crud_and_run_selection(tmp_path, monkeypatch):
 
     assert detail["project"]["slug"] == "epsilon"
     assert detail["active_run"]["project_id"] == project["id"]
+
+
+def test_project_theorem_unassign_safe_move(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    _write_project_fixture(
+        lea_root,
+        {
+            "solo": "import Mathlib\n\nnamespace Lea.Epsilon\n\ntheorem solo : True := by\n  trivial\n\nend Lea.Epsilon\n",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(model="o4-mini", max_turns=2, lea_api_base_url="http://127.0.0.1:8000", lea_root=lea_root),
+    )
+    monkeypatch.setattr(project_unassignment, "_verify_lean_file", lambda config, path: None)
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="Epsilon"))
+
+    checked = main.project_theorem_unassignment_check(project["id"], "solo")
+    result = main.project_theorem_unassign(project["id"], "solo")
+
+    assert checked["status"] == "safe"
+    assert result["status"] == "unassigned"
+    assert result["move"]["to_path"] == "workspace/proofs/Lea/Misc/solo.lean"
+    assert not (lea_root / "workspace" / "proofs" / "Lea" / "Epsilon" / "solo.lean").exists()
+    moved = lea_root / "workspace" / "proofs" / "Lea" / "Misc" / "solo.lean"
+    assert "namespace Lea.Misc" in moved.read_text()
+    assert "end Lea.Misc" in moved.read_text()
+    assert "## Theorem: solo" not in (lea_root / "workspace" / "projects" / "epsilon.md").read_text()
+
+
+def test_project_theorem_unassign_blocks_when_used_by_other_project_theorem(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    _write_project_fixture(
+        lea_root,
+        {
+            "even_square_of_even": (
+                "import Mathlib\n\nnamespace Lea.Epsilon\n\n"
+                "theorem even_square_of_even : True := by\n  trivial\n\nend Lea.Epsilon\n"
+            ),
+            "even_square_of_double_plus_double": (
+                "import Mathlib\nimport Lea.Epsilon.even_square_of_even\n\nnamespace Lea.Epsilon\n\n"
+                "theorem even_square_of_double_plus_double : True := by\n  exact even_square_of_even\n\nend Lea.Epsilon\n"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(model="o4-mini", max_turns=2, lea_api_base_url="http://127.0.0.1:8000", lea_root=lea_root),
+    )
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="Epsilon"))
+
+    with pytest.raises(HTTPException) as exc:
+        main.project_theorem_unassignment_check(project["id"], "even_square_of_even")
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["conflict_type"] == "used_by_project_theorems"
+    assert "even_square_of_double_plus_double" in exc.value.detail["message"]
+
+
+def test_project_theorem_unassign_blocks_when_target_uses_project_theorem(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    lea_root = tmp_path / "lea"
+    _write_project_fixture(
+        lea_root,
+        {
+            "even_square_of_even": (
+                "import Mathlib\n\nnamespace Lea.Epsilon\n\n"
+                "theorem even_square_of_even : True := by\n  trivial\n\nend Lea.Epsilon\n"
+            ),
+            "even_square_of_double_plus_double": (
+                "import Mathlib\nimport Lea.Epsilon.even_square_of_even\n\nnamespace Lea.Epsilon\n\n"
+                "theorem even_square_of_double_plus_double : True := by\n  exact even_square_of_even\n\nend Lea.Epsilon\n"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: LeaConfig(model="o4-mini", max_turns=2, lea_api_base_url="http://127.0.0.1:8000", lea_root=lea_root),
+    )
+    project = main.create_project(main.ProjectRequest(slug="epsilon", title="Epsilon"))
+
+    with pytest.raises(HTTPException) as exc:
+        main.project_theorem_unassignment_check(project["id"], "even_square_of_double_plus_double")
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["conflict_type"] == "uses_project_theorems"
+    assert "imports `Lea.Epsilon.even_square_of_even`" in exc.value.detail["message"]
 
 
 def test_run_events_builds_project_payload(tmp_path, monkeypatch):
@@ -211,3 +307,34 @@ async def _read_stream(iterator):
     async for chunk in iterator:
         chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
     return "".join(chunks)
+
+
+def _write_project_fixture(lea_root, proofs):
+    project_dir = lea_root / "workspace" / "projects"
+    proof_dir = lea_root / "workspace" / "proofs" / "Lea" / "Epsilon"
+    project_dir.mkdir(parents=True)
+    proof_dir.mkdir(parents=True)
+    entries = ['# Project epsilon\n\n<!-- lea:project id="epsilon" -->\n']
+    for name, content in proofs.items():
+        (proof_dir / f"{name}.lean").write_text(content)
+        entries.append(
+            "\n".join(
+                [
+                    f"## Theorem: {name}",
+                    "",
+                    f'<!-- lea:theorem name="{name}" proof="workspace/proofs/Lea/Epsilon/{name}.lean" module="Lea.Epsilon.{name}" -->',
+                    "",
+                    "### Signature",
+                    "",
+                    "```lean",
+                    f"theorem {name} : True := by",
+                    "```",
+                    "",
+                    "### Lean Location",
+                    "",
+                    f"`workspace/proofs/Lea/Epsilon/{name}.lean`",
+                    "",
+                ]
+            )
+        )
+    (project_dir / "epsilon.md").write_text("\n".join(entries))

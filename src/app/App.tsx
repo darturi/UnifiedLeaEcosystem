@@ -5,6 +5,16 @@ import { ChatInterface } from './components/ChatInterface';
 import { CodeViewer } from './components/CodeViewer';
 import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from './components/ui/alert-dialog';
 import { timelineStepCount } from './stepTimeline.mjs';
 import {
   ChatMessage,
@@ -12,16 +22,20 @@ import {
   ApprovalDecision,
   ApprovalEvent,
   PendingApproval,
+  ProjectTheoremEntry,
+  ProjectUnassignmentCheck,
   SessionSummary,
   SessionDetail,
   StatusEvent,
   Project,
+  checkProjectTheoremUnassignment,
   createProject,
   createRun,
   getSession,
   listProjects,
   listSessions,
   submitApproval,
+  unassignProjectTheorem,
 } from './api';
 
 export default function App() {
@@ -43,7 +57,13 @@ export default function App() {
   const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
+  const [projectTheorem, setProjectTheorem] = useState<ProjectTheoremEntry>();
+  const [pendingUnassignment, setPendingUnassignment] = useState<ProjectUnassignmentCheck>();
+  const [availableUnassignment, setAvailableUnassignment] = useState<ProjectUnassignmentCheck>();
+  const [unassignmentBlockedReason, setUnassignmentBlockedReason] = useState<string>();
+  const [isUnassigningProject, setIsUnassigningProject] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const selectedSessionIdRef = useRef<string | undefined>(undefined);
   const codeStepCountRef = useRef(0);
   const activeTimelineStepIndexRef = useRef<number | null>(null);
 
@@ -85,6 +105,24 @@ export default function App() {
     return loaded;
   };
 
+  const refreshUnassignmentAvailability = async (detail: SessionDetail) => {
+    setAvailableUnassignment(undefined);
+    setUnassignmentBlockedReason(undefined);
+    if (!detail.project?.id || !detail.project_theorem || detail.active_run) {
+      return;
+    }
+    const sessionId = detail.id;
+    try {
+      const plan = await checkProjectTheoremUnassignment(detail.project.id, detail.project_theorem.name);
+      setAvailableUnassignment(selectedSessionIdRef.current === sessionId ? plan : undefined);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'This theorem cannot be unassigned.';
+      if (selectedSessionIdRef.current === sessionId) {
+        setUnassignmentBlockedReason(message);
+      }
+    }
+  };
+
   useEffect(() => {
     const restoreInitialSession = async () => {
       const loaded = await refreshSessions();
@@ -106,12 +144,17 @@ export default function App() {
   }, []);
 
   const applySessionDetail = (detail: SessionDetail) => {
+    selectedSessionIdRef.current = detail.id;
     setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
     setApprovalEvents(detail.approval_events || []);
     setSelectedProjectId(detail.project?.id || detail.project_id || undefined);
+    setProjectTheorem(detail.project_theorem || undefined);
+    setPendingUnassignment(undefined);
+    setAvailableUnassignment(undefined);
+    setUnassignmentBlockedReason(undefined);
     codeStepCountRef.current = detail.code_steps.length;
     setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
@@ -132,12 +175,14 @@ export default function App() {
   const loadSession = async (sessionId: string) => {
     const detail = await getSession(sessionId);
     applySessionDetail(detail);
+    await refreshUnassignmentAvailability(detail);
     window.localStorage.setItem('lea:selectedSessionId', detail.id);
   };
 
   const reconcileSession = async (sessionId: string) => {
     const detail = await getSession(sessionId);
     applySessionDetail(detail);
+    await refreshUnassignmentAvailability(detail);
   };
 
   const selectedSession = useMemo(
@@ -178,6 +223,10 @@ export default function App() {
     setError(undefined);
     setApprovalError(undefined);
     setPendingApproval(undefined);
+    setProjectTheorem(undefined);
+    setPendingUnassignment(undefined);
+    setAvailableUnassignment(undefined);
+    setUnassignmentBlockedReason(undefined);
     eventSourceRef.current?.close();
 
     try {
@@ -441,6 +490,49 @@ export default function App() {
     }
   };
 
+  const handleRequestProjectUnassignment = async () => {
+    if (!availableUnassignment || isRunning || isUnassigningProject) {
+      return;
+    }
+    setPendingUnassignment(availableUnassignment);
+  };
+
+  const handleConfirmProjectUnassignment = async () => {
+    const projectId = selectedProjectId || selectedSession?.project_id || undefined;
+    if (!projectId || !pendingUnassignment || isUnassigningProject) {
+      return;
+    }
+    setIsUnassigningProject(true);
+    setError(undefined);
+    try {
+      const result = await unassignProjectTheorem(projectId, pendingUnassignment.theorem.name);
+      setPendingUnassignment(undefined);
+      setAvailableUnassignment(undefined);
+      setUnassignmentBlockedReason(undefined);
+      if (selectedSessionId) {
+        await reconcileSession(selectedSessionId);
+      }
+      await refreshSessions();
+      await refreshProjects();
+      setStatusEvents((current) => [
+        ...current,
+        {
+          id: `project-unassigned-${Date.now()}`,
+          session_id: selectedSessionId,
+          run_id: undefined,
+          step_number: null,
+          status: 'project_unassigned',
+          message: `Unassigned ${result.theorem.name} from the project and moved it to ${result.move.to_path}.`,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to unassign project theorem.');
+    } finally {
+      setIsUnassigningProject(false);
+    }
+  };
+
   if (view === 'stats') {
     return <StatsPage onBack={() => setView('main')} />;
   }
@@ -449,7 +541,25 @@ export default function App() {
   }
 
   return (
-    <div className="size-full">
+    <>
+      <AlertDialog open={Boolean(pendingUnassignment)} onOpenChange={(open) => !open && setPendingUnassignment(undefined)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Unassign theorem from project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will remove {pendingUnassignment?.theorem.name} from the project markdown and move
+              {' '}{pendingUnassignment?.planned_move.from_path} to {pendingUnassignment?.planned_move.to_path}.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isUnassigningProject}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmProjectUnassignment} disabled={isUnassigningProject}>
+              Unassign
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <div className="size-full">
       <PanelGroup direction="horizontal">
         <Panel defaultSize={20} minSize={15} maxSize={30}>
           <SessionList
@@ -457,6 +567,7 @@ export default function App() {
             selectedSessionId={selectedSessionId}
             onSelectSession={(id) => loadSession(id).catch((err) => setError(err.message))}
             onNewSession={() => {
+              selectedSessionIdRef.current = undefined;
               setSelectedSessionId(undefined);
               setMessages([]);
               setCodeSteps([]);
@@ -467,6 +578,10 @@ export default function App() {
               setActiveTimelineStep(null);
               setCurrentRunId(undefined);
               setPendingApproval(undefined);
+              setProjectTheorem(undefined);
+              setPendingUnassignment(undefined);
+              setAvailableUnassignment(undefined);
+              setUnassignmentBlockedReason(undefined);
               setApprovalError(undefined);
               setIsRunning(false);
               setSelectedProjectId(undefined);
@@ -495,12 +610,17 @@ export default function App() {
             onTogglePause={() => setIsPaused(!isPaused)}
             onOpenStats={() => setView('stats')}
             onOpenSettings={() => setView('settings')}
+            onRequestProjectUnassignment={handleRequestProjectUnassignment}
             theoremName={title}
             currentStepIndex={currentStepIndex}
             activeTimelineStepIndex={activeTimelineStepIndex}
             pendingApproval={pendingApproval}
             isSubmittingApproval={isSubmittingApproval}
             approvalError={approvalError}
+            projectTheorem={projectTheorem}
+            canUnassignProjectTheorem={Boolean(availableUnassignment)}
+            unassignmentDisabledReason={unassignmentBlockedReason}
+            isUnassigningProject={isUnassigningProject}
             projects={projects}
             selectedProjectId={selectedProjectId}
             onProjectChange={setSelectedProjectId}
@@ -535,6 +655,7 @@ export default function App() {
           />
         </Panel>
       </PanelGroup>
-    </div>
+      </div>
+    </>
   );
 }

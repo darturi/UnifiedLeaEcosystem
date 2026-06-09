@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
-import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus } from 'lucide-react';
-import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, SessionStatus, StatusEvent } from '../api';
+import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink } from 'lucide-react';
+import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
@@ -19,6 +19,7 @@ export function ChatInterface({
   onTogglePause,
   onOpenStats,
   onOpenSettings,
+  onRequestProjectUnassignment,
   onSubmitApproval,
   onRetry,
   theoremName,
@@ -27,6 +28,10 @@ export function ChatInterface({
   pendingApproval,
   isSubmittingApproval,
   approvalError,
+  projectTheorem,
+  canUnassignProjectTheorem,
+  unassignmentDisabledReason,
+  isUnassigningProject,
   projects,
   selectedProjectId,
   onProjectChange,
@@ -50,11 +55,16 @@ export function ChatInterface({
   onSubmit: (content: string) => Promise<boolean>;
   onRetry: (content: string) => Promise<boolean>;
   onSubmitApproval: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
+  onRequestProjectUnassignment: () => Promise<void>;
   onStepSelect: (stepIndex: number) => void;
   onTogglePause: () => void;
   onOpenStats: () => void;
   onOpenSettings: () => void;
   theoremName: string;
+  projectTheorem?: ProjectTheoremEntry;
+  canUnassignProjectTheorem: boolean;
+  unassignmentDisabledReason?: string;
+  isUnassigningProject: boolean;
   currentStepIndex: number;
   activeTimelineStepIndex: number | null;
 }) {
@@ -378,6 +388,26 @@ export function ChatInterface({
             <Settings className="w-4 h-4" />
             Settings
           </button>
+          {projectTheorem && (
+            <button
+              type="button"
+              onClick={() => void onRequestProjectUnassignment()}
+              disabled={isRunning || isUnassigningProject || !canUnassignProjectTheorem}
+              title={
+                canUnassignProjectTheorem
+                  ? `Unassign ${projectTheorem.name} from this project`
+                  : unassignmentDisabledReason || 'This theorem cannot be unassigned from the project.'
+              }
+              className={[
+                'flex items-center gap-2 rounded-md bg-secondary px-3 py-2',
+                'text-secondary-foreground transition-opacity hover:opacity-90',
+                'disabled:cursor-not-allowed disabled:opacity-50',
+              ].join(' ')}
+            >
+              {isUnassigningProject ? <Loader2 className="h-4 w-4 animate-spin" /> : <Unlink className="h-4 w-4" />}
+              Unassign
+            </button>
+          )}
         </div>
       </div>
 
