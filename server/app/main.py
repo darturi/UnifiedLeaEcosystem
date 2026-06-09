@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .config import load_config
@@ -200,3 +203,11 @@ async def run_events(run_id: str) -> StreamingResponse:
                 break
 
     return StreamingResponse(stream_events(), media_type="text/event-stream")
+
+
+# Serve the built frontend same-origin when present (packaged/Docker builds).
+# Mounted last so every /api route above takes precedence. Skipped in local dev,
+# where Vite serves the frontend on :5173 and this directory doesn't exist.
+_web_dist = os.environ.get("LEA_WEB_DIST", str(Path(__file__).resolve().parents[2] / "dist"))
+if Path(_web_dist).is_dir():
+    app.mount("/", StaticFiles(directory=_web_dist, html=True), name="web")
