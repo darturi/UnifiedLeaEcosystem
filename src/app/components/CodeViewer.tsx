@@ -2,9 +2,11 @@ import { useMemo } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { CodeStep } from '../api';
 import { diffForStep } from '../codeDiff';
+import type { RunTimelineSection } from '../runAttempts';
 
 export function CodeViewer({
   codeSteps,
+  runTimelineSections,
   timelineStepCount,
   isPaused,
   isRunning,
@@ -12,6 +14,7 @@ export function CodeViewer({
   onStepChange,
 }: {
   codeSteps: CodeStep[];
+  runTimelineSections: RunTimelineSection[];
   timelineStepCount: number;
   isPaused: boolean;
   isRunning: boolean;
@@ -20,15 +23,46 @@ export function CodeViewer({
 }) {
   const totalSteps = Math.max(timelineStepCount, codeSteps.length);
   const safeIndex = Math.min(Math.max(currentStepIndex, 0), Math.max(totalSteps - 1, 0));
-  const exactCodeStep = codeSteps.find((step) => step.step_number === safeIndex + 1);
+  const flattenedTimelineItems = runTimelineSections.flatMap((section) =>
+    section.timeline.stepItems.map((item) => ({
+      section,
+      item,
+      globalIndex: section.stepOffset + item.stepIndex,
+    })),
+  );
+  const currentTimelineItem = flattenedTimelineItems.find((entry) => entry.globalIndex === safeIndex);
+  const exactCodeStep = currentTimelineItem?.item.codeStep;
   const currentStep =
     exactCodeStep ||
-    [...codeSteps].reverse().find((step) => step.step_number <= safeIndex + 1);
+    [...flattenedTimelineItems]
+      .reverse()
+      .find((entry) => entry.globalIndex <= safeIndex && entry.item.codeStep)
+      ?.item.codeStep;
   const currentCodeStepIndex = currentStep
     ? codeSteps.findIndex((step) => step.id === currentStep.id)
     : -1;
   const hasCodeChangeForTimelineStep = !!exactCodeStep;
-  const canNavigate = totalSteps > 1;
+  const currentSection =
+    currentTimelineItem?.section ||
+    runTimelineSections.find((section) => {
+      const stepCount = section.timeline.stepItems.length;
+      return safeIndex >= section.stepOffset && safeIndex < section.stepOffset + stepCount;
+    }) ||
+    (currentStep
+      ? runTimelineSections.find((section) => section.id === currentStep.run_id)
+      : undefined);
+  const currentSectionStepCount = currentSection?.timeline.stepItems.length ?? 0;
+  const currentSectionStepIndex =
+    currentSection && currentSectionStepCount > 0
+      ? Math.min(
+          Math.max(safeIndex - currentSection.stepOffset, 0),
+          currentSectionStepCount - 1,
+        )
+      : -1;
+  const stepLabel =
+    currentSection?.attemptNumber && currentSectionStepIndex >= 0
+      ? `Attempt ${currentSection.attemptNumber} · Step ${currentSectionStepIndex + 1} of ${currentSectionStepCount}`
+      : `Step ${safeIndex + 1} of ${totalSteps}`;
 
   const diffedLines = useMemo(() => {
     if (!currentStep) {
@@ -65,7 +99,7 @@ export function CodeViewer({
       <div className="p-4 border-b border-border">
         <div className="flex items-center justify-between gap-3">
           <h2 className="shrink-0 text-foreground">Lean Code</h2>
-          {canNavigate && (
+          {totalSteps > 0 && (
             <div className="flex shrink-0 items-center gap-2">
               <button
                 onClick={handlePrevious}
@@ -75,7 +109,7 @@ export function CodeViewer({
                 <ChevronLeft className="w-5 h-5" />
               </button>
               <span className="text-sm text-muted-foreground whitespace-nowrap">
-                Step {safeIndex + 1} of {totalSteps}
+                {stepLabel}
               </span>
               <button
                 onClick={handleNext}

@@ -17,6 +17,7 @@ import {
 } from './components/ui/alert-dialog';
 import { timelineStepCount } from './stepTimeline.mjs';
 import { hasResolvedProjectAssociation } from './projectAssociation.mjs';
+import { buildRunTimelineSections, timelineIndexForCodeStep } from './runAttempts';
 import {
   ChatMessage,
   CodeStep,
@@ -46,6 +47,7 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState('');
   const [codeSteps, setCodeSteps] = useState<CodeStep[]>([]);
   const [isPaused, setIsPaused] = useState(false);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
@@ -73,6 +75,11 @@ export default function App() {
   const selectedSessionIdRef = useRef<string | undefined>(undefined);
   const codeStepCountRef = useRef(0);
   const activeTimelineStepIndexRef = useRef<number | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const statusEventsRef = useRef<StatusEvent[]>([]);
+  const approvalEventsRef = useRef<ApprovalEvent[]>([]);
+  const pendingApprovalRef = useRef<PendingApproval | undefined>(undefined);
+  const selectedTerminalMessageIdRef = useRef<string | null>(null);
 
   const setActiveTimelineStep = (stepIndex: number | null) => {
     activeTimelineStepIndexRef.current = stepIndex;
@@ -209,6 +216,11 @@ export default function App() {
       .find((message) => message.role === 'assistant' || message.role === 'system');
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, selectedSession?.status]);
+  messagesRef.current = messages;
+  statusEventsRef.current = statusEvents;
+  approvalEventsRef.current = approvalEvents;
+  pendingApprovalRef.current = pendingApproval;
+  selectedTerminalMessageIdRef.current = selectedTerminalMessageId;
   const currentTimelineStepCount = useMemo(
     () =>
       timelineStepCount({
@@ -218,13 +230,28 @@ export default function App() {
       }),
     [messages, codeSteps, selectedTerminalMessageId],
   );
+  const runTimelineSections = useMemo(
+    () =>
+      buildRunTimelineSections({
+        messages,
+        codeSteps,
+        statusEvents,
+        approvalEvents,
+        pendingApproval,
+        terminalMessageId: selectedTerminalMessageId,
+      }),
+    [messages, codeSteps, statusEvents, approvalEvents, pendingApproval, selectedTerminalMessageId],
+  );
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((current) => {
       if (current.some((item) => item.id === message.id)) {
+        messagesRef.current = current;
         return current;
       }
-      return [...current, message];
+      const next = [...current, message];
+      messagesRef.current = next;
+      return next;
     });
   };
 
@@ -273,11 +300,13 @@ export default function App() {
         setMessages((current) => {
           const existing = current.find((message) => message.id === liveAssistantId);
           if (existing) {
-            return current.map((message) =>
+            const next = current.map((message) =>
               message.id === liveAssistantId
                 ? { ...message, content: message.content + payload.text }
                 : message,
             );
+            messagesRef.current = next;
+            return next;
           }
           const assistantStepCount = current.filter(
             (message) =>
@@ -285,7 +314,7 @@ export default function App() {
               !message.is_live_terminal_summary,
           ).length;
           setActiveTimelineStep(assistantStepCount);
-          return [
+          const next = [
             ...current,
             {
               id: liveAssistantId,
@@ -298,6 +327,8 @@ export default function App() {
               live_started_after_code_steps: codeStepCountRef.current,
             },
           ];
+          messagesRef.current = next;
+          return next;
         });
       });
 
@@ -315,9 +346,10 @@ export default function App() {
               ? current.filter((message) => message.id !== liveAssistantId)
               : current;
           if (withoutLive.some((message) => message.id === payload.id)) {
+            messagesRef.current = withoutLive;
             return withoutLive;
           }
-          return [
+          const next = [
             ...withoutLive,
             shouldReplaceLive && liveMessage
               ? {
@@ -327,6 +359,8 @@ export default function App() {
                 }
               : payload,
           ];
+          messagesRef.current = next;
+          return next;
         });
       });
 
@@ -338,8 +372,17 @@ export default function App() {
           }
           const next = [...current, payload];
           codeStepCountRef.current = next.length;
-          setCurrentStepIndex(payload.step_number - 1);
-          setActiveTimelineStep(payload.step_number - 1);
+          const nextSections = buildRunTimelineSections({
+            messages: messagesRef.current,
+            codeSteps: next,
+            statusEvents: statusEventsRef.current,
+            approvalEvents: approvalEventsRef.current,
+            pendingApproval: pendingApprovalRef.current,
+            terminalMessageId: selectedTerminalMessageIdRef.current,
+          });
+          const timelineIndex = timelineIndexForCodeStep(nextSections, payload.id) ?? payload.step_number - 1;
+          setCurrentStepIndex(timelineIndex);
+          setActiveTimelineStep(timelineIndex);
           return next;
         });
       });
@@ -354,18 +397,22 @@ export default function App() {
           activeTimelineStepIndexRef.current === null
             ? null
             : activeTimelineStepIndexRef.current + 1;
-        setStatusEvents((current) => [
-          ...current,
-          {
-            id: payload.id || `${run.run_id}-${current.length}-${Date.now()}`,
-            session_id: payload.session_id || run.session_id,
-            run_id: payload.run_id || run.run_id,
-            step_number: payloadStepNumber || activeStepNumber,
-            status: payload.status || null,
-            message: payload.message || payload.status || 'Lea status update',
-            created_at: payload.created_at || new Date().toISOString(),
-          },
-        ]);
+        setStatusEvents((current) => {
+          const next = [
+            ...current,
+            {
+              id: payload.id || `${run.run_id}-${current.length}-${Date.now()}`,
+              session_id: payload.session_id || run.session_id,
+              run_id: payload.run_id || run.run_id,
+              step_number: payloadStepNumber || activeStepNumber,
+              status: payload.status || null,
+              message: payload.message || payload.status || 'Lea status update',
+              created_at: payload.created_at || new Date().toISOString(),
+            },
+          ];
+          statusEventsRef.current = next;
+          return next;
+        });
       });
 
       source.addEventListener('approval_requested', (event) => {
@@ -655,6 +702,7 @@ export default function App() {
               selectedSessionIdRef.current = undefined;
               setSelectedSessionId(undefined);
               setMessages([]);
+              setChatDraft('');
               setCodeSteps([]);
               codeStepCountRef.current = 0;
               setStatusEvents([]);
@@ -690,8 +738,10 @@ export default function App() {
             sessionStatus={selectedSession?.status}
             statusEvents={statusEvents}
             approvalEvents={approvalEvents}
+            input={chatDraft}
             onSubmit={handleSubmit}
             onRetry={handleSubmit}
+            onInputChange={setChatDraft}
             onSubmitApproval={handleSubmitApproval}
             onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}
@@ -734,6 +784,7 @@ export default function App() {
         <Panel defaultSize={30} minSize={20} maxSize={50}>
           <CodeViewer
             codeSteps={codeSteps}
+            runTimelineSections={runTimelineSections}
             timelineStepCount={Math.max(
               currentTimelineStepCount,
               activeTimelineStepIndex === null ? 0 : activeTimelineStepIndex + 1,

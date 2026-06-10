@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink, Link2 } from 'lucide-react';
 import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SessionStatus, StatusEvent } from '../api';
-import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
+import { codeStepFallbackContent } from '../stepTimeline.mjs';
+import { buildRunTimelineSections } from '../runAttempts';
 import { MarkdownMessage } from './MarkdownMessage';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
 
@@ -13,8 +14,10 @@ export function ChatInterface({
   codeSteps,
   statusEvents,
   approvalEvents,
+  input,
   sessionStatus,
   onSubmit,
+  onInputChange,
   onStepSelect,
   onTogglePause,
   onOpenStats,
@@ -55,8 +58,10 @@ export function ChatInterface({
   sessionStatus?: SessionStatus;
   statusEvents: StatusEvent[];
   approvalEvents: ApprovalEvent[];
+  input: string;
   onSubmit: (content: string) => Promise<boolean>;
   onRetry: (content: string) => Promise<boolean>;
+  onInputChange: (content: string) => void;
   onSubmitApproval: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
   onRequestProjectAssignment: () => Promise<void>;
   onRequestProjectUnassignment: () => Promise<void>;
@@ -74,7 +79,6 @@ export function ChatInterface({
   currentStepIndex: number;
   activeTimelineStepIndex: number | null;
 }) {
-  const [input, setInput] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [newProjectTitle, setNewProjectTitle] = useState('');
@@ -89,59 +93,22 @@ export function ChatInterface({
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, sessionStatus]);
   const runSections = useMemo(() => {
-    const runIds: string[] = [];
-    const runTimes = new Map<string, number>();
-    const addRun = (runId?: string | null, createdAt?: string | null) => {
-      if (!runId) {
-        return;
-      }
-      if (!runIds.includes(runId)) {
-        runIds.push(runId);
-      }
-      const parsed = Date.parse(createdAt || '');
-      if (Number.isFinite(parsed)) {
-        runTimes.set(runId, Math.min(runTimes.get(runId) ?? parsed, parsed));
-      }
-    };
-
-    messages.forEach((message) => addRun(message.run_id, message.created_at));
-    codeSteps.forEach((step) => addRun(step.run_id, step.created_at));
-    statusEvents.forEach((event) => addRun(event.run_id, event.created_at));
-    approvalEvents.forEach((approval) => addRun(approval.run_id, approval.resolved_at));
-    addRun(pendingApproval?.run_id);
-
-    runIds.sort((a, b) => (runTimes.get(a) ?? 0) - (runTimes.get(b) ?? 0));
-
-    let stepOffset = 0;
-    return runIds.map((runId, index) => {
-      const runMessages = messages.filter((message) => message.run_id === runId);
-      const runCodeSteps = codeSteps.filter((step) => step.run_id === runId);
-      const runStatusEvents = statusEvents.filter((event) => event.run_id === runId);
+    return buildRunTimelineSections({
+      messages,
+      codeSteps,
+      statusEvents,
+      approvalEvents,
+      pendingApproval,
+      terminalMessageId,
+    }).map((section) => {
       const runApprovals = approvalEvents.filter(
-        (approval) => approval.run_id === runId && approval.approval_id !== pendingApproval?.approval_id,
+        (approval) => approval.run_id === section.id && approval.approval_id !== pendingApproval?.approval_id,
       );
-      const runPendingApproval = pendingApproval?.run_id === runId ? pendingApproval : undefined;
-      const runSystemTerminal = [...runMessages].reverse().find((message) => message.role === 'system');
-      const runTerminalMessageId =
-        terminalMessageId && runMessages.some((message) => message.id === terminalMessageId)
-          ? terminalMessageId
-          : runSystemTerminal?.id ?? null;
-      const sectionTimeline = buildStepTimeline({
-        messages: runMessages,
-        codeSteps: runCodeSteps,
-        statusEvents: runStatusEvents,
-        terminalMessageId: runTerminalMessageId,
-      });
-      const section = {
-        id: runId,
-        attemptNumber: index + 1,
-        stepOffset,
-        timeline: sectionTimeline,
+      return {
+        ...section,
         approvals: runApprovals,
-        pendingApproval: runPendingApproval,
+        pendingApproval: pendingApproval?.run_id === section.id ? pendingApproval : undefined,
       };
-      stepOffset += sectionTimeline.stepItems.length;
-      return section;
     });
   }, [messages, codeSteps, statusEvents, approvalEvents, pendingApproval, terminalMessageId]);
   const highlightedStepIndex =
@@ -165,7 +132,7 @@ export function ChatInterface({
     setIsSubmitting(true);
     const succeeded = await onSubmit(content);
     if (succeeded) {
-      setInput('');
+      onInputChange('');
     }
     setIsSubmitting(false);
   };
@@ -297,15 +264,13 @@ export function ChatInterface({
       message?.content ||
       (step ? codeStepFallbackContent(step) : 'Lea is preparing this step.');
     const createdAt = message?.created_at || step?.created_at || new Date().toISOString();
-    const selectableIndex =
-      step && Number.isInteger(step.step_number) ? step.step_number - 1 : globalStepIndex;
 
     return (
       <div key={item.id} className="flex justify-start">
         <div className="flex w-full flex-col gap-2 md:flex-row md:items-start">
           <div
             className={`max-w-[80%] cursor-pointer rounded-lg bg-muted p-4 text-muted-foreground transition-all hover:ring-2 hover:ring-foreground/40 md:max-w-[66%] ${activeStepClass}`}
-            onClick={() => onStepSelect(selectableIndex)}
+            onClick={() => onStepSelect(globalStepIndex)}
           >
             <div className="mb-3 text-xs font-semibold uppercase tracking-wide text-foreground/70">
               <span>Step {item.stepNumber}</span>
@@ -426,7 +391,7 @@ export function ChatInterface({
 
         {runSections.map((section) => (
           <div key={section.id} className="space-y-4">
-            {section.attemptNumber > 1 && (
+            {section.attemptNumber !== null && (
               <div className="flex items-center gap-3 py-2">
                 <div className="h-px flex-1 bg-border" />
                 <span className="shrink-0 rounded-md border border-border bg-background px-2 py-1 font-mono text-[0.65rem] uppercase tracking-widest text-muted-foreground">
@@ -577,7 +542,7 @@ export function ChatInterface({
         <form onSubmit={handleSubmit} className="flex items-end gap-2">
           <textarea
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => onInputChange(e.target.value)}
             onKeyDown={handleInputKeyDown}
             placeholder="Enter your theorem in LaTeX or natural language..."
             rows={2}
