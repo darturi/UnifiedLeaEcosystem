@@ -130,6 +130,7 @@ class LeaApiClient:
                 "max_turns": self.config.max_turns,
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
+                "theorem_translation_max_retries": self.config.theorem_translation_max_retries,
             },
         }
         if self.config.model:
@@ -141,6 +142,7 @@ class LeaApiClient:
             config["agent"] = {
                 "narrate_tool_steps": self.config.narrate_tool_steps,
                 "permission_tier": self.config.permission_tier,
+                "theorem_translation_max_retries": self.config.theorem_translation_max_retries,
             }
         return config
 

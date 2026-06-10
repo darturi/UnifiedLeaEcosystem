@@ -46,6 +46,8 @@ Set `narrate_tool_steps = true` to ask the bundled Lea agent to emit short Markd
 
 Set `permission_tier = "theorem_translation"` to pause each run for approval of the checked top-level Lean theorem skeleton before proof search starts. Use `permission_tier = "none"` to disable approval prompts.
 
+Set `theorem_translation_max_retries = 3` to control how many internal preflight attempts Lea makes to produce a checked Lean theorem statement before surfacing the approval step. This only affects the theorem translation permission tier.
+
 The default config uses the bundled Lea API at `http://127.0.0.1:8000` and resolves Lean file paths relative to the submodule:
 
 ```toml

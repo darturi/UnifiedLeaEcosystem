@@ -16,6 +16,7 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
         max_turns = 12
         max_spend_usd = 20.0
         permission_tier = "theorem_translation"
+        theorem_translation_max_retries = 4
         openai_api_key = "sk-secret-1234"
         """
     )
@@ -25,6 +26,7 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
     assert payload["model"] == "gpt-4o"
     assert payload["max_turns"] == 12
     assert payload["max_spend_usd"] == 20.0
+    assert payload["theorem_translation_max_retries"] == 4
     assert payload["api_keys"]["openai"] == {"configured": True, "last4": "1234"}
     assert payload["api_keys"]["anthropic"] == {"configured": False, "last4": None}
 
@@ -41,6 +43,7 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
         model = "gpt-4o"
         max_turns = 12
         permission_tier = "theorem_translation"
+        theorem_translation_max_retries = 3
         openai_api_key = "old-secret"
         """
     )
@@ -51,6 +54,7 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
             "max_turns": 30,
             "max_spend_usd": 9.5,
             "permission_tier": "stepwise",
+            "theorem_translation_max_retries": 7,
             "api_keys": {
                 "openai": {"clear": True},
                 "anthropic": {"value": "sk-ant-secret123456"},
@@ -61,13 +65,29 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
     text = config_path.read_text()
 
     assert payload["permission_tier"] == "stepwise"
+    assert payload["theorem_translation_max_retries"] == 7
     assert 'lea_root = "external/lea-prover"' in text
     assert 'model = "claude-sonnet-4-6"' in text
     assert "max_turns = 30" in text
     assert "max_spend_usd = 9.5" in text
     assert 'permission_tier = "stepwise"' in text
+    assert "theorem_translation_max_retries = 7" in text
     assert "openai_api_key" not in text
     assert 'anthropic_api_key = "sk-ant-secret123456"' in text
+
+
+def test_update_settings_rejects_invalid_theorem_translation_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text("")
+
+    try:
+        settings_service.update_settings({"theorem_translation_max_retries": 0}, config_path)
+    except ValueError as exc:
+        assert str(exc) == "theorem_translation_max_retries must be at least 1"
+    else:
+        raise AssertionError("Expected ValueError")
 
 
 def test_update_settings_rejects_selected_model_without_api_key(tmp_path, monkeypatch):

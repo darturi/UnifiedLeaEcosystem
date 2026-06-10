@@ -19,6 +19,7 @@ def test_load_config_defaults_to_local_lea_api(tmp_path):
     assert config.lea_root == Path(__file__).resolve().parents[2] / "external" / "lea-prover"
     assert config.narrate_tool_steps is False
     assert config.permission_tier == "none"
+    assert config.theorem_translation_max_retries == 3
 
 
 def test_load_config_honors_api_settings(tmp_path):
@@ -38,6 +39,7 @@ def test_load_config_honors_api_settings(tmp_path):
         openai_base_url = "https://openai.example/v1"
         narrate_tool_steps = true
         permission_tier = "stepwise"
+        theorem_translation_max_retries = 5
         """
     )
 
@@ -57,6 +59,7 @@ def test_load_config_honors_api_settings(tmp_path):
     assert config.openai_base_url == "https://openai.example/v1"
     assert config.narrate_tool_steps is True
     assert config.permission_tier == "stepwise"
+    assert config.theorem_translation_max_retries == 5
 
 
 def test_load_config_rejects_invalid_api_base_url(tmp_path):
@@ -80,6 +83,18 @@ def test_load_config_rejects_invalid_permission_tier(tmp_path):
     config_path.write_text('permission_tier = "ask_everything"\n')
 
     with pytest.raises(ValueError, match="permission_tier"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["0", "-1", "true", "1.5", '"3"'],
+)
+def test_load_config_rejects_invalid_theorem_translation_retries(tmp_path, value):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text(f"theorem_translation_max_retries = {value}\n")
+
+    with pytest.raises(ValueError, match="theorem_translation_max_retries"):
         load_config(config_path)
 
 

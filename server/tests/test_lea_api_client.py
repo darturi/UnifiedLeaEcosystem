@@ -37,6 +37,7 @@ def make_config(**overrides):
         lea_job_timeout_seconds=overrides.get("lea_job_timeout_seconds", 900),
         narrate_tool_steps=overrides.get("narrate_tool_steps", False),
         permission_tier=overrides.get("permission_tier", "none"),
+        theorem_translation_max_retries=overrides.get("theorem_translation_max_retries", 3),
         anthropic_api_key=overrides.get("anthropic_api_key"),
         openai_api_key=overrides.get("openai_api_key"),
         google_api_key=overrides.get("google_api_key"),
@@ -64,7 +65,12 @@ def test_start_run_posts_task_config_and_bearer_auth():
     assert seen["body"] == {
         "task": "prove True",
         "config": {
-            "agent": {"max_turns": 5, "narrate_tool_steps": False, "permission_tier": "none"},
+            "agent": {
+                "max_turns": 5,
+                "narrate_tool_steps": False,
+                "permission_tier": "none",
+                "theorem_translation_max_retries": 3,
+            },
             "model": {"name": "o4-mini"},
         },
     }
@@ -82,6 +88,7 @@ def test_start_run_sends_narration_flag_even_without_max_turns():
     assert seen["body"]["config"]["agent"] == {
         "narrate_tool_steps": True,
         "permission_tier": "none",
+        "theorem_translation_max_retries": 3,
     }
 
 
@@ -98,6 +105,21 @@ def test_start_run_sends_permission_tier():
     ).start_run("task")
 
     assert seen["body"]["config"]["agent"]["permission_tier"] == "theorem_translation"
+
+
+def test_start_run_sends_theorem_translation_retries():
+    seen = {}
+
+    def transport(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(json.dumps({"run_id": "api-1"}).encode("utf-8"))
+
+    LeaApiClient(
+        make_config(theorem_translation_max_retries=8),
+        transport=transport,
+    ).start_run("task")
+
+    assert seen["body"]["config"]["agent"]["theorem_translation_max_retries"] == 8
 
 
 def test_start_run_sends_project_payload():

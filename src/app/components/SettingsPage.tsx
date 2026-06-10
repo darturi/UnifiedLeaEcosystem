@@ -56,6 +56,7 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
   const [settings, setSettings] = useState<AppSettings>();
   const [model, setModel] = useState('');
   const [permissionTier, setPermissionTier] = useState<PermissionTier>('theorem_translation');
+  const [theoremTranslationRetries, setTheoremTranslationRetries] = useState(3);
   const [maxTurns, setMaxTurns] = useState(20);
   const [maxSpend, setMaxSpend] = useState('');
   const [apiKeys, setApiKeys] = useState<Record<ApiKeyFamily, string>>({
@@ -87,6 +88,7 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
       setSettings(loaded);
       setModel(loaded.model);
       setPermissionTier(loaded.permission_tier);
+      setTheoremTranslationRetries(loaded.theorem_translation_max_retries);
       setMaxTurns(loaded.max_turns ?? 20);
       setMaxSpend(loaded.max_spend_usd == null ? '' : String(loaded.max_spend_usd));
       setApiKeys({ openai: '', anthropic: '', google: '' });
@@ -150,6 +152,7 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
       const update: SettingsUpdate = {
         model,
         permission_tier: permissionTier,
+        theorem_translation_max_retries: theoremTranslationRetries,
         max_turns: maxTurns,
         max_spend_usd: maxSpend.trim() ? Number(maxSpend) : null,
         api_keys: Object.keys(apiKeyUpdates).length ? apiKeyUpdates : undefined,
@@ -158,6 +161,7 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
       setSettings(savedSettings);
       setModel(savedSettings.model);
       setPermissionTier(savedSettings.permission_tier);
+      setTheoremTranslationRetries(savedSettings.theorem_translation_max_retries);
       setMaxTurns(savedSettings.max_turns ?? 20);
       setMaxSpend(savedSettings.max_spend_usd == null ? '' : String(savedSettings.max_spend_usd));
       setApiKeys({ openai: '', anthropic: '', google: '' });
@@ -338,6 +342,24 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
 
             <Separator />
 
+            <Section
+              title="Theorem Translation Retries"
+              description="Internal attempts to produce a checked Lean theorem statement."
+            >
+              <Input
+                type="number"
+                min={1}
+                step={1}
+                value={theoremTranslationRetries}
+                disabled={permissionTier !== 'theorem_translation'}
+                onChange={(event) => setTheoremTranslationRetries(toPositiveInteger(event.target.value))}
+                aria-label="Theorem translation retry attempts"
+                className="w-32 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+            </Section>
+
+            <Separator />
+
             <Section title="Max Turns" description="Maximum turns the agent may take on a proof attempt.">
               <div className="flex items-center gap-4">
                 <Slider
@@ -457,6 +479,11 @@ function modelFamilyFor(model: string, settings?: AppSettings): string | undefin
     return 'google';
   }
   return undefined;
+}
+
+function toPositiveInteger(value: string): number {
+  const parsed = Math.trunc(Number(value));
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
 }
 
 function validateSettingsBeforeSave(

@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
 from .config import load_config
 from .db import init_db
@@ -72,6 +72,7 @@ class ApiKeyUpdateRequest(BaseModel):
 class SettingsRequest(BaseModel):
     model: str | None = None
     permission_tier: str | None = None
+    theorem_translation_max_retries: StrictInt | None = None
     max_turns: int | None = None
     max_spend_usd: float | None = None
     api_keys: dict[str, ApiKeyUpdateRequest] | None = None

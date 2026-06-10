@@ -65,6 +65,7 @@ def settings_payload(path: Path | None = None) -> dict[str, Any]:
         "max_turns": config.max_turns,
         "max_spend_usd": config.max_spend_usd,
         "permission_tier": config.permission_tier,
+        "theorem_translation_max_retries": config.theorem_translation_max_retries,
         "current_spend_usd": float(stats["global"]["cost_usd"]),
         "api_keys": {
             family: _masked_key(getattr(config, field))
@@ -95,6 +96,17 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
         if permission_tier not in PERMISSION_TIERS:
             raise ValueError("permission_tier must be one of: none, theorem_translation, stepwise")
         updates["permission_tier"] = permission_tier
+
+    if "theorem_translation_max_retries" in values:
+        theorem_translation_max_retries = values["theorem_translation_max_retries"]
+        if (
+            not isinstance(theorem_translation_max_retries, int)
+            or isinstance(theorem_translation_max_retries, bool)
+        ):
+            raise ValueError("theorem_translation_max_retries must be an integer")
+        if theorem_translation_max_retries < 1:
+            raise ValueError("theorem_translation_max_retries must be at least 1")
+        updates["theorem_translation_max_retries"] = theorem_translation_max_retries
 
     if "max_turns" in values:
         max_turns = values["max_turns"]

@@ -24,6 +24,7 @@ class LeaConfig:
     openai_base_url: str | None = None
     narrate_tool_steps: bool = False
     permission_tier: str = "none"
+    theorem_translation_max_retries: int = 3
 
 
 def load_config(path: Path | None = None) -> LeaConfig:
@@ -49,6 +50,14 @@ def load_config(path: Path | None = None) -> LeaConfig:
         raise ValueError("permission_tier must be a string")
     if permission_tier not in {"none", "theorem_translation", "stepwise"}:
         raise ValueError("permission_tier must be one of: none, theorem_translation, stepwise")
+    theorem_translation_max_retries = data.get("theorem_translation_max_retries", 3)
+    if (
+        not isinstance(theorem_translation_max_retries, int)
+        or isinstance(theorem_translation_max_retries, bool)
+    ):
+        raise ValueError("theorem_translation_max_retries must be an integer")
+    if theorem_translation_max_retries < 1:
+        raise ValueError("theorem_translation_max_retries must be at least 1")
     max_spend_usd = data.get("max_spend_usd")
     if max_spend_usd is not None:
         max_spend_usd = float(max_spend_usd)
@@ -69,6 +78,7 @@ def load_config(path: Path | None = None) -> LeaConfig:
         openai_base_url=data.get("openai_base_url"),
         narrate_tool_steps=narrate_tool_steps,
         permission_tier=permission_tier,
+        theorem_translation_max_retries=theorem_translation_max_retries,
     )
 
 

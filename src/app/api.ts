@@ -227,6 +227,7 @@ export interface ApiKeyStatus {
 export interface AppSettings {
   model: string;
   permission_tier: PermissionTier;
+  theorem_translation_max_retries: number;
   max_turns?: number | null;
   max_spend_usd?: number | null;
   current_spend_usd: number;
@@ -238,6 +239,7 @@ export interface AppSettings {
 export interface SettingsUpdate {
   model?: string;
   permission_tier?: PermissionTier;
+  theorem_translation_max_retries?: number;
   max_turns?: number | null;
   max_spend_usd?: number | null;
   api_keys?: Partial<Record<'openai' | 'anthropic' | 'google', { value?: string; clear?: boolean }>>;
@@ -353,7 +355,8 @@ export async function getSettings(): Promise<AppSettings> {
   if (!response.ok) {
     throw new Error(`Failed to load settings: ${response.statusText}`);
   }
-  return response.json();
+  const settings = await response.json();
+  return validateSettingsPayload(settings);
 }
 
 export async function saveSettings(update: SettingsUpdate): Promise<AppSettings> {
@@ -374,7 +377,8 @@ export async function saveSettings(update: SettingsUpdate): Promise<AppSettings>
     }
     throw error;
   }
-  return response.json();
+  const settings = await response.json();
+  return validateSettingsPayload(settings);
 }
 
 export async function createRun(message: string, sessionId?: string, projectId?: string): Promise<{
@@ -424,4 +428,13 @@ async function errorMessage(response: Response, fallback: string): Promise<strin
     return detail.detail.message;
   }
   return fallback;
+}
+
+function validateSettingsPayload(settings: AppSettings): AppSettings {
+  if (!Number.isInteger(settings.theorem_translation_max_retries) || settings.theorem_translation_max_retries < 1) {
+    throw new Error(
+      'Settings API did not return theorem translation retry configuration. Restart the local backend and try again.',
+    );
+  }
+  return settings;
 }
