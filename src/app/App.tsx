@@ -5,26 +5,49 @@ import { ChatInterface } from './components/ChatInterface';
 import { CodeViewer } from './components/CodeViewer';
 import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from './components/ui/alert-dialog';
 import { timelineStepCount } from './stepTimeline.mjs';
+import { hasResolvedProjectAssociation } from './projectAssociation.mjs';
+import { buildRunTimelineSections, timelineIndexForCodeStep } from './runAttempts';
 import {
   ChatMessage,
   CodeStep,
   ApprovalDecision,
   ApprovalEvent,
   PendingApproval,
+  ProjectTheoremEntry,
+  ProjectAssignmentCheck,
+  ProjectUnassignmentCheck,
   SessionSummary,
   SessionDetail,
   StatusEvent,
+  Project,
+  assignProject,
+  checkProjectAssignment,
+  checkProjectTheoremUnassignment,
+  createProject,
   createRun,
   getSession,
+  listProjects,
   listSessions,
   submitApproval,
+  unassignProjectTheorem,
 } from './api';
 
 export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState('');
   const [codeSteps, setCodeSteps] = useState<CodeStep[]>([]);
   const [isPaused, setIsPaused] = useState(false);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
@@ -38,9 +61,25 @@ export default function App() {
   const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
   const [approvalEvents, setApprovalEvents] = useState<ApprovalEvent[]>([]);
   const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>();
+  const [projectTheorem, setProjectTheorem] = useState<ProjectTheoremEntry>();
+  const [pendingAssignment, setPendingAssignment] = useState<{ projectId: string; projectTitle: string }>();
+  const [assignmentPlan, setAssignmentPlan] = useState<ProjectAssignmentCheck>();
+  const [isAssigningProject, setIsAssigningProject] = useState(false);
+  const [pendingUnassignment, setPendingUnassignment] = useState<ProjectUnassignmentCheck>();
+  const [availableUnassignment, setAvailableUnassignment] = useState<ProjectUnassignmentCheck>();
+  const [unassignmentBlockedReason, setUnassignmentBlockedReason] = useState<string>();
+  const [isUnassigningProject, setIsUnassigningProject] = useState(false);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const selectedSessionIdRef = useRef<string | undefined>(undefined);
   const codeStepCountRef = useRef(0);
   const activeTimelineStepIndexRef = useRef<number | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const statusEventsRef = useRef<StatusEvent[]>([]);
+  const approvalEventsRef = useRef<ApprovalEvent[]>([]);
+  const pendingApprovalRef = useRef<PendingApproval | undefined>(undefined);
+  const selectedTerminalMessageIdRef = useRef<string | null>(null);
 
   const setActiveTimelineStep = (stepIndex: number | null) => {
     activeTimelineStepIndexRef.current = stepIndex;
@@ -74,9 +113,34 @@ export default function App() {
     return loaded;
   };
 
+  const refreshProjects = async () => {
+    const loaded = await listProjects();
+    setProjects(loaded);
+    return loaded;
+  };
+
+  const refreshUnassignmentAvailability = async (detail: SessionDetail) => {
+    setAvailableUnassignment(undefined);
+    setUnassignmentBlockedReason(undefined);
+    if (!detail.project?.id || !detail.project_theorem || detail.active_run) {
+      return;
+    }
+    const sessionId = detail.id;
+    try {
+      const plan = await checkProjectTheoremUnassignment(detail.project.id, detail.project_theorem.name);
+      setAvailableUnassignment(selectedSessionIdRef.current === sessionId ? plan : undefined);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'This theorem cannot be unassigned.';
+      if (selectedSessionIdRef.current === sessionId) {
+        setUnassignmentBlockedReason(message);
+      }
+    }
+  };
+
   useEffect(() => {
     const restoreInitialSession = async () => {
       const loaded = await refreshSessions();
+      await refreshProjects();
       const savedSessionId = window.localStorage.getItem('lea:selectedSessionId');
       const savedSession = savedSessionId
         ? loaded.find((session) => session.id === savedSessionId)
@@ -94,11 +158,19 @@ export default function App() {
   }, []);
 
   const applySessionDetail = (detail: SessionDetail) => {
+    selectedSessionIdRef.current = detail.id;
     setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
     setApprovalEvents(detail.approval_events || []);
+    setSelectedProjectId(detail.project?.id || detail.project_id || undefined);
+    setProjectTheorem(detail.project_theorem || undefined);
+    setPendingAssignment(undefined);
+    setAssignmentPlan(undefined);
+    setPendingUnassignment(undefined);
+    setAvailableUnassignment(undefined);
+    setUnassignmentBlockedReason(undefined);
     codeStepCountRef.current = detail.code_steps.length;
     setCurrentStepIndex(lastTimelineStepIndex(detail));
     setActiveTimelineStep(null);
@@ -119,12 +191,14 @@ export default function App() {
   const loadSession = async (sessionId: string) => {
     const detail = await getSession(sessionId);
     applySessionDetail(detail);
+    await refreshUnassignmentAvailability(detail);
     window.localStorage.setItem('lea:selectedSessionId', detail.id);
   };
 
   const reconcileSession = async (sessionId: string) => {
     const detail = await getSession(sessionId);
     applySessionDetail(detail);
+    await refreshUnassignmentAvailability(detail);
   };
 
   const selectedSession = useMemo(
@@ -142,6 +216,11 @@ export default function App() {
       .find((message) => message.role === 'assistant' || message.role === 'system');
     return terminalMessage?.id ?? null;
   }, [isRunning, messages, selectedSession?.status]);
+  messagesRef.current = messages;
+  statusEventsRef.current = statusEvents;
+  approvalEventsRef.current = approvalEvents;
+  pendingApprovalRef.current = pendingApproval;
+  selectedTerminalMessageIdRef.current = selectedTerminalMessageId;
   const currentTimelineStepCount = useMemo(
     () =>
       timelineStepCount({
@@ -151,13 +230,28 @@ export default function App() {
       }),
     [messages, codeSteps, selectedTerminalMessageId],
   );
+  const runTimelineSections = useMemo(
+    () =>
+      buildRunTimelineSections({
+        messages,
+        codeSteps,
+        statusEvents,
+        approvalEvents,
+        pendingApproval,
+        terminalMessageId: selectedTerminalMessageId,
+      }),
+    [messages, codeSteps, statusEvents, approvalEvents, pendingApproval, selectedTerminalMessageId],
+  );
 
   const appendMessage = (message: ChatMessage) => {
     setMessages((current) => {
       if (current.some((item) => item.id === message.id)) {
+        messagesRef.current = current;
         return current;
       }
-      return [...current, message];
+      const next = [...current, message];
+      messagesRef.current = next;
+      return next;
     });
   };
 
@@ -165,10 +259,14 @@ export default function App() {
     setError(undefined);
     setApprovalError(undefined);
     setPendingApproval(undefined);
+    setProjectTheorem(undefined);
+    setPendingUnassignment(undefined);
+    setAvailableUnassignment(undefined);
+    setUnassignmentBlockedReason(undefined);
     eventSourceRef.current?.close();
 
     try {
-      const run = await createRun(content, selectedSessionId);
+      const run = await createRun(content, selectedSessionId, selectedProjectId);
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       appendMessage(run.message);
@@ -202,11 +300,13 @@ export default function App() {
         setMessages((current) => {
           const existing = current.find((message) => message.id === liveAssistantId);
           if (existing) {
-            return current.map((message) =>
+            const next = current.map((message) =>
               message.id === liveAssistantId
                 ? { ...message, content: message.content + payload.text }
                 : message,
             );
+            messagesRef.current = next;
+            return next;
           }
           const assistantStepCount = current.filter(
             (message) =>
@@ -214,7 +314,7 @@ export default function App() {
               !message.is_live_terminal_summary,
           ).length;
           setActiveTimelineStep(assistantStepCount);
-          return [
+          const next = [
             ...current,
             {
               id: liveAssistantId,
@@ -227,6 +327,8 @@ export default function App() {
               live_started_after_code_steps: codeStepCountRef.current,
             },
           ];
+          messagesRef.current = next;
+          return next;
         });
       });
 
@@ -244,9 +346,10 @@ export default function App() {
               ? current.filter((message) => message.id !== liveAssistantId)
               : current;
           if (withoutLive.some((message) => message.id === payload.id)) {
+            messagesRef.current = withoutLive;
             return withoutLive;
           }
-          return [
+          const next = [
             ...withoutLive,
             shouldReplaceLive && liveMessage
               ? {
@@ -256,6 +359,8 @@ export default function App() {
                 }
               : payload,
           ];
+          messagesRef.current = next;
+          return next;
         });
       });
 
@@ -267,8 +372,17 @@ export default function App() {
           }
           const next = [...current, payload];
           codeStepCountRef.current = next.length;
-          setCurrentStepIndex(payload.step_number - 1);
-          setActiveTimelineStep(payload.step_number - 1);
+          const nextSections = buildRunTimelineSections({
+            messages: messagesRef.current,
+            codeSteps: next,
+            statusEvents: statusEventsRef.current,
+            approvalEvents: approvalEventsRef.current,
+            pendingApproval: pendingApprovalRef.current,
+            terminalMessageId: selectedTerminalMessageIdRef.current,
+          });
+          const timelineIndex = timelineIndexForCodeStep(nextSections, payload.id) ?? payload.step_number - 1;
+          setCurrentStepIndex(timelineIndex);
+          setActiveTimelineStep(timelineIndex);
           return next;
         });
       });
@@ -283,18 +397,22 @@ export default function App() {
           activeTimelineStepIndexRef.current === null
             ? null
             : activeTimelineStepIndexRef.current + 1;
-        setStatusEvents((current) => [
-          ...current,
-          {
-            id: payload.id || `${run.run_id}-${current.length}-${Date.now()}`,
-            session_id: payload.session_id || run.session_id,
-            run_id: payload.run_id || run.run_id,
-            step_number: payloadStepNumber || activeStepNumber,
-            status: payload.status || null,
-            message: payload.message || payload.status || 'Lea status update',
-            created_at: payload.created_at || new Date().toISOString(),
-          },
-        ]);
+        setStatusEvents((current) => {
+          const next = [
+            ...current,
+            {
+              id: payload.id || `${run.run_id}-${current.length}-${Date.now()}`,
+              session_id: payload.session_id || run.session_id,
+              run_id: payload.run_id || run.run_id,
+              step_number: payloadStepNumber || activeStepNumber,
+              status: payload.status || null,
+              message: payload.message || payload.status || 'Lea status update',
+              created_at: payload.created_at || new Date().toISOString(),
+            },
+          ];
+          statusEventsRef.current = next;
+          return next;
+        });
       });
 
       source.addEventListener('approval_requested', (event) => {
@@ -428,6 +546,97 @@ export default function App() {
     }
   };
 
+  const handleRequestProjectAssignment = async () => {
+    const projectId = selectedProjectId;
+    const project = projects.find((item) => item.id === projectId);
+    if (!selectedSessionId || !projectId || !project || isRunning || isAssigningProject) {
+      return;
+    }
+    if (hasResolvedProjectAssociation(projectTheorem)) {
+      setError('This formalization is already associated with a project. Reassignment is not supported yet.');
+      return;
+    }
+    if (selectedSession?.status === 'failed') {
+      setError(
+        'This proof did not complete successfully. Retry the proof in this chat with a project selected; if the retry succeeds, the formalization will join that project. Failed formalizations are not moved.',
+      );
+      return;
+    }
+    if (selectedSession?.status !== 'success') {
+      setError('Only completed successful formalizations can be assigned to a project.');
+      return;
+    }
+    setError(undefined);
+    setAssignmentPlan(undefined);
+    setPendingAssignment({ projectId, projectTitle: project.title });
+  };
+
+  const handleConfirmProjectAssignment = async () => {
+    if (!selectedSessionId || !pendingAssignment || isAssigningProject) {
+      return;
+    }
+    setIsAssigningProject(true);
+    setError(undefined);
+    try {
+      const plan = await checkProjectAssignment(selectedSessionId, pendingAssignment.projectId);
+      setAssignmentPlan(plan);
+      const result = await assignProject(selectedSessionId, pendingAssignment.projectId);
+      setPendingAssignment(undefined);
+      setAssignmentPlan(undefined);
+      await reconcileSession(selectedSessionId);
+      await refreshSessions();
+      await refreshProjects();
+      setCurrentStepIndex(Math.max(0, result.code_step.step_number - 1));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to assign formalization to project.');
+    } finally {
+      setIsAssigningProject(false);
+    }
+  };
+
+  const handleRequestProjectUnassignment = async () => {
+    if (!availableUnassignment || isRunning || isUnassigningProject) {
+      return;
+    }
+    setPendingUnassignment(availableUnassignment);
+  };
+
+  const handleConfirmProjectUnassignment = async () => {
+    const projectId = selectedProjectId || selectedSession?.project_id || undefined;
+    if (!projectId || !pendingUnassignment || isUnassigningProject) {
+      return;
+    }
+    setIsUnassigningProject(true);
+    setError(undefined);
+    try {
+      const result = await unassignProjectTheorem(projectId, pendingUnassignment.theorem.name);
+      setPendingUnassignment(undefined);
+      setAvailableUnassignment(undefined);
+      setUnassignmentBlockedReason(undefined);
+      if (selectedSessionId) {
+        await reconcileSession(selectedSessionId);
+      }
+      await refreshSessions();
+      await refreshProjects();
+      setStatusEvents((current) => [
+        ...current,
+        {
+          id: `project-unassigned-${Date.now()}`,
+          session_id: selectedSessionId,
+          run_id: undefined,
+          step_number: null,
+          status: 'project_unassigned',
+          message: `Unassigned ${result.theorem.name} from the project and moved it to ${result.move.to_path}.`,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to unassign project theorem.');
+    } finally {
+      setIsUnassigningProject(false);
+    }
+  };
+
   if (view === 'stats') {
     return <StatsPage onBack={() => setView('main')} />;
   }
@@ -436,7 +645,53 @@ export default function App() {
   }
 
   return (
-    <div className="size-full">
+    <>
+      <AlertDialog open={Boolean(pendingUnassignment)} onOpenChange={(open) => !open && setPendingUnassignment(undefined)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Unassign theorem from project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will remove {pendingUnassignment?.theorem.name} from the project markdown and move
+              {' '}{pendingUnassignment?.planned_move.from_path} to {pendingUnassignment?.planned_move.to_path}.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isUnassigningProject}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmProjectUnassignment} disabled={isUnassigningProject}>
+              Unassign
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog
+        open={Boolean(pendingAssignment)}
+        onOpenChange={(open) => {
+          if (!open && !isAssigningProject) {
+            setPendingAssignment(undefined);
+            setAssignmentPlan(undefined);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Assign formalization to project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will check for namespace conflicts, update the Lean namespace, move the proof out of
+              {' '}Lea.Misc, and record it in {pendingAssignment?.projectTitle}.
+              {assignmentPlan
+                ? ` Planned move: ${assignmentPlan.planned_move.from_path} to ${assignmentPlan.planned_move.to_path}.`
+                : ''}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isAssigningProject}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmProjectAssignment} disabled={isAssigningProject}>
+              Assign
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <div className="size-full">
       <PanelGroup direction="horizontal">
         <Panel defaultSize={20} minSize={15} maxSize={30}>
           <SessionList
@@ -444,8 +699,10 @@ export default function App() {
             selectedSessionId={selectedSessionId}
             onSelectSession={(id) => loadSession(id).catch((err) => setError(err.message))}
             onNewSession={() => {
+              selectedSessionIdRef.current = undefined;
               setSelectedSessionId(undefined);
               setMessages([]);
+              setChatDraft('');
               setCodeSteps([]);
               codeStepCountRef.current = 0;
               setStatusEvents([]);
@@ -454,8 +711,15 @@ export default function App() {
               setActiveTimelineStep(null);
               setCurrentRunId(undefined);
               setPendingApproval(undefined);
+              setProjectTheorem(undefined);
+              setPendingAssignment(undefined);
+              setAssignmentPlan(undefined);
+              setPendingUnassignment(undefined);
+              setAvailableUnassignment(undefined);
+              setUnassignmentBlockedReason(undefined);
               setApprovalError(undefined);
               setIsRunning(false);
+              setSelectedProjectId(undefined);
               window.localStorage.removeItem('lea:selectedSessionId');
               setError(undefined);
             }}
@@ -474,19 +738,44 @@ export default function App() {
             sessionStatus={selectedSession?.status}
             statusEvents={statusEvents}
             approvalEvents={approvalEvents}
+            input={chatDraft}
             onSubmit={handleSubmit}
             onRetry={handleSubmit}
+            onInputChange={setChatDraft}
             onSubmitApproval={handleSubmitApproval}
             onStepSelect={setCurrentStepIndex}
             onTogglePause={() => setIsPaused(!isPaused)}
             onOpenStats={() => setView('stats')}
             onOpenSettings={() => setView('settings')}
+            onRequestProjectAssignment={handleRequestProjectAssignment}
+            onRequestProjectUnassignment={handleRequestProjectUnassignment}
             theoremName={title}
             currentStepIndex={currentStepIndex}
             activeTimelineStepIndex={activeTimelineStepIndex}
             pendingApproval={pendingApproval}
             isSubmittingApproval={isSubmittingApproval}
             approvalError={approvalError}
+            projectTheorem={projectTheorem}
+            isProjectAssociated={hasResolvedProjectAssociation(projectTheorem)}
+            isAssigningProject={isAssigningProject}
+            canUnassignProjectTheorem={Boolean(availableUnassignment)}
+            unassignmentDisabledReason={unassignmentBlockedReason}
+            isUnassigningProject={isUnassigningProject}
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            onProjectChange={setSelectedProjectId}
+            onCreateProject={async (title) => {
+              const slug = title
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9_-]+/g, '-')
+                .replace(/^-+|-+$/g, '')
+                || 'project';
+              const project = await createProject({ title, slug });
+              await refreshProjects();
+              setSelectedProjectId(project.id);
+              return project;
+            }}
           />
         </Panel>
 
@@ -495,6 +784,7 @@ export default function App() {
         <Panel defaultSize={30} minSize={20} maxSize={50}>
           <CodeViewer
             codeSteps={codeSteps}
+            runTimelineSections={runTimelineSections}
             timelineStepCount={Math.max(
               currentTimelineStepCount,
               activeTimelineStepIndex === null ? 0 : activeTimelineStepIndex + 1,
@@ -506,6 +796,7 @@ export default function App() {
           />
         </Panel>
       </PanelGroup>
-    </div>
+      </div>
+    </>
   );
 }

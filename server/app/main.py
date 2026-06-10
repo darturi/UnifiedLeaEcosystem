@@ -7,16 +7,27 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
 from .config import load_config
 from .db import init_db
 from .lea_api_client import LeaApiClient, LeaApiError
+from .project_assignment import (
+    ProjectAssignmentError,
+    assign_project,
+    check_project_assignment,
+)
+from .project_unassignment import (
+    ProjectUnassignmentError,
+    check_project_theorem_unassignment,
+    project_theorem_for_proof_path,
+    unassign_project_theorem,
+)
 from .runner import RunnerContext, run_lea
 from . import settings as settings_service
 from . import store
@@ -37,6 +48,17 @@ app.add_middleware(
 class RunRequest(BaseModel):
     message: str
     session_id: str | None = None
+    project_id: str | None = None
+
+
+class ProjectRequest(BaseModel):
+    slug: str | None = None
+    title: str | None = None
+    path: str | None = None
+
+
+class ProjectAssignmentRequest(BaseModel):
+    project_id: str
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -52,6 +74,7 @@ class ApiKeyUpdateRequest(BaseModel):
 class SettingsRequest(BaseModel):
     model: str | None = None
     permission_tier: str | None = None
+    theorem_translation_max_retries: StrictInt | None = None
     max_turns: int | None = None
     max_spend_usd: float | None = None
     api_keys: dict[str, ApiKeyUpdateRequest] | None = None
@@ -77,6 +100,60 @@ def stats() -> dict:
     return store.usage_stats()
 
 
+@app.get("/api/projects")
+def projects() -> dict:
+    return {"projects": store.list_projects()}
+
+
+@app.post("/api/projects")
+def create_project(request: ProjectRequest) -> dict:
+    slug = request.slug or request.title or ""
+    try:
+        return store.create_project(slug=slug, title=request.title, path=request.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}")
+def project_detail(project_id: str) -> dict:
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.post("/api/projects/{project_id}/theorems/{theorem_name}/unassignment-check")
+def project_theorem_unassignment_check(project_id: str, theorem_name: str) -> dict:
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return check_project_theorem_unassignment(project, load_config(), theorem_name)
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+@app.post("/api/projects/{project_id}/theorems/{theorem_name}/unassign")
+def project_theorem_unassign(project_id: str, theorem_name: str) -> dict:
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return unassign_project_theorem(project, load_config(), theorem_name)
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+
+
+@app.put("/api/projects/{project_id}")
+def update_project(project_id: str, request: ProjectRequest) -> dict:
+    project = store.update_project(project_id, title=request.title, path=request.path)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
 @app.get("/api/settings")
 def settings() -> dict:
     return settings_service.settings_payload()
@@ -99,7 +176,38 @@ def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Session not found")
+    detail["project_theorem"] = _project_theorem_for_session(detail)
     return detail
+
+
+@app.post("/api/sessions/{session_id}/project-assignment-check")
+def session_project_assignment_check(session_id: str, request: ProjectAssignmentRequest) -> dict:
+    project = store.get_project(request.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return check_project_assignment(session_id, project, load_config())
+    except ProjectAssignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+
+
+@app.post("/api/sessions/{session_id}/assign-project")
+def session_assign_project(session_id: str, request: ProjectAssignmentRequest) -> dict:
+    project = store.get_project(request.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return assign_project(session_id, project, load_config())
+    except ProjectAssignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
 
 
 @app.post("/api/runs")
@@ -111,14 +219,26 @@ def create_run(request: RunRequest) -> dict:
     config = load_config()
     if settings_service.spend_limit_reached(config.max_spend_usd):
         raise HTTPException(status_code=402, detail="Max spend limit has been reached.")
+    project = None
+    if request.project_id:
+        project = store.get_project(request.project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
     if request.session_id:
         session = store.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        if project and session.get("project_id") not in {None, project["id"]}:
+            raise HTTPException(status_code=409, detail="Session already belongs to a different project")
     else:
-        session = store.create_session(message)
+        session = store.create_session(message, project_id=project["id"] if project else None)
 
-    run = store.create_run(session["id"], config.model, None, config.max_turns)
+    project_id = project["id"] if project else session.get("project_id")
+    if project and session.get("project_id") is None:
+        store.assign_session_project(session["id"], project["id"])
+        session = store.get_session(session["id"]) or session
+    run = store.create_run(session["id"], config.model, None, config.max_turns, project_id=project_id)
     user_message = store.add_message(session["id"], "user", message, run["id"])
     return {
         "session_id": session["id"],
@@ -178,12 +298,14 @@ async def run_events(run_id: str) -> StreamingResponse:
     if not task:
         raise HTTPException(status_code=404, detail="Run task not found")
 
+    config = load_config()
     context = RunnerContext(
         session_id=run["session_id"],
         run_id=run_id,
         task=task,
-        config=load_config(),
+        config=config,
         events=queue,
+        project=_project_payload(run.get("project_id"), config),
     )
     thread = Thread(target=run_lea, args=(context,), daemon=True)
     thread.start()
@@ -205,9 +327,45 @@ async def run_events(run_id: str) -> StreamingResponse:
     return StreamingResponse(stream_events(), media_type="text/event-stream")
 
 
-# Serve the built frontend same-origin when present (packaged/Docker builds).
-# Mounted last so every /api route above takes precedence. Skipped in local dev,
-# where Vite serves the frontend on :5173 and this directory doesn't exist.
-_web_dist = os.environ.get("LEA_WEB_DIST", str(Path(__file__).resolve().parents[2] / "dist"))
-if Path(_web_dist).is_dir():
-    app.mount("/", StaticFiles(directory=_web_dist, html=True), name="web")
+def _project_payload(project_id: str | None, config) -> dict | None:
+    if not project_id:
+        return None
+    project = store.get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if config.lea_root is None:
+        raise HTTPException(status_code=422, detail="lea_root is required for project context")
+    path = Path(str(project["path"]))
+    full_path = path if path.is_absolute() else config.lea_root / path
+    try:
+        full_path.resolve().relative_to(config.lea_root.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Project path must be inside lea_root") from exc
+    if full_path.suffix != ".md":
+        raise HTTPException(status_code=422, detail="Project path must be a markdown file")
+    context = full_path.read_text() if full_path.exists() else ""
+    return {
+        "project_id": project["slug"],
+        "project_path": str(path),
+        "project_context": context,
+        "record_on_success": True,
+    }
+
+
+def _project_theorem_for_session(detail: dict) -> dict | None:
+    project = detail.get("project")
+    if not project:
+        return None
+    code_steps = detail.get("code_steps") or []
+    proof_path = None
+    for step in reversed(code_steps):
+        if step.get("kind", "code") == "code" and str(step.get("path") or "").endswith(".lean"):
+            proof_path = str(step["path"])
+            break
+    if not proof_path:
+        return None
+    try:
+        return project_theorem_for_proof_path(project, load_config(), proof_path)
+    except Exception:
+        logger.debug("Unable to resolve project theorem for session %s", detail.get("id"), exc_info=True)
+        return None

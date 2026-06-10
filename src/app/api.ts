@@ -25,6 +25,10 @@ export interface ApprovalEvent extends PendingApproval {
 
 export interface SessionSummary {
   id: string;
+  project_id?: string | null;
+  project_slug?: string | null;
+  project_title?: string | null;
+  project_path?: string | null;
   title: string;
   status: SessionStatus;
   created_at: string;
@@ -106,6 +110,66 @@ export interface SessionDetail extends SessionSummary {
     status: string;
     pending_approval?: PendingApproval | null;
   } | null;
+  project?: Project | null;
+  project_theorem?: ProjectTheoremEntry | null;
+}
+
+export interface Project {
+  id: string;
+  slug: string;
+  title: string;
+  path: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectTheoremEntry {
+  name: string;
+  proof_path: string;
+  module_name?: string | null;
+}
+
+export interface ProjectUnassignmentMove {
+  from_path: string;
+  to_path: string;
+  from_module?: string | null;
+  to_module?: string | null;
+}
+
+export interface ProjectUnassignmentCheck {
+  status: 'safe';
+  theorem: ProjectTheoremEntry;
+  planned_move: ProjectUnassignmentMove;
+}
+
+export interface ProjectUnassignmentResult {
+  status: 'unassigned';
+  theorem: ProjectTheoremEntry;
+  move: ProjectUnassignmentMove;
+  code_step?: CodeStep | null;
+  affected_session_ids?: string[];
+}
+
+export interface ProjectAssignmentMove {
+  from_path: string;
+  to_path: string;
+  from_module?: string | null;
+  to_module?: string | null;
+}
+
+export interface ProjectAssignmentCheck {
+  status: 'safe';
+  theorem: ProjectTheoremEntry;
+  planned_move: ProjectAssignmentMove;
+  entry_action: string;
+}
+
+export interface ProjectAssignmentResult {
+  status: 'assigned';
+  theorem: ProjectTheoremEntry;
+  planned_move: ProjectAssignmentMove;
+  entry_action: string;
+  code_step: CodeStep;
 }
 
 export interface UsageSessionSummary extends SessionSummary {}
@@ -163,6 +227,7 @@ export interface ApiKeyStatus {
 export interface AppSettings {
   model: string;
   permission_tier: PermissionTier;
+  theorem_translation_max_retries: number;
   max_turns?: number | null;
   max_spend_usd?: number | null;
   current_spend_usd: number;
@@ -174,6 +239,7 @@ export interface AppSettings {
 export interface SettingsUpdate {
   model?: string;
   permission_tier?: PermissionTier;
+  theorem_translation_max_retries?: number;
   max_turns?: number | null;
   max_spend_usd?: number | null;
   api_keys?: Partial<Record<'openai' | 'anthropic' | 'google', { value?: string; clear?: boolean }>>;
@@ -204,12 +270,93 @@ export async function getUsageStats(): Promise<UsageStats> {
   return response.json();
 }
 
+export async function listProjects(): Promise<Project[]> {
+  const response = await fetch('/api/projects');
+  if (!response.ok) {
+    throw new Error(`Failed to load projects: ${response.statusText}`);
+  }
+  const data = await response.json();
+  return data.projects;
+}
+
+export async function createProject(input: { slug?: string; title?: string; path?: string }): Promise<Project> {
+  const response = await fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || `Failed to create project: ${response.statusText}`);
+  }
+  return response.json();
+}
+
+export async function checkProjectTheoremUnassignment(
+  projectId: string,
+  theoremName: string,
+): Promise<ProjectUnassignmentCheck> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/theorems/${encodeURIComponent(theoremName)}/unassignment-check`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to check project unassignment: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function unassignProjectTheorem(
+  projectId: string,
+  theoremName: string,
+): Promise<ProjectUnassignmentResult> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/theorems/${encodeURIComponent(theoremName)}/unassign`,
+    { method: 'POST' },
+  );
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to unassign project theorem: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function checkProjectAssignment(
+  sessionId: string,
+  projectId: string,
+): Promise<ProjectAssignmentCheck> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/project-assignment-check`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to check project assignment: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function assignProject(
+  sessionId: string,
+  projectId: string,
+): Promise<ProjectAssignmentResult> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/assign-project`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to assign project: ${response.statusText}`));
+  }
+  return response.json();
+}
+
 export async function getSettings(): Promise<AppSettings> {
   const response = await fetch('/api/settings');
   if (!response.ok) {
     throw new Error(`Failed to load settings: ${response.statusText}`);
   }
-  return response.json();
+  const settings = await response.json();
+  return validateSettingsPayload(settings);
 }
 
 export async function saveSettings(update: SettingsUpdate): Promise<AppSettings> {
@@ -230,10 +377,11 @@ export async function saveSettings(update: SettingsUpdate): Promise<AppSettings>
     }
     throw error;
   }
-  return response.json();
+  const settings = await response.json();
+  return validateSettingsPayload(settings);
 }
 
-export async function createRun(message: string, sessionId?: string): Promise<{
+export async function createRun(message: string, sessionId?: string, projectId?: string): Promise<{
   session_id: string;
   run_id: string;
   message: ChatMessage;
@@ -241,7 +389,7 @@ export async function createRun(message: string, sessionId?: string): Promise<{
   const response = await fetch('/api/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, session_id: sessionId }),
+    body: JSON.stringify({ message, session_id: sessionId, project_id: projectId }),
   });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
@@ -269,4 +417,24 @@ export async function submitApproval(
     const detail = await response.json().catch(() => ({}));
     throw new Error(detail.detail || `Failed to submit approval: ${response.statusText}`);
   }
+}
+
+async function errorMessage(response: Response, fallback: string): Promise<string> {
+  const detail = await response.json().catch(() => ({}));
+  if (typeof detail.detail === 'string') {
+    return detail.detail;
+  }
+  if (detail.detail?.message) {
+    return detail.detail.message;
+  }
+  return fallback;
+}
+
+function validateSettingsPayload(settings: AppSettings): AppSettings {
+  if (!Number.isInteger(settings.theorem_translation_max_retries) || settings.theorem_translation_max_retries < 1) {
+    throw new Error(
+      'Settings API did not return theorem translation retry configuration. Restart the local backend and try again.',
+    );
+  }
+  return settings;
 }

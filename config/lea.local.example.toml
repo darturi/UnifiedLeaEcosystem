@@ -14,6 +14,7 @@ lea_job_timeout_seconds = 900
 lea_root = "external/lea-prover"
 narrate_tool_steps = true
 permission_tier = "theorem_translation"
+theorem_translation_max_retries = 3
 
 # Provider credentials can also be exported in your shell. If set here, npm run
 # dev passes them only to the bundled Lea API process.

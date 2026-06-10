@@ -1,6 +1,23 @@
 import { CheckCircle, XCircle, Circle } from 'lucide-react';
 import { SessionSummary } from '../api';
 
+const projectTagColors = [
+  'border-sky-200 bg-sky-100 text-sky-800',
+  'border-emerald-200 bg-emerald-100 text-emerald-800',
+  'border-amber-200 bg-amber-100 text-amber-800',
+  'border-rose-200 bg-rose-100 text-rose-800',
+  'border-violet-200 bg-violet-100 text-violet-800',
+  'border-cyan-200 bg-cyan-100 text-cyan-800',
+];
+
+function projectTagClass(projectTitle: string) {
+  const colorIndex = Array.from(projectTitle).reduce(
+    (sum, character) => sum + character.charCodeAt(0),
+    0,
+  ) % projectTagColors.length;
+  return projectTagColors[colorIndex];
+}
+
 export function SessionList({
   sessions,
   selectedSessionId,
@@ -56,6 +73,16 @@ export function SessionList({
                   <p className="text-xs text-muted-foreground mt-1">
                     {new Date(session.updated_at).toLocaleTimeString()}
                   </p>
+                  {session.project_title && (
+                    <span
+                      className={`mt-1 inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-xs font-medium ${projectTagClass(session.project_title)}`}
+                      title={session.project_title}
+                    >
+                      <span className="truncate">
+                        {session.project_title}
+                      </span>
+                    </span>
+                  )}
                 </div>
               </div>
             </button>

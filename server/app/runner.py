@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import re
 import socket
 import time
@@ -44,6 +45,7 @@ class RunnerContext:
     config: LeaConfig
     events: Queue[dict[str, Any]]
     client: LeaApiClient | None = None
+    project: dict[str, Any] | None = None
 
 
 @dataclass
@@ -54,6 +56,8 @@ class ToolTracker:
     pending_edit_path: str | None = None
     pending_lean_check_path: str | None = None
     last_lean_check_path: str | None = None
+    last_lean_check_succeeded: bool | None = None
+    unchecked_write_after_lean_check: bool = False
     drift_warnings: set[tuple[str, str]] | None = None
 
     def __post_init__(self) -> None:
@@ -323,6 +327,7 @@ def _text_delta(frame: dict[str, Any]) -> str | None:
         "tool_resulted",
         "turn_started",
         "usage_updated",
+        "project_entry_updated",
         "finished",
         "done",
         "completed",
@@ -334,6 +339,11 @@ def _text_delta(frame: dict[str, Any]) -> str | None:
 
 def _status_message(frame: dict[str, Any]) -> str | None:
     kind = _event_type(frame)
+    if kind == "project_entry_updated":
+        project_id = _first_string(frame, "project_id") or "project"
+        theorem_name = _first_string(frame, "theorem_name") or "theorem"
+        action = _first_string(frame, "entry_action") or "updated"
+        return f"Project {project_id} {action} entry for {theorem_name}."
     if kind in {
         "status",
         "progress",
@@ -343,6 +353,7 @@ def _status_message(frame: dict[str, Any]) -> str | None:
         "tool_resulted",
         "turn_started",
         "usage_updated",
+        "project_entry_updated",
         "started",
     }:
         return _first_string(frame, "message", "status", "name", "tool", "text")
@@ -677,6 +688,8 @@ def _track_tool_frame(
     content = _first_string_from(event, "content", "preview") or ""
     succeeded = _tool_result_succeeded(content)
     if tool_name == "write_file":
+        if succeeded:
+            tracker.unchecked_write_after_lean_check = True
         if succeeded and tracker.pending_write_path and not tracker.pending_write_had_content:
             file_path = _resolve_lea_path(tracker.pending_write_path, context.config.lea_root)
             step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
@@ -686,6 +699,8 @@ def _track_tool_frame(
         tracker.pending_write_path = None
         tracker.pending_write_had_content = False
     elif tool_name == "edit_file":
+        if succeeded:
+            tracker.unchecked_write_after_lean_check = True
         if succeeded and tracker.pending_edit_path:
             file_path = _resolve_lea_path(tracker.pending_edit_path, context.config.lea_root)
             step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
@@ -694,6 +709,8 @@ def _track_tool_frame(
                 steps.append(step)
         tracker.pending_edit_path = None
     elif tool_name == "lean_check":
+        tracker.last_lean_check_succeeded = _lean_check_succeeded(content)
+        tracker.unchecked_write_after_lean_check = False
         if tracker.pending_lean_check_path:
             file_path = _resolve_lea_path(tracker.pending_lean_check_path, context.config.lea_root)
             step = _emit_file_snapshot(context=context, path=file_path, emitted=emitted)
@@ -708,6 +725,41 @@ def _track_tool_frame(
 def _tool_result_succeeded(content: str) -> bool:
     stripped = content.strip()
     return bool(stripped) and not stripped.lower().startswith("error:")
+
+
+def _lean_check_succeeded(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if lowered.startswith("error:"):
+        return False
+    if re.search(r"(^|\n).*?:\d+:\d+:\s+error:", stripped):
+        return False
+    if "declaration uses `sorry`" in lowered or "declaration uses 'sorry'" in lowered:
+        return False
+    return True
+
+
+def _terminal_status_after_tool_checks(
+    status: str | None,
+    tracker: ToolTracker,
+) -> tuple[str | None, str | None]:
+    if status != "success":
+        return status, None
+    if tracker.last_lean_check_succeeded is False:
+        detail = "Lea API reported completion, but the most recent lean_check failed."
+        if tracker.last_lean_check_path:
+            detail = f"{detail} Checked file: {tracker.last_lean_check_path}."
+        return "failed", detail
+    if tracker.unchecked_write_after_lean_check:
+        detail = "Lea API reported completion, but it changed a Lean file after the most recent lean_check."
+        if tracker.last_write_or_edit_path:
+            detail = f"{detail} Unchecked file: {tracker.last_write_or_edit_path}."
+        return "failed", detail
+    if tracker.last_lean_check_succeeded is not True:
+        return "failed", "Lea API reported completion, but no successful lean_check was observed."
+    return status, None
 
 
 def _emit_path_drift_if_needed(
@@ -874,6 +926,17 @@ def _api_run_terminal_status(run_status: dict[str, Any]) -> str | None:
     return _api_run_status_to_local(run_status.get("status"))
 
 
+def _start_api_run(client: LeaApiClient, task: str, project: dict[str, Any] | None) -> dict[str, Any]:
+    signature = inspect.signature(client.start_run)
+    params = signature.parameters
+    accepts_project = "project" in params or any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+    if accepts_project:
+        return client.start_run(task, project=project)
+    return client.start_run(task)
+
+
 def _is_timeout(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError | socket.timeout) or "timed out" in str(exc).lower()
 
@@ -918,7 +981,7 @@ def run_lea(context: RunnerContext) -> None:
             max_turns=context.config.max_turns,
         )
 
-        run = client.start_run(context.task)
+        run = _start_api_run(client, context.task, context.project)
         api_run_id = str(run["run_id"])
         store.set_run_api_run_id(context.run_id, api_run_id)
         log_status(context, f"Lea API run started: {api_run_id}", status="api_run_started", api_run_id=api_run_id)
@@ -1095,8 +1158,21 @@ def run_lea(context: RunnerContext) -> None:
         ):
             code_step_emitted = True
 
-        if terminal_status in {"success", "max_turns"} and not code_step_emitted:
+        if terminal_status == "success" and not code_step_emitted:
             _emit_terminal_no_code_step(context, api_run_id)
+            terminal_status = "failed"
+            terminal_error = (
+                "Lea API reported completion, but no readable Lean file or code artifact was exposed, "
+                "so the proof could not be verified."
+            )
+            log_status(context, terminal_error, status="missing_lean_artifact", api_run_id=api_run_id)
+        elif terminal_status == "max_turns" and not code_step_emitted:
+            _emit_terminal_no_code_step(context, api_run_id)
+
+        terminal_status, tool_check_failure = _terminal_status_after_tool_checks(terminal_status, tool_tracker)
+        if tool_check_failure:
+            terminal_error = tool_check_failure
+            log_status(context, tool_check_failure, status="lean_check_failed", api_run_id=api_run_id)
 
         _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
         assistant_text = "".join(assistant_chunks).strip()
