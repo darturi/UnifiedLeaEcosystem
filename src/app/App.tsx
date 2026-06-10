@@ -16,6 +16,7 @@ import {
   AlertDialogTitle,
 } from './components/ui/alert-dialog';
 import { timelineStepCount } from './stepTimeline.mjs';
+import { hasResolvedProjectAssociation } from './projectAssociation.mjs';
 import {
   ChatMessage,
   CodeStep,
@@ -23,11 +24,14 @@ import {
   ApprovalEvent,
   PendingApproval,
   ProjectTheoremEntry,
+  ProjectAssignmentCheck,
   ProjectUnassignmentCheck,
   SessionSummary,
   SessionDetail,
   StatusEvent,
   Project,
+  assignProject,
+  checkProjectAssignment,
   checkProjectTheoremUnassignment,
   createProject,
   createRun,
@@ -58,6 +62,9 @@ export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string>();
   const [projectTheorem, setProjectTheorem] = useState<ProjectTheoremEntry>();
+  const [pendingAssignment, setPendingAssignment] = useState<{ projectId: string; projectTitle: string }>();
+  const [assignmentPlan, setAssignmentPlan] = useState<ProjectAssignmentCheck>();
+  const [isAssigningProject, setIsAssigningProject] = useState(false);
   const [pendingUnassignment, setPendingUnassignment] = useState<ProjectUnassignmentCheck>();
   const [availableUnassignment, setAvailableUnassignment] = useState<ProjectUnassignmentCheck>();
   const [unassignmentBlockedReason, setUnassignmentBlockedReason] = useState<string>();
@@ -152,6 +159,8 @@ export default function App() {
     setApprovalEvents(detail.approval_events || []);
     setSelectedProjectId(detail.project?.id || detail.project_id || undefined);
     setProjectTheorem(detail.project_theorem || undefined);
+    setPendingAssignment(undefined);
+    setAssignmentPlan(undefined);
     setPendingUnassignment(undefined);
     setAvailableUnassignment(undefined);
     setUnassignmentBlockedReason(undefined);
@@ -490,6 +499,54 @@ export default function App() {
     }
   };
 
+  const handleRequestProjectAssignment = async () => {
+    const projectId = selectedProjectId;
+    const project = projects.find((item) => item.id === projectId);
+    if (!selectedSessionId || !projectId || !project || isRunning || isAssigningProject) {
+      return;
+    }
+    if (hasResolvedProjectAssociation(projectTheorem)) {
+      setError('This formalization is already associated with a project. Reassignment is not supported yet.');
+      return;
+    }
+    if (selectedSession?.status === 'failed') {
+      setError(
+        'This proof did not complete successfully. Retry the proof in this chat with a project selected; if the retry succeeds, the formalization will join that project. Failed formalizations are not moved.',
+      );
+      return;
+    }
+    if (selectedSession?.status !== 'success') {
+      setError('Only completed successful formalizations can be assigned to a project.');
+      return;
+    }
+    setError(undefined);
+    setAssignmentPlan(undefined);
+    setPendingAssignment({ projectId, projectTitle: project.title });
+  };
+
+  const handleConfirmProjectAssignment = async () => {
+    if (!selectedSessionId || !pendingAssignment || isAssigningProject) {
+      return;
+    }
+    setIsAssigningProject(true);
+    setError(undefined);
+    try {
+      const plan = await checkProjectAssignment(selectedSessionId, pendingAssignment.projectId);
+      setAssignmentPlan(plan);
+      const result = await assignProject(selectedSessionId, pendingAssignment.projectId);
+      setPendingAssignment(undefined);
+      setAssignmentPlan(undefined);
+      await reconcileSession(selectedSessionId);
+      await refreshSessions();
+      await refreshProjects();
+      setCurrentStepIndex(Math.max(0, result.code_step.step_number - 1));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to assign formalization to project.');
+    } finally {
+      setIsAssigningProject(false);
+    }
+  };
+
   const handleRequestProjectUnassignment = async () => {
     if (!availableUnassignment || isRunning || isUnassigningProject) {
       return;
@@ -559,6 +616,34 @@ export default function App() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      <AlertDialog
+        open={Boolean(pendingAssignment)}
+        onOpenChange={(open) => {
+          if (!open && !isAssigningProject) {
+            setPendingAssignment(undefined);
+            setAssignmentPlan(undefined);
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Assign formalization to project?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will check for namespace conflicts, update the Lean namespace, move the proof out of
+              {' '}Lea.Misc, and record it in {pendingAssignment?.projectTitle}.
+              {assignmentPlan
+                ? ` Planned move: ${assignmentPlan.planned_move.from_path} to ${assignmentPlan.planned_move.to_path}.`
+                : ''}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isAssigningProject}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleConfirmProjectAssignment} disabled={isAssigningProject}>
+              Assign
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       <div className="size-full">
       <PanelGroup direction="horizontal">
         <Panel defaultSize={20} minSize={15} maxSize={30}>
@@ -579,6 +664,8 @@ export default function App() {
               setCurrentRunId(undefined);
               setPendingApproval(undefined);
               setProjectTheorem(undefined);
+              setPendingAssignment(undefined);
+              setAssignmentPlan(undefined);
               setPendingUnassignment(undefined);
               setAvailableUnassignment(undefined);
               setUnassignmentBlockedReason(undefined);
@@ -610,6 +697,7 @@ export default function App() {
             onTogglePause={() => setIsPaused(!isPaused)}
             onOpenStats={() => setView('stats')}
             onOpenSettings={() => setView('settings')}
+            onRequestProjectAssignment={handleRequestProjectAssignment}
             onRequestProjectUnassignment={handleRequestProjectUnassignment}
             theoremName={title}
             currentStepIndex={currentStepIndex}
@@ -618,6 +706,8 @@ export default function App() {
             isSubmittingApproval={isSubmittingApproval}
             approvalError={approvalError}
             projectTheorem={projectTheorem}
+            isProjectAssociated={hasResolvedProjectAssociation(projectTheorem)}
+            isAssigningProject={isAssigningProject}
             canUnassignProjectTheorem={Boolean(availableUnassignment)}
             unassignmentDisabledReason={unassignmentBlockedReason}
             isUnassigningProject={isUnassigningProject}

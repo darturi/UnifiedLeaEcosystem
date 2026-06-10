@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import store
 from .config import ROOT, LeaConfig
 
 
@@ -43,6 +44,7 @@ def unassign_project_theorem(project: dict[str, Any], config: LeaConfig, theorem
     original_markdown = context["markdown"]
     original_text = source_path.read_text()
     moved = False
+    code_steps: list[dict[str, Any]] = []
 
     try:
         updated_markdown, _ = project_module.remove_project_entry(original_markdown, theorem_name)
@@ -53,6 +55,14 @@ def unassign_project_theorem(project: dict[str, Any], config: LeaConfig, theorem
         dest_path.write_text(rewritten)
         project_path.write_text(updated_markdown)
         _verify_lean_file(config, dest_path)
+        message = f"Unassigned {context['target'].name} from {project['title']} and moved it to {context['dest_rel']}."
+        code_steps = store.record_project_unassignment(
+            context["affected_sessions"],
+            str(project["id"]),
+            context["dest_rel"],
+            rewritten,
+            message,
+        )
     except Exception:
         if moved:
             if dest_path.exists():
@@ -71,6 +81,8 @@ def unassign_project_theorem(project: dict[str, Any], config: LeaConfig, theorem
             "from_module": context["target"].module_name,
             "to_module": context["dest_module"],
         },
+        "code_step": code_steps[0] if code_steps else None,
+        "affected_session_ids": [str(step["session_id"]) for step in code_steps],
     }
 
 
@@ -124,6 +136,7 @@ def _build_context(project: dict[str, Any], config: LeaConfig, theorem_name: str
             },
         )
 
+    affected_sessions = store.sessions_with_latest_code_path(source_rel)
     entries = [
         entry
         for entry in project_module.parse_project_entries(markdown)
@@ -157,6 +170,7 @@ def _build_context(project: dict[str, Any], config: LeaConfig, theorem_name: str
         "target": target,
         "source_path": source_path,
         "source_rel": source_rel,
+        "affected_sessions": affected_sessions,
         "dest_path": dest_path,
         "dest_rel": dest_rel,
         "dest_module": _module_from_proof_rel(dest_rel),

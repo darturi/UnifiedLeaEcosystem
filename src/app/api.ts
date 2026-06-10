@@ -146,6 +146,30 @@ export interface ProjectUnassignmentResult {
   status: 'unassigned';
   theorem: ProjectTheoremEntry;
   move: ProjectUnassignmentMove;
+  code_step?: CodeStep | null;
+  affected_session_ids?: string[];
+}
+
+export interface ProjectAssignmentMove {
+  from_path: string;
+  to_path: string;
+  from_module?: string | null;
+  to_module?: string | null;
+}
+
+export interface ProjectAssignmentCheck {
+  status: 'safe';
+  theorem: ProjectTheoremEntry;
+  planned_move: ProjectAssignmentMove;
+  entry_action: string;
+}
+
+export interface ProjectAssignmentResult {
+  status: 'assigned';
+  theorem: ProjectTheoremEntry;
+  planned_move: ProjectAssignmentMove;
+  entry_action: string;
+  code_step: CodeStep;
 }
 
 export interface UsageSessionSummary extends SessionSummary {}
@@ -290,6 +314,36 @@ export async function unassignProjectTheorem(
   );
   if (!response.ok) {
     throw new Error(await errorMessage(response, `Failed to unassign project theorem: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function checkProjectAssignment(
+  sessionId: string,
+  projectId: string,
+): Promise<ProjectAssignmentCheck> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/project-assignment-check`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to check project assignment: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function assignProject(
+  sessionId: string,
+  projectId: string,
+): Promise<ProjectAssignmentResult> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/assign-project`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId }),
+  });
+  if (!response.ok) {
+    throw new Error(await errorMessage(response, `Failed to assign project: ${response.statusText}`));
   }
   return response.json();
 }

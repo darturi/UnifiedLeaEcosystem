@@ -160,6 +160,104 @@ def update_project(project_id: str, title: str | None = None, path: str | None =
     return row_to_dict(updated)
 
 
+def assign_session_project(session_id: str, project_id: str | None) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update sessions set project_id = ?, updated_at = ? where id = ?",
+            (project_id, now, session_id),
+        )
+
+
+def sessions_with_latest_code_path(path: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select
+                s.id as session_id,
+                s.project_id,
+                cs.run_id
+            from sessions s
+            join code_steps cs on cs.id = (
+                select latest.id
+                from code_steps latest
+                where latest.session_id = s.id
+                    and latest.kind = 'code'
+                    and latest.path like '%.lean'
+                order by latest.step_number desc
+                limit 1
+            )
+            where cs.path = ?
+            """,
+            (path,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def record_project_unassignment(
+    sessions: list[dict],
+    project_id: str,
+    dest_rel: str,
+    code: str,
+    message: str,
+) -> list[dict]:
+    now = utc_now()
+    code_steps: list[dict] = []
+    with connect() as conn:
+        for session in sessions:
+            if session.get("project_id") != project_id:
+                continue
+            session_id = str(session["session_id"])
+            run_id = str(session["run_id"])
+            conn.execute(
+                "update sessions set project_id = ?, updated_at = ? where id = ?",
+                (None, now, session_id),
+            )
+            row = conn.execute(
+                "select coalesce(max(step_number), 0) + 1 as next_step from code_steps where session_id = ?",
+                (session_id,),
+            ).fetchone()
+            step_number = int(row["next_step"])
+            step_id = str(uuid4())
+            conn.execute(
+                """
+                insert into code_steps (id, session_id, run_id, step_number, path, code, kind, summary, turn, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step_id,
+                    session_id,
+                    run_id,
+                    step_number,
+                    dest_rel,
+                    code,
+                    "code",
+                    "Moved proof out of project namespace into Lea.Misc.",
+                    None,
+                    now,
+                ),
+            )
+            message_id = str(uuid4())
+            conn.execute(
+                """
+                insert into messages (id, session_id, run_id, role, content, created_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (message_id, session_id, run_id, "system", message, now),
+            )
+            event_id = str(uuid4())
+            conn.execute(
+                """
+                insert into status_events (id, session_id, run_id, step_number, status, message, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, session_id, run_id, step_number, "project_unassigned", message, now),
+            )
+            inserted = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
+            code_steps.append(row_to_dict(inserted))
+    return code_steps
+
+
 def validate_project_slug(slug: str) -> str:
     value = str(slug or "").strip()
     if not PROJECT_SLUG_RE.fullmatch(value):

@@ -15,6 +15,11 @@ from pydantic import BaseModel
 from .config import load_config
 from .db import init_db
 from .lea_api_client import LeaApiClient, LeaApiError
+from .project_assignment import (
+    ProjectAssignmentError,
+    assign_project,
+    check_project_assignment,
+)
 from .project_unassignment import (
     ProjectUnassignmentError,
     check_project_theorem_unassignment,
@@ -48,6 +53,10 @@ class ProjectRequest(BaseModel):
     slug: str | None = None
     title: str | None = None
     path: str | None = None
+
+
+class ProjectAssignmentRequest(BaseModel):
+    project_id: str
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -168,6 +177,36 @@ def session_detail(session_id: str) -> dict:
     return detail
 
 
+@app.post("/api/sessions/{session_id}/project-assignment-check")
+def session_project_assignment_check(session_id: str, request: ProjectAssignmentRequest) -> dict:
+    project = store.get_project(request.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return check_project_assignment(session_id, project, load_config())
+    except ProjectAssignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+
+
+@app.post("/api/sessions/{session_id}/assign-project")
+def session_assign_project(session_id: str, request: ProjectAssignmentRequest) -> dict:
+    project = store.get_project(request.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        return assign_project(session_id, project, load_config())
+    except ProjectAssignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ProjectUnassignmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"message": str(exc)}) from exc
+
+
 @app.post("/api/runs")
 def create_run(request: RunRequest) -> dict:
     message = request.message.strip()
@@ -193,6 +232,9 @@ def create_run(request: RunRequest) -> dict:
         session = store.create_session(message, project_id=project["id"] if project else None)
 
     project_id = project["id"] if project else session.get("project_id")
+    if project and session.get("project_id") is None:
+        store.assign_session_project(session["id"], project["id"])
+        session = store.get_session(session["id"]) or session
     run = store.create_run(session["id"], config.model, None, config.max_turns, project_id=project_id)
     user_message = store.add_message(session["id"], "user", message, run["id"])
     return {

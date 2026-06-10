@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink } from 'lucide-react';
+import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink, Link2 } from 'lucide-react';
 import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SessionStatus, StatusEvent } from '../api';
 import { buildStepTimeline, codeStepFallbackContent } from '../stepTimeline.mjs';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -19,6 +19,7 @@ export function ChatInterface({
   onTogglePause,
   onOpenStats,
   onOpenSettings,
+  onRequestProjectAssignment,
   onRequestProjectUnassignment,
   onSubmitApproval,
   onRetry,
@@ -29,6 +30,8 @@ export function ChatInterface({
   isSubmittingApproval,
   approvalError,
   projectTheorem,
+  isProjectAssociated,
+  isAssigningProject,
   canUnassignProjectTheorem,
   unassignmentDisabledReason,
   isUnassigningProject,
@@ -55,6 +58,7 @@ export function ChatInterface({
   onSubmit: (content: string) => Promise<boolean>;
   onRetry: (content: string) => Promise<boolean>;
   onSubmitApproval: (decision: ApprovalDecision, feedback?: string) => Promise<void>;
+  onRequestProjectAssignment: () => Promise<void>;
   onRequestProjectUnassignment: () => Promise<void>;
   onStepSelect: (stepIndex: number) => void;
   onTogglePause: () => void;
@@ -62,6 +66,8 @@ export function ChatInterface({
   onOpenSettings: () => void;
   theoremName: string;
   projectTheorem?: ProjectTheoremEntry;
+  isProjectAssociated: boolean;
+  isAssigningProject: boolean;
   canUnassignProjectTheorem: boolean;
   unassignmentDisabledReason?: string;
   isUnassigningProject: boolean;
@@ -546,6 +552,26 @@ export function ChatInterface({
           >
             {isCreatingProject ? <Loader2 className="h-4 w-4 animate-spin" /> : <FolderPlus className="h-4 w-4" />}
             Create
+          </button>
+          <button
+            type="button"
+            onClick={() => void onRequestProjectAssignment()}
+            disabled={isRunning || isAssigningProject || !selectedProjectId || isProjectAssociated}
+            title={
+              isProjectAssociated
+                ? 'This formalization is already associated with a project. Reassignment is not supported yet.'
+                : selectedProjectId
+                ? 'Assign this formalization to the selected project'
+                : 'Select a project before assigning'
+            }
+            className={[
+              'inline-flex h-9 items-center gap-2 rounded-md bg-secondary px-3 text-sm',
+              'text-secondary-foreground transition-opacity hover:opacity-90',
+              'disabled:cursor-not-allowed disabled:opacity-50',
+            ].join(' ')}
+          >
+            {isAssigningProject ? <Loader2 className="h-4 w-4 animate-spin" /> : <Link2 className="h-4 w-4" />}
+            Assign
           </button>
         </div>
         <form onSubmit={handleSubmit} className="flex items-end gap-2">

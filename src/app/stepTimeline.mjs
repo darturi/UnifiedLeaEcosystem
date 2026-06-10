@@ -17,7 +17,12 @@ function dedupeConsecutiveLogs(logs) {
   const deduped = [];
   for (const log of logs) {
     const previous = deduped[deduped.length - 1];
-    if (previous && previous.message === log.message && previous.status === log.status) {
+    const sameOperationalTool =
+      previous &&
+      previous.message === log.message &&
+      previous.status === 'tool_called' &&
+      log.status === 'tool_resulted';
+    if (previous && previous.message === log.message && (previous.status === log.status || sameOperationalTool)) {
       continue;
     }
     deduped.push(log);

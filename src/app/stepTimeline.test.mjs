@@ -142,6 +142,20 @@ test('consecutive duplicate status events are collapsed per step', () => {
   );
 });
 
+test('tool call and result pair is displayed as one operational log', () => {
+  const timeline = buildStepTimeline({
+    messages: [assistant('assistant-1', 'I checked the file.')],
+    codeSteps: [codeStep('code-1', 1)],
+    statusEvents: [
+      statusEvent('status-1', 'lean_check', 1, { status: 'tool_called' }),
+      statusEvent('status-2', 'lean_check', 1, { status: 'tool_resulted' }),
+    ],
+    terminalMessageId: null,
+  });
+
+  assert.deepEqual(timeline.stepItems[0].logs.map((log) => log.id), ['status-1']);
+});
+
 test('unnumbered operational logs attach to the nearest step instead of setup', () => {
   const timeline = buildStepTimeline({
     messages: [assistant('assistant-1', 'I wrote the file.')],
