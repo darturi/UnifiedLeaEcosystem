@@ -1,0 +1,23 @@
+# Lea Interface — one-container local deployment.
+#
+#   1. docker compose up --build      (first time; builds the image)
+#   2. Open http://localhost:8001
+#   3. Add your API key in the Settings pane (no key needed to start).
+#
+# Sessions, proof history, and your saved settings/key persist on the host
+# in ./data and ./config.
+
+services:
+  lea:
+    image: lea-interface:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/arm64        # Apple Silicon Macs
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data         # persisted SQLite DB + Lea API event logs
+      - ./config:/app/config     # persisted settings + API key (written by the Settings pane)
+    init: true                   # reap the background Lea API process cleanly
+    restart: "no"
