@@ -985,6 +985,13 @@ def run_lea(context: RunnerContext) -> None:
         api_run_id = str(run["run_id"])
         store.set_run_api_run_id(context.run_id, api_run_id)
         log_status(context, f"Lea API run started: {api_run_id}", status="api_run_started", api_run_id=api_run_id)
+        if context.config.permission_tier == "theorem_translation":
+            log_status(
+                context,
+                "Waiting for theorem translation preflight to produce an approvable Lean statement.",
+                status="theorem_translation_preflight",
+                api_run_id=api_run_id,
+            )
 
         started = time.monotonic()
         attempts = 0
@@ -1075,6 +1082,32 @@ def run_lea(context: RunnerContext) -> None:
                         output_tokens = (output_tokens or 0) + frame_output_tokens
                     if frame_cost_usd is not None:
                         cost_usd = (cost_usd or 0.0) + frame_cost_usd
+                    store.update_run(
+                        context.run_id,
+                        "running",
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cost_usd=cost_usd,
+                    )
+                    store.replace_run_usage_breakdown(
+                        context.run_id,
+                        usage_breakdown.final_rows(input_tokens, output_tokens, cost_usd),
+                    )
+                    emit(
+                        context.events,
+                        "usage_updated",
+                        {
+                            "run_id": context.run_id,
+                            "session_id": context.session_id,
+                            "input_tokens": input_tokens or 0,
+                            "output_tokens": output_tokens or 0,
+                            "total_tokens": int(input_tokens or 0) + int(output_tokens or 0),
+                            "cost_usd": cost_usd or 0.0,
+                            "delta_input_tokens": frame_input_tokens or 0,
+                            "delta_output_tokens": frame_output_tokens or 0,
+                            "delta_cost_usd": frame_cost_usd or 0.0,
+                        },
+                    )
                     if settings_service.spend_limit_reached(context.config.max_spend_usd, cost_usd):
                         terminal_status = "max_spend"
                         final_text = "Max spend limit reached. Lea run was cancelled."

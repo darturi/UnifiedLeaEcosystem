@@ -81,6 +81,18 @@ export interface StatusEvent {
   created_at: string;
 }
 
+export interface UsageUpdatedEvent {
+  session_id: string;
+  run_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  delta_input_tokens: number;
+  delta_output_tokens: number;
+  delta_cost_usd: number;
+}
+
 export interface UsageBreakdownRow {
   id: string;
   session_id?: string;

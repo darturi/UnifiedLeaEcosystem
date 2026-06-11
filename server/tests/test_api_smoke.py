@@ -72,6 +72,39 @@ def test_stats_endpoint_returns_usage_rollups(tmp_path, monkeypatch):
     assert body["models"][0]["cost_usd"] == 0.03
 
 
+def test_stats_and_session_detail_include_running_usage(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    session = store.create_session("running usage")
+    run = store.create_run(session["id"], "o4-mini", None, 2)
+    store.add_message(session["id"], "user", "prove True", run["id"])
+    store.update_run(run["id"], "running", input_tokens=25, output_tokens=10, cost_usd=0.004)
+    store.replace_run_usage_breakdown(
+        run["id"],
+        [
+            {
+                "phase": "theorem_translation",
+                "label": "Theorem translation preflight",
+                "input_tokens": 25,
+                "output_tokens": 10,
+                "cost_usd": 0.004,
+                "event_count": 1,
+            }
+        ],
+    )
+
+    stats_body = main.stats()
+    detail = main.session_detail(session["id"])
+
+    assert stats_body["global"]["total_tokens"] == 35
+    assert abs(stats_body["global"]["cost_usd"] - 0.004) < 1e-9
+    assert stats_body["sessions"][0]["status"] == "running"
+    assert stats_body["sessions"][0]["total_tokens"] == 35
+    assert detail["total_tokens"] == 35
+    assert detail["usage_breakdown"][0]["total_tokens"] == 35
+
+
 def test_project_crud_and_run_selection(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
