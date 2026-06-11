@@ -68,6 +68,8 @@ export interface CodeStep {
   kind?: 'code' | 'no_code';
   summary?: string | null;
   turn?: number | null;
+  used_project_formalizations?: ProjectFormalizationUse[];
+  used_by_project_formalizations?: ProjectFormalizationUse[];
   created_at: string;
 }
 
@@ -139,6 +141,13 @@ export interface ProjectTheoremEntry {
   name: string;
   proof_path: string;
   module_name?: string | null;
+}
+
+export interface ProjectFormalizationUse extends ProjectTheoremEntry {
+  project_id?: string | null;
+  project_slug?: string | null;
+  project_title?: string | null;
+  project_path?: string | null;
 }
 
 export interface ProjectUnassignmentMove {

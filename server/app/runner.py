@@ -15,6 +15,7 @@ from . import settings as settings_service
 from . import store
 from .config import ROOT, LeaConfig
 from .lea_api_client import LeaApiClient, LeaApiError
+from .project_usage import detect_used_project_formalizations
 
 
 active_run_lock = Lock()
@@ -241,13 +242,20 @@ def _emit_file_snapshot(
     if emitted_key in emitted:
         return None
     emitted.add(emitted_key)
+    code = path.read_text()
+    relative_path = _relative_path(str(path), context.config.lea_root)
     step = store.add_code_step(
         context.session_id,
         context.run_id,
-        _relative_path(str(path), context.config.lea_root),
-        path.read_text(),
+        relative_path,
+        code,
         kind="code",
         turn=getattr(context, "current_turn", None),
+        used_project_formalizations=_used_project_formalizations(
+            context,
+            relative_path,
+            code,
+        ),
     )
     emit(context.events, "code_step", step)
     log_status(
@@ -280,6 +288,7 @@ def _emit_no_code_step(
         kind="no_code",
         summary=summary,
         turn=turn,
+        used_project_formalizations=_used_project_formalizations(context, latest_path, latest_code),
     )
     emit(context.events, "code_step", step)
     log_status(context, summary, status="no_code_step", turn=turn, step_number=step["step_number"])
@@ -639,6 +648,7 @@ def _emit_code_payload(
             code,
             kind="code",
             turn=turn,
+            used_project_formalizations=_used_project_formalizations(context, relative_path, code),
         )
         emit(context.events, "code_step", step)
         log_status(
@@ -900,6 +910,19 @@ def _emit_terminal_no_code_step(context: RunnerContext, api_run_id: str | None) 
         step_number=step["step_number"],
     )
     return step
+
+
+def _used_project_formalizations(
+    context: RunnerContext,
+    proof_path: str | None,
+    code: str,
+) -> list[dict[str, Any]]:
+    return detect_used_project_formalizations(
+        project=context.project,
+        config=context.config,
+        code=code,
+        proof_path=proof_path,
+    )
 
 
 def _api_run_status_to_local(status: str | None) -> str | None:

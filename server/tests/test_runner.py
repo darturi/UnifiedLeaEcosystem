@@ -760,6 +760,85 @@ def test_api_code_events_create_code_step(tmp_path, monkeypatch):
     assert detail["code_steps"][0]["code"].startswith("theorem demo")
 
 
+def test_project_code_step_includes_used_formalizations(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    lea_root = tmp_path / "lea"
+    _write_project_usage_fixture(lea_root)
+    code = (
+        "import Mathlib\n"
+        "import Lea.Epsilon.helper\n\n"
+        "namespace Lea.Epsilon\n\n"
+        "theorem target : True := by\n"
+        "  exact helper\n\n"
+        "end Lea.Epsilon\n"
+    )
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "code_step",
+                "path": "workspace/proofs/Lea/Epsilon/target.lean",
+                "code": code,
+                "turn": 1,
+            },
+            {"seq": 1, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/Lea/Epsilon/target.lean"}},
+            {"seq": 2, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 3, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+    context.config = make_config(tmp_path, lea_root=lea_root)
+    context.project = {
+        "project_id": "epsilon",
+        "project_path": "workspace/projects/epsilon.md",
+        "project_context": "",
+        "record_on_success": True,
+    }
+
+    run_lea(context)
+
+    events = drain_events(context.events)
+    detail = store.session_detail(context.session_id)
+    expected = [
+        {
+            "name": "helper",
+            "proof_path": "workspace/proofs/Lea/Epsilon/helper.lean",
+            "module_name": "Lea.Epsilon.helper",
+            "project_id": "epsilon",
+            "project_slug": "epsilon",
+            "project_title": "epsilon",
+            "project_path": "workspace/projects/epsilon.md",
+        }
+    ]
+    assert detail["code_steps"][0]["used_project_formalizations"] == expected
+    code_event = next(event for event in events if event["type"] == "code_step")
+    assert code_event["payload"]["used_project_formalizations"] == expected
+
+
+def test_non_project_code_step_has_no_used_formalizations(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    client = FakeLeaApiClient(
+        events=[
+            {
+                "seq": 0,
+                "type": "code_step",
+                "path": "workspace/proofs/demo.lean",
+                "code": "theorem demo : True := by\n  trivial",
+                "turn": 1,
+            },
+            {"seq": 1, "type": "tool_called", "name": "lean_check", "args": {"path": "workspace/proofs/demo.lean"}},
+            {"seq": 2, "type": "tool_resulted", "name": "lean_check", "content": "OK - no errors, no warnings."},
+            {"seq": 3, "type": "finished", "reason": "completed", "final_text": "done"},
+        ]
+    )
+    context = make_context(tmp_path, client)
+
+    run_lea(context)
+
+    detail = store.session_detail(context.session_id)
+    assert detail["code_steps"][0]["used_project_formalizations"] == []
+
+
 def test_nested_write_file_tool_call_creates_code_step(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     client = FakeLeaApiClient(
@@ -1390,3 +1469,28 @@ def test_max_turns_persists_partial_assistant_text_before_system_notice(tmp_path
     assert persisted[-2]["content"] == "I will try induction.\nThe base case is straightforward."
     assert persisted[-1]["role"] == "system"
     assert persisted[-1]["content"] == "Error: max turns reached."
+
+
+def _write_project_usage_fixture(lea_root):
+    project_dir = lea_root / "workspace" / "projects"
+    project_dir.mkdir(parents=True)
+    (project_dir / "epsilon.md").write_text(
+        "\n".join(
+            [
+                "# Project epsilon",
+                "",
+                '<!-- lea:project id="epsilon" -->',
+                "",
+                "## Theorem: helper",
+                "",
+                '<!-- lea:theorem name="helper" proof="workspace/proofs/Lea/Epsilon/helper.lean" module="Lea.Epsilon.helper" -->',
+                "",
+                "### Signature",
+                "",
+                "```lean",
+                "theorem helper : True := by",
+                "```",
+                "",
+            ]
+        )
+    )
