@@ -730,6 +730,7 @@ export default function App() {
 
         <Panel defaultSize={50} minSize={30}>
           <ChatInterface
+            sessionId={selectedSessionId}
             error={error}
             isPaused={isPaused}
             isRunning={isRunning}
