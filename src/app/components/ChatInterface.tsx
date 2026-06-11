@@ -2,9 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Send, Pause, Play, BarChart3, Loader2, Settings, RotateCcw, FolderPlus, Unlink, Link2, ArrowDown } from 'lucide-react';
 import { ApprovalDecision, ApprovalEvent, ChatMessage, CodeStep, PendingApproval, Project, ProjectTheoremEntry, SessionStatus, StatusEvent } from '../api';
 import { codeStepFallbackContent } from '../stepTimeline.mjs';
+import { timelineItemMatchesTarget } from '../timelineTarget.mjs';
 import { buildRunTimelineSections } from '../runAttempts';
 import { MarkdownMessage } from './MarkdownMessage';
 import { TheoremApprovalPanel } from './TheoremApprovalPanel';
+
+type ActiveTimelineTarget = {
+  runId?: string;
+  codeStepId?: string;
+  messageId?: string;
+  provisionalKey?: string;
+} | null;
 
 const BOTTOM_SCROLL_THRESHOLD_PX = 48;
 
@@ -31,7 +39,7 @@ export function ChatInterface({
   onRetry,
   theoremName,
   currentStepIndex,
-  activeTimelineStepIndex,
+  activeTimelineTarget,
   pendingApproval,
   isSubmittingApproval,
   approvalError,
@@ -81,7 +89,7 @@ export function ChatInterface({
   unassignmentDisabledReason?: string;
   isUnassigningProject: boolean;
   currentStepIndex: number;
-  activeTimelineStepIndex: number | null;
+  activeTimelineTarget: ActiveTimelineTarget;
 }) {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const bottomAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -119,8 +127,6 @@ export function ChatInterface({
       };
     });
   }, [messages, codeSteps, statusEvents, approvalEvents, pendingApproval, terminalMessageId]);
-  const highlightedStepIndex =
-    isRunning ? activeTimelineStepIndex : currentStepIndex;
   const lastUserMessage = useMemo(
     () => [...messages].reverse().find((message) => message.role === 'user'),
     [messages],
@@ -324,14 +330,16 @@ export function ChatInterface({
   const renderStepItem = (item: any, globalStepIndex: number) => {
     const step = item.codeStep;
     const message = item.message;
-    const isActiveStep = globalStepIndex === highlightedStepIndex;
+    const isActiveStep = isRunning
+      ? timelineItemMatchesTarget(item, activeTimelineTarget)
+      : globalStepIndex === currentStepIndex;
     const activeStepClass = isActiveStep
       ? 'ring-2 ring-foreground ring-offset-2 ring-offset-background bg-muted/80'
       : '';
     const content =
       message?.content ||
       (step ? codeStepFallbackContent(step) : 'Lea is preparing this step.');
-    const createdAt = message?.created_at || step?.created_at || new Date().toISOString();
+    const createdAt = message?.created_at || step?.created_at || item.createdAt;
 
     return (
       <div key={item.id} className="flex justify-start">
@@ -348,7 +356,7 @@ export function ChatInterface({
             </div>
             <MarkdownMessage content={content} />
             <p className="text-xs opacity-70 mt-2">
-              {new Date(createdAt).toLocaleTimeString()}
+              {createdAt ? new Date(createdAt).toLocaleTimeString() : ''}
             </p>
           </div>
           {renderLogList(item.logs)}
