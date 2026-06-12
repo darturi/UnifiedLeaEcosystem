@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   buildCacheKey,
@@ -27,6 +27,7 @@ const BACKUP_DIR = path.join(APP_DIR, "backups");
 const DEFAULT_LEAN_TOOLCHAIN = "leanprover/lean4:v4.30.0";
 const DEFAULT_LEA_PROVIDER = "openai";
 const DEFAULT_LEA_MODEL = "o4-mini";
+const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
 const DEFAULT_LAKEFILE = `import Lake
@@ -44,16 +45,15 @@ export async function createServer({
   settingsPath = SETTINGS_PATH,
   cachePath = CACHE_PATH,
   jobsPath = JOBS_PATH,
-  spawnImpl = spawn,
+  fetchImpl = fetch,
   env = process.env
 } = {}) {
   const state = {
     settingsPath,
     cachePath,
     jobsPath,
-    spawnImpl,
+    fetchImpl,
     env,
-    commandExists,
     settings: applyEnvDefaults(await readJson(settingsPath, {}), env),
     cache: await readJson(cachePath, {}),
     jobs: await readJson(jobsPath, {})
@@ -351,6 +351,8 @@ async function routeRequest(request, response, state) {
       ok: true,
       workspacePath: state.settings.workspacePath || "",
       leaRepoPath: state.settings.leaRepoPath || "",
+      leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+      leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
       leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
       leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
       leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
@@ -387,6 +389,10 @@ async function routeRequest(request, response, state) {
     }
 
     state.settings.leaRepoPath = path.resolve(leaRepoPath);
+    state.settings.leaApiBaseUrl = normalizeLeaApiBaseUrl(
+      payload.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
+    );
+    state.settings.leaApiKey = String(payload.leaApiKey || state.settings.leaApiKey || "");
     state.settings.leaProvider = String(payload.leaProvider || DEFAULT_LEA_PROVIDER);
     state.settings.leaModel = String(payload.leaModel || DEFAULT_LEA_MODEL);
     state.settings.leaMaxTurns = Number.parseInt(String(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS), 10);
@@ -398,6 +404,8 @@ async function routeRequest(request, response, state) {
     sendJson(response, 200, {
       ok: true,
       leaRepoPath: state.settings.leaRepoPath,
+      leaApiBaseUrl: state.settings.leaApiBaseUrl,
+      leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
       leaProvider: state.settings.leaProvider,
       leaModel: state.settings.leaModel,
       leaMaxTurns: state.settings.leaMaxTurns,
@@ -502,16 +510,12 @@ function validateLeaRuntime(state) {
   if (!state.env?.OPENAI_API_KEY) {
     return { ok: false, error: "missing_openai_key", message: "OPENAI_API_KEY must be set before running Lea." };
   }
-  const hasCommand = state.commandExists || commandExists;
-  if (!hasCommand("uv")) {
-    return { ok: false, error: "missing_uv", message: "`uv` must be available on PATH before running Lea." };
+  try {
+    normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return { ok: false, error: "invalid_lea_api_url", message: "Lea API base URL must be an absolute http(s) URL." };
   }
   return { ok: true };
-}
-
-function commandExists(command) {
-  const result = spawnSync(command, ["--version"], { stdio: "ignore" });
-  return result.status === 0;
 }
 
 async function createFormalizationJob({ state, target, theoremText }) {
@@ -543,6 +547,8 @@ async function createFormalizationJob({ state, target, theoremText }) {
     startedAt: new Date().toISOString(),
     finishedAt: null,
     leaRepoPath: state.settings.leaRepoPath,
+    leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
     leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
     leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
@@ -558,27 +564,15 @@ async function runLeaJob({ state, job, target, theoremText }) {
     theoremLabel: target.theoremLabel,
     theoremText
   });
-  const args = [
-    "run",
-    "python",
-    "-m",
-    "lea.cli",
-    "-p",
-    job.leaProvider,
-    "-m",
-    job.leaModel,
-    "--max-turns",
-    String(job.leaMaxTurns),
-    prompt
-  ];
-  await appendLog(job.logPath, `$ uv ${args.map(shellQuote).join(" ")}\n\n`);
-
-  const exit = await spawnAndCapture({
-    spawnImpl: state.spawnImpl || spawn,
-    command: "uv",
-    args,
-    cwd: job.leaRepoPath,
-    env: buildLeaEnv({ baseEnv: state.env || process.env, leaRepoPath: job.leaRepoPath }),
+  await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs\n\n${prompt}\n\n`);
+  const exit = await runLeaApiFormalization({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: job.leaApiBaseUrl,
+    apiKey: state.settings.leaApiKey,
+    model: job.leaModel,
+    maxTurns: job.leaMaxTurns,
+    openAiApiKey: state.env?.OPENAI_API_KEY,
+    prompt,
     logPath: job.logPath,
     timeoutMs: job.leaJobTimeoutSeconds * 1000
   });
@@ -591,18 +585,22 @@ async function runLeaJob({ state, job, target, theoremText }) {
     cache: state.cache,
     jobs: {}
   });
-  job.status = exit.code === 0 && status.status === "formalized" ? "formalized" : "failed";
+  const nextJobStatus = exit.ok && status.status === "formalized" ? "formalized" : "failed";
   job.finalStatus = status.status;
-  job.exitCode = exit.code;
+  job.apiRunId = exit.apiRunId || null;
+  job.exitCode = exit.ok ? 0 : 1;
   job.timedOut = exit.timedOut;
   if (exit.timedOut) {
     job.error = `Lea timed out after ${job.leaJobTimeoutSeconds} seconds.`;
+  } else if (!exit.ok) {
+    job.error = exit.error || "Lea API run did not complete successfully.";
   }
   job.finishedAt = new Date().toISOString();
   const exitSummary = exit.timedOut
     ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
-    : `Lea exited with ${exit.code}`;
+    : `Lea API run ${exit.ok ? "completed" : "failed"}`;
   await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${status.status}\n`);
+  job.status = nextJobStatus;
   await writeJson(state.jobsPath, state.jobs);
 }
 
@@ -620,39 +618,107 @@ The final file must compile with no sorry/admit in theorem ${theoremLabel}.
 Do not create a placeholder theorem. If you cannot complete the proof, leave the best partial Lean file in ${absolutePath}.`;
 }
 
-function buildLeaEnv({ baseEnv, leaRepoPath }) {
-  return {
-    ...baseEnv,
-    PYTHONPATH: [leaRepoPath, baseEnv.PYTHONPATH].filter(Boolean).join(path.delimiter)
+async function runLeaApiFormalization({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  model,
+  maxTurns,
+  openAiApiKey,
+  prompt,
+  logPath,
+  timeoutMs
+}) {
+  const started = Date.now();
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  const body = {
+    task: prompt,
+    config: {
+      model: {
+        name: model,
+        ...(openAiApiKey ? { model_kwargs: { api_key: openAiApiKey } } : {})
+      },
+      agent: {
+        max_turns: maxTurns,
+        narrate_tool_steps: false,
+        permission_tier: "none",
+        theorem_translation_max_retries: 3
+      }
+    }
   };
+
+  const startResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body)
+  });
+  if (!startResponse.ok) {
+    return { ok: false, timedOut: false, error: startResponse.error };
+  }
+
+  const apiRunId = startResponse.body?.run_id;
+  if (!apiRunId) {
+    return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
+  }
+  await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
+
+  while (Date.now() - started < timeoutMs) {
+    await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))));
+    const statusResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`, {
+      method: "GET",
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+    });
+    if (!statusResponse.ok) {
+      return { ok: false, timedOut: false, apiRunId, error: statusResponse.error };
+    }
+
+    const run = statusResponse.body || {};
+    const status = String(run.status || run.state || "").toLowerCase();
+    const message = run.final_text || run.error || run.message || "";
+    if (message) {
+      await appendLog(logPath, `[lea-api] ${message}\n`);
+    }
+    if (["completed", "succeeded", "success", "done"].includes(status)) {
+      return { ok: true, timedOut: false, apiRunId };
+    }
+    if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
+      return { ok: false, timedOut: false, apiRunId, error: message || `Lea API status: ${status}` };
+    }
+  }
+
+  return { ok: false, timedOut: true, apiRunId };
 }
 
-function spawnAndCapture({ spawnImpl, command, args, cwd, env, logPath, timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    const child = spawnImpl(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-    const timer = timeoutMs > 0
-      ? setTimeout(() => {
-        appendLog(logPath, `\n[backend] Killing Lea after ${Math.round(timeoutMs / 1000)} seconds with no completion.\n`);
-        finish({ code: null, timedOut: true });
-        child.kill?.("SIGTERM");
-      }, timeoutMs)
-      : null;
-    timer?.unref?.();
-    child.stdout?.on("data", (chunk) => appendLog(logPath, chunk.toString()));
-    child.stderr?.on("data", (chunk) => appendLog(logPath, chunk.toString()));
-    child.on("error", (error) => {
-      if (settled) return;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => finish({ code, timedOut: false }));
+async function fetchJson(fetchImpl, url, options) {
+  try {
+    const response = await fetchImpl(url, options);
+    const text = await response.text();
+    const body = text ? JSON.parse(text) : null;
+    if (!response.ok) {
+      return { ok: false, error: `Lea API returned HTTP ${response.status}: ${text}` };
+    }
+    return { ok: true, body };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function normalizeLeaApiBaseUrl(value) {
+  const text = String(value || DEFAULT_LEA_API_BASE_URL).trim().replace(/\/+$/, "");
+  const parsed = new URL(text);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Lea API base URL must be http(s).");
+  }
+  return text;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
   });
 }
 
@@ -682,11 +748,6 @@ function buildJobResponse({ job, status, target }) {
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };
-}
-
-function shellQuote(value) {
-  const text = String(value);
-  return /^[A-Za-z0-9_./:=+-]+$/.test(text) ? text : JSON.stringify(text);
 }
 
 async function getTheoremStatus({ workspacePath, overleafProjectId = "unknown", theoremLabel, theoremText, cache, jobs = {} }) {

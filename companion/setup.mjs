@@ -9,14 +9,14 @@ const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
-const LEA_REPO_URL = "https://github.com/chinmayhegde/lea-prover.git";
+const LEA_REPO_URL = "https://github.com/darturi/lea-prover.git";
+const LEA_REPO_BRANCH = "thrm_permission";
 const LEA_REPO_PATH = path.join(PROJECT_ROOT, "vendor", "lea-prover");
 const MATHLIB_PACKAGE_PATH = path.join(PROJECT_ROOT, ".lake", "packages", "mathlib");
 const REFRESH_LEAN_DEPS = process.argv.includes("--refresh-lean-deps");
 const DEFAULTS = {
   OPENAI_API_KEY: "your_openai_key_here",
-  LEA_REPO_PATH,
-  LEAN_WORKSPACE_PATH: PROJECT_ROOT,
+  LEA_API_BASE_URL: "http://127.0.0.1:8000",
   LEA_PROVIDER: "openai",
   LEA_MODEL: "o4-mini",
   LEA_MAX_TURNS: "20",
@@ -52,7 +52,10 @@ async function ensureLeaRepo() {
   await fs.mkdir(path.dirname(LEA_REPO_PATH), { recursive: true });
 
   if (existsSync(path.join(LEA_REPO_PATH, ".git"))) {
-    console.log("Updating Lea checkout...");
+    console.log("Updating Lea submodule checkout...");
+    await run("git", ["remote", "set-url", "origin", LEA_REPO_URL], { cwd: LEA_REPO_PATH });
+    await run("git", ["fetch", "origin", LEA_REPO_BRANCH], { cwd: LEA_REPO_PATH });
+    await run("git", ["checkout", LEA_REPO_BRANCH], { cwd: LEA_REPO_PATH });
     await run("git", ["pull", "--ff-only"], { cwd: LEA_REPO_PATH });
     return;
   }
@@ -61,13 +64,13 @@ async function ensureLeaRepo() {
     throw new Error(`${LEA_REPO_PATH} exists but is not a git checkout. Move it aside and rerun setup.`);
   }
 
-  console.log("Cloning Lea into vendor/lea-prover...");
-  await run("git", ["clone", LEA_REPO_URL, LEA_REPO_PATH], { cwd: PROJECT_ROOT });
+  console.log("Initializing Lea submodule at vendor/lea-prover...");
+  await run("git", ["submodule", "update", "--init", "--recursive", LEA_REPO_PATH], { cwd: PROJECT_ROOT });
 }
 
 async function syncLeaEnvironment() {
-  console.log("Installing Lea Python dependencies with uv...");
-  await run("uv", ["sync"], { cwd: LEA_REPO_PATH });
+  console.log("Installing Lea API Python dependencies with uv...");
+  await run("uv", ["sync", "--extra", "api"], { cwd: LEA_REPO_PATH });
 }
 
 async function fetchMathlib() {
@@ -86,8 +89,7 @@ async function fetchMathlib() {
 async function writeLocalEnv() {
   const existing = await readEnvFile(ENV_PATH);
   const merged = { ...DEFAULTS, ...existing };
-  merged.LEA_REPO_PATH = LEA_REPO_PATH;
-  merged.LEAN_WORKSPACE_PATH = PROJECT_ROOT;
+  merged.LEA_API_BASE_URL = merged.LEA_API_BASE_URL || DEFAULTS.LEA_API_BASE_URL;
   merged.LEA_PROVIDER = merged.LEA_PROVIDER || DEFAULTS.LEA_PROVIDER;
   merged.LEA_MODEL = merged.LEA_MODEL || DEFAULTS.LEA_MODEL;
   merged.LEA_MAX_TURNS = merged.LEA_MAX_TURNS || DEFAULTS.LEA_MAX_TURNS;
@@ -103,6 +105,7 @@ async function writeLocalSettings() {
     ...settings,
     workspacePath: PROJECT_ROOT,
     leaRepoPath: LEA_REPO_PATH,
+    leaApiBaseUrl: settings.leaApiBaseUrl || DEFAULTS.LEA_API_BASE_URL,
     leaProvider: settings.leaProvider || DEFAULTS.LEA_PROVIDER,
     leaModel: settings.leaModel || DEFAULTS.LEA_MODEL,
     leaMaxTurns: settings.leaMaxTurns || Number(DEFAULTS.LEA_MAX_TURNS),
@@ -156,8 +159,7 @@ async function readEnvFile(filePath) {
 function formatEnv(values) {
   const lines = [
     ["OPENAI_API_KEY", values.OPENAI_API_KEY || DEFAULTS.OPENAI_API_KEY],
-    ["LEA_REPO_PATH", values.LEA_REPO_PATH],
-    ["LEAN_WORKSPACE_PATH", values.LEAN_WORKSPACE_PATH],
+    ["LEA_API_BASE_URL", values.LEA_API_BASE_URL],
     ["LEA_PROVIDER", values.LEA_PROVIDER],
     ["LEA_MODEL", values.LEA_MODEL],
     ["LEA_MAX_TURNS", values.LEA_MAX_TURNS],

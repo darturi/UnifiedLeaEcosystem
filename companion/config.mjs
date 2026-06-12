@@ -1,5 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULT_LEA_REPO_PATH = path.join(PROJECT_ROOT, "vendor", "lea-prover");
 
 export function loadDotEnv(projectRoot) {
   const envPath = path.join(projectRoot, ".env");
@@ -32,8 +36,10 @@ export function loadDotEnv(projectRoot) {
 export function applyEnvDefaults(settings, env = process.env) {
   return {
     ...settings,
-    workspacePath: settings.workspacePath || env.LEAN_WORKSPACE_PATH,
-    leaRepoPath: settings.leaRepoPath || env.LEA_REPO_PATH,
+    workspacePath: settings.workspacePath || env.LEAN_WORKSPACE_PATH || PROJECT_ROOT,
+    leaRepoPath: settings.leaRepoPath || env.LEA_REPO_PATH || DEFAULT_LEA_REPO_PATH,
+    leaApiBaseUrl: settings.leaApiBaseUrl || env.LEA_API_BASE_URL || "http://127.0.0.1:8000",
+    leaApiKey: settings.leaApiKey || env.LEA_API_KEY || "",
     leaProvider: settings.leaProvider || env.LEA_PROVIDER || "openai",
     leaModel: settings.leaModel || env.LEA_MODEL || "o4-mini",
     leaMaxTurns: settings.leaMaxTurns || parseInt(env.LEA_MAX_TURNS || "20", 10),

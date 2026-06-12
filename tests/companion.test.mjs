@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -232,8 +231,7 @@ test("formalize starts Lea without creating a placeholder file first", async () 
   const state = await makeState(workspace, {
     leaRepoPath: leaRepo,
     env: { OPENAI_API_KEY: "test-key" },
-    spawnImpl: makeHangingSpawn(calls),
-    commandExists: () => true
+    fetchImpl: makeLeaApiFetch(calls)
   });
 
   const result = await handleFormalize({
@@ -247,29 +245,19 @@ test("formalize starts Lea without creating a placeholder file first", async () 
   assert.equal(result.body.relativePath, path.join("Formalization", "Overleaf", "project-1", "lea_test.lean"));
   assert.equal(await fileExists(path.join(workspace, result.body.relativePath)), false);
   await waitFor(() => calls.length > 0);
-  assert.equal(calls[0].command, "uv");
-  assert.deepEqual(calls[0].args.slice(0, 10), [
-    "run",
-    "python",
-    "-m",
-    "lea.cli",
-    "-p",
-    "openai",
-    "-m",
-    "o4-mini",
-    "--max-turns",
-    "20"
-  ]);
-  assert.match(calls[0].options.env.PYTHONPATH, /lea-prover-/);
+  assert.equal(calls[0].url, "http://127.0.0.1:8000/v1/runs");
+  assert.equal(calls[0].body.config.model.name, "o4-mini");
+  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "test-key");
+  assert.equal(calls[0].body.config.agent.max_turns, 20);
   assert.match(
-    calls[0].args.at(-1),
+    calls[0].body.task,
     new RegExp(escapeRegExp(path.join(workspace, "Formalization", "Overleaf", "project-1", "lea_test.lean")))
   );
   assert.match(
-    calls[0].args.at(-1),
+    calls[0].body.task,
     /do not create Formalization\/Overleaf\/project-1\/lea_test\.lean relative to the current working directory/
   );
-  assert.match(calls[0].args.at(-1), /A theorem\./);
+  assert.match(calls[0].body.task, /A theorem\./);
 });
 
 test("formalize returns active job instead of starting a duplicate", async () => {
@@ -279,8 +267,7 @@ test("formalize returns active job instead of starting a duplicate", async () =>
   const state = await makeState(workspace, {
     leaRepoPath: leaRepo,
     env: { OPENAI_API_KEY: "test-key" },
-    spawnImpl: makeHangingSpawn(calls),
-    commandExists: () => true
+    fetchImpl: makeLeaApiFetch(calls)
   });
   const payload = {
     overleafProjectId: "project-1",
@@ -296,7 +283,7 @@ test("formalize returns active job instead of starting a duplicate", async () =>
   assert.equal(second.statusCode, 200);
   assert.equal(second.body.status, "in_progress");
   assert.equal(second.body.jobId, first.body.jobId);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.filter((call) => call.url.endsWith("/v1/runs")).length, 1);
 });
 
 test("statuses report active Lea jobs as in progress", async () => {
@@ -305,8 +292,7 @@ test("statuses report active Lea jobs as in progress", async () => {
   const state = await makeState(workspace, {
     leaRepoPath: leaRepo,
     env: { OPENAI_API_KEY: "test-key" },
-    spawnImpl: makeHangingSpawn([]),
-    commandExists: () => true
+    fetchImpl: makeLeaApiFetch([])
   });
 
   await handleFormalize({
@@ -330,8 +316,7 @@ test("statuses report formalized when active job has already written a complete 
   const state = await makeState(workspace, {
     leaRepoPath: leaRepo,
     env: { OPENAI_API_KEY: "test-key" },
-    spawnImpl: makeHangingSpawn([]),
-    commandExists: () => true
+    fetchImpl: makeLeaApiFetch([])
   });
 
   await handleFormalize({
@@ -367,8 +352,7 @@ test("formalize rejects missing OpenAI key", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState(workspace, {
     leaRepoPath: leaRepo,
-    env: {},
-    commandExists: () => true
+    env: {}
   });
 
   const result = await handleFormalize({
@@ -414,8 +398,7 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
     leaRepoPath: leaRepo,
     leaJobTimeoutSeconds: 0.01,
     env: { OPENAI_API_KEY: "test-key" },
-    spawnImpl: makeHangingSpawn([]),
-    commandExists: () => true
+    fetchImpl: makeLeaApiFetch([])
   });
 
   const result = await handleFormalize({
@@ -430,7 +413,7 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
 
   const job = state.jobs[result.body.jobId];
   assert.equal(job.timedOut, true);
-  assert.equal(job.exitCode, null);
+  assert.equal(job.exitCode, 1);
   assert.match(job.error, /timed out/);
 
   const statuses = await handleGetStatuses({
@@ -440,7 +423,7 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
 
   assert.equal(statuses.statusCode, 200);
   assert.equal(statuses.body.statuses.timeout_test.status, "failed");
-  assert.match(statuses.body.statuses.timeout_test.logTail, /Killing Lea/);
+  assert.match(statuses.body.statuses.timeout_test.logTail, /timed out/);
 });
 
 test("startup recovery fails interrupted in-progress jobs", async () => {
@@ -485,6 +468,7 @@ async function makeWorkspace() {
 
 async function makeLeaRepo() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lea-prover-"));
+  await fs.mkdir(path.join(dir, "lea_api"), { recursive: true });
   await fs.writeFile(path.join(dir, "pyproject.toml"), "[project]\nname = \"lea-prover\"\n", "utf8");
   return dir;
 }
@@ -510,8 +494,7 @@ async function makeState(workspacePath, overrides = {}) {
     cache: {},
     jobs: {},
     env: overrides.env || process.env,
-    spawnImpl: overrides.spawnImpl,
-    commandExists: overrides.commandExists
+    fetchImpl: overrides.fetchImpl
   };
 }
 
@@ -524,17 +507,24 @@ async function fileExists(filePath) {
   }
 }
 
-function makeHangingSpawn(calls) {
-  return (command, args, options) => {
-    calls.push({ command, args, options });
-    const child = new EventEmitter();
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
-    child.kill = () => {
-      child.emit("close", null);
-      return true;
-    };
-    return child;
+function makeLeaApiFetch(calls) {
+  return async (url, options = {}) => {
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url, options, body });
+    if (String(url).endsWith("/v1/runs")) {
+      return jsonResponse(200, { run_id: "api-run-1", status: "running" });
+    }
+    return jsonResponse(200, { run_id: "api-run-1", status: "running" });
+  };
+}
+
+function jsonResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async text() {
+      return JSON.stringify(body);
+    }
   };
 }
 

@@ -1,8 +1,9 @@
 {
-  "workspacePath": "/Users/danielarturi/Desktop/VIDA Personal/Overleaf1",
-  "leaRepoPath": "/Users/danielarturi/Desktop/VIDA Personal/Overleaf1/vendor/lea-prover",
+  "workspacePath": "/Users/danielarturi/Developer/VIDA_Dev/Overleaf1",
+  "leaRepoPath": "/Users/danielarturi/Developer/VIDA_Dev/Overleaf1/vendor/lea-prover",
   "leaProvider": "openai",
   "leaModel": "o4-mini",
   "leaMaxTurns": 10,
-  "leaJobTimeoutSeconds": 900
+  "leaJobTimeoutSeconds": 900,
+  "leaApiBaseUrl": "http://127.0.0.1:8000"
 }

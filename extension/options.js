@@ -4,6 +4,7 @@ const form = document.querySelector("#settings-form");
 const companionUrlInput = document.querySelector("#companion-url");
 const workspacePathInput = document.querySelector("#workspace-path");
 const leaRepoPathInput = document.querySelector("#lea-repo-path");
+const leaApiBaseUrlInput = document.querySelector("#lea-api-base-url");
 const leaModelInput = document.querySelector("#lea-model");
 const leaMaxTurnsInput = document.querySelector("#lea-max-turns");
 const loadCompanionSettingsButton = document.querySelector("#load-companion-settings");
@@ -14,6 +15,7 @@ chrome.storage.sync.get(
     companionUrl: DEFAULT_COMPANION_URL,
     workspacePath: "",
     leaRepoPath: "",
+    leaApiBaseUrl: "http://127.0.0.1:8000",
     leaModel: "o4-mini",
     leaMaxTurns: 20
   },
@@ -21,6 +23,7 @@ chrome.storage.sync.get(
     companionUrlInput.value = settings.companionUrl;
     workspacePathInput.value = settings.workspacePath;
     leaRepoPathInput.value = settings.leaRepoPath;
+    leaApiBaseUrlInput.value = settings.leaApiBaseUrl;
     leaModelInput.value = settings.leaModel;
     leaMaxTurnsInput.value = settings.leaMaxTurns;
     loadCompanionSettings({ silent: true });
@@ -38,6 +41,7 @@ form.addEventListener("submit", async (event) => {
   const companionUrl = companionUrlInput.value.trim().replace(/\/+$/, "");
   const workspacePath = workspacePathInput.value.trim();
   const leaRepoPath = leaRepoPathInput.value.trim();
+  const leaApiBaseUrl = leaApiBaseUrlInput.value.trim().replace(/\/+$/, "");
   const leaModel = leaModelInput.value.trim() || "o4-mini";
   const leaMaxTurns = Number.parseInt(leaMaxTurnsInput.value, 10) || 20;
 
@@ -57,6 +61,7 @@ form.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         leaRepoPath,
+        leaApiBaseUrl,
         leaProvider: "openai",
         leaModel,
         leaMaxTurns
@@ -71,6 +76,7 @@ form.addEventListener("submit", async (event) => {
       companionUrl,
       workspacePath: workspacePayload.workspacePath,
       leaRepoPath: leaPayload.leaRepoPath,
+      leaApiBaseUrl: leaPayload.leaApiBaseUrl,
       leaModel: leaPayload.leaModel,
       leaMaxTurns: leaPayload.leaMaxTurns
     });
@@ -93,6 +99,7 @@ async function loadCompanionSettings({ silent }) {
     companionUrlInput.value = companionUrl;
     workspacePathInput.value = payload.workspacePath || workspacePathInput.value;
     leaRepoPathInput.value = payload.leaRepoPath || leaRepoPathInput.value;
+    leaApiBaseUrlInput.value = payload.leaApiBaseUrl || leaApiBaseUrlInput.value || "http://127.0.0.1:8000";
     leaModelInput.value = payload.leaModel || leaModelInput.value || "o4-mini";
     leaMaxTurnsInput.value = payload.leaMaxTurns || leaMaxTurnsInput.value || 20;
 
@@ -100,6 +107,7 @@ async function loadCompanionSettings({ silent }) {
       companionUrl,
       workspacePath: workspacePathInput.value,
       leaRepoPath: leaRepoPathInput.value,
+      leaApiBaseUrl: leaApiBaseUrlInput.value,
       leaModel: leaModelInput.value,
       leaMaxTurns: Number.parseInt(leaMaxTurnsInput.value, 10) || 20
     });

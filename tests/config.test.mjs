@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { applyEnvDefaults, loadDotEnv } from "../companion/config.mjs";
+
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test("loads .env values without overriding existing environment", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "overleaf-env-"));
@@ -49,4 +52,11 @@ test("applies environment defaults without replacing explicit settings", () => {
   assert.equal(settings.leaRepoPath, "/tmp/lea");
   assert.equal(settings.leaModel, "explicit-model");
   assert.equal(settings.leaMaxTurns, 7);
+});
+
+test("derives local path defaults when env values are absent", () => {
+  const settings = applyEnvDefaults({}, {});
+
+  assert.equal(settings.workspacePath, PROJECT_ROOT);
+  assert.equal(settings.leaRepoPath, path.join(PROJECT_ROOT, "vendor", "lea-prover"));
 });

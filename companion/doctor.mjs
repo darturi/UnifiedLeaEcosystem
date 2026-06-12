@@ -25,8 +25,10 @@ checkPath("Lean workspace", settings.workspacePath || PROJECT_ROOT, (dir) => (
 checkMathlib(settings.workspacePath || PROJECT_ROOT);
 checkPath("Lea repo", settings.leaRepoPath, (dir) => (
   fs.existsSync(path.join(dir, "pyproject.toml")) &&
-  fs.existsSync(path.join(dir, "lea", "cli.py"))
-), "must point at a lea-prover checkout");
+  fs.existsSync(path.join(dir, "lea_api"))
+), "must point at the Lea API-enabled lea-prover checkout");
+checkPath("Lea API virtualenv", settings.leaRepoPath ? path.join(settings.leaRepoPath, ".venv", "bin", "python") : "", () => true, "run `npm run setup:api`");
+checkUrl("Lea API URL", settings.leaApiBaseUrl || "http://127.0.0.1:8000");
 
 console.log("Overleaf Lea Formalizer doctor\n");
 console.log(`${dotenv.loaded ? "✓" : "•"} .env ${dotenv.loaded ? `loaded from ${dotenv.path}` : "not found; using shell/settings only"}`);
@@ -67,6 +69,21 @@ function checkPath(label, value, predicate, requirement) {
     ok,
     label,
     detail: ok ? value : `${value || "unset"} (${requirement})`
+  });
+}
+
+function checkUrl(label, value) {
+  let ok = false;
+  try {
+    const parsed = new URL(value);
+    ok = ["http:", "https:"].includes(parsed.protocol);
+  } catch {
+    ok = false;
+  }
+  checks.push({
+    ok,
+    label,
+    detail: ok ? value : `${value || "unset"} (must be absolute http(s) URL)`
   });
 }
 

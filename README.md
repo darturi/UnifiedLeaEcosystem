@@ -32,17 +32,18 @@ For a minimal test document, define the display macro in the preamble:
 Run the setup script from the repository root:
 
 ```sh
+git submodule update --init --recursive
 npm run setup
 ```
 
 The script does the one-time local work:
 
 - creates the Lean workspace files if needed
-- clones or updates Lea at `vendor/lea-prover`
-- runs `uv sync` for Lea
+- initializes or updates the Lea submodule at `vendor/lea-prover`
+- runs `uv sync --extra api` for the bundled Lea API
 - runs `lake update` for Mathlib only when the local Mathlib checkout is missing
 - runs `lake exe cache get` for Mathlib's compiled cache
-- writes `.env` and `.overleaf-lean-stub/settings.json` with local absolute paths
+- writes `.env` for API/runtime settings and `.overleaf-lean-stub/settings.json` for local paths
 
 After the first successful setup, rerunning `npm run setup` reuses the existing
 `.lake/packages/mathlib` checkout and skips the heavier dependency update step. To force a Lean
@@ -56,8 +57,12 @@ Then edit `.env` and replace the placeholder API key:
 
 ```text
 OPENAI_API_KEY=your_openai_key_here
+LEA_API_BASE_URL=http://127.0.0.1:8000
 LEA_JOB_TIMEOUT_SECONDS=900
 ```
+
+The Lean workspace and Lea repo paths are derived automatically from this repository:
+the workspace is the project root, and the Lea checkout is `vendor/lea-prover`.
 
 Check setup:
 
@@ -68,6 +73,14 @@ npm run doctor
 Fix anything marked with `✗` before starting the companion.
 
 ## Run The Companion
+
+Start the bundled Lea API in one terminal:
+
+```sh
+npm run start:lea-api
+```
+
+Then start the Overleaf companion in another terminal:
 
 ```sh
 npm start
@@ -125,13 +138,14 @@ npm test
 
 The main workflow expects:
 
-- a local clone of `https://github.com/chinmayhegde/lea-prover` at `vendor/lea-prover`
+- the `vendor/lea-prover` submodule initialized from `https://github.com/darturi/lea-prover.git`
 - `uv` available on `PATH`
+- the Lea API reachable at `LEA_API_BASE_URL` (default `http://127.0.0.1:8000`)
 - `OPENAI_API_KEY` in `.env` or exported in the shell that runs `npm start`
 - optional `LEA_JOB_TIMEOUT_SECONDS` in `.env` to fail and unblock stalled Lea runs
 - Lean and Lake available on `PATH`
 
-The extension options page stores only paths and model settings. API keys stay in `.env` or the companion process environment.
+The extension options page stores only paths, the Lea API URL, and model settings. API keys stay in `.env` or the companion process environment.
 
 ## Generated Lean File
 
