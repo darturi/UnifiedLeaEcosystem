@@ -1,13 +1,14 @@
 # Overleaf Lea Formalizer MVP
 
-This repository contains a local MVP for turning labeled Overleaf theorem blocks into Lean files through the Lea prover.
+This repository contains a local MVP for sending labeled Overleaf theorem blocks to Lea and tracking the resulting Lean proofs in Lea's own workspace.
 
 ## Pieces
 
 - `extension/`: Chrome MV3 extension for Overleaf.
-- `companion/`: local HTTP service that runs Lea and tracks formalization jobs.
+- `companion/`: local HTTP service that starts Lea jobs and tracks statuses.
 - `shared/`: parser and helper logic used by tests and the companion.
 - `tests/`: Node test suite.
+- `vendor/lea-prover/`: Lea checkout. All Lean work happens under `vendor/lea-prover/workspace`.
 
 ## Theorem Syntax
 
@@ -19,7 +20,7 @@ The MVP requires labeled theorem blocks:
 }\label{my_theorem_name}
 ```
 
-The `\label{...}` value is used as the generated Lean declaration name and filename. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
+The `\label{...}` value is used as the generated Lean declaration name. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
 
 For a minimal test document, define the display macro in the preamble:
 
@@ -38,16 +39,14 @@ npm run setup
 
 The script does the one-time local work:
 
-- creates the Lean workspace files if needed
 - initializes or updates the Lea submodule at `vendor/lea-prover`
 - runs `uv sync --extra api` for the bundled Lea API
-- runs `lake update` for Mathlib only when the local Mathlib checkout is missing
-- runs `lake exe cache get` for Mathlib's compiled cache
-- writes `.env` for API/runtime settings and `.overleaf-lean-stub/settings.json` for local paths
+- runs `lake update` in `vendor/lea-prover/workspace` when the local Mathlib checkout is missing
+- runs `lake exe cache get` in `vendor/lea-prover/workspace`
+- verifies `import Mathlib` against the compiled cache so first-run cache issues fail during setup
+- writes `.env` for API/runtime settings and `.overleaf-lean-stub/settings.json` for local Lea paths
 
-After the first successful setup, rerunning `npm run setup` reuses the existing
-`.lake/packages/mathlib` checkout and skips the heavier dependency update step. To force a Lean
-dependency refresh, run:
+To force a Lean dependency refresh:
 
 ```sh
 npm run update-lean-deps
@@ -60,9 +59,6 @@ OPENAI_API_KEY=your_openai_key_here
 LEA_API_BASE_URL=http://127.0.0.1:8000
 LEA_JOB_TIMEOUT_SECONDS=900
 ```
-
-The Lean workspace and Lea repo paths are derived automatically from this repository:
-the workspace is the project root, and the Lea checkout is `vendor/lea-prover`.
 
 Check setup:
 
@@ -92,29 +88,6 @@ The companion listens on:
 http://127.0.0.1:31245
 ```
 
-On startup, the companion checks whether this project directory is a valid Lean workspace. If not, it creates:
-
-```text
-lean-toolchain
-lakefile.lean
-Formalization/
-```
-
-The generated `lakefile.lean` includes Mathlib pinned to the workspace Lean toolchain. The setup
-script fetches Mathlib and its compiled cache so Lea-created files can use `import Mathlib`.
-
-If you ever need to refresh that manually, run:
-
-```sh
-npm run update-lean-deps
-```
-
-It also stores the selected workspace path in:
-
-```text
-.overleaf-lean-stub/settings.json
-```
-
 ## Configure The Extension
 
 1. Open `chrome://extensions`.
@@ -122,16 +95,26 @@ It also stores the selected workspace path in:
 3. Load unpacked extension from the `extension/` directory.
 4. Open the extension options page.
 5. Confirm the companion URL is `http://127.0.0.1:31245`.
-
-If the companion starts and this project directory is not already a Lean workspace, it creates a minimal one automatically:
-
-- `lean-toolchain`
-- `lakefile.lean` or `lakefile.toml`
+6. Confirm the Lea repo path points to this checkout's `vendor/lea-prover`.
 
 ## Run Tests
 
 ```sh
 npm test
+```
+
+## Reset Local Run State
+
+To clear prior local formalization runs while keeping Lea dependencies intact:
+
+```sh
+npm run reset:local
+```
+
+This removes Lea project markdowns, Lea proof files, companion job logs, backups, and local job/cache indexes. Preview the reset without deleting anything:
+
+```sh
+npm run reset:local -- --dry-run
 ```
 
 ## Lea Setup
@@ -145,15 +128,24 @@ The main workflow expects:
 - optional `LEA_JOB_TIMEOUT_SECONDS` in `.env` to fail and unblock stalled Lea runs
 - Lean and Lake available on `PATH`
 
-The extension options page stores only paths, the Lea API URL, and model settings. API keys stay in `.env` or the companion process environment.
+The extension options page stores only the companion URL, Lea repo path, Lea API URL, and model settings. API keys stay in `.env` or the companion process environment.
 
-## Generated Lean File
+## Generated Lean Work
 
-For Overleaf project `abc123` and label `my_theorem_name`, Lea creates or edits:
+Lea owns all Lean artifacts. Project records live under:
 
 ```text
-Formalization/Overleaf/abc123/my_theorem_name.lean
+vendor/lea-prover/workspace/projects/
 ```
 
-The legacy `/stubs` endpoint still writes to `Formalization/Generated/`, but the extension no longer uses it for the main workflow.
-# LeaOverleafExtension
+The companion passes Overleaf project context to Lea's project-aware API. On
+successful runs, Lea records rich markdown entries with theorem metadata,
+signature, solving summary, proof path, and module name.
+
+Project proof files live under Lea's project namespace, for example:
+
+```text
+vendor/lea-prover/workspace/proofs/Lea/<ProjectName>/
+```
+
+Temporary retry behavior: when a failed theorem is retried, the companion removes the prior generated proof file and the matching project markdown theorem entry before asking Lea to run again. This is a stopgap so stale failed Lean files do not interfere with artifact mapping; we should revisit it once we decide how failed Lean files should be retained, archived, or surfaced.

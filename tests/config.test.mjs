@@ -42,13 +42,11 @@ test("applies environment defaults without replacing explicit settings", () => {
     { leaModel: "explicit-model" },
     {
       LEA_REPO_PATH: "/tmp/lea",
-      LEAN_WORKSPACE_PATH: "/tmp/workspace",
       LEA_MODEL: "env-model",
       LEA_MAX_TURNS: "7"
     }
   );
 
-  assert.equal(settings.workspacePath, "/tmp/workspace");
   assert.equal(settings.leaRepoPath, "/tmp/lea");
   assert.equal(settings.leaModel, "explicit-model");
   assert.equal(settings.leaMaxTurns, 7);
@@ -57,6 +55,5 @@ test("applies environment defaults without replacing explicit settings", () => {
 test("derives local path defaults when env values are absent", () => {
   const settings = applyEnvDefaults({}, {});
 
-  assert.equal(settings.workspacePath, PROJECT_ROOT);
   assert.equal(settings.leaRepoPath, path.join(PROJECT_ROOT, "vendor", "lea-prover"));
 });

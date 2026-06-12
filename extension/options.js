@@ -2,7 +2,6 @@ const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
 
 const form = document.querySelector("#settings-form");
 const companionUrlInput = document.querySelector("#companion-url");
-const workspacePathInput = document.querySelector("#workspace-path");
 const leaRepoPathInput = document.querySelector("#lea-repo-path");
 const leaApiBaseUrlInput = document.querySelector("#lea-api-base-url");
 const leaModelInput = document.querySelector("#lea-model");
@@ -13,7 +12,6 @@ const statusEl = document.querySelector("#status");
 chrome.storage.sync.get(
   {
     companionUrl: DEFAULT_COMPANION_URL,
-    workspacePath: "",
     leaRepoPath: "",
     leaApiBaseUrl: "http://127.0.0.1:8000",
     leaModel: "o4-mini",
@@ -21,7 +19,6 @@ chrome.storage.sync.get(
   },
   (settings) => {
     companionUrlInput.value = settings.companionUrl;
-    workspacePathInput.value = settings.workspacePath;
     leaRepoPathInput.value = settings.leaRepoPath;
     leaApiBaseUrlInput.value = settings.leaApiBaseUrl;
     leaModelInput.value = settings.leaModel;
@@ -36,26 +33,15 @@ loadCompanionSettingsButton.addEventListener("click", () => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  statusEl.textContent = "Validating workspace...";
+  statusEl.textContent = "Validating Lea settings...";
 
   const companionUrl = companionUrlInput.value.trim().replace(/\/+$/, "");
-  const workspacePath = workspacePathInput.value.trim();
   const leaRepoPath = leaRepoPathInput.value.trim();
   const leaApiBaseUrl = leaApiBaseUrlInput.value.trim().replace(/\/+$/, "");
   const leaModel = leaModelInput.value.trim() || "o4-mini";
   const leaMaxTurns = Number.parseInt(leaMaxTurnsInput.value, 10) || 20;
 
   try {
-    const workspaceResponse = await fetch(`${companionUrl}/settings/workspace`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workspacePath })
-    });
-    const workspacePayload = await workspaceResponse.json().catch(() => ({}));
-    if (!workspaceResponse.ok) {
-      throw new Error(workspacePayload.message || `Companion returned HTTP ${workspaceResponse.status}.`);
-    }
-
     const leaResponse = await fetch(`${companionUrl}/settings/lea`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -74,7 +60,6 @@ form.addEventListener("submit", async (event) => {
 
     await chrome.storage.sync.set({
       companionUrl,
-      workspacePath: workspacePayload.workspacePath,
       leaRepoPath: leaPayload.leaRepoPath,
       leaApiBaseUrl: leaPayload.leaApiBaseUrl,
       leaModel: leaPayload.leaModel,
@@ -97,7 +82,6 @@ async function loadCompanionSettings({ silent }) {
     }
 
     companionUrlInput.value = companionUrl;
-    workspacePathInput.value = payload.workspacePath || workspacePathInput.value;
     leaRepoPathInput.value = payload.leaRepoPath || leaRepoPathInput.value;
     leaApiBaseUrlInput.value = payload.leaApiBaseUrl || leaApiBaseUrlInput.value || "http://127.0.0.1:8000";
     leaModelInput.value = payload.leaModel || leaModelInput.value || "o4-mini";
@@ -105,7 +89,6 @@ async function loadCompanionSettings({ silent }) {
 
     await chrome.storage.sync.set({
       companionUrl,
-      workspacePath: workspacePathInput.value,
       leaRepoPath: leaRepoPathInput.value,
       leaApiBaseUrl: leaApiBaseUrlInput.value,
       leaModel: leaModelInput.value,

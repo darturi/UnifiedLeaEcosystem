@@ -4,7 +4,4 @@
 .overleaf-lean-stub/jobs.json
 .overleaf-lean-stub/jobs/
 .overleaf-lean-stub/backups/
-Formalization/Generated/
-Formalization/Overleaf/
-!Formalization/Overleaf/.gitkeep
 vendor/lea-prover/

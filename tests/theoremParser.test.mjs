@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isValidLeanIdentifier, parseTheorems } from "../shared/theoremParser.mjs";
+import {
+  inferLeanDeclarationName,
+  isValidLeanIdentifier,
+  parseTheorems
+} from "../shared/theoremParser.mjs";
 
 test("detects a labeled theorem", () => {
   const [theorem] = parseTheorems("\\theorem{A}\\label{foo}");
@@ -38,4 +42,17 @@ test("validates Lean identifiers", () => {
   assert.equal(isValidLeanIdentifier("main theorem"), false);
   assert.equal(isValidLeanIdentifier("main-theorem"), false);
   assert.equal(isValidLeanIdentifier("1theorem"), false);
+});
+
+test("infers Lean declaration names from theorem text", () => {
+  assert.equal(
+    inferLeanDeclarationName("Lean signature:\ntheorem even_square_of_even {n : Nat} : True := by"),
+    "even_square_of_even"
+  );
+  assert.equal(
+    inferLeanDeclarationName("```lean\nlemma foo_bar : True := by\n  trivial\n```"),
+    "foo_bar"
+  );
+  assert.equal(inferLeanDeclarationName("Theorem name: named_result"), "named_result");
+  assert.equal(inferLeanDeclarationName("Theorem name: invalid-name"), "");
 });

@@ -1,64 +1,44 @@
 import path from "node:path";
-import { hashTheoremText, isValidLeanIdentifier, normalizeTheoremText } from "./theoremParser.mjs";
 
-export const GENERATOR_VERSION = "lean-stub-v1";
-export const GENERATED_DIR = path.join("Formalization", "Generated");
-export const OVERLEAF_DIR = path.join("Formalization", "Overleaf");
-
-export function buildRelativeLeanPath(theoremLabel) {
-  if (!isValidLeanIdentifier(theoremLabel)) {
-    throw new Error("Theorem label must be a valid Lean identifier.");
-  }
-  return path.join(GENERATED_DIR, `${theoremLabel}.lean`);
-}
+export const GENERATOR_VERSION = "lea-overleaf-v2";
+export const LEA_PROJECTS_DIR = path.join("workspace", "projects");
+export const LEA_PROOFS_DIR = path.join("workspace", "proofs");
 
 export function slugProjectId(overleafProjectId) {
-  const slug = String(overleafProjectId || "unknown").replace(/[^A-Za-z0-9_-]/g, "_");
-  return slug || "unknown";
-}
-
-export function buildProjectRelativeLeanPath({ overleafProjectId, theoremLabel }) {
-  if (!isValidLeanIdentifier(theoremLabel)) {
-    throw new Error("Theorem label must be a valid Lean identifier.");
+  const raw = String(overleafProjectId || "").trim();
+  let slug = raw.replace(/[^A-Za-z0-9_-]/g, "_");
+  if (!slug) {
+    slug = "unknown";
   }
-  return path.join(OVERLEAF_DIR, slugProjectId(overleafProjectId), `${theoremLabel}.lean`);
-}
-
-export function buildLeanStub({ theoremLabel, theoremText }) {
-  if (!isValidLeanIdentifier(theoremLabel)) {
-    throw new Error("Theorem label must be a valid Lean identifier.");
+  if (!/^[A-Za-z0-9]/.test(slug)) {
+    slug = `project_${slug}`;
   }
-
-  return `/-!
-Generated from Overleaf.
-
-Label: ${theoremLabel}
-
-Original theorem:
-
-${String(theoremText).trim()}
--/
-
-theorem ${theoremLabel} : True := by
-  sorry
-`;
+  return slug.slice(0, 80);
 }
 
-export function buildCacheKey({ workspacePath, theoremLabel, theoremText }) {
-  return [
-    path.resolve(workspacePath),
-    theoremLabel,
-    hashTheoremText(theoremText),
-    GENERATOR_VERSION
-  ].join("|");
+export function buildLeaWorkspacePath(leaRepoPath) {
+  return path.join(path.resolve(leaRepoPath), "workspace");
 }
 
-export function buildGeneratedMetadata({ theoremLabel, theoremText }) {
-  return {
-    theoremLabel,
-    declarationName: theoremLabel,
-    normalizedTheorem: normalizeTheoremText(theoremText),
-    theoremHash: hashTheoremText(theoremText),
-    generatorVersion: GENERATOR_VERSION
-  };
+export function buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId }) {
+  return path.join(
+    buildLeaWorkspacePath(leaRepoPath),
+    "projects",
+    `${slugProjectId(overleafProjectId)}.md`
+  );
+}
+
+export function buildLeaProofPath({ leaRepoPath, proofPath }) {
+  const repoRoot = path.resolve(leaRepoPath);
+  const absolutePath = path.isAbsolute(proofPath)
+    ? path.resolve(proofPath)
+    : path.resolve(repoRoot, proofPath);
+  if (absolutePath !== repoRoot && !absolutePath.startsWith(`${repoRoot}${path.sep}`)) {
+    return null;
+  }
+  return absolutePath;
+}
+
+export function relativeToLeaRepo({ leaRepoPath, absolutePath }) {
+  return path.relative(path.resolve(leaRepoPath), path.resolve(absolutePath));
 }

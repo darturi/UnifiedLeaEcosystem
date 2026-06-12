@@ -5,14 +5,19 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
-  buildCacheKey,
-  buildGeneratedMetadata,
-  buildLeanStub,
-  buildProjectRelativeLeanPath,
-  buildRelativeLeanPath,
-  GENERATOR_VERSION
+  buildLeaProjectMarkdownPath,
+  buildLeaProofPath,
+  buildLeaWorkspacePath,
+  GENERATOR_VERSION,
+  LEA_PROOFS_DIR,
+  relativeToLeaRepo,
+  slugProjectId
 } from "../shared/leanStub.mjs";
-import { hashTheoremText, isValidLeanIdentifier } from "../shared/theoremParser.mjs";
+import {
+  hashTheoremText,
+  inferLeanDeclarationName,
+  isValidLeanIdentifier
+} from "../shared/theoremParser.mjs";
 import { applyEnvDefaults, loadDotEnv } from "./config.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -20,45 +25,29 @@ const DEFAULT_PORT = 31245;
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
-const CACHE_PATH = path.join(APP_DIR, "cache.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
-const BACKUP_DIR = path.join(APP_DIR, "backups");
-const DEFAULT_LEAN_TOOLCHAIN = "leanprover/lean4:v4.30.0";
 const DEFAULT_LEA_PROVIDER = "openai";
 const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
-const DEFAULT_LAKEFILE = `import Lake
-open Lake DSL
-
-package «overleaf_lean_stub_workspace» where
-
-require mathlib from git
-  "https://github.com/leanprover-community/mathlib4.git" @ "v4.30.0"
-
-lean_lib Formalization where
-`;
 
 export async function createServer({
   settingsPath = SETTINGS_PATH,
-  cachePath = CACHE_PATH,
   jobsPath = JOBS_PATH,
   fetchImpl = fetch,
   env = process.env
 } = {}) {
   const state = {
     settingsPath,
-    cachePath,
     jobsPath,
     fetchImpl,
     env,
     settings: applyEnvDefaults(await readJson(settingsPath, {}), env),
-    cache: await readJson(cachePath, {}),
     jobs: await readJson(jobsPath, {})
   };
-  await ensureStartupWorkspace(state);
+  await ensureStartupLeaRuntime(state);
   await recoverInterruptedJobs(state);
 
   return http.createServer(async (request, response) => {
@@ -95,99 +84,10 @@ export async function recoverInterruptedJobs(state) {
   }
 }
 
-export async function handleCreateStub(payload, state) {
-  const workspacePath = state.settings.workspacePath;
-  if (!workspacePath) {
-    return errorResponse(400, "workspace_unset", "Configure a Lean workspace before creating stubs.");
-  }
-
-  const workspaceValidation = await validateWorkspace(workspacePath);
-  if (!workspaceValidation.ok) {
-    return errorResponse(400, "invalid_workspace", workspaceValidation.message);
-  }
-
-  const theoremLabel = String(payload.theoremLabel || "");
-  const theoremText = String(payload.theoremText || "");
-  if (!isValidLeanIdentifier(theoremLabel)) {
-    return errorResponse(400, "invalid_label", "Theorem label must be a valid Lean identifier.");
-  }
-  if (!theoremText.trim()) {
-    return errorResponse(400, "missing_theorem_text", "Theorem text is required.");
-  }
-
-  const expectedHash = hashTheoremText(theoremText);
-  if (payload.sourceHash && payload.sourceHash !== expectedHash) {
-    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
-  }
-
-  const relativePath = buildRelativeLeanPath(theoremLabel);
-  const absolutePath = path.join(path.resolve(workspacePath), relativePath);
-  const cacheKey = buildCacheKey({ workspacePath, theoremLabel, theoremText });
-
-  if (existsSync(absolutePath)) {
-    const currentStatus = await getTheoremStatus({
-      workspacePath,
-      theoremLabel,
-      theoremText,
-      cache: state.cache
-    });
-
-    const existingMetadata = await readExistingGeneratedMetadata(absolutePath);
-    if (existingMetadata && existingMetadata.theoremHash !== expectedHash) {
-      return errorResponse(
-        409,
-        "stub_conflict",
-        `A generated stub already exists for ${theoremLabel} with different theorem text.`
-      );
-    }
-
-    return {
-      statusCode: 200,
-      body: {
-        ...currentStatus,
-        action: "checked"
-      }
-    };
-  }
-
-  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-  await fs.writeFile(absolutePath, buildLeanStub({ theoremLabel, theoremText }), "utf8");
-
-  const leanCheck = await runOptionalLeanCheck(workspacePath, relativePath);
-  const metadata = buildGeneratedMetadata({ theoremLabel, theoremText });
-  state.cache[cacheKey] = {
-    ...metadata,
-    overleafProjectId: payload.overleafProjectId || null,
-    relativePath,
-    absolutePath,
-    leanCheck,
-    createdAt: new Date().toISOString()
-  };
-  await writeJson(state.cachePath, state.cache);
-
-  return {
-    statusCode: 200,
-    body: {
-      status: "sorry_stub",
-      action: "created",
-      theoremLabel,
-      declarationName: theoremLabel,
-      relativePath,
-      absolutePath,
-      leanCheck
-    }
-  };
-}
-
 export async function handleGetStatuses(payload, state) {
-  const workspacePath = state.settings.workspacePath;
-  if (!workspacePath) {
-    return errorResponse(400, "workspace_unset", "Configure a Lean workspace before checking statuses.");
-  }
-
-  const workspaceValidation = await validateWorkspace(workspacePath);
-  if (!workspaceValidation.ok) {
-    return errorResponse(400, "invalid_workspace", workspaceValidation.message);
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: false });
+  if (!leaValidation.ok) {
+    return errorResponse(400, leaValidation.error, leaValidation.message);
   }
 
   const theorems = Array.isArray(payload.theorems) ? payload.theorems : [];
@@ -201,11 +101,9 @@ export async function handleGetStatuses(payload, state) {
     }
 
     statuses[theoremLabel] = await getTheoremStatus({
-      workspacePath,
+      leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId: payload.overleafProjectId || "unknown",
       theoremLabel,
-      theoremText,
-      cache: state.cache,
       jobs: state.jobs || {}
     });
   }
@@ -214,17 +112,7 @@ export async function handleGetStatuses(payload, state) {
 }
 
 export async function handleFormalize(payload, state) {
-  const workspacePath = state.settings.workspacePath;
-  if (!workspacePath) {
-    return errorResponse(400, "workspace_unset", "Configure a Lean workspace before formalizing.");
-  }
-
-  const workspaceValidation = await validateWorkspace(workspacePath);
-  if (!workspaceValidation.ok) {
-    return errorResponse(400, "invalid_workspace", workspaceValidation.message);
-  }
-
-  const validation = validateFormalizationPayload(payload);
+  const validation = validateLeaPayload(payload);
   if (!validation.ok) {
     return errorResponse(400, validation.error, validation.message);
   }
@@ -235,7 +123,16 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
   }
 
-  const target = buildFormalizationTarget({ workspacePath, overleafProjectId, theoremLabel });
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) {
+    return errorResponse(400, leaValidation.error, leaValidation.message);
+  }
+
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    theoremLabel
+  });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
     return {
@@ -244,13 +141,14 @@ export async function handleFormalize(payload, state) {
     };
   }
 
-  const leaValidation = validateLeaRuntime(state);
-  if (!leaValidation.ok) {
-    return errorResponse(400, leaValidation.error, leaValidation.message);
-  }
-
-  await fs.mkdir(path.dirname(target.absolutePath), { recursive: true });
-  const job = await createFormalizationJob({ state, target, theoremText });
+  const cleanup = await cleanupPreviousRunArtifacts({
+    leaRepoPath: state.settings.leaRepoPath,
+    target,
+    theoremText,
+    jobs: state.jobs || {}
+  });
+  const job = await createLeaJob({ state, target, theoremText });
+  job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
@@ -268,62 +166,33 @@ export async function handleFormalize(payload, state) {
   };
 }
 
-export async function validateWorkspace(workspacePath) {
-  if (!workspacePath || !path.isAbsolute(workspacePath)) {
-    return { ok: false, message: "Workspace path must be absolute." };
+export async function validateLeaRepo(leaRepoPath) {
+  if (!leaRepoPath || !path.isAbsolute(leaRepoPath)) {
+    return { ok: false, message: "Lea repo path must be absolute." };
   }
-
-  const toolchain = path.join(workspacePath, "lean-toolchain");
-  const lakefileLean = path.join(workspacePath, "lakefile.lean");
-  const lakefileToml = path.join(workspacePath, "lakefile.toml");
-
-  if (!existsSync(toolchain)) {
-    return { ok: false, message: "Workspace must contain lean-toolchain." };
+  if (!existsSync(path.join(leaRepoPath, "pyproject.toml"))) {
+    return { ok: false, message: "Lea repo path must contain pyproject.toml." };
   }
-  if (!existsSync(lakefileLean) && !existsSync(lakefileToml)) {
-    return { ok: false, message: "Workspace must contain lakefile.lean or lakefile.toml." };
+  const leaWorkspacePath = buildLeaWorkspacePath(leaRepoPath);
+  if (!existsSync(path.join(leaWorkspacePath, "lean-toolchain"))) {
+    return { ok: false, message: "Lea workspace must contain lean-toolchain." };
   }
-
-  return { ok: true };
+  if (!existsSync(path.join(leaWorkspacePath, "lakefile.lean")) && !existsSync(path.join(leaWorkspacePath, "lakefile.toml"))) {
+    return { ok: false, message: "Lea workspace must contain lakefile.lean or lakefile.toml." };
+  }
+  return { ok: true, leaWorkspacePath };
 }
 
-export async function ensureStartupWorkspace(state, workspacePath = PROJECT_ROOT) {
-  const defaultWorkspace = path.resolve(workspacePath);
-  const currentValidation = state.settings.workspacePath
-    ? await validateWorkspace(state.settings.workspacePath)
-    : { ok: false };
-
-  if (currentValidation.ok) {
-    return { workspacePath: path.resolve(state.settings.workspacePath), created: false, reusedExistingSetting: true };
-  }
-
-  const defaultValidation = await validateWorkspace(defaultWorkspace);
-  if (!defaultValidation.ok) {
-    await setupMinimalLeanWorkspace(defaultWorkspace);
-  }
-
-  state.settings.workspacePath = defaultWorkspace;
+export async function ensureStartupLeaRuntime(state) {
+  const validation = await validateLeaRepo(state.settings.leaRepoPath);
+  state.settings.leaWorkspacePath = validation.ok ? validation.leaWorkspacePath : buildLeaWorkspacePath(state.settings.leaRepoPath);
   await writeJson(state.settingsPath, state.settings);
-
   return {
-    workspacePath: defaultWorkspace,
-    created: !defaultValidation.ok,
-    reusedExistingSetting: false
+    leaRepoPath: state.settings.leaRepoPath,
+    leaWorkspacePath: state.settings.leaWorkspacePath,
+    ok: validation.ok,
+    message: validation.message || ""
   };
-}
-
-export async function setupMinimalLeanWorkspace(workspacePath) {
-  await fs.mkdir(path.join(workspacePath, "Formalization"), { recursive: true });
-
-  const toolchainPath = path.join(workspacePath, "lean-toolchain");
-  const lakefilePath = path.join(workspacePath, "lakefile.lean");
-
-  if (!existsSync(toolchainPath)) {
-    await fs.writeFile(toolchainPath, `${DEFAULT_LEAN_TOOLCHAIN}\n`, "utf8");
-  }
-  if (!existsSync(lakefilePath) && !existsSync(path.join(workspacePath, "lakefile.toml"))) {
-    await fs.writeFile(lakefilePath, DEFAULT_LAKEFILE, "utf8");
-  }
 }
 
 async function routeRequest(request, response, state) {
@@ -338,57 +207,32 @@ async function routeRequest(request, response, state) {
   const url = new URL(request.url || "/", "http://127.0.0.1");
 
   if (request.method === "GET" && url.pathname === "/health") {
+    const validation = await validateLeaRepo(state.settings.leaRepoPath);
     sendJson(response, 200, {
       ok: true,
       generatorVersion: GENERATOR_VERSION,
-      workspaceConfigured: Boolean(state.settings.workspacePath)
+      leaRepoConfigured: validation.ok,
+      leaWorkspacePath: validation.ok ? validation.leaWorkspacePath : state.settings.leaWorkspacePath || ""
     });
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/settings") {
-    sendJson(response, 200, {
-      ok: true,
-      workspacePath: state.settings.workspacePath || "",
-      leaRepoPath: state.settings.leaRepoPath || "",
-      leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
-      leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
-      leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
-      leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
-      leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
-      leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
-    });
-    return;
-  }
-
-  if (request.method === "POST" && url.pathname === "/settings/workspace") {
-    const payload = await readBodyJson(request);
-    const workspacePath = String(payload.workspacePath || "");
-    const validation = await validateWorkspace(workspacePath);
-    if (!validation.ok) {
-      sendJson(response, 400, { error: "invalid_workspace", message: validation.message });
-      return;
-    }
-
-    state.settings.workspacePath = path.resolve(workspacePath);
-    await writeJson(state.settingsPath, state.settings);
-    sendJson(response, 200, { ok: true, workspacePath: state.settings.workspacePath });
+    sendJson(response, 200, buildSettingsResponse(state));
     return;
   }
 
   if (request.method === "POST" && url.pathname === "/settings/lea") {
     const payload = await readBodyJson(request);
     const leaRepoPath = String(payload.leaRepoPath || "").trim();
-    if (!leaRepoPath || !path.isAbsolute(leaRepoPath)) {
-      sendJson(response, 400, { error: "invalid_lea_path", message: "Lea repo path must be absolute." });
-      return;
-    }
-    if (!existsSync(path.join(leaRepoPath, "pyproject.toml"))) {
-      sendJson(response, 400, { error: "invalid_lea_path", message: "Lea repo path must contain pyproject.toml." });
+    const validation = await validateLeaRepo(leaRepoPath);
+    if (!validation.ok) {
+      sendJson(response, 400, { error: "invalid_lea_path", message: validation.message });
       return;
     }
 
     state.settings.leaRepoPath = path.resolve(leaRepoPath);
+    state.settings.leaWorkspacePath = validation.leaWorkspacePath;
     state.settings.leaApiBaseUrl = normalizeLeaApiBaseUrl(
       payload.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
     );
@@ -401,22 +245,7 @@ async function routeRequest(request, response, state) {
       10
     );
     await writeJson(state.settingsPath, state.settings);
-    sendJson(response, 200, {
-      ok: true,
-      leaRepoPath: state.settings.leaRepoPath,
-      leaApiBaseUrl: state.settings.leaApiBaseUrl,
-      leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
-      leaProvider: state.settings.leaProvider,
-      leaModel: state.settings.leaModel,
-      leaMaxTurns: state.settings.leaMaxTurns,
-      leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds
-    });
-    return;
-  }
-
-  if (request.method === "POST" && url.pathname === "/stubs") {
-    const result = await handleCreateStub(await readBodyJson(request), state);
-    sendJson(response, result.statusCode, result.body);
+    sendJson(response, 200, buildSettingsResponse(state));
     return;
   }
 
@@ -449,19 +278,22 @@ async function routeRequest(request, response, state) {
   sendJson(response, 404, { error: "not_found", message: "Unknown endpoint." });
 }
 
-async function readExistingGeneratedMetadata(absolutePath) {
-  if (!existsSync(absolutePath)) return null;
-  const content = await fs.readFile(absolutePath, "utf8");
-  const labelMatch = content.match(/^Label:\s*(.+)$/m);
-  const theoremMatch = content.match(/Original theorem:\n\n([\s\S]*?)\n-\/\n/);
-  if (!labelMatch || !theoremMatch) return null;
-  return buildGeneratedMetadata({
-    theoremLabel: labelMatch[1].trim(),
-    theoremText: theoremMatch[1].trim()
-  });
+function buildSettingsResponse(state) {
+  const leaRepoPath = state.settings.leaRepoPath || "";
+  return {
+    ok: true,
+    leaRepoPath,
+    leaWorkspacePath: leaRepoPath ? buildLeaWorkspacePath(leaRepoPath) : "",
+    leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
+    leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
+    leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
+    leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
+  };
 }
 
-function validateFormalizationPayload(payload) {
+function validateLeaPayload(payload) {
   const overleafProjectId = String(payload.overleafProjectId || "");
   const theoremLabel = String(payload.theoremLabel || "");
   const theoremText = String(payload.theoremText || "");
@@ -477,16 +309,19 @@ function validateFormalizationPayload(payload) {
   return { ok: true, overleafProjectId, theoremLabel, theoremText };
 }
 
-function buildFormalizationTarget({ workspacePath, overleafProjectId, theoremLabel }) {
-  const relativePath = buildProjectRelativeLeanPath({ overleafProjectId, theoremLabel });
-  const absolutePath = path.join(path.resolve(workspacePath), relativePath);
+function buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel }) {
+  const projectSlug = slugProjectId(overleafProjectId);
+  const projectMarkdownPath = buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId });
   return {
     overleafProjectId,
+    projectId: overleafProjectId,
+    projectSlug,
     theoremLabel,
     declarationName: theoremLabel,
-    relativePath,
-    absolutePath,
-    jobKey: `${overleafProjectId}:${theoremLabel}`
+    projectMarkdownPath,
+    relativePath: relativeToLeaRepo({ leaRepoPath, absolutePath: projectMarkdownPath }),
+    absolutePath: projectMarkdownPath,
+    jobKey: `${projectSlug}:${theoremLabel}`
   };
 }
 
@@ -500,14 +335,24 @@ function findLatestJob(jobs, jobKey, status) {
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
 }
 
-function validateLeaRuntime(state) {
+function findLatestFinishedJob(jobs, jobKey) {
+  return Object.values(jobs || {})
+    .filter((job) => job.jobKey === jobKey && job.status !== "in_progress")
+    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
+}
+
+function validateLeaRuntime(state, { requireApiKey }) {
   if (!state.settings.leaRepoPath || !path.isAbsolute(state.settings.leaRepoPath)) {
     return { ok: false, error: "lea_unconfigured", message: "Configure an absolute Lea repo path first." };
   }
   if (!existsSync(path.join(state.settings.leaRepoPath, "pyproject.toml"))) {
     return { ok: false, error: "invalid_lea_path", message: "Lea repo path must contain pyproject.toml." };
   }
-  if (!state.env?.OPENAI_API_KEY) {
+  const leaWorkspacePath = buildLeaWorkspacePath(state.settings.leaRepoPath);
+  if (!existsSync(path.join(leaWorkspacePath, "lakefile.lean")) && !existsSync(path.join(leaWorkspacePath, "lakefile.toml"))) {
+    return { ok: false, error: "invalid_lea_workspace", message: "Lea workspace must contain a lakefile." };
+  }
+  if (requireApiKey && !state.env?.OPENAI_API_KEY) {
     return { ok: false, error: "missing_openai_key", message: "OPENAI_API_KEY must be set before running Lea." };
   }
   try {
@@ -518,18 +363,12 @@ function validateLeaRuntime(state) {
   return { ok: true };
 }
 
-async function createFormalizationJob({ state, target, theoremText }) {
+async function createLeaJob({ state, target, theoremText }) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jobId = `${target.theoremLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
-  const backupPath = existsSync(target.absolutePath)
-    ? path.join(BACKUP_DIR, jobId, `${target.theoremLabel}.lean`)
-    : null;
+  const declarationNameHint = inferLeanDeclarationName(theoremText);
 
-  if (backupPath) {
-    await fs.mkdir(path.dirname(backupPath), { recursive: true });
-    await fs.copyFile(target.absolutePath, backupPath);
-  }
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
 
@@ -538,15 +377,20 @@ async function createFormalizationJob({ state, target, theoremText }) {
     jobKey: target.jobKey,
     status: "in_progress",
     overleafProjectId: target.overleafProjectId,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath,
     theoremLabel: target.theoremLabel,
+    declarationName: target.theoremLabel,
+    declarationNameHint: declarationNameHint || null,
     theoremTextHash: hashTheoremText(theoremText),
     relativePath: target.relativePath,
     absolutePath: target.absolutePath,
-    backupPath,
     logPath,
     startedAt: new Date().toISOString(),
     finishedAt: null,
     leaRepoPath: state.settings.leaRepoPath,
+    leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
     leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
@@ -556,16 +400,94 @@ async function createFormalizationJob({ state, target, theoremText }) {
   };
 }
 
+async function cleanupPreviousRunArtifacts({ leaRepoPath, target, theoremText, jobs }) {
+  const previousJob = findLatestFinishedJob(jobs, target.jobKey);
+  if (!previousJob) {
+    return { removedProofPaths: [], removedProjectEntries: [] };
+  }
+
+  const declarationHint = inferLeanDeclarationName(theoremText);
+  const candidateNames = new Set([
+    previousJob.declarationName,
+    previousJob.declarationNameHint,
+    declarationHint,
+    target.theoremLabel
+  ].filter(Boolean));
+  const candidateProofPaths = new Set([
+    previousJob.recordedProofPath
+  ].filter(Boolean));
+
+  const entries = await readProjectTheoremEntries(target.projectMarkdownPath);
+  const entriesToRemove = entries.filter((entry) => (
+    candidateNames.has(entry.name) || candidateProofPaths.has(entry.proofPath)
+  ));
+  for (const entry of entriesToRemove) {
+    candidateProofPaths.add(entry.proofPath);
+  }
+
+  const removedProofPaths = [];
+  for (const proofPath of candidateProofPaths) {
+    if (await removeLeaProofFile({ leaRepoPath, proofPath })) {
+      removedProofPaths.push(proofPath);
+    }
+  }
+
+  const removedProjectEntries = await removeProjectTheoremEntries({
+    projectMarkdownPath: target.projectMarkdownPath,
+    entriesToRemove
+  });
+
+  return { removedProofPaths, removedProjectEntries };
+}
+
+async function removeLeaProofFile({ leaRepoPath, proofPath }) {
+  if (!String(proofPath || "").startsWith(`${LEA_PROOFS_DIR}${path.sep}`)) {
+    return false;
+  }
+  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
+  if (!absolutePath || !existsSync(absolutePath)) {
+    return false;
+  }
+
+  try {
+    await fs.rm(absolutePath, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemove }) {
+  if (entriesToRemove.length === 0 || !existsSync(projectMarkdownPath)) {
+    return [];
+  }
+
+  const markdown = await fs.readFile(projectMarkdownPath, "utf8");
+  const keysToRemove = new Set(entriesToRemove.map(markerKey));
+  const sections = findProjectTheoremSections(markdown)
+    .filter((section) => keysToRemove.has(markerKey(section.entry)));
+  if (sections.length === 0) {
+    return [];
+  }
+
+  let nextMarkdown = markdown;
+  for (const section of [...sections].sort((a, b) => b.start - a.start)) {
+    nextMarkdown = `${nextMarkdown.slice(0, section.start)}${nextMarkdown.slice(section.end)}`;
+  }
+  await fs.writeFile(projectMarkdownPath, nextMarkdown.replace(/\n{3,}/g, "\n\n"), "utf8");
+  return sections.map((section) => section.entry.name);
+}
+
 async function runLeaJob({ state, job, target, theoremText }) {
+  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
-    workspacePath: state.settings.workspacePath,
-    relativePath: target.relativePath,
-    absolutePath: target.absolutePath,
+    projectSlug: target.projectSlug,
     theoremLabel: target.theoremLabel,
-    theoremText
+    theoremText,
+    declarationNameHint: job.declarationNameHint || ""
   });
   await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs\n\n${prompt}\n\n`);
-  const exit = await runLeaApiFormalization({
+  const exit = await runLeaApiProofJob({
     fetchImpl: state.fetchImpl || fetch,
     baseUrl: job.leaApiBaseUrl,
     apiKey: state.settings.leaApiKey,
@@ -573,52 +495,99 @@ async function runLeaJob({ state, job, target, theoremText }) {
     maxTurns: job.leaMaxTurns,
     openAiApiKey: state.env?.OPENAI_API_KEY,
     prompt,
+    project: {
+      project_id: target.projectSlug,
+      project_path: target.relativePath,
+      record_on_success: true
+    },
     logPath: job.logPath,
     timeoutMs: job.leaJobTimeoutSeconds * 1000
   });
 
-  const status = await getTheoremStatus({
-    workspacePath: state.settings.workspacePath,
-    overleafProjectId: target.overleafProjectId,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    cache: state.cache,
-    jobs: {}
-  });
-  const nextJobStatus = exit.ok && status.status === "formalized" ? "formalized" : "failed";
+  const artifact = exit.ok
+    ? await identifyLeaArtifact({
+      leaRepoPath: state.settings.leaRepoPath,
+      target,
+      beforeMarkers,
+      job
+    })
+    : null;
+
+  if (artifact?.ok) {
+    job.declarationName = artifact.entry.name;
+    job.recordedProofPath = artifact.entry.proofPath;
+    job.moduleName = artifact.entry.moduleName || null;
+  }
+
+  const status = artifact?.ok
+    ? await getLeaProofStatusFromEntry({
+      leaRepoPath: state.settings.leaRepoPath,
+      target,
+      entry: artifact.entry
+    })
+    : artifact?.error
+      ? {
+        status: "unformalized",
+        theoremLabel: target.theoremLabel,
+        declarationName: target.declarationName,
+        relativePath: target.relativePath,
+        absolutePath: target.absolutePath,
+        projectId: target.projectId,
+        projectSlug: target.projectSlug,
+        projectMarkdownPath: target.projectMarkdownPath
+      }
+      : await getTheoremStatus({
+        leaRepoPath: state.settings.leaRepoPath,
+        overleafProjectId: target.overleafProjectId,
+        theoremLabel: target.theoremLabel,
+        jobs: {}
+      });
+  let proofComplete = status.status === "formalized";
+  if (proofComplete && status.absolutePath) {
+    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, status.absolutePath);
+    proofComplete = job.leanCheck.ok;
+  }
+  const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
   job.finalStatus = status.status;
   job.apiRunId = exit.apiRunId || null;
-  job.exitCode = exit.ok ? 0 : 1;
+  job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
   job.timedOut = exit.timedOut;
-  if (exit.timedOut) {
-    job.error = `Lea timed out after ${job.leaJobTimeoutSeconds} seconds.`;
-  } else if (!exit.ok) {
-    job.error = exit.error || "Lea API run did not complete successfully.";
+  if (nextJobStatus === "failed") {
+    job.error = exit.error ||
+      artifact?.error ||
+      job.leanCheck?.message ||
+      `Lea API run completed but final status is ${status.status}.`;
   }
   job.finishedAt = new Date().toISOString();
   const exitSummary = exit.timedOut
     ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
     : `Lea API run ${exit.ok ? "completed" : "failed"}`;
   await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${status.status}\n`);
+  if (job.error) {
+    await appendLog(job.logPath, `[backend] ${job.error}\n`);
+  }
   job.status = nextJobStatus;
   await writeJson(state.jobsPath, state.jobs);
 }
 
-function buildLeaPrompt({ workspacePath, relativePath, absolutePath, theoremLabel, theoremText }) {
-  return `In the Lean workspace at ${workspacePath}, create or edit only this file:
-${absolutePath}
+function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, declarationNameHint }) {
+  const naming = declarationNameHint
+    ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
+    : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
+  const proofTarget = declarationNameHint || theoremLabel;
 
-This absolute target path is derived from the configured workspace at companion startup. Lea is running from its own repository, so do not create ${relativePath} relative to the current working directory.
-
-Create a Lean theorem named ${theoremLabel} corresponding to this Overleaf theorem:
+  return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
+${naming}
 
 ${theoremText}
 
-The final file must compile with no sorry/admit in theorem ${theoremLabel}.
-Do not create a placeholder theorem. If you cannot complete the proof, leave the best partial Lean file in ${absolutePath}.`;
+The final file must compile with no sorry/admit in theorem ${proofTarget}.
+Use the Lea project context to choose the project namespace and proof path.
+Do not edit the project markdown during proof search; Lea will record the final result after the proof succeeds.
+Do not create placeholder files outside Lea's workspace. If you cannot complete the proof, leave the best partial Lean file in the Lea project proof directory.`;
 }
 
-async function runLeaApiFormalization({
+async function runLeaApiProofJob({
   fetchImpl,
   baseUrl,
   apiKey,
@@ -626,6 +595,7 @@ async function runLeaApiFormalization({
   maxTurns,
   openAiApiKey,
   prompt,
+  project,
   logPath,
   timeoutMs
 }) {
@@ -647,7 +617,8 @@ async function runLeaApiFormalization({
         permission_tier: "none",
         theorem_translation_max_retries: 3
       }
-    }
+    },
+    project
   };
 
   const startResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs`, {
@@ -677,11 +648,15 @@ async function runLeaApiFormalization({
 
     const run = statusResponse.body || {};
     const status = String(run.status || run.state || "").toLowerCase();
-    const message = run.final_text || run.error || run.message || "";
+    const message = extractRunMessage(run);
     if (message) {
       await appendLog(logPath, `[lea-api] ${message}\n`);
     }
     if (["completed", "succeeded", "success", "done"].includes(status)) {
+      const reason = String(run.result?.reason || "").toLowerCase();
+      if (reason && !["success", "succeeded", "done", "completed"].includes(reason)) {
+        return { ok: false, timedOut: false, apiRunId, error: message || `Lea API completed with reason: ${reason}` };
+      }
       return { ok: true, timedOut: false, apiRunId };
     }
     if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
@@ -689,7 +664,11 @@ async function runLeaApiFormalization({
     }
   }
 
-  return { ok: false, timedOut: true, apiRunId };
+  return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out." };
+}
+
+function extractRunMessage(run) {
+  return run.final_text || run.error || run.message || run.result?.text || "";
 }
 
 async function fetchJson(fetchImpl, url, options) {
@@ -704,6 +683,56 @@ async function fetchJson(fetchImpl, url, options) {
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+async function runLeanCheck(leaWorkspacePath, proofPath) {
+  return new Promise((resolve) => {
+    const child = spawn("lake", ["env", "lean", proofPath], {
+      cwd: leaWorkspacePath,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      resolve({
+        ok: false,
+        exitCode: null,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        message: "Lean check timed out."
+      });
+    }, 60_000);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        exitCode: null,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        message: error.message
+      });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
+      resolve({
+        ok: code === 0,
+        exitCode: code,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        message: code === 0 ? "Lean check passed." : output || `Lean exited with code ${code}.`
+      });
+    });
+  });
 }
 
 function normalizeLeaApiBaseUrl(value) {
@@ -737,120 +766,376 @@ async function readLogTail(logPath, maxChars = 4000) {
 }
 
 function buildJobResponse({ job, status, target }) {
+  const declarationName = job.declarationName || target.declarationName || target.theoremLabel;
   return {
     status,
     jobId: job.jobId,
     theoremLabel: target.theoremLabel,
-    declarationName: target.theoremLabel,
-    relativePath: target.relativePath,
-    absolutePath: target.absolutePath,
+    declarationName,
+    relativePath: job.recordedProofPath || target.relativePath,
+    absolutePath: job.recordedProofPath
+      ? buildLeaProofPath({ leaRepoPath: job.leaRepoPath, proofPath: job.recordedProofPath }) || target.absolutePath
+      : target.absolutePath,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath,
+    recordedProofPath: job.recordedProofPath || null,
+    moduleName: job.moduleName || null,
     logTail: "",
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };
 }
 
-async function getTheoremStatus({ workspacePath, overleafProjectId = "unknown", theoremLabel, theoremText, cache, jobs = {} }) {
-  const target = buildFormalizationTarget({ workspacePath, overleafProjectId, theoremLabel });
-  const failedJob = findLatestJob(jobs, target.jobKey, "failed");
+async function getTheoremStatus({
+  leaRepoPath,
+  overleafProjectId = "unknown",
+  theoremLabel,
+  jobs = {}
+}) {
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel });
+  const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
+  const directProofStatus = await getLeaDirectProofStatus({ leaRepoPath, target });
+  const mappedStatus = await getLatestMappedJobStatus({ leaRepoPath, target, jobs });
 
-  const relativePath = target.relativePath;
-  const absolutePath = target.absolutePath;
-  const cacheKey = buildCacheKey({ workspacePath, theoremLabel, theoremText });
-  const cached = cache[cacheKey];
   const activeJob = findActiveJob(jobs, target.jobKey);
+  if (activeJob) {
+    if (
+      mappedStatus?.status === "formalized" ||
+      projectStatus?.status === "formalized" ||
+      directProofStatus?.status === "formalized"
+    ) {
+      return mappedStatus?.status === "formalized"
+        ? mappedStatus
+        : projectStatus?.status === "formalized"
+          ? projectStatus
+          : directProofStatus;
+    }
+    return buildJobResponse({ job: activeJob, status: "in_progress", target });
+  }
 
-  if (!existsSync(absolutePath)) {
-    if (activeJob) {
-      return buildJobResponse({ job: activeJob, status: "in_progress", target });
-    }
-    if (failedJob) {
-      return {
-        ...buildJobResponse({ job: failedJob, status: "failed", target }),
-        logTail: await readLogTail(failedJob.logPath)
-      };
-    }
-    const legacyRelativePath = buildRelativeLeanPath(theoremLabel);
-    const legacyAbsolutePath = path.join(path.resolve(workspacePath), legacyRelativePath);
-    if (existsSync(legacyAbsolutePath)) {
-      return getLegacyTheoremStatus({
-        workspacePath,
-        theoremLabel,
-        theoremText,
-        cache
-      });
-    }
+  if (mappedStatus) {
+    return mappedStatus;
+  }
+
+  if (directProofStatus?.status === "formalized") {
+    return directProofStatus;
+  }
+
+  const failedJob = findLatestJob(jobs, target.jobKey, "failed");
+  if (failedJob) {
     return {
-      status: "unformalized",
-      theoremLabel,
-      declarationName: theoremLabel,
-      relativePath,
-      absolutePath
+      ...buildJobResponse({ job: failedJob, status: "failed", target }),
+      logTail: await readLogTail(failedJob.logPath)
     };
   }
 
-  const content = await fs.readFile(absolutePath, "utf8");
-  if (/\bsorry\b|admit\b/.test(content)) {
-    if (activeJob) {
-      return buildJobResponse({ job: activeJob, status: "in_progress", target });
-    }
-    if (failedJob) {
-      return {
-        ...buildJobResponse({ job: failedJob, status: "failed", target }),
-        logTail: await readLogTail(failedJob.logPath)
-      };
-    }
-    return {
-      status: "in_progress",
-      theoremLabel,
-      declarationName: theoremLabel,
-      relativePath,
-      absolutePath,
-      leanCheck: cached?.leanCheck || null
-    };
+  if (projectStatus) {
+    return projectStatus;
+  }
+  if (directProofStatus) {
+    return directProofStatus;
   }
 
   return {
-    status: "formalized",
+    status: "unformalized",
     theoremLabel,
     declarationName: theoremLabel,
-    relativePath,
-    absolutePath,
-    leanStatement: extractLeanStatement(content, theoremLabel)
+    relativePath: target.relativePath,
+    absolutePath: target.absolutePath,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath
   };
 }
 
-async function getLegacyTheoremStatus({ workspacePath, theoremLabel, theoremText, cache }) {
-  const relativePath = buildRelativeLeanPath(theoremLabel);
-  const absolutePath = path.join(path.resolve(workspacePath), relativePath);
-  const cacheKey = buildCacheKey({ workspacePath, theoremLabel, theoremText });
-  const cached = cache[cacheKey];
+async function getLeaProjectTheoremStatus({ leaRepoPath, target }) {
+  if (!leaRepoPath || !path.isAbsolute(leaRepoPath)) {
+    return null;
+  }
+  if (!existsSync(target.projectMarkdownPath)) {
+    return null;
+  }
+
+  const markdown = await fs.readFile(target.projectMarkdownPath, "utf8");
+  const entry = findProjectTheoremEntry(markdown, target.declarationName || target.theoremLabel);
+  if (!entry) {
+    return null;
+  }
+
+  return getLeaProofStatusFromEntry({ leaRepoPath, target, entry });
+}
+
+async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
+  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: entry.proofPath });
+  const responseBase = {
+    theoremLabel: target.theoremLabel,
+    declarationName: entry.name,
+    relativePath: entry.proofPath,
+    absolutePath: absolutePath || "",
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath,
+    recordedProofPath: entry.proofPath,
+    moduleName: entry.moduleName || null
+  };
+
+  if (!absolutePath || !existsSync(absolutePath)) {
+    return {
+      status: "unformalized",
+      ...responseBase,
+      message: "Project markdown entry exists, but the recorded proof file is missing."
+    };
+  }
 
   const content = await fs.readFile(absolutePath, "utf8");
   if (/\bsorry\b|admit\b/.test(content)) {
-    const existingMetadata = await readExistingGeneratedMetadata(absolutePath);
-    const status = existingMetadata && existingMetadata.theoremHash === hashTheoremText(theoremText)
-      ? "sorry_stub"
-      : "in_progress";
-
     return {
-      status,
-      theoremLabel,
-      declarationName: theoremLabel,
-      relativePath,
-      absolutePath,
-      leanCheck: cached?.leanCheck || null
+      status: "in_progress",
+      ...responseBase
     };
   }
 
   return {
     status: "formalized",
-    theoremLabel,
-    declarationName: theoremLabel,
-    relativePath,
-    absolutePath,
-    leanStatement: extractLeanStatement(content, theoremLabel)
+    ...responseBase,
+    leanStatement: extractLeanStatement(content, entry.name)
   };
+}
+
+async function getLeaDirectProofStatus({ leaRepoPath, target }) {
+  const declarationName = target.declarationName || target.theoremLabel;
+  const proofPath = path.join("workspace", "proofs", `${declarationName}.lean`);
+  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
+  if (!absolutePath || !existsSync(absolutePath)) {
+    return null;
+  }
+
+  const content = await fs.readFile(absolutePath, "utf8");
+  if (!containsDeclaration(content, declarationName)) {
+    return null;
+  }
+
+  const responseBase = {
+    theoremLabel: target.theoremLabel,
+    declarationName,
+    relativePath: proofPath,
+    absolutePath,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath,
+    recordedProofPath: proofPath,
+    moduleName: null
+  };
+
+  if (/\bsorry\b|admit\b/.test(content)) {
+    return {
+      status: "in_progress",
+      ...responseBase
+    };
+  }
+
+  return {
+    status: "formalized",
+    ...responseBase,
+    leanStatement: extractLeanStatement(content, declarationName)
+  };
+}
+
+async function getLatestMappedJobStatus({ leaRepoPath, target, jobs }) {
+  const mappedJob = Object.values(jobs || {})
+    .filter((job) => (
+      job.jobKey === target.jobKey &&
+      job.status === "formalized" &&
+      job.declarationName &&
+      job.recordedProofPath
+    ))
+    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+
+  if (!mappedJob) {
+    return null;
+  }
+
+  return getLeaProofStatusFromEntry({
+    leaRepoPath,
+    target,
+    entry: {
+      name: mappedJob.declarationName,
+      proofPath: mappedJob.recordedProofPath,
+      moduleName: mappedJob.moduleName || null
+    }
+  });
+}
+
+function findProjectTheoremEntry(markdown, theoremLabel) {
+  for (const entry of parseProjectTheoremEntries(markdown)) {
+    if (entry.name !== theoremLabel) {
+      continue;
+    }
+    return entry;
+  }
+  return null;
+}
+
+async function identifyLeaArtifact({ leaRepoPath, target, beforeMarkers, job }) {
+  const afterMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
+  if (afterMarkers.length === 0) {
+    return null;
+  }
+
+  const beforeKeys = new Set(beforeMarkers.map(markerKey));
+  const newMarkers = afterMarkers.filter((entry) => !beforeKeys.has(markerKey(entry)));
+  const newResult = selectLeaArtifactCandidate({
+    candidates: newMarkers,
+    job,
+    ambiguousMessage: "Lea recorded multiple new theorem entries; could not uniquely identify Lea output."
+  });
+  if (newResult) {
+    return newResult;
+  }
+
+  const changedMarkers = [];
+  const beforeByName = new Map(beforeMarkers.map((entry) => [entry.name, entry]));
+  for (const entry of afterMarkers) {
+    const before = beforeByName.get(entry.name);
+    if (!before || markerKey(before) === markerKey(entry)) {
+      continue;
+    }
+    if (await proofFileTouchedAfter({ leaRepoPath, proofPath: entry.proofPath, isoTime: job.startedAt })) {
+      changedMarkers.push(entry);
+    }
+  }
+
+  return selectLeaArtifactCandidate({
+    candidates: changedMarkers,
+    job,
+    ambiguousMessage: "Lea changed multiple theorem entries; could not uniquely identify Lea output."
+  });
+}
+
+function selectLeaArtifactCandidate({ candidates, job, ambiguousMessage }) {
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (candidates.length === 1) {
+    return { ok: true, entry: candidates[0] };
+  }
+
+  if (job.declarationNameHint) {
+    const hinted = candidates.filter((entry) => entry.name === job.declarationNameHint);
+    if (hinted.length === 1) {
+      return { ok: true, entry: hinted[0] };
+    }
+  }
+
+  return {
+    ok: false,
+    error: `${ambiguousMessage} Candidates: ${candidates.map((entry) => entry.name).join(", ")}.`
+  };
+}
+
+async function readProjectTheoremEntries(projectMarkdownPath) {
+  try {
+    return parseProjectTheoremEntries(await fs.readFile(projectMarkdownPath, "utf8"));
+  } catch (error) {
+    if (error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+}
+
+function parseProjectTheoremEntries(markdown) {
+  const entries = [];
+  const markerPattern = /<!--\s*lea:theorem\s+([^>]*?)-->/g;
+  for (const match of String(markdown || "").matchAll(markerPattern)) {
+    const attrs = parseMarkerAttrs(match[1]);
+    if (!attrs.name || !attrs.proof) {
+      continue;
+    }
+    entries.push({
+      name: attrs.name,
+      proofPath: attrs.proof,
+      moduleName: attrs.module || null
+    });
+  }
+  return entries;
+}
+
+function findProjectTheoremSections(markdown) {
+  const text = String(markdown || "");
+  const sections = [];
+  const markerPattern = /<!--\s*lea:theorem\s+([^>]*?)-->/g;
+  for (const match of text.matchAll(markerPattern)) {
+    const attrs = parseMarkerAttrs(match[1]);
+    if (!attrs.name || !attrs.proof) {
+      continue;
+    }
+
+    const markerStart = match.index || 0;
+    const headingStart = findSectionHeadingStart(text, markerStart);
+    const nextHeading = text.slice(markerStart).search(/\n## Theorem:/);
+    sections.push({
+      start: headingStart,
+      end: nextHeading === -1 ? text.length : markerStart + nextHeading,
+      entry: {
+        name: attrs.name,
+        proofPath: attrs.proof,
+        moduleName: attrs.module || null
+      }
+    });
+  }
+  return sections;
+}
+
+function findSectionHeadingStart(markdown, markerStart) {
+  const beforeMarker = markdown.slice(0, markerStart);
+  const headingIndex = beforeMarker.lastIndexOf("\n## Theorem:");
+  if (headingIndex !== -1) {
+    return headingIndex;
+  }
+  return beforeMarker.startsWith("## Theorem:") ? 0 : markerStart;
+}
+
+function markerKey(entry) {
+  return `${entry.name}\u0000${entry.proofPath}\u0000${entry.moduleName || ""}`;
+}
+
+async function proofFileTouchedAfter({ leaRepoPath, proofPath, isoTime }) {
+  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
+  if (!absolutePath) {
+    return false;
+  }
+  try {
+    const stat = await fs.stat(absolutePath);
+    return stat.mtimeMs >= Date.parse(isoTime);
+  } catch {
+    return false;
+  }
+}
+
+function parseMarkerAttrs(text) {
+  const attrs = {};
+  for (const match of String(text || "").matchAll(/([A-Za-z_][A-Za-z0-9_-]*)="([^"]*)"/g)) {
+    attrs[match[1]] = unescapeHtmlAttribute(match[2]);
+  }
+  return attrs;
+}
+
+function unescapeHtmlAttribute(value) {
+  return String(value || "")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+function containsDeclaration(content, theoremLabel) {
+  const declarationPattern = new RegExp(
+    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma)\\s+${escapeRegExp(theoremLabel)}\\b`
+  );
+  return declarationPattern.test(content);
 }
 
 function extractLeanStatement(content, theoremLabel) {
@@ -860,56 +1145,14 @@ function extractLeanStatement(content, theoremLabel) {
   const match = content.match(declarationPattern);
   if (!match) return "";
 
-  const statement = match[0]
+  return match[0]
     .replace(/^\n/, "")
     .replace(/\s*:=\s*$/, "")
     .trim();
-  return statement;
 }
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-async function runOptionalLeanCheck(workspacePath, relativePath) {
-  if (!existsSync(path.join(workspacePath, "lakefile.lean")) && !existsSync(path.join(workspacePath, "lakefile.toml"))) {
-    return { skipped: true, ok: false, message: "No lakefile found." };
-  }
-
-  return new Promise((resolve) => {
-    const child = spawn("lake", ["env", "lean", relativePath], {
-      cwd: workspacePath,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      resolve({ skipped: false, ok: false, message: "Lean check timed out." });
-    }, 15_000);
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolve({ skipped: true, ok: false, message: error.message });
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({
-        skipped: false,
-        ok: code === 0,
-        exitCode: code,
-        stdout: stdout.trim(),
-        stderr: stderr.trim()
-      });
-    });
-  });
 }
 
 async function readBodyJson(request) {
@@ -959,8 +1202,8 @@ if (isMain) {
   }
   const server = await createServer();
   server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
-    console.log(`Overleaf Lean Stub companion listening at http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
-    console.log(`Default Lean workspace: ${PROJECT_ROOT}`);
+    console.log(`Overleaf Lea companion listening at http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
+    console.log(`Lea workspace: ${buildLeaWorkspacePath(applyEnvDefaults({}, process.env).leaRepoPath)}`);
     if (!process.env.OPENAI_API_KEY) {
       console.log("Warning: OPENAI_API_KEY is not set. Lea jobs will not start.");
     }

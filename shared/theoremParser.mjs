@@ -16,6 +16,22 @@ export function isValidLeanIdentifier(value) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+export function inferLeanDeclarationName(text) {
+  const source = String(text || "");
+  const declaration = source.match(/(?:^|\n)\s*(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_]*)(?=\s|$|[:{(])/);
+  if (declaration && isValidLeanIdentifier(declaration[1])) {
+    return declaration[1];
+  }
+
+  const named = source.match(/(?:^|\n)\s*Theorem\s+name\s*:\s*([^\n]+)/i);
+  if (named) {
+    const value = named[1].trim();
+    return isValidLeanIdentifier(value) ? value : "";
+  }
+
+  return "";
+}
+
 export function parseTheorems(source) {
   const theorems = [];
   let index = 0;

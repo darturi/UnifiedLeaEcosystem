@@ -1,18 +1,19 @@
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { setupMinimalLeanWorkspace } from "./server.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const ENV_PATH = path.join(PROJECT_ROOT, ".env");
 const LEA_REPO_URL = "https://github.com/darturi/lea-prover.git";
-const LEA_REPO_BRANCH = "thrm_permission";
+const LEA_REPO_BRANCH = "main";
 const LEA_REPO_PATH = path.join(PROJECT_ROOT, "vendor", "lea-prover");
-const MATHLIB_PACKAGE_PATH = path.join(PROJECT_ROOT, ".lake", "packages", "mathlib");
+const LEA_WORKSPACE_PATH = path.join(LEA_REPO_PATH, "workspace");
+const MATHLIB_PACKAGE_PATH = path.join(LEA_WORKSPACE_PATH, ".lake", "packages", "mathlib");
 const REFRESH_LEAN_DEPS = process.argv.includes("--refresh-lean-deps");
 const DEFAULTS = {
   OPENAI_API_KEY: "your_openai_key_here",
@@ -28,7 +29,6 @@ await main();
 async function main() {
   console.log("Overleaf Lea Formalizer setup\n");
 
-  await ensureWorkspace();
   await ensureLeaRepo();
   await syncLeaEnvironment();
   await fetchMathlib();
@@ -41,11 +41,6 @@ async function main() {
   console.log("2. Run `npm run doctor`.");
   console.log("3. Run `npm start`.");
   console.log("4. Load the extension/ folder in Chrome.");
-}
-
-async function ensureWorkspace() {
-  console.log("Ensuring Lean workspace...");
-  await setupMinimalLeanWorkspace(PROJECT_ROOT);
 }
 
 async function ensureLeaRepo() {
@@ -75,15 +70,34 @@ async function syncLeaEnvironment() {
 
 async function fetchMathlib() {
   if (REFRESH_LEAN_DEPS || !existsSync(MATHLIB_PACKAGE_PATH)) {
-    console.log("Fetching Mathlib dependencies...");
-    await run("lake", ["update"], { cwd: PROJECT_ROOT });
+    console.log("Fetching Lea workspace Mathlib dependencies...");
+    await run("lake", ["update"], { cwd: LEA_WORKSPACE_PATH });
   } else {
-    console.log("Mathlib dependencies already present; skipping `lake update`.");
+    console.log("Lea workspace Mathlib dependencies already present; skipping `lake update`.");
     console.log("Run `npm run update-lean-deps` to refresh Lean dependencies.");
   }
 
-  console.log("Fetching Mathlib compiled cache...");
-  await run("lake", ["exe", "cache", "get"], { cwd: PROJECT_ROOT });
+  console.log("Fetching Lea workspace Mathlib compiled cache...");
+  await run("lake", ["exe", "cache", "get"], { cwd: LEA_WORKSPACE_PATH });
+  await verifyMathlibCache();
+}
+
+async function verifyMathlibCache() {
+  const scratchDir = await fs.mkdtemp(path.join(os.tmpdir(), "overleaf-lea-mathlib-"));
+  const scratchFile = path.join(scratchDir, "ImportMathlib.lean");
+
+  try {
+    await fs.writeFile(scratchFile, "import Mathlib\n\n#check Nat\n", "utf8");
+    console.log("Verifying Lea workspace Mathlib compiled cache...");
+    await run("lake", ["env", "lean", scratchFile], { cwd: LEA_WORKSPACE_PATH });
+  } catch (error) {
+    throw new Error(
+      `${error.message}\nMathlib is present but the compiled cache is not usable. ` +
+      "Run `npm run update-lean-deps` and wait for `lake exe cache get` to finish."
+    );
+  } finally {
+    await fs.rm(scratchDir, { recursive: true, force: true });
+  }
 }
 
 async function writeLocalEnv() {
@@ -103,8 +117,8 @@ async function writeLocalSettings() {
   const settings = await readJson(SETTINGS_PATH, {});
   const next = {
     ...settings,
-    workspacePath: PROJECT_ROOT,
     leaRepoPath: LEA_REPO_PATH,
+    leaWorkspacePath: LEA_WORKSPACE_PATH,
     leaApiBaseUrl: settings.leaApiBaseUrl || DEFAULTS.LEA_API_BASE_URL,
     leaProvider: settings.leaProvider || DEFAULTS.LEA_PROVIDER,
     leaModel: settings.leaModel || DEFAULTS.LEA_MODEL,

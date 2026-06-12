@@ -10,6 +10,7 @@
     "start:lea-api": "cd vendor/lea-prover && LEA_API_HOST=127.0.0.1 LEA_API_PORT=8000 ./.venv/bin/python -m lea_api",
     "start": "node companion/server.mjs",
     "doctor": "node companion/doctor.mjs",
+    "reset:local": "node companion/reset-local-state.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "engines": {

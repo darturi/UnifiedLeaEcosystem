@@ -18,15 +18,16 @@ checkCommand("lean", ["--version"]);
 checkCommand("lake", ["--version"]);
 
 checkEnv("OPENAI_API_KEY");
-checkPath("Lean workspace", settings.workspacePath || PROJECT_ROOT, (dir) => (
-  fs.existsSync(path.join(dir, "lean-toolchain")) &&
-  (fs.existsSync(path.join(dir, "lakefile.lean")) || fs.existsSync(path.join(dir, "lakefile.toml")))
-), "must contain lean-toolchain and lakefile.lean or lakefile.toml");
-checkMathlib(settings.workspacePath || PROJECT_ROOT);
 checkPath("Lea repo", settings.leaRepoPath, (dir) => (
   fs.existsSync(path.join(dir, "pyproject.toml")) &&
   fs.existsSync(path.join(dir, "lea_api"))
 ), "must point at the Lea API-enabled lea-prover checkout");
+const leaWorkspacePath = settings.leaRepoPath ? path.join(settings.leaRepoPath, "workspace") : "";
+checkPath("Lea workspace", leaWorkspacePath, (dir) => (
+  fs.existsSync(path.join(dir, "lean-toolchain")) &&
+  (fs.existsSync(path.join(dir, "lakefile.lean")) || fs.existsSync(path.join(dir, "lakefile.toml")))
+), "must contain lean-toolchain and lakefile.lean or lakefile.toml");
+checkMathlib(leaWorkspacePath);
 checkPath("Lea API virtualenv", settings.leaRepoPath ? path.join(settings.leaRepoPath, ".venv", "bin", "python") : "", () => true, "run `npm run setup:api`");
 checkUrl("Lea API URL", settings.leaApiBaseUrl || "http://127.0.0.1:8000");
 
@@ -87,15 +88,16 @@ function checkUrl(label, value) {
   });
 }
 
-function checkMathlib(workspacePath) {
-  const workspace = workspacePath || PROJECT_ROOT;
-  const lakefilePath = path.join(workspace, "lakefile.lean");
-  const manifestPath = path.join(workspace, "lake-manifest.json");
-  const mathlibPackagePath = path.join(workspace, ".lake", "packages", "mathlib");
+function checkMathlib(leaWorkspacePath) {
+  const lakefilePath = path.join(leaWorkspacePath, "lakefile.lean");
+  const manifestPath = path.join(leaWorkspacePath, "lake-manifest.json");
+  const mathlibPackagePath = path.join(leaWorkspacePath, ".lake", "packages", "mathlib");
+  const mathlibOleanPath = path.join(mathlibPackagePath, ".lake", "build", "lib", "lean", "Mathlib.olean");
   const lakefile = readText(lakefilePath);
   const manifest = readText(manifestPath);
   const configured = /require\s+mathlib\b/.test(lakefile) || /"name"\s*:\s*"mathlib"/.test(manifest);
   const fetched = fs.existsSync(mathlibPackagePath);
+  const compiled = fs.existsSync(mathlibOleanPath);
 
   checks.push({
     ok: configured,
@@ -106,6 +108,11 @@ function checkMathlib(workspacePath) {
     ok: fetched,
     label: "Mathlib package fetched",
     detail: fetched ? mathlibPackagePath : "run `lake update` and `lake exe cache get`"
+  });
+  checks.push({
+    ok: compiled,
+    label: "Mathlib compiled cache",
+    detail: compiled ? mathlibOleanPath : "run `npm run update-lean-deps` and wait for cache decompression to finish"
   });
 }
 

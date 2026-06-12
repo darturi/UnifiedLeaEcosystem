@@ -65,7 +65,7 @@
     confirmButton.textContent = buttonTextForStatus(currentStatus);
     confirmButton.disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
     if (currentStatus === "in_progress") {
-      status.textContent = "Formalization is in progress.";
+      status.textContent = "Lea proof is in progress.";
     } else if (isExtensionContextInvalidated()) {
       status.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
     }
@@ -73,7 +73,7 @@
     confirmButton.addEventListener("click", async () => {
       confirmButton.disabled = true;
       status.textContent = currentStatus === "formalized" || currentStatus === "unknown"
-        ? "Checking Lean workspace..."
+        ? "Checking Lea status..."
         : "Starting Lea...";
       try {
         const result = currentStatus === "formalized" || currentStatus === "unknown"
