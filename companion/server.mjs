@@ -32,6 +32,13 @@ const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
+export const LEA_MODEL_OPTIONS = [
+  { id: "o4-mini", label: "o4-mini", tag: "Current default" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", tag: "Fast" },
+  { id: "gpt-5.4", label: "GPT-5.4", tag: "Balanced" },
+  { id: "gpt-5.5", label: "GPT-5.5", tag: "Most capable" }
+];
+const LEA_MODEL_IDS = new Set(LEA_MODEL_OPTIONS.map((model) => model.id));
 
 export async function createServer({
   settingsPath = SETTINGS_PATH,
@@ -166,6 +173,57 @@ export async function handleFormalize(payload, state) {
   };
 }
 
+export async function handleUpdateLeaSettings(payload, state) {
+  const leaRepoPath = String(payload.leaRepoPath || "").trim();
+  const validation = await validateLeaRepo(leaRepoPath);
+  if (!validation.ok) {
+    return errorResponse(400, "invalid_lea_path", validation.message);
+  }
+
+  const provider = String(payload.leaProvider || DEFAULT_LEA_PROVIDER);
+  const model = String(payload.leaModel || DEFAULT_LEA_MODEL);
+  if (provider !== DEFAULT_LEA_PROVIDER) {
+    return errorResponse(400, "invalid_lea_provider", "Lea provider must be openai.");
+  }
+  if (!LEA_MODEL_IDS.has(model)) {
+    return errorResponse(400, "invalid_lea_model", "Lea model must be one of the supported OpenAI models.");
+  }
+
+  let leaApiBaseUrl;
+  try {
+    leaApiBaseUrl = normalizeLeaApiBaseUrl(
+      payload.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
+    );
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+
+  state.settings.leaRepoPath = path.resolve(leaRepoPath);
+  state.settings.leaWorkspacePath = validation.leaWorkspacePath;
+  state.settings.leaApiBaseUrl = leaApiBaseUrl;
+  state.settings.leaApiKey = String(payload.leaApiKey || state.settings.leaApiKey || "");
+  state.settings.leaProvider = provider;
+  state.settings.leaModel = model;
+  state.settings.leaMaxTurns = normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
+  state.settings.leaJobTimeoutSeconds = Number.parseInt(
+    String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
+    10
+  );
+  await writeJson(state.settingsPath, state.settings);
+  return { statusCode: 200, body: buildSettingsResponse(state) };
+}
+
+export function handleGetUsage(payload, state) {
+  const overleafProjectId = String(payload.overleafProjectId || "unknown");
+  return {
+    statusCode: 200,
+    body: {
+      project: aggregateUsage(state.jobs || {}, { overleafProjectId }),
+      allTime: aggregateUsage(state.jobs || {}, {})
+    }
+  };
+}
+
 export async function validateLeaRepo(leaRepoPath) {
   if (!leaRepoPath || !path.isAbsolute(leaRepoPath)) {
     return { ok: false, message: "Lea repo path must be absolute." };
@@ -223,29 +281,16 @@ async function routeRequest(request, response, state) {
   }
 
   if (request.method === "POST" && url.pathname === "/settings/lea") {
-    const payload = await readBodyJson(request);
-    const leaRepoPath = String(payload.leaRepoPath || "").trim();
-    const validation = await validateLeaRepo(leaRepoPath);
-    if (!validation.ok) {
-      sendJson(response, 400, { error: "invalid_lea_path", message: validation.message });
-      return;
-    }
+    const result = await handleUpdateLeaSettings(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
 
-    state.settings.leaRepoPath = path.resolve(leaRepoPath);
-    state.settings.leaWorkspacePath = validation.leaWorkspacePath;
-    state.settings.leaApiBaseUrl = normalizeLeaApiBaseUrl(
-      payload.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
-    );
-    state.settings.leaApiKey = String(payload.leaApiKey || state.settings.leaApiKey || "");
-    state.settings.leaProvider = String(payload.leaProvider || DEFAULT_LEA_PROVIDER);
-    state.settings.leaModel = String(payload.leaModel || DEFAULT_LEA_MODEL);
-    state.settings.leaMaxTurns = Number.parseInt(String(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS), 10);
-    state.settings.leaJobTimeoutSeconds = Number.parseInt(
-      String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
-      10
-    );
-    await writeJson(state.settingsPath, state.settings);
-    sendJson(response, 200, buildSettingsResponse(state));
+  if (request.method === "GET" && url.pathname === "/usage") {
+    const result = handleGetUsage({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || "unknown"
+    }, state);
+    sendJson(response, result.statusCode, result.body);
     return;
   }
 
@@ -278,7 +323,7 @@ async function routeRequest(request, response, state) {
   sendJson(response, 404, { error: "not_found", message: "Unknown endpoint." });
 }
 
-function buildSettingsResponse(state) {
+export function buildSettingsResponse(state) {
   const leaRepoPath = state.settings.leaRepoPath || "";
   return {
     ok: true,
@@ -288,6 +333,7 @@ function buildSettingsResponse(state) {
     leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
     leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
     leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
+    leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
@@ -359,6 +405,12 @@ function validateLeaRuntime(state, { requireApiKey }) {
     normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
   } catch {
     return { ok: false, error: "invalid_lea_api_url", message: "Lea API base URL must be an absolute http(s) URL." };
+  }
+  if ((state.settings.leaProvider || DEFAULT_LEA_PROVIDER) !== DEFAULT_LEA_PROVIDER) {
+    return { ok: false, error: "invalid_lea_provider", message: "Lea provider must be openai." };
+  }
+  if (!LEA_MODEL_IDS.has(state.settings.leaModel || DEFAULT_LEA_MODEL)) {
+    return { ok: false, error: "invalid_lea_model", message: "Lea model must be one of the supported OpenAI models." };
   }
   return { ok: true };
 }
@@ -501,7 +553,15 @@ async function runLeaJob({ state, job, target, theoremText }) {
       record_on_success: true
     },
     logPath: job.logPath,
-    timeoutMs: job.leaJobTimeoutSeconds * 1000
+    timeoutMs: job.leaJobTimeoutSeconds * 1000,
+    onUsageUpdated: async (usage) => {
+      if (usage.delta) {
+        recordJobUsageDelta(job, usage);
+      } else {
+        recordJobUsageSnapshot(job, usage);
+      }
+      await writeJson(state.jobsPath, state.jobs);
+    }
   });
 
   const artifact = exit.ok
@@ -518,6 +578,7 @@ async function runLeaJob({ state, job, target, theoremText }) {
     job.recordedProofPath = artifact.entry.proofPath;
     job.moduleName = artifact.entry.moduleName || null;
   }
+  recordJobUsage(job, exit);
 
   const status = artifact?.ok
     ? await getLeaProofStatusFromEntry({
@@ -597,7 +658,8 @@ async function runLeaApiProofJob({
   prompt,
   project,
   logPath,
-  timeoutMs
+  timeoutMs,
+  onUsageUpdated = null
 }) {
   const started = Date.now();
   const headers = { "Content-Type": "application/json" };
@@ -635,6 +697,16 @@ async function runLeaApiProofJob({
     return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
   }
   await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
+  const usageAbort = new AbortController();
+  const eventsPromise = tailLeaRunUsageEvents({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    apiRunId,
+    logPath,
+    onUsageUpdated,
+    signal: usageAbort.signal
+  });
 
   while (Date.now() - started < timeoutMs) {
     await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))));
@@ -643,6 +715,7 @@ async function runLeaApiProofJob({
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
     });
     if (!statusResponse.ok) {
+      usageAbort.abort();
       return { ok: false, timedOut: false, apiRunId, error: statusResponse.error };
     }
 
@@ -655,20 +728,250 @@ async function runLeaApiProofJob({
     if (["completed", "succeeded", "success", "done"].includes(status)) {
       const reason = String(run.result?.reason || "").toLowerCase();
       if (reason && !["success", "succeeded", "done", "completed"].includes(reason)) {
-        return { ok: false, timedOut: false, apiRunId, error: message || `Lea API completed with reason: ${reason}` };
+        usageAbort.abort();
+        await settleUsageEvents(eventsPromise);
+        return {
+          ok: false,
+          timedOut: false,
+          apiRunId,
+          error: message || `Lea API completed with reason: ${reason}`,
+          ...extractRunUsage(run)
+        };
       }
-      return { ok: true, timedOut: false, apiRunId };
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return { ok: true, timedOut: false, apiRunId, ...extractRunUsage(run) };
     }
     if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
-      return { ok: false, timedOut: false, apiRunId, error: message || `Lea API status: ${status}` };
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return {
+        ok: false,
+        timedOut: false,
+        apiRunId,
+        error: message || `Lea API status: ${status}`,
+        ...extractRunUsage(run)
+      };
     }
   }
 
+  usageAbort.abort();
   return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out." };
+}
+
+async function tailLeaRunUsageEvents({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  apiRunId,
+  logPath,
+  onUsageUpdated,
+  signal
+}) {
+  if (!onUsageUpdated) return;
+
+  try {
+    const response = await fetchImpl(`${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/events`, {
+      method: "GET",
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      signal
+    });
+    if (!response?.ok || !response.body) {
+      return;
+    }
+
+    let buffer = "";
+    for await (const chunk of iterateResponseBody(response.body)) {
+      buffer += decodeChunk(chunk);
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() || "";
+      for (const frame of frames) {
+        const shouldContinue = await handleLeaEventFrame(frame, onUsageUpdated);
+        if (!shouldContinue) return;
+      }
+    }
+    if (buffer.trim()) {
+      await handleLeaEventFrame(buffer, onUsageUpdated);
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    await appendLog(logPath, `[backend] Lea usage event stream unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+async function handleLeaEventFrame(frame, onUsageUpdated) {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n")
+    .trim();
+  if (!data) return true;
+
+  let event;
+  try {
+    event = JSON.parse(data);
+  } catch {
+    return true;
+  }
+
+  if (event.type === "usage_updated") {
+    await onUsageUpdated({
+      inputTokens: event.input_tokens,
+      outputTokens: event.output_tokens,
+      totalTokens: toNonNegativeNumber(event.input_tokens) + toNonNegativeNumber(event.output_tokens),
+      costUsd: event.cost,
+      delta: true
+    });
+    return true;
+  }
+  if (event.type === "finished") {
+    if (event.usage || event.cost !== undefined) {
+      await onUsageUpdated(extractEventUsage(event));
+    }
+    return false;
+  }
+  if (event.type === "error") {
+    return false;
+  }
+  return true;
+}
+
+function extractEventUsage(event) {
+  const usage = event?.usage || event || {};
+  const inputTokens = toNonNegativeNumber(usage.input_tokens);
+  const outputTokens = toNonNegativeNumber(usage.output_tokens);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    costUsd: toNonNegativeNumber(event?.cost)
+  };
+}
+
+async function settleUsageEvents(eventsPromise) {
+  if (!eventsPromise) return;
+  try {
+    await Promise.race([eventsPromise, delay(25)]);
+  } catch {
+    // Usage events are best-effort; terminal run polling remains authoritative.
+  }
+}
+
+async function* iterateResponseBody(body) {
+  if (body?.[Symbol.asyncIterator]) {
+    yield* body;
+    return;
+  }
+  if (!body?.getReader) return;
+
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+}
+
+function decodeChunk(chunk) {
+  if (typeof chunk === "string") return chunk;
+  if (chunk instanceof Uint8Array) return new TextDecoder().decode(chunk);
+  return String(chunk);
 }
 
 function extractRunMessage(run) {
   return run.final_text || run.error || run.message || run.result?.text || "";
+}
+
+function extractRunUsage(run) {
+  const usage = run?.result?.usage || {};
+  const inputTokens = toNonNegativeNumber(usage.input_tokens);
+  const outputTokens = toNonNegativeNumber(usage.output_tokens);
+  const costUsd = toNonNegativeNumber(run?.result?.cost);
+  return {
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens
+    },
+    costUsd
+  };
+}
+
+function recordJobUsage(job, exit) {
+  if (!exit?.usage) return;
+  recordJobUsageSnapshot(job, {
+    ...exit.usage,
+    costUsd: exit.costUsd
+  });
+}
+
+function recordJobUsageSnapshot(job, usage) {
+  job.usage = {
+    inputTokens: toNonNegativeNumber(usage.inputTokens),
+    outputTokens: toNonNegativeNumber(usage.outputTokens),
+    totalTokens: toNonNegativeNumber(usage.totalTokens) ||
+      toNonNegativeNumber(usage.inputTokens) + toNonNegativeNumber(usage.outputTokens)
+  };
+  job.costUsd = toNonNegativeNumber(usage.costUsd);
+}
+
+function recordJobUsageDelta(job, usage) {
+  const current = job.usage || {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0
+  };
+  const inputTokens = toNonNegativeNumber(current.inputTokens) + toNonNegativeNumber(usage.inputTokens);
+  const outputTokens = toNonNegativeNumber(current.outputTokens) + toNonNegativeNumber(usage.outputTokens);
+  job.usage = {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens
+  };
+  job.costUsd = Number((toNonNegativeNumber(job.costUsd) + toNonNegativeNumber(usage.costUsd)).toFixed(6));
+}
+
+function aggregateUsage(jobs, { overleafProjectId } = {}) {
+  const projectSlug = overleafProjectId ? slugProjectId(overleafProjectId) : "";
+  const aggregate = {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    runCount: 0
+  };
+
+  for (const job of Object.values(jobs || {})) {
+    if (overleafProjectId && job.overleafProjectId !== overleafProjectId && job.projectSlug !== projectSlug) {
+      continue;
+    }
+    if (!job.usage) {
+      continue;
+    }
+    aggregate.inputTokens += toNonNegativeNumber(job.usage.inputTokens);
+    aggregate.outputTokens += toNonNegativeNumber(job.usage.outputTokens);
+    aggregate.totalTokens += toNonNegativeNumber(job.usage.totalTokens);
+    aggregate.costUsd += toNonNegativeNumber(job.costUsd);
+    aggregate.runCount += 1;
+  }
+
+  aggregate.costUsd = Number(aggregate.costUsd.toFixed(6));
+  return aggregate;
+}
+
+function toNonNegativeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function normalizeLeaMaxTurns(value) {
+  const parsed = Number.parseInt(String(value || DEFAULT_LEA_MAX_TURNS), 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_MAX_TURNS;
 }
 
 async function fetchJson(fetchImpl, url, options) {

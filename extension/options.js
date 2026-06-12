@@ -1,4 +1,10 @@
 const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
+const DEFAULT_MODEL_OPTIONS = [
+  { id: "o4-mini", label: "o4-mini", tag: "Current default" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", tag: "Fast" },
+  { id: "gpt-5.4", label: "GPT-5.4", tag: "Balanced" },
+  { id: "gpt-5.5", label: "GPT-5.5", tag: "Most capable" }
+];
 
 const form = document.querySelector("#settings-form");
 const companionUrlInput = document.querySelector("#companion-url");
@@ -21,7 +27,7 @@ chrome.storage.sync.get(
     companionUrlInput.value = settings.companionUrl;
     leaRepoPathInput.value = settings.leaRepoPath;
     leaApiBaseUrlInput.value = settings.leaApiBaseUrl;
-    leaModelInput.value = settings.leaModel;
+    renderModelOptions(DEFAULT_MODEL_OPTIONS, settings.leaModel);
     leaMaxTurnsInput.value = settings.leaMaxTurns;
     loadCompanionSettings({ silent: true });
   }
@@ -84,7 +90,7 @@ async function loadCompanionSettings({ silent }) {
     companionUrlInput.value = companionUrl;
     leaRepoPathInput.value = payload.leaRepoPath || leaRepoPathInput.value;
     leaApiBaseUrlInput.value = payload.leaApiBaseUrl || leaApiBaseUrlInput.value || "http://127.0.0.1:8000";
-    leaModelInput.value = payload.leaModel || leaModelInput.value || "o4-mini";
+    renderModelOptions(payload.leaModelOptions || DEFAULT_MODEL_OPTIONS, payload.leaModel || leaModelInput.value || "o4-mini");
     leaMaxTurnsInput.value = payload.leaMaxTurns || leaMaxTurnsInput.value || 20;
 
     await chrome.storage.sync.set({
@@ -103,4 +109,17 @@ async function loadCompanionSettings({ silent }) {
       statusEl.textContent = error instanceof Error ? error.message : String(error);
     }
   }
+}
+
+function renderModelOptions(options, selectedModel) {
+  leaModelInput.replaceChildren();
+  for (const model of options) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
+    leaModelInput.appendChild(option);
+  }
+  leaModelInput.value = [...leaModelInput.options].some((option) => option.value === selectedModel)
+    ? selectedModel
+    : "o4-mini";
 }

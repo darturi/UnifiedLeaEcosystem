@@ -1,16 +1,26 @@
 (function () {
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
+  const DEFAULT_LEA_MODEL = "o4-mini";
+  const DEFAULT_LEA_MAX_TURNS = 20;
+  const DEFAULT_MODEL_OPTIONS = [
+    { id: "o4-mini", label: "o4-mini", tag: "Current default" },
+    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", tag: "Fast" },
+    { id: "gpt-5.4", label: "GPT-5.4", tag: "Balanced" },
+    { id: "gpt-5.5", label: "GPT-5.5", tag: "Most capable" }
+  ];
   let activePopover = null;
   let statusRefreshTimer = null;
+  let usageRefreshTimer = null;
   let latestTheorems = [];
   let latestStatuses = {};
   let badgeLayer = null;
+  let settingsButton = null;
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     if (event.data?.type === "OL_LEAN_THEOREM_CLICK") {
       rememberTheorem(event.data.theorem);
-      showPopover(event.data.clientX, event.data.clientY, event.data.theorem);
+      showTheoremPopover(event.data.clientX, event.data.clientY, event.data.theorem);
       return;
     }
     if (event.data?.type === "OL_LEAN_THEOREMS_VISIBLE") {
@@ -22,6 +32,7 @@
 
   injectPageBridge();
   requestTheoremsSoon();
+  renderSettingsButton();
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closePopover();
@@ -39,15 +50,35 @@
     renderStatusBadges();
   }, true);
 
-  function showPopover(clientX, clientY, theorem) {
+  function renderSettingsButton() {
+    if (settingsButton) return;
+    settingsButton = document.createElement("button");
+    settingsButton.type = "button";
+    settingsButton.className = "ol-lean-settings-trigger";
+    settingsButton.setAttribute("aria-label", "Open Lea settings and usage");
+    settingsButton.title = "Lea settings and usage";
+    settingsButton.innerHTML = `
+      <span class="ol-lean-slider-line"><span></span></span>
+      <span class="ol-lean-slider-line"><span></span></span>
+      <span class="ol-lean-slider-line"><span></span></span>
+    `;
+    settingsButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showSettingsPopover();
+    });
+    (document.body || document.documentElement).appendChild(settingsButton);
+  }
+
+  function showTheoremPopover(clientX, clientY, theorem) {
     closePopover();
 
     const popover = document.createElement("div");
-    popover.className = "ol-lean-popover";
+    popover.className = "ol-lean-theorem-popover";
     popover.innerHTML = `
       <p class="ol-lean-popover-title">Lean formalization</p>
       <p class="ol-lean-popover-meta">Label: <strong></strong></p>
-    <div class="ol-lean-popover-actions">
+      <div class="ol-lean-popover-actions">
         <button type="button" data-primary="true">Confirm</button>
         <button type="button">Close</button>
       </div>
@@ -79,7 +110,7 @@
         const result = currentStatus === "formalized" || currentStatus === "unknown"
           ? await refreshSingleStatus(theorem)
           : await formalize(theorem);
-        status.textContent = `${formatStatus(result.status)} at ${result.relativePath}`;
+        status.textContent = `${formatStatus(result.status)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
         renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[theorem.label]?.leanStatement || "");
         await refreshStatusesNow();
       } catch (error) {
@@ -91,19 +122,158 @@
     closeButton.addEventListener("click", closePopover);
 
     document.body.appendChild(popover);
-    const rect = popover.getBoundingClientRect();
-    const left = Math.min(clientX + 8, window.innerWidth - rect.width - 12);
-    const top = Math.min(clientY + 8, window.innerHeight - rect.height - 12);
-    popover.style.left = `${Math.max(12, left)}px`;
-    popover.style.top = `${Math.max(12, top)}px`;
+    positionPopover(popover, clientX, clientY);
     activePopover = popover;
   }
 
+  function showSettingsPopover() {
+    closePopover();
+
+    const popover = document.createElement("div");
+    popover.className = "ol-lean-popover ol-lean-settings-popover";
+    popover.innerHTML = `
+      <div class="ol-lean-popover-arrow ol-lean-popover-arrow-bottom" aria-hidden="true"></div>
+      <div class="ol-lean-popover-header">
+        <div class="ol-lean-popover-kicker">
+          <span class="ol-lean-popover-mark" aria-hidden="true">L</span>
+          <span>Extension Settings</span>
+        </div>
+        <button type="button" class="ol-lean-icon-button" data-role="close" aria-label="Close Lea popover">x</button>
+      </div>
+      <div class="ol-lean-popover-body">
+        <section class="ol-lean-usage-panel" aria-live="polite">
+          <div class="ol-lean-usage-row" data-usage="project">
+            <div class="ol-lean-usage-row-head">
+              <span>This project</span>
+              <strong data-field="cost">--</strong>
+            </div>
+            <div class="ol-lean-usage-metrics">
+              <span><small>In</small><strong data-field="input">--</strong></span>
+              <span><small>Out</small><strong data-field="output">--</strong></span>
+            </div>
+          </div>
+          <div class="ol-lean-usage-separator"></div>
+          <div class="ol-lean-usage-row" data-usage="allTime">
+            <div class="ol-lean-usage-row-head">
+              <span>All-time</span>
+              <strong data-field="cost">--</strong>
+            </div>
+            <div class="ol-lean-usage-metrics">
+              <span><small>In</small><strong data-field="input">--</strong></span>
+              <span><small>Out</small><strong data-field="output">--</strong></span>
+            </div>
+          </div>
+        </section>
+        <section class="ol-lean-settings-panel">
+          <label>
+            <span>Model</span>
+            <select data-role="model"></select>
+          </label>
+          <label>
+            <span>Max turns</span>
+            <input type="number" min="1" max="200" data-role="max-turns">
+          </label>
+          <button type="button" class="ol-lean-save-button" data-role="save-settings" disabled>Save changes</button>
+        </section>
+      </div>
+      <p class="ol-lean-popover-status" role="status"></p>
+    `;
+
+    const closeButton = popover.querySelector("[data-role='close']");
+    const status = popover.querySelector(".ol-lean-popover-status");
+    const modelSelect = popover.querySelector("[data-role='model']");
+    const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
+    const saveButton = popover.querySelector("[data-role='save-settings']");
+
+    closeButton.addEventListener("click", closePopover);
+    modelSelect.addEventListener("change", markSettingsDirty);
+    maxTurnsInput.addEventListener("input", markSettingsDirty);
+    saveButton.addEventListener("click", async () => {
+      saveButton.disabled = true;
+      status.textContent = "Saving Lea settings...";
+      try {
+        const settings = await savePopoverSettings(popover);
+        popover.dataset.savedModel = settings.leaModel;
+        popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
+        markSettingsDirty();
+        status.textContent = "Settings saved.";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error);
+        markSettingsDirty();
+      }
+    });
+
+    document.body.appendChild(popover);
+    positionSettingsPopover(popover);
+    activePopover = popover;
+    loadPopoverSettings(popover).catch((error) => {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    });
+    loadUsage(popover).catch((error) => {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    });
+    scheduleUsageRefresh(popover);
+
+    function markSettingsDirty() {
+      const dirty = modelSelect.value !== popover.dataset.savedModel ||
+        String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns;
+      saveButton.disabled = !dirty;
+    }
+  }
+
   function closePopover() {
+    clearTimeout(usageRefreshTimer);
+    usageRefreshTimer = null;
     if (activePopover) {
       activePopover.remove();
       activePopover = null;
     }
+  }
+
+  function positionPopover(popover, clientX, clientY) {
+    const rect = popover.getBoundingClientRect();
+    const gap = 12;
+    const left = Math.min(clientX + gap, window.innerWidth - rect.width - 12);
+    const top = Math.min(clientY + gap, window.innerHeight - rect.height - 12);
+    popover.style.left = `${Math.max(12, left)}px`;
+    popover.style.top = `${Math.max(12, top)}px`;
+  }
+
+  function positionSettingsPopover(popover) {
+    const rect = popover.getBoundingClientRect();
+    const buttonRect = settingsButton?.getBoundingClientRect();
+    const right = 20;
+    const bottom = buttonRect ? window.innerHeight - buttonRect.top + 12 : 76;
+    popover.style.left = `${Math.max(12, window.innerWidth - rect.width - right)}px`;
+    popover.style.top = `${Math.max(12, window.innerHeight - rect.height - bottom)}px`;
+  }
+
+  function updatePopoverStatus(popover, theorem) {
+    if (!popover || popover.dataset.theoremLabel !== theorem.label) return;
+    const statusInfo = latestStatuses[theorem.label] || { status: "unknown" };
+    const currentStatus = statusInfo.status || "unknown";
+    const chip = popover.querySelector(".ol-lean-status-chip");
+    const detail = popover.querySelector(".ol-lean-popover-detail");
+    const actionButton = popover.querySelector("[data-role='theorem-action']");
+    const leanStatement = popover.querySelector(".ol-lean-popover-lean");
+
+    chip.className = `ol-lean-status-chip ol-lean-status-chip-${currentStatus}`;
+    chip.textContent = formatStatus(currentStatus);
+    actionButton.textContent = buttonTextForStatus(currentStatus);
+    actionButton.disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
+
+    if (isExtensionContextInvalidated()) {
+      detail.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
+    } else if (statusInfo.message) {
+      detail.textContent = statusInfo.message;
+    } else if (statusInfo.relativePath) {
+      detail.textContent = statusInfo.relativePath;
+    } else if (currentStatus === "in_progress") {
+      detail.textContent = "Lea proof is in progress.";
+    } else {
+      detail.textContent = "Ready to send this theorem to Lea.";
+    }
+    renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
   }
 
   async function formalize(theorem) {
@@ -169,6 +339,10 @@
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
     postStatuses(withFallbackStatuses(payload.statuses || {}));
+    if (activePopover?.dataset.theoremLabel) {
+      const theorem = latestTheorems.find((item) => item.label === activePopover.dataset.theoremLabel);
+      if (theorem) updatePopoverStatus(activePopover, theorem);
+    }
     if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
       scheduleStatusRefresh();
     }
@@ -216,16 +390,18 @@
       const coords = theorem.coords || { left: 24, top: 24 };
       const statusInfo = latestStatuses[theorem.label] || { status: "unknown" };
       const status = statusInfo.status || "unknown";
-      const badge = document.createElement("span");
+      const badge = document.createElement("button");
       badge.className = `ol-lean-status ol-lean-status-${status}`;
+      badge.type = "button";
       badge.textContent = formatStatus(status);
       badge.title = statusInfo.message || `Lean status for ${theorem.label}: ${formatStatus(status)}`;
+      badge.setAttribute("aria-label", `Open Lea popover for ${theorem.label}. Status: ${formatStatus(status)}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
       badge.style.top = `${coords.top}px`;
       badge.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        showPopover(event.clientX, event.clientY, theorem);
+        showTheoremPopover(event.clientX, event.clientY, theorem);
       });
       badgeLayer.appendChild(badge);
     }
@@ -282,8 +458,150 @@
       return Promise.reject(new Error("Extension was reloaded. Refresh this Overleaf tab."));
     }
     return chrome.storage.sync.get({
-      companionUrl: DEFAULT_COMPANION_URL
+      companionUrl: DEFAULT_COMPANION_URL,
+      leaRepoPath: "",
+      leaApiBaseUrl: "http://127.0.0.1:8000",
+      leaModel: DEFAULT_LEA_MODEL,
+      leaMaxTurns: DEFAULT_LEA_MAX_TURNS
     });
+  }
+
+  async function loadCompanionSettings() {
+    const stored = await getSettings();
+    const baseUrl = String(stored.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    try {
+      const response = await fetch(`${baseUrl}/settings`);
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      }
+      const settings = {
+        companionUrl: baseUrl,
+        leaRepoPath: payload.leaRepoPath || stored.leaRepoPath || "",
+        leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
+        leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
+        leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+        leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS
+      };
+      await chrome.storage.sync.set({
+        companionUrl: settings.companionUrl,
+        leaRepoPath: settings.leaRepoPath,
+        leaApiBaseUrl: settings.leaApiBaseUrl,
+        leaModel: settings.leaModel,
+        leaMaxTurns: settings.leaMaxTurns
+      });
+      return settings;
+    } catch {
+      return {
+        ...stored,
+        companionUrl: baseUrl,
+        leaModelOptions: DEFAULT_MODEL_OPTIONS
+      };
+    }
+  }
+
+  async function loadPopoverSettings(popover) {
+    const settings = await loadCompanionSettings();
+    const modelSelect = popover.querySelector("[data-role='model']");
+    const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
+    renderModelOptions(modelSelect, settings.leaModelOptions || DEFAULT_MODEL_OPTIONS, settings.leaModel || DEFAULT_LEA_MODEL);
+    maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
+    popover.dataset.savedModel = modelSelect.value;
+    popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
+    popover.querySelector("[data-role='save-settings']").disabled = true;
+  }
+
+  function renderModelOptions(select, options, selectedModel) {
+    select.replaceChildren();
+    for (const model of options) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
+      select.appendChild(option);
+    }
+    select.value = [...select.options].some((option) => option.value === selectedModel)
+      ? selectedModel
+      : DEFAULT_LEA_MODEL;
+  }
+
+  async function savePopoverSettings(popover) {
+    const current = await loadCompanionSettings();
+    const baseUrl = String(current.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const leaModel = popover.querySelector("[data-role='model']").value || DEFAULT_LEA_MODEL;
+    const leaMaxTurns = Number.parseInt(popover.querySelector("[data-role='max-turns']").value, 10) || DEFAULT_LEA_MAX_TURNS;
+    const response = await fetch(`${baseUrl}/settings/lea`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        leaRepoPath: current.leaRepoPath,
+        leaApiBaseUrl: current.leaApiBaseUrl,
+        leaProvider: "openai",
+        leaModel,
+        leaMaxTurns
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    }
+    await chrome.storage.sync.set({
+      companionUrl: baseUrl,
+      leaRepoPath: payload.leaRepoPath,
+      leaApiBaseUrl: payload.leaApiBaseUrl,
+      leaModel: payload.leaModel,
+      leaMaxTurns: payload.leaMaxTurns
+    });
+    return payload;
+  }
+
+  async function loadUsage(popover) {
+    if (!popover?.isConnected) return;
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const response = await fetch(`${baseUrl}/usage?overleafProjectId=${encodeURIComponent(extractOverleafProjectId())}`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    }
+    renderUsage(popover, "project", payload.project);
+    renderUsage(popover, "allTime", payload.allTime);
+  }
+
+  function scheduleUsageRefresh(popover) {
+    clearTimeout(usageRefreshTimer);
+    usageRefreshTimer = setTimeout(async () => {
+      if (!popover?.isConnected || activePopover !== popover) {
+        return;
+      }
+      try {
+        await loadUsage(popover);
+      } catch (error) {
+        const status = popover.querySelector(".ol-lean-popover-status");
+        if (status) status.textContent = error instanceof Error ? error.message : String(error);
+      }
+      scheduleUsageRefresh(popover);
+    }, 1000);
+  }
+
+  function renderUsage(popover, key, usage) {
+    const row = popover.querySelector(`[data-usage='${key}']`);
+    if (!row) return;
+    row.querySelector("[data-field='cost']").textContent = formatCost(usage?.costUsd || 0);
+    row.querySelector("[data-field='input']").textContent = formatTokens(usage?.inputTokens || 0);
+    row.querySelector("[data-field='output']").textContent = formatTokens(usage?.outputTokens || 0);
+  }
+
+  function formatTokens(value) {
+    const number = Number(value) || 0;
+    if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(2)}M`;
+    if (number >= 1_000) return `${(number / 1_000).toFixed(1)}k`;
+    return String(number);
+  }
+
+  function formatCost(value) {
+    const number = Number(value) || 0;
+    if (number > 0 && number < 0.01) return "<$0.01";
+    return `$${number.toFixed(2)}`;
   }
 
   function isExtensionContextInvalidated() {
