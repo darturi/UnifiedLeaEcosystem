@@ -39,7 +39,7 @@ test("loads .env values without overriding existing environment", async () => {
 
 test("applies environment defaults without replacing explicit settings", () => {
   const settings = applyEnvDefaults(
-    { leaModel: "explicit-model" },
+    { leaModel: "explicit-model", leaApiKey: "legacy-openai-key" },
     {
       LEA_REPO_PATH: "/tmp/lea",
       LEA_MODEL: "env-model",
@@ -50,6 +50,8 @@ test("applies environment defaults without replacing explicit settings", () => {
   assert.equal(settings.leaRepoPath, "/tmp/lea");
   assert.equal(settings.leaModel, "explicit-model");
   assert.equal(settings.leaMaxTurns, 7);
+  assert.equal(settings.leaApiKey, "legacy-openai-key");
+  assert.equal(settings.leaProviderApiKeys, undefined);
 });
 
 test("derives local path defaults when env values are absent", () => {

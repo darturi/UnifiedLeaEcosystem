@@ -52,10 +52,13 @@ To force a Lean dependency refresh:
 npm run update-lean-deps
 ```
 
-Then edit `.env` and replace the placeholder API key:
+Then edit `.env` and replace the placeholder API key, or enter provider keys in the extension settings UI. When entered through the UI, keys are written by the local companion to `.env`; they are not stored in Chrome or `.overleaf-lean-stub/settings.json`.
 
 ```text
 OPENAI_API_KEY=your_openai_key_here
+ANTHROPIC_API_KEY=your_anthropic_key_here
+GEMINI_API_KEY=your_gemini_key_here
+# GOOGLE_API_KEY is also accepted for Gemini
 LEA_API_BASE_URL=http://127.0.0.1:8000
 LEA_JOB_TIMEOUT_SECONDS=900
 ```

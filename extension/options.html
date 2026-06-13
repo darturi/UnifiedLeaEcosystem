@@ -23,9 +23,26 @@
           <input id="lea-api-base-url" name="leaApiBaseUrl" type="url" required placeholder="http://127.0.0.1:8000">
         </label>
         <label>
-          Lea OpenAI model
-          <input id="lea-model" name="leaModel" type="text" required>
+          Lea model
+          <select id="lea-model" name="leaModel" required></select>
         </label>
+        <fieldset>
+          <legend>Model family API keys</legend>
+          <p>Keys are saved to the local .env by the companion. They are not stored in Chrome or companion settings.</p>
+          <ul id="provider-key-status" class="provider-key-status" aria-live="polite"></ul>
+          <label>
+            OpenAI API key
+            <input id="openai-api-key" name="openaiApiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
+          </label>
+          <label>
+            Gemini API key
+            <input id="gemini-api-key" name="geminiApiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
+          </label>
+          <label>
+            Anthropic API key
+            <input id="anthropic-api-key" name="anthropicApiKey" type="password" autocomplete="off" placeholder="Leave blank to keep current key">
+          </label>
+        </fieldset>
         <label>
           Lea max turns
           <input id="lea-max-turns" name="leaMaxTurns" type="number" min="1" max="200" required>

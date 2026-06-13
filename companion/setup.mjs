@@ -17,6 +17,8 @@ const MATHLIB_PACKAGE_PATH = path.join(LEA_WORKSPACE_PATH, ".lake", "packages", 
 const REFRESH_LEAN_DEPS = process.argv.includes("--refresh-lean-deps");
 const DEFAULTS = {
   OPENAI_API_KEY: "your_openai_key_here",
+  ANTHROPIC_API_KEY: "your_anthropic_key_here",
+  GEMINI_API_KEY: "your_gemini_key_here",
   LEA_API_BASE_URL: "http://127.0.0.1:8000",
   LEA_PROVIDER: "openai",
   LEA_MODEL: "o4-mini",

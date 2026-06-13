@@ -1,5 +1,6 @@
 .lake/
 .env
+.overleaf-lean-stub/settings.json
 .overleaf-lean-stub/cache.json
 .overleaf-lean-stub/jobs.json
 .overleaf-lean-stub/jobs/

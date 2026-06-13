@@ -38,7 +38,6 @@ export function applyEnvDefaults(settings, env = process.env) {
     ...settings,
     leaRepoPath: settings.leaRepoPath || env.LEA_REPO_PATH || DEFAULT_LEA_REPO_PATH,
     leaApiBaseUrl: settings.leaApiBaseUrl || env.LEA_API_BASE_URL || "http://127.0.0.1:8000",
-    leaApiKey: settings.leaApiKey || env.LEA_API_KEY || "",
     leaProvider: settings.leaProvider || env.LEA_PROVIDER || "openai",
     leaModel: settings.leaModel || env.LEA_MODEL || "o4-mini",
     leaMaxTurns: settings.leaMaxTurns || parseInt(env.LEA_MAX_TURNS || "20", 10),

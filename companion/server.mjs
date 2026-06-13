@@ -24,14 +24,38 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 31245;
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
+const ENV_PATH = path.join(PROJECT_ROOT, ".env");
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
-const DEFAULT_LEA_PROVIDER = "openai";
 const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
+const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
+const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
+const LEA_MODEL_FAMILIES = [
+  { id: "openai", label: "OpenAI", envVars: ["OPENAI_API_KEY"] },
+  { id: "gemini", label: "Gemini", envVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY"] },
+  { id: "anthropic", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] }
+];
+export const LEA_MODEL_OPTIONS = [
+  { id: "o4-mini", label: "o4-mini", family: "openai", tag: "Current default" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", family: "openai", tag: "Fast" },
+  { id: "gpt-5.4", label: "GPT-5.4", family: "openai", tag: "Balanced" },
+  { id: "gpt-5.5", label: "GPT-5.5", family: "openai", tag: "Most capable" },
+  { id: "gemini/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", family: "gemini", tag: "Research" },
+  { id: "gemini/gemini-2.5-pro", label: "Gemini 2.5 Pro", family: "gemini", tag: "Capable" },
+  { id: "gemini/gemini-2.5-flash", label: "Gemini 2.5 Flash", family: "gemini", tag: "Fast" },
+  { id: "anthropic/claude-opus-4-8", label: "Claude Opus 4.8", family: "anthropic", tag: "Most capable" },
+  { id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "anthropic", tag: "Balanced" }
+];
+const LEA_MODEL_BY_ID = new Map(LEA_MODEL_OPTIONS.map((model) => [model.id, model]));
+const LEA_MODEL_FAMILY_BY_ID = new Map(LEA_MODEL_FAMILIES.map((family) => [family.id, family]));
+const LEGACY_LEA_MODEL_ALIASES = new Map([
+  ["anthropic/claude-opus-4-20250514", "anthropic/claude-opus-4-8"],
+  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"]
+]);
 
 export async function createServer({
   settingsPath = SETTINGS_PATH,
@@ -166,6 +190,80 @@ export async function handleFormalize(payload, state) {
   };
 }
 
+export async function handleUpdateLeaSettings(payload, state) {
+  const leaRepoPath = String(payload.leaRepoPath || "").trim();
+  const validation = await validateLeaRepo(leaRepoPath);
+  if (!validation.ok) {
+    return errorResponse(400, "invalid_lea_path", validation.message);
+  }
+
+  const model = normalizeLeaModelId(payload.leaModel || DEFAULT_LEA_MODEL);
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  if (!modelInfo) {
+    return errorResponse(400, "invalid_lea_model", "Lea model must be one of the supported models.");
+  }
+
+  let leaApiBaseUrl;
+  try {
+    leaApiBaseUrl = normalizeLeaApiBaseUrl(
+      payload.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
+    );
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+
+  const providerEnvPatch = buildProviderEnvPatch(payload.leaProviderApiKeys);
+  const nextSettings = {
+    ...state.settings,
+    leaRepoPath: path.resolve(leaRepoPath),
+    leaWorkspacePath: validation.leaWorkspacePath,
+    leaApiBaseUrl,
+    leaProvider: modelInfo.family,
+    leaModel: model,
+    leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
+    leaJobTimeoutSeconds: Number.parseInt(
+    String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
+    10
+    )
+  };
+  const nextState = { ...state, settings: nextSettings, env: { ...(state.env || {}), ...providerEnvPatch } };
+  if (!getProviderApiKey(nextState, modelInfo.family)) {
+    return errorResponse(
+      400,
+      `missing_${modelInfo.family}_key`,
+      `${LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family)?.label || modelInfo.family} API key must be set in .env or the companion process environment before selecting this model.`
+    );
+  }
+  const keyValidation = await validateProviderApiKeys({
+    fetchImpl: state.fetchImpl || fetch,
+    providerEnvPatch,
+    selectedFamilyId: modelInfo.family,
+    state: nextState
+  });
+  if (!keyValidation.ok) {
+    return errorResponse(400, keyValidation.error, keyValidation.message);
+  }
+  if (Object.keys(providerEnvPatch).length > 0) {
+    await persistEnvPatch(state.envPath || ENV_PATH, providerEnvPatch);
+    state.env ||= {};
+    Object.assign(state.env, providerEnvPatch);
+  }
+  state.settings = nextSettings;
+  await writeJson(state.settingsPath, sanitizeSettingsForStorage(state.settings));
+  return { statusCode: 200, body: buildSettingsResponse(state) };
+}
+
+export function handleGetUsage(payload, state) {
+  const overleafProjectId = String(payload.overleafProjectId || "unknown");
+  return {
+    statusCode: 200,
+    body: {
+      project: aggregateUsage(state.jobs || {}, { overleafProjectId }),
+      allTime: aggregateUsage(state.jobs || {}, {})
+    }
+  };
+}
+
 export async function validateLeaRepo(leaRepoPath) {
   if (!leaRepoPath || !path.isAbsolute(leaRepoPath)) {
     return { ok: false, message: "Lea repo path must be absolute." };
@@ -184,9 +282,19 @@ export async function validateLeaRepo(leaRepoPath) {
 }
 
 export async function ensureStartupLeaRuntime(state) {
+  const legacyProviderEnvPatch = buildLegacyProviderEnvPatch(state);
+  if (state.settings?.leaApiKey && !getProviderApiKey(state, "openai") && !legacyProviderEnvPatch.OPENAI_API_KEY) {
+    legacyProviderEnvPatch.OPENAI_API_KEY = String(state.settings.leaApiKey).trim();
+  }
+  if (Object.keys(legacyProviderEnvPatch).length > 0) {
+    await persistEnvPatch(state.envPath || ENV_PATH, legacyProviderEnvPatch);
+    state.env ||= {};
+    Object.assign(state.env, legacyProviderEnvPatch);
+  }
+  state.settings = sanitizeRuntimeSettings(state.settings || {});
   const validation = await validateLeaRepo(state.settings.leaRepoPath);
   state.settings.leaWorkspacePath = validation.ok ? validation.leaWorkspacePath : buildLeaWorkspacePath(state.settings.leaRepoPath);
-  await writeJson(state.settingsPath, state.settings);
+  await writeJson(state.settingsPath, sanitizeSettingsForStorage(state.settings));
   return {
     leaRepoPath: state.settings.leaRepoPath,
     leaWorkspacePath: state.settings.leaWorkspacePath,
@@ -223,29 +331,16 @@ async function routeRequest(request, response, state) {
   }
 
   if (request.method === "POST" && url.pathname === "/settings/lea") {
-    const payload = await readBodyJson(request);
-    const leaRepoPath = String(payload.leaRepoPath || "").trim();
-    const validation = await validateLeaRepo(leaRepoPath);
-    if (!validation.ok) {
-      sendJson(response, 400, { error: "invalid_lea_path", message: validation.message });
-      return;
-    }
+    const result = await handleUpdateLeaSettings(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
 
-    state.settings.leaRepoPath = path.resolve(leaRepoPath);
-    state.settings.leaWorkspacePath = validation.leaWorkspacePath;
-    state.settings.leaApiBaseUrl = normalizeLeaApiBaseUrl(
-      payload.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
-    );
-    state.settings.leaApiKey = String(payload.leaApiKey || state.settings.leaApiKey || "");
-    state.settings.leaProvider = String(payload.leaProvider || DEFAULT_LEA_PROVIDER);
-    state.settings.leaModel = String(payload.leaModel || DEFAULT_LEA_MODEL);
-    state.settings.leaMaxTurns = Number.parseInt(String(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS), 10);
-    state.settings.leaJobTimeoutSeconds = Number.parseInt(
-      String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
-      10
-    );
-    await writeJson(state.settingsPath, state.settings);
-    sendJson(response, 200, buildSettingsResponse(state));
+  if (request.method === "GET" && url.pathname === "/usage") {
+    const result = handleGetUsage({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || "unknown"
+    }, state);
+    sendJson(response, result.statusCode, result.body);
     return;
   }
 
@@ -278,19 +373,220 @@ async function routeRequest(request, response, state) {
   sendJson(response, 404, { error: "not_found", message: "Unknown endpoint." });
 }
 
-function buildSettingsResponse(state) {
+export function buildSettingsResponse(state) {
   const leaRepoPath = state.settings.leaRepoPath || "";
+  const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL);
+  const modelInfo = LEA_MODEL_BY_ID.get(model) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
   return {
     ok: true,
     leaRepoPath,
     leaWorkspacePath: leaRepoPath ? buildLeaWorkspacePath(leaRepoPath) : "",
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
-    leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
-    leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
-    leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
+    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
+    leaProvider: modelInfo.family,
+    leaProviderFamily: modelInfo.family,
+    leaProviderKeys: buildProviderKeyStatus(state),
+    leaModel: modelInfo.id,
+    leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
+}
+
+function buildProviderKeyStatus(state) {
+  const status = {};
+  for (const family of LEA_MODEL_FAMILIES) {
+    status[family.id] = {
+      label: family.label,
+      configured: Boolean(getProviderApiKey(state, family.id))
+    };
+  }
+  return status;
+}
+
+function getProviderApiKey(state, familyId) {
+  const family = LEA_MODEL_FAMILY_BY_ID.get(familyId);
+  for (const envVar of family?.envVars || []) {
+    const value = String(state.env?.[envVar] || "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+async function validateProviderApiKeys({ fetchImpl, providerEnvPatch, selectedFamilyId, state }) {
+  const requests = new Map();
+  for (const [envVar, apiKey] of Object.entries(providerEnvPatch || {})) {
+    const family = LEA_MODEL_FAMILIES.find((candidate) => candidate.envVars.includes(envVar));
+    if (!family || !apiKey) continue;
+    requests.set(`${family.id}:${apiKey}`, { familyId: family.id, apiKey });
+  }
+
+  const selectedApiKey = getProviderApiKey(state, selectedFamilyId);
+  if (selectedApiKey) {
+    requests.set(`${selectedFamilyId}:${selectedApiKey}`, {
+      familyId: selectedFamilyId,
+      apiKey: selectedApiKey
+    });
+  }
+
+  for (const request of requests.values()) {
+    const result = await validateProviderApiKey(fetchImpl, request);
+    if (!result.ok) return result;
+  }
+  return { ok: true };
+}
+
+async function validateProviderApiKey(fetchImpl, { familyId, apiKey }) {
+  const family = LEA_MODEL_FAMILY_BY_ID.get(familyId);
+  const label = family?.label || familyId;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROVIDER_KEY_VALIDATION_TIMEOUT_MS);
+
+  try {
+    const response = await fetchImpl(providerValidationUrl(familyId, apiKey), {
+      method: "GET",
+      headers: providerValidationHeaders(familyId, apiKey),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        error: `invalid_${familyId}_key`,
+        message: `${label} API key was rejected by ${label}. Check the key and try again.`
+      };
+    }
+    if (!response.ok) {
+      return providerKeyVerificationError(familyId, label);
+    }
+    if (text) {
+      try {
+        JSON.parse(text);
+      } catch {
+        return providerKeyVerificationError(familyId, label);
+      }
+    }
+    return { ok: true };
+  } catch {
+    return providerKeyVerificationError(familyId, label);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function providerValidationUrl(familyId, apiKey) {
+  if (familyId === "openai") return "https://api.openai.com/v1/models";
+  if (familyId === "gemini") {
+    return `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+  }
+  if (familyId === "anthropic") return "https://api.anthropic.com/v1/models";
+  return "";
+}
+
+function providerValidationHeaders(familyId, apiKey) {
+  if (familyId === "openai") {
+    return { Authorization: `Bearer ${apiKey}` };
+  }
+  if (familyId === "anthropic") {
+    return {
+      "anthropic-version": "2023-06-01",
+      "x-api-key": apiKey
+    };
+  }
+  return {};
+}
+
+function providerKeyVerificationError(familyId, label) {
+  return {
+    ok: false,
+    error: `${familyId}_key_verification_failed`,
+    message: `Could not verify ${label} API key. Check your network connection or try again.`
+  };
+}
+
+function buildProviderEnvPatch(patchKeys) {
+  const patch = {};
+  if (!patchKeys || typeof patchKeys !== "object" || Array.isArray(patchKeys)) {
+    return patch;
+  }
+  for (const family of LEA_MODEL_FAMILIES) {
+    if (!Object.prototype.hasOwnProperty.call(patchKeys, family.id)) continue;
+    const value = String(patchKeys[family.id] || "").trim();
+    if (!value) continue;
+    const envVar = family.envVars[0];
+    patch[envVar] = value;
+  }
+  return patch;
+}
+
+function buildLegacyProviderEnvPatch(state) {
+  const patch = {};
+  const patchKeys = state.settings?.leaProviderApiKeys;
+  if (!patchKeys || typeof patchKeys !== "object" || Array.isArray(patchKeys)) {
+    return patch;
+  }
+  for (const family of LEA_MODEL_FAMILIES) {
+    if (getProviderApiKey(state, family.id)) continue;
+    const value = String(patchKeys[family.id] || "").trim();
+    if (value) {
+      patch[family.envVars[0]] = value;
+    }
+  }
+  return patch;
+}
+
+async function persistEnvPatch(envPath, patch) {
+  let content = "";
+  try {
+    content = await fs.readFile(envPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  const lines = content ? content.split(/\r?\n/) : [];
+  const seen = new Set();
+  const nextLines = lines.map((line) => {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
+    if (!match || !Object.prototype.hasOwnProperty.call(patch, match[1])) {
+      return line;
+    }
+    seen.add(match[1]);
+    return `${match[1]}=${formatEnvValue(patch[match[1]])}`;
+  });
+
+  for (const [key, value] of Object.entries(patch)) {
+    if (!seen.has(key)) {
+      nextLines.push(`${key}=${formatEnvValue(value)}`);
+    }
+  }
+
+  await fs.writeFile(envPath, `${nextLines.filter((line, index) => line || index < nextLines.length - 1).join("\n")}\n`, "utf8");
+}
+
+function formatEnvValue(value) {
+  const text = String(value);
+  return /[\s#"'\\]/.test(text) ? JSON.stringify(text) : text;
+}
+
+function normalizeLeaModelId(modelId) {
+  const raw = String(modelId || DEFAULT_LEA_MODEL);
+  return LEGACY_LEA_MODEL_ALIASES.get(raw) || raw;
+}
+
+function sanitizeRuntimeSettings(settings) {
+  const {
+    leaApiKey: _leaApiKey,
+    leaProviderApiKeys: _leaProviderApiKeys,
+    ...rest
+  } = settings || {};
+  return {
+    ...rest,
+    leaModel: normalizeLeaModelId(rest.leaModel || DEFAULT_LEA_MODEL)
+  };
+}
+
+function sanitizeSettingsForStorage(settings) {
+  return sanitizeRuntimeSettings(settings);
 }
 
 function validateLeaPayload(payload) {
@@ -352,13 +648,23 @@ function validateLeaRuntime(state, { requireApiKey }) {
   if (!existsSync(path.join(leaWorkspacePath, "lakefile.lean")) && !existsSync(path.join(leaWorkspacePath, "lakefile.toml"))) {
     return { ok: false, error: "invalid_lea_workspace", message: "Lea workspace must contain a lakefile." };
   }
-  if (requireApiKey && !state.env?.OPENAI_API_KEY) {
-    return { ok: false, error: "missing_openai_key", message: "OPENAI_API_KEY must be set before running Lea." };
-  }
   try {
     normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
   } catch {
     return { ok: false, error: "invalid_lea_api_url", message: "Lea API base URL must be an absolute http(s) URL." };
+  }
+  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL));
+  if (!modelInfo) {
+    return { ok: false, error: "invalid_lea_model", message: "Lea model must be one of the supported models." };
+  }
+  if (requireApiKey && !getProviderApiKey(state, modelInfo.family)) {
+    const family = LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family);
+    const envList = family?.envVars?.join(" or ") || "provider API key";
+    return {
+      ok: false,
+      error: `missing_${modelInfo.family}_key`,
+      message: `${family?.label || modelInfo.family} API key must be set in .env or the companion process environment as ${envList}.`
+    };
   }
   return { ok: true };
 }
@@ -371,6 +677,7 @@ async function createLeaJob({ state, target, theoremText }) {
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
+  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL)) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
 
   return {
     jobId,
@@ -392,9 +699,10 @@ async function createLeaJob({ state, target, theoremText }) {
     leaRepoPath: state.settings.leaRepoPath,
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
-    leaApiKeyConfigured: Boolean(state.settings.leaApiKey),
-    leaProvider: state.settings.leaProvider || DEFAULT_LEA_PROVIDER,
-    leaModel: state.settings.leaModel || DEFAULT_LEA_MODEL,
+    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
+    leaProvider: modelInfo.family,
+    leaProviderFamily: modelInfo.family,
+    leaModel: modelInfo.id,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
@@ -490,10 +798,10 @@ async function runLeaJob({ state, job, target, theoremText }) {
   const exit = await runLeaApiProofJob({
     fetchImpl: state.fetchImpl || fetch,
     baseUrl: job.leaApiBaseUrl,
-    apiKey: state.settings.leaApiKey,
+    apiKey: state.env?.LEA_API_KEY,
     model: job.leaModel,
     maxTurns: job.leaMaxTurns,
-    openAiApiKey: state.env?.OPENAI_API_KEY,
+    providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
     prompt,
     project: {
       project_id: target.projectSlug,
@@ -501,7 +809,15 @@ async function runLeaJob({ state, job, target, theoremText }) {
       record_on_success: true
     },
     logPath: job.logPath,
-    timeoutMs: job.leaJobTimeoutSeconds * 1000
+    timeoutMs: job.leaJobTimeoutSeconds * 1000,
+    onUsageUpdated: async (usage) => {
+      if (usage.delta) {
+        recordJobUsageDelta(job, usage);
+      } else {
+        recordJobUsageSnapshot(job, usage);
+      }
+      await writeJson(state.jobsPath, state.jobs);
+    }
   });
 
   const artifact = exit.ok
@@ -518,6 +834,7 @@ async function runLeaJob({ state, job, target, theoremText }) {
     job.recordedProofPath = artifact.entry.proofPath;
     job.moduleName = artifact.entry.moduleName || null;
   }
+  recordJobUsage(job, exit);
 
   const status = artifact?.ok
     ? await getLeaProofStatusFromEntry({
@@ -593,11 +910,12 @@ async function runLeaApiProofJob({
   apiKey,
   model,
   maxTurns,
-  openAiApiKey,
+  providerApiKey,
   prompt,
   project,
   logPath,
-  timeoutMs
+  timeoutMs,
+  onUsageUpdated = null
 }) {
   const started = Date.now();
   const headers = { "Content-Type": "application/json" };
@@ -609,7 +927,10 @@ async function runLeaApiProofJob({
     config: {
       model: {
         name: model,
-        ...(openAiApiKey ? { model_kwargs: { api_key: openAiApiKey } } : {})
+        model_kwargs: {
+          max_tokens: DEFAULT_LEA_MODEL_MAX_TOKENS,
+          ...(providerApiKey ? { api_key: providerApiKey } : {})
+        }
       },
       agent: {
         max_turns: maxTurns,
@@ -635,6 +956,16 @@ async function runLeaApiProofJob({
     return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
   }
   await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
+  const usageAbort = new AbortController();
+  const eventsPromise = tailLeaRunUsageEvents({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    apiRunId,
+    logPath,
+    onUsageUpdated,
+    signal: usageAbort.signal
+  });
 
   while (Date.now() - started < timeoutMs) {
     await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))));
@@ -643,6 +974,7 @@ async function runLeaApiProofJob({
       headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
     });
     if (!statusResponse.ok) {
+      usageAbort.abort();
       return { ok: false, timedOut: false, apiRunId, error: statusResponse.error };
     }
 
@@ -655,20 +987,250 @@ async function runLeaApiProofJob({
     if (["completed", "succeeded", "success", "done"].includes(status)) {
       const reason = String(run.result?.reason || "").toLowerCase();
       if (reason && !["success", "succeeded", "done", "completed"].includes(reason)) {
-        return { ok: false, timedOut: false, apiRunId, error: message || `Lea API completed with reason: ${reason}` };
+        usageAbort.abort();
+        await settleUsageEvents(eventsPromise);
+        return {
+          ok: false,
+          timedOut: false,
+          apiRunId,
+          error: message || `Lea API completed with reason: ${reason}`,
+          ...extractRunUsage(run)
+        };
       }
-      return { ok: true, timedOut: false, apiRunId };
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return { ok: true, timedOut: false, apiRunId, ...extractRunUsage(run) };
     }
     if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
-      return { ok: false, timedOut: false, apiRunId, error: message || `Lea API status: ${status}` };
+      usageAbort.abort();
+      await settleUsageEvents(eventsPromise);
+      return {
+        ok: false,
+        timedOut: false,
+        apiRunId,
+        error: message || `Lea API status: ${status}`,
+        ...extractRunUsage(run)
+      };
     }
   }
 
+  usageAbort.abort();
   return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out." };
+}
+
+async function tailLeaRunUsageEvents({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  apiRunId,
+  logPath,
+  onUsageUpdated,
+  signal
+}) {
+  if (!onUsageUpdated) return;
+
+  try {
+    const response = await fetchImpl(`${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/events`, {
+      method: "GET",
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      signal
+    });
+    if (!response?.ok || !response.body) {
+      return;
+    }
+
+    let buffer = "";
+    for await (const chunk of iterateResponseBody(response.body)) {
+      buffer += decodeChunk(chunk);
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() || "";
+      for (const frame of frames) {
+        const shouldContinue = await handleLeaEventFrame(frame, onUsageUpdated);
+        if (!shouldContinue) return;
+      }
+    }
+    if (buffer.trim()) {
+      await handleLeaEventFrame(buffer, onUsageUpdated);
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    await appendLog(logPath, `[backend] Lea usage event stream unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+async function handleLeaEventFrame(frame, onUsageUpdated) {
+  const data = frame
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart())
+    .join("\n")
+    .trim();
+  if (!data) return true;
+
+  let event;
+  try {
+    event = JSON.parse(data);
+  } catch {
+    return true;
+  }
+
+  if (event.type === "usage_updated") {
+    await onUsageUpdated({
+      inputTokens: event.input_tokens,
+      outputTokens: event.output_tokens,
+      totalTokens: toNonNegativeNumber(event.input_tokens) + toNonNegativeNumber(event.output_tokens),
+      costUsd: event.cost,
+      delta: true
+    });
+    return true;
+  }
+  if (event.type === "finished") {
+    if (event.usage || event.cost !== undefined) {
+      await onUsageUpdated(extractEventUsage(event));
+    }
+    return false;
+  }
+  if (event.type === "error") {
+    return false;
+  }
+  return true;
+}
+
+function extractEventUsage(event) {
+  const usage = event?.usage || event || {};
+  const inputTokens = toNonNegativeNumber(usage.input_tokens);
+  const outputTokens = toNonNegativeNumber(usage.output_tokens);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens,
+    costUsd: toNonNegativeNumber(event?.cost)
+  };
+}
+
+async function settleUsageEvents(eventsPromise) {
+  if (!eventsPromise) return;
+  try {
+    await Promise.race([eventsPromise, delay(25)]);
+  } catch {
+    // Usage events are best-effort; terminal run polling remains authoritative.
+  }
+}
+
+async function* iterateResponseBody(body) {
+  if (body?.[Symbol.asyncIterator]) {
+    yield* body;
+    return;
+  }
+  if (!body?.getReader) return;
+
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+}
+
+function decodeChunk(chunk) {
+  if (typeof chunk === "string") return chunk;
+  if (chunk instanceof Uint8Array) return new TextDecoder().decode(chunk);
+  return String(chunk);
 }
 
 function extractRunMessage(run) {
   return run.final_text || run.error || run.message || run.result?.text || "";
+}
+
+function extractRunUsage(run) {
+  const usage = run?.result?.usage || {};
+  const inputTokens = toNonNegativeNumber(usage.input_tokens);
+  const outputTokens = toNonNegativeNumber(usage.output_tokens);
+  const costUsd = toNonNegativeNumber(run?.result?.cost);
+  return {
+    usage: {
+      inputTokens,
+      outputTokens,
+      totalTokens: inputTokens + outputTokens
+    },
+    costUsd
+  };
+}
+
+function recordJobUsage(job, exit) {
+  if (!exit?.usage) return;
+  recordJobUsageSnapshot(job, {
+    ...exit.usage,
+    costUsd: exit.costUsd
+  });
+}
+
+function recordJobUsageSnapshot(job, usage) {
+  job.usage = {
+    inputTokens: toNonNegativeNumber(usage.inputTokens),
+    outputTokens: toNonNegativeNumber(usage.outputTokens),
+    totalTokens: toNonNegativeNumber(usage.totalTokens) ||
+      toNonNegativeNumber(usage.inputTokens) + toNonNegativeNumber(usage.outputTokens)
+  };
+  job.costUsd = toNonNegativeNumber(usage.costUsd);
+}
+
+function recordJobUsageDelta(job, usage) {
+  const current = job.usage || {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0
+  };
+  const inputTokens = toNonNegativeNumber(current.inputTokens) + toNonNegativeNumber(usage.inputTokens);
+  const outputTokens = toNonNegativeNumber(current.outputTokens) + toNonNegativeNumber(usage.outputTokens);
+  job.usage = {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + outputTokens
+  };
+  job.costUsd = Number((toNonNegativeNumber(job.costUsd) + toNonNegativeNumber(usage.costUsd)).toFixed(6));
+}
+
+function aggregateUsage(jobs, { overleafProjectId } = {}) {
+  const projectSlug = overleafProjectId ? slugProjectId(overleafProjectId) : "";
+  const aggregate = {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    runCount: 0
+  };
+
+  for (const job of Object.values(jobs || {})) {
+    if (overleafProjectId && job.overleafProjectId !== overleafProjectId && job.projectSlug !== projectSlug) {
+      continue;
+    }
+    if (!job.usage) {
+      continue;
+    }
+    aggregate.inputTokens += toNonNegativeNumber(job.usage.inputTokens);
+    aggregate.outputTokens += toNonNegativeNumber(job.usage.outputTokens);
+    aggregate.totalTokens += toNonNegativeNumber(job.usage.totalTokens);
+    aggregate.costUsd += toNonNegativeNumber(job.costUsd);
+    aggregate.runCount += 1;
+  }
+
+  aggregate.costUsd = Number(aggregate.costUsd.toFixed(6));
+  return aggregate;
+}
+
+function toNonNegativeNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function normalizeLeaMaxTurns(value) {
+  const parsed = Number.parseInt(String(value || DEFAULT_LEA_MAX_TURNS), 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_MAX_TURNS;
 }
 
 async function fetchJson(fetchImpl, url, options) {
