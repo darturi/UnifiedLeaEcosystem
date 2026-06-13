@@ -704,6 +704,7 @@ async function createLeaJob({ state, target, theoremText }) {
     leaProviderFamily: modelInfo.family,
     leaModel: modelInfo.id,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaCurrentTurn: null,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
 }
@@ -817,6 +818,10 @@ async function runLeaJob({ state, job, target, theoremText }) {
         recordJobUsageSnapshot(job, usage);
       }
       await writeJson(state.jobsPath, state.jobs);
+    },
+    onProgressUpdated: async (progress) => {
+      if (!recordJobTurnProgress(job, progress)) return;
+      await writeJson(state.jobsPath, state.jobs);
     }
   });
 
@@ -915,7 +920,8 @@ async function runLeaApiProofJob({
   project,
   logPath,
   timeoutMs,
-  onUsageUpdated = null
+  onUsageUpdated = null,
+  onProgressUpdated = null
 }) {
   const started = Date.now();
   const headers = { "Content-Type": "application/json" };
@@ -963,7 +969,9 @@ async function runLeaApiProofJob({
     apiKey,
     apiRunId,
     logPath,
+    maxTurns,
     onUsageUpdated,
+    onProgressUpdated,
     signal: usageAbort.signal
   });
 
@@ -979,6 +987,7 @@ async function runLeaApiProofJob({
     }
 
     const run = statusResponse.body || {};
+    await notifyTurnProgress(onProgressUpdated, run, maxTurns);
     const status = String(run.status || run.state || "").toLowerCase();
     const message = extractRunMessage(run);
     if (message) {
@@ -1024,10 +1033,12 @@ async function tailLeaRunUsageEvents({
   apiKey,
   apiRunId,
   logPath,
+  maxTurns,
   onUsageUpdated,
+  onProgressUpdated,
   signal
 }) {
-  if (!onUsageUpdated) return;
+  if (!onUsageUpdated && !onProgressUpdated) return;
 
   try {
     const response = await fetchImpl(`${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/events`, {
@@ -1045,12 +1056,12 @@ async function tailLeaRunUsageEvents({
       const frames = buffer.split(/\r?\n\r?\n/);
       buffer = frames.pop() || "";
       for (const frame of frames) {
-        const shouldContinue = await handleLeaEventFrame(frame, onUsageUpdated);
+        const shouldContinue = await handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated });
         if (!shouldContinue) return;
       }
     }
     if (buffer.trim()) {
-      await handleLeaEventFrame(buffer, onUsageUpdated);
+      await handleLeaEventFrame(buffer, { maxTurns, onUsageUpdated, onProgressUpdated });
     }
   } catch (error) {
     if (error?.name === "AbortError") return;
@@ -1058,7 +1069,7 @@ async function tailLeaRunUsageEvents({
   }
 }
 
-async function handleLeaEventFrame(frame, onUsageUpdated) {
+async function handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated }) {
   const data = frame
     .split(/\r?\n/)
     .filter((line) => line.startsWith("data:"))
@@ -1074,18 +1085,22 @@ async function handleLeaEventFrame(frame, onUsageUpdated) {
     return true;
   }
 
+  await notifyTurnProgress(onProgressUpdated, event, maxTurns);
+
   if (event.type === "usage_updated") {
-    await onUsageUpdated({
-      inputTokens: event.input_tokens,
-      outputTokens: event.output_tokens,
-      totalTokens: toNonNegativeNumber(event.input_tokens) + toNonNegativeNumber(event.output_tokens),
-      costUsd: event.cost,
-      delta: true
-    });
+    if (onUsageUpdated) {
+      await onUsageUpdated({
+        inputTokens: event.input_tokens,
+        outputTokens: event.output_tokens,
+        totalTokens: toNonNegativeNumber(event.input_tokens) + toNonNegativeNumber(event.output_tokens),
+        costUsd: event.cost,
+        delta: true
+      });
+    }
     return true;
   }
   if (event.type === "finished") {
-    if (event.usage || event.cost !== undefined) {
+    if (onUsageUpdated && (event.usage || event.cost !== undefined)) {
       await onUsageUpdated(extractEventUsage(event));
     }
     return false;
@@ -1106,6 +1121,13 @@ function extractEventUsage(event) {
     totalTokens: inputTokens + outputTokens,
     costUsd: toNonNegativeNumber(event?.cost)
   };
+}
+
+async function notifyTurnProgress(onProgressUpdated, payload, defaultMaxTurns = null) {
+  if (!onProgressUpdated) return;
+  const progress = extractTurnProgress(payload, defaultMaxTurns);
+  if (!progress) return;
+  await onProgressUpdated(progress);
 }
 
 async function settleUsageEvents(eventsPromise) {
@@ -1195,6 +1217,58 @@ function recordJobUsageDelta(job, usage) {
   job.costUsd = Number((toNonNegativeNumber(job.costUsd) + toNonNegativeNumber(usage.costUsd)).toFixed(6));
 }
 
+function recordJobTurnProgress(job, progress) {
+  const current = toPositiveInteger(progress?.current);
+  const max = toPositiveInteger(progress?.max) || toPositiveInteger(job.leaMaxTurns);
+  if (!current || !max) return false;
+  if (job.leaCurrentTurn === current && job.leaMaxTurns === max) return false;
+  job.leaCurrentTurn = current;
+  job.leaMaxTurns = max;
+  return true;
+}
+
+function extractTurnProgress(payload, defaultMaxTurns = null) {
+  const current = firstPositiveInteger(payload, [
+    "current_turn",
+    "currentTurn",
+    "turn",
+    "turn_index",
+    "turnIndex",
+    "agent_turn",
+    "agentTurn"
+  ]);
+  const max = firstPositiveInteger(payload, [
+    "max_turns",
+    "maxTurns",
+    "maximum_turns",
+    "maximumTurns"
+  ]) || toPositiveInteger(defaultMaxTurns);
+  if (!current || !max) return null;
+  return { current, max };
+}
+
+function firstPositiveInteger(payload, keys) {
+  for (const source of turnProgressSources(payload)) {
+    for (const key of keys) {
+      const value = toPositiveInteger(source?.[key]);
+      if (value) return value;
+    }
+  }
+  return 0;
+}
+
+function turnProgressSources(payload) {
+  if (!payload || typeof payload !== "object") return [];
+  return [
+    payload,
+    payload.progress,
+    payload.result,
+    payload.result?.progress,
+    payload.agent,
+    payload.agent?.progress
+  ].filter((source) => source && typeof source === "object");
+}
+
 function aggregateUsage(jobs, { overleafProjectId } = {}) {
   const projectSlug = overleafProjectId ? slugProjectId(overleafProjectId) : "";
   const aggregate = {
@@ -1226,6 +1300,11 @@ function aggregateUsage(jobs, { overleafProjectId } = {}) {
 function toNonNegativeNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function toPositiveInteger(value) {
+  const number = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(number) && number >= 1 ? number : 0;
 }
 
 function normalizeLeaMaxTurns(value) {
@@ -1329,7 +1408,7 @@ async function readLogTail(logPath, maxChars = 4000) {
 
 function buildJobResponse({ job, status, target }) {
   const declarationName = job.declarationName || target.declarationName || target.theoremLabel;
-  return {
+  const response = {
     status,
     jobId: job.jobId,
     theoremLabel: target.theoremLabel,
@@ -1347,6 +1426,19 @@ function buildJobResponse({ job, status, target }) {
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };
+  const turnProgress = buildTurnProgress(job, status);
+  if (turnProgress) {
+    response.turnProgress = turnProgress;
+  }
+  return response;
+}
+
+function buildTurnProgress(job, status) {
+  if (status !== "in_progress") return null;
+  const current = toPositiveInteger(job.leaCurrentTurn);
+  const max = toPositiveInteger(job.leaMaxTurns);
+  if (!current || !max) return null;
+  return { current, max };
 }
 
 async function getTheoremStatus({
