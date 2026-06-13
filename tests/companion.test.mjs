@@ -486,6 +486,121 @@ test("statuses report active Lea jobs as in progress", async () => {
   assert.equal(statuses.body.statuses.active_status_test.status, "in_progress");
 });
 
+test("formalize response includes turn progress after Lea events report a current turn", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([], {
+      eventFrames: [
+        { type: "turn_started", turn: 6 }
+      ]
+    })
+  });
+  const payload = {
+    overleafProjectId: "project-1",
+    theoremLabel: "event_turn_test",
+    theoremText: "A theorem."
+  };
+
+  const first = await handleFormalize(payload, state);
+  await waitFor(() => state.jobs[first.body.jobId]?.leaCurrentTurn === 6);
+  const second = await handleFormalize(payload, state);
+
+  assert.equal(second.statusCode, 200);
+  assert.deepEqual(second.body.turnProgress, { current: 6, max: 20 });
+});
+
+test("statuses include turn progress for active Lea jobs", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([], {
+      eventFrames: [
+        { type: "turn_started", turn: 6 }
+      ]
+    })
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "active_progress_test",
+    theoremText: "A theorem."
+  }, state);
+
+  await waitFor(() => state.jobs[result.body.jobId]?.leaCurrentTurn === 6);
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "active_progress_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.deepEqual(statuses.body.statuses.active_progress_test.turnProgress, { current: 6, max: 20 });
+});
+
+test("status polling updates active Lea job turn progress when events omit it", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([], {
+      statusBody: {
+        run_id: "api-run-1",
+        status: "running",
+        progress: {
+          turn: 6
+        }
+      }
+    })
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "poll_turn_test",
+    theoremText: "A theorem."
+  }, state);
+
+  await waitFor(() => state.jobs[result.body.jobId]?.leaCurrentTurn === 6);
+  assert.deepEqual(state.jobs[result.body.jobId].leaMaxTurns, 20);
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "poll_turn_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.deepEqual(statuses.body.statuses.poll_turn_test.turnProgress, { current: 6, max: 20 });
+});
+
+test("active Lea job omits turn progress when current turn is unknown or invalid", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([], {
+      eventFrames: [
+        { type: "agent_progress", current_turn: 0, max_turns: 20 }
+      ]
+    })
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "unknown_turn_test",
+    theoremText: "A theorem."
+  }, state);
+
+  await waitFor(() => state.jobs[result.body.jobId]?.status === "in_progress");
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "unknown_turn_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.unknown_turn_test.status, "in_progress");
+  assert.equal(statuses.body.statuses.unknown_turn_test.turnProgress, undefined);
+});
+
 test("statuses report formalized proofs recorded in Lea project markdown", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });

@@ -106,7 +106,7 @@
     confirmButton.textContent = buttonTextForStatus(currentStatus);
     confirmButton.disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
     if (currentStatus === "in_progress") {
-      status.textContent = "Lea proof is in progress.";
+      status.textContent = inProgressMessage(latestStatuses[theorem.label]);
     } else if (isExtensionContextInvalidated()) {
       status.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
     }
@@ -318,7 +318,7 @@
     } else if (statusInfo.relativePath) {
       detail.textContent = statusInfo.relativePath;
     } else if (currentStatus === "in_progress") {
-      detail.textContent = "Lea proof is in progress.";
+      detail.textContent = inProgressMessage(statusInfo);
     } else {
       detail.textContent = "Ready to send this theorem to Lea.";
     }
@@ -442,9 +442,20 @@
       const badge = document.createElement("button");
       badge.className = `ol-lean-status ol-lean-status-${status}`;
       badge.type = "button";
-      badge.textContent = formatStatus(status);
-      badge.title = statusInfo.message || `Lean status for ${theorem.label}: ${formatStatus(status)}`;
-      badge.setAttribute("aria-label", `Open Lea popover for ${theorem.label}. Status: ${formatStatus(status)}.`);
+      badge.appendChild(document.createTextNode(formatStatus(status)));
+      const turnProgress = getTurnProgressDisplay(statusInfo);
+      if (turnProgress.text) {
+        const progress = document.createElement("span");
+        progress.className = `ol-lean-status-progress${turnProgress.pending ? " ol-lean-status-progress-pending" : ""}`;
+        progress.textContent = turnProgress.text;
+        if (turnProgress.pending) {
+          progress.setAttribute("aria-hidden", "true");
+        }
+        badge.appendChild(progress);
+      }
+      const statusLabel = `${formatStatus(status)}${turnProgress.label ? ` ${turnProgress.label}` : ""}`;
+      badge.title = statusInfo.message || `Lean status for ${theorem.label}: ${statusLabel}`;
+      badge.setAttribute("aria-label", `Open Lea popover for ${theorem.label}. Status: ${statusLabel}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
       badge.style.top = `${coords.top}px`;
       badge.addEventListener("click", (event) => {
@@ -475,6 +486,28 @@
       default:
         return "checking";
     }
+  }
+
+  function inProgressMessage(statusInfo) {
+    const turnProgressText = formatTurnProgress(statusInfo);
+    return turnProgressText
+      ? `Lea proof is in progress: ${turnProgressText}.`
+      : "Lea proof is in progress. Waiting for the first turn update.";
+  }
+
+  function getTurnProgressDisplay(statusInfo) {
+    if (statusInfo?.status !== "in_progress") return { text: "", label: "", pending: false };
+    const turnProgressText = formatTurnProgress(statusInfo);
+    if (turnProgressText) return { text: turnProgressText, label: turnProgressText, pending: false };
+    return { text: "...", label: "progress pending", pending: true };
+  }
+
+  function formatTurnProgress(statusInfo) {
+    if (statusInfo?.status !== "in_progress") return "";
+    const current = Number.parseInt(String(statusInfo.turnProgress?.current || ""), 10);
+    const max = Number.parseInt(String(statusInfo.turnProgress?.max || ""), 10);
+    if (!Number.isFinite(current) || current < 1 || !Number.isFinite(max) || max < 1) return "";
+    return `${current}/${max}`;
   }
 
   function renderLeanStatement(element, statement) {
