@@ -7,60 +7,66 @@ import {
 } from "../shared/theoremParser.mjs";
 
 test("detects a labeled theorem", () => {
-  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}");
-  assert.equal(theorem.label, "foo");
-  assert.equal(theorem.text, "A");
-  assert.deepEqual(theorem.uses, []);
-});
-
-test("keeps legacy optional labels working", () => {
   const [theorem] = parseTheorems("\\theorem[label=foo]{A}");
   assert.equal(theorem.label, "foo");
   assert.equal(theorem.text, "A");
   assert.deepEqual(theorem.uses, []);
 });
 
-test("parses a single theorem use after the label", () => {
-  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}\\uses{bar}");
+test("accepts braced scalar metadata values", () => {
+  const [theorem] = parseTheorems("\\theorem[label={foo}]{A}");
   assert.equal(theorem.label, "foo");
-  assert.deepEqual(theorem.uses, ["bar"]);
-  assert.equal(theorem.to, "\\theorem{A}\\label{foo}\\uses{bar}".length);
+  assert.equal(theorem.text, "A");
+  assert.deepEqual(theorem.uses, []);
 });
 
-test("parses a theorem use from a LaTeX comment after the label", () => {
-  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}\n% \\uses{bar}");
+test("parses a single theorem use from metadata", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, uses={bar}]{A}");
   assert.equal(theorem.label, "foo");
   assert.deepEqual(theorem.uses, ["bar"]);
-  assert.equal(theorem.to, "\\theorem{A}\\label{foo}\n% \\uses{bar}".length);
+  assert.equal(theorem.to, "\\theorem[label=foo, uses={bar}]{A}".length);
 });
 
-test("parses multiple theorem uses with whitespace", () => {
-  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}\n% \\uses{ bar,\n baz, qux }");
+test("parses multiple theorem uses from metadata", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, uses={bar, baz, qux}]{A}");
+  assert.equal(theorem.label, "foo");
   assert.deepEqual(theorem.uses, ["bar", "baz", "qux"]);
 });
 
-test("parses theorem uses with legacy optional labels", () => {
-  const [theorem] = parseTheorems("\\theorem[label=foo]{A}\\uses{bar}");
+test("handles whitespace and newlines in metadata", () => {
+  const [theorem] = parseTheorems("\\theorem[\n  label = {foo},\n  uses = { bar,\n baz, qux }\n]{A}");
   assert.equal(theorem.label, "foo");
-  assert.deepEqual(theorem.uses, ["bar"]);
+  assert.deepEqual(theorem.uses, ["bar", "baz", "qux"]);
+});
+
+test("splits metadata only on top-level commas", () => {
+  const [theorem] = parseTheorems("\\theorem[uses={bar, baz}, label=foo]{A}");
+  assert.equal(theorem.label, "foo");
+  assert.deepEqual(theorem.uses, ["bar", "baz"]);
 });
 
 test("handles multiline theorem bodies", () => {
-  const [theorem] = parseTheorems("\\theorem{\nA\nB\n}\\label{foo}");
+  const [theorem] = parseTheorems("\\theorem[label=foo]{\nA\nB\n}");
   assert.equal(theorem.text, "A\nB");
 });
 
 test("handles nested braces", () => {
-  const [theorem] = parseTheorems("\\theorem{A_{n} and {nested {text}}}\\label{foo}");
+  const [theorem] = parseTheorems("\\theorem[label=foo]{A_{n} and {nested {text}}}");
   assert.equal(theorem.text, "A_{n} and {nested {text}}");
 });
 
-test("ignores unlabeled theorems", () => {
+test("ignores theorems without metadata", () => {
   assert.deepEqual(parseTheorems("\\theorem{A}"), []);
+});
+
+test("ignores theorems without valid metadata labels", () => {
+  assert.deepEqual(parseTheorems("\\theorem[uses={bar}]{A}"), []);
+  assert.deepEqual(parseTheorems("\\theorem[label=invalid-label]{A}"), []);
 });
 
 test("ignores malformed theorem blocks", () => {
   assert.deepEqual(parseTheorems("\\theorem[label=foo]{A"), []);
+  assert.deepEqual(parseTheorems("\\theorem[label=foo{A}"), []);
 });
 
 test("validates Lean identifiers", () => {
