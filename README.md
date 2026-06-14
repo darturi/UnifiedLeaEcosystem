@@ -32,6 +32,16 @@ To point Lea at especially helpful prior results, add `uses={...}` with one or m
 
 Each `uses={...}` entry must be a valid label in the same Overleaf project and must already be formalized. The companion resolves those labels to Lea's recorded theorem names and proof files before starting the new run.
 
+To give Lea natural-language formalization tips, add `context={...}`:
+
+```tex
+\theorem[label=my_guided_theorem, context={Use induction on n, then simplify.}]{
+  Prove this with the suggested strategy.
+}
+```
+
+When provided, the context is added to the Lea prompt as formalization guidance. Use braces around context text that contains commas or spans multiple lines, just as with `uses={...}`.
+
 For a minimal test document, define the display macro in the preamble. The optional argument is consumed by the extension and ignored by LaTeX rendering:
 
 ```tex

@@ -11,6 +11,7 @@ test("detects a labeled theorem", () => {
   assert.equal(theorem.label, "foo");
   assert.equal(theorem.text, "A");
   assert.deepEqual(theorem.uses, []);
+  assert.equal(theorem.context, "");
 });
 
 test("accepts braced scalar metadata values", () => {
@@ -39,10 +40,49 @@ test("handles whitespace and newlines in metadata", () => {
   assert.deepEqual(theorem.uses, ["bar", "baz", "qux"]);
 });
 
+test("accepts newline-separated theorem metadata entries", () => {
+  const [theorem] = parseTheorems("\\theorem[\n  label=foo\n  context={Use the hypothesis to rewrite n as 2 * k, then simplify the square.}\n]{A}");
+  assert.equal(theorem.label, "foo");
+  assert.equal(theorem.context, "Use the hypothesis to rewrite n as 2 * k, then simplify the square.");
+});
+
 test("splits metadata only on top-level commas", () => {
   const [theorem] = parseTheorems("\\theorem[uses={bar, baz}, label=foo]{A}");
   assert.equal(theorem.label, "foo");
   assert.deepEqual(theorem.uses, ["bar", "baz"]);
+});
+
+test("parses theorem context from metadata", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, context={Use induction on n.}]{A}");
+  assert.equal(theorem.context, "Use induction on n.");
+});
+
+test("parses unbraced theorem context from metadata", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, context=Use simp first]{A}");
+  assert.equal(theorem.context, "Use simp first");
+});
+
+test("preserves commas inside braced theorem context", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, context={Use simp, then omega.}, uses={bar}]{A}");
+  assert.equal(theorem.context, "Use simp, then omega.");
+  assert.deepEqual(theorem.uses, ["bar"]);
+});
+
+test("parses theorem context containing square-bracket Lean attributes", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, context=try [simp]]{A}");
+  assert.equal(theorem.label, "foo");
+  assert.equal(theorem.context, "try [simp]");
+});
+
+test("keeps commas inside square-bracket theorem context", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, context=try [simp, omega], uses={bar}]{A}");
+  assert.equal(theorem.context, "try [simp, omega]");
+  assert.deepEqual(theorem.uses, ["bar"]);
+});
+
+test("normalizes empty theorem context", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo, context={   }]{A}");
+  assert.equal(theorem.context, "");
 });
 
 test("handles multiline theorem bodies", () => {

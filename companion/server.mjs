@@ -141,7 +141,7 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, theoremLabel, theoremText, theoremUses } = validation;
+  const { overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext } = validation;
   const expectedHash = hashTheoremText(theoremText);
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
@@ -181,12 +181,12 @@ export async function handleFormalize(payload, state) {
     theoremText,
     jobs: state.jobs || {}
   });
-  const job = await createLeaJob({ state, target, theoremText, resolvedUses: usesResolution.resolvedUses });
+  const job = await createLeaJob({ state, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses });
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
-  runLeaJob({ state, job, target, theoremText, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
+  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
     job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
@@ -603,6 +603,7 @@ function validateLeaPayload(payload) {
   const overleafProjectId = String(payload.overleafProjectId || "");
   const theoremLabel = String(payload.theoremLabel || "");
   const theoremText = String(payload.theoremText || "");
+  const theoremContext = String(payload.theoremContext || "").trim();
   const theoremUses = Array.isArray(payload.theoremUses)
     ? payload.theoremUses.map((value) => String(value || "").trim()).filter(Boolean)
     : [];
@@ -619,7 +620,7 @@ function validateLeaPayload(payload) {
   if (!theoremText.trim()) {
     return { ok: false, error: "missing_theorem_text", message: "Theorem text is required." };
   }
-  return { ok: true, overleafProjectId, theoremLabel, theoremText, theoremUses };
+  return { ok: true, overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext };
 }
 
 function buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel }) {
@@ -723,7 +724,7 @@ function validateLeaRuntime(state, { requireApiKey }) {
   return { ok: true };
 }
 
-async function createLeaJob({ state, target, theoremText, resolvedUses = [] }) {
+async function createLeaJob({ state, target, theoremText, theoremContext = "", resolvedUses = [] }) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jobId = `${target.theoremLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
@@ -745,6 +746,7 @@ async function createLeaJob({ state, target, theoremText, resolvedUses = [] }) {
     declarationName: target.theoremLabel,
     declarationNameHint: declarationNameHint || null,
     theoremUses: resolvedUses,
+    theoremContext,
     theoremTextHash: hashTheoremText(theoremText),
     relativePath: target.relativePath,
     absolutePath: target.absolutePath,
@@ -842,12 +844,13 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
   return sections.map((section) => section.entry.name);
 }
 
-async function runLeaJob({ state, job, target, theoremText, resolvedUses = [] }) {
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
   const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
     projectSlug: target.projectSlug,
     theoremLabel: target.theoremLabel,
     theoremText,
+    theoremContext,
     declarationNameHint: job.declarationNameHint || "",
     resolvedUses
   });
@@ -948,7 +951,7 @@ async function runLeaJob({ state, job, target, theoremText, resolvedUses = [] })
   await writeJson(state.jobsPath, state.jobs);
 }
 
-function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, declarationNameHint, resolvedUses = [] }) {
+function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [] }) {
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -958,12 +961,16 @@ function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, declarationNam
     : `\n${resolvedUses.map((use) => (
       `To formalize the theorem make use of the ${use.declarationName} theorem at ${use.absolutePath}.`
     )).join("\n")}\n`;
+  const formalizationGuidance = theoremContext.trim()
+    ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
+    : "";
 
   return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
 ${naming}
 ${usesGuidance}
 
 ${theoremText}
+${formalizationGuidance}
 
 The final file must compile with no sorry/admit in theorem ${proofTarget}.
 Use the Lea project context to choose the project namespace and proof path.

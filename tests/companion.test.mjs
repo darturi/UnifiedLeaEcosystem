@@ -393,6 +393,50 @@ test("formalize starts Lea without root workspace paths", async () => {
   assert.doesNotMatch(calls[0].body.task, /also record the theorem/);
 });
 
+test("formalize includes optional theorem context in the Lea prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "context_test",
+    theoremText: "A theorem.",
+    theoremContext: "Use induction on n."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.length > 0);
+  assert.match(calls[0].body.task, /A theorem\.\n\nFormalization Guidance: Use induction on n\./);
+  assert.equal(state.jobs[result.body.jobId].theoremContext, "Use induction on n.");
+});
+
+test("formalize omits blank theorem context from the Lea prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "blank_context_test",
+    theoremText: "A theorem.",
+    theoremContext: "   "
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.length > 0);
+  assert.doesNotMatch(calls[0].body.task, /Formalization Guidance:/);
+  assert.equal(state.jobs[result.body.jobId].theoremContext, "");
+});
+
 test("formalize sends the selected model family key to Lea", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
@@ -814,7 +858,8 @@ test("formalize includes multiple resolved theorem uses in source order", async 
       overleafProjectId: "project-1",
       theoremLabel: "multi_use_target",
       theoremText: "theorem multi_use_target : True := by",
-      theoremUses: ["first_label", "second_label"]
+      theoremUses: ["first_label", "second_label"],
+      theoremContext: "Reuse the support lemmas in the listed order."
     }, state);
 
     await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
@@ -824,6 +869,7 @@ test("formalize includes multiple resolved theorem uses in source order", async 
     assert.notEqual(firstIndex, -1);
     assert.notEqual(secondIndex, -1);
     assert.ok(firstIndex < secondIndex);
+    assert.match(task, /Formalization Guidance: Reuse the support lemmas in the listed order\./);
   } finally {
     restorePath();
   }

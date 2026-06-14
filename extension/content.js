@@ -336,6 +336,7 @@
         theoremLabel: theorem.label,
         theoremText: theorem.text,
         theoremUses: theorem.uses || [],
+        theoremContext: theorem.context || "",
         sourceHash: await sha256(normalizeTheoremText(theorem.text))
       })
     });
