@@ -2,6 +2,7 @@
   const THEOREM_PREFIX = "\\theorem";
   const LABEL_PREFIX = "[label=";
   const LATEX_LABEL_PREFIX = "\\label";
+  const LATEX_USES_PREFIX = "\\uses";
   let activeView = null;
 
   window.addEventListener("UNSTABLE_editor:extensions", (event) => {
@@ -91,6 +92,7 @@
       theorems: theorems.map((theorem) => ({
         label: theorem.label,
         text: theorem.text,
+        uses: theorem.uses,
         from: theorem.from,
         to: theorem.to,
         coords: getTheoremCoords(view, theorem)
@@ -176,6 +178,9 @@
             : parseTrailingLatexLabel(source, theoremEnd);
           if (!labelResult.ok) return { ok: false };
           theoremEnd = labelResult.end;
+          const usesResult = parseTrailingLatexUses(source, theoremEnd);
+          if (!usesResult.ok) return { ok: false };
+          theoremEnd = usesResult.end;
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(labelResult.label)) return { ok: false };
 
           return {
@@ -183,6 +188,7 @@
             theorem: {
               label: labelResult.label,
               text: source.slice(bodyFrom, bodyEnd).trim(),
+              uses: usesResult.uses,
               from: start,
               to: theoremEnd
             }
@@ -211,6 +217,38 @@
       ok: true,
       label: source.slice(labelStart, labelEnd).trim(),
       end: labelEnd + 1
+    };
+  }
+
+  function parseTrailingLatexUses(source, cursor) {
+    const originalCursor = cursor;
+    cursor = skipWhitespace(source, cursor);
+    if (source[cursor] === "%" && source[cursor - 1] !== "\\") {
+      const commentUsesStart = skipWhitespace(source, cursor + 1);
+      if (!source.startsWith(LATEX_USES_PREFIX, commentUsesStart)) {
+        return { ok: true, uses: [], end: originalCursor };
+      }
+      cursor = commentUsesStart;
+    }
+
+    if (!source.startsWith(LATEX_USES_PREFIX, cursor)) {
+      return { ok: true, uses: [], end: originalCursor };
+    }
+
+    cursor = skipWhitespace(source, cursor + LATEX_USES_PREFIX.length);
+    if (source[cursor] !== "{") return { ok: false };
+
+    const usesStart = cursor + 1;
+    const usesEnd = source.indexOf("}", usesStart);
+    if (usesEnd === -1) return { ok: false };
+
+    return {
+      ok: true,
+      uses: source.slice(usesStart, usesEnd)
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean),
+      end: usesEnd + 1
     };
   }
 

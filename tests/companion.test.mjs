@@ -696,6 +696,179 @@ test("formalize maps an Overleaf label to the Lean artifact Lea records", async 
   }
 });
 
+test("formalize includes resolved theorem uses in the Lea prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const dependencyProofPath = path.join("workspace", "proofs", "Lea", "Project1", "even_square_of_even.lean");
+  const targetProofPath = path.join("workspace", "proofs", "Lea", "Project1", "even_square_of_double_plus_double.lean");
+  const restorePath = await installFakeLake();
+  try {
+    await writeLeaProjectProof(
+      leaRepo,
+      dependencyProofPath,
+      "theorem even_square_of_even : True := by\n  trivial\n"
+    );
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(
+            leaRepo,
+            targetProofPath,
+            "theorem even_square_of_double_plus_double : True := by\n  trivial\n"
+          );
+          await writeLeaProjectMarkdown(leaRepo, "project-1", {
+            theoremName: "even_square_of_double_plus_double",
+            proofPath: targetProofPath,
+            moduleName: "Lea.Project1.even_square_of_double_plus_double"
+          });
+        }
+      })
+    });
+    state.jobs["epsilon-one-job"] = {
+      jobId: "epsilon-one-job",
+      jobKey: "project-1:epsilon_one",
+      status: "formalized",
+      declarationName: "even_square_of_even",
+      recordedProofPath: dependencyProofPath,
+      moduleName: "Lea.Project1.even_square_of_even",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      finishedAt: "2026-01-01T00:00:01.000Z"
+    };
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "epsilon_two",
+      theoremText: [
+        "Theorem name: even_square_of_double_plus_double",
+        "Lean signature:",
+        "theorem even_square_of_double_plus_double : True := by"
+      ].join("\n"),
+      theoremUses: ["epsilon_one"]
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    assert.equal(result.statusCode, 200);
+    assert.match(
+      calls[0].body.task,
+      new RegExp(`To formalize the theorem make use of the even_square_of_even theorem at ${escapeRegExp(path.join(leaRepo, dependencyProofPath))}\\.`)
+    );
+    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
+      theoremLabel: "epsilon_one",
+      declarationName: "even_square_of_even",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath),
+      moduleName: "Lea.Project1.even_square_of_even"
+    }]);
+  } finally {
+    restorePath();
+  }
+});
+
+test("formalize includes multiple resolved theorem uses in source order", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const firstProofPath = path.join("workspace", "proofs", "Lea", "Project1", "first_support.lean");
+  const secondProofPath = path.join("workspace", "proofs", "Lea", "Project1", "second_support.lean");
+  const targetProofPath = path.join("workspace", "proofs", "Lea", "Project1", "multi_use_target.lean");
+  const restorePath = await installFakeLake();
+  try {
+    await writeLeaProjectProof(leaRepo, firstProofPath, "theorem first_support : True := by\n  trivial\n");
+    await writeLeaProjectProof(leaRepo, secondProofPath, "theorem second_support : True := by\n  trivial\n");
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, targetProofPath, "theorem multi_use_target : True := by\n  trivial\n");
+          await writeLeaProjectMarkdown(leaRepo, "project-1", {
+            theoremName: "multi_use_target",
+            proofPath: targetProofPath
+          });
+        }
+      })
+    });
+    state.jobs["first-support-job"] = {
+      jobId: "first-support-job",
+      jobKey: "project-1:first_label",
+      status: "formalized",
+      declarationName: "first_support",
+      recordedProofPath: firstProofPath,
+      startedAt: "2026-01-01T00:00:00.000Z",
+      finishedAt: "2026-01-01T00:00:01.000Z"
+    };
+    state.jobs["second-support-job"] = {
+      jobId: "second-support-job",
+      jobKey: "project-1:second_label",
+      status: "formalized",
+      declarationName: "second_support",
+      recordedProofPath: secondProofPath,
+      startedAt: "2026-01-01T00:00:02.000Z",
+      finishedAt: "2026-01-01T00:00:03.000Z"
+    };
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "multi_use_target",
+      theoremText: "theorem multi_use_target : True := by",
+      theoremUses: ["first_label", "second_label"]
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    const task = calls[0].body.task;
+    const firstIndex = task.indexOf(`make use of the first_support theorem at ${path.join(leaRepo, firstProofPath)}.`);
+    const secondIndex = task.indexOf(`make use of the second_support theorem at ${path.join(leaRepo, secondProofPath)}.`);
+    assert.notEqual(firstIndex, -1);
+    assert.notEqual(secondIndex, -1);
+    assert.ok(firstIndex < secondIndex);
+  } finally {
+    restorePath();
+  }
+});
+
+test("formalize blocks unresolved theorem uses", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "needs_support",
+    theoremText: "A theorem.",
+    theoremUses: ["missing_support"]
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "unresolved_uses");
+  assert.match(result.body.message, /missing_support/);
+  assert.equal(calls.length, 0);
+});
+
+test("formalize rejects invalid theorem uses labels", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "needs_support",
+    theoremText: "A theorem.",
+    theoremUses: ["invalid-label"]
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "invalid_uses");
+});
+
 test("formalize maps unnamed theorem output that uses the Overleaf label", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
@@ -1410,6 +1583,10 @@ function inferProviderValidationFamily(url) {
   if (text.startsWith("https://generativelanguage.googleapis.com/")) return "gemini";
   if (text.startsWith("https://api.anthropic.com/")) return "anthropic";
   return "";
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function sseResponse(status, frames) {

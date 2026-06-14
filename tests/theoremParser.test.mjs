@@ -10,12 +10,39 @@ test("detects a labeled theorem", () => {
   const [theorem] = parseTheorems("\\theorem{A}\\label{foo}");
   assert.equal(theorem.label, "foo");
   assert.equal(theorem.text, "A");
+  assert.deepEqual(theorem.uses, []);
 });
 
 test("keeps legacy optional labels working", () => {
   const [theorem] = parseTheorems("\\theorem[label=foo]{A}");
   assert.equal(theorem.label, "foo");
   assert.equal(theorem.text, "A");
+  assert.deepEqual(theorem.uses, []);
+});
+
+test("parses a single theorem use after the label", () => {
+  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}\\uses{bar}");
+  assert.equal(theorem.label, "foo");
+  assert.deepEqual(theorem.uses, ["bar"]);
+  assert.equal(theorem.to, "\\theorem{A}\\label{foo}\\uses{bar}".length);
+});
+
+test("parses a theorem use from a LaTeX comment after the label", () => {
+  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}\n% \\uses{bar}");
+  assert.equal(theorem.label, "foo");
+  assert.deepEqual(theorem.uses, ["bar"]);
+  assert.equal(theorem.to, "\\theorem{A}\\label{foo}\n% \\uses{bar}".length);
+});
+
+test("parses multiple theorem uses with whitespace", () => {
+  const [theorem] = parseTheorems("\\theorem{A}\\label{foo}\n% \\uses{ bar,\n baz, qux }");
+  assert.deepEqual(theorem.uses, ["bar", "baz", "qux"]);
+});
+
+test("parses theorem uses with legacy optional labels", () => {
+  const [theorem] = parseTheorems("\\theorem[label=foo]{A}\\uses{bar}");
+  assert.equal(theorem.label, "foo");
+  assert.deepEqual(theorem.uses, ["bar"]);
 });
 
 test("handles multiline theorem bodies", () => {

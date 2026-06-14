@@ -22,6 +22,17 @@ The MVP requires labeled theorem blocks:
 
 The `\label{...}` value is used as the generated Lean declaration name. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
 
+To point Lea at especially helpful prior results, add a trailing commented `% \uses{...}` tag with one or more previously formalized Overleaf labels. Keeping the tag in a comment prevents LaTeX from rendering it or treating `\uses` as an undefined control sequence:
+
+```tex
+\theorem{
+  Prove this using earlier project results.
+}\label{my_next_theorem}
+% \uses{my_prior_theorem, another_prior_theorem}
+```
+
+Each `% \uses{...}` entry must be a valid label in the same Overleaf project and must already be formalized. The companion resolves those labels to Lea's recorded theorem names and proof files before starting the new run.
+
 For a minimal test document, define the display macro in the preamble:
 
 ```tex

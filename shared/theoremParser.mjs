@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 const THEOREM_PREFIX = "\\theorem";
 const LABEL_PREFIX = "[label=";
 const LATEX_LABEL_PREFIX = "\\label";
+const LATEX_USES_PREFIX = "\\uses";
 
 export function normalizeTheoremText(text) {
   return String(text).replace(/\s+/g, " ").trim();
@@ -99,6 +100,11 @@ export function parseTheoremAt(source, start) {
           return labelResult;
         }
         theoremEnd = labelResult.end;
+        const usesResult = parseTrailingLatexUses(source, theoremEnd);
+        if (!usesResult.ok) {
+          return usesResult;
+        }
+        theoremEnd = usesResult.end;
         if (!isValidLeanIdentifier(labelResult.label)) {
           return { ok: false, reason: "invalid label" };
         }
@@ -108,6 +114,7 @@ export function parseTheoremAt(source, start) {
           theorem: {
             label: labelResult.label,
             text: source.slice(bodyStart, bodyEnd).trim(),
+            uses: usesResult.uses,
             from: start,
             to: theoremEnd,
             bodyFrom: bodyStart,
@@ -145,6 +152,42 @@ function parseTrailingLatexLabel(source, cursor) {
     ok: true,
     label: source.slice(labelStart, labelEnd).trim(),
     end: labelEnd + 1
+  };
+}
+
+function parseTrailingLatexUses(source, cursor) {
+  const originalCursor = cursor;
+  cursor = skipWhitespace(source, cursor);
+  if (source[cursor] === "%" && source[cursor - 1] !== "\\") {
+    const commentUsesStart = skipWhitespace(source, cursor + 1);
+    if (!source.startsWith(LATEX_USES_PREFIX, commentUsesStart)) {
+      return { ok: true, uses: [], end: originalCursor };
+    }
+    cursor = commentUsesStart;
+  }
+
+  if (!source.startsWith(LATEX_USES_PREFIX, cursor)) {
+    return { ok: true, uses: [], end: originalCursor };
+  }
+
+  cursor = skipWhitespace(source, cursor + LATEX_USES_PREFIX.length);
+  if (source[cursor] !== "{") {
+    return { ok: false, reason: "missing uses body" };
+  }
+
+  const usesStart = cursor + 1;
+  const usesEnd = source.indexOf("}", usesStart);
+  if (usesEnd === -1) {
+    return { ok: false, reason: "unterminated uses body" };
+  }
+
+  return {
+    ok: true,
+    uses: source.slice(usesStart, usesEnd)
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+    end: usesEnd + 1
   };
 }
 
