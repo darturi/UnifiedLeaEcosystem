@@ -38,6 +38,17 @@
   animation: ol-lean-status-progress-pulse 1.1s ease-in-out infinite;
 }
 
+.ol-lean-stubbed-use-mark {
+  display: inline-grid;
+  place-items: center;
+  min-width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  color: #92400e;
+  background: #fde68a;
+  font: 800 9px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
 @keyframes ol-lean-status-progress-pulse {
   0%,
   100% {
@@ -358,10 +369,16 @@
 }
 
 .ol-lean-popover-detail,
+.ol-lean-popover-warning,
 .ol-lean-popover-status {
   margin: 8px 0 0;
   color: #6b7280;
   overflow-wrap: anywhere;
+}
+
+.ol-lean-popover-warning {
+  color: #92400e;
+  font-weight: 700;
 }
 
 .ol-lean-popover-status {

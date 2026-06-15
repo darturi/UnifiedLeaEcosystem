@@ -993,7 +993,8 @@ test("formalize includes resolved theorem uses in the Lea prompt", async () => {
       declarationName: "even_square_of_even",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
-      moduleName: "Lea.Project1.even_square_of_even"
+      moduleName: "Lea.Project1.even_square_of_even",
+      status: "formalized"
     }]);
   } finally {
     restorePath();
@@ -1083,7 +1084,7 @@ test("formalize allows theorem uses backed by sorry stubs", async () => {
       fetchImpl: makeLeaApiFetch(calls, {
         statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
         onStatusRequest: async () => {
-          await writeLeaProjectProof(leaRepo, targetProofPath, "theorem uses_stub_support : True := by\n  trivial\n");
+          await writeLeaProjectProof(leaRepo, targetProofPath, "import Lea.Project1.stub_support\n\ntheorem uses_stub_support : True := by\n  trivial\n");
           await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
             {
               theoremName: "stub_support",
@@ -1117,7 +1118,143 @@ test("formalize allows theorem uses backed by sorry stubs", async () => {
       declarationName: "stub_support",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
-      moduleName: "Lea.Project1.stub_support"
+      moduleName: "Lea.Project1.stub_support",
+      status: "sorry_stub"
+    }]);
+    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, [{
+      theoremLabel: "stub_support",
+      declarationName: "stub_support",
+      moduleName: "Lea.Project1.stub_support",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath)
+    }]);
+    const statuses = await handleGetStatuses({
+      overleafProjectId: "project-1",
+      theorems: [{ theoremLabel: "uses_stub_support", theoremText: "A theorem." }]
+    }, state);
+    assert.equal(statuses.body.statuses.uses_stub_support.status, "formalized");
+    assert.deepEqual(statuses.body.statuses.uses_stub_support.stubbedTheoremUses, [{
+      theoremLabel: "stub_support",
+      declarationName: "stub_support",
+      moduleName: "Lea.Project1.stub_support",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath)
+    }]);
+    assert.equal(statuses.body.statuses.uses_stub_support.hasStubbedTheoremUses, true);
+  } finally {
+    restorePath();
+  }
+});
+
+test("formalized theorem has no stubbed-use warning when stub support is not imported", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const dependencyProofPath = path.join("workspace", "proofs", "Lea", "Project1", "unused_stub_support.lean");
+  const targetProofPath = path.join("workspace", "proofs", "Lea", "Project1", "does_not_import_stub_support.lean");
+  const restorePath = await installFakeLake();
+  try {
+    await writeLeaProjectProof(leaRepo, dependencyProofPath, "theorem unused_stub_support : True := by\n  sorry\n");
+    await writeLeaProjectMarkdown(leaRepo, "project-1", {
+      theoremName: "unused_stub_support",
+      proofPath: dependencyProofPath,
+      moduleName: "Lea.Project1.unused_stub_support"
+    });
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, targetProofPath, "theorem does_not_import_stub_support : True := by\n  trivial\n");
+          await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
+            {
+              theoremName: "unused_stub_support",
+              proofPath: dependencyProofPath,
+              moduleName: "Lea.Project1.unused_stub_support"
+            },
+            {
+              theoremName: "does_not_import_stub_support",
+              proofPath: targetProofPath
+            }
+          ]);
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "does_not_import_stub_support",
+      theoremText: "theorem does_not_import_stub_support : True := by",
+      theoremUses: ["unused_stub_support"]
+    }, state);
+
+    assert.equal(result.statusCode, 200);
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, []);
+    const statuses = await handleGetStatuses({
+      overleafProjectId: "project-1",
+      theorems: [{ theoremLabel: "does_not_import_stub_support", theoremText: "A theorem." }]
+    }, state);
+    assert.equal(statuses.body.statuses.does_not_import_stub_support.status, "formalized");
+    assert.equal(statuses.body.statuses.does_not_import_stub_support.stubbedTheoremUses, undefined);
+    assert.equal(statuses.body.statuses.does_not_import_stub_support.hasStubbedTheoremUses, undefined);
+  } finally {
+    restorePath();
+  }
+});
+
+test("formalized theorem has no stubbed-use warning when imported support is formalized", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const dependencyProofPath = path.join("workspace", "proofs", "Lea", "Project1", "formalized_support.lean");
+  const targetProofPath = path.join("workspace", "proofs", "Lea", "Project1", "imports_formalized_support.lean");
+  const restorePath = await installFakeLake();
+  try {
+    await writeLeaProjectProof(leaRepo, dependencyProofPath, "theorem formalized_support : True := by\n  trivial\n");
+    await writeLeaProjectMarkdown(leaRepo, "project-1", {
+      theoremName: "formalized_support",
+      proofPath: dependencyProofPath,
+      moduleName: "Lea.Project1.formalized_support"
+    });
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, targetProofPath, "import Lea.Project1.formalized_support\n\ntheorem imports_formalized_support : True := by\n  trivial\n");
+          await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
+            {
+              theoremName: "formalized_support",
+              proofPath: dependencyProofPath,
+              moduleName: "Lea.Project1.formalized_support"
+            },
+            {
+              theoremName: "imports_formalized_support",
+              proofPath: targetProofPath
+            }
+          ]);
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      theoremLabel: "imports_formalized_support",
+      theoremText: "theorem imports_formalized_support : True := by",
+      theoremUses: ["formalized_support"]
+    }, state);
+
+    assert.equal(result.statusCode, 200);
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, []);
+    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
+      theoremLabel: "formalized_support",
+      declarationName: "formalized_support",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath),
+      moduleName: "Lea.Project1.formalized_support",
+      status: "formalized"
     }]);
   } finally {
     restorePath();
@@ -1143,7 +1280,7 @@ test("formalize allows theorem uses backed by failed sorry stubs", async () => {
       fetchImpl: makeLeaApiFetch(calls, {
         statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
         onStatusRequest: async () => {
-          await writeLeaProjectProof(leaRepo, targetProofPath, "theorem uses_failed_stub_support : True := by\n  trivial\n");
+          await writeLeaProjectProof(leaRepo, targetProofPath, "import Lea.Project1.failed_stub_support\n\ntheorem uses_failed_stub_support : True := by\n  trivial\n");
           await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
             {
               theoremName: "failed_stub_support",
@@ -1204,7 +1341,15 @@ test("formalize allows theorem uses backed by failed sorry stubs", async () => {
       declarationName: "failed_stub_support",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
-      moduleName: "Lea.Project1.failed_stub_support"
+      moduleName: "Lea.Project1.failed_stub_support",
+      status: "sorry_stub"
+    }]);
+    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, [{
+      theoremLabel: "failed_stub_support",
+      declarationName: "failed_stub_support",
+      moduleName: "Lea.Project1.failed_stub_support",
+      relativePath: dependencyProofPath,
+      absolutePath: path.join(leaRepo, dependencyProofPath)
     }]);
   } finally {
     restorePath();

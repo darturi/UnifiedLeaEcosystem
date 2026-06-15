@@ -90,6 +90,7 @@
       <p class="ol-lean-popover-meta">Label: <strong></strong></p>
       <div class="ol-lean-popover-actions" data-role="theorem-actions"></div>
       <pre class="ol-lean-popover-lean" hidden></pre>
+      <p class="ol-lean-popover-warning" hidden></p>
       <p class="ol-lean-popover-status"></p>
     `;
 
@@ -98,9 +99,11 @@
     const actions = popover.querySelector("[data-role='theorem-actions']");
     const status = popover.querySelector(".ol-lean-popover-status");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
+    const stubbedWarning = popover.querySelector(".ol-lean-popover-warning");
     const currentStatus = latestStatuses[theorem.label]?.status || "unknown";
     const actionStatus = getActionStatus(latestStatuses[theorem.label]);
     renderLeanStatement(leanStatement, latestStatuses[theorem.label]?.leanStatement || "");
+    renderStubbedTheoremUsesWarning(stubbedWarning, latestStatuses[theorem.label]);
     renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus);
     if (currentStatus === "in_progress") {
       status.textContent = inProgressMessage(latestStatuses[theorem.label]);
@@ -367,10 +370,14 @@
     const detail = popover.querySelector(".ol-lean-popover-detail");
     const actions = popover.querySelector("[data-role='theorem-actions']");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
+    const stubbedWarning = popover.querySelector(".ol-lean-popover-warning");
 
     if (chip) {
       chip.className = `ol-lean-status-chip ol-lean-status-chip-${currentStatus}`;
       chip.textContent = formatStatus(currentStatus);
+      if (hasStubbedTheoremUses(statusInfo)) {
+        chip.appendChild(createStubbedTheoremUsesMark());
+      }
     }
     if (actions) {
       renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement, actionStatus);
@@ -390,6 +397,7 @@
       }
     }
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
+    renderStubbedTheoremUsesWarning(stubbedWarning, statusInfo);
   }
 
   async function formalize(theorem) {
@@ -535,6 +543,9 @@
       badge.className = `ol-lean-status ol-lean-status-${status}`;
       badge.type = "button";
       badge.appendChild(document.createTextNode(formatStatus(status)));
+      if (hasStubbedTheoremUses(statusInfo)) {
+        badge.appendChild(createStubbedTheoremUsesMark());
+      }
       const turnProgress = getTurnProgressDisplay(statusInfo);
       if (turnProgress.text) {
         const progress = document.createElement("span");
@@ -545,7 +556,8 @@
         }
         badge.appendChild(progress);
       }
-      const statusLabel = `${formatStatus(status)}${turnProgress.label ? ` ${turnProgress.label}` : ""}`;
+      const stubbedUsesLabel = hasStubbedTheoremUses(statusInfo) ? " warning: proof uses sorry-stubbed support" : "";
+      const statusLabel = `${formatStatus(status)}${turnProgress.label ? ` ${turnProgress.label}` : ""}${stubbedUsesLabel}`;
       badge.title = statusInfo.message || `Lean status for ${theorem.label}: ${statusLabel}`;
       badge.setAttribute("aria-label", `Open Lea popover for ${theorem.label}. Status: ${statusLabel}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
@@ -611,6 +623,39 @@
     }
     element.hidden = false;
     element.textContent = statement;
+  }
+
+  function renderStubbedTheoremUsesWarning(element, statusInfo) {
+    if (!element) return;
+    const uses = getStubbedTheoremUses(statusInfo);
+    if (uses.length === 0) {
+      element.hidden = true;
+      element.textContent = "";
+      return;
+    }
+    const names = uses.map((use) => use.declarationName || use.theoremLabel).filter(Boolean).join(", ");
+    const plural = uses.length !== 1;
+    element.hidden = false;
+    element.textContent = plural
+      ? `Proof uses supporting theorems ${names}, which have been sorry stubbed but not fully formalized.`
+      : `Proof uses supporting theorem ${names}, which has been sorry stubbed but not fully formalized.`;
+  }
+
+  function getStubbedTheoremUses(statusInfo) {
+    return Array.isArray(statusInfo?.stubbedTheoremUses) ? statusInfo.stubbedTheoremUses : [];
+  }
+
+  function hasStubbedTheoremUses(statusInfo) {
+    return statusInfo?.status === "formalized" && getStubbedTheoremUses(statusInfo).length > 0;
+  }
+
+  function createStubbedTheoremUsesMark() {
+    const mark = document.createElement("span");
+    mark.className = "ol-lean-stubbed-use-mark";
+    mark.textContent = "!";
+    mark.title = "Proof uses sorry-stubbed support";
+    mark.setAttribute("aria-hidden", "true");
+    return mark;
   }
 
   function buttonTextForStatus(status) {

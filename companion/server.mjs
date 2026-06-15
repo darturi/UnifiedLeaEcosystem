@@ -773,7 +773,8 @@ async function resolveTheoremUses({ leaRepoPath, overleafProjectId, theoremUses,
       declarationName: equivalentStatus.declarationName,
       relativePath: equivalentStatus.recordedProofPath || equivalentStatus.relativePath || "",
       absolutePath: equivalentStatus.absolutePath,
-      moduleName: equivalentStatus.moduleName || null
+      moduleName: equivalentStatus.moduleName || null,
+      status: equivalentStatus.status
     });
   }
 
@@ -1040,6 +1041,12 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     proofComplete = job.leanCheck.ok;
   }
   const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
+  job.stubbedTheoremUses = nextJobStatus === "formalized"
+    ? await findImportedStubbedTheoremUses({
+      proofPath: effectiveStatus.absolutePath,
+      resolvedUses
+    })
+    : [];
   job.finalStatus = effectiveStatus.status;
   job.apiRunId = exit.apiRunId || null;
   job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
@@ -1282,6 +1289,12 @@ async function finishLeaProofJob({ state, job, target, beforeMarkers, exit }) {
     proofComplete = job.leanCheck.ok;
   }
   const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
+  job.stubbedTheoremUses = nextJobStatus === "formalized"
+    ? await findImportedStubbedTheoremUses({
+      proofPath: effectiveStatus.absolutePath,
+      resolvedUses: job.theoremUses || []
+    })
+    : [];
   job.finalStatus = effectiveStatus.status;
   job.apiRunId = exit.apiRunId || job.apiRunId || null;
   job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
@@ -2046,10 +2059,20 @@ function buildJobResponse({ job, status, target }) {
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };
+  addStubbedTheoremUses(response, job.stubbedTheoremUses);
   const turnProgress = buildTurnProgress(job, status);
   if (turnProgress) {
     response.turnProgress = turnProgress;
   }
+  return response;
+}
+
+function addStubbedTheoremUses(response, stubbedTheoremUses) {
+  if (!Array.isArray(stubbedTheoremUses) || stubbedTheoremUses.length === 0) {
+    return response;
+  }
+  response.stubbedTheoremUses = stubbedTheoremUses;
+  response.hasStubbedTheoremUses = true;
   return response;
 }
 
@@ -2059,6 +2082,45 @@ function buildTurnProgress(job, status) {
   const max = toPositiveInteger(job.leaMaxTurns);
   if (!current || !max) return null;
   return { current, max };
+}
+
+async function findImportedStubbedTheoremUses({ proofPath, resolvedUses = [] }) {
+  const stubbedUses = resolvedUses.filter((use) => use?.status === "sorry_stub" && use.moduleName);
+  if (!proofPath || stubbedUses.length === 0) {
+    return [];
+  }
+
+  let content = "";
+  try {
+    content = await fs.readFile(proofPath, "utf8");
+  } catch {
+    return [];
+  }
+
+  const imports = parseLeanImports(content);
+  return stubbedUses
+    .filter((use) => imports.has(use.moduleName))
+    .map((use) => ({
+      theoremLabel: use.theoremLabel,
+      declarationName: use.declarationName,
+      moduleName: use.moduleName,
+      relativePath: use.relativePath || "",
+      absolutePath: use.absolutePath || ""
+    }));
+}
+
+function parseLeanImports(content) {
+  const imports = new Set();
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const match = line.match(/^\s*import\s+(.+?)\s*(?:--.*)?$/);
+    if (!match) continue;
+    for (const moduleName of match[1].trim().split(/\s+/)) {
+      if (moduleName) {
+        imports.add(moduleName);
+      }
+    }
+  }
+  return imports;
 }
 
 async function getTheoremStatus({
@@ -2270,7 +2332,7 @@ async function getLatestMappedJobStatus({ leaRepoPath, target, jobs }) {
     return null;
   }
 
-  return getLeaProofStatusFromEntry({
+  const status = await getLeaProofStatusFromEntry({
     leaRepoPath,
     target,
     entry: {
@@ -2279,6 +2341,7 @@ async function getLatestMappedJobStatus({ leaRepoPath, target, jobs }) {
       moduleName: mappedJob.moduleName || null
     }
   });
+  return addStubbedTheoremUses(status, mappedJob.stubbedTheoremUses);
 }
 
 function findProjectTheoremEntry(markdown, theoremLabel) {
