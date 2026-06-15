@@ -1141,6 +1141,15 @@ test("formalize allows theorem uses backed by sorry stubs", async () => {
       absolutePath: path.join(leaRepo, dependencyProofPath)
     }]);
     assert.equal(statuses.body.statuses.uses_stub_support.hasStubbedTheoremUses, true);
+
+    await writeLeaProjectProof(leaRepo, dependencyProofPath, "theorem stub_support : True := by\n  trivial\n");
+    const refreshedStatuses = await handleGetStatuses({
+      overleafProjectId: "project-1",
+      theorems: [{ theoremLabel: "uses_stub_support", theoremText: "A theorem." }]
+    }, state);
+    assert.equal(refreshedStatuses.body.statuses.uses_stub_support.status, "formalized");
+    assert.equal(refreshedStatuses.body.statuses.uses_stub_support.stubbedTheoremUses, undefined);
+    assert.equal(refreshedStatuses.body.statuses.uses_stub_support.hasStubbedTheoremUses, undefined);
   } finally {
     restorePath();
   }

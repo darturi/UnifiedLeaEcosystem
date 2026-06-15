@@ -2109,6 +2109,60 @@ async function findImportedStubbedTheoremUses({ proofPath, resolvedUses = [] }) 
     }));
 }
 
+async function findImportedCurrentlyStubbedTheoremUses({
+  leaRepoPath,
+  overleafProjectId,
+  proofPath,
+  resolvedUses = [],
+  jobs = {}
+}) {
+  const candidateUses = resolvedUses
+    .map((use) => ({
+      theoremLabel: String(use?.theoremLabel || "").trim(),
+      moduleName: use?.moduleName || null
+    }))
+    .filter((use) => use.theoremLabel && use.moduleName);
+  if (!proofPath || candidateUses.length === 0) {
+    return [];
+  }
+
+  let content = "";
+  try {
+    content = await fs.readFile(proofPath, "utf8");
+  } catch {
+    return [];
+  }
+
+  const imports = parseLeanImports(content);
+  const importedUses = candidateUses.filter((use) => imports.has(use.moduleName));
+  if (importedUses.length === 0) {
+    return [];
+  }
+
+  const stubbedUses = [];
+  for (const use of importedUses) {
+    const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+      leaRepoPath,
+      overleafProjectId,
+      theoremLabel: use.theoremLabel,
+      jobs
+    }));
+    if (status?.status !== "sorry_stub") {
+      continue;
+    }
+
+    stubbedUses.push({
+      theoremLabel: use.theoremLabel,
+      declarationName: status.declarationName,
+      moduleName: status.moduleName || use.moduleName,
+      relativePath: status.recordedProofPath || status.relativePath || "",
+      absolutePath: status.absolutePath || ""
+    });
+  }
+
+  return stubbedUses;
+}
+
 function parseLeanImports(content) {
   const imports = new Set();
   for (const line of String(content || "").split(/\r?\n/)) {
@@ -2130,9 +2184,12 @@ async function getTheoremStatus({
   jobs = {}
 }) {
   const target = buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel });
-  const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
-  const directProofStatus = await getLeaDirectProofStatus({ leaRepoPath, target });
-  const mappedStatus = await getLatestMappedJobStatus({ leaRepoPath, target, jobs });
+  const { projectStatus, directProofStatus, mappedStatus } = await getCurrentTheoremProofStatuses({
+    leaRepoPath,
+    target,
+    jobs,
+    includeStubbedTheoremUses: true
+  });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
 
   const activeJob = findActiveJob(jobs, target.jobKey);
@@ -2180,6 +2237,47 @@ async function getTheoremStatus({
   }
 
   return {
+    status: "unformalized",
+    theoremLabel,
+    declarationName: theoremLabel,
+    relativePath: target.relativePath,
+    absolutePath: target.absolutePath,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath
+  };
+}
+
+async function getCurrentTheoremProofStatuses({
+  leaRepoPath,
+  target,
+  jobs = {},
+  includeStubbedTheoremUses = false
+}) {
+  const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
+  const directProofStatus = await getLeaDirectProofStatus({ leaRepoPath, target });
+  const mappedStatus = await getLatestMappedJobStatus({
+    leaRepoPath,
+    target,
+    jobs,
+    includeStubbedTheoremUses
+  });
+  return { projectStatus, directProofStatus, mappedStatus };
+}
+
+async function getCurrentTheoremProofStatus({
+  leaRepoPath,
+  overleafProjectId = "unknown",
+  theoremLabel,
+  jobs = {}
+}) {
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel });
+  const { mappedStatus, projectStatus, directProofStatus } = await getCurrentTheoremProofStatuses({
+    leaRepoPath,
+    target,
+    jobs
+  });
+  return mappedStatus || projectStatus || directProofStatus || {
     status: "unformalized",
     theoremLabel,
     declarationName: theoremLabel,
@@ -2318,7 +2416,12 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
   };
 }
 
-async function getLatestMappedJobStatus({ leaRepoPath, target, jobs }) {
+async function getLatestMappedJobStatus({
+  leaRepoPath,
+  target,
+  jobs,
+  includeStubbedTheoremUses = false
+}) {
   const mappedJob = Object.values(jobs || {})
     .filter((job) => (
       job.jobKey === target.jobKey &&
@@ -2341,7 +2444,21 @@ async function getLatestMappedJobStatus({ leaRepoPath, target, jobs }) {
       moduleName: mappedJob.moduleName || null
     }
   });
-  return addStubbedTheoremUses(status, mappedJob.stubbedTheoremUses);
+  if (!includeStubbedTheoremUses) {
+    return status;
+  }
+  const stubbedTheoremUses = status.status === "formalized"
+    ? await findImportedCurrentlyStubbedTheoremUses({
+      leaRepoPath,
+      overleafProjectId: target.projectId,
+      proofPath: status.absolutePath,
+      resolvedUses: Array.isArray(mappedJob.theoremUses) && mappedJob.theoremUses.length > 0
+        ? mappedJob.theoremUses
+        : mappedJob.stubbedTheoremUses || [],
+      jobs
+    })
+    : [];
+  return addStubbedTheoremUses(status, stubbedTheoremUses);
 }
 
 function findProjectTheoremEntry(markdown, theoremLabel) {
