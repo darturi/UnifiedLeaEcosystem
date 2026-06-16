@@ -5,10 +5,25 @@ dist/
 __pycache__/
 .pytest_cache/
 *.pyc
-.env
+.lake/
 
-apps/overleaf-extension/.env
-apps/overleaf-extension/.overleaf-lean-stub/
-apps/lea-ui/config/lea.local.toml
-apps/lea-ui/data/
-apps/lea-ui/server/.venv/
+# Environment files — all variants, but keep tracked templates
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Common secret material (defense in depth)
+*.key
+*.pem
+*.token
+.gemini_key
+.github_token
+*credentials*.json
+*secret*.json
+
+# App-local generated state & private config (location-independent,
+# so each workspace's files are ignored wherever it lives in the tree)
+.overleaf-lean-stub/
+lea.local.toml
+data/

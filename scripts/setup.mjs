@@ -11,11 +11,9 @@ const OVERLEAF_ROOT = path.join(MONOREPO_ROOT, "apps", "overleaf-extension");
 const UI_ROOT = path.join(MONOREPO_ROOT, "apps", "lea-ui");
 const UI_SERVER_ROOT = path.join(UI_ROOT, "server");
 const ENV_EXAMPLE_PATH = path.join(MONOREPO_ROOT, ".env.example");
-const OVERLEAF_LEGACY_ENV_PATH = path.join(OVERLEAF_ROOT, ".env");
 const OVERLEAF_SETTINGS_PATH = path.join(OVERLEAF_ROOT, ".overleaf-lean-stub", "settings.json");
 const ROOT_ENV = readDotEnv(ROOT_ENV_PATH);
-const OVERLEAF_LEGACY_ENV = readDotEnv(OVERLEAF_LEGACY_ENV_PATH);
-const LEA_ROOT = resolveMonorepoPath(process.env.LEA_ROOT || ROOT_ENV.LEA_ROOT || OVERLEAF_LEGACY_ENV.LEA_ROOT || "vendor/lea-prover");
+const LEA_ROOT = resolveMonorepoPath(process.env.LEA_ROOT || ROOT_ENV.LEA_ROOT || "vendor/lea-prover");
 const LEA_WORKSPACE = path.join(LEA_ROOT, "workspace");
 const MATHLIB_PACKAGE_PATH = path.join(LEA_WORKSPACE, ".lake", "packages", "mathlib");
 const MATHLIB_OLEAN_PATH = path.join(MATHLIB_PACKAGE_PATH, ".lake", "build", "lib", "lean", "Mathlib.olean");
@@ -101,25 +99,15 @@ async function writeRootEnv() {
     console.log("Created root .env from .env.example.");
   }
 
-  const legacy = await readEnvFile(OVERLEAF_LEGACY_ENV_PATH);
   const existing = await readEnvFile(ROOT_ENV_PATH);
   const patch = {};
 
   for (const [key, value] of Object.entries(DEFAULT_ENV)) {
-    patch[key] = existing[key] || legacy[key] || value;
-  }
-
-  for (const [key, value] of Object.entries(legacy)) {
-    if (!Object.prototype.hasOwnProperty.call(existing, key) && value !== "") {
-      patch[key] = value;
-    }
+    patch[key] = existing[key] || value;
   }
 
   await patchEnvFile(ROOT_ENV_PATH, patch);
   console.log(`Wrote root .env defaults at ${path.relative(MONOREPO_ROOT, ROOT_ENV_PATH)}.`);
-  if (Object.keys(legacy).length > 0) {
-    console.log("Migrated values from apps/overleaf-extension/.env; verify root .env before removing the legacy file.");
-  }
 }
 
 async function syncLeaApiEnvironment() {

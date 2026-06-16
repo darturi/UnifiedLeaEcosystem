@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tomllib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +12,6 @@ from .env import merged_env, read_dotenv
 ROOT = Path(__file__).resolve().parents[2]
 MONOREPO_ROOT = ROOT.parents[1]
 ROOT_ENV_PATH = MONOREPO_ROOT / ".env"
-LEGACY_CONFIG_PATH = ROOT / "config" / "lea.local.toml"
 
 
 @dataclass(frozen=True)
@@ -34,18 +32,13 @@ class LeaConfig:
     theorem_translation_max_retries: int = 3
 
 
-def load_config(path: Path | None = None, env_path: Path | None = None, environ: Mapping[str, str] | None = None) -> LeaConfig:
-    config_path = path or LEGACY_CONFIG_PATH
-    data: dict = {}
-    if config_path.exists():
-        data = tomllib.loads(config_path.read_text())
-    env_file_path = env_path if env_path is not None else (ROOT_ENV_PATH if path is None else None)
+def load_config(env_path: Path | None = None, environ: Mapping[str, str] | None = None) -> LeaConfig:
+    env_file_path = env_path if env_path is not None else ROOT_ENV_PATH
     env_file_values = read_dotenv(env_file_path) if env_file_path is not None else {}
     env = merged_env(env_file_values, os.environ if environ is None else environ)
-    env_data = _config_from_env(env)
-    config_data = {**data, **env_data}
+    config_data = _config_from_env(env)
 
-    env_lea_root = env.get("LEA_ROOT") if "lea_root" in env_data else None
+    env_lea_root = env.get("LEA_ROOT") if "lea_root" in config_data else None
     lea_root = config_data.get("lea_root", "../../vendor/lea-prover")
     resolved_lea_root = None
     if lea_root:

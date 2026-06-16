@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
@@ -43,25 +43,7 @@ function resolveBin(name) {
 }
 
 function readConfigStrings() {
-  const values = envToConfig(rootEnv);
-  const configPath = path.join(root, "config", "lea.local.toml");
-  if (existsSync(configPath)) {
-    const config = readFileSync(configPath, "utf8");
-    for (const key of [
-      "lea_api_base_url",
-      "lea_api_key",
-      "google_api_key",
-      "anthropic_api_key",
-      "openai_api_key",
-      "openai_base_url",
-    ]) {
-      const match = config.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m"));
-      if (match && !values[key]) {
-        values[key] = match[1];
-      }
-    }
-  }
-  return { ...values, ...envToConfig(process.env) };
+  return { ...envToConfig(rootEnv), ...envToConfig(process.env) };
 }
 
 function envToConfig(env) {
@@ -131,6 +113,20 @@ function waitFor(url, label, timeoutMs = 20000) {
   });
 }
 
+function probeHealthy(url, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const request = http.get(url, (response) => {
+      response.resume();
+      resolve(response.statusCode >= 200 && response.statusCode < 500);
+    });
+    request.setTimeout(timeoutMs, () => {
+      request.destroy();
+      resolve(false);
+    });
+    request.on("error", () => resolve(false));
+  });
+}
+
 function portOpen(port, host = "127.0.0.1") {
   return new Promise((resolve) => {
     const socket = net.createConnection({ host, port });
@@ -197,12 +193,16 @@ if (nodeMajor !== 22 && nodeMajor !== 20) {
 const config = readConfigStrings();
 const leaApiBaseUrl = (config.lea_api_base_url || defaultLeaApiBaseUrl).replace(/\/$/, "");
 if (isDefaultBundledApi(leaApiBaseUrl)) {
-  ensurePath(path.join(leaRoot, ".venv", "bin", "python"), "bundled Lea API virtualenv is missing. Run npm run setup -- --target ui from the monorepo root.");
-  await ensurePortAvailable(8000, "Lea API");
-  start("lea-api", "./.venv/bin/python", ["-m", "lea_api"], {
-    cwd: leaRoot,
-    env: leaApiEnv(config),
-  });
+  if (await probeHealthy(`${leaApiBaseUrl}/v1/healthz`)) {
+    console.log(`[dev] Reusing Lea API already running at ${leaApiBaseUrl}`);
+  } else {
+    ensurePath(path.join(leaRoot, ".venv", "bin", "python"), "bundled Lea API virtualenv is missing. Run npm run setup -- --target ui from the monorepo root.");
+    await ensurePortAvailable(8000, "Lea API");
+    start("lea-api", "./.venv/bin/python", ["-m", "lea_api"], {
+      cwd: leaRoot,
+      env: leaApiEnv(config),
+    });
+  }
 } else {
   console.log(`[dev] Using external Lea API at ${leaApiBaseUrl}`);
 }

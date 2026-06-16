@@ -357,15 +357,10 @@ def _provider_label(family: str) -> str:
 def _load_settings_config(path: Path | None = None) -> LeaConfig:
     if path is None:
         return load_config()
-    if path.suffix == ".toml":
-        return load_config(path)
     return load_config(env_path=path)
 
 
 def _write_config_updates(path: Path, updates: dict[str, Any]) -> None:
-    if path.suffix == ".toml":
-        _write_toml_updates(path, updates)
-        return
     patch_dotenv(
         path,
         {
@@ -374,62 +369,3 @@ def _write_config_updates(path: Path, updates: dict[str, Any]) -> None:
             if key in CONFIG_ENV_FIELDS
         },
     )
-
-
-def _write_toml_updates(path: Path, updates: dict[str, Any]) -> None:
-    if not updates:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = path.read_text().splitlines() if path.exists() else []
-    updated_keys: set[str] = set()
-    key_pattern = re.compile(r"^(\s*)([A-Za-z0-9_]+)(\s*=\s*)(.*)$")
-    table_pattern = re.compile(r"^\s*\[[^\]]+\]\s*(#.*)?$")
-    next_lines: list[str] = []
-    in_root = True
-    first_table_index: int | None = None
-
-    for line in lines:
-        if table_pattern.match(line):
-            in_root = False
-            if first_table_index is None:
-                first_table_index = len(next_lines)
-        match = key_pattern.match(line)
-        if in_root and match and match.group(2) in updates:
-            key = match.group(2)
-            updated_keys.add(key)
-            value = updates[key]
-            if value is None:
-                continue
-            next_lines.append(f"{match.group(1)}{key}{match.group(3)}{_toml_scalar(value)}")
-        else:
-            next_lines.append(line)
-
-    missing_lines = [
-        f"{key} = {_toml_scalar(updates[key])}"
-        for key in updates
-        if key not in updated_keys and updates[key] is not None
-    ]
-    if missing_lines:
-        if first_table_index is None:
-            if next_lines and next_lines[-1].strip():
-                next_lines.append("")
-            next_lines.extend(missing_lines)
-        else:
-            insertion = list(missing_lines)
-            if first_table_index > 0 and next_lines[first_table_index - 1].strip():
-                insertion.insert(0, "")
-            if first_table_index < len(next_lines) and next_lines[first_table_index].strip():
-                insertion.append("")
-            next_lines[first_table_index:first_table_index] = insertion
-
-    path.write_text("\n".join(next_lines).rstrip() + "\n")
-
-
-def _toml_scalar(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        return str(value)
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'

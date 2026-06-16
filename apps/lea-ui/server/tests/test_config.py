@@ -6,10 +6,10 @@ from app.config import load_config
 
 
 def test_load_config_defaults_to_local_lea_api(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text("")
+    env_path = tmp_path / ".env"
+    env_path.write_text("")
 
-    config = load_config(config_path, environ={})
+    config = load_config(env_path=env_path, environ={})
 
     assert config.lea_api_base_url == "http://127.0.0.1:8000"
     assert config.model == "gemini/gemini-3.1-pro-preview"
@@ -23,27 +23,27 @@ def test_load_config_defaults_to_local_lea_api(tmp_path):
 
 
 def test_load_config_honors_api_settings(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text(
+    env_path = tmp_path / ".env"
+    env_path.write_text(
         """
-        lea_api_base_url = "http://localhost:8123/"
-        lea_api_key = "test-key"
-        model = "o4-mini"
-        max_turns = 7
-        max_spend_usd = 12.5
-        lea_job_timeout_seconds = 45
-        lea_root = "../../vendor/lea-prover"
-        google_api_key = "google-secret"
-        anthropic_api_key = "anthropic-secret"
-        openai_api_key = "openai-secret"
-        openai_base_url = "https://openai.example/v1"
-        narrate_tool_steps = true
-        permission_tier = "stepwise"
-        theorem_translation_max_retries = 5
+        LEA_API_BASE_URL=http://localhost:8123/
+        LEA_API_KEY=test-key
+        LEA_MODEL=o4-mini
+        LEA_MAX_TURNS=7
+        LEA_MAX_SPEND_USD=12.5
+        LEA_JOB_TIMEOUT_SECONDS=45
+        LEA_ROOT=vendor/lea-prover
+        GOOGLE_API_KEY=google-secret
+        ANTHROPIC_API_KEY=anthropic-secret
+        OPENAI_API_KEY=openai-secret
+        OPENAI_BASE_URL=https://openai.example/v1
+        LEA_NARRATE_TOOL_STEPS=true
+        LEA_PERMISSION_TIER=stepwise
+        LEA_THEOREM_TRANSLATION_MAX_RETRIES=5
         """
     )
 
-    config = load_config(config_path, environ={})
+    config = load_config(env_path=env_path, environ={})
 
     assert config.lea_api_base_url == "http://localhost:8123"
     assert config.lea_api_key == "test-key"
@@ -63,60 +63,51 @@ def test_load_config_honors_api_settings(tmp_path):
 
 
 def test_load_config_rejects_invalid_api_base_url(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text('lea_api_base_url = "file:///tmp/lea"\n')
+    env_path = tmp_path / ".env"
+    env_path.write_text("LEA_API_BASE_URL=file:///tmp/lea\n")
 
     with pytest.raises(ValueError, match="lea_api_base_url"):
-        load_config(config_path, environ={})
+        load_config(env_path=env_path, environ={})
 
 
 def test_load_config_rejects_non_boolean_narration_flag(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text('narrate_tool_steps = "maybe"\n')
+    env_path = tmp_path / ".env"
+    env_path.write_text("LEA_NARRATE_TOOL_STEPS=maybe\n")
 
     with pytest.raises(ValueError, match="narrate_tool_steps"):
-        load_config(config_path, environ={})
+        load_config(env_path=env_path, environ={})
 
 
 def test_load_config_rejects_invalid_permission_tier(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text('permission_tier = "ask_everything"\n')
+    env_path = tmp_path / ".env"
+    env_path.write_text("LEA_PERMISSION_TIER=ask_everything\n")
 
     with pytest.raises(ValueError, match="permission_tier"):
-        load_config(config_path, environ={})
+        load_config(env_path=env_path, environ={})
 
 
 @pytest.mark.parametrize(
     "value",
-    ["0", "-1", "true", "1.5", '"3"'],
+    ["0", "-1", "true", "1.5", "abc"],
 )
 def test_load_config_rejects_invalid_theorem_translation_retries(tmp_path, value):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text(f"theorem_translation_max_retries = {value}\n")
+    env_path = tmp_path / ".env"
+    env_path.write_text(f"LEA_THEOREM_TRANSLATION_MAX_RETRIES={value}\n")
 
     with pytest.raises(ValueError, match="theorem_translation_max_retries"):
-        load_config(config_path, environ={})
+        load_config(env_path=env_path, environ={})
 
 
 def test_load_config_rejects_negative_max_spend(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
-    config_path.write_text("max_spend_usd = -1\n")
+    env_path = tmp_path / ".env"
+    env_path.write_text("LEA_MAX_SPEND_USD=-1\n")
 
     with pytest.raises(ValueError, match="max_spend_usd"):
-        load_config(config_path, environ={})
+        load_config(env_path=env_path, environ={})
 
 
-def test_load_config_uses_root_env_over_legacy_toml_and_shell_over_env(tmp_path):
-    config_path = tmp_path / "lea.local.toml"
+def test_load_config_uses_shell_over_root_env(tmp_path):
     env_path = tmp_path / ".env"
-    config_path.write_text(
-        """
-        model = "legacy-model"
-        max_turns = 3
-        openai_api_key = "legacy-openai"
-        lea_root = "../../vendor/lea-prover"
-        """
-    )
     env_path.write_text(
         """
         LEA_MODEL=o4-mini
@@ -130,7 +121,6 @@ def test_load_config_uses_root_env_over_legacy_toml_and_shell_over_env(tmp_path)
     )
 
     config = load_config(
-        config_path,
         env_path=env_path,
         environ={"LEA_MODEL": "shell-model", "ANTHROPIC_API_KEY": "shell-anthropic"},
     )

@@ -1,3 +1,0 @@
-# Deprecated: use ../../../.env.example and keep private values in the monorepo
-# root .env file. Existing config/lea.local.toml files are still read as a
-# migration fallback, but new setup should not create one.

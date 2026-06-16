@@ -106,4 +106,4 @@ If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A fai
 - Bundled Lea API submodule: `../../vendor/lea-prover`
 - Local Lea file snapshots: configured by `LEA_ROOT`
 
-Do not commit `.env`; rotate any API key that is pasted into logs or chat. Existing `config/lea.local.toml` files are still read as migration fallbacks, but new local setup should use the root `.env`.
+Do not commit `.env`; rotate any API key that is pasted into logs or chat. All private runtime config lives in the monorepo root `.env`.

@@ -182,13 +182,15 @@ npm test
 
 ## Reset Local Run State
 
-To clear prior local formalization runs while keeping Lea dependencies intact:
+Local run state for both apps is reset from the monorepo root with the unified
+script. To clear prior local formalization runs while keeping Lea dependencies
+intact, from the monorepo root:
 
 ```sh
 npm run reset:local
 ```
 
-This removes Lea project markdowns, Lea proof files, mirrored Overleaf LaTeX context, companion job logs, backups, and local job/cache indexes. Preview the reset without deleting anything:
+This removes Lea project markdowns, Lea proof files, mirrored Overleaf LaTeX context, companion job logs, backups, local job/cache indexes, and the Lea UI SQLite state. Preview the reset without deleting anything:
 
 ```sh
 npm run reset:local -- --dry-run

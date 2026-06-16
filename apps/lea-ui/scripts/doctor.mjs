@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -54,10 +54,7 @@ const nodeMajor = Number(process.versions.node.split(".")[0]);
 checks.push(check("Node version", nodeMajor === 22 || nodeMajor === 20, `v${process.versions.node}; Node 22 LTS is recommended`));
 
 checks.push(check("node_modules", existsSync(path.join(nodeModulesRoot, "node_modules")), "run npm run setup from the monorepo root if missing"));
-console.log(`[INFO] root .env - ${existsSync(ROOT_ENV_PATH) ? ROOT_ENV_PATH : "not found; using shell/defaults/legacy fallback"}`);
-if (existsSync(path.join(root, "config", "lea.local.toml"))) {
-  console.log("[WARN] legacy config found at apps/lea-ui/config/lea.local.toml; migrate private values to root .env.");
-}
+console.log(`[INFO] root .env - ${existsSync(ROOT_ENV_PATH) ? ROOT_ENV_PATH : "not found; using shell/defaults"}`);
 checks.push(check("server virtualenv", existsSync(path.join(root, "server", ".venv", "bin", "python")), "run npm run setup -- --target ui from the monorepo root if missing"));
 checks.push(check(
   "Lea submodule",
@@ -87,12 +84,7 @@ checks.push(check(
   "run npm run setup -- --target ui from the monorepo root; otherwise the first lean_check may compile Mathlib for several minutes",
 ));
 
-const configPath = path.join(root, "config", "lea.local.toml");
 let leaApiUrl = process.env.LEA_API_BASE_URL || rootEnv.LEA_API_BASE_URL || "";
-if (existsSync(configPath)) {
-  const config = readFileSync(configPath, "utf8");
-  leaApiUrl = leaApiUrl || config.match(/lea_api_base_url\s*=\s*"([^"]+)"/)?.[1] || "";
-}
 leaApiUrl = leaApiUrl || "http://127.0.0.1:8000";
 {
   try {
