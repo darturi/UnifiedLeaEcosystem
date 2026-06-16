@@ -6,8 +6,9 @@ import { applyEnvDefaults, loadDotEnv } from "./config.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SETTINGS_PATH = path.join(PROJECT_ROOT, ".overleaf-lean-stub", "settings.json");
+const LEGACY_ENV_PATH = path.join(PROJECT_ROOT, ".env");
 
-const dotenv = loadDotEnv(PROJECT_ROOT);
+const dotenv = loadDotEnv();
 const settings = applyEnvDefaults(readJson(SETTINGS_PATH, {}));
 const checks = [];
 
@@ -28,11 +29,14 @@ checkPath("Lea workspace", leaWorkspacePath, (dir) => (
   (fs.existsSync(path.join(dir, "lakefile.lean")) || fs.existsSync(path.join(dir, "lakefile.toml")))
 ), "must contain lean-toolchain and lakefile.lean or lakefile.toml");
 checkMathlib(leaWorkspacePath);
-checkPath("Lea API virtualenv", settings.leaRepoPath ? path.join(settings.leaRepoPath, ".venv", "bin", "python") : "", () => true, "run `npm run setup:api`");
+checkPath("Lea API virtualenv", settings.leaRepoPath ? path.join(settings.leaRepoPath, ".venv", "bin", "python") : "", () => true, "run `npm run setup -- --target overleaf` from the monorepo root");
 checkUrl("Lea API URL", settings.leaApiBaseUrl || "http://127.0.0.1:8000");
 
 console.log("Overleaf Lea Formalizer doctor\n");
-console.log(`${dotenv.loaded ? "✓" : "•"} .env ${dotenv.loaded ? `loaded from ${dotenv.path}` : "not found; using shell/settings only"}`);
+console.log(`${dotenv.loaded ? "✓" : "•"} root .env ${dotenv.loaded ? `loaded from ${dotenv.path}` : "not found; using shell/settings only"}`);
+if (fs.existsSync(LEGACY_ENV_PATH)) {
+  console.log("! legacy apps/overleaf-extension/.env found; migrate private values to the root .env.");
+}
 for (const check of checks) {
   console.log(`${check.ok ? "✓" : "✗"} ${check.label}${check.detail ? `: ${check.detail}` : ""}`);
 }
@@ -112,7 +116,7 @@ function checkMathlib(leaWorkspacePath) {
   checks.push({
     ok: compiled,
     label: "Mathlib compiled cache",
-    detail: compiled ? mathlibOleanPath : "run `npm run update-lean-deps` and wait for cache decompression to finish"
+    detail: compiled ? mathlibOleanPath : "run `npm run update-lean-deps` from the monorepo root and wait for cache decompression to finish"
   });
 }
 

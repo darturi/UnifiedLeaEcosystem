@@ -13,7 +13,7 @@ npm run dev
 The launcher:
 
 - checks required local files
-- starts the bundled Lea API from `external/lea-prover`
+- starts the bundled Lea API from `../../vendor/lea-prover`
 - waits for `http://127.0.0.1:8000/v1/healthz`
 - starts the local FastAPI adapter backend
 - waits for `http://127.0.0.1:8001/api/health`
@@ -25,14 +25,23 @@ Stop all local processes with `Ctrl+C`.
 
 ## First-Time Setup
 
+From the monorepo root:
+
 ```bash
-git submodule update --init --recursive
-npm install
-cp config/lea.local.example.toml config/lea.local.toml
-npm run setup:api
+npm run setup
 ```
 
-`npm run setup:api` installs the Python services and downloads the pinned Mathlib build cache. This can take a while on the first run, but it prevents the first proof check from compiling Mathlib during `lean_check`.
+This sets up the full monorepo: shared Node dependencies, the bundled Lea API,
+Lean/Mathlib cache, root `.env`, this UI's adapter API, and the Overleaf
+companion settings.
+
+If you only need the UI:
+
+```bash
+npm run setup -- --target ui
+```
+
+The setup can take a while on the first run, but it prevents the first proof check from compiling Mathlib during `lean_check`.
 
 If cloning from scratch, this is equivalent:
 
@@ -40,22 +49,22 @@ If cloning from scratch, this is equivalent:
 git clone --recurse-submodules <repo-url>
 ```
 
-Edit `config/lea.local.toml` and set `model`, `max_turns`, and one provider key such as `google_api_key`, `anthropic_api_key`, or `openai_api_key`. You can also export provider keys in your shell instead of writing them to the config file.
+Edit the monorepo root `.env` and set `LEA_MODEL`, `LEA_MAX_TURNS`, and one provider key such as `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY`. You can also export provider keys in your shell instead of writing them to `.env`.
 
-Set `narrate_tool_steps = true` to ask the bundled Lea agent to emit short Markdown/LaTeX progress summaries before it calls tools. This keeps step narration inside Lea rather than synthesizing it in the UI adapter.
+Set `LEA_NARRATE_TOOL_STEPS=true` to ask the bundled Lea agent to emit short Markdown/LaTeX progress summaries before it calls tools. This keeps step narration inside Lea rather than synthesizing it in the UI adapter.
 
-Set `permission_tier = "theorem_translation"` to pause each run for approval of the checked top-level Lean theorem skeleton before proof search starts. Use `permission_tier = "none"` to disable approval prompts.
+Set `LEA_PERMISSION_TIER=theorem_translation` to pause each run for approval of the checked top-level Lean theorem skeleton before proof search starts. Use `LEA_PERMISSION_TIER=none` to disable approval prompts.
 
-Set `theorem_translation_max_retries = 3` to control how many internal preflight attempts Lea makes to produce a checked Lean theorem statement before surfacing the approval step. This only affects the theorem translation permission tier.
+Set `LEA_THEOREM_TRANSLATION_MAX_RETRIES=3` to control how many internal preflight attempts Lea makes to produce a checked Lean theorem statement before surfacing the approval step. This only affects the theorem translation permission tier.
 
 The default config uses the bundled Lea API at `http://127.0.0.1:8000` and resolves Lean file paths relative to the submodule:
 
-```toml
-lea_api_base_url = "http://127.0.0.1:8000"
-lea_root = "external/lea-prover"
+```text
+LEA_API_BASE_URL=http://127.0.0.1:8000
+LEA_ROOT=vendor/lea-prover
 ```
 
-Advanced users can point `lea_api_base_url` at an external Lea API. In that case `npm run dev` will use the configured external service instead of starting the bundled one.
+Advanced users can point `LEA_API_BASE_URL` at an external Lea API. In that case `npm run dev` will use the configured external service instead of starting the bundled one.
 
 To install only the bundled agent dependencies manually, run `npm run setup:agent`.
 
@@ -85,16 +94,16 @@ curl http://127.0.0.1:8000/v1/healthz
 curl -I http://127.0.0.1:5173/
 ```
 
-If the submodule is missing, run `git submodule update --init --recursive`.
+If the submodule is missing, run `npm run setup` from the monorepo root.
 
-If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A failing `Lean workspace Mathlib cache` check means the first check is compiling Mathlib locally; rerun `npm run setup:api` and wait for the cache download to finish.
+If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A failing `Lean workspace Mathlib cache` check means the first check is compiling Mathlib locally; rerun `npm run setup -- --target ui` from the monorepo root and wait for the cache download to finish.
 
 ## Data
 
 - App database: `data/lea-interface.sqlite3`
 - Raw Lea API event diagnostics: `data/lea-api-events/`
-- Local adapter config: `config/lea.local.toml`
-- Bundled Lea API submodule: `external/lea-prover`
-- Local Lea file snapshots: configured by `lea_root`
+- Local adapter config: monorepo root `.env`
+- Bundled Lea API submodule: `../../vendor/lea-prover`
+- Local Lea file snapshots: configured by `LEA_ROOT`
 
-Do not commit `config/lea.local.toml`; rotate any API key that is pasted into logs or chat.
+Do not commit `.env`; rotate any API key that is pasted into logs or chat. Existing `config/lea.local.toml` files are still read as migration fallbacks, but new local setup should use the root `.env`.

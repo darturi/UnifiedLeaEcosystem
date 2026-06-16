@@ -15,7 +15,7 @@ const dryRun = process.argv.includes("--dry-run");
 const appDir = path.join(root, ".overleaf-lean-stub");
 const settingsPath = path.join(appDir, "settings.json");
 
-loadDotEnv(root);
+loadDotEnv();
 const settings = applyEnvDefaults(readJson(settingsPath, {}));
 const leaRepoPath = path.resolve(settings.leaRepoPath);
 const workspaceDir = path.join(leaRepoPath, "workspace");

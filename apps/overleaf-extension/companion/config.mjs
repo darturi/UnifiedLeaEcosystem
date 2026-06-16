@@ -1,57 +1,45 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadEnvFile, ROOT_ENV_PATH } from "../../../scripts/env.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const DEFAULT_LEA_REPO_PATH = path.join(PROJECT_ROOT, "vendor", "lea-prover");
+const MONOREPO_ROOT = path.resolve(PROJECT_ROOT, "../..");
+const DEFAULT_LEA_REPO_PATH = path.resolve(MONOREPO_ROOT, "vendor", "lea-prover");
 
-export function loadDotEnv(projectRoot) {
-  const envPath = path.join(projectRoot, ".env");
-  if (!fs.existsSync(envPath)) return { loaded: false, path: envPath };
+export function loadDotEnv(projectRoot = MONOREPO_ROOT, target = process.env) {
+  const envRoot = projectRoot === PROJECT_ROOT ? MONOREPO_ROOT : projectRoot;
+  return loadEnvFile(path.join(envRoot, ".env"), target);
+}
 
-  const content = fs.readFileSync(envPath, "utf8");
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    const equals = trimmed.indexOf("=");
-    if (equals === -1) continue;
-
-    const key = trimmed.slice(0, equals).trim();
-    let value = trimmed.slice(equals + 1).trim();
-    if (!key || process.env[key] !== undefined) continue;
-
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    process.env[key] = value;
-  }
-
-  return { loaded: true, path: envPath };
+export function loadRootDotEnv(target = process.env) {
+  return loadEnvFile(ROOT_ENV_PATH, target);
 }
 
 export function applyEnvDefaults(settings, env = process.env) {
   const leaMaxSpendUsd = normalizeOptionalNonNegativeNumber(
-    Object.prototype.hasOwnProperty.call(settings, "leaMaxSpendUsd")
-      ? settings.leaMaxSpendUsd
-      : env.LEA_MAX_SPEND_USD,
+    env.LEA_MAX_SPEND_USD !== undefined
+      ? env.LEA_MAX_SPEND_USD
+      : settings.leaMaxSpendUsd,
     "leaMaxSpendUsd"
   );
   return {
     ...settings,
-    leaRepoPath: settings.leaRepoPath || env.LEA_REPO_PATH || DEFAULT_LEA_REPO_PATH,
-    leaApiBaseUrl: settings.leaApiBaseUrl || env.LEA_API_BASE_URL || "http://127.0.0.1:8000",
-    leaProvider: settings.leaProvider || env.LEA_PROVIDER || "openai",
-    leaModel: settings.leaModel || env.LEA_MODEL || "o4-mini",
-    leaMaxTurns: settings.leaMaxTurns || parseInt(env.LEA_MAX_TURNS || "20", 10),
-    leaTheoremTranslationMaxRetries: settings.leaTheoremTranslationMaxRetries || parseInt(env.LEA_THEOREM_TRANSLATION_MAX_RETRIES || "3", 10),
-    leaJobTimeoutSeconds: settings.leaJobTimeoutSeconds || parseInt(env.LEA_JOB_TIMEOUT_SECONDS || "900", 10),
+    leaRepoPath: resolveLeaRoot(env.LEA_REPO_PATH || env.LEA_ROOT || settings.leaRepoPath),
+    leaApiBaseUrl: env.LEA_API_BASE_URL || settings.leaApiBaseUrl || "http://127.0.0.1:8000",
+    leaProvider: env.LEA_PROVIDER || settings.leaProvider || "openai",
+    leaModel: env.LEA_MODEL || settings.leaModel || "o4-mini",
+    leaMaxTurns: parseInt(env.LEA_MAX_TURNS || settings.leaMaxTurns || "20", 10),
+    leaTheoremTranslationMaxRetries: parseInt(env.LEA_THEOREM_TRANSLATION_MAX_RETRIES || settings.leaTheoremTranslationMaxRetries || "3", 10),
+    leaJobTimeoutSeconds: parseInt(env.LEA_JOB_TIMEOUT_SECONDS || settings.leaJobTimeoutSeconds || "900", 10),
     leaLatexContextMode: normalizeLeaLatexContextMode(settings.leaLatexContextMode || env.LEA_LATEX_CONTEXT_MODE || "off"),
     leaMaxSpendUsd
   };
+}
+
+function resolveLeaRoot(value) {
+  if (!value) return DEFAULT_LEA_REPO_PATH;
+  return path.isAbsolute(value) ? value : path.resolve(MONOREPO_ROOT, value);
 }
 
 export function normalizeLeaLatexContextMode(value) {

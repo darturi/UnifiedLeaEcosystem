@@ -22,11 +22,8 @@ git clone --branch beta-2026-06-16 --recurse-submodules https://github.com/dartu
 cd LeaOverleafExtension
 ```
 
-If you already cloned without submodules, run this from inside the repository:
-
-```sh
-git submodule update --init --recursive
-```
+If you already cloned without submodules, the setup command below initializes
+the shared Lea submodule for you.
 
 ## 2. Run Setup
 
@@ -34,7 +31,9 @@ git submodule update --init --recursive
 npm run setup
 ```
 
-This prepares the local Lea checkout, installs the Lea API dependencies, fetches Lean dependencies, downloads the Mathlib cache, and writes local settings files.
+This installs workspace Node dependencies, prepares the local Lea checkout,
+installs the Lea API dependencies, fetches Lean dependencies, downloads the
+Mathlib cache, and writes local settings files.
 
 The first setup may take a while because Lean and Mathlib artifacts are large.
 
@@ -59,8 +58,8 @@ LEA_API_BASE_URL=http://127.0.0.1:8000
 LEA_PROVIDER=openai
 LEA_MODEL=o4-mini
 LEA_MAX_TURNS=20
-LEA_LATEX_CONTEXT_MODE=off
 LEA_JOB_TIMEOUT_SECONDS=900
+LEA_THEOREM_TRANSLATION_MAX_RETRIES=3
 ```
 
 ## 4. Check Your Install
@@ -124,7 +123,6 @@ If Daniel gives you a new beta tag, run these commands from inside the repositor
 ```sh
 git fetch --tags origin
 git checkout beta-NEW-TAG-HERE
-git submodule update --init --recursive
 npm run setup
 npm run doctor
 ```

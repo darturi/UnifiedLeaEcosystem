@@ -39,7 +39,7 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
     config_path.write_text(
         """
         lea_api_base_url = "http://127.0.0.1:8000"
-        lea_root = "external/lea-prover"
+        lea_root = "../../vendor/lea-prover"
         model = "gpt-4o"
         max_turns = 12
         permission_tier = "theorem_translation"
@@ -66,7 +66,7 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
 
     assert payload["permission_tier"] == "stepwise"
     assert payload["theorem_translation_max_retries"] == 7
-    assert 'lea_root = "external/lea-prover"' in text
+    assert 'lea_root = "../../vendor/lea-prover"' in text
     assert 'model = "claude-sonnet-4-6"' in text
     assert "max_turns = 30" in text
     assert "max_spend_usd = 9.5" in text
@@ -74,6 +74,47 @@ def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, m
     assert "theorem_translation_max_retries = 7" in text
     assert "openai_api_key" not in text
     assert 'anthropic_api_key = "sk-ant-secret123456"' in text
+
+
+def test_update_settings_writes_root_env_values(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(settings_service, "_verify_api_key_credentials", lambda family, value, config, model=None: None)
+    db.init_db()
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        """
+        LEA_API_BASE_URL=http://127.0.0.1:8000
+        LEA_ROOT=vendor/lea-prover
+        LEA_MODEL=gpt-4o
+        OPENAI_API_KEY=sk-oldsecret
+        """
+    )
+
+    payload = settings_service.update_settings(
+        {
+            "model": "claude-sonnet-4-6",
+            "max_turns": 30,
+            "max_spend_usd": 9.5,
+            "permission_tier": "stepwise",
+            "theorem_translation_max_retries": 7,
+            "api_keys": {
+                "openai": {"clear": True},
+                "anthropic": {"value": "sk-ant-secret123456"},
+            },
+        },
+        env_path,
+    )
+    text = env_path.read_text()
+
+    assert payload["model"] == "claude-sonnet-4-6"
+    assert payload["permission_tier"] == "stepwise"
+    assert "LEA_MODEL=claude-sonnet-4-6" in text
+    assert "LEA_MAX_TURNS=30" in text
+    assert "LEA_MAX_SPEND_USD=9.5" in text
+    assert "LEA_PERMISSION_TIER=stepwise" in text
+    assert "LEA_THEOREM_TRANSLATION_MAX_RETRIES=7" in text
+    assert "OPENAI_API_KEY" not in text
+    assert "ANTHROPIC_API_KEY=sk-ant-secret123456" in text
 
 
 def test_update_settings_rejects_invalid_theorem_translation_retries(tmp_path, monkeypatch):

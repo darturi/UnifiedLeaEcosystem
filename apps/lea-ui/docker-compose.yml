@@ -11,13 +11,13 @@ services:
   lea:
     image: lea-interface:local
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: apps/lea-ui/Dockerfile
     platform: linux/arm64        # Apple Silicon Macs
     ports:
       - "8001:8001"
     volumes:
       - ./data:/app/data         # persisted SQLite DB + Lea API event logs
-      - ./config:/app/config     # persisted settings + API key (written by the Settings pane)
+      - ./config:/app/config     # container-local persisted settings/key
     init: true                   # reap the background Lea API process cleanly
     restart: "no"

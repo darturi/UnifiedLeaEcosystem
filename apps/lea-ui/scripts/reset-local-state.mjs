@@ -3,10 +3,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const monorepoRoot = path.resolve(root, "../..");
 const dryRun = process.argv.includes("--dry-run");
 
 const dataDir = path.join(root, "data");
-const workspaceDir = path.join(root, "external", "lea-prover", "workspace");
+const workspaceDir = path.join(monorepoRoot, "vendor", "lea-prover", "workspace");
 const projectsDir = path.join(workspaceDir, "projects");
 const proofsDir = path.join(workspaceDir, "proofs");
 

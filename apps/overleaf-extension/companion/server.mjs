@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { patchEnvFile, ROOT_ENV_PATH } from "../../../scripts/env.mjs";
 import {
   buildLeaLatexActiveTexPath,
   buildLeaLatexContextManifestPath,
@@ -28,7 +29,7 @@ const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 31245;
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
-const ENV_PATH = path.join(PROJECT_ROOT, ".env");
+const ENV_PATH = ROOT_ENV_PATH;
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
@@ -42,6 +43,16 @@ const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
 const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
 const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
+const SHARED_SETTING_ENV_FIELDS = {
+  leaRepoPath: "LEA_ROOT",
+  leaApiBaseUrl: "LEA_API_BASE_URL",
+  leaProvider: "LEA_PROVIDER",
+  leaModel: "LEA_MODEL",
+  leaMaxTurns: "LEA_MAX_TURNS",
+  leaMaxSpendUsd: "LEA_MAX_SPEND_USD",
+  leaTheoremTranslationMaxRetries: "LEA_THEOREM_TRANSLATION_MAX_RETRIES",
+  leaJobTimeoutSeconds: "LEA_JOB_TIMEOUT_SECONDS"
+};
 const LEA_MODEL_FAMILIES = [
   { id: "openai", label: "OpenAI", envVars: ["OPENAI_API_KEY"] },
   { id: "gemini", label: "Gemini", envVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY"] },
@@ -435,10 +446,12 @@ export async function handleUpdateLeaSettings(payload, state) {
   if (!keyValidation.ok) {
     return errorResponse(400, keyValidation.error, keyValidation.message);
   }
-  if (Object.keys(providerEnvPatch).length > 0) {
-    await persistEnvPatch(state.envPath || ENV_PATH, providerEnvPatch);
+  const sharedEnvPatch = buildSharedSettingsEnvPatch(nextSettings);
+  const envPatch = { ...sharedEnvPatch, ...providerEnvPatch };
+  if (Object.keys(envPatch).length > 0) {
+    await persistEnvPatch(state.envPath || ENV_PATH, envPatch);
     state.env ||= {};
-    Object.assign(state.env, providerEnvPatch);
+    applyEnvPatchToState(state.env, envPatch);
   }
   state.settings = nextSettings;
   await writeJson(state.settingsPath, sanitizeSettingsForStorage(state.settings));
@@ -483,12 +496,14 @@ export async function ensureStartupLeaRuntime(state) {
   if (state.settings?.leaApiKey && !getProviderApiKey(state, "openai") && !legacyProviderEnvPatch.OPENAI_API_KEY) {
     legacyProviderEnvPatch.OPENAI_API_KEY = String(state.settings.leaApiKey).trim();
   }
-  if (Object.keys(legacyProviderEnvPatch).length > 0) {
-    await persistEnvPatch(state.envPath || ENV_PATH, legacyProviderEnvPatch);
+  const legacySharedEnvPatch = buildLegacySharedSettingsEnvPatch(state.settings, state.env || {});
+  const envPatch = { ...legacySharedEnvPatch, ...legacyProviderEnvPatch };
+  if (Object.keys(envPatch).length > 0) {
+    await persistEnvPatch(state.envPath || ENV_PATH, envPatch);
     state.env ||= {};
-    Object.assign(state.env, legacyProviderEnvPatch);
+    applyEnvPatchToState(state.env, envPatch);
   }
-  state.settings = sanitizeRuntimeSettings(state.settings || {});
+  state.settings = applyEnvDefaults(sanitizeRuntimeSettings(state.settings || {}), state.env || {});
   const validation = await validateLeaRepo(state.settings.leaRepoPath);
   state.settings.leaWorkspacePath = validation.ok ? validation.leaWorkspacePath : buildLeaWorkspacePath(state.settings.leaRepoPath);
   await writeJson(state.settingsPath, sanitizeSettingsForStorage(state.settings));
@@ -749,36 +764,40 @@ function buildLegacyProviderEnvPatch(state) {
 }
 
 async function persistEnvPatch(envPath, patch) {
-  let content = "";
-  try {
-    content = await fs.readFile(envPath, "utf8");
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-
-  const lines = content ? content.split(/\r?\n/) : [];
-  const seen = new Set();
-  const nextLines = lines.map((line) => {
-    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=/);
-    if (!match || !Object.prototype.hasOwnProperty.call(patch, match[1])) {
-      return line;
-    }
-    seen.add(match[1]);
-    return `${match[1]}=${formatEnvValue(patch[match[1]])}`;
-  });
-
-  for (const [key, value] of Object.entries(patch)) {
-    if (!seen.has(key)) {
-      nextLines.push(`${key}=${formatEnvValue(value)}`);
-    }
-  }
-
-  await fs.writeFile(envPath, `${nextLines.filter((line, index) => line || index < nextLines.length - 1).join("\n")}\n`, "utf8");
+  await patchEnvFile(envPath, patch);
 }
 
-function formatEnvValue(value) {
-  const text = String(value);
-  return /[\s#"'\\]/.test(text) ? JSON.stringify(text) : text;
+function buildSharedSettingsEnvPatch(settings) {
+  const patch = {};
+  for (const [settingKey, envKey] of Object.entries(SHARED_SETTING_ENV_FIELDS)) {
+    if (!Object.prototype.hasOwnProperty.call(settings || {}, settingKey)) continue;
+    const value = settings[settingKey];
+    if (value === undefined) continue;
+    patch[envKey] = settingKey === "leaModel" ? normalizeLeaModelId(value) : value;
+  }
+  return patch;
+}
+
+function buildLegacySharedSettingsEnvPatch(settings, env) {
+  const patch = {};
+  for (const [settingKey, envKey] of Object.entries(SHARED_SETTING_ENV_FIELDS)) {
+    if (!Object.prototype.hasOwnProperty.call(settings || {}, settingKey)) continue;
+    if (env?.[envKey] !== undefined && String(env[envKey]).trim() !== "") continue;
+    const value = settings[settingKey];
+    if (value === undefined || value === "") continue;
+    patch[envKey] = settingKey === "leaModel" ? normalizeLeaModelId(value) : value;
+  }
+  return patch;
+}
+
+function applyEnvPatchToState(env, patch) {
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value === null || value === undefined || value === "") {
+      delete env[key];
+    } else {
+      env[key] = String(value);
+    }
+  }
 }
 
 function normalizeLeaModelId(modelId) {
@@ -790,12 +809,19 @@ function sanitizeRuntimeSettings(settings) {
   const {
     leaApiKey: _leaApiKey,
     leaProviderApiKeys: _leaProviderApiKeys,
+    leaRepoPath: _leaRepoPath,
+    leaWorkspacePath: _leaWorkspacePath,
+    leaApiBaseUrl: _leaApiBaseUrl,
+    leaProvider: _leaProvider,
+    leaModel: _leaModel,
+    leaMaxTurns: _leaMaxTurns,
+    leaMaxSpendUsd: _leaMaxSpendUsd,
+    leaTheoremTranslationMaxRetries: _leaTheoremTranslationMaxRetries,
+    leaJobTimeoutSeconds: _leaJobTimeoutSeconds,
     ...rest
   } = settings || {};
   return {
     ...rest,
-    leaModel: normalizeLeaModelId(rest.leaModel || DEFAULT_LEA_MODEL),
-    leaMaxSpendUsd: normalizeLeaMaxSpendUsd(rest.leaMaxSpendUsd),
     leaLatexContextMode: normalizeLeaLatexContextMode(rest.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE)
   };
 }
@@ -3234,16 +3260,16 @@ function errorResponse(statusCode, error, message) {
 
 const isMain = fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const dotenv = loadDotEnv(PROJECT_ROOT);
+  const dotenv = loadDotEnv();
   if (dotenv.loaded) {
-    console.log(`Loaded environment from ${dotenv.path}`);
+    console.log(`Loaded root environment from ${dotenv.path}`);
   }
   const server = await createServer();
   server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
     console.log(`Overleaf Lea companion listening at http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
     console.log(`Lea workspace: ${buildLeaWorkspacePath(applyEnvDefaults({}, process.env).leaRepoPath)}`);
     if (!process.env.OPENAI_API_KEY) {
-      console.log("Warning: OPENAI_API_KEY is not set. Lea jobs will not start.");
+      console.log("Warning: OPENAI_API_KEY is not set in the root .env or process environment. Lea jobs will not start.");
     }
     console.log("Run `npm run doctor` if setup fails.");
   });

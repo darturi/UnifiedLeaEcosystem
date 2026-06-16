@@ -293,7 +293,7 @@ def _verify_lean_file(config: LeaConfig, path: Path) -> None:
 def _load_project_module(config: LeaConfig):
     if config.lea_root is None:
         raise ProjectUnassignmentError(422, {"message": "lea_root is required for project unassignment."})
-    import_root = config.lea_root if (config.lea_root / "lea").exists() else ROOT / "external" / "lea-prover"
+    import_root = config.lea_root
     root = str(import_root)
     if root not in sys.path:
         sys.path.insert(0, root)

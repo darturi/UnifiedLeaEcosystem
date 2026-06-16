@@ -3,8 +3,13 @@ import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { readDotEnv, ROOT_ENV_PATH } from "../../../scripts/env.mjs";
 
 const root = process.cwd();
+const monorepoRoot = path.resolve(root, "../..");
+const rootEnv = readDotEnv(ROOT_ENV_PATH);
+const leaRoot = resolveMonorepoPath(process.env.LEA_ROOT || rootEnv.LEA_ROOT || "vendor/lea-prover");
+const viteBin = resolveBin("vite");
 const children = [];
 const defaultLeaApiBaseUrl = "http://127.0.0.1:8000";
 
@@ -19,24 +24,55 @@ function ensure(pathname, message) {
   }
 }
 
+function ensurePath(pathname, message) {
+  if (!existsSync(pathname)) {
+    fail(message);
+  }
+}
+
+function resolveMonorepoPath(value) {
+  return path.isAbsolute(value) ? value : path.resolve(monorepoRoot, value);
+}
+
+function resolveBin(name) {
+  const candidates = [
+    path.join(root, "node_modules", ".bin", name),
+    path.join(monorepoRoot, "node_modules", ".bin", name),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) || candidates[0];
+}
+
 function readConfigStrings() {
+  const values = envToConfig(rootEnv);
   const configPath = path.join(root, "config", "lea.local.toml");
-  const config = readFileSync(configPath, "utf8");
-  const values = {};
-  for (const key of [
-    "lea_api_base_url",
-    "lea_api_key",
-    "google_api_key",
-    "anthropic_api_key",
-    "openai_api_key",
-    "openai_base_url",
-  ]) {
-    const match = config.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m"));
-    if (match) {
-      values[key] = match[1];
+  if (existsSync(configPath)) {
+    const config = readFileSync(configPath, "utf8");
+    for (const key of [
+      "lea_api_base_url",
+      "lea_api_key",
+      "google_api_key",
+      "anthropic_api_key",
+      "openai_api_key",
+      "openai_base_url",
+    ]) {
+      const match = config.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]*)"`, "m"));
+      if (match && !values[key]) {
+        values[key] = match[1];
+      }
     }
   }
-  return values;
+  return { ...values, ...envToConfig(process.env) };
+}
+
+function envToConfig(env) {
+  return Object.fromEntries(Object.entries({
+    lea_api_base_url: env.LEA_API_BASE_URL,
+    lea_api_key: env.LEA_API_KEY,
+    google_api_key: env.GEMINI_API_KEY || env.GOOGLE_API_KEY,
+    anthropic_api_key: env.ANTHROPIC_API_KEY,
+    openai_api_key: env.OPENAI_API_KEY,
+    openai_base_url: env.OPENAI_BASE_URL,
+  }).filter(([, value]) => value !== undefined && value !== ""));
 }
 
 function isDefaultBundledApi(url) {
@@ -149,10 +185,9 @@ function shutdown(code = 0) {
 process.on("SIGINT", () => shutdown());
 process.on("SIGTERM", () => shutdown());
 
-ensure("node_modules", "node_modules is missing. Run npm install.");
-ensure("config/lea.local.toml", "config/lea.local.toml is missing. Copy config/lea.local.example.toml.");
-ensure("server/.venv/bin/python", "server virtualenv is missing. Run npm run setup:api.");
-ensure("external/lea-prover/pyproject.toml", "external/lea-prover is missing. Run git submodule update --init --recursive.");
+ensurePath(viteBin, "Vite is missing. Run npm run setup from the monorepo root.");
+ensure("server/.venv/bin/python", "server virtualenv is missing. Run npm run setup -- --target ui from the monorepo root.");
+ensurePath(path.join(leaRoot, "pyproject.toml"), "shared Lea submodule is missing. Run npm run setup from the monorepo root.");
 
 const nodeMajor = Number(process.versions.node.split(".")[0]);
 if (nodeMajor !== 22 && nodeMajor !== 20) {
@@ -162,10 +197,10 @@ if (nodeMajor !== 22 && nodeMajor !== 20) {
 const config = readConfigStrings();
 const leaApiBaseUrl = (config.lea_api_base_url || defaultLeaApiBaseUrl).replace(/\/$/, "");
 if (isDefaultBundledApi(leaApiBaseUrl)) {
-  ensure("external/lea-prover/.venv/bin/python", "bundled Lea API virtualenv is missing. Run npm run setup:api.");
+  ensurePath(path.join(leaRoot, ".venv", "bin", "python"), "bundled Lea API virtualenv is missing. Run npm run setup -- --target ui from the monorepo root.");
   await ensurePortAvailable(8000, "Lea API");
   start("lea-api", "./.venv/bin/python", ["-m", "lea_api"], {
-    cwd: path.join(root, "external", "lea-prover"),
+    cwd: leaRoot,
     env: leaApiEnv(config),
   });
 } else {
@@ -192,7 +227,7 @@ try {
 }
 
 await ensurePortAvailable(5173, "frontend");
-start("web", path.join(root, "node_modules", ".bin", "vite"), ["--host", "0.0.0.0", "--strictPort"]);
+start("web", viteBin, ["--host", "0.0.0.0", "--strictPort"]);
 
 try {
   await waitFor("http://127.0.0.1:5173", "frontend");

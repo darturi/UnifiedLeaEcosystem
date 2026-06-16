@@ -4,7 +4,7 @@
 # Lea Interface — self-contained image (frontend + UI adapter + bundled Lea API
 # + Lean 4 + Mathlib). Built for linux/arm64 (Apple Silicon Macs).
 #
-# Build:  docker buildx build --platform linux/arm64 -t lea-interface:local --load .
+# Build:  docker buildx build --platform linux/arm64 -f apps/lea-ui/Dockerfile -t lea-interface:local --load .
 # Run:    docker compose up
 # =============================================================================
 
@@ -14,12 +14,12 @@
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
 
-COPY package.json package-lock.json ./
+COPY apps/lea-ui/package.json apps/lea-ui/package-lock.json ./
 RUN npm ci
 
 # Only the files the Vite build actually reads (keeps this layer small + cacheable).
-COPY index.html vite.config.ts postcss.config.mjs ./
-COPY src ./src
+COPY apps/lea-ui/index.html apps/lea-ui/vite.config.ts apps/lea-ui/postcss.config.mjs ./
+COPY apps/lea-ui/src ./src
 RUN npm run build   # -> /web/dist
 
 # -----------------------------------------------------------------------------
@@ -46,7 +46,7 @@ WORKDIR /app
 
 # --- Bundled Lea agent + API (the submodule) -------------------------------
 # Copy the submodule first so the expensive Mathlib bake is its own cache layer.
-COPY external/lea-prover ./external/lea-prover
+COPY vendor/lea-prover ./vendor/lea-prover
 
 # Bake Mathlib: download the prebuilt oleans (multi-GB). `lake exe cache get`
 # resolves dependencies (clones Mathlib) and downloads the prebuilt cache
@@ -56,7 +56,7 @@ COPY external/lea-prover ./external/lea-prover
 # `lean_lib Lea` rooted at proofs/, which the agent populates at runtime — at
 # build time proofs/ is empty so `lake build` fails on a missing proofs/Lea.lean.
 # We only need Mathlib's oleans, so we just fetch the cache and verify it landed.
-WORKDIR /app/external/lea-prover/workspace
+WORKDIR /app/vendor/lea-prover/workspace
 RUN lake exe cache get \
  && test -n "$(ls -A .lake/packages/mathlib/.lake/build/lib 2>/dev/null)" \
  && echo "[build] Mathlib oleans present" \
@@ -64,27 +64,28 @@ RUN lake exe cache get \
  && rm -rf /root/.cache/mathlib \
  && echo "[build] removed dependency .git histories + compressed cache (~1GB)"
 
-# Python deps for the agent + Lea API (creates external/lea-prover/.venv).
-WORKDIR /app/external/lea-prover
+# Python deps for the agent + Lea API (creates vendor/lea-prover/.venv).
+WORKDIR /app/vendor/lea-prover
 RUN uv sync --extra api
 
 # --- UI adapter (FastAPI) ---------------------------------------------------
 WORKDIR /app/server
-COPY server ./
+COPY apps/lea-ui/server ./
 RUN uv sync   # creates /app/server/.venv
 
 # --- Built frontend + entrypoint -------------------------------------------
 COPY --from=web /web/dist /app/dist
-COPY docker/entrypoint.sh /app/entrypoint.sh
+COPY apps/lea-ui/docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 WORKDIR /app
 
 # Defaults that make the adapter and Lea API agree on paths/URLs in-container.
-# Provider key + model come from the runtime environment (lea.env).
+# Provider key + model come from the runtime environment; local development uses
+# the monorepo root .env.
 ENV PYTHONUNBUFFERED=1 \
     LEA_API_BASE_URL=http://127.0.0.1:8000 \
-    LEA_ROOT=/app/external/lea-prover \
+    LEA_ROOT=/app/vendor/lea-prover \
     LEA_WEB_DIST=/app/dist \
     LEA_MODEL=gemini/gemini-3.1-pro-preview
 

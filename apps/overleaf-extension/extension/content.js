@@ -264,7 +264,7 @@
         </section>
         <section class="ol-lean-provider-panel" data-role="provider-keys">
           <div class="ol-lean-provider-title">Model families</div>
-          <p class="ol-lean-provider-note">Keys are saved to the local .env by the companion, not to Chrome or settings.json.</p>
+          <p class="ol-lean-provider-note">Keys are saved to the root .env by the companion, not to Chrome or settings.json.</p>
           ${Object.entries(MODEL_FAMILY_LABELS).map(([family, label]) => `
             <div class="ol-lean-provider-row" data-family="${family}">
               <div class="ol-lean-provider-row-head">

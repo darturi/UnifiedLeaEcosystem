@@ -1,43 +1,20 @@
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const root = process.cwd();
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const monorepoRoot = path.resolve(projectRoot, "../..");
+const rootSetup = path.join(monorepoRoot, "scripts", "setup.mjs");
+const args = ["--target", "ui", ...process.argv.slice(2)];
 
-function fail(message) {
-  console.error(`\n[setup] ${message}`);
-  process.exit(1);
+const result = spawnSync(process.execPath, [rootSetup, ...args], {
+  cwd: monorepoRoot,
+  stdio: "inherit",
+  env: process.env,
+});
+
+if (result.error) {
+  throw result.error;
 }
 
-function ensure(pathname, message) {
-  if (!existsSync(path.join(root, pathname))) {
-    fail(message);
-  }
-}
-
-function run(label, args, cwd) {
-  console.log(`[setup] ${label}`);
-  const result = spawnSync(args[0], args.slice(1), {
-    cwd,
-    stdio: "inherit",
-    env: process.env,
-  });
-  if (result.status !== 0) {
-    fail(`${label} failed with exit code ${result.status ?? "unknown"}.`);
-  }
-}
-
-ensure(
-  "external/lea-prover/pyproject.toml",
-  "external/lea-prover is missing. Run git submodule update --init --recursive.",
-);
-
-run("Installing UI adapter dependencies", ["uv", "sync"], path.join(root, "server"));
-run("Installing bundled Lea API dependencies", ["uv", "sync", "--extra", "api"], path.join(root, "external", "lea-prover"));
-run("Downloading Lean workspace cache", ["lake", "exe", "cache", "get"], path.join(root, "external", "lea-prover", "workspace"));
-ensure(
-  "external/lea-prover/workspace/.lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean",
-  "Lean Mathlib cache is missing after cache download.",
-);
-
-console.log("[setup] Done.");
+process.exit(result.status ?? 1);

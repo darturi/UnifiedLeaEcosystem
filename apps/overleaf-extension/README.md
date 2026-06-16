@@ -97,18 +97,28 @@ If your document already defines `\theorem`, replace `\NewDocumentCommand` with 
 Run the setup script from the repository root:
 
 ```sh
-git submodule update --init --recursive
 npm run setup
 ```
 
-The script does the one-time local work:
+This sets up the full monorepo: shared Node dependencies, the bundled Lea API,
+Lean/Mathlib cache, root `.env`, this extension's companion settings, and the
+Lea UI.
+
+If you only need the Overleaf extension:
+
+```sh
+npm run setup -- --target overleaf
+```
+
+The unified setup does the one-time local work:
 
 - initializes or updates the Lea submodule at `vendor/lea-prover`
+- runs `npm install` for the monorepo
 - runs `uv sync --extra api` for the bundled Lea API
 - runs `lake update` in `vendor/lea-prover/workspace` when the local Mathlib checkout is missing
 - runs `lake exe cache get` in `vendor/lea-prover/workspace`
 - verifies `import Mathlib` against the compiled cache so first-run cache issues fail during setup
-- writes `.env` for API/runtime settings and `.overleaf-lean-stub/settings.json` for local Lea paths
+- writes the monorepo root `.env` for API/runtime settings and `.overleaf-lean-stub/settings.json` for local Lea paths
 
 To force a Lean dependency refresh:
 
@@ -116,7 +126,7 @@ To force a Lean dependency refresh:
 npm run update-lean-deps
 ```
 
-Then edit `.env` and replace the placeholder API key, or enter provider keys in the extension settings UI. When entered through the UI, keys are written by the local companion to `.env`; they are not stored in Chrome or `.overleaf-lean-stub/settings.json`.
+Then edit the monorepo root `.env` and replace the placeholder API key, or enter provider keys in the extension settings UI. When entered through the UI, keys are written by the local companion to the root `.env`; they are not stored in Chrome or `.overleaf-lean-stub/settings.json`.
 
 ```text
 OPENAI_API_KEY=your_openai_key_here
@@ -125,7 +135,6 @@ GEMINI_API_KEY=your_gemini_key_here
 # GOOGLE_API_KEY is also accepted for Gemini
 LEA_API_BASE_URL=http://127.0.0.1:8000
 LEA_JOB_TIMEOUT_SECONDS=900
-LEA_LATEX_CONTEXT_MODE=off
 ```
 
 Check setup:
@@ -192,19 +201,15 @@ The main workflow expects:
 - the `vendor/lea-prover` submodule initialized from `https://github.com/darturi/lea-prover.git`
 - `uv` available on `PATH`
 - the Lea API reachable at `LEA_API_BASE_URL` (default `http://127.0.0.1:8000`)
-- `OPENAI_API_KEY` in `.env` or exported in the shell that runs `npm start`
-- optional `LEA_JOB_TIMEOUT_SECONDS` in `.env` to fail and unblock stalled Lea runs
+- `OPENAI_API_KEY` in the monorepo root `.env` or exported in the shell that runs `npm start`
+- optional `LEA_JOB_TIMEOUT_SECONDS` in the root `.env` to fail and unblock stalled Lea runs
 - Lean and Lake available on `PATH`
 
-The extension options page stores local companion and Lea runtime settings. API keys stay in `.env` or the companion process environment.
+The extension options page stores local companion and Lea runtime settings. API keys stay in the root `.env` or the companion process environment.
 
 ## Optional LaTeX Context
 
-Lea can optionally mirror the currently open Overleaf editor buffer into its workspace so proof-search agents can inspect surrounding LaTeX when notation or exposition matters. This is off by default. Enable it from the extension settings or set:
-
-```text
-LEA_LATEX_CONTEXT_MODE=active_file
-```
+Lea can optionally mirror the currently open Overleaf editor buffer into its workspace so proof-search agents can inspect surrounding LaTeX when notation or exposition matters. This is off by default. Enable it from the extension settings. This setting is Overleaf-specific and is not shared with the Lea UI.
 
 The v1 mirror only tracks the active editor file, not the full Overleaf file tree. Mirrored context is written under:
 

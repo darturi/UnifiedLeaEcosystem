@@ -10,16 +10,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ROOT, LeaConfig, load_config
+from .config import ROOT_ENV_PATH, LeaConfig, load_config
+from .env import patch_dotenv
 from . import store
 
 
-CONFIG_PATH = ROOT / "config" / "lea.local.toml"
+CONFIG_PATH = ROOT_ENV_PATH
 PERMISSION_TIERS = {"none", "theorem_translation", "stepwise"}
 API_KEY_FIELDS = {
     "openai": "openai_api_key",
     "anthropic": "anthropic_api_key",
     "google": "google_api_key",
+}
+CONFIG_ENV_FIELDS = {
+    "model": "LEA_MODEL",
+    "max_turns": "LEA_MAX_TURNS",
+    "max_spend_usd": "LEA_MAX_SPEND_USD",
+    "permission_tier": "LEA_PERMISSION_TIER",
+    "theorem_translation_max_retries": "LEA_THEOREM_TRANSLATION_MAX_RETRIES",
+    "openai_api_key": "OPENAI_API_KEY",
+    "anthropic_api_key": "ANTHROPIC_API_KEY",
+    "google_api_key": "GEMINI_API_KEY",
 }
 PROVIDER_LABELS = {
     "openai": "OpenAI",
@@ -58,7 +69,7 @@ class ApiKeyUpdate:
 
 
 def settings_payload(path: Path | None = None) -> dict[str, Any]:
-    config = load_config(path)
+    config = _load_settings_config(path)
     stats = store.usage_stats()
     return {
         "model": config.model,
@@ -82,7 +93,7 @@ def settings_payload(path: Path | None = None) -> dict[str, Any]:
 
 def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
     config_path = path or CONFIG_PATH
-    current_config = load_config(config_path)
+    current_config = _load_settings_config(config_path)
     updates: dict[str, Any] = {}
 
     if "model" in values and values["model"] is not None:
@@ -154,7 +165,7 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
                 updates[field] = value
 
     _validate_selected_model_has_key(current_config, updates)
-    _write_toml_updates(config_path, updates)
+    _write_config_updates(config_path, updates)
     return settings_payload(config_path)
 
 
@@ -341,6 +352,28 @@ def _looks_like_model_error(detail: str) -> bool:
 
 def _provider_label(family: str) -> str:
     return PROVIDER_LABELS.get(family, family.title())
+
+
+def _load_settings_config(path: Path | None = None) -> LeaConfig:
+    if path is None:
+        return load_config()
+    if path.suffix == ".toml":
+        return load_config(path)
+    return load_config(env_path=path)
+
+
+def _write_config_updates(path: Path, updates: dict[str, Any]) -> None:
+    if path.suffix == ".toml":
+        _write_toml_updates(path, updates)
+        return
+    patch_dotenv(
+        path,
+        {
+            CONFIG_ENV_FIELDS[key]: value
+            for key, value in updates.items()
+            if key in CONFIG_ENV_FIELDS
+        },
+    )
 
 
 def _write_toml_updates(path: Path, updates: dict[str, Any]) -> None:

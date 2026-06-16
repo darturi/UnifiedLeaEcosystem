@@ -3,8 +3,9 @@
 # also serves the built frontend.
 #
 # No API key is needed to start. The container boots keyless; the user adds and
-# validates their key in the app's Settings pane, which saves it to
-# /app/config/lea.local.toml (mounted as a volume so it persists). The adapter
+# validates their key in the app's Settings pane, which persists it inside the
+# mounted /app/config volume for container runs. Local development uses root .env.
+# The adapter
 # forwards that key to the Lea API per run.
 set -euo pipefail
 
@@ -13,7 +14,7 @@ cleanup() { [ -n "$api_pid" ] && kill "$api_pid" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
 echo "[lea] starting Lea API on 127.0.0.1:8000 ..."
-( cd /app/external/lea-prover \
+( cd /app/vendor/lea-prover \
   && LEA_API_HOST=127.0.0.1 LEA_API_PORT=8000 .venv/bin/python -m lea_api ) &
 api_pid=$!
 

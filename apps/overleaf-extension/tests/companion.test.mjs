@@ -162,10 +162,18 @@ test("settings save supported models when their family key is configured", async
   assert.equal(anthropicResult.body.leaProvider, "anthropic");
   assert.equal(anthropicResult.body.leaModel, "anthropic/claude-sonnet-4-6");
 
+  const envFile = await fs.readFile(state.envPath, "utf8");
+  assert.match(envFile, /LEA_MODEL=anthropic\/claude-sonnet-4-6/);
+  assert.match(envFile, /LEA_MAX_TURNS=21/);
+  assert.match(envFile, /LEA_MAX_SPEND_USD=9.5/);
+  assert.match(envFile, /LEA_THEOREM_TRANSLATION_MAX_RETRIES=8/);
+
   const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
-  assert.equal(saved.leaTheoremTranslationMaxRetries, 8);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaModel"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxTurns"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxSpendUsd"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaTheoremTranslationMaxRetries"), false);
   assert.equal(saved.leaLatexContextMode, "active_file");
-  assert.equal(saved.leaMaxSpendUsd, 9.5);
 });
 
 test("settings reject unsupported latex context modes", async () => {
@@ -320,7 +328,7 @@ test("settings writes scrub legacy key fields", async () => {
   assert.match(envFile, /ANTHROPIC_API_KEY=legacy-anthropic-key/);
   assert.match(envFile, /OPENAI_API_KEY=legacy-openai-key/);
   const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
-  assert.equal(saved.leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaModel"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaApiKey"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaProviderApiKeys"), false);
 });
@@ -346,10 +354,14 @@ test("settings save provider key patches to env file without settings persistenc
 
   const envFile = await fs.readFile(state.envPath, "utf8");
   assert.match(envFile, /ANTHROPIC_API_KEY=anthropic-key/);
+  assert.match(envFile, /LEA_MODEL=anthropic\/claude-sonnet-4-6/);
+  assert.match(envFile, /LEA_MAX_TURNS=20/);
 
   const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaApiKey"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaProviderApiKeys"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaModel"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxTurns"), false);
 });
 
 test("settings reject invalid submitted Gemini keys before persistence", async () => {

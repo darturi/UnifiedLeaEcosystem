@@ -1,0 +1,14 @@
+.DS_Store
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+
+apps/overleaf-extension/.env
+apps/overleaf-extension/.overleaf-lean-stub/
+apps/lea-ui/config/lea.local.toml
+apps/lea-ui/data/
+apps/lea-ui/server/.venv/
