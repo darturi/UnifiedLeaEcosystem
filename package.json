@@ -1,0 +1,15 @@
+{
+  "name": "lea-ecosystem",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:lea": "cd vendor/lea-prover && LEA_API_HOST=127.0.0.1 LEA_API_PORT=8000 ./.venv/bin/python -m lea_api",
+    "dev:overleaf": "npm start -w apps/overleaf-extension",
+    "dev:ui": "npm run dev -w apps/lea-ui",
+    "doctor": "npm run doctor -w apps/overleaf-extension && npm run doctor -w apps/lea-ui",
+    "test": "npm test -w apps/overleaf-extension && npm run test:frontend -w apps/lea-ui"
+  }
+}
