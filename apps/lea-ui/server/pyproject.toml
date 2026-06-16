@@ -1,0 +1,20 @@
+[project]
+name = "lea-interface-server"
+version = "0.1.0"
+description = "Local FastAPI adapter between the Lea UI and Lea API."
+requires-python = ">=3.11"
+dependencies = [
+  "certifi>=2024.8.30",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.8.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
