@@ -1,0 +1,699 @@
+.ol-lean-theorem {
+  background: rgba(124, 58, 237, 0.12);
+  border-bottom: 1px solid rgba(124, 58, 237, 0.6);
+  cursor: pointer;
+}
+
+.ol-lean-status-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+}
+
+.ol-lean-status {
+  position: fixed;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid rgba(17, 24, 39, 0.12);
+  border-radius: 6px;
+  color: #4b5563;
+  background: #ffffff;
+  font: 700 11px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  white-space: nowrap;
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.ol-lean-status-progress {
+  font-weight: 700;
+  opacity: 0.72;
+}
+
+.ol-lean-status-progress-pending {
+  min-width: 12px;
+  animation: ol-lean-status-progress-pulse 1.1s ease-in-out infinite;
+}
+
+.ol-lean-stubbed-use-mark {
+  display: inline-grid;
+  place-items: center;
+  min-width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  color: #92400e;
+  background: #fde68a;
+  font: 800 9px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+@keyframes ol-lean-status-progress-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+
+  50% {
+    opacity: 0.9;
+  }
+}
+
+.ol-lean-status:focus-visible,
+.ol-lean-settings-trigger:focus-visible,
+.ol-lean-theorem-popover button:focus-visible,
+.ol-lean-popover button:focus-visible,
+.ol-lean-popover select:focus-visible,
+.ol-lean-popover input:focus-visible {
+  outline: 2px solid rgba(124, 58, 237, 0.55);
+  outline-offset: 2px;
+}
+
+.ol-lean-status-unformalized {
+  color: #92400e;
+  background: #fef3c7;
+  border-color: #f59e0b;
+}
+
+.ol-lean-status-in_progress {
+  color: #1d4ed8;
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
+.ol-lean-status-formalized {
+  color: #15803d;
+  background: #dcfce7;
+  border-color: #86efac;
+}
+
+.ol-lean-status-sorry_stub {
+  color: #c2410c;
+  background: #ffedd5;
+  border-color: #fdba74;
+}
+
+.ol-lean-status-offline,
+.ol-lean-status-failed {
+  color: #b91c1c;
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+
+.ol-lean-status-unavailable {
+  color: #7e22ce;
+  background: #f3e8ff;
+  border-color: #d8b4fe;
+}
+
+.ol-lean-settings-trigger {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 2147483646;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 38px;
+  height: 38px;
+  padding: 0 9px;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.16), 0 1px 4px rgba(17, 24, 39, 0.08);
+  cursor: pointer;
+}
+
+.ol-lean-settings-trigger:hover {
+  border-color: #c4b5fd;
+  background: #faf9ff;
+}
+
+.ol-lean-slider-line {
+  position: relative;
+  display: block;
+  height: 2px;
+  border-radius: 999px;
+  background: #7c3aed;
+}
+
+.ol-lean-slider-line span {
+  position: absolute;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #7c3aed;
+  transform: translateY(-50%);
+}
+
+.ol-lean-slider-line:nth-child(1) span {
+  left: 3px;
+}
+
+.ol-lean-slider-line:nth-child(2) span {
+  right: 2px;
+}
+
+.ol-lean-slider-line:nth-child(3) span {
+  left: 9px;
+}
+
+.ol-lean-theorem-popover {
+  position: fixed;
+  z-index: 2147483647;
+  min-width: 260px;
+  max-width: 360px;
+  padding: 12px;
+  color: #172033;
+  background: #ffffff;
+  border: 1px solid rgba(23, 32, 51, 0.18);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(23, 32, 51, 0.22);
+  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-popover-title {
+  margin: 0 0 8px;
+  font-weight: 700;
+}
+
+.ol-lean-popover-meta {
+  margin: 0 0 10px;
+  color: #536078;
+  word-break: break-word;
+}
+
+.ol-lean-theorem-popover button {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(23, 32, 51, 0.16);
+  border-radius: 6px;
+  background: #f8f9fc;
+  color: #172033;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ol-lean-theorem-popover button[data-primary="true"] {
+  border-color: #2357d9;
+  background: #2f65f6;
+  color: #ffffff;
+}
+
+.ol-lean-popover {
+  position: fixed;
+  z-index: 2147483647;
+  width: 280px;
+  color: #111827;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.05);
+  font: 12px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-popover-arrow {
+  position: absolute;
+  top: -5px;
+  left: 18px;
+  width: 10px;
+  height: 10px;
+  background: #ffffff;
+  border-left: 1px solid #e5e7eb;
+  border-top: 1px solid #e5e7eb;
+  transform: rotate(45deg);
+}
+
+.ol-lean-popover-arrow-bottom {
+  top: auto;
+  right: 18px;
+  bottom: -5px;
+  left: auto;
+  border-top: 0;
+  border-left: 0;
+  border-right: 1px solid #e5e7eb;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.ol-lean-cost-cap-notice {
+  position: fixed;
+  z-index: 2147483647;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(280px, calc(100vw - 24px));
+  box-sizing: border-box;
+  padding: 10px 10px 10px 12px;
+  color: #7f1d1d;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(127, 29, 29, 0.16);
+  font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-cost-cap-notice div {
+  min-width: 0;
+}
+
+.ol-lean-cost-cap-notice strong,
+.ol-lean-cost-cap-notice span {
+  display: block;
+}
+
+.ol-lean-cost-cap-notice strong {
+  margin-bottom: 2px;
+  color: #991b1b;
+  font-weight: 700;
+}
+
+.ol-lean-cost-cap-notice button {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: #991b1b;
+  background: transparent;
+  cursor: pointer;
+  font: 700 14px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-cost-cap-notice button:hover,
+.ol-lean-cost-cap-notice button:focus-visible {
+  background: #fee2e2;
+}
+
+.ol-lean-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px 9px;
+  border-bottom: 1px solid #f3f4f6;
+}
+
+.ol-lean-popover-kicker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #9ca3af;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.ol-lean-popover-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  color: #7c3aed;
+  background: #ede9fe;
+}
+
+.ol-lean-icon-button {
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  color: #9ca3af;
+  background: transparent;
+  cursor: pointer;
+}
+
+.ol-lean-icon-button:hover {
+  color: #374151;
+  background: #f3f4f6;
+}
+
+.ol-lean-popover-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.ol-lean-theorem-card,
+.ol-lean-usage-panel,
+.ol-lean-settings-panel {
+  border: 1px solid #f3f4f6;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+.ol-lean-theorem-card {
+  padding: 10px 12px;
+}
+
+.ol-lean-theorem-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ol-lean-field-label {
+  margin: 0 0 2px;
+  color: #9ca3af;
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ol-lean-theorem-label {
+  max-width: 160px;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #111827;
+  font-weight: 700;
+}
+
+.ol-lean-status-chip {
+  flex: 0 0 auto;
+  max-width: 96px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #4b5563;
+  background: #eef2f8;
+  font: 700 10px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  text-transform: lowercase;
+}
+
+.ol-lean-status-chip-unformalized {
+  color: #92400e;
+  background: #fef3c7;
+}
+
+.ol-lean-status-chip-in_progress {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.ol-lean-status-chip-formalized {
+  color: #15803d;
+  background: #dcfce7;
+}
+
+.ol-lean-status-chip-sorry_stub {
+  color: #c2410c;
+  background: #ffedd5;
+}
+
+.ol-lean-status-chip-offline,
+.ol-lean-status-chip-failed {
+  color: #b91c1c;
+  background: #fee2e2;
+}
+
+.ol-lean-status-chip-unavailable {
+  color: #7e22ce;
+  background: #f3e8ff;
+}
+
+.ol-lean-popover-detail,
+.ol-lean-popover-warning,
+.ol-lean-popover-status {
+  margin: 8px 0 0;
+  color: #6b7280;
+  overflow-wrap: anywhere;
+}
+
+.ol-lean-popover-warning {
+  color: #92400e;
+  font-weight: 700;
+}
+
+.ol-lean-popover-status {
+  min-height: 16px;
+  margin: 0 14px 12px;
+}
+
+.ol-lean-popover-lean {
+  max-width: 100%;
+  max-height: 118px;
+  margin: 9px 0 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid #e5e7eb;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #374151;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.ol-lean-popover-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.ol-lean-primary-button,
+.ol-lean-secondary-button,
+.ol-lean-save-button {
+  min-height: 32px;
+  border-radius: 7px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.ol-lean-primary-button {
+  flex: 1;
+  border: 0;
+  color: #ffffff;
+  background: #7c3aed;
+}
+
+.ol-lean-primary-button:hover:not(:disabled),
+.ol-lean-save-button:hover:not(:disabled) {
+  background: #6d28d9;
+}
+
+.ol-lean-secondary-button {
+  padding: 0 10px;
+  border: 1px solid #e5e7eb;
+  color: #374151;
+  background: #ffffff;
+}
+
+.ol-lean-primary-button:disabled,
+.ol-lean-secondary-button:disabled,
+.ol-lean-save-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.ol-lean-usage-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.ol-lean-usage-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ol-lean-usage-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #9ca3af;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ol-lean-usage-row-head strong {
+  color: #7c3aed;
+  font-size: 13px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.ol-lean-usage-metrics {
+  display: flex;
+  gap: 8px;
+}
+
+.ol-lean-usage-metrics span {
+  flex: 1;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: #f3f4f6;
+}
+
+.ol-lean-usage-metrics small {
+  display: block;
+  margin-bottom: 2px;
+  color: #9ca3af;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ol-lean-usage-metrics strong {
+  color: #374151;
+  font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+.ol-lean-usage-separator {
+  height: 1px;
+  background: #e5e7eb;
+}
+
+.ol-lean-usage-cap {
+  margin: 8px 0 0;
+  color: #6b7280;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.ol-lean-usage-cap[data-reached="true"] {
+  color: #b91c1c;
+}
+
+.ol-lean-provider-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.ol-lean-provider-title {
+  color: #6b7280;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ol-lean-provider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 7px;
+  background: #f9fafb;
+}
+
+.ol-lean-provider-row[data-configured="true"] {
+  border-color: #c7d2fe;
+  background: #eef2ff;
+}
+
+.ol-lean-provider-row-head,
+.ol-lean-provider-key-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ol-lean-provider-note {
+  margin: 0;
+  color: #6b7280;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.ol-lean-provider-row-head span {
+  color: #374151;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.ol-lean-provider-row-head strong {
+  color: #b91c1c;
+  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ol-lean-provider-row[data-configured="true"] .ol-lean-provider-row-head strong {
+  color: #4338ca;
+}
+
+.ol-lean-provider-key-button {
+  min-height: 26px;
+  padding: 4px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  color: #374151;
+  background: #ffffff;
+  font-size: 11px;
+}
+
+.ol-lean-provider-key-button:hover {
+  border-color: #7c3aed;
+  color: #6d28d9;
+}
+
+.ol-lean-provider-key-controls input {
+  flex: 1;
+  min-width: 0;
+}
+
+.ol-lean-settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #ffffff;
+}
+
+.ol-lean-settings-panel label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: #6b7280;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+}
+
+.ol-lean-settings-panel select,
+.ol-lean-settings-panel input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 32px;
+  padding: 6px 9px;
+  border: 1px solid #d1d5db;
+  border-radius: 7px;
+  color: #111827;
+  background: #ffffff;
+  font: 12px/1.3 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.ol-lean-settings-panel input {
+  width: 72px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  text-align: center;
+}
+
+.ol-lean-save-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #e5e7eb;
+  color: #9ca3af;
+  background: #f9fafb;
+}
+
+.ol-lean-save-button:not(:disabled) {
+  border-color: #7c3aed;
+  color: #ffffff;
+  background: #7c3aed;
+}

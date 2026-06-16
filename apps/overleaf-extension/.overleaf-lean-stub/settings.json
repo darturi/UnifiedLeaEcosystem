@@ -1,0 +1,12 @@
+{
+  "leaRepoPath": "/Users/danielarturi/Developer/VIDA_Dev/Overleaf1/vendor/lea-prover",
+  "leaWorkspacePath": "/Users/danielarturi/Developer/VIDA_Dev/Overleaf1/vendor/lea-prover/workspace",
+  "leaProvider": "openai",
+  "leaModel": "gpt-5.4",
+  "leaMaxTurns": 10,
+  "leaJobTimeoutSeconds": 900,
+  "leaApiBaseUrl": "http://127.0.0.1:8000",
+  "leaTheoremTranslationMaxRetries": 1,
+  "leaMaxSpendUsd": 1.19,
+  "leaLatexContextMode": "active_file"
+}
