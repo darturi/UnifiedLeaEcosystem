@@ -1,0 +1,3 @@
+[submodule "vendor/lea-prover"]
+	path = vendor/lea-prover
+	url = https://github.com/darturi/lea-prover.git
