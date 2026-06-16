@@ -84,6 +84,7 @@ GEMINI_API_KEY=your_gemini_key_here
 # GOOGLE_API_KEY is also accepted for Gemini
 LEA_API_BASE_URL=http://127.0.0.1:8000
 LEA_JOB_TIMEOUT_SECONDS=900
+LEA_LATEX_CONTEXT_MODE=off
 ```
 
 Check setup:
@@ -137,7 +138,7 @@ To clear prior local formalization runs while keeping Lea dependencies intact:
 npm run reset:local
 ```
 
-This removes Lea project markdowns, Lea proof files, companion job logs, backups, and local job/cache indexes. Preview the reset without deleting anything:
+This removes Lea project markdowns, Lea proof files, mirrored Overleaf LaTeX context, companion job logs, backups, and local job/cache indexes. Preview the reset without deleting anything:
 
 ```sh
 npm run reset:local -- --dry-run
@@ -154,7 +155,25 @@ The main workflow expects:
 - optional `LEA_JOB_TIMEOUT_SECONDS` in `.env` to fail and unblock stalled Lea runs
 - Lean and Lake available on `PATH`
 
-The extension options page stores only the companion URL, Lea repo path, Lea API URL, and model settings. API keys stay in `.env` or the companion process environment.
+The extension options page stores local companion and Lea runtime settings. API keys stay in `.env` or the companion process environment.
+
+## Optional LaTeX Context
+
+Lea can optionally mirror the currently open Overleaf editor buffer into its workspace so proof-search agents can inspect surrounding LaTeX when notation or exposition matters. This is off by default. Enable it from the extension settings or set:
+
+```text
+LEA_LATEX_CONTEXT_MODE=active_file
+```
+
+The v1 mirror only tracks the active editor file, not the full Overleaf file tree. Mirrored context is written under:
+
+```text
+vendor/lea-prover/workspace/context/overleaf/<ProjectSlug>/
+  manifest.json
+  tex/active.tex
+```
+
+Formalization prompts include only the manifest path. Lea can open the mirrored `.tex` file if it decides the additional context is useful.
 
 ## Generated Lean Work
 

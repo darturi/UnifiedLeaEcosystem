@@ -1,4 +1,5 @@
 const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
+const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
 const MODEL_FAMILY_LABELS = {
   openai: "OpenAI",
   gemini: "Gemini",
@@ -22,6 +23,7 @@ const leaRepoPathInput = document.querySelector("#lea-repo-path");
 const leaApiBaseUrlInput = document.querySelector("#lea-api-base-url");
 const leaModelInput = document.querySelector("#lea-model");
 const leaMaxTurnsInput = document.querySelector("#lea-max-turns");
+const leaLatexContextModeInput = document.querySelector("#lea-latex-context-mode");
 const providerStatusList = document.querySelector("#provider-key-status");
 const providerKeyInputs = {
   openai: document.querySelector("#openai-api-key"),
@@ -39,7 +41,8 @@ chrome.storage.sync.get(
     leaRepoPath: "",
     leaApiBaseUrl: "http://127.0.0.1:8000",
     leaModel: "o4-mini",
-    leaMaxTurns: 20
+    leaMaxTurns: 20,
+    leaLatexContextMode: DEFAULT_LEA_LATEX_CONTEXT_MODE
   },
   (settings) => {
     companionUrlInput.value = settings.companionUrl;
@@ -48,6 +51,7 @@ chrome.storage.sync.get(
     renderModelOptions(DEFAULT_MODEL_OPTIONS, settings.leaModel, latestProviderKeys);
     renderProviderKeyStatus(latestProviderKeys);
     leaMaxTurnsInput.value = settings.leaMaxTurns;
+    leaLatexContextModeInput.value = settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE;
     loadCompanionSettings({ silent: true });
   }
 );
@@ -65,6 +69,7 @@ form.addEventListener("submit", async (event) => {
   const leaApiBaseUrl = leaApiBaseUrlInput.value.trim().replace(/\/+$/, "");
   const leaModel = leaModelInput.value.trim() || "o4-mini";
   const leaMaxTurns = Number.parseInt(leaMaxTurnsInput.value, 10) || 20;
+  const leaLatexContextMode = leaLatexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
   const leaProviderApiKeys = collectProviderApiKeyPatch();
   try {
     const leaResponse = await fetch(`${companionUrl}/settings/lea`, {
@@ -75,6 +80,7 @@ form.addEventListener("submit", async (event) => {
         leaApiBaseUrl,
         leaModel,
         leaMaxTurns,
+        leaLatexContextMode,
         leaProviderApiKeys
       })
     });
@@ -88,7 +94,8 @@ form.addEventListener("submit", async (event) => {
       leaRepoPath: leaPayload.leaRepoPath,
       leaApiBaseUrl: leaPayload.leaApiBaseUrl,
       leaModel: leaPayload.leaModel,
-      leaMaxTurns: leaPayload.leaMaxTurns
+      leaMaxTurns: leaPayload.leaMaxTurns,
+      leaLatexContextMode: leaPayload.leaLatexContextMode
     });
     latestProviderKeys = leaPayload.leaProviderKeys || latestProviderKeys;
     renderProviderKeyStatus(latestProviderKeys);
@@ -117,13 +124,15 @@ async function loadCompanionSettings({ silent }) {
     renderProviderKeyStatus(latestProviderKeys);
     renderModelOptions(latestModelOptions, payload.leaModel || leaModelInput.value || "o4-mini", latestProviderKeys);
     leaMaxTurnsInput.value = payload.leaMaxTurns || leaMaxTurnsInput.value || 20;
+    leaLatexContextModeInput.value = payload.leaLatexContextMode || leaLatexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
 
     await chrome.storage.sync.set({
       companionUrl,
       leaRepoPath: leaRepoPathInput.value,
       leaApiBaseUrl: leaApiBaseUrlInput.value,
       leaModel: leaModelInput.value,
-      leaMaxTurns: Number.parseInt(leaMaxTurnsInput.value, 10) || 20
+      leaMaxTurns: Number.parseInt(leaMaxTurnsInput.value, 10) || 20,
+      leaLatexContextMode: leaLatexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE
     });
 
     if (!silent) {

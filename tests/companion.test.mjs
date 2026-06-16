@@ -10,12 +10,15 @@ import {
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
+  handleLatexContext,
   handleStub,
   handleUpdateLeaSettings,
   recoverInterruptedJobs,
   validateLeaRepo
 } from "../companion/server.mjs";
 import {
+  buildLeaLatexActiveTexPath,
+  buildLeaLatexContextManifestPath,
   buildLeaProjectMarkdownPath,
   buildLeaWorkspacePath,
   slugProjectId
@@ -91,6 +94,7 @@ test("settings response includes model families and key status", async () => {
   assert.equal(response.leaProviderKeys.gemini.configured, false);
   assert.equal(response.leaProviderKeys.anthropic.configured, true);
   assert.equal(response.leaTheoremTranslationMaxRetries, 3);
+  assert.equal(response.leaLatexContextMode, "off");
   assert.equal(response.leaMaxSpendUsd, 0.5);
   assert.equal(response.leaCurrentSpendUsd, 0.125);
 });
@@ -128,7 +132,8 @@ test("settings save supported models when their family key is configured", async
     leaModel: "gpt-5.4-mini",
     leaMaxTurns: 34,
     leaMaxSpendUsd: 9.5,
-    leaTheoremTranslationMaxRetries: 8
+    leaTheoremTranslationMaxRetries: 8,
+    leaLatexContextMode: "active_file"
   }, state);
   const geminiResult = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
@@ -149,6 +154,7 @@ test("settings save supported models when their family key is configured", async
   assert.equal(openAiResult.body.leaMaxTurns, 34);
   assert.equal(openAiResult.body.leaMaxSpendUsd, 9.5);
   assert.equal(openAiResult.body.leaTheoremTranslationMaxRetries, 8);
+  assert.equal(openAiResult.body.leaLatexContextMode, "active_file");
   assert.equal(geminiResult.statusCode, 200);
   assert.equal(geminiResult.body.leaProvider, "gemini");
   assert.equal(geminiResult.body.leaModel, "gemini/gemini-2.5-flash");
@@ -158,7 +164,88 @@ test("settings save supported models when their family key is configured", async
 
   const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
   assert.equal(saved.leaTheoremTranslationMaxRetries, 8);
+  assert.equal(saved.leaLatexContextMode, "active_file");
   assert.equal(saved.leaMaxSpendUsd, 9.5);
+});
+
+test("settings reject unsupported latex context modes", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo, env: { OPENAI_API_KEY: "openai-key" } });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaModel: "o4-mini",
+    leaMaxTurns: 20,
+    leaLatexContextMode: "project"
+  }, state);
+
+  assert.equal(result.statusCode, 400);
+  assert.equal(result.body.error, "invalid_latex_context_mode");
+});
+
+test("latex context endpoint mirrors the active file into Lea workspace", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const first = await handleLatexContext({
+    overleafProjectId: "project-1",
+    mode: "active_file",
+    activeTex: "\\section{First}\n\\theorem[label=foo]{A}"
+  }, state);
+  const second = await handleLatexContext({
+    overleafProjectId: "project-1",
+    mode: "active_file",
+    activeTex: "\\section{Second}\n\\theorem[label=foo]{B}"
+  }, state);
+
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal(
+    await fs.readFile(buildLeaLatexActiveTexPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }), "utf8"),
+    "\\section{Second}\n\\theorem[label=foo]{B}"
+  );
+  const manifest = JSON.parse(await fs.readFile(
+    buildLeaLatexContextManifestPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }),
+    "utf8"
+  ));
+  assert.equal(manifest.overleafProjectId, "project-1");
+  assert.equal(manifest.projectSlug, "project-1");
+  assert.equal(manifest.mode, "active_file");
+  assert.equal(manifest.files[0].path, "tex/active.tex");
+  assert.equal(manifest.files[0].sourceKind, "active_file");
+  assert.equal(manifest.files[0].bytes, Buffer.byteLength("\\section{Second}\n\\theorem[label=foo]{B}", "utf8"));
+
+  const projectMarkdown = await fs.readFile(buildLeaProjectMarkdownPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }), "utf8");
+  assert.match(projectMarkdown, /## LaTeX Context/);
+  assert.match(projectMarkdown, /workspace\/context\/overleaf\/project-1\/manifest\.json/);
+});
+
+test("latex context endpoint rejects disabled mode and invalid payloads", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const disabled = await handleLatexContext({
+    overleafProjectId: "project-1",
+    mode: "off",
+    activeTex: "A"
+  }, state);
+  const missingProject = await handleLatexContext({
+    mode: "active_file",
+    activeTex: "A"
+  }, state);
+  const invalidTex = await handleLatexContext({
+    overleafProjectId: "project-1",
+    mode: "active_file",
+    activeTex: 1
+  }, state);
+
+  assert.equal(disabled.statusCode, 400);
+  assert.equal(disabled.body.error, "latex_context_disabled");
+  assert.equal(missingProject.statusCode, 400);
+  assert.equal(missingProject.body.error, "missing_project_id");
+  assert.equal(invalidTex.statusCode, 400);
+  assert.equal(invalidTex.body.error, "invalid_active_tex");
 });
 
 test("settings clear max spend and reject negative caps", async () => {
@@ -440,6 +527,34 @@ test("formalize starts Lea without root workspace paths", async () => {
   assert.match(calls[0].body.task, /A theorem\./);
   assert.match(calls[0].body.task, /Use the Lea project context/);
   assert.doesNotMatch(calls[0].body.task, /also record the theorem/);
+});
+
+test("formalize includes mirrored latex context pointer when enabled", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaLatexContextMode: "active_file",
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  await handleLatexContext({
+    overleafProjectId: "project-1",
+    mode: "active_file",
+    activeTex: "\\newcommand{\\dist}{d}"
+  }, state);
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "uses_context",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.length > 0);
+  assert.match(calls[0].body.task, /Additional Overleaf LaTeX context is available/);
+  assert.match(calls[0].body.task, /workspace\/context\/overleaf\/project-1\/manifest\.json/);
+  assert.doesNotMatch(calls[0].body.task, /\\newcommand/);
 });
 
 test("formalize includes optional theorem context in the Lea prompt", async () => {
@@ -2239,6 +2354,7 @@ async function makeState(overrides = {}) {
         leaMaxTurns: 20,
         leaMaxSpendUsd: overrides.leaMaxSpendUsd ?? null,
         leaTheoremTranslationMaxRetries: overrides.leaTheoremTranslationMaxRetries || 3,
+        leaLatexContextMode: overrides.leaLatexContextMode || "off",
         ...(overrides.leaJobTimeoutSeconds ? {
           leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
         } : {})

@@ -3,6 +3,7 @@ import path from "node:path";
 export const GENERATOR_VERSION = "lea-overleaf-v2";
 export const LEA_PROJECTS_DIR = path.join("workspace", "projects");
 export const LEA_PROOFS_DIR = path.join("workspace", "proofs");
+export const LEA_OVERLEAF_CONTEXT_DIR = path.join("workspace", "context", "overleaf");
 
 export function slugProjectId(overleafProjectId) {
   const raw = String(overleafProjectId || "").trim();
@@ -26,6 +27,23 @@ export function buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId }) 
     "projects",
     `${slugProjectId(overleafProjectId)}.md`
   );
+}
+
+export function buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId }) {
+  return path.join(
+    buildLeaWorkspacePath(leaRepoPath),
+    "context",
+    "overleaf",
+    slugProjectId(overleafProjectId)
+  );
+}
+
+export function buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId }) {
+  return path.join(buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId }), "manifest.json");
+}
+
+export function buildLeaLatexActiveTexPath({ leaRepoPath, overleafProjectId }) {
+  return path.join(buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId }), "tex", "active.tex");
 }
 
 export function buildLeaProofPath({ leaRepoPath, proofPath }) {

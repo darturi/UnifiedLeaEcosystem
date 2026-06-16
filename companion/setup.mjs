@@ -23,6 +23,7 @@ const DEFAULTS = {
   LEA_PROVIDER: "openai",
   LEA_MODEL: "o4-mini",
   LEA_MAX_TURNS: "20",
+  LEA_LATEX_CONTEXT_MODE: "off",
   LEA_JOB_TIMEOUT_SECONDS: "900"
 };
 
@@ -109,6 +110,7 @@ async function writeLocalEnv() {
   merged.LEA_PROVIDER = merged.LEA_PROVIDER || DEFAULTS.LEA_PROVIDER;
   merged.LEA_MODEL = merged.LEA_MODEL || DEFAULTS.LEA_MODEL;
   merged.LEA_MAX_TURNS = merged.LEA_MAX_TURNS || DEFAULTS.LEA_MAX_TURNS;
+  merged.LEA_LATEX_CONTEXT_MODE = merged.LEA_LATEX_CONTEXT_MODE || DEFAULTS.LEA_LATEX_CONTEXT_MODE;
   merged.LEA_JOB_TIMEOUT_SECONDS = merged.LEA_JOB_TIMEOUT_SECONDS || DEFAULTS.LEA_JOB_TIMEOUT_SECONDS;
 
   await fs.writeFile(ENV_PATH, formatEnv(merged), "utf8");
@@ -125,6 +127,7 @@ async function writeLocalSettings() {
     leaProvider: settings.leaProvider || DEFAULTS.LEA_PROVIDER,
     leaModel: settings.leaModel || DEFAULTS.LEA_MODEL,
     leaMaxTurns: settings.leaMaxTurns || Number(DEFAULTS.LEA_MAX_TURNS),
+    leaLatexContextMode: settings.leaLatexContextMode || DEFAULTS.LEA_LATEX_CONTEXT_MODE,
     leaJobTimeoutSeconds: settings.leaJobTimeoutSeconds || Number(DEFAULTS.LEA_JOB_TIMEOUT_SECONDS)
   };
 
@@ -179,6 +182,7 @@ function formatEnv(values) {
     ["LEA_PROVIDER", values.LEA_PROVIDER],
     ["LEA_MODEL", values.LEA_MODEL],
     ["LEA_MAX_TURNS", values.LEA_MAX_TURNS],
+    ["LEA_LATEX_CONTEXT_MODE", values.LEA_LATEX_CONTEXT_MODE],
     ["LEA_JOB_TIMEOUT_SECONDS", values.LEA_JOB_TIMEOUT_SECONDS]
   ];
   return `${lines.map(([key, value]) => `${key}=${value}`).join("\n")}\n`;

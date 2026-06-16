@@ -4,7 +4,11 @@ import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import {
+  buildLeaLatexActiveTexPath,
+  buildLeaLatexContextManifestPath,
+  buildLeaLatexContextRoot,
   buildLeaProjectMarkdownPath,
   buildLeaProofPath,
   buildLeaWorkspacePath,
@@ -18,7 +22,7 @@ import {
   inferLeanDeclarationName,
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
-import { applyEnvDefaults, loadDotEnv } from "./config.mjs";
+import { applyEnvDefaults, loadDotEnv, normalizeLeaLatexContextMode } from "./config.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 31245;
@@ -33,6 +37,7 @@ const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
+const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
 const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
 const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
@@ -192,6 +197,12 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, usesResolution.error, usesResolution.message);
   }
 
+  const latexContext = await maybePrepareLatexContext({
+    state,
+    payload,
+    overleafProjectId
+  });
+
   const cleanup = await cleanupPreviousRunArtifacts({
     leaRepoPath: state.settings.leaRepoPath,
     target,
@@ -199,11 +210,12 @@ export async function handleFormalize(payload, state) {
     jobs: state.jobs || {}
   });
   const job = await createLeaJob({ state, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses });
+  job.latexContext = latexContext;
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
-  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
+  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses, latexContext }).catch(async (error) => {
     job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
@@ -258,6 +270,12 @@ export async function handleStub(payload, state) {
     return errorResponse(409, "not_unformalized", "Stub is only available for unformalized theorems.");
   }
 
+  const latexContext = await maybePrepareLatexContext({
+    state,
+    payload,
+    overleafProjectId
+  });
+
   const cleanup = await cleanupPreviousRunArtifacts({
     leaRepoPath: state.settings.leaRepoPath,
     target,
@@ -266,12 +284,13 @@ export async function handleStub(payload, state) {
   });
   const job = await createLeaJob({ state, target, theoremText, theoremContext });
   job.kind = "stub";
+  job.latexContext = latexContext;
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
   try {
-    await createStubJob({ state, job, target, theoremText, theoremContext });
+    await createStubJob({ state, job, target, theoremText, theoremContext, latexContext });
     if (job.finalStatus === "max_spend") {
       return {
         statusCode: 200,
@@ -297,6 +316,43 @@ export async function handleStub(payload, state) {
     statusCode: 200,
     body: buildJobResponse({ job, status: "sorry_stub", target })
   };
+}
+
+export async function handleLatexContext(payload, state) {
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: false });
+  if (!leaValidation.ok) {
+    return errorResponse(400, leaValidation.error, leaValidation.message);
+  }
+
+  let mode;
+  try {
+    mode = normalizeLeaLatexContextMode(payload.mode || state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE);
+  } catch {
+    return errorResponse(400, "invalid_latex_context_mode", "LaTeX context mode must be off or active_file.");
+  }
+  if (mode !== "active_file") {
+    return errorResponse(400, "latex_context_disabled", "LaTeX context mirroring is disabled.");
+  }
+
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  if (!overleafProjectId.trim()) {
+    return errorResponse(400, "missing_project_id", "overleafProjectId is required.");
+  }
+  if (typeof payload.activeTex !== "string") {
+    return errorResponse(400, "invalid_active_tex", "activeTex must be a string.");
+  }
+
+  const context = await writeActiveLatexContext({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    activeTex: payload.activeTex
+  });
+  await upsertProjectLatexContextEntry({
+    projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId }),
+    projectId: overleafProjectId,
+    context
+  });
+  return { statusCode: 200, body: { ok: true, context } };
 }
 
 export async function handleUpdateLeaSettings(payload, state) {
@@ -332,6 +388,16 @@ export async function handleUpdateLeaSettings(payload, state) {
   } catch {
     return errorResponse(400, "invalid_max_spend", "Lea max spend must be greater than or equal to 0.");
   }
+  let leaLatexContextMode;
+  try {
+    leaLatexContextMode = normalizeLeaLatexContextMode(
+      Object.prototype.hasOwnProperty.call(payload, "leaLatexContextMode")
+        ? payload.leaLatexContextMode
+        : state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE
+    );
+  } catch {
+    return errorResponse(400, "invalid_latex_context_mode", "LaTeX context mode must be off or active_file.");
+  }
   const nextSettings = {
     ...state.settings,
     leaRepoPath: path.resolve(leaRepoPath),
@@ -346,6 +412,7 @@ export async function handleUpdateLeaSettings(payload, state) {
       state.settings.leaTheoremTranslationMaxRetries ||
       DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES
     ),
+    leaLatexContextMode,
     leaJobTimeoutSeconds: Number.parseInt(
     String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
     10
@@ -480,6 +547,12 @@ async function routeRequest(request, response, state) {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/latex-context") {
+    const result = await handleLatexContext(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/formalize") {
     const result = await handleFormalize(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
@@ -528,6 +601,7 @@ export function buildSettingsResponse(state) {
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
     leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
     leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
+    leaLatexContextMode: normalizeLeaLatexContextMode(state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE),
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
 }
@@ -721,7 +795,8 @@ function sanitizeRuntimeSettings(settings) {
   return {
     ...rest,
     leaModel: normalizeLeaModelId(rest.leaModel || DEFAULT_LEA_MODEL),
-    leaMaxSpendUsd: normalizeLeaMaxSpendUsd(rest.leaMaxSpendUsd)
+    leaMaxSpendUsd: normalizeLeaMaxSpendUsd(rest.leaMaxSpendUsd),
+    leaLatexContextMode: normalizeLeaLatexContextMode(rest.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE)
   };
 }
 
@@ -751,6 +826,94 @@ function validateLeaPayload(payload) {
     return { ok: false, error: "missing_theorem_text", message: "Theorem text is required." };
   }
   return { ok: true, overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext };
+}
+
+async function maybePrepareLatexContext({ state, payload, overleafProjectId }) {
+  const mode = normalizeLeaLatexContextMode(state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE);
+  if (mode !== "active_file") return null;
+
+  if (typeof payload.activeTex === "string") {
+    const context = await writeActiveLatexContext({
+      leaRepoPath: state.settings.leaRepoPath,
+      overleafProjectId,
+      activeTex: payload.activeTex
+    });
+    await upsertProjectLatexContextEntry({
+      projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId }),
+      projectId: overleafProjectId,
+      context
+    });
+    return context;
+  }
+
+  return readExistingLatexContext({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId
+  });
+}
+
+async function writeActiveLatexContext({ leaRepoPath, overleafProjectId, activeTex }) {
+  const projectSlug = slugProjectId(overleafProjectId);
+  const rootPath = buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId });
+  const activeTexPath = buildLeaLatexActiveTexPath({ leaRepoPath, overleafProjectId });
+  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
+  const activeRelativePath = path.relative(rootPath, activeTexPath).split(path.sep).join("/");
+  const updatedAt = new Date().toISOString();
+  const bytes = Buffer.byteLength(activeTex, "utf8");
+  const sha256 = createHash("sha256").update(activeTex).digest("hex");
+  const manifest = {
+    overleafProjectId,
+    projectSlug,
+    mode: "active_file",
+    updatedAt,
+    files: [{
+      path: activeRelativePath,
+      sourceKind: "active_file",
+      sha256,
+      bytes,
+      lastSeenAt: updatedAt
+    }]
+  };
+
+  await atomicWriteFile(activeTexPath, activeTex, "utf8");
+  await atomicWriteJson(manifestPath, manifest);
+  return buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest });
+}
+
+async function readExistingLatexContext({ leaRepoPath, overleafProjectId }) {
+  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
+  try {
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    return buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest });
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest }) {
+  const rootPath = buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId });
+  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
+  return {
+    mode: "active_file",
+    rootPath: relativeToLeaRepo({ leaRepoPath, absolutePath: rootPath }),
+    manifestPath: relativeToLeaRepo({ leaRepoPath, absolutePath: manifestPath }),
+    updatedAt: manifest.updatedAt || null
+  };
+}
+
+async function atomicWriteJson(filePath, value) {
+  await atomicWriteFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function atomicWriteFile(filePath, content, encoding) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tmpPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`
+  );
+  await fs.writeFile(tmpPath, content, encoding);
+  await fs.rename(tmpPath, filePath);
 }
 
 function buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel }) {
@@ -988,7 +1151,7 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
   return sections.map((section) => section.entry.name);
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
   const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
     projectSlug: target.projectSlug,
@@ -996,7 +1159,8 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     theoremText,
     theoremContext,
     declarationNameHint: job.declarationNameHint || "",
-    resolvedUses
+    resolvedUses,
+    latexContext
   });
   await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs\n\n${prompt}\n\n`);
   const exit = await runLeaApiProofJob({
@@ -1170,14 +1334,15 @@ async function maybeResumeStubFormalization({ state, target, theoremText, theore
   };
 }
 
-async function createStubJob({ state, job, target, theoremText, theoremContext = "" }) {
+async function createStubJob({ state, job, target, theoremText, theoremContext = "", latexContext = null }) {
   const prompt = buildLeaPrompt({
     projectSlug: target.projectSlug,
     theoremLabel: target.theoremLabel,
     theoremText,
     theoremContext,
     declarationNameHint: job.declarationNameHint || "",
-    resolvedUses: []
+    resolvedUses: [],
+    latexContext
   });
   await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs (theorem translation approval)\n\n${prompt}\n\n`);
   const pause = await runLeaApiApprovalStubJob({
@@ -1362,7 +1527,7 @@ async function finishLeaProofJob({ state, job, target, beforeMarkers, exit }) {
   await writeJson(state.jobsPath, state.jobs);
 }
 
-function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [] }) {
+function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], latexContext = null }) {
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -1375,6 +1540,9 @@ function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext
   const formalizationGuidance = theoremContext.trim()
     ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
     : "";
+  const latexContextGuidance = latexContext?.manifestPath
+    ? `\nAdditional Overleaf LaTeX context is available in Lea's workspace at:\n${latexContext.manifestPath}\n\nConsult it if theorem statements, notation, definitions, or surrounding exposition are unclear.\n`
+    : "";
 
   return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
 ${naming}
@@ -1382,6 +1550,7 @@ ${usesGuidance}
 
 ${theoremText}
 ${formalizationGuidance}
+${latexContextGuidance}
 
 The final file must compile with no sorry/admit in theorem ${proofTarget}.
 Use the Lea project context to choose the project namespace and proof path.
@@ -2792,6 +2961,61 @@ async function upsertProjectTheoremEntry({
   await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
 }
 
+async function upsertProjectLatexContextEntry({ projectMarkdownPath, projectId, context }) {
+  let existing;
+  try {
+    existing = await fs.readFile(projectMarkdownPath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    existing = `# Lea Project: ${projectId}\n\n<!-- lea:project id="${escapeHtmlAttribute(projectId)}" -->\n`;
+  }
+
+  const entry = renderProjectLatexContextEntry(context);
+  const section = findProjectLatexContextSection(existing);
+  let next;
+  if (section) {
+    next = `${existing.slice(0, section.start).trimEnd()}\n\n${entry.trimEnd()}\n${existing.slice(section.end).trimStart() ? `\n${existing.slice(section.end).trimStart()}` : ""}`;
+  } else {
+    const firstTheorem = existing.search(/\n## Theorem:/);
+    if (firstTheorem === -1) {
+      next = `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
+    } else {
+      next = `${existing.slice(0, firstTheorem).trimEnd()}\n\n${entry.trimEnd()}\n\n${existing.slice(firstTheorem).trimStart()}`;
+    }
+  }
+  await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
+  await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
+}
+
+function renderProjectLatexContextEntry(context) {
+  const rootPath = context?.rootPath || "";
+  const manifestPath = context?.manifestPath || "";
+  const attrs = [
+    `root="${escapeHtmlAttribute(rootPath)}"`,
+    `manifest="${escapeHtmlAttribute(manifestPath)}"`,
+    context?.updatedAt ? `updated="${escapeHtmlAttribute(context.updatedAt)}"` : ""
+  ].filter(Boolean).join(" ");
+  return `## LaTeX Context
+
+<!-- lea:latex-context ${attrs} -->
+
+Available project LaTeX mirror:
+\`${manifestPath}\`
+`;
+}
+
+function findProjectLatexContextSection(markdown) {
+  const text = String(markdown || "");
+  const marker = text.search(/<!--\s*lea:latex-context\b[^>]*-->/);
+  if (marker === -1) return null;
+  const headingStart = findNamedSectionHeadingStart(text, marker, "LaTeX Context");
+  const nextHeading = text.slice(marker).search(/\n## /);
+  return {
+    start: headingStart,
+    end: nextHeading === -1 ? text.length : marker + nextHeading
+  };
+}
+
 function renderProjectTheoremEntry({
   theoremName,
   proofPath,
@@ -2890,6 +3114,16 @@ function findSectionHeadingStart(markdown, markerStart) {
     return headingIndex;
   }
   return beforeMarker.startsWith("## Theorem:") ? 0 : markerStart;
+}
+
+function findNamedSectionHeadingStart(markdown, markerStart, heading) {
+  const beforeMarker = markdown.slice(0, markerStart);
+  const pattern = `\n## ${heading}`;
+  const headingIndex = beforeMarker.lastIndexOf(pattern);
+  if (headingIndex !== -1) {
+    return headingIndex;
+  }
+  return beforeMarker.startsWith(`## ${heading}`) ? 0 : markerStart;
 }
 
 function markerKey(entry) {

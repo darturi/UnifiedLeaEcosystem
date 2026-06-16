@@ -45,6 +45,7 @@ test("applies environment defaults without replacing explicit settings", () => {
       LEA_MODEL: "env-model",
       LEA_MAX_TURNS: "7",
       LEA_THEOREM_TRANSLATION_MAX_RETRIES: "5",
+      LEA_LATEX_CONTEXT_MODE: "active_file",
       LEA_MAX_SPEND_USD: "12.5"
     }
   );
@@ -53,6 +54,7 @@ test("applies environment defaults without replacing explicit settings", () => {
   assert.equal(settings.leaModel, "explicit-model");
   assert.equal(settings.leaMaxTurns, 7);
   assert.equal(settings.leaTheoremTranslationMaxRetries, 5);
+  assert.equal(settings.leaLatexContextMode, "active_file");
   assert.equal(settings.leaMaxSpendUsd, 12.5);
   assert.equal(settings.leaApiKey, "legacy-openai-key");
   assert.equal(settings.leaProviderApiKeys, undefined);
@@ -74,9 +76,17 @@ test("negative max spend is rejected", () => {
   );
 });
 
+test("invalid latex context mode is rejected", () => {
+  assert.throws(
+    () => applyEnvDefaults({}, { LEA_LATEX_CONTEXT_MODE: "project" }),
+    /leaLatexContextMode/
+  );
+});
+
 test("derives local path defaults when env values are absent", () => {
   const settings = applyEnvDefaults({}, {});
 
   assert.equal(settings.leaRepoPath, path.join(PROJECT_ROOT, "vendor", "lea-prover"));
+  assert.equal(settings.leaLatexContextMode, "off");
   assert.equal(settings.leaMaxSpendUsd, null);
 });

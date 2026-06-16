@@ -83,9 +83,11 @@
   }, 1500);
 
   function publishTheorems(view) {
-    const theorems = parseTheorems(view.state.doc.toString());
+    const source = view.state.doc.toString();
+    const theorems = parseTheorems(source);
     window.postMessage({
       type: "OL_LEAN_THEOREMS_VISIBLE",
+      activeTex: source,
       theorems: theorems.map((theorem) => ({
         label: theorem.label,
         text: theorem.text,

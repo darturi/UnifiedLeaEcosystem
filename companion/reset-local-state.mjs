@@ -21,6 +21,7 @@ const leaRepoPath = path.resolve(settings.leaRepoPath);
 const workspaceDir = path.join(leaRepoPath, "workspace");
 const projectsDir = path.join(workspaceDir, "projects");
 const proofsDir = path.join(workspaceDir, "proofs");
+const overleafContextDir = path.join(workspaceDir, "context", "overleaf");
 const cachePath = path.join(appDir, "cache.json");
 const jobsPath = path.join(appDir, "jobs.json");
 const jobsDir = path.join(appDir, "jobs");
@@ -78,6 +79,7 @@ function relative(filePath) {
 
 removeEntries("Lea project entries", collectEntries(projectsDir));
 removeEntries("Lea proof entries", collectEntries(proofsDir));
+removeDir("Lea Overleaf LaTeX context", overleafContextDir);
 removeDir("companion job logs", jobsDir);
 removeDir("companion backups", backupsDir);
 writeJsonFile("companion job index", jobsPath, {});
