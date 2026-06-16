@@ -1,4 +1,0 @@
-[submodule "external/lea-prover"]
-	path = external/lea-prover
-	url = https://github.com/darturi/lea-prover.git
-	branch = thrm_permission
