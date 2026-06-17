@@ -1,6 +1,6 @@
 # Beta Install Guide
 
-These instructions install the beta version of the Overleaf Lea Formalizer Chrome extension from the pinned beta tag.
+These instructions install the beta version of the Overleaf Lea Formalizer Chrome extension from the pinned beta tag of the LeaEcosystem monorepo. All commands are run from the monorepo root unless noted.
 
 ## What You Need
 
@@ -18,8 +18,8 @@ If you are not sure whether the command-line tools are installed, continue with 
 Replace `beta-2026-06-16` if you were given a newer beta tag.
 
 ```sh
-git clone --branch beta-2026-06-16 --recurse-submodules https://github.com/darturi/LeaOverleafExtension.git
-cd LeaOverleafExtension
+git clone --branch beta-2026-06-16 --recurse-submodules https://github.com/darturi/UnifiedLeaEcosystem.git
+cd UnifiedLeaEcosystem
 ```
 
 If you already cloned without submodules, the setup command below initializes
@@ -77,13 +77,13 @@ Open two terminal windows or tabs in the repository root.
 In the first terminal, start the Lea API:
 
 ```sh
-npm run start:lea-api
+npm run dev:lea
 ```
 
 In the second terminal, start the Overleaf companion:
 
 ```sh
-npm start
+npm run dev:overleaf
 ```
 
 Keep both terminals running while you use the extension.
@@ -94,7 +94,7 @@ Keep both terminals running while you use the extension.
 2. Go to `chrome://extensions`.
 3. Turn on Developer Mode.
 4. Click Load unpacked.
-5. Select the `extension` folder inside this repository.
+5. Select the `apps/overleaf-extension/extension` folder inside this repository.
 6. Open the extension options page.
 7. Confirm the companion URL is:
 
@@ -102,7 +102,7 @@ Keep both terminals running while you use the extension.
 http://127.0.0.1:31245
 ```
 
-8. Confirm the Lea repo path points to this checkout's `vendor/lea-prover` folder.
+8. Confirm the Lea repo path points to the monorepo root `vendor/lea-prover` folder.
 
 ## 7. Use It In Overleaf
 
@@ -130,8 +130,8 @@ npm run doctor
 Then restart both local services:
 
 ```sh
-npm run start:lea-api
-npm start
+npm run dev:lea
+npm run dev:overleaf
 ```
 
 ## Troubleshooting

@@ -77,6 +77,16 @@ To install only the bundled agent dependencies manually, run `npm run setup:agen
 - After a run completes, click a chat step to jump the Lean Code panel to the matching code step.
 - Markdown and TeX math in assistant messages are rendered in the chat panel.
 
+## Overleaf Runs In The UI
+
+When shared process state is enabled (`LEA_SHARED_STATE=true` in the monorepo
+root `.env`), formalizations started from the Overleaf extension are recorded
+into the same shared database and appear in the sessions list with their full
+process timeline, rendered identically to UI-originated runs. The Overleaf
+extension can also deep-link straight to a recorded session: opening the UI with
+`?session=<id>` selects that session on load. See the monorepo root `README.md`
+and `docs/shared-process-state.md` for details.
+
 ## Health Check
 
 Run:

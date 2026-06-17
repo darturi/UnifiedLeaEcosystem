@@ -1,6 +1,9 @@
 # Overleaf Lea Formalizer MVP
 
-This repository contains a local MVP for sending labeled Overleaf theorem blocks to Lea and tracking the resulting Lean proofs in Lea's own workspace.
+This is the Overleaf app within the [LeaEcosystem](../../README.md) monorepo: a
+local MVP for sending labeled Overleaf theorem blocks to Lea and tracking the
+resulting Lean proofs in Lea's own workspace. Setup, the shared Lea API, and the
+shared `.env` are managed from the monorepo root.
 
 For beta testers installing from a pinned release tag, see [BETA_INSTALL.md](BETA_INSTALL.md).
 
@@ -10,7 +13,11 @@ For beta testers installing from a pinned release tag, see [BETA_INSTALL.md](BET
 - `companion/`: local HTTP service that starts Lea jobs and tracks statuses.
 - `shared/`: parser and helper logic used by tests and the companion.
 - `tests/`: Node test suite.
-- `vendor/lea-prover/`: Lea checkout. All Lean work happens under `vendor/lea-prover/workspace`.
+
+The Lea checkout is shared across the monorepo at the **root** `vendor/lea-prover`
+submodule (not inside this app). All Lean work happens under
+`vendor/lea-prover/workspace`, where paths shown below are relative to the
+monorepo root.
 
 ## Theorem Syntax
 
@@ -172,7 +179,7 @@ http://127.0.0.1:31245
 3. Load unpacked extension from the `extension/` directory.
 4. Open the extension options page.
 5. Confirm the companion URL is `http://127.0.0.1:31245`.
-6. Confirm the Lea repo path points to this checkout's `vendor/lea-prover`.
+6. Confirm the Lea repo path points to the monorepo root `vendor/lea-prover`.
 
 ## Run Tests
 
@@ -195,6 +202,18 @@ This removes Lea project markdowns, Lea proof files, mirrored Overleaf LaTeX con
 ```sh
 npm run reset:local -- --dry-run
 ```
+
+## Shared Process State
+
+When `LEA_SHARED_STATE=true` is set in the monorepo root `.env`, the companion
+records each run's full process timeline (assistant messages, code steps,
+approvals, usage) into the shared database that the Lea UI reads, so an
+Overleaf-originated formalization shows up in the UI exactly like a UI-originated
+run. The extension surfaces an "open in Lea UI" link that deep-links to the
+recorded session (`?session=<id>`). Set `LEA_UI_BASE_URL` (default
+`http://localhost:5173`) so the link targets your running UI. See the monorepo
+root `README.md` and `docs/shared-process-state.md` for the full design and the
+related `.env` options.
 
 ## Lea Setup
 
