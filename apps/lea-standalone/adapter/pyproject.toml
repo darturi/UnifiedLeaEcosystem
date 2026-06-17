@@ -1,0 +1,29 @@
+[project]
+name = "lea-interface-server"
+version = "0.1.0"
+description = "Local FastAPI adapter that drives the vendored Lea prover in-process."
+# >=3.13 because the adapter now imports the prover (lea-prover) in-process, and
+# the prover requires >=3.13. Single-process architecture (D1) — no HTTP boundary.
+requires-python = ">=3.13"
+dependencies = [
+  "certifi>=2024.8.30",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.8.0",
+  "litellm>=1.50.0",
+  # The vendored prover, imported in-process as a library (D1/D20). Editable
+  # path dep so edits under prover/lea are picked up without re-syncing.
+  "lea-prover",
+]
+
+[tool.uv.sources]
+lea-prover = { path = "../prover", editable = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

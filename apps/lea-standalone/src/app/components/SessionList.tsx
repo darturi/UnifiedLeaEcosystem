@@ -1,0 +1,75 @@
+import { CheckCircle, XCircle, Circle, CircleDashed } from 'lucide-react';
+import type { SessionSummary } from '../api';
+
+// v2 session status is derived from the latest code step's verdict:
+//   ok → compiles · error → has errors · unchecked → written but not checked · empty
+function StatusIcon({ status }: { status: SessionSummary['status'] }) {
+  switch (status) {
+    case 'ok':
+      return <CheckCircle className="h-4 w-4 text-green-600" />;
+    case 'error':
+      return <XCircle className="h-4 w-4 text-destructive" />;
+    case 'unchecked':
+      return <Circle className="h-4 w-4 text-muted-foreground" />;
+    default:
+      return <CircleDashed className="h-4 w-4 text-muted-foreground/60" />;
+  }
+}
+
+export function SessionList({
+  sessions,
+  selectedSessionId,
+  onSelectSession,
+  onNewSession,
+}: {
+  sessions: SessionSummary[];
+  selectedSessionId?: string;
+  onSelectSession: (id: string) => void;
+  onNewSession: () => void;
+}) {
+  return (
+    <div className="flex h-full flex-col border-r border-sidebar-border bg-sidebar">
+      <div className="border-b border-sidebar-border p-4">
+        <h2 className="text-sidebar-foreground">Sessions</h2>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        {sessions.length === 0 ? (
+          <div className="p-4 text-sm text-muted-foreground">No saved sessions yet.</div>
+        ) : (
+          sessions.map((session) => (
+            <button
+              key={session.id}
+              onClick={() => onSelectSession(session.id)}
+              className={`w-full border-b border-sidebar-border p-4 text-left transition-colors hover:bg-sidebar-accent ${
+                selectedSessionId === session.id ? 'bg-sidebar-accent' : ''
+              }`}
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-1 flex-shrink-0">
+                  <StatusIcon status={session.status} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-sidebar-foreground">{session.title}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {new Date(session.updated_at).toLocaleString()}
+                    {session.primary_model ? ` · ${session.primary_model}` : ''}
+                  </p>
+                </div>
+              </div>
+            </button>
+          ))
+        )}
+      </div>
+
+      <div className="border-t border-sidebar-border p-4">
+        <button
+          onClick={onNewSession}
+          className="w-full rounded-md bg-primary px-4 py-2 text-primary-foreground transition-opacity hover:opacity-90"
+        >
+          New Session
+        </button>
+      </div>
+    </div>
+  );
+}

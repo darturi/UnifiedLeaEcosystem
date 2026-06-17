@@ -1,0 +1,24 @@
+# Copy this file to config/lea.local.toml.
+#
+# This is the single config file for the whole app (architecture D1·cfg). The
+# adapter reads it into one LeaConfig and drives the vendored prover in-process —
+# there is no separate Lea API process or URL anymore.
+
+model = "gemini/gemini-3.1-pro-preview"
+max_turns = 20
+max_spend_usd = 25.0
+narrate_tool_steps = true
+
+# lea_root is the directory proof files + per-session git repos live under,
+# relative to the repo root. For the bundled local app, "prover" is expected.
+lea_root = "prover"
+
+# Provider credentials. Set the key for whichever provider your `model` uses.
+# The adapter exports these to the process environment (where LiteLLM reads
+# them); they are never stored on the config object. You can also export them
+# in your shell instead of here. NEVER commit your real key.
+# google_api_key = "..."
+# anthropic_api_key = "..."
+# openai_api_key = "..."
+# Any other provider works too, keyed by its LiteLLM env var name:
+# MISTRAL_API_KEY = "..."
