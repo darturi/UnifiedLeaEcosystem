@@ -83,6 +83,7 @@ test("settings response includes model families and key status", async () => {
     "gpt-5.4-mini",
     "gpt-5.4",
     "gpt-5.5",
+    "gpt-4o",
     "gemini/gemini-3.1-pro-preview",
     "gemini/gemini-2.5-pro",
     "gemini/gemini-2.5-flash",

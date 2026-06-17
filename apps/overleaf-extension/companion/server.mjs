@@ -58,6 +58,7 @@ const SHARED_SETTING_ENV_FIELDS = {
   leaProvider: "LEA_PROVIDER",
   leaModel: "LEA_MODEL",
   leaMaxTurns: "LEA_MAX_TURNS",
+  leaNarrateToolSteps: "LEA_NARRATE_TOOL_STEPS",
   leaMaxSpendUsd: "LEA_MAX_SPEND_USD",
   leaTheoremTranslationMaxRetries: "LEA_THEOREM_TRANSLATION_MAX_RETRIES",
   leaJobTimeoutSeconds: "LEA_JOB_TIMEOUT_SECONDS"
@@ -608,6 +609,7 @@ export function buildSettingsResponse(state) {
     leaModel: modelInfo.value,
     leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
     leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
     leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
@@ -1116,6 +1118,7 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaProviderFamily: modelInfo.family,
     leaModel: modelInfo.value,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
     leaCurrentTurn: null,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
@@ -1221,6 +1224,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     theoremTranslationMaxRetries: job.leaTheoremTranslationMaxRetries,
     providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
     prompt,
+    narrateToolSteps: job.leaNarrateToolSteps !== false,
     project: {
       project_id: target.projectSlug,
       project_path: target.relativePath,
@@ -1404,6 +1408,7 @@ async function createStubJob({ state, job, target, theoremText, theoremContext =
     theoremTranslationMaxRetries: job.leaTheoremTranslationMaxRetries,
     providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
     prompt,
+    narrateToolSteps: job.leaNarrateToolSteps !== false,
     project: {
       project_id: target.projectSlug,
       project_path: target.relativePath,
@@ -1621,6 +1626,7 @@ async function runLeaApiProofJob({
   project,
   logPath,
   timeoutMs,
+  narrateToolSteps = true,
   onRunStarted = null,
   onUsageUpdated = null,
   onProgressUpdated = null
@@ -1635,7 +1641,8 @@ async function runLeaApiProofJob({
     providerApiKey,
     prompt,
     project,
-    permissionTier: "none"
+    permissionTier: "none",
+    narrateToolSteps
   });
   if (!startResponse.ok) {
     return { ok: false, timedOut: false, error: startResponse.error };
@@ -1673,6 +1680,7 @@ async function runLeaApiApprovalStubJob({
   project,
   logPath,
   timeoutMs,
+  narrateToolSteps = true,
   onRunStarted = null,
   onUsageUpdated = null,
   onProgressUpdated = null
@@ -1687,7 +1695,8 @@ async function runLeaApiApprovalStubJob({
     providerApiKey,
     prompt,
     project,
-    permissionTier: "theorem_translation"
+    permissionTier: "theorem_translation",
+    narrateToolSteps
   });
   if (!startResponse.ok) {
     return { ok: false, timedOut: false, error: startResponse.error };
@@ -1723,7 +1732,8 @@ async function startLeaApiRun({
   providerApiKey,
   prompt,
   project,
-  permissionTier
+  permissionTier,
+  narrateToolSteps = true
 }) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) {
@@ -1741,7 +1751,7 @@ async function startLeaApiRun({
       },
       agent: {
         max_turns: maxTurns,
-        narrate_tool_steps: false,
+        narrate_tool_steps: narrateToolSteps !== false,
         permission_tier: permissionTier,
         theorem_translation_max_retries: normalizeLeaTheoremTranslationMaxRetries(theoremTranslationMaxRetries)
       }

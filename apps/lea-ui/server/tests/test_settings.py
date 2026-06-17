@@ -34,13 +34,14 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
         "gpt-5.4-mini",
         "gpt-5.4",
         "gpt-5.5",
+        "gpt-4o",
         "gemini/gemini-3.1-pro-preview",
         "gemini/gemini-2.5-pro",
         "gemini/gemini-2.5-flash",
         "anthropic/claude-opus-4-8",
         "anthropic/claude-sonnet-4-6",
     ]
-    assert payload["model_options"][4]["family"] == "google"
+    assert payload["model_options"][5]["family"] == "google"
 
 
 def test_update_settings_writes_root_env_values(tmp_path, monkeypatch):

@@ -35,6 +35,10 @@ export function applyEnvDefaults(settings, env = process.env) {
       env.LEA_SHARED_STATE !== undefined ? env.LEA_SHARED_STATE : settings.leaSharedState,
       false
     ),
+    leaNarrateToolSteps: normalizeBoolean(
+      env.LEA_NARRATE_TOOL_STEPS !== undefined ? env.LEA_NARRATE_TOOL_STEPS : settings.leaNarrateToolSteps,
+      true
+    ),
     leaUiServerDir,
     leaRecorderPython:
       env.LEA_RECORDER_PYTHON ||
