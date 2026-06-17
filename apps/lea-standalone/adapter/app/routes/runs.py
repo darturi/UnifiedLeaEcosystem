@@ -1,0 +1,138 @@
+"""Run endpoints: start a run, stream its events (SSE), interrupt it, and answer
+a per-tool approval. One run streams at a time (enforced in the bridge)."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from queue import Empty, Queue
+from threading import Thread
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from ..config import load_config
+from .. import bridge
+from ..bridge import RunnerContext, run_lea, request_stop
+from .. import settings as settings_service
+from .. import store
+
+router = APIRouter()
+
+
+class RunRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+    # Autonomous run (D19): when true the run uses no per-tool approval gate and the
+    # non-interactive `default` prompt variant, so it formalizes end-to-end with zero
+    # human interaction (the Overleaf path). Defaults false → the interactive UI
+    # behavior (gated tools + collaborator prompt) is unchanged.
+    autonomous: bool = False
+
+
+class ApprovalDecisionRequest(BaseModel):
+    decision: str
+
+
+def sse(event_type: str, payload: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+
+
+@router.post("/api/runs")
+def create_run(request: RunRequest) -> dict:
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+
+    config = load_config()
+    if settings_service.spend_limit_reached(config.max_spend_usd):
+        raise HTTPException(status_code=402, detail="Max spend limit has been reached.")
+
+    if request.session_id:
+        session = store.get_session(request.session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+    else:
+        session = store.create_session(message)
+
+    run = store.create_run(session["id"], config.model, None, config.max_turns,
+                           autonomous=request.autonomous)
+    user_message = store.add_message(session["id"], "user", message, run["id"])
+    return {"session_id": session["id"], "run_id": run["id"], "message": user_message}
+
+
+@router.post("/api/runs/{run_id}/approvals/{approval_id}")
+def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionRequest) -> dict:
+    """Answer a per-tool approval (D19): the human's allow / deny / always_session
+    decision for a gated tool call (bash / write_file / edit_file). The bridge
+    `.send()`s it into the paused run. 409 if the approval is stale/unknown (the
+    run already moved on, e.g. a Stop bailed it)."""
+    if request.decision not in {"allow", "deny", "always_session"}:
+        raise HTTPException(status_code=422, detail="decision must be 'allow', 'deny', or 'always_session'")
+    if not bridge.resolve_approval(run_id, approval_id, request.decision):
+        raise HTTPException(status_code=409, detail="No pending approval matches this run/approval id")
+    return {"status": "resolved", "decision": request.decision}
+
+
+@router.post("/api/runs/{run_id}/interrupt")
+def interrupt_run(run_id: str) -> dict:
+    """Request a clean cooperative stop (D18). The agent checks the flag at the
+    next turn boundary and ends with a committed file + accurate canvas — not a
+    hard kill. Idempotent: setting an already-set flag is a no-op."""
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] not in {"pending", "running"}:
+        raise HTTPException(status_code=409, detail="Run is not active")
+    request_stop(run_id)
+    return {"status": "interrupting"}
+
+
+@router.get("/api/runs/{run_id}/events")
+async def run_events(run_id: str) -> StreamingResponse:
+    run = store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run["status"] not in {"pending", "running"}:
+        raise HTTPException(status_code=409, detail="Run has already completed")
+
+    queue: Queue[dict] = Queue()
+    session = store.session_detail(run["session_id"])
+    if not session or not session["messages"]:
+        raise HTTPException(status_code=404, detail="Run task not found")
+
+    task = next(
+        (m["content"] for m in reversed(session["messages"])
+         if m["run_id"] == run_id and m["role"] == "user"),
+        None,
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="Run task not found")
+
+    context = RunnerContext(
+        session_id=run["session_id"],
+        run_id=run_id,
+        task=task,
+        config=load_config(),
+        events=queue,
+        project=None,  # project context is deferred to v2.1 (D8)
+        autonomous=bool(run.get("autonomous")),
+    )
+    thread = Thread(target=run_lea, args=(context,), daemon=True)
+    thread.start()
+
+    async def stream_events():
+        while True:
+            try:
+                item = queue.get_nowait()
+            except Empty:
+                if not thread.is_alive():
+                    break
+                await asyncio.sleep(0.1)
+                continue
+            yield sse(item["type"], item["payload"])
+            if item["type"] == "done":
+                break
+
+    return StreamingResponse(stream_events(), media_type="text/event-stream")

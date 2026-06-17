@@ -1,0 +1,26 @@
+# Keep the build context small and avoid leaking local state/secrets into the image.
+.git
+**/.git
+node_modules
+**/node_modules
+dist
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+.DS_Store
+
+# Local virtualenvs (recreated inside the image)
+.venv
+**/.venv
+adapter/.venv
+prover/.venv
+
+# Built Lean artifacts from the host (rebuilt inside the image for linux/arm64)
+prover/workspace/.lake
+prover/.lake
+prover/third_party/SafeVerify/.lake
+
+# Local runtime data and secrets — must never enter the image
+data
+config/lea.local.toml
+lea.env

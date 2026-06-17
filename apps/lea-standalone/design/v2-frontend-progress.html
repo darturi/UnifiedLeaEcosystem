@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="refresh" content="8" />
+<title>LeaUI v2 — Frontend Rebuild Progress</title>
+<style>
+  :root {
+    --bg: #f5f4ef; --panel: #fffefb; --ink: #2a2724; --muted: #8a847c;
+    --line: #e6e2da; --accent: #c96442; --green: #4f8a5b; --red: #c0564a;
+    --amber: #b8842a; --blue: #4a6fa5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: 32px 0 80px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  header { margin-bottom: 8px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 18px 0 6px; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+  .counts { color: var(--muted); font-size: 12.5px; margin-bottom: 26px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 14px 0 28px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 99px; display: inline-block; }
+  .d-queued { background: #cdc8be; } .d-planned { background: var(--amber); }
+  .d-prog { background: var(--blue); } .d-tested { background: #7aa37f; } .d-done { background: var(--green); }
+
+  .group { margin-bottom: 30px; }
+  .group > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    margin: 0 0 12px; font-weight: 600; }
+
+  .todo { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 15px; margin-bottom: 9px; }
+  .todo.is-planned { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(184,132,42,.15); }
+  .todo.is-done { opacity: .62; }
+  .todo .top { display: flex; align-items: center; gap: 10px; }
+  .id { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+  .title { font-weight: 550; flex: 1; }
+  .dec { color: var(--muted); font-size: 11.5px; font-family: ui-monospace, monospace; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 99px; white-space: nowrap; }
+  .b-queued { background: #efece6; color: #8a847c; }
+  .b-planned { background: #f7ecd6; color: var(--amber); }
+  .b-prog { background: #e4ecf6; color: var(--blue); }
+  .b-tested { background: #e2efe4; color: #5a8a62; }
+  .b-done { background: #dcefe1; color: var(--green); }
+  .scope { color: var(--muted); font-size: 13px; margin: 6px 0 0 0; }
+  code { background: #f0ede6; border-radius: 4px; padding: 1px 5px; font: 12px ui-monospace, monospace; }
+  footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LeaUI v2 — Frontend Rebuild</h1>
+    <div class="sub">Live progress tracker · React UI rebuilt to <code>design/v2-mockup.html</code> on the v2 backend · auto-refreshes every 8s</div>
+  </header>
+
+  <div class="bar"><i style="width:52%"></i></div>
+  <div class="counts"><b>10 tested</b> · <b>1</b> built (M5, untested) · <b>9</b> open + cleanup · next: M16–M18 (test-loop UX), then M9 / M13–M15 / M6 · M7 → v2.1</div>
+
+  <div class="legend">
+    <span><i class="dot d-queued"></i> Queued</span>
+    <span><i class="dot d-planned"></i> Planned</span>
+    <span><i class="dot d-prog"></i> Built (not yet confirmed)</span>
+    <span><i class="dot d-done"></i> Tested ✓</span>
+  </div>
+
+  <div class="group">
+    <h2>Foundation (design-agnostic — survived the pivot)</h2>
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">F0</span>
+        <span class="title">Data layer + <code>seq</code> timeline</span>
+        <span class="dec">contract</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope"><code>api.ts</code> (v2 types + fetchers for every route incl. <code>/file</code>, <code>/lean-check</code>, <code>/verify</code>, <code>/interrupt</code>, per-tool approvals) and <code>timeline.mjs</code> (stable merge on the authoritative <code>seq</code>) carry over unchanged. Tests: <code>timeline.test.mjs</code>.</div>
+    </div>
+  </div>
+
+  <div class="group">
+    <h2>M1–M7 · Rebuild to <code>design/v2-mockup.html</code></h2>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M1</span>
+        <span class="title">App shell + design system</span>
+        <span class="dec">layout</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">Ported the mockup CSS to <code>src/styles/lea-v2.css</code>. New <code>App</code> shell: <b>sidebar + chat + collapsible canvas</b> grid (replaces the 3 resize panels). <code>Sidebar</code> — brand, New proof, date-grouped chats with status dots, settings gear. Search + Projects group omitted (v2.1).</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M2</span>
+        <span class="title">Chat thread</span>
+        <span class="dec">thread</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope"><code>ChatThread</code>: centered thread, You/Lea bubbles, <b>step cards</b> with "worked via" tool chips (from <code>tool_call</code>/<code>lean_check</code> status events, grouped by turn), green/red <b>final card</b> with token/cost/step meta. Clicking a step focuses the canvas.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M3</span>
+        <span class="title">Canvas — highlighted Lean + stepper</span>
+        <span class="dec">canvas</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope"><code>Canvas</code>: file head, stepper, verdict chip, line-numbered <b>syntax-highlighted</b> Lean (new <code>leanHighlight.mjs</code> + test), added-line tinting via <code>codeDiff</code>, compile + SafeVerify badges in the foot.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M4</span>
+        <span class="title">Composer + approval card</span>
+        <span class="dec">supervision</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">Mockup composer (textarea + auto/model chips + send/stop). Per-tool gate restyled to the amber <code>.approval</code> card (Allow once / Always this session / Deny) → <code>POST /runs/{id}/approvals/{id}</code>. Stop → <code>/interrupt</code>.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M5</span>
+        <span class="title">Writeable canvas — edit → lean_check → verify</span>
+        <span class="dec">canvas</span>
+        <span class="badge b-prog">Built</span>
+      </div>
+      <div class="scope">Edit the latest snapshot in place → <code>POST /sessions/{id}/file</code> (commits <code>author=user</code> + edit note) → <code>lean-check</code>; verdict shown in the foot. SafeVerify button on a compiling proof.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top">
+        <span class="id">M6</span>
+        <span class="title">Settings + Stats for v2</span>
+        <span class="dec">config</span>
+        <span class="badge b-planned">Planned</span>
+      </div>
+      <div class="scope">Rewire <code>SettingsPage</code> to the v2 settings payload (model / max_turns / max_spend / provider key — no tiers) and <code>StatsPage</code> to <code>/api/stats</code>, restyled to the mockup. Until then these two views may error if opened from the gear.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top">
+        <span class="id">M7</span>
+        <span class="title">Projects window + ⌘K search</span>
+        <span class="dec">v2.1</span>
+        <span class="badge b-planned">Deferred</span>
+      </div>
+      <div class="scope">The mockup's project window (hero, proof list, Instructions/Memory/Files rail) and global search overlay. Deferred with the rest of the projects feature to v2.1.</div>
+    </div>
+  </div>
+
+  <div class="group">
+    <h2>M8–M18 · Requested polish</h2>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M8</span>
+        <span class="title">Auto-grow composer textarea</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">The chat input now grows with content (ref + reset-to-<code>scrollHeight</code> on each keystroke) up to a 200px cap, then scrolls inside (<code>overflow-y:auto</code>). No more scrolling at the 2nd <code>\n</code>.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M9</span>
+        <span class="title">Model picker in the main page (searchable)</span>
+        <span class="dec">UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">The <code>model: gemini/gemini-3.1-pro-preview</code> chip in the chat head should be a searchable select + dropdown (reuse <code>ModelCombobox</code> from settings) right in the main page so switching models is one click. Keep the model selector in Settings too; both write the same <code>model</code> via <code>PUT /api/settings</code>.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M10</span>
+        <span class="title">System prompt — collaborator, plan in NL before formalizing</span>
+        <span class="dec">prover prompt</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">Rewrote the <code>interactive</code> prompt (<code>prover/lea/prompt.py</code>) from an autoformalizer into a <b>proof collaborator</b>: lead with a natural-language sketch, propose + confirm the Lean statement, then formalize step by step <b>narrating each tool call</b>. Reference blocks extracted to single-source constants shared with <code>default</code>; hard rules intact. Hardened into a true pause (see M10b).</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M10b</span>
+        <span class="title">Hard pause — lead with the math, wait for "go ahead"</span>
+        <span class="dec">harness + prompt</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">Fix for "it dives straight into <code>write_file</code>". An interactive text-only turn now <b>finishes the run</b> instead of being nudged by <code>_NO_PROOF_ARTIFACT_MESSAGE</code> into writing a skeleton (<code>agent.py</code>); the prompt makes the first reply math-only with no tools; the intent classifier routes "go ahead"/confirmations to FORMALIZE so the resume turn proves. Eval/<code>default</code> variant keeps the nudge.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M11</span>
+        <span class="title">Per-write intent summary on the step card</span>
+        <span class="dec">bridge + UI</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">The narration the model writes before a write (flushed at <code>ToolCalled</code>) is stashed as <code>last_intent</code> and passed as <code>summary=</code> to <code>add_code_step</code>, shown as the step-card body and folded in (no duplicate prose bubble). Capped at 280 chars so a long NL sketch is never folded out of the thread.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M12</span>
+        <span class="title">On deny — explain intent + invite an alternative</span>
+        <span class="dec">prover prompt</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">Reworded the deny tool-result (<code>agent.py</code>) so a declined tool tells the model to explain what it was about to do and ask how to proceed — not silently retry or switch steps — and wait. Added a matching "a denied action is a redirect, not a failure" clause to the collaborator prompt.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M13</span>
+        <span class="title">Denied approval should stay visible in the thread</span>
+        <span class="dec">UI</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">Right now resolving an approval (allow/deny) clears the card and it vanishes — so there's no record you rejected something. Keep a resolved card in the thread (mockup's <code>.approval.resolved</code> with a "you denied this" tag), tied to that point in the timeline, instead of removing it.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M14</span>
+        <span class="title">Scratch files shouldn't drive session status / "Proved"</span>
+        <span class="dec">store + UI</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">A run that only wrote <code>scratch.lean</code> (an <code>exact?</code> probe) showed session status <b>ok</b> and the NL sketch as a green "✓ Proved" card. Partly fixed in UI (FinalCard now needs a real non-scratch compiling step). Backend follow-up: <code>store</code> session-status derivation should ignore scratch/probe files so a session isn't "ok" without a real proof.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M15</span>
+        <span class="title">Abandoned/paused run shouldn't lock out all new runs</span>
+        <span class="dec">bridge UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">A run paused on an approval (or whose SSE client navigated away) keeps holding the global <code>active_run_lock</code>, so every new run fails with the cryptic <i>"Another Lea run is already active."</i> Fixes: auto-interrupt an orphaned run when its event stream disconnects (release the lock), and/or surface the active run in the UI with a Cancel button, and/or time out <code>_await_decision</code>. For now a backend restart clears it.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M16</span>
+        <span class="title">"Proved" is a milestone card keyed on run completion</span>
+        <span class="dec">bridge + store + UI</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">The green "Proved" box was styling on the terminal message, so it moved/duplicated and leaked onto Q&amp;A turns. Reworked into a <b>milestone card keyed on the run's outcome</b>: bridge un-flattens <code>completed→success</code> (proved) vs <code>assistant→answered</code> (chat/pause); <code>session_detail</code> exposes <code>runs[]</code> for reload; the thread groups items by run and drops one green card after a <code>success</code> run (red after <code>failed</code>/<code>max_turns</code>). Shows once, never on intermediate checks, persists through later chat + reload. Removed <code>terminalMessageId</code>/<code>hasRealProof</code>.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M17</span>
+        <span class="title">Live tool-activity indicator (all tools)</span>
+        <span class="dec">UI</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">The "thinking" indicator now names the current tool for <b>every</b> tool — 🔍 search_mathlib, 💻 bash, 📖 read_file, ✎ write/edit, ⚙ lean_check, fallback for any other — driven by the latest <code>tool_call</code>/<code>lean_check</code> status event scoped to the active run. So a <code>search</code> in a Q&amp;A turn (no step card) is now visible live. Falls back to "Lea is thinking" when no tool is active.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M17b</span>
+        <span class="title">Persist tool/status activity (survives reload)</span>
+        <span class="dec">store + bridge</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">Status/tool events are <b>live-only</b> — the bridge emits them over SSE but never calls <code>store.add_status_event</code>, and <code>status_events</code> lacks <code>turn</code>/<code>check_status</code> columns. So the "worked via" step chips and the M17 activity vanish on reload. Follow-up: add the columns + persist at the emit sites so tool history survives reload.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M18</span>
+        <span class="title">"Lea is thinking…" indicator after submit</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">Between sending a prompt and the first <code>assistant_delta</code>, there's no feedback — it feels like nothing happened. Show a blinking "Lea is thinking…" indicator in the thread while a run is active and no streaming text has arrived yet, so the user knows the request reached the backend and the model is working.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M19</span>
+        <span class="title">First-run onboarding — point users to add a key</span>
+        <span class="dec">UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">A brand-new user with no provider key configured has no idea where to go (and a run would just fail). When no key is set, show a small card above the composer — e.g. "Add your model preference and API key <b>[Open settings]</b>" — linking straight to Settings. Detect via <code>/api/settings</code> (<code>api_keys[*].configured</code> / model requirements). Pairs with M6 (Settings page for v2).</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M20</span>
+        <span class="title">Canvas edit — signal the pending edit + ask for a summary</span>
+        <span class="dec">UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">After editing the proof in the canvas, there's no signal that an unsent human edit is staged. Show a badge near the composer (e.g. "✎ you edited <code>DivSix.lean</code>") and swap the input placeholder to prompt for context — "What did you change? A short note helps Lea pick up where you left off." That note is exactly the divergence context (D12) Lea consumes on the next run, so the summary improves the handoff.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M21</span>
+        <span class="title">SafeVerify wrongly rejected every namespaced proof</span>
+        <span class="dec">prover bug</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">SafeVerify built its target from the bare signature (root-level <code>div_6</code>) while the proof declares <code>Lea.Misc.div_6</code> — so it reported "declaration not found in submission" and <b>rejected valid proofs</b>. Fixed: <code>safeverify.namespace_context()</code> reproduces the submission's <code>namespace</code> wrapper in the target (<code>lea/interface.py</code>), so names match. Confirmed end-to-end: the <code>n³−n</code> proof now returns <code>ok</code>. Also deleted dead <code>adapter/app/safe_verify.py</code> (orphaned import of the removed <code>eval/</code>).</div>
+    </div>
+  </div>
+
+  <div class="group">
+    <h2>Cleanup (after you confirm the new UI works)</h2>
+    <div class="todo">
+      <div class="top">
+        <span class="id">F7</span>
+        <span class="title">Delete superseded files</span>
+        <span class="dec">housekeeping</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">Now unused (not bundled): <code>ChatInterface.tsx</code>, <code>CodeViewer.tsx</code>, <code>TheoremApprovalPanel.tsx</code>, <code>runAttempts.ts</code>, <code>stepTimeline.mjs</code>, <code>timelineTarget.mjs</code>, <code>projectAssociation.mjs</code>, <code>projectTags.js</code>, plus their tests. Kept on disk this pass so you can diff; deleted once the rebuild is confirmed.</div>
+    </div>
+  </div>
+
+  <footer>LeaUI v2 frontend · rebuilt to the mockup · git owns proof content, UI renders what the stream/hydration give it</footer>
+</div>
+</body>
+</html>

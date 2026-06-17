@@ -8,11 +8,11 @@
   "scripts": {
     "setup": "node scripts/setup.mjs",
     "update-lean-deps": "node scripts/setup.mjs --refresh-lean-deps",
-    "dev:lea": "cd vendor/lea-prover && LEA_API_HOST=127.0.0.1 LEA_API_PORT=8000 ./.venv/bin/python -m lea_api",
+    "start:adapter": "npm run start:api -w apps/lea-standalone",
     "dev:overleaf": "npm start -w apps/overleaf-extension",
-    "dev:ui": "npm run dev -w apps/lea-ui",
-    "doctor": "npm run doctor -w apps/overleaf-extension && npm run doctor -w apps/lea-ui",
+    "dev:ui": "npm run dev -w apps/lea-standalone",
+    "doctor": "npm run doctor -w apps/overleaf-extension && npm run doctor -w apps/lea-standalone",
     "reset:local": "node scripts/reset-local-state.mjs",
-    "test": "npm test -w apps/overleaf-extension && npm run test:frontend -w apps/lea-ui"
+    "test": "npm test -w apps/overleaf-extension && npm run test:frontend -w apps/lea-standalone"
   }
 }

@@ -1,0 +1,319 @@
+// Lea standalone adapter (`/api`) client for the Overleaf companion.
+//
+// This replaces the old vendored `/v1` Lea API. The standalone adapter
+// (apps/lea-standalone/adapter, :8001) drives the new prover in-process and is a
+// pure event stream: there is no resumable, seq-numbered wire and no run-status
+// polling endpoint. A run is started with POST /api/runs, then *driven and
+// observed* by opening its SSE event stream — opening the stream is what spawns
+// the run thread adapter-side. We consume the stream to terminal `done`.
+//
+// Differences from `/v1` that the companion must absorb (see
+// docs/migrate-to-standalone.md §4 — deferred TODOs):
+//   * Per-run config (model / max_turns / permission_tier / project) is NOT sent
+//     here; the adapter reads it from config/lea.local.toml. We pass only the
+//     prompt (+ optional session_id for multi-turn continuation).
+//   * There is no `theorem_translation` approval tier. The adapter gates impactful
+//     *tools* (bash / write_file / edit_file) with allow/deny/always_session for
+//     interactive UI runs. For Overleaf we start the run with `autonomous: true`,
+//     which tells the adapter to skip the gate entirely and use the non-interactive
+//     `default` prompt variant — so the run formalizes end-to-end with no human in
+//     the loop. (We still auto-resolve approval events client-side as a fallback,
+//     but an autonomous run emits none.) The "approve the statement, then formalize"
+//     flow is a deferred TODO that lights up when the native tier lands on `/api`.
+//   * Project recording is deferred adapter-side (`project=None`), so the
+//     formalized/unformalized status derived from project markdown will not update
+//     until the coworker's project feature lands. Also a deferred TODO.
+//   * Usage/cost is not streamed; it is persisted on the run row. We read it back
+//     from GET /api/sessions/{id} after the run finishes (best-effort).
+
+const TOOL_APPROVAL_DECISION = "always_session";
+
+// done.status values the adapter emits (see bridge._FINISH_STATUS + run_lea):
+//   success | answered | max_turns | cancelled | failed
+// For a *formalization* job only "success" (the agent passed final verification)
+// counts as ok; "answered" finished cleanly but proved nothing.
+const SUCCESS_DONE_STATUS = new Set(["success"]);
+
+export function isApiFlavor(flavor) {
+  return String(flavor || "").toLowerCase() === "api";
+}
+
+function toNonNegativeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function decodeChunk(chunk) {
+  if (typeof chunk === "string") return chunk;
+  if (chunk instanceof Uint8Array) return new TextDecoder().decode(chunk);
+  return String(chunk);
+}
+
+async function* iterateResponseBody(body) {
+  if (!body) return;
+  if (body[Symbol.asyncIterator]) {
+    yield* body;
+    return;
+  }
+  if (!body.getReader) return;
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    reader.releaseLock?.();
+  }
+}
+
+// Parse one SSE frame ("event: <type>\ndata: <json>") into { type, data }.
+// The adapter encodes the event name on the `event:` line and the payload (with
+// NO embedded `type`) on `data:` lines — unlike `/v1`, which inlined `type`.
+export function parseSseFrame(frame) {
+  let type = "message";
+  const dataLines = [];
+  for (const rawLine of frame.split(/\r?\n/)) {
+    if (rawLine.startsWith("event:")) {
+      type = rawLine.slice("event:".length).trim();
+    } else if (rawLine.startsWith("data:")) {
+      dataLines.push(rawLine.slice("data:".length).replace(/^ /, ""));
+    }
+  }
+  const dataText = dataLines.join("\n").trim();
+  if (!dataText) return { type, data: null };
+  try {
+    return { type, data: JSON.parse(dataText) };
+  } catch {
+    return { type, data: null };
+  }
+}
+
+function buildHeaders(apiKey, extra = {}) {
+  const headers = { ...extra };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  return headers;
+}
+
+async function fetchJson(fetchImpl, url, options) {
+  let response;
+  try {
+    response = await fetchImpl(url, options);
+  } catch (error) {
+    return { ok: false, error: `Request to ${url} failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  let body = null;
+  const text = await response.text().catch(() => "");
+  if (text) {
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = null;
+    }
+  }
+  if (!response.ok) {
+    const detail = body?.detail || body?.error || text || `HTTP ${response.status}`;
+    return { ok: false, status: response.status, error: `HTTP ${response.status}: ${detail}` };
+  }
+  return { ok: true, status: response.status, body };
+}
+
+export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true }) {
+  // `autonomous: true` tells the adapter to run with no per-tool approval gate and
+  // the non-interactive `default` prompt variant, so the Overleaf job formalizes
+  // end-to-end with zero human interaction. (The client also auto-resolves any
+  // approval events below as a belt-and-suspenders, but an autonomous run emits
+  // none.) Defaults true because this client is the autonomous Overleaf path.
+  const body = { message, autonomous };
+  if (sessionId) body.session_id = sessionId;
+  return fetchJson(fetchImpl, `${baseUrl}/api/runs`, {
+    method: "POST",
+    headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+}
+
+export function resolveApiApproval({ fetchImpl, baseUrl, apiKey, runId, approvalId, decision = TOOL_APPROVAL_DECISION }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(approvalId)}`, {
+    method: "POST",
+    headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ decision }),
+  });
+}
+
+export function interruptApiRun({ fetchImpl, baseUrl, apiKey, runId }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/runs/${encodeURIComponent(runId)}/interrupt`, {
+    method: "POST",
+    headers: buildHeaders(apiKey),
+  });
+}
+
+// Pull this run's usage/cost back off the persisted run row (no usage events on
+// the wire). Best-effort: any shape mismatch yields zeroes.
+export async function fetchApiRunUsage({ fetchImpl, baseUrl, apiKey, sessionId, runId }) {
+  const detail = await fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "GET",
+    headers: buildHeaders(apiKey),
+  });
+  const empty = { usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, costUsd: 0 };
+  if (!detail.ok || !detail.body) return empty;
+  const runs = Array.isArray(detail.body.runs) ? detail.body.runs : [];
+  const run = runs.find((r) => r && r.id === runId) || null;
+  const source = run || detail.body.usage || {};
+  const inputTokens = toNonNegativeNumber(source.input_tokens ?? source.inputTokens);
+  const outputTokens = toNonNegativeNumber(source.output_tokens ?? source.outputTokens);
+  const costUsd = toNonNegativeNumber(source.cost_usd ?? source.costUsd ?? run?.cost_usd);
+  return {
+    usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+    costUsd,
+  };
+}
+
+function deriveTurnProgress(payload, defaultMaxTurns) {
+  if (!payload || typeof payload !== "object") return null;
+  const turn = Number(payload.turn);
+  if (!Number.isFinite(turn) || turn <= 0) return null;
+  return { currentTurn: turn, maxTurns: defaultMaxTurns ?? null };
+}
+
+// Drive + observe one run to terminal `done`. Opening the stream is what runs the
+// job adapter-side; auto-approving keeps it autonomous. Returns the terminal
+// outcome (NOT usage — caller reads that back via fetchApiRunUsage).
+export async function streamApiRun({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  runId,
+  maxTurns = null,
+  autoApprove = true,
+  onEvent = null,
+  onProgressUpdated = null,
+  signal = null,
+}) {
+  let response;
+  try {
+    response = await fetchImpl(`${baseUrl}/api/runs/${encodeURIComponent(runId)}/events`, {
+      method: "GET",
+      headers: buildHeaders(apiKey),
+      signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") return { ok: false, aborted: true, error: "Run stream aborted." };
+    return { ok: false, error: `Could not open run event stream: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!response?.ok || !response.body) {
+    return { ok: false, error: `Run event stream returned HTTP ${response?.status ?? "?"}.` };
+  }
+
+  let doneStatus = null;
+  let runError = null;
+  let buffer = "";
+
+  const handleFrame = async (frame) => {
+    const { type, data } = parseSseFrame(frame);
+    if (!type) return;
+    if (onEvent) await onEvent(type, data);
+    if (onProgressUpdated) {
+      const progress = deriveTurnProgress(data, maxTurns);
+      if (progress) await onProgressUpdated(progress);
+    }
+    if (type === "approval_requested" && autoApprove && data?.approval_id) {
+      await resolveApiApproval({ fetchImpl, baseUrl, apiKey, runId, approvalId: data.approval_id });
+    } else if (type === "run_error") {
+      runError = data?.message || "Lea run error.";
+    } else if (type === "done") {
+      doneStatus = String(data?.status || "").toLowerCase();
+    }
+  };
+
+  try {
+    for await (const chunk of iterateResponseBody(response.body)) {
+      buffer += decodeChunk(chunk);
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() || "";
+      for (const frame of frames) {
+        if (frame.trim()) await handleFrame(frame);
+      }
+      if (doneStatus !== null) break;
+    }
+    if (doneStatus === null && buffer.trim()) await handleFrame(buffer);
+  } catch (error) {
+    if (error?.name === "AbortError") return { ok: false, aborted: true, error: runError || "Run stream aborted." };
+    return { ok: false, error: `Run event stream failed: ${error instanceof Error ? error.message : String(error)}`, doneStatus, runError };
+  }
+
+  const ok = doneStatus !== null && SUCCESS_DONE_STATUS.has(doneStatus);
+  return {
+    ok,
+    doneStatus,
+    error: ok ? null : (runError || (doneStatus ? `Lea run ended with status: ${doneStatus}` : "Lea run ended without a terminal status.")),
+  };
+}
+
+// High-level: start a run and drive it to completion, returning the same shape
+// the companion's `/v1` `waitForLeaApiProofJob` produced
+// ({ ok, timedOut, apiRunId, error, usage, costUsd }) so the orchestration in
+// server.mjs is contract-compatible.
+export async function runApiProofJob({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  message,
+  sessionId = null,
+  maxTurns = null,
+  timeoutMs = 900000,
+  autoApprove = true,
+  autonomous = true,
+  appendLog = null,
+  logPath = null,
+  onRunStarted = null,
+  onProgressUpdated = null,
+}) {
+  const log = async (line) => {
+    if (appendLog && logPath) await appendLog(logPath, line);
+  };
+
+  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous });
+  if (!start.ok) return { ok: false, timedOut: false, error: start.error };
+
+  const runId = start.body?.run_id;
+  const newSessionId = start.body?.session_id || sessionId;
+  if (!runId) return { ok: false, timedOut: false, error: "Lea adapter did not return a run_id." };
+  await log(`[backend] Lea adapter run started: ${runId} (session ${newSessionId})\n`);
+  if (onRunStarted) await onRunStarted(runId, newSessionId);
+
+  const abort = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort.abort();
+    interruptApiRun({ fetchImpl, baseUrl, apiKey, runId }).catch(() => {});
+  }, Math.max(1, timeoutMs));
+  if (typeof timer.unref === "function") timer.unref();
+
+  let outcome;
+  try {
+    outcome = await streamApiRun({
+      fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
+      signal: abort.signal, onProgressUpdated,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const usage = await fetchApiRunUsage({ fetchImpl, baseUrl, apiKey, sessionId: newSessionId, runId });
+
+  if (timedOut) {
+    return { ok: false, timedOut: true, apiRunId: runId, sessionId: newSessionId, error: "Lea adapter run timed out.", ...usage };
+  }
+  return {
+    ok: outcome.ok,
+    timedOut: false,
+    apiRunId: runId,
+    sessionId: newSessionId,
+    doneStatus: outcome.doneStatus,
+    error: outcome.ok ? undefined : outcome.error,
+    ...usage,
+  };
+}

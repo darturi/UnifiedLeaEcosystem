@@ -1,0 +1,1096 @@
+from __future__ import annotations
+
+import json
+import re
+from uuid import uuid4
+
+from typing import Any
+
+from .db import ROOT, connect, row_to_dict, utc_now
+
+
+RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+
+
+def create_session(title: str, project_id: str | None = None) -> dict:
+    now = utc_now()
+    session_id = str(uuid4())
+    with connect() as conn:
+        conn.execute(
+            "insert into sessions (id, project_id, title, created_at, updated_at) values (?, ?, ?, ?, ?)",
+            (session_id, project_id, title[:120] or "Untitled theorem", now, now),
+        )
+        row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def touch_session(session_id: str) -> None:
+    """Bump a session's updated_at. There is no stored status to set — a session's
+    status is its working-copy verdict, derived from the latest code_step on read
+    (D14). Run lifecycle is tracked on runs.status, not here."""
+    now = utc_now()
+    with connect() as conn:
+        conn.execute("update sessions set updated_at = ? where id = ?", (now, session_id))
+
+
+def get_session(session_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def list_sessions() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select
+                s.*,
+                coalesce(sum(r.input_tokens), 0) as input_tokens,
+                coalesce(sum(r.output_tokens), 0) as output_tokens,
+                coalesce(sum(r.input_tokens + r.output_tokens), 0) as total_tokens,
+                coalesce(sum(r.cost_usd), 0) as cost_usd,
+                count(distinct r.id) as run_count,
+                (
+                    select count(*)
+                    from messages m
+                    where m.session_id = s.id
+                ) as message_count,
+                (
+                    select r2.model
+                    from runs r2
+                    where r2.session_id = s.id
+                    order by r2.updated_at desc, r2.created_at desc
+                    limit 1
+                ) as primary_model,
+                group_concat(distinct r.model) as models,
+                p.id as project_id,
+                p.slug as project_slug,
+                p.title as project_title,
+                p.path as project_path,
+                s.created_at as started_at,
+                s.updated_at as ended_at,
+                (
+                    select cs.check_status
+                    from code_steps cs
+                    where cs.session_id = s.id
+                    order by cs.seq desc
+                    limit 1
+                ) as latest_check_status,
+                (select count(*) from code_steps cs where cs.session_id = s.id) as code_step_count,
+                max(0, cast((julianday(s.updated_at) - julianday(s.created_at)) * 86400 as integer)) as duration_seconds
+            from sessions s
+            left join runs r on r.session_id = s.id
+            left join projects p on p.id = s.project_id
+            group by s.id
+            order by s.updated_at desc
+            limit 100
+            """
+        ).fetchall()
+    sessions = []
+    for row in rows:
+        data = row_to_dict(row)
+        data["status"] = _derive_session_status(
+            data.pop("latest_check_status", None), int(data.pop("code_step_count", 0) or 0)
+        )
+        sessions.append(_normalize_usage_session(data))
+    return sessions
+
+
+def create_run(
+    session_id: str,
+    model: str,
+    provider: str | None,
+    max_turns: int | None,
+    project_id: str | None = None,
+    autonomous: bool = False,
+) -> dict:
+    now = utc_now()
+    run_id = str(uuid4())
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into runs (id, session_id, project_id, status, autonomous, model, provider, max_turns, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, session_id, project_id, "pending", 1 if autonomous else 0, model, provider, max_turns, now, now),
+        )
+        row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_projects() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("select * from projects order by updated_at desc, title asc").fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_project(project_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+    slug = validate_project_slug(slug)
+    now = utc_now()
+    project_id = str(uuid4())
+    project_title = (title or slug).strip() or slug
+    project_path = path or f"workspace/projects/{slug}.md"
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into projects (id, slug, title, path, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, slug, project_title, project_path, now, now),
+        )
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def update_project(project_id: str, title: str | None = None, path: str | None = None) -> dict | None:
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+        if not row:
+            return None
+        current = row_to_dict(row)
+        conn.execute(
+            """
+            update projects
+            set title = ?, path = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                (title if title is not None else current["title"]).strip() or current["title"],
+                path if path is not None else current["path"],
+                now,
+                project_id,
+            ),
+        )
+        updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(updated)
+
+
+def assign_session_project(session_id: str, project_id: str | None) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update sessions set project_id = ?, updated_at = ? where id = ?",
+            (project_id, now, session_id),
+        )
+
+
+# NOTE (D8): `sessions_with_latest_code_path` and `record_project_unassignment`
+# lived here — both were project-only (v2.1) AND broken against the v2 schema
+# (they referenced the dropped `code`/`kind`/`step_number`/`used_project_formalizations`
+# columns). Removed rather than left as landmines; the projects feature rewrites its
+# store layer against the git-backed code_steps when it returns. The dormant project
+# CRUD below (projects table) stays as the v2.1 foundation.
+
+
+def validate_project_slug(slug: str) -> str:
+    value = str(slug or "").strip()
+    if not PROJECT_SLUG_RE.fullmatch(value):
+        raise ValueError("Project slug must be 1-80 characters using letters, numbers, '_' or '-'.")
+    return value
+
+
+def update_run(
+    run_id: str,
+    status: str,
+    final_text: str | None = None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cost_usd: float | None = None,
+) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            update runs
+            set status = ?,
+                final_text = coalesce(?, final_text),
+                input_tokens = coalesce(?, input_tokens),
+                output_tokens = coalesce(?, output_tokens),
+                cost_usd = coalesce(?, cost_usd),
+                updated_at = ?
+            where id = ?
+            """,
+            (status, final_text, input_tokens, output_tokens, cost_usd, now, run_id),
+        )
+
+
+def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update runs set api_run_id = ?, updated_at = ? where id = ?",
+            (api_run_id, now, run_id),
+        )
+
+
+def set_session_api_session_id(session_id: str, api_session_id: str) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update sessions set api_session_id = ?, updated_at = ? where id = ?",
+            (api_session_id, now, session_id),
+        )
+
+
+def set_run_messages_kind(run_id: str, kind: str, role: str = "assistant") -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update messages set kind = ? where run_id = ? and role = ?",
+            (kind, run_id, role),
+        )
+        conn.execute("update runs set updated_at = ? where id = ?", (now, run_id))
+
+
+def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None:
+    now = utc_now()
+    value = json.dumps(pending_approval) if pending_approval is not None else None
+    with connect() as conn:
+        conn.execute(
+            "update runs set pending_approval = ?, updated_at = ? where id = ?",
+            (value, now, run_id),
+        )
+
+
+def set_run_safe_verify(run_id: str, status: str, detail: str | None) -> None:
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update runs set safe_verify_status = ?, safe_verify_detail = ?, updated_at = ? where id = ?",
+            (status, detail, now, run_id),
+        )
+
+
+def last_lean_code_step_for_run(run_id: str) -> dict | None:
+    """The final `.lean` proof snapshot for a run (used as the SafeVerify submission)."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from code_steps where run_id = ? order by seq desc, created_at desc",
+            (run_id,),
+        ).fetchall()
+    for row in rows:
+        step = row_to_dict(row)
+        if str(step.get("kind") or "code") == "code" and str(step.get("path") or "").endswith(".lean"):
+            return step
+    return None
+
+
+def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
+    """The most recent code_step for a file in a session (newest seq wins).
+
+    The standalone lean-check / verify endpoints use this to back-fill the verdict
+    onto the current working step (the canvas's latest snapshot of that file)."""
+    with connect() as conn:
+        row = conn.execute(
+            "select * from code_steps where session_id = ? and path = ? "
+            "order by seq desc, created_at desc limit 1",
+            (session_id, path),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def latest_agent_code_step(session_id: str) -> dict | None:
+    """The most recent agent-authored code_step — the proof state the agent last
+    'knew' (D12). Diffing its commit against HEAD reveals any human edits since."""
+    with connect() as conn:
+        row = conn.execute(
+            "select * from code_steps where session_id = ? and author = 'agent' "
+            "order by seq desc limit 1",
+            (session_id,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def edit_notes_since(session_id: str, seq: int) -> list[str]:
+    """Edit-note explanations (D11) recorded after a given timeline position —
+    the human's words about edits made since the agent last acted (D12)."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select content from messages where session_id = ? and kind = 'edit_note' and seq > ? "
+            "order by seq asc",
+            (session_id, seq),
+        ).fetchall()
+    return [row["content"] for row in rows]
+
+
+def get_run(run_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+    return _normalize_run(row_to_dict(row)) if row else None
+
+
+def set_run_transcript(run_id: str, messages: list) -> None:
+    """Persist the faithful prover conversation at this run's end (D16/multi-turn).
+
+    `messages` is the prover's `Finished.transcript["messages"]` — the structured
+    model-replay conversation (tool_call/tool_result parts intact, raw_part already
+    stripped). Stored as JSON; the next activation in the session replays it as the
+    base. Only called on a Finished run, so an errored run leaves this NULL.
+    """
+    with connect() as conn:
+        conn.execute(
+            "update runs set transcript = ?, updated_at = ? where id = ?",
+            (json.dumps(messages), utc_now(), run_id),
+        )
+
+
+def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = None) -> list | None:
+    """The most recent stored transcript in the session — the base for the next run.
+
+    Each activation receives the prior transcript and returns the full updated one,
+    so the latest run that has a transcript holds the whole conversation so far.
+    `exclude_run_id` skips the current (just-created, transcript-less) run. Returns
+    None when the session has no prior Finished run (a cold first activation).
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select transcript from runs
+            where session_id = ? and transcript is not null and id != ?
+            order by created_at desc, id desc
+            limit 1
+            """,
+            (session_id, exclude_run_id or ""),
+        ).fetchone()
+    if not row or row["transcript"] is None:
+        return None
+    return json.loads(row["transcript"])
+
+
+def add_message(
+    session_id: str,
+    role: str,
+    content: str,
+    run_id: str | None = None,
+    kind: str = "assistant",
+    commit_sha: str | None = None,
+) -> dict:
+    """Append a transcript message. A user's edit explanation (D11) is just this
+    with `kind='edit_note'` + `commit_sha` set to the edit's commit — no bespoke
+    channel; it rides the same path that feeds context to the prover."""
+    now = utc_now()
+    message_id = str(uuid4())
+    with connect() as conn:
+        seq = _next_seq(conn, session_id)
+        conn.execute(
+            """
+            insert into messages (id, session_id, run_id, role, content, kind, commit_sha, seq, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (message_id, session_id, run_id, role, content, kind, commit_sha, seq, now),
+        )
+        row = conn.execute("select * from messages where id = ?", (message_id,)).fetchone()
+    touch_session(session_id)
+    return row_to_dict(row)
+
+
+def _next_seq(conn, session_id: str) -> int:
+    """The next shared timeline position for a session (C4): one monotonic counter
+    that both messages and code_steps draw from, so the thread is an ORDER BY seq
+    merge. Runs on the insert's own connection, so the read+write are atomic under
+    SQLite's single-writer lock (same max+1 pattern the old step_number used)."""
+    row = conn.execute(
+        """
+        select coalesce(max(seq), 0) + 1 as next from (
+            select seq from code_steps where session_id = ?
+            union all
+            select seq from messages where session_id = ?
+        )
+        """,
+        (session_id, session_id),
+    ).fetchone()
+    return int(row["next"])
+
+
+def add_code_step(
+    session_id: str,
+    run_id: str | None,
+    path: str,
+    *,
+    commit_sha: str,
+    author: str = "agent",
+    summary: str | None = None,
+    turn: int | None = None,
+    check_status: str | None = None,
+    check_detail: str | None = None,
+) -> dict:
+    """Record a curated timeline step pointing at a git commit (D7/D8).
+
+    `commit_sha` is the pointer into the session's git repo where the content
+    lives — it is keyword-only and required, so a v1-style positional call that
+    passed file *text* fails loudly instead of silently storing code as a sha.
+    `run_id` is NULL for user edits made outside a run (D9); `turn` is NULL for
+    user edits. The verdict (`check_status`/`check_detail`) is recorded here, not
+    in the commit message (D6), and may be back-filled once `lean_check` returns.
+    """
+    now = utc_now()
+    step_id = str(uuid4())
+    with connect() as conn:
+        seq = _next_seq(conn, session_id)
+        conn.execute(
+            """
+            insert into code_steps (
+                id, session_id, run_id, seq, turn, author, path,
+                commit_sha, summary, check_status, check_detail, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                step_id,
+                session_id,
+                run_id,
+                seq,
+                turn,
+                author,
+                path,
+                commit_sha,
+                summary,
+                check_status,
+                check_detail,
+                now,
+            ),
+        )
+        inserted = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
+    touch_session(session_id)
+    return row_to_dict(inserted)
+
+
+def set_code_step_check(step_id: str, check_status: str, check_detail: str | None = None) -> dict | None:
+    """Back-fill a code_step's verdict once `lean_check` returns (D6).
+
+    A write is committed and its row inserted *before* the check runs (FileChanged
+    precedes CheckResult), so the verdict lands here, on the existing row, rather
+    than in the commit message. Returns the updated row, or None if the id is
+    unknown.
+    """
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            "update code_steps set check_status = ?, check_detail = ? where id = ?",
+            (check_status, check_detail, step_id),
+        )
+        row = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def add_status_event(
+    session_id: str,
+    run_id: str,
+    message: str,
+    status: str | None = None,
+    step_number: int | None = None,
+) -> dict:
+    now = utc_now()
+    event_id = str(uuid4())
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into status_events (id, session_id, run_id, step_number, status, message, created_at)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id, session_id, run_id, step_number, status, message, now),
+        )
+        row = conn.execute("select * from status_events where id = ?", (event_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def replace_run_usage_breakdown(run_id: str, rows: list[dict[str, Any]]) -> None:
+    now = utc_now()
+    with connect() as conn:
+        run = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+        if not run:
+            return
+        run_dict = row_to_dict(run)
+        session_id = str(run_dict["session_id"])
+        run_ids = [
+            str(row["id"])
+            for row in conn.execute(
+                "select id from runs where session_id = ? order by created_at asc, id asc",
+                (session_id,),
+            ).fetchall()
+        ]
+        run_number = run_ids.index(run_id) + 1 if run_id in run_ids else 1
+        conn.execute("delete from run_usage_breakdown where run_id = ?", (run_id,))
+        for index, row in enumerate(rows, start=1):
+            conn.execute(
+                """
+                insert into run_usage_breakdown (
+                    id, session_id, run_id, run_number, ordinal, phase, label, turn, candidate,
+                    input_tokens, output_tokens, cost_usd, event_count, created_at
+                )
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row.get("id") or uuid4()),
+                    session_id,
+                    run_id,
+                    run_number,
+                    int(row.get("ordinal") or index),
+                    str(row.get("phase") or "unattributed"),
+                    str(row.get("label") or "Unattributed usage"),
+                    _optional_int(row.get("turn")),
+                    _optional_int(row.get("candidate")),
+                    int(row.get("input_tokens") or 0),
+                    int(row.get("output_tokens") or 0),
+                    float(row.get("cost_usd") or 0),
+                    int(row.get("event_count") or 0),
+                    str(row.get("created_at") or now),
+                ),
+            )
+
+
+def usage_breakdown_for_session(session_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select *
+            from run_usage_breakdown
+            where session_id = ?
+            order by run_number asc, ordinal asc, created_at asc
+            """,
+            (session_id,),
+        ).fetchall()
+    persisted = [_normalize_usage_breakdown_row(row_to_dict(row)) for row in rows]
+    if persisted:
+        return persisted
+    return _usage_breakdown_from_raw_logs(session_id)
+
+
+def session_detail(session_id: str) -> dict | None:
+    session = get_session(session_id)
+    if not session:
+        return None
+    with connect() as conn:
+        usage_row = conn.execute(
+            """
+            select
+                coalesce(sum(input_tokens), 0) as input_tokens,
+                coalesce(sum(output_tokens), 0) as output_tokens,
+                coalesce(sum(input_tokens + output_tokens), 0) as total_tokens,
+                coalesce(sum(cost_usd), 0) as cost_usd,
+                count(*) as run_count,
+                (
+                    select model
+                    from runs
+                    where session_id = ?
+                    order by updated_at desc, created_at desc
+                    limit 1
+                ) as primary_model,
+                group_concat(distinct model) as models
+            from runs
+            where session_id = ?
+            """,
+            (session_id, session_id),
+        ).fetchone()
+        # both ordered by the shared timeline seq (C4) so the frontend merges them
+        # into one thread by a single key, not by index-pairing
+        messages = conn.execute(
+            "select * from messages where session_id = ? order by seq asc",
+            (session_id,),
+        ).fetchall()
+        code_steps = conn.execute(
+            "select * from code_steps where session_id = ? order by seq asc",
+            (session_id,),
+        ).fetchall()
+        status_events = conn.execute(
+            "select * from status_events where session_id = ? order by created_at asc",
+            (session_id,),
+        ).fetchall()
+        active_run = conn.execute(
+            """
+            select *
+            from runs
+            where session_id = ? and status in ('pending', 'running')
+            order by updated_at desc, created_at desc
+            limit 1
+            """,
+            (session_id,),
+        ).fetchone()
+        latest_run = conn.execute(
+            "select * from runs where session_id = ? order by created_at desc, id desc limit 1",
+            (session_id,),
+        ).fetchone()
+        # Per-run outcomes (id + status), so the UI can place the "Proved"
+        # milestone after the run that completed — live and on reload (M16).
+        runs = conn.execute(
+            "select id, status from runs where session_id = ? order by created_at asc, id asc",
+            (session_id,),
+        ).fetchall()
+        project = None
+        if session.get("project_id"):
+            project = conn.execute(
+                "select * from projects where id = ?",
+                (session["project_id"],),
+            ).fetchone()
+    usage = _normalize_usage_session(
+        {
+            **(row_to_dict(usage_row) if usage_row else {}),
+            "message_count": len(messages),
+            "started_at": session["created_at"],
+            "ended_at": session["updated_at"],
+            "duration_seconds": _duration_seconds(session["created_at"], session["updated_at"]),
+        }
+    )
+    # working-copy verdict, derived from the latest code_step (code_steps is asc)
+    latest_check_status = code_steps[-1]["check_status"] if code_steps else None
+    return {
+        **session,
+        **usage,
+        "status": _derive_session_status(latest_check_status, len(code_steps)),
+        "messages": [row_to_dict(row) for row in messages],
+        "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
+        "status_events": [row_to_dict(row) for row in status_events],
+        "approval_events": approval_events_for_session(session_id),
+        "usage_breakdown": usage_breakdown_for_session(session_id),
+        "active_run": _normalize_run(row_to_dict(active_run)) if active_run else None,
+        "runs": [row_to_dict(r) for r in runs],
+        "safe_verify": _safe_verify_summary(row_to_dict(latest_run)) if latest_run else None,
+        "project": row_to_dict(project) if project else None,
+    }
+
+
+def _derive_session_status(latest_check_status: str | None, code_step_count: int) -> str:
+    """A session's status is its working-copy verdict (D14), derived — never stored.
+    No code yet → 'empty'; a step whose verdict hasn't landed → 'unchecked'; else the
+    latest code_step's check_status ('ok' | 'error')."""
+    if not code_step_count:
+        return "empty"
+    return latest_check_status or "unchecked"
+
+
+def _safe_verify_summary(run: dict) -> dict | None:
+    """The latest run's SafeVerify verdict, for showing/auto-firing on reload."""
+    status = run.get("safe_verify_status")
+    if not status:
+        return None
+    return {"run_id": run.get("id"), "status": status, "detail": run.get("safe_verify_detail")}
+
+
+def usage_stats() -> dict:
+    sessions = list_sessions()
+    with connect() as conn:
+        daily_rows = conn.execute(
+            """
+            select
+                date(updated_at) as day,
+                coalesce(sum(input_tokens), 0) as input_tokens,
+                coalesce(sum(output_tokens), 0) as output_tokens,
+                coalesce(sum(input_tokens + output_tokens), 0) as total_tokens,
+                coalesce(sum(cost_usd), 0) as cost_usd,
+                count(distinct id) as run_count,
+                count(distinct session_id) as session_count
+            from runs
+            group by date(updated_at)
+            order by day asc
+            """
+        ).fetchall()
+        model_rows = conn.execute(
+            """
+            select
+                model,
+                coalesce(sum(input_tokens), 0) as input_tokens,
+                coalesce(sum(output_tokens), 0) as output_tokens,
+                coalesce(sum(input_tokens + output_tokens), 0) as total_tokens,
+                coalesce(sum(cost_usd), 0) as cost_usd,
+                count(*) as run_count,
+                count(distinct session_id) as session_count
+            from runs
+            group by model
+            order by cost_usd desc, total_tokens desc
+            """
+        ).fetchall()
+
+    total_sessions = len(sessions)
+    total_messages = sum(int(session["message_count"]) for session in sessions)
+    input_tokens = sum(int(session["input_tokens"]) for session in sessions)
+    output_tokens = sum(int(session["output_tokens"]) for session in sessions)
+    total_tokens = input_tokens + output_tokens
+    cost_usd = sum(float(session["cost_usd"]) for session in sessions)
+
+    return {
+        "sessions": sessions,
+        "global": {
+            "session_count": total_sessions,
+            "message_count": total_messages,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cost_usd": cost_usd,
+            "average_tokens_per_session": round(total_tokens / total_sessions) if total_sessions else 0,
+            "average_cost_per_session": cost_usd / total_sessions if total_sessions else 0,
+            "average_messages_per_session": round(total_messages / total_sessions) if total_sessions else 0,
+        },
+        "daily": [_normalize_usage_day(row_to_dict(row)) for row in daily_rows],
+        "models": [_normalize_usage_model(row_to_dict(row)) for row in model_rows],
+    }
+
+
+def _normalize_usage_session(row: dict) -> dict:
+    models = [
+        model for model in str(row.get("models") or "").split(",")
+        if model
+    ]
+    row["models"] = models
+    row["primary_model"] = row.get("primary_model") or (models[0] if models else None)
+    for key in ("input_tokens", "output_tokens", "total_tokens", "message_count", "run_count", "duration_seconds"):
+        row[key] = int(row.get(key) or 0)
+    row["cost_usd"] = float(row.get("cost_usd") or 0)
+    row["started_at"] = row.get("started_at")
+    row["ended_at"] = row.get("ended_at")
+    return row
+
+
+def _normalize_code_step(row: dict) -> dict:
+    # v2: a code_step is a plain pointer row (commit_sha + path + verdict); there
+    # is nothing to decode. The JSON `used_project_formalizations` field was
+    # dropped with the projects feature (deferred to v2.1). Kept as the single
+    # read-side hook in case future presentation fields need shaping.
+    return row
+
+
+def _normalize_usage_day(row: dict) -> dict:
+    for key in ("input_tokens", "output_tokens", "total_tokens", "run_count", "session_count"):
+        row[key] = int(row.get(key) or 0)
+    row["cost_usd"] = float(row.get("cost_usd") or 0)
+    return row
+
+
+def _normalize_usage_model(row: dict) -> dict:
+    row["model"] = row.get("model") or "unknown"
+    for key in ("input_tokens", "output_tokens", "total_tokens", "run_count", "session_count"):
+        row[key] = int(row.get(key) or 0)
+    row["cost_usd"] = float(row.get("cost_usd") or 0)
+    return row
+
+
+def _normalize_usage_breakdown_row(row: dict) -> dict:
+    for key in ("run_number", "ordinal", "input_tokens", "output_tokens", "event_count"):
+        row[key] = int(row.get(key) or 0)
+    row["turn"] = _optional_int(row.get("turn"))
+    row["candidate"] = _optional_int(row.get("candidate"))
+    row["cost_usd"] = float(row.get("cost_usd") or 0)
+    row["total_tokens"] = int(row["input_tokens"]) + int(row["output_tokens"])
+    return row
+
+
+def _normalize_run(row: dict) -> dict:
+    raw_pending = row.get("pending_approval")
+    if isinstance(raw_pending, str) and raw_pending:
+        try:
+            row["pending_approval"] = json.loads(raw_pending)
+        except json.JSONDecodeError:
+            row["pending_approval"] = None
+    else:
+        row["pending_approval"] = None
+    return row
+
+
+def _duration_seconds(started_at: str | None, ended_at: str | None) -> int:
+    if not started_at or not ended_at:
+        return 0
+    from datetime import datetime
+
+    try:
+        started = datetime.fromisoformat(started_at)
+        ended = datetime.fromisoformat(ended_at)
+    except ValueError:
+        return 0
+    return max(0, int((ended - started).total_seconds()))
+
+
+def _usage_breakdown_from_raw_logs(session_id: str) -> list[dict]:
+    with connect() as conn:
+        runs = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                select id, input_tokens, output_tokens, cost_usd
+                from runs
+                where session_id = ?
+                order by created_at asc, id asc
+                """,
+                (session_id,),
+            ).fetchall()
+        ]
+    rows: list[dict] = []
+    for run_number, run in enumerate(runs, start=1):
+        log_path = RAW_EVENT_LOG_DIR / f"{run['id']}.jsonl"
+        if not log_path.exists():
+            continue
+        run_rows, totals = _usage_breakdown_from_log(log_path, run_number)
+        input_total = max(int(run.get("input_tokens") or 0), int(totals.get("input_tokens") or 0))
+        output_total = max(int(run.get("output_tokens") or 0), int(totals.get("output_tokens") or 0))
+        cost_total = max(float(run.get("cost_usd") or 0), float(totals.get("cost_usd") or 0))
+        _append_unattributed_usage(run_rows, input_total, output_total, cost_total, run_number)
+        for ordinal, row in enumerate(run_rows, start=1):
+            row["ordinal"] = ordinal
+        rows.extend(_normalize_usage_breakdown_row(row) for row in run_rows)
+    return rows
+
+
+def approval_events_for_session(session_id: str) -> list[dict]:
+    with connect() as conn:
+        runs = [
+            row_to_dict(row)
+            for row in conn.execute(
+                """
+                select id
+                from runs
+                where session_id = ?
+                order by created_at asc, id asc
+                """,
+                (session_id,),
+            ).fetchall()
+        ]
+    approvals: list[dict] = []
+    for run in runs:
+        log_path = RAW_EVENT_LOG_DIR / f"{run['id']}.jsonl"
+        if not log_path.exists():
+            continue
+        approvals.extend(_approval_events_from_log(log_path, run["id"], session_id))
+    return approvals
+
+
+def _approval_events_from_log(path, run_id: str, session_id: str) -> list[dict]:
+    approvals: dict[str, dict] = {}
+    order: list[str] = []
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else frame
+            frame_type = str(frame.get("type") or _event_type(payload)).lower()
+            approval_id = str(payload.get("approval_id") or "")
+            if not approval_id:
+                continue
+            if frame_type == "approval_requested":
+                if approval_id not in approvals:
+                    order.append(approval_id)
+                approvals[approval_id] = {
+                    "id": f"{run_id}:{approval_id}",
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "approval_id": approval_id,
+                    "tier": payload.get("tier"),
+                    "candidate": _optional_int(payload.get("candidate")),
+                    "lean_code": str(payload.get("lean_code") or ""),
+                    "theorem_name": payload.get("theorem_name"),
+                    "check_result": payload.get("check_result"),
+                    "decision": None,
+                    "feedback": None,
+                    "resolved_at": None,
+                }
+            elif frame_type == "approval_resolved" and approval_id in approvals:
+                approvals[approval_id]["decision"] = payload.get("decision") or "resolved"
+                approvals[approval_id]["feedback"] = payload.get("feedback")
+                approvals[approval_id]["resolved_at"] = payload.get("created_at")
+    return [approvals[approval_id] for approval_id in order if approval_id in approvals]
+
+
+def _usage_breakdown_from_log(path, run_number: int) -> tuple[list[dict], dict[str, float | int]]:
+    rows: list[dict] = []
+    current_turn: int | None = None
+    totals: dict[str, float | int] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else frame
+            frame_type = str(frame.get("type") or _event_type(payload)).lower()
+            if frame_type == "turn_started":
+                current_turn = _first_int(payload, "turn")
+            if frame_type == "approval_requested":
+                candidate = _first_int(payload, "candidate")
+                preflight = _last_unlabeled_preflight(rows)
+                if preflight is not None and candidate is not None:
+                    preflight["candidate"] = candidate
+                    preflight["label"] = f"Theorem translation preflight candidate {candidate}"
+
+            input_tokens, output_tokens = _frame_usage(payload)
+            cost_usd = _frame_cost(payload)
+            if frame_type == "usage_updated":
+                _add_usage_breakdown_event(rows, run_number, current_turn, input_tokens, output_tokens, cost_usd)
+            elif frame_type in {"finished", "run_status"}:
+                totals["input_tokens"] = max(int(totals["input_tokens"]), input_tokens or 0)
+                totals["output_tokens"] = max(int(totals["output_tokens"]), output_tokens or 0)
+                totals["cost_usd"] = max(float(totals["cost_usd"]), cost_usd or 0.0)
+    return rows, totals
+
+
+def _add_usage_breakdown_event(
+    rows: list[dict],
+    run_number: int,
+    current_turn: int | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cost_usd: float | None,
+) -> None:
+    if not input_tokens and not output_tokens and not cost_usd:
+        return
+    if current_turn is None:
+        row = _last_unlabeled_preflight(rows)
+        if row is None:
+            row = _new_usage_breakdown_row(
+                run_number=run_number,
+                phase="theorem_translation",
+                label="Theorem translation preflight",
+                turn=None,
+                candidate=None,
+            )
+            rows.append(row)
+    else:
+        row = next(
+            (
+                item for item in rows
+                if item.get("run_number") == run_number
+                and item.get("phase") == "proof_turn"
+                and item.get("turn") == current_turn
+            ),
+            None,
+        )
+        if row is None:
+            row = _new_usage_breakdown_row(
+                run_number=run_number,
+                phase="proof_turn",
+                label=f"Turn {current_turn}",
+                turn=current_turn,
+                candidate=None,
+            )
+            rows.append(row)
+    row["input_tokens"] += int(input_tokens or 0)
+    row["output_tokens"] += int(output_tokens or 0)
+    row["cost_usd"] += float(cost_usd or 0)
+    row["event_count"] += 1
+
+
+def _append_unattributed_usage(
+    rows: list[dict],
+    input_total: int,
+    output_total: int,
+    cost_total: float,
+    run_number: int,
+) -> None:
+    input_seen = sum(int(row.get("input_tokens") or 0) for row in rows)
+    output_seen = sum(int(row.get("output_tokens") or 0) for row in rows)
+    cost_seen = sum(float(row.get("cost_usd") or 0) for row in rows)
+    input_delta = max(0, input_total - input_seen)
+    output_delta = max(0, output_total - output_seen)
+    cost_delta = max(0.0, cost_total - cost_seen)
+    if not input_delta and not output_delta and cost_delta < 0.000000001:
+        return
+    row = _new_usage_breakdown_row(
+        run_number=run_number,
+        phase="unattributed",
+        label="Unattributed usage",
+        turn=None,
+        candidate=None,
+    )
+    row["input_tokens"] = input_delta
+    row["output_tokens"] = output_delta
+    row["cost_usd"] = cost_delta
+    rows.append(row)
+
+
+def _new_usage_breakdown_row(
+    *,
+    run_number: int,
+    phase: str,
+    label: str,
+    turn: int | None,
+    candidate: int | None,
+) -> dict:
+    return {
+        "id": str(uuid4()),
+        "run_number": run_number,
+        "ordinal": 0,
+        "phase": phase,
+        "label": label,
+        "turn": turn,
+        "candidate": candidate,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "event_count": 0,
+        "created_at": utc_now(),
+    }
+
+
+def _last_unlabeled_preflight(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    row = rows[-1]
+    if row.get("phase") == "theorem_translation" and row.get("candidate") is None:
+        return row
+    return None
+
+
+def _event_type(frame: dict[str, Any]) -> str:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("type") or candidate.get("event") or candidate.get("kind")
+        if isinstance(value, str) and value:
+            return value.strip().lower()
+    return ""
+
+
+def _frame_usage(frame: dict[str, Any]) -> tuple[int | None, int | None]:
+    for candidate in _walk_dicts(frame):
+        usage = candidate.get("usage") if isinstance(candidate.get("usage"), dict) else candidate
+        input_tokens = usage.get("input_tokens") or usage.get("prompt_tokens")
+        output_tokens = usage.get("output_tokens") or usage.get("completion_tokens")
+        if isinstance(input_tokens, int | float) or isinstance(output_tokens, int | float):
+            return (
+                int(input_tokens) if isinstance(input_tokens, int | float) else None,
+                int(output_tokens) if isinstance(output_tokens, int | float) else None,
+            )
+    return None, None
+
+
+def _frame_cost(frame: dict[str, Any]) -> float | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get("cost")
+        if isinstance(value, int | float):
+            return float(value)
+        value = candidate.get("cost_usd")
+        if isinstance(value, int | float):
+            return float(value)
+    return None
+
+
+def _first_int(frame: dict[str, Any], key: str) -> int | None:
+    for candidate in _walk_dicts(frame):
+        value = candidate.get(key)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    return int(value) if isinstance(value, int | float) else None
+
+
+def _walk_dicts(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            found.append(item)
+            for nested in item.values():
+                visit(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return found

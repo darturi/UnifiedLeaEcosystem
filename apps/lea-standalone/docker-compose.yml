@@ -1,0 +1,25 @@
+# Lea Interface — pull the prebuilt image from Docker Hub and run.
+#
+#   1. docker compose up              (pulls the published image; no local build)
+#   2. Open http://localhost:8001
+#   3. Add your API key in the Settings pane (no key needed to start).
+#
+# Sessions, proof history, and your saved settings/key persist on the host
+# in ./data and ./config.
+#
+# Maintainers — to rebuild and publish the image from source:
+#   docker buildx build --platform linux/arm64 -t shaswatpatel123/leaui:latest --load .
+#   docker push shaswatpatel123/leaui:latest
+
+services:
+  lea:
+    image: shaswatpatel123/leaui:latest
+    pull_policy: always
+    platform: linux/arm64        # Apple Silicon Macs
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data         # persisted SQLite DB + per-run event logs
+      - ./config:/app/config     # persisted settings + API key (written by the Settings pane)
+    init: true                   # PID 1 signal handling / zombie reaping
+    restart: "no"

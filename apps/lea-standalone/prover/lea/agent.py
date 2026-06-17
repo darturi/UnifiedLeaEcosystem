@@ -1,0 +1,638 @@
+"""Lea agent — the core loop. Model calls tools until done.
+
+`run_events()` is the generator core: it yields a typed event stream and never
+prints. `run()` is a backward-compatible wrapper that drains those events through
+the default stdout renderer and returns the final text (and optional transcript),
+so existing callers (CLI, eval) keep working unchanged.
+"""
+
+import json
+from datetime import datetime, timezone
+
+from .config import LeaConfig
+from .prompt import load_system_prompt
+from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
+from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
+from .tools import _lean_check_has_error, _first_error_line, _tool_result_ok
+from .registry import build_toolset, import_tool_modules
+from .events import (
+    TurnStarted,
+    AssistantTextDelta,
+    ToolCalled,
+    ToolResulted,
+    ToolApprovalRequested,
+    FileChanged,
+    CheckResult,
+    UsageUpdated,
+    ProjectEntryUpdated,
+    Finished,
+)
+from .project import ProjectContext, record_project_entry
+
+
+_NARRATE_TOOL_STEPS_INSTRUCTION = """
+
+When you are about to call one or more tools, first write a concise progress
+summary for the user. Keep it to one or two sentences, use Markdown when helpful,
+and include mathematical notation in normal LaTeX delimiters when useful. Explain
+what you are trying next and why, then call the tool. Do not narrate after every
+minor token or repeat boilerplate; summarize the meaningful proof step.
+"""
+
+
+_FORCED_TOOL_NARRATION_INSTRUCTION = """
+
+You are Lea explaining the next proof action to the user. The main model turn
+selected a tool call without first writing user-facing narration. Write the
+missing narration now.
+
+Rules:
+- Write one concise paragraph unless the mathematical plan genuinely benefits
+  from a short numbered list.
+- Explain the mathematical or Lean proof move being attempted and why it is the
+  next useful step.
+- Use Markdown and ordinary LaTeX delimiters when helpful.
+- Do not mention JSON, API internals, or hidden/private reasoning.
+- Do not call tools. Return only the narration text.
+"""
+
+
+_INTENT_CLASSIFIER_PROMPT = """\
+You route the user's latest message in an interactive Lean 4 session that already \
+contains prior work (often a completed proof).
+
+Reply with exactly one word:
+- FORMALIZE — the user is giving you a NEW mathematical statement to formalize and \
+prove, is otherwise asking you to prove/formalize something, OR is approving/confirming a \
+formalization you just proposed (e.g. "go ahead", "yes, prove it", "sounds good", "that's \
+right") so you should now carry out the proof.
+- ASSISTANT — the user is asking a question, requesting an explanation, asking you to \
+look up a lemma in Mathlib, clarifying a tactic, or otherwise continuing the \
+conversation about existing work.
+
+Output only the single word FORMALIZE or ASSISTANT, with no other text."""
+
+
+def _text_only_history(messages: list, limit: int = 8) -> list[dict]:
+    """Flatten messages to a cheap text-only {role, content} list for classification.
+
+    Drops tool calls/results and assistant tool-call parts so the classifier sees a
+    clean conversation; keeps only the trailing `limit` text turns.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        else:
+            text = ""
+        text = text.strip()
+        if not text:
+            continue
+        if role == "assistant":
+            # Assistant turns must use the parts format: _to_openai_messages treats a
+            # bare string as a user-only shape and iterates assistant content as a list.
+            out.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
+        else:
+            out.append({"role": "user", "content": text})
+    return out[-limit:]
+
+
+def _classify_intent(model: str, messages: list, config: LeaConfig) -> tuple[str, Usage, float]:
+    """Ask the model whether the latest turn is FORMALIZE or ASSISTANT.
+
+    Returns (decision, usage, cost). Defaults to FORMALIZE on any ambiguity so a
+    genuine theorem to prove is never silently dropped into chat mode.
+    """
+    history = _text_only_history(messages)
+    text = ""
+    usage = Usage()
+    cost = 0.0
+    for event in stream(
+        model,
+        _INTENT_CLASSIFIER_PROMPT,
+        history,
+        [],
+        config.model_kwargs,
+        streaming=config.stream,
+    ):
+        if isinstance(event, TextDelta):
+            text += event.text
+        elif isinstance(event, Done):
+            usage.input_tokens += event.usage.input_tokens
+            usage.output_tokens += event.usage.output_tokens
+            cost += event.cost
+    decision = "ASSISTANT" if "ASSISTANT" in text.strip().upper() else "FORMALIZE"
+    return decision, usage, cost
+
+
+def _meaning_events(tool_name: str, args: dict, result: str) -> list:
+    """Map one finished tool call to the meaning-level events the adapter acts on
+    (D17). Reuses the same classification as ProofVerificationState.note_tool_result
+    so the event stream and the agent's proof-state can never disagree.
+
+    Scope (A2): FileChanged (on .lean writes) + CheckResult (on lean_check).
+    VerifyResult arrives with the verify capability (A6); Error with the bridge.
+    """
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return []
+    if tool_name in {"write_file", "edit_file"}:
+        if path.endswith(".lean") and _tool_result_ok(result):
+            return [FileChanged(path)]
+        return []
+    if tool_name == "lean_check":
+        err = _lean_check_has_error(result)
+        return [CheckResult(path, "error" if err else "ok",
+                            _first_error_line(result) if err else None)]
+    return []
+
+
+class ProofVerificationState:
+    """Track whether the latest Lean proof file has passed a fresh check."""
+
+    def __init__(self):
+        self.latest_proof_path: str | None = None
+        self.unchecked_write = False
+        self.latest_check_path: str | None = None
+        self.latest_check_output: str | None = None
+        self.latest_check_passed: bool | None = None
+
+    def note_tool_result(self, tool_name: str, args: dict, result: str) -> None:
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return
+        if tool_name in {"write_file", "edit_file"}:
+            if _tool_result_ok(result) and path.endswith(".lean"):
+                self.latest_proof_path = path
+                self.unchecked_write = True
+            return
+        if tool_name == "lean_check":
+            passed = not _lean_check_has_error(result)
+            self.latest_check_path = path
+            self.latest_check_output = result
+            self.latest_check_passed = passed
+            if path == self.latest_proof_path:
+                self.unchecked_write = False
+
+    def needs_final_check(self) -> bool:
+        if not self.latest_proof_path:
+            return False
+        return (
+            self.unchecked_write
+            or self.latest_check_path != self.latest_proof_path
+        )
+
+    def latest_proof_verified(self) -> bool:
+        return (
+            bool(self.latest_proof_path)
+            and not self.unchecked_write
+            and self.latest_check_path == self.latest_proof_path
+            and self.latest_check_passed is True
+        )
+
+
+_FINAL_GATE_FAILURE_MESSAGE = (
+    "Error: final verification gate failed. Lea claimed the proof was complete, "
+    "but the latest proof file did not pass lean_check."
+)
+
+_NO_PROOF_ARTIFACT_MESSAGE = (
+    "Error: no proof artifact was produced. You must create a complete .lean file "
+    "with the write_file tool, then run lean_check on that file. Do not finish with "
+    "only prose or a Markdown code block."
+)
+
+
+def _tool_call_for_prompt(name: str, args: dict) -> dict:
+    """Compact a tool call enough to show a narration-only model pass."""
+    compact: dict = {}
+    for key, value in args.items():
+        if isinstance(value, str):
+            if key == "content" and len(value) > 1600:
+                compact[key] = value[:1600] + "\n... [truncated]"
+            elif len(value) > 800:
+                compact[key] = value[:800] + "... [truncated]"
+            else:
+                compact[key] = value
+        else:
+            compact[key] = value
+    return {"name": name, "args": compact}
+
+
+def _forced_tool_narration(
+    *,
+    model: str,
+    system: str,
+    messages: list,
+    tool_name: str,
+    tool_args: dict,
+    config: LeaConfig,
+):
+    """Ask the model for narration when a tool-only turn would otherwise be silent."""
+    narration_messages = messages + [{
+        "role": "user",
+        "content": (
+            "Write the user-facing narration that should appear immediately "
+            "before this Lea tool call:\n"
+            f"{json.dumps(_tool_call_for_prompt(tool_name, tool_args), ensure_ascii=False, indent=2)}"
+        ),
+    }]
+    text = ""
+    usage = Usage()
+    cost = 0.0
+    try:
+        for event in stream(
+            model,
+            system + _FORCED_TOOL_NARRATION_INSTRUCTION,
+            narration_messages,
+            [],
+            config.model_kwargs,
+            streaming=config.stream,
+        ):
+            if isinstance(event, TextDelta):
+                text += event.text
+                yield event
+            elif isinstance(event, Done):
+                usage.input_tokens += event.usage.input_tokens
+                usage.output_tokens += event.usage.output_tokens
+                cost += event.cost
+    except Exception:
+        fallback = _fallback_tool_narration(tool_name, tool_args)
+        text += fallback
+        yield TextDelta(fallback)
+    return text.strip(), usage, cost
+
+
+def _fallback_tool_narration(tool_name: str, args: dict) -> str:
+    path = args.get("path")
+    if tool_name == "write_file":
+        if isinstance(path, str) and path:
+            return f"I will write the next Lean proof attempt in `{path}` and then check whether it compiles."
+        return "I will write the next Lean proof attempt and then check whether it compiles."
+    if tool_name == "edit_file":
+        if isinstance(path, str) and path:
+            return f"I will revise `{path}` to address the previous Lean feedback, then re-run the checker."
+        return "I will revise the Lean proof to address the previous checker feedback, then re-run it."
+    if tool_name == "lean_check":
+        if isinstance(path, str) and path:
+            return f"I will run Lean on `{path}` to verify the current proof and inspect any errors."
+        return "I will run Lean to verify the current proof and inspect any errors."
+    if tool_name == "search_mathlib":
+        query = args.get("query")
+        if isinstance(query, str) and query:
+            return f"I will search Mathlib for lemmas related to `{query}` so the next proof step can use existing results."
+        return "I will search Mathlib for a relevant lemma before continuing the proof."
+    return f"I will use `{tool_name}` for the next proof step and then use its result to continue."
+
+
+def run_events(
+    config: LeaConfig,
+    messages: list,
+    *,
+    project: dict | ProjectContext | None = None,
+    session_id: str | None = None,
+    working_dir: str | None = None,
+    should_stop=None,
+    gate=None,
+):
+    """Core loop as a generator: yields typed events, never prints.
+
+    **Stateless (D16):** one activation = one pure call. The caller passes the full
+    conversation `messages` (the transcript it owns in the DB), and the prover holds
+    nothing between activations — no disk persistence, no resume-from-disk. The
+    final messages ride back out in the `Finished` event's transcript.
+
+    Yields per turn: TurnStarted, AssistantTextDelta*, ToolCalled*, UsageUpdated,
+    ToolResulted* (+ meaning-level FileChanged/CheckResult), and finally Finished.
+
+    **Per-tool gate (D19):** `gate` is an optional callable `(tool_name, args) -> bool`
+    supplied by the adapter; True means "this tool needs human approval." Before
+    running such a tool the loop yields a two-way `ToolApprovalRequested`; the caller
+    answers with `gen.send('allow' | 'always_session' | 'deny')`. The gated set + the
+    session allowlist are the adapter's policy (it owns `always_session`); run_events
+    only asks and honors the answer. `gate=None` → no gating.
+
+    **Interrupt (D18):** `should_stop` is an optional `() -> bool` the caller flips to
+    request a stop. It's checked at each turn boundary (one turn = one UI step), so the
+    stop is *cooperative and clean* — the current step's write is already committed and
+    the canvas is accurate — not a hard kill. On stop the loop yields a terminal
+    `Finished("interrupted", ...)` carrying the transcript so far (so a follow-up still
+    has a coherent base). An in-flight turn is not interrupted mid-flight; the stop
+    lands at the next turn boundary.
+
+    Owns MCP lifecycle: starts configured servers (which register their tools)
+    before the inner loop resolves the toolset, and stops them when the event
+    stream ends or is closed.
+    """
+    mcp_manager = None
+    if config.mcp_servers:
+        from .mcp import MCPManager
+        mcp_manager = MCPManager(config.mcp_servers)
+        mcp_manager.start()
+    try:
+        yield from _run_events_inner(
+            config, messages, project=project, session_id=session_id,
+            working_dir=working_dir, should_stop=should_stop, gate=gate,
+        )
+    finally:
+        if mcp_manager is not None:
+            mcp_manager.stop()
+
+
+def _run_events_inner(
+    config: LeaConfig,
+    messages: list,
+    *,
+    project: dict | ProjectContext | None = None,
+    session_id: str | None = None,
+    working_dir: str | None = None,
+    should_stop=None,
+    gate=None,
+):
+    system = load_system_prompt(config.prompt_variant, config.skills, workspace=working_dir)
+    if config.narrate_tool_steps:
+        system += _NARRATE_TOOL_STEPS_INSTRUCTION
+    model = config.model
+
+    # Resolve the active toolset once: import any user tool modules so their
+    # tools register, then select per config (None → all registered tools).
+    import_tool_modules(config.tool_modules)
+    tools_schema, tool_handlers = build_toolset(config.tools)
+    if isinstance(project, dict):
+        project = ProjectContext(
+            project_id=str(project.get("project_id") or ""),
+            project_path=project.get("project_path"),
+            project_context=project.get("project_context"),
+            record_on_success=bool(project.get("record_on_success", True)),
+        )
+
+    # Stateless (D16): the caller owns the transcript. Work on a private copy so we
+    # never mutate the caller's list in place; the final state rides out via the
+    # Finished transcript. Per-activation usage starts at zero — the adapter
+    # accumulates across activations. The adapter owns session identity; we only
+    # generate a label if it didn't pass one (e.g. a standalone/test call).
+    messages = list(messages)
+    if session_id is None:
+        session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    total_usage = Usage()
+    # The original request — first plain-text user message. Used only for project
+    # recording on success (a v2.1-deferred path the D-group reworks).
+    task = next(
+        (m["content"] for m in messages
+         if m.get("role") == "user" and isinstance(m.get("content"), str)),
+        "",
+    )
+
+    total_cost = 0.0
+    accepted_signature: str | None = None
+    proof_state = ProofVerificationState()
+
+    def transcript(turns: int) -> dict:
+        clean = []
+        for msg in messages:
+            if msg["role"] == "assistant" and isinstance(msg["content"], list):
+                clean.append({"role": "assistant", "content": [
+                    {k: v for k, v in item.items() if k != "raw_part"}
+                    for item in msg["content"]
+                ]})
+            else:
+                clean.append(msg)
+        return {
+            "session_id": session_id,
+            "model": model,
+            "turns": turns,
+            "usage": {"input_tokens": total_usage.input_tokens, "output_tokens": total_usage.output_tokens},
+            "messages": clean,
+        }
+
+    # Interactive chat: classify whether this turn is a new formalization or an
+    # assistant/QA request (explain, look up a lemma, etc.), and route. Only fires
+    # when the conversation already has a prior assistant turn — a first turn is
+    # always a formalization, so the cold-start path is untouched. (Keying off a
+    # prior assistant turn, not message count, stays correct even when the caller
+    # prepends project context to a fresh run.)
+    assistant_mode = False
+    if config.prompt_variant == "interactive" and any(m.get("role") == "assistant" for m in messages):
+        decision, intent_usage, intent_cost = _classify_intent(model, messages, config)
+        total_usage.input_tokens += intent_usage.input_tokens
+        total_usage.output_tokens += intent_usage.output_tokens
+        total_cost += intent_cost
+        if intent_usage.input_tokens or intent_usage.output_tokens or intent_cost:
+            yield UsageUpdated(intent_usage.input_tokens, intent_usage.output_tokens, intent_cost)
+        assistant_mode = decision == "ASSISTANT"
+
+    turn = 0
+    while True:
+        # Cooperative interrupt (D18): the human asked to stop. `turn` is the count
+        # of completed turns, so the last step's write is already committed and the
+        # canvas is accurate — a clean stop, not a hard kill. The transcript so far
+        # rides out so a follow-up still has a coherent base.
+        if should_stop is not None and should_stop():
+            yield Finished("interrupted", "Run interrupted by the user.",
+                           turn, session_id, model, total_usage, total_cost, transcript(turn))
+            return
+
+        turn += 1
+        if config.max_turns and turn > config.max_turns:
+            yield Finished("max_turns", "Error: max turns reached without completing the proof.",
+                           turn - 1, session_id, model, total_usage, total_cost, transcript(turn - 1))
+            return
+
+        yield TurnStarted(turn)
+
+        assistant_parts = []
+        current_text = ""
+        tool_calls = []
+        forced_narration_emitted = False
+
+        for event in stream(model, system, messages, tools_schema, config.model_kwargs, streaming=config.stream):
+            if isinstance(event, TextDelta):
+                current_text += event.text
+                yield AssistantTextDelta(event.text)
+            elif isinstance(event, ToolCall):
+                if config.narrate_tool_steps and not forced_narration_emitted and not current_text and not any(
+                    part.get("type") == "text" and part.get("text") for part in assistant_parts
+                ):
+                    narration = _forced_tool_narration(
+                        model=model,
+                        system=system,
+                        messages=messages,
+                        tool_name=event.name,
+                        tool_args=event.args,
+                        config=config,
+                    )
+                    try:
+                        while True:
+                            narration_event = next(narration)
+                            current_text += narration_event.text
+                            yield AssistantTextDelta(narration_event.text)
+                    except StopIteration as result:
+                        _, narration_usage, narration_cost = result.value
+                        total_usage.input_tokens += narration_usage.input_tokens
+                        total_usage.output_tokens += narration_usage.output_tokens
+                        total_cost += narration_cost
+                        if narration_usage.input_tokens or narration_usage.output_tokens or narration_cost:
+                            yield UsageUpdated(
+                                narration_usage.input_tokens,
+                                narration_usage.output_tokens,
+                                narration_cost,
+                            )
+                    forced_narration_emitted = True
+                if current_text:
+                    assistant_parts.append({"type": "text", "text": current_text})
+                    current_text = ""
+                yield ToolCalled(event.name, event.args)
+                tool_calls.append({"name": event.name, "args": event.args, "id": None, "raw_part": event.raw_part})
+            elif isinstance(event, _ToolMeta):
+                if tool_calls:
+                    tool_calls[-1]["id"] = event.tool_use_id
+            elif isinstance(event, Done):
+                total_usage.input_tokens += event.usage.input_tokens
+                total_usage.output_tokens += event.usage.output_tokens
+                total_cost += event.cost
+                yield UsageUpdated(event.usage.input_tokens, event.usage.output_tokens, event.cost)
+
+        if current_text:
+            assistant_parts.append({"type": "text", "text": current_text})
+        for tc in tool_calls:
+            assistant_parts.append({
+                "type": "tool_call",
+                "name": tc["name"],
+                "args": tc["args"],
+                "id": tc["id"],
+                "raw_part": tc.get("raw_part"),
+            })
+        messages.append({"role": "assistant", "content": assistant_parts})
+
+        if not tool_calls:
+            text = "".join(p["text"] for p in assistant_parts if p["type"] == "text")
+            if assistant_mode:
+                # Chat/assistant turn — not a formalization run, so skip the
+                # proof gate and project recording entirely.
+                yield Finished("assistant", text or "(no response)", turn, session_id, model,
+                               total_usage, total_cost, transcript(turn))
+                return
+            if not proof_state.latest_proof_path:
+                # Interactive collaborator: a text-only turn before any proof file
+                # exists means the model is presenting its plan / natural-language
+                # sketch and waiting for the user — the prompt tells it to lead with
+                # the math and not touch files until the user confirms. Let the run
+                # pause here instead of forcing a proof artifact. Non-interactive
+                # variants (eval/default) keep the nudge so they never stop short.
+                if config.prompt_variant == "interactive":
+                    yield Finished("assistant", text or "(no response)", turn, session_id,
+                                   model, total_usage, total_cost, transcript(turn))
+                    return
+                messages.append({"role": "user", "content": _NO_PROOF_ARTIFACT_MESSAGE})
+                continue
+            if proof_state.needs_final_check():
+                check_path = proof_state.latest_proof_path
+                assert check_path is not None
+                check_args = {"path": check_path}
+                yield ToolCalled("lean_check", check_args)
+                handler = tool_handlers.get("lean_check")
+                if handler:
+                    try:
+                        result = handler(check_args)
+                    except Exception as e:
+                        result = f"Error: tool 'lean_check' raised {type(e).__name__}: {e}"
+                else:
+                    result = "Error: unknown tool 'lean_check'"
+                preview = result[:200] + "..." if len(result) > 200 else result
+                yield ToolResulted("lean_check", result, preview)
+                for ev in _meaning_events("lean_check", check_args, result):
+                    yield ev
+                proof_state.note_tool_result("lean_check", check_args, result)
+
+                tool_result = {"type": "tool_result", "tool_name": "lean_check", "content": result}
+                gate_call_id = f"final_gate_lean_check_{turn}"
+                messages.append({"role": "assistant", "content": [{
+                    "type": "tool_call",
+                    "name": "lean_check",
+                    "args": check_args,
+                    "id": gate_call_id,
+                }]})
+                tool_result["tool_use_id"] = gate_call_id
+                tool_result["tool_call_id"] = gate_call_id
+                messages.append({"role": "user", "content": [tool_result]})
+            if proof_state.latest_proof_path and not proof_state.latest_proof_verified():
+                diagnostic = proof_state.latest_check_output or "No successful lean_check was observed."
+                messages.append({"role": "user", "content": f"{_FINAL_GATE_FAILURE_MESSAGE}\n\n{diagnostic}"})
+                continue
+
+            final_transcript = transcript(turn)
+            if project:
+                try:
+                    update = record_project_entry(
+                        project=project,
+                        task=task,
+                        transcript=final_transcript,
+                        signature=accepted_signature,
+                    )
+                    if update:
+                        yield ProjectEntryUpdated(
+                            update.project_id,
+                            update.project_path,
+                            update.theorem_name,
+                            update.proof_path,
+                            update.entry_action,
+                            update.module_name,
+                        )
+                except Exception as exc:
+                    yield AssistantTextDelta(
+                        f"\n\nProject recording failed: {type(exc).__name__}: {exc}"
+                    )
+            yield Finished("completed", text or "(no response)", turn, session_id, model,
+                           total_usage, total_cost, final_transcript)
+            return
+
+        tool_results = []
+        for tc in tool_calls:
+            # Per-tool gate (D19): pause for human approval before an impactful tool.
+            # The adapter owns which tools are gated and the session allowlist, so a
+            # not-yet-allowed gated tool yields a two-way ToolApprovalRequested; deny
+            # (or anything not explicitly allowed) skips it with a tool-error so the
+            # model picks another step rather than the run dying.
+            approved = True
+            if gate is not None and gate(tc["name"], tc["args"]):
+                decision = yield ToolApprovalRequested(tc["name"], tc["args"])
+                approved = decision in ("allow", "always_session")
+
+            if not approved:
+                result = (
+                    f"The user declined to run this {tc['name']} call. Treat this as a redirect, "
+                    "not a failure. Do NOT silently retry or jump to a different step. In your next "
+                    "message, explain to the user what you were about to do and why, then ask how "
+                    "they'd like to proceed — and wait for their reply before acting."
+                )
+            else:
+                handler = tool_handlers.get(tc["name"])
+                if handler:
+                    try:
+                        result = handler(tc["args"])
+                    except Exception as e:
+                        result = f"Error: tool '{tc['name']}' raised {type(e).__name__}: {e}"
+                else:
+                    result = f"Error: unknown tool '{tc['name']}'"
+
+            preview = result[:200] + "..." if len(result) > 200 else result
+            yield ToolResulted(tc["name"], result, preview)
+            for ev in _meaning_events(tc["name"], tc["args"], result):
+                yield ev
+            proof_state.note_tool_result(tc["name"], tc["args"], result)
+
+            tool_result = {"type": "tool_result", "tool_name": tc["name"], "content": result}
+            if tc["id"]:
+                tool_result["tool_use_id"] = tc["id"]
+                tool_result["tool_call_id"] = tc["id"]
+            tool_results.append(tool_result)
+
+        messages.append({"role": "user", "content": tool_results})

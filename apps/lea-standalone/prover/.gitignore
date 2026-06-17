@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+uv.lock
+
+# Secrets — never commit API keys or tokens
+.gemini_key
+.github_token
+*.key
+*.token
+.env
+
+# Lean
+.lake/
+*.olean
+*.ilean
+*.trace
+miniF2F-lean4/
+FormalQualBench/
+workspace/proofs/*
+!workspace/proofs/.gitkeep
+workspace/*.lean
+!workspace/lakefile.lean
+workspace/projects/*
+
+# SafeVerify scratch (target/submission .lean + .olean, written then cleaned up)
+workspace/.sv_scratch/
+# Vendored SafeVerify build/scratch artifacts (source is committed, build output isn't)
+third_party/SafeVerify/.sv_scratch/
+third_party/*/.lake/
+third_party/*/build/
+
+# Eval results
+eval/results/
+eval/*.log
+eval/*.pid
+
+# Agent scratch files in repo root
+/*.lean
+/temp*.py
+/test*.py
+/search_*.py
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+_archive/
+
+# Local Claude notes (ops, paths, personal context)
+.claude.local.md
+CLAUDE.md

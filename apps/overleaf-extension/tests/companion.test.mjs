@@ -2459,6 +2459,14 @@ async function makeState(overrides = {}) {
       ...(overrides.leaRepoPath ? {
         leaRepoPath: overrides.leaRepoPath,
         leaWorkspacePath: buildLeaWorkspacePath(overrides.leaRepoPath),
+        // These tests pin the legacy vendored /v1 contract (POST :8000/v1/runs,
+        // project recording, theorem-translation approval). That path is preserved
+        // for one-release rollback behind leaApiFlavor "v1"; the cutover default is
+        // "api" (the standalone adapter). Run this suite explicitly on v1 so it keeps
+        // validating the rollback path; the /api path is covered by
+        // leaApiClient.test.mjs and the api-flavor tests below.
+        leaApiBaseUrl: overrides.leaApiBaseUrl || "http://127.0.0.1:8000",
+        leaApiFlavor: overrides.leaApiFlavor || "v1",
         leaProvider: overrides.leaProvider || "openai",
         leaModel: overrides.leaModel || "o4-mini",
         leaProviderApiKeys: overrides.leaProviderApiKeys || {},
@@ -2612,3 +2620,91 @@ async function waitFor(predicate) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
+
+// --- New default backend: the standalone adapter (/api) -------------------
+// These cover the cutover default (leaApiFlavor "api"). The deep project-status
+// assertions of the /v1 suite above don't apply here: project recording is
+// deferred adapter-side (docs/migrate-to-standalone.md §4), so we assert the wire
+// (POST /api/runs, no /v1 calls, autonomous run) rather than formalized status.
+
+// An adapter-style SSE response: the event name rides the `event:` line (unlike
+// the /v1 `sseResponse`, which inlines `type` in the data body).
+function adapterSseResponse(frames) {
+  return {
+    ok: true,
+    status: 200,
+    body: (async function* () {
+      for (const { type, data } of frames) {
+        yield new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+      }
+    })()
+  };
+}
+
+function makeAdapterApiFetch(calls, options = {}) {
+  return async (url, requestOptions = {}) => {
+    const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
+    calls.push({ url, options: requestOptions, body });
+    if (String(url).endsWith("/api/runs") && requestOptions.method === "POST") {
+      return jsonResponse(200, { session_id: "sess-api-1", run_id: "api-run-1", message: {} });
+    }
+    if (String(url).includes("/api/runs/") && String(url).endsWith("/events")) {
+      return adapterSseResponse(options.eventFrames || [
+        { type: "status", data: { status: "tool_call", message: "Running write_file", turn: 1 } },
+        { type: "done", data: { status: options.doneStatus || "success" } }
+      ]);
+    }
+    if (String(url).includes("/approvals/")) {
+      return jsonResponse(200, { status: "resolved", decision: "always_session" });
+    }
+    if (String(url).includes("/api/sessions/")) {
+      return jsonResponse(200, { runs: [{ id: "api-run-1", input_tokens: 10, output_tokens: 5, cost_usd: 0.001 }] });
+    }
+    if (String(url).endsWith("/interrupt")) {
+      return jsonResponse(200, { status: "interrupting" });
+    }
+    throw new Error(`unexpected adapter fetch: ${url}`);
+  };
+}
+
+test("stub-then-formalize is unavailable on the standalone /api backend (deferred TODO)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+
+  const result = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "t_api_stub",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 501);
+  assert.equal(result.body.error, "stub_unsupported_on_api");
+});
+
+test("formalize on the /api backend posts to /api/runs and runs autonomously (no /v1 calls)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "t_api",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.status, "in_progress");
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.ok(runCall.body.message.includes("project project-1"));
+  assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
+});

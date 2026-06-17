@@ -1,0 +1,119 @@
+"""The prover's public surface — the one import the LeaUI adapter uses.
+
+The prover exposes three capabilities (architecture D2):
+  - run_events(...)  the agent loop                          (re-exported — A7)
+  - check(path)      lean_check on a file, no model run      (A5, here)
+  - verify(path)     SafeVerify on a file, no model run      (A6, here)
+plus the typed event classes.
+
+`check` / `verify` are standalone: give them a file path, they run the check and
+hand back a structured verdict (a CheckResult / VerifyResult). No agent run — so the
+adapter can verify a user-edited file on demand (the writeable canvas).
+"""
+
+from pathlib import Path
+
+from . import safeverify
+from .agent import run_events
+from .events import (
+    AgentEvent,
+    AssistantTextDelta,
+    CheckResult,
+    Error,
+    FileChanged,
+    Finished,
+    ProjectEntryUpdated,
+    ToolApprovalRequested,
+    ToolCalled,
+    ToolResulted,
+    TurnStarted,
+    UsageUpdated,
+    VerifyResult,
+)
+from .tools import lean_check, _lean_check_has_error, _first_error_line
+
+__all__ = [
+    # the three capabilities (D2)
+    "run_events",
+    "check",
+    "verify",
+    # the typed event stream (D17) — one import for every event type
+    "AgentEvent",
+    "AssistantTextDelta",
+    "TurnStarted",
+    "ToolCalled",
+    "ToolResulted",
+    "ToolApprovalRequested",
+    "UsageUpdated",
+    "FileChanged",
+    "CheckResult",
+    "VerifyResult",
+    "Error",
+    "Finished",
+    "ProjectEntryUpdated",
+]
+
+
+def check(path: str) -> CheckResult:
+    """Run `lean_check` on a file (LSP fast path) and return a structured verdict.
+
+    No agent run. Uses the same output classifiers as the agent's live CheckResult
+    events (tools._lean_check_has_error / _first_error_line), so this verdict can
+    never disagree with what a run would report for the same file.
+    """
+    out = lean_check(path)
+    err = _lean_check_has_error(out)
+    return CheckResult(
+        path,
+        "error" if err else "ok",
+        _first_error_line(out) if err else None,
+    )
+
+
+def verify(path: str) -> VerifyResult:
+    """Audit a finished proof with SafeVerify (kernel replay + axiom whitelist).
+
+    No agent run. Derives the target from the proof's own main theorem, so it
+    catches `sorry`/`axiom`/`native_decide`/shadowing tricks a plain compile
+    misses. Expensive (~two compiles + a replay), so the adapter runs it once on
+    the final artifact and serializes calls.
+
+    status: 'ok' (passed) | 'rejected' (cheat caught) | 'error' (couldn't run /
+    no theorem) | 'unavailable' (binary not built). 'error'/'unavailable' are
+    deliberately distinct from 'rejected' — "couldn't verify" must never read as
+    "verified bad."
+    """
+    if not safeverify.is_available():
+        return VerifyResult("unavailable", "SafeVerify is not built on this server.")
+
+    p = Path(path)
+    if not p.exists():
+        return VerifyResult("error", f"File not found: {path}")
+    code = p.read_text()
+
+    signature = safeverify.theorem_signature(code)
+    if not signature:
+        return VerifyResult("error", "Could not find a theorem/lemma to verify in the proof.")
+
+    workspace = safeverify.WORKSPACE
+    scratch = workspace / ".sv_scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    stem = p.stem or "proof"
+    target = scratch / f"{stem}_sv_target.lean"
+    submission = scratch / f"{stem}_sv_submission.lean"
+    # Reproduce the submission's namespace so the target's declaration shares the
+    # submission's fully-qualified name (e.g. `Lea.Misc.div_6`). Without this the
+    # target declares a root-level `div_6`, which SafeVerify can't find in the
+    # namespaced submission and rejects a valid proof.
+    ns_open, ns_close = safeverify.namespace_context(code)
+    target.write_text("import Mathlib\n\n" + ns_open + signature + " := by\n  sorry\n" + ns_close)
+    submission.write_text(code if code.endswith("\n") else code + "\n")
+
+    try:
+        ok, detail = safeverify.verify_proof(target, submission, workspace)
+        return VerifyResult("ok" if ok else "rejected", None if ok else detail)
+    except Exception as exc:  # noqa: BLE001 — report any failure as an error verdict, not a crash
+        return VerifyResult("error", f"{type(exc).__name__}: {exc}")
+    finally:
+        target.unlink(missing_ok=True)
+        submission.unlink(missing_ok=True)
