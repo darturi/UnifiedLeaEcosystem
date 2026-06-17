@@ -22,6 +22,7 @@ export function ChatThread({
   runStatus,
   runStatusById,
   isRunning,
+  currentRunId,
   items,
   statusEvents,
   activeCodeIndex,
@@ -43,6 +44,7 @@ export function ChatThread({
   runStatus?: RunStatus;
   runStatusById: Record<string, string>;
   isRunning: boolean;
+  currentRunId?: string;
   items: TimelineItem[];
   statusEvents: StatusEvent[];
   activeCodeIndex: number;
@@ -145,6 +147,18 @@ export function ChatThread({
     !pendingApproval &&
     !items.some((i) => i.kind === 'message' && i.message.live);
 
+  // M17: the tool Lea is currently running (all tools), scoped to the active run
+  // so a prior run's last tool never leaks in. Drives the activity label.
+  const activity = useMemo(() => {
+    if (!thinking) return null;
+    for (let i = statusEvents.length - 1; i >= 0; i -= 1) {
+      const s = statusEvents[i];
+      if (currentRunId && s.run_id && s.run_id !== currentRunId) continue;
+      if (s.status === 'tool_call' || s.status === 'lean_check') return activityLabel(s);
+    }
+    return null;
+  }, [thinking, statusEvents, currentRunId]);
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -245,7 +259,7 @@ export function ChatThread({
           {thinking && (
             <div className="thinking">
               <span className="avatar lea">L</span>
-              <span>Lea is thinking</span>
+              <span>{activity ? activity : 'Lea is thinking'}</span>
               <span className="dots">
                 <i />
                 <i />
@@ -378,6 +392,23 @@ function approvalPreview(approval: PendingApproval): string {
       : '';
   if (path || content) return [path, content].filter(Boolean).join('\n\n');
   return JSON.stringify(args, null, 2);
+}
+
+// Friendly "what Lea is doing" label for a tool_call / lean_check status event,
+// covering every tool (M17).
+const TOOL_ACTIVITY: Record<string, string> = {
+  search_mathlib: '🔍 Searching Mathlib',
+  bash: '💻 Running a shell command',
+  read_file: '📖 Reading a file',
+  write_file: '✎ Writing the proof',
+  edit_file: '✎ Editing the proof',
+  lean_check: '⚙ Checking with Lean',
+};
+
+function activityLabel(event: StatusEvent): string {
+  if (event.status === 'lean_check') return TOOL_ACTIVITY.lean_check;
+  const name = (event.message || '').replace(/^Running\s+/, '').trim();
+  return TOOL_ACTIVITY[name] || `⚙ Running ${name || 'a tool'}`;
 }
 
 function stepTitle(step: CodeStep): string {

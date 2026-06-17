@@ -369,12 +369,12 @@ export default function App() {
             title={title}
             model={model}
             session={selectedSession}
-            sessionStatus={selectedSession?.status}
             runStatus={runStatus}
+            runStatusById={runStatusById}
             isRunning={isRunning}
+            currentRunId={currentRunId}
             items={items}
             statusEvents={statusEvents}
-            runStatusById={runStatusById}
             activeCodeIndex={codeIndex}
             onSelectStep={selectStep}
             pendingApproval={pendingApproval}
