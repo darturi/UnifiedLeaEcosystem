@@ -24,6 +24,11 @@ router = APIRouter()
 class RunRequest(BaseModel):
     message: str
     session_id: str | None = None
+    # Autonomous run (D19): when true the run uses no per-tool approval gate and the
+    # non-interactive `default` prompt variant, so it formalizes end-to-end with zero
+    # human interaction (the Overleaf path). Defaults false → the interactive UI
+    # behavior (gated tools + collaborator prompt) is unchanged.
+    autonomous: bool = False
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -51,7 +56,8 @@ def create_run(request: RunRequest) -> dict:
     else:
         session = store.create_session(message)
 
-    run = store.create_run(session["id"], config.model, None, config.max_turns)
+    run = store.create_run(session["id"], config.model, None, config.max_turns,
+                           autonomous=request.autonomous)
     user_message = store.add_message(session["id"], "user", message, run["id"])
     return {"session_id": session["id"], "run_id": run["id"], "message": user_message}
 
@@ -111,6 +117,7 @@ async def run_events(run_id: str) -> StreamingResponse:
         config=load_config(),
         events=queue,
         project=None,  # project context is deferred to v2.1 (D8)
+        autonomous=bool(run.get("autonomous")),
     )
     thread = Thread(target=run_lea, args=(context,), daemon=True)
     thread.start()

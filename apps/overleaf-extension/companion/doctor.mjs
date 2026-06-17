@@ -18,18 +18,26 @@ checkCommand("lean", ["--version"]);
 checkCommand("lake", ["--version"]);
 
 checkEnv("OPENAI_API_KEY");
-checkPath("Lea repo", settings.leaRepoPath, (dir) => (
+// The backend is now the standalone app: the companion reads proof artifacts
+// from the standalone prover's workspace and talks to the adapter (:8001), not a
+// vendored Lea API. leaRepoPath points at apps/lea-standalone/prover.
+checkPath("Lea prover repo", settings.leaRepoPath, (dir) => (
   fs.existsSync(path.join(dir, "pyproject.toml")) &&
-  fs.existsSync(path.join(dir, "lea_api"))
-), "must point at the Lea API-enabled lea-prover checkout");
+  fs.existsSync(path.join(dir, "lea"))
+), "must point at the standalone prover (apps/lea-standalone/prover)");
 const leaWorkspacePath = settings.leaRepoPath ? path.join(settings.leaRepoPath, "workspace") : "";
 checkPath("Lea workspace", leaWorkspacePath, (dir) => (
   fs.existsSync(path.join(dir, "lean-toolchain")) &&
   (fs.existsSync(path.join(dir, "lakefile.lean")) || fs.existsSync(path.join(dir, "lakefile.toml")))
 ), "must contain lean-toolchain and lakefile.lean or lakefile.toml");
 checkMathlib(leaWorkspacePath);
-checkPath("Lea API virtualenv", settings.leaRepoPath ? path.join(settings.leaRepoPath, ".venv", "bin", "python") : "", () => true, "run `npm run setup -- --target overleaf` from the monorepo root");
-checkUrl("Lea API URL", settings.leaApiBaseUrl || "http://127.0.0.1:8000");
+// The API runs in the adapter venv (apps/lea-standalone/adapter/.venv), a sibling
+// of the prover dir.
+const adapterVenv = settings.leaRepoPath
+  ? path.resolve(settings.leaRepoPath, "..", "adapter", ".venv", "bin", "python")
+  : "";
+checkPath("Lea adapter virtualenv", adapterVenv, () => true, "run `npm run setup` from the monorepo root");
+checkUrl(`Lea adapter URL (flavor: ${settings.leaApiFlavor || "api"})`, settings.leaApiBaseUrl || "http://127.0.0.1:8001");
 
 console.log("Overleaf Lea Formalizer doctor\n");
 console.log(`${dotenv.loaded ? "✓" : "•"} root .env ${dotenv.loaded ? `loaded from ${dotenv.path}` : "not found; using shell/settings only"}`);

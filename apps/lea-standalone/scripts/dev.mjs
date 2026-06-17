@@ -9,7 +9,17 @@ import path from "node:path";
 // exports its own provider keys from config (D1·cfg). So dev runs just two
 // processes: the FastAPI adapter (:8001) and the Vite web dev server (:5173).
 const root = process.cwd();
+// In the monorepo, npm hoists workspace deps to the repo-root node_modules, so
+// this app may have no local node_modules. Resolve hoisted tools from either
+// place (local checkout first, then the monorepo root).
+const MONOREPO_ROOT = path.resolve(root, "..", "..");
 const children = [];
+
+function resolveHoisted(...segments) {
+  const local = path.join(root, "node_modules", ...segments);
+  if (existsSync(local)) return local;
+  return path.join(MONOREPO_ROOT, "node_modules", ...segments);
+}
 
 function fail(message) {
   console.error(`\n[dev] ${message}`);
@@ -99,7 +109,9 @@ function shutdown(code = 0) {
 process.on("SIGINT", () => shutdown());
 process.on("SIGTERM", () => shutdown());
 
-ensure("node_modules", "node_modules is missing. Run npm install.");
+if (!existsSync(path.join(root, "node_modules")) && !existsSync(path.join(MONOREPO_ROOT, "node_modules"))) {
+  fail("node_modules is missing. Run npm install from the monorepo root.");
+}
 ensure("config/lea.local.toml", "config/lea.local.toml is missing. Copy config/lea.local.example.toml.");
 ensure("adapter/.venv/bin/python", "adapter virtualenv is missing. Run npm run setup:api.");
 ensure("prover/pyproject.toml", "prover/ is missing — this is a broken checkout.");
@@ -124,7 +136,7 @@ try {
 }
 
 await ensurePortAvailable(5173, "frontend");
-start("web", path.join(root, "node_modules", ".bin", "vite"), ["--host", "0.0.0.0", "--strictPort"]);
+start("web", resolveHoisted(".bin", "vite"), ["--host", "0.0.0.0", "--strictPort"]);
 
 try {
   await waitFor("http://127.0.0.1:5173", "frontend");

@@ -44,7 +44,8 @@ export function applyEnvDefaults(settings, env = process.env) {
       env.LEA_RECORDER_PYTHON ||
       settings.leaRecorderPython ||
       path.join(leaUiServerDir, ".venv", "bin", "python"),
-    leaApiBaseUrl: env.LEA_API_BASE_URL || settings.leaApiBaseUrl || "http://127.0.0.1:8000",
+    leaApiBaseUrl: env.LEA_API_BASE_URL || settings.leaApiBaseUrl || "http://127.0.0.1:8001",
+    leaApiFlavor: normalizeLeaApiFlavor(env.LEA_API_FLAVOR || settings.leaApiFlavor || "api"),
     leaUiBaseUrl: env.LEA_UI_BASE_URL || settings.leaUiBaseUrl || "http://localhost:5173",
     leaProvider: normalizeModelFamilyId(env.LEA_PROVIDER || settings.leaProvider || "openai"),
     leaModel: env.LEA_MODEL || settings.leaModel || "o4-mini",
@@ -73,6 +74,12 @@ export function normalizeBoolean(value, fallback = false) {
   if (["true", "1", "yes", "on"].includes(text)) return true;
   if (["false", "0", "no", "off"].includes(text)) return false;
   return fallback;
+}
+
+export function normalizeLeaApiFlavor(value) {
+  const flavor = String(value || "api").trim().toLowerCase();
+  if (flavor === "api" || flavor === "v1") return flavor;
+  throw new Error("leaApiFlavor must be 'api' (standalone adapter) or 'v1' (legacy vendored API)");
 }
 
 export function normalizeLeaLatexContextMode(value) {

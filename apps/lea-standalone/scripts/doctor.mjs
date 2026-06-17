@@ -44,7 +44,13 @@ const checks = [];
 const nodeMajor = Number(process.versions.node.split(".")[0]);
 checks.push(check("Node version", nodeMajor === 22 || nodeMajor === 20, `v${process.versions.node}; Node 22 LTS is recommended`));
 
-checks.push(check("node_modules", existsSync(path.join(root, "node_modules")), "run npm install if missing"));
+// In the monorepo, workspace deps hoist to the repo-root node_modules, so a local
+// one may not exist — accept either.
+checks.push(check(
+  "node_modules",
+  existsSync(path.join(root, "node_modules")) || existsSync(path.join(root, "..", "..", "node_modules")),
+  "run npm install from the monorepo root if missing",
+));
 checks.push(check("local config", existsSync(path.join(root, "config", "lea.local.toml")), "copy config/lea.local.example.toml if missing"));
 checks.push(check("adapter virtualenv", existsSync(path.join(root, "adapter", ".venv", "bin", "python")), "run npm run setup:api if missing"));
 checks.push(check(

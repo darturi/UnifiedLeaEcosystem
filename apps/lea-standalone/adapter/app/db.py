@@ -57,6 +57,13 @@ def init_db() -> None:
                 session_id text not null references sessions(id),
                 project_id text references projects(id),
                 status text not null,
+                -- Autonomous run (D19): 1 → no per-tool approval gate AND the
+                -- non-interactive `default` prompt variant, so the run formalizes
+                -- end-to-end with zero human interaction (the Overleaf path). 0 →
+                -- the interactive UI behavior (gated tools + collaborator prompt).
+                -- Set at create time from the request; read back when the SSE
+                -- stream spawns the run thread (a separate HTTP request).
+                autonomous integer not null default 0,
                 api_run_id text,
                 pending_approval text,
                 model text not null,

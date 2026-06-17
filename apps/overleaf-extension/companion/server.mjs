@@ -32,6 +32,7 @@ import {
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeLeaLatexContextMode } from "./config.mjs";
+import { isApiFlavor, runApiProofJob } from "./leaApiClient.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 31245;
@@ -41,7 +42,11 @@ const ENV_PATH = ROOT_ENV_PATH;
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
-const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
+const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8001";
+// Which Lea backend wire to speak. "api" = the standalone adapter's /api
+// (apps/lea-standalone/adapter); "v1" = the legacy vendored Lea API (retired,
+// kept only for one-release rollback). Default is the standalone adapter.
+const DEFAULT_LEA_API_FLAVOR = "api";
 const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
@@ -54,6 +59,7 @@ const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
 const SHARED_SETTING_ENV_FIELDS = {
   leaRepoPath: "LEA_ROOT",
   leaApiBaseUrl: "LEA_API_BASE_URL",
+  leaApiFlavor: "LEA_API_FLAVOR",
   leaUiBaseUrl: "LEA_UI_BASE_URL",
   leaProvider: "LEA_PROVIDER",
   leaModel: "LEA_MODEL",
@@ -249,6 +255,18 @@ export async function handleStub(payload, state) {
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
+  }
+  // The "stub the statement, approve, then formalize" flow depends on the
+  // theorem-translation approval tier, which the standalone adapter does not
+  // expose yet (deferred — docs/migrate-to-standalone.md §4). Until the native
+  // tier lands on /api, surface a clear, non-failing message instead of starting
+  // a run that cannot pause for approval.
+  if (isApiFlavor(state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
+    return errorResponse(
+      501,
+      "stub_unsupported_on_api",
+      "Theorem-translation approval (stub-then-formalize) is not available on the standalone Lea backend yet. Use Formalize directly for now."
+    );
   }
   if (spendLimitReached(state)) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
@@ -1112,6 +1130,8 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaRepoPath: state.settings.leaRepoPath,
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaApiFlavor: state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR,
+    leaSessionId: null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,
@@ -1203,19 +1223,55 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
   return sections.map((section) => section.entry.name);
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
-  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
-  const prompt = buildLeaPrompt({
-    projectSlug: target.projectSlug,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    theoremContext,
-    declarationNameHint: job.declarationNameHint || "",
-    resolvedUses,
-    latexContext
-  });
+// Run one autonomous proof job against the configured Lea backend, returning the
+// legacy `exit` contract ({ ok, timedOut, apiRunId, error, usage, costUsd }) the
+// rest of the orchestration consumes — regardless of wire flavor.
+//
+// "api"  → the standalone adapter (apps/lea-standalone/adapter). Config (model,
+//          max_turns) is server-side; tool-approval gates are auto-approved so the
+//          run is autonomous; usage is read back from the run row at the end.
+//          NOTE: project recording is deferred adapter-side (a TODO from
+//          docs/migrate-to-standalone.md §4), so the formalized/unformalized
+//          status derived from project markdown does not update yet.
+// "v1"   → the legacy vendored Lea API (retired; kept for rollback only).
+async function runLeaProofJobForJob({ state, job, target, prompt }) {
+  if (isApiFlavor(job.leaApiFlavor)) {
+    await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/api/runs\n\n${prompt}\n\n`);
+    const exit = await runApiProofJob({
+      fetchImpl: state.fetchImpl || fetch,
+      baseUrl: job.leaApiBaseUrl,
+      apiKey: state.env?.LEA_API_KEY,
+      message: prompt,
+      sessionId: job.leaSessionId || null,
+      maxTurns: job.leaMaxTurns,
+      timeoutMs: job.leaJobTimeoutSeconds * 1000,
+      autoApprove: true,
+      appendLog,
+      logPath: job.logPath,
+      onRunStarted: async (apiRunId, sessionId) => {
+        job.apiRunId = apiRunId;
+        job.leaSessionId = sessionId || job.leaSessionId || null;
+        await writeJson(state.jobsPath, state.jobs);
+      },
+      onProgressUpdated: async (progress) => {
+        if (!recordJobTurnProgress(job, progress)) return;
+        await writeJson(state.jobsPath, state.jobs);
+      }
+    });
+    // No live usage on /api, so enforce the spend limit once, post-run.
+    if (exit.usage || exit.costUsd !== undefined) {
+      await recordUsageAndEnforceSpendLimit({
+        state,
+        job,
+        usage: { ...exit.usage, costUsd: exit.costUsd },
+        mode: "formalization"
+      });
+    }
+    return exit;
+  }
+
   await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs\n\n${prompt}\n\n`);
-  const exit = await runLeaApiProofJob({
+  return runLeaApiProofJob({
     fetchImpl: state.fetchImpl || fetch,
     baseUrl: job.leaApiBaseUrl,
     apiKey: state.env?.LEA_API_KEY,
@@ -1245,6 +1301,20 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
       await writeJson(state.jobsPath, state.jobs);
     }
   });
+}
+
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
+  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
+  const prompt = buildLeaPrompt({
+    projectSlug: target.projectSlug,
+    theoremLabel: target.theoremLabel,
+    theoremText,
+    theoremContext,
+    declarationNameHint: job.declarationNameHint || "",
+    resolvedUses,
+    latexContext
+  });
+  const exit = await runLeaProofJobForJob({ state, job, target, prompt });
   if (job.finalStatus === "max_spend") return;
 
   const artifact = exit.ok
@@ -1607,6 +1677,8 @@ ${usesGuidance}
 ${theoremText}
 ${formalizationGuidance}
 ${latexContextGuidance}
+
+Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a statement for approval. If a detail is ambiguous (for example which number type to use), pick the most natural interpretation and proceed without waiting. Do everything in this run: write the Lean file under Lea's workspace and carry the proof through to completion.
 
 The final file must compile with no sorry/admit in theorem ${proofTarget}.
 Use the Lea project context to choose the project namespace and proof path.

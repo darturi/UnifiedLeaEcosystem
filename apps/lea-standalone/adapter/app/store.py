@@ -103,16 +103,17 @@ def create_run(
     provider: str | None,
     max_turns: int | None,
     project_id: str | None = None,
+    autonomous: bool = False,
 ) -> dict:
     now = utc_now()
     run_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into runs (id, session_id, project_id, status, model, provider, max_turns, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into runs (id, session_id, project_id, status, autonomous, model, provider, max_turns, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, session_id, project_id, "pending", model, provider, max_turns, now, now),
+            (run_id, session_id, project_id, "pending", 1 if autonomous else 0, model, provider, max_turns, now, now),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
     return row_to_dict(row)

@@ -119,6 +119,64 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
     assert types[-1] == "done"
 
 
+def _policy_recording_fake(received: dict):
+    """A fake run_events that records the prompt_variant + gate it was handed,
+    then finishes cleanly. Lets us assert the autonomous policy without a model."""
+
+    def fake(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+        received["prompt_variant"] = config.prompt_variant
+        received["gate"] = gate
+        yield TurnStarted(1)
+        yield Finished("assistant", "ok", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    return fake
+
+
+def test_autonomous_run_disables_gate_and_uses_default_variant(tmp_path, monkeypatch):
+    # Overleaf path: an autonomous run must reach the prover with NO gate (no
+    # approval prompts) and the non-interactive `default` prompt variant (no
+    # plan-then-pause) — so it formalizes with zero human interaction.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove A")
+    run = store.create_run(session["id"], "gemini/test", None, 3, autonomous=True)
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path,
+                       prompt_variant="interactive")
+    ctx = bridge.RunnerContext(session_id=session["id"], run_id=run["id"], task="Prove A",
+                               config=config, events=Queue(), autonomous=True)
+
+    received: dict = {}
+    monkeypatch.setattr(bridge, "run_events", _policy_recording_fake(received))
+    bridge.run_lea(ctx)
+
+    assert received["gate"] is None
+    assert received["prompt_variant"] == "default"
+    # the run row persisted the flag (it must survive create → events HTTP hops)
+    assert bool(store.get_run(run["id"])["autonomous"]) is True
+
+
+def test_interactive_run_keeps_gate_and_config_variant(tmp_path, monkeypatch):
+    # UI path (default): the gate is wired and the configured prompt variant is
+    # left untouched — current behavior is preserved.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove A")
+    run = store.create_run(session["id"], "gemini/test", None, 3)  # autonomous defaults False
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path,
+                       prompt_variant="interactive")
+    ctx = bridge.RunnerContext(session_id=session["id"], run_id=run["id"], task="Prove A",
+                               config=config, events=Queue())  # autonomous defaults False
+
+    received: dict = {}
+    monkeypatch.setattr(bridge, "run_events", _policy_recording_fake(received))
+    bridge.run_lea(ctx)
+
+    assert callable(received["gate"])
+    assert received["prompt_variant"] == "interactive"
+    assert bool(store.get_run(run["id"])["autonomous"]) is False
+
+
 def test_done_emitted_and_run_failed_on_exception(tmp_path, monkeypatch):
     ctx, queue = _context(tmp_path, monkeypatch)
 

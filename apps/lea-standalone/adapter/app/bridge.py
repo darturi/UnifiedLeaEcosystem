@@ -26,7 +26,7 @@ interrupt is D7; diff-on-divergence context is D6.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock
@@ -144,6 +144,9 @@ class RunnerContext:
     config: LeaConfig
     events: Queue[dict[str, Any]]
     project: dict[str, Any] | None = None
+    # Autonomous (D19): no approval gate + the non-interactive `default` prompt
+    # variant, so the run formalizes with zero human interaction (Overleaf path).
+    autonomous: bool = False
 
 
 def emit(events: Queue[dict[str, Any]], event_type: str, payload: dict[str, Any]) -> None:
@@ -242,6 +245,12 @@ def run_lea(context: RunnerContext) -> None:
     """
     events = context.events
     cfg = context.config
+    if context.autonomous:
+        # Autonomous (D19): swap the interactive collaborator prompt for the
+        # `default` autoformalizer so the run never pauses to present a plan and
+        # wait for confirmation. LeaConfig is frozen, so build a copy. The gate is
+        # disabled separately below.
+        cfg = replace(cfg, prompt_variant="default")
     session_id = context.session_id
     run_id = context.run_id
 
@@ -303,8 +312,11 @@ def run_lea(context: RunnerContext) -> None:
         # Drive the generator manually (not `for`): the per-tool gate (D19) is a
         # two-way exchange — the prover yields ToolApprovalRequested and we feed the
         # human's decision back via gen.send(). A plain for-loop can't send.
+        # Autonomous (D19): gate=None → no tool ever pauses for human approval, so
+        # the run is fully unattended. Interactive UI runs keep the per-tool gate.
         gen = run_events(cfg, messages, session_id=session_id, working_dir=str(repo),
-                         should_stop=stop_event.is_set, gate=_make_gate(session_id))
+                         should_stop=stop_event.is_set,
+                         gate=(None if context.autonomous else _make_gate(session_id)))
         to_send = None
         while True:
             try:

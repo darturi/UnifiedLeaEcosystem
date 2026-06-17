@@ -10,15 +10,14 @@ import path from "node:path";
 import { MONOREPO_ROOT, loadRootEnv, readDotEnv, ROOT_ENV_PATH } from "./env.mjs";
 
 // Unified local-state reset for the whole monorepo. Replaces the former
-// per-app reset scripts (apps/overleaf-extension/companion/reset-local-state.mjs
-// and apps/lea-ui/scripts/reset-local-state.mjs); both apps share the Lea
-// workspace under vendor/lea-prover, so their cleanup is consolidated here.
+// per-app reset scripts; both apps share the Lea workspace under the standalone
+// prover (apps/lea-standalone/prover), so their cleanup is consolidated here.
 
 const dryRun = process.argv.includes("--dry-run");
 
 loadRootEnv();
 const rootEnv = readDotEnv(ROOT_ENV_PATH);
-const leaRoot = resolveMonorepoPath(process.env.LEA_ROOT || rootEnv.LEA_ROOT || "vendor/lea-prover");
+const leaRoot = resolveMonorepoPath(process.env.LEA_ROOT || rootEnv.LEA_ROOT || "apps/lea-standalone/prover");
 const workspaceDir = path.join(leaRoot, "workspace");
 const projectsDir = path.join(workspaceDir, "projects");
 const proofsDir = path.join(workspaceDir, "proofs");
@@ -31,8 +30,14 @@ const companionBackupsDir = path.join(companionDir, "backups");
 const companionJobsIndex = path.join(companionDir, "jobs.json");
 const companionCache = path.join(companionDir, "cache.json");
 
-// Lea UI local state.
-const uiDataDir = path.join(MONOREPO_ROOT, "apps", "lea-ui", "data");
+// Lea UI / adapter local state. The standalone adapter keeps its SQLite DB
+// (sessions, runs, code steps) under apps/lea-standalone/data; LEA_DB_PATH /
+// LEA_SHARED_DATA_DIR can relocate it. (The retired apps/lea-ui/data path is kept
+// in the scan list only so older checkouts still get cleaned up.)
+const uiDataDir = resolveMonorepoPath(
+  process.env.LEA_SHARED_DATA_DIR || rootEnv.LEA_SHARED_DATA_DIR || "apps/lea-standalone/data",
+);
+const legacyUiDataDir = path.join(MONOREPO_ROOT, "apps", "lea-ui", "data");
 
 function resolveMonorepoPath(value) {
   return path.isAbsolute(value) ? value : path.resolve(MONOREPO_ROOT, value);
@@ -82,12 +87,12 @@ function writeJsonFile(label, filePath, value) {
   console.log(`${dryRun ? "Would write" : "Wrote"} ${rel(filePath)}`);
 }
 
-const sqliteFiles = collectEntries(
-  uiDataDir,
-  (filePath, isDir) => !isDir && /\.(db|sqlite|sqlite3)(-(journal|shm|wal))?$/.test(path.basename(filePath)),
-  [],
-  true,
-);
+const isSqlite = (filePath, isDir) =>
+  !isDir && /\.(db|sqlite|sqlite3)(-(journal|shm|wal))?$/.test(path.basename(filePath));
+const sqliteFiles = [
+  ...collectEntries(uiDataDir, isSqlite, [], true),
+  ...collectEntries(legacyUiDataDir, isSqlite, [], true),
+];
 
 // Shared Lea workspace artifacts (used by both apps).
 removeEntries("Lea project entries", collectEntries(projectsDir));
