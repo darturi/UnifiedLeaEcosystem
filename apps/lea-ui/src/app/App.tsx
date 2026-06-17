@@ -150,6 +150,11 @@ export default function App() {
     const restoreInitialSession = async () => {
       const loaded = await refreshSessions();
       await refreshProjects();
+      const urlSessionId = new URLSearchParams(window.location.search).get('session') || undefined;
+      if (urlSessionId) {
+        await loadSession(urlSessionId);
+        return;
+      }
       const savedSessionId = window.localStorage.getItem('lea:selectedSessionId');
       const savedSession = savedSessionId
         ? loaded.find((session) => session.id === savedSessionId)

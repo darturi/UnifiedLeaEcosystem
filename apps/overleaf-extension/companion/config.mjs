@@ -41,6 +41,7 @@ export function applyEnvDefaults(settings, env = process.env) {
       settings.leaRecorderPython ||
       path.join(leaUiServerDir, ".venv", "bin", "python"),
     leaApiBaseUrl: env.LEA_API_BASE_URL || settings.leaApiBaseUrl || "http://127.0.0.1:8000",
+    leaUiBaseUrl: env.LEA_UI_BASE_URL || settings.leaUiBaseUrl || "http://localhost:5173",
     leaProvider: normalizeModelFamilyId(env.LEA_PROVIDER || settings.leaProvider || "openai"),
     leaModel: env.LEA_MODEL || settings.leaModel || "o4-mini",
     leaMaxTurns: parseInt(env.LEA_MAX_TURNS || settings.leaMaxTurns || "20", 10),

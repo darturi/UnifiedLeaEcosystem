@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -699,7 +700,86 @@ test("formalize returns active job instead of starting a duplicate", async () =>
   assert.equal(second.statusCode, 200);
   assert.equal(second.body.status, "in_progress");
   assert.equal(second.body.jobId, first.body.jobId);
+  assert.equal(second.body.leaSessionId, null);
+  assert.equal(second.body.leaSessionUrl, null);
   assert.equal(calls.filter((call) => call.url.endsWith("/v1/runs")).length, 1);
+});
+
+test("active formalization status includes Lea UI session link after recorder handshake", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const child = makeFakeChild();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls),
+  });
+  state.settings.leaSharedState = true;
+  state.settings.leaRecorderPython = "/venv/bin/python";
+  state.settings.leaUiServerDir = "/repo/apps/lea-ui/server";
+  state.settings.leaUiBaseUrl = "http://localhost:5173";
+  state.spawnImpl = () => child;
+
+  const payload = {
+    overleafProjectId: "project-1",
+    theoremLabel: "linked_stream_test",
+    theoremText: "A theorem."
+  };
+
+  const first = await handleFormalize(payload, state);
+  await waitFor(() => state.jobs[first.body.jobId]?.recorderPid === 4242);
+  child.stdout.emit("data", "{\"type\":\"session_link\",\"session_id\":\"sess-stream\",\"run_id\":\"run-stream\"}\n");
+  await waitFor(() => state.jobs[first.body.jobId]?.recorderSessionId === "sess-stream");
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "linked_stream_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.linked_stream_test.status, "in_progress");
+  assert.equal(statuses.body.statuses.linked_stream_test.leaSessionId, "sess-stream");
+  assert.equal(statuses.body.statuses.linked_stream_test.leaSessionUrl, "http://localhost:5173/?session=sess-stream");
+});
+
+test("completed formalization status keeps Lea UI session link", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "linked_done_test.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem linked_done_test : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "linked_done_test",
+    proofPath,
+    moduleName: "Lea.Project1.linked_done_test"
+  });
+  state.jobs.completed_link = {
+    jobId: "completed_link",
+    jobKey: "project-1:linked_done_test",
+    status: "success",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    theoremLabel: "linked_done_test",
+    declarationName: "linked_done_test",
+    recorderSessionId: "sess-done",
+    recorderRunId: "run-done",
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "linked_done_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.linked_done_test.status, "formalized");
+  assert.equal(statuses.body.statuses.linked_done_test.leaSessionId, "sess-done");
+  assert.equal(statuses.body.statuses.linked_done_test.leaSessionUrl, "http://localhost:5173/?session=sess-done");
 });
 
 test("stub starts Lea in theorem translation approval mode and records a sorry stub", async () => {
@@ -2412,6 +2492,14 @@ function makeUsageJob({ jobId, projectId, inputTokens, outputTokens, costUsd }) 
     startedAt: "2026-01-01T00:00:00.000Z",
     finishedAt: "2026-01-01T00:00:01.000Z"
   };
+}
+
+function makeFakeChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.pid = 4242;
+  return child;
 }
 
 async function fileExists(filePath) {

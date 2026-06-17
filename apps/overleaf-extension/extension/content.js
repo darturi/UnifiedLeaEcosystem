@@ -1,5 +1,6 @@
 (function () {
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
+  const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
@@ -112,11 +113,12 @@
     const status = popover.querySelector(".ol-lean-popover-status");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
     const stubbedWarning = popover.querySelector(".ol-lean-popover-warning");
-    const currentStatus = latestStatuses[theorem.label]?.status || "unknown";
-    const actionStatus = getActionStatus(latestStatuses[theorem.label]);
-    renderLeanStatement(leanStatement, latestStatuses[theorem.label]?.leanStatement || "");
-    renderStubbedTheoremUsesWarning(stubbedWarning, latestStatuses[theorem.label]);
-    renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus);
+    const statusInfo = latestStatuses[theorem.label] || {};
+    const currentStatus = statusInfo.status || "unknown";
+    const actionStatus = getActionStatus(statusInfo);
+    renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
+    renderStubbedTheoremUsesWarning(stubbedWarning, statusInfo);
+    renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus, statusInfo);
     if (currentStatus === "in_progress") {
       status.textContent = inProgressMessage(latestStatuses[theorem.label]);
     } else if (isExtensionContextInvalidated()) {
@@ -128,7 +130,7 @@
     activePopover = popover;
   }
 
-  function renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus = currentStatus) {
+  function renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus = currentStatus, statusInfo = {}) {
     actions.replaceChildren();
     const disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
     const actionSpecs = actionSpecsForStatus(actionStatus);
@@ -161,6 +163,26 @@
         }
       });
       actions.appendChild(button);
+    }
+
+    const leaSession = getLeaSessionLink(statusInfo);
+    if (leaSession) {
+      const sessionButton = document.createElement("button");
+      sessionButton.type = "button";
+      sessionButton.textContent = "Open Lea session";
+      sessionButton.dataset.role = "open-lea-session";
+      sessionButton.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        status.textContent = "Opening Lea session...";
+        try {
+          await openLeaSession(leaSession);
+          status.textContent = "Opened Lea session.";
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : String(error);
+        }
+      });
+      actions.appendChild(sessionButton);
     }
 
     const closeButton = document.createElement("button");
@@ -426,7 +448,7 @@
       }
     }
     if (actions) {
-      renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement, actionStatus);
+      renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement, actionStatus, statusInfo);
     }
 
     if (detail) {
@@ -788,6 +810,56 @@
     return statusInfo?.status || "unknown";
   }
 
+  function getLeaSessionLink(statusInfo) {
+    const sessionUrl = String(statusInfo?.leaSessionUrl || "").trim();
+    const sessionId = String(statusInfo?.leaSessionId || "").trim();
+    if (!sessionUrl && !sessionId) return null;
+    const baseUrl = String(statusInfo?.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL).replace(/\/+$/, "");
+    return {
+      sessionId,
+      baseUrl,
+      url: sessionUrl || buildLeaSessionUrl(baseUrl, sessionId)
+    };
+  }
+
+  function buildLeaSessionUrl(baseUrl, sessionId) {
+    const url = new URL(baseUrl || DEFAULT_LEA_UI_BASE_URL);
+    url.searchParams.set("session", sessionId);
+    return url.toString();
+  }
+
+  function openLeaSession(sessionLink) {
+    if (!sessionLink?.url) {
+      return Promise.reject(new Error("Lea session link is not available yet."));
+    }
+    return new Promise((resolve, reject) => {
+      const fallback = () => {
+        const opened = window.open(sessionLink.url, "_blank", "noopener");
+        if (opened) resolve();
+        else reject(new Error("Browser blocked the Lea session tab."));
+      };
+      if (!globalThis.chrome?.runtime?.sendMessage) {
+        fallback();
+        return;
+      }
+      chrome.runtime.sendMessage({
+        type: "OPEN_LEA_SESSION",
+        url: sessionLink.url,
+        baseUrl: sessionLink.baseUrl
+      }, (response) => {
+        if (chrome.runtime.lastError) {
+          fallback();
+          return;
+        }
+        if (response?.ok) {
+          resolve();
+          return;
+        }
+        reject(new Error(response?.message || "Could not open Lea session."));
+      });
+    });
+  }
+
   function getSettings() {
     if (isExtensionContextInvalidated()) {
       return Promise.reject(new Error("Extension was reloaded. Refresh this Overleaf tab."));
@@ -796,6 +868,7 @@
       companionUrl: DEFAULT_COMPANION_URL,
       leaRepoPath: "",
       leaApiBaseUrl: "http://127.0.0.1:8000",
+      leaUiBaseUrl: DEFAULT_LEA_UI_BASE_URL,
       leaModel: DEFAULT_LEA_MODEL,
       leaMaxTurns: DEFAULT_LEA_MAX_TURNS,
       leaMaxSpendUsd: null,
@@ -817,6 +890,7 @@
         companionUrl: baseUrl,
         leaRepoPath: payload.leaRepoPath || stored.leaRepoPath || "",
         leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
+        leaUiBaseUrl: payload.leaUiBaseUrl || stored.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL,
         leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
         leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
         leaMaxSpendUsd: payload.leaMaxSpendUsd ?? stored.leaMaxSpendUsd ?? null,
@@ -830,6 +904,7 @@
         companionUrl: settings.companionUrl,
         leaRepoPath: settings.leaRepoPath,
         leaApiBaseUrl: settings.leaApiBaseUrl,
+        leaUiBaseUrl: settings.leaUiBaseUrl,
         leaModel: settings.leaModel,
         leaMaxTurns: settings.leaMaxTurns,
         leaMaxSpendUsd: settings.leaMaxSpendUsd,
@@ -1011,6 +1086,7 @@
       companionUrl: baseUrl,
       leaRepoPath: payload.leaRepoPath,
       leaApiBaseUrl: payload.leaApiBaseUrl,
+      leaUiBaseUrl: payload.leaUiBaseUrl || current.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL,
       leaModel: payload.leaModel,
       leaMaxTurns: payload.leaMaxTurns,
       leaMaxSpendUsd: payload.leaMaxSpendUsd,

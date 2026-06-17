@@ -42,6 +42,7 @@ const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
+const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
@@ -53,6 +54,7 @@ const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
 const SHARED_SETTING_ENV_FIELDS = {
   leaRepoPath: "LEA_ROOT",
   leaApiBaseUrl: "LEA_API_BASE_URL",
+  leaUiBaseUrl: "LEA_UI_BASE_URL",
   leaProvider: "LEA_PROVIDER",
   leaModel: "LEA_MODEL",
   leaMaxTurns: "LEA_MAX_TURNS",
@@ -598,6 +600,7 @@ export function buildSettingsResponse(state) {
     leaRepoPath,
     leaWorkspacePath: leaRepoPath ? buildLeaWorkspacePath(leaRepoPath) : "",
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,
     leaProviderFamily: modelInfo.family,
@@ -830,6 +833,7 @@ function sanitizeRuntimeSettings(settings) {
     leaRepoPath: _leaRepoPath,
     leaWorkspacePath: _leaWorkspacePath,
     leaApiBaseUrl: _leaApiBaseUrl,
+    leaUiBaseUrl: _leaUiBaseUrl,
     leaProvider: _leaProvider,
     leaModel: _leaModel,
     leaMaxTurns: _leaMaxTurns,
@@ -1106,6 +1110,7 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaRepoPath: state.settings.leaRepoPath,
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,
     leaProviderFamily: modelInfo.family,
@@ -1966,14 +1971,19 @@ async function cancelLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId }) {
 export function parseRecorderResult(stdout) {
   const lines = String(stdout || "").trim().split(/\r?\n/).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
-    try {
-      const parsed = JSON.parse(lines[i]);
-      if (parsed && typeof parsed === "object" && parsed.session_id) return parsed;
-    } catch {
-      // Ignore non-JSON log lines.
-    }
+    const parsed = parseRecorderJsonLine(lines[i]);
+    if (parsed?.session_id) return parsed;
   }
   return null;
+}
+
+export function parseRecorderJsonLine(line) {
+  try {
+    const parsed = JSON.parse(String(line || ""));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export function buildRecorderArgs({ job, target, apiRunId, prompt }) {
@@ -1988,6 +1998,7 @@ export function buildRecorderArgs({ job, target, apiRunId, prompt }) {
     "--origin", "overleaf",
     "--task", String(prompt || ""),
     "--title", String(target.theoremLabel || job.jobId || "Overleaf formalization"),
+    "--emit-session-link",
     "--external-ref", JSON.stringify(externalRef)
   ];
   if (job.leaModel) args.push("--model", String(job.leaModel));
@@ -2036,8 +2047,21 @@ export async function spawnLeaRecorder({ state, job, target, apiRunId, prompt })
   }
 
   let stdout = "";
+  let stdoutRemainder = "";
   let stderr = "";
-  child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+  child.stdout?.on("data", (chunk) => {
+    const text = String(chunk);
+    stdout += text;
+    stdoutRemainder += text;
+    const lines = stdoutRemainder.split(/\r?\n/);
+    stdoutRemainder = lines.pop() || "";
+    for (const line of lines) {
+      const parsed = parseRecorderJsonLine(line);
+      if (parsed?.session_id) {
+        recordLinkedSession({ state, job, parsed, status: parsed.status }).catch(() => {});
+      }
+    }
+  });
   child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
   child.on("error", async (error) => {
     await appendLog(
@@ -2051,11 +2075,11 @@ export async function spawnLeaRecorder({ state, job, target, apiRunId, prompt })
     }
     const parsed = parseRecorderResult(stdout);
     if (parsed) {
-      job.recorderSessionId = parsed.session_id;
-      job.recorderRunId = parsed.run_id;
+      await recordLinkedSession({ state, job, parsed, status: parsed.status });
+      const recorderStatus = parsed.status || (code === 0 ? "linked" : `exit ${code}`);
       await appendLog(
         job.logPath,
-        `[backend] Shared-state recorder linked session ${parsed.session_id} (status ${parsed.status}).\n`
+        `[backend] Shared-state recorder linked session ${parsed.session_id} (status ${recorderStatus}).\n`
       );
     } else if (code !== 0) {
       await appendLog(job.logPath, `[backend] Shared-state recorder exited with code ${code}.\n`);
@@ -2074,6 +2098,20 @@ export async function spawnLeaRecorder({ state, job, target, apiRunId, prompt })
     // best-effort
   }
   return child;
+}
+
+async function recordLinkedSession({ state, job, parsed, status }) {
+  if (!parsed?.session_id) return;
+  job.recorderSessionId = parsed.session_id;
+  job.recorderRunId = parsed.run_id || job.recorderRunId || null;
+  if (status) {
+    job.recorderStatus = status;
+  }
+  try {
+    await writeJson(state.jobsPath, state.jobs);
+  } catch {
+    // jobs.json write is best-effort here.
+  }
 }
 
 async function tailLeaRunUsageEvents({
@@ -2506,6 +2544,21 @@ function normalizeLeaApiBaseUrl(value) {
   return text;
 }
 
+function normalizeLeaUiBaseUrl(value) {
+  const text = String(value || DEFAULT_LEA_UI_BASE_URL).trim().replace(/\/+$/, "");
+  const parsed = new URL(text);
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Lea UI base URL must be http(s).");
+  }
+  return text;
+}
+
+function buildLeaSessionUrl(baseUrl, sessionId) {
+  const url = new URL(normalizeLeaUiBaseUrl(baseUrl || DEFAULT_LEA_UI_BASE_URL));
+  url.searchParams.set("session", sessionId);
+  return url.toString();
+}
+
 function delay(ms, { ref = true } = {}) {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -2531,6 +2584,7 @@ async function readLogTail(logPath, maxChars = 4000) {
 
 function buildJobResponse({ job, status, target }) {
   const declarationName = job.declarationName || target.declarationName || target.theoremLabel;
+  const leaSessionId = job.recorderSessionId || null;
   const response = {
     status,
     jobId: job.jobId,
@@ -2547,6 +2601,8 @@ function buildJobResponse({ job, status, target }) {
     moduleName: job.moduleName || null,
     logTail: "",
     message: job.error || "",
+    leaSessionId,
+    leaSessionUrl: leaSessionId ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId) : null,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };
@@ -2682,6 +2738,8 @@ async function getTheoremStatus({
     includeStubbedTheoremUses: true
   });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
+  const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
+  const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
 
   const activeJob = findActiveJob(jobs, target.jobKey);
   if (activeJob) {
@@ -2690,41 +2748,45 @@ async function getTheoremStatus({
       projectStatus?.status === "formalized" ||
       directProofStatus?.status === "formalized"
     ) {
-      return mappedStatus?.status === "formalized"
+      return withLeaSession(mappedStatus?.status === "formalized"
         ? mappedStatus
         : projectStatus?.status === "formalized"
           ? projectStatus
-          : directProofStatus;
+          : directProofStatus);
     }
     return buildJobResponse({ job: activeJob, status: "in_progress", target });
   }
 
   if (mappedStatus?.status === "formalized") {
-    return mappedStatus;
+    return withLeaSession(mappedStatus);
   }
 
   if (directProofStatus?.status === "formalized") {
-    return directProofStatus;
+    return withLeaSession(directProofStatus);
   }
 
   if (failedJob) {
-    return buildFailedTheoremStatus({
+    return withLeaSession(buildFailedTheoremStatus({
       failedJob,
       target,
       equivalentStatus: mappedStatus || projectStatus || directProofStatus,
       logTail: await readLogTail(failedJob.logPath)
-    });
+    }));
+  }
+
+  if (projectStatus?.status === "formalized") {
+    return withLeaSession(projectStatus);
   }
 
   if (mappedStatus) {
-    return mappedStatus;
+    return withLeaSession(mappedStatus);
   }
 
   if (projectStatus) {
-    return projectStatus;
+    return withLeaSession(projectStatus);
   }
   if (directProofStatus) {
-    return directProofStatus;
+    return withLeaSession(directProofStatus);
   }
 
   return {
@@ -2935,6 +2997,7 @@ async function getLatestMappedJobStatus({
       moduleName: mappedJob.moduleName || null
     }
   });
+  addLeaSessionLink(status, mappedJob);
   if (!includeStubbedTheoremUses) {
     return status;
   }
@@ -2950,6 +3013,21 @@ async function getLatestMappedJobStatus({
     })
     : [];
   return addStubbedTheoremUses(status, stubbedTheoremUses);
+}
+
+function addLeaSessionLink(status, job) {
+  if (!status || !job?.recorderSessionId) {
+    return status;
+  }
+  status.leaSessionId = job.recorderSessionId;
+  status.leaSessionUrl = buildLeaSessionUrl(job.leaUiBaseUrl, job.recorderSessionId);
+  return status;
+}
+
+function findLatestJobWithLeaSession(jobs, jobKey) {
+  return Object.values(jobs || {})
+    .filter((job) => job.jobKey === jobKey && job.recorderSessionId)
+    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
 }
 
 function findProjectTheoremEntry(markdown, theoremLabel) {

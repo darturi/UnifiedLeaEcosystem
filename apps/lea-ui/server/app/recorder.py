@@ -10,6 +10,9 @@ to persist the full process timeline.
 
 It prints a single JSON object to stdout on completion:
 ``{"session_id": ..., "run_id": ..., "status": ...}``.
+When ``--emit-session-link`` is passed, it also prints an earlier JSON object
+after the UI session is created:
+``{"type": "session_link", "session_id": ..., "run_id": ...}``.
 
 Usage:
     python -m app.recorder --api-run-id run_abc \\
@@ -84,6 +87,7 @@ def run(argv: list[str] | None = None) -> dict:
     parser.add_argument("--project-title", default=None, help="Project title (used only when creating it).")
     parser.add_argument("--project-path", default=None, help="Project markdown path (used only when creating it).")
     parser.add_argument("--external-ref", default=None, help="JSON object of origin-specific identifiers.")
+    parser.add_argument("--emit-session-link", action="store_true", help="Print the session/run ids immediately after creation.")
     args = parser.parse_args(argv)
 
     init_db()
@@ -115,6 +119,14 @@ def run(argv: list[str] | None = None) -> dict:
     )
     if args.task.strip():
         store.add_message(session["id"], "user", args.task.strip(), run_row["id"])
+
+    if args.emit_session_link:
+        sys.stdout.write(json.dumps({
+            "type": "session_link",
+            "session_id": session["id"],
+            "run_id": run_row["id"],
+        }) + "\n")
+        sys.stdout.flush()
 
     context = RunnerContext(
         session_id=session["id"],

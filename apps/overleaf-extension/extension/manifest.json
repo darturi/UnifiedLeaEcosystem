@@ -3,8 +3,11 @@
   "name": "Overleaf Lea Formalizer MVP",
   "version": "0.1.0",
   "description": "Run Lea formalization jobs from labeled Overleaf theorem blocks.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "tabs"],
   "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.overleaf.com/project/*"],

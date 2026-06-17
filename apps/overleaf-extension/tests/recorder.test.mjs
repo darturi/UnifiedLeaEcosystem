@@ -50,6 +50,7 @@ test("buildRecorderArgs encodes run, origin, project, and external ref", () => {
   assert.equal(flag("--origin"), "overleaf");
   assert.equal(flag("--task"), "Prove it");
   assert.equal(flag("--title"), "lemma-1");
+  assert.ok(args.includes("--emit-session-link"));
   assert.equal(flag("--model"), "o4-mini");
   assert.equal(flag("--max-turns"), "20");
   assert.equal(flag("--project-slug"), "myproj");
@@ -121,9 +122,16 @@ test("spawnLeaRecorder spawns the recorder and links the session on close", asyn
   assert.equal(job.recorderPid, 4242);
 
   child.stdout.emit("data", "{\"session_id\":\"sess-9\",\"run_id\":\"run-9\",\"status\":\"success\"}\n");
-  child.emit("close", 0);
 
   let logText = "";
+  for (let i = 0; i < 50 && job.recorderSessionId !== "sess-9"; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(job.recorderSessionId, "sess-9");
+  assert.equal(job.recorderRunId, "run-9");
+
+  child.emit("close", 0);
+
   for (let i = 0; i < 50 && !logText.includes("linked session sess-9"); i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 10));
     logText = await fs.readFile(job.logPath, "utf8");

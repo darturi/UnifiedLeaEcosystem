@@ -1,4 +1,5 @@
 from queue import Queue
+import json
 
 import app.runner as runner
 from app import db, recorder, store
@@ -178,3 +179,56 @@ def test_recorder_cli_creates_linked_overleaf_session(tmp_path, monkeypatch):
     assert project is not None
     assert detail["project"]["slug"] == "myproj"
     assert store.get_run(result["run_id"])["origin"] == "overleaf"
+
+
+def test_recorder_emits_session_link_before_recording_when_requested(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("LEA_API_BASE_URL", "http://127.0.0.1:8000")
+
+    captured = {}
+
+    def fake_record_run(context, api_run_id, **kwargs):
+        captured["stdout_before_record"] = capsys.readouterr().out
+        store.update_run(context.run_id, "success")
+        store.touch_session(context.session_id, "success")
+        return "success"
+
+    monkeypatch.setattr(recorder, "record_run", fake_record_run)
+
+    result = recorder.run([
+        "--api-run-id", "run_cli_link",
+        "--task", "Prove the link",
+        "--title", "linked-lemma",
+        "--origin", "overleaf",
+        "--emit-session-link",
+    ])
+
+    line = json.loads(captured["stdout_before_record"].strip())
+    assert line["type"] == "session_link"
+    assert line["session_id"] == result["session_id"]
+    assert line["run_id"] == result["run_id"]
+
+
+def test_recorder_main_still_prints_final_result_json(tmp_path, monkeypatch, capsys):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("LEA_API_BASE_URL", "http://127.0.0.1:8000")
+
+    def fake_record_run(context, api_run_id, **kwargs):
+        store.update_run(context.run_id, "success")
+        store.touch_session(context.session_id, "success")
+        return "success"
+
+    monkeypatch.setattr(recorder, "record_run", fake_record_run)
+
+    exit_code = recorder.main([
+        "--api-run-id", "run_cli_final",
+        "--task", "Prove final output",
+        "--title", "final-lemma",
+        "--origin", "overleaf",
+    ])
+
+    output = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 0
+    assert output["session_id"]
+    assert output["run_id"]
+    assert output["status"] == "success"
