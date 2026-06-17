@@ -166,6 +166,55 @@ export default function App() {
     };
   }, []);
 
+  // Keep the session list (and any externally-driven, e.g. Overleaf, run that is
+  // currently selected) live without a manual page refresh. Runs the UI itself
+  // starts already stream over SSE, so we skip detail polling while that local
+  // stream is active to avoid fighting it.
+  const polledStatusRef = useRef<{ id: string | null; status: string | null }>({ id: null, status: null });
+  useEffect(() => {
+    const POLL_MS = 4000;
+    let inFlight = false;
+
+    const poll = async () => {
+      if (inFlight || document.hidden) return;
+      inFlight = true;
+      try {
+        const loaded = await refreshSessions();
+        const sessionId = selectedSessionIdRef.current;
+        if (sessionId && !eventSourceRef.current) {
+          const current = loaded.find((session) => session.id === sessionId);
+          if (current) {
+            const previous = polledStatusRef.current;
+            const statusChanged = previous.id === sessionId && previous.status !== current.status;
+            polledStatusRef.current = { id: sessionId, status: current.status };
+            // Reconcile while a run is in progress, and once more when it
+            // transitions to a terminal state, so the detail pane picks up the
+            // final messages and clears the "Lea is working" indicator.
+            if (current.status === 'running' || statusChanged) {
+              await reconcileSession(sessionId);
+            }
+          }
+        } else if (!sessionId) {
+          polledStatusRef.current = { id: null, status: null };
+        }
+      } catch {
+        // Transient fetch failure; the next tick retries.
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const interval = window.setInterval(poll, POLL_MS);
+    const onFocus = () => {
+      void poll();
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, []);
+
   const applySessionDetail = (detail: SessionDetail) => {
     selectedSessionIdRef.current = detail.id;
     setSelectedSessionId(detail.id);

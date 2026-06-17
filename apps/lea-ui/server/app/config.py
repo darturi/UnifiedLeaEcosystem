@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from .env import merged_env, read_dotenv
+from .model_catalog import default_model
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,7 +74,7 @@ def load_config(env_path: Path | None = None, environ: Mapping[str, str] | None 
             raise ValueError("max_spend_usd must be greater than or equal to 0")
 
     return LeaConfig(
-        model=config_data.get("model", "gemini/gemini-3.1-pro-preview"),
+        model=config_data.get("model", default_model()),
         max_turns=int(max_turns) if max_turns is not None else None,
         max_spend_usd=max_spend_usd,
         lea_api_base_url=_normalize_base_url(config_data.get("lea_api_base_url", "http://127.0.0.1:8000")),

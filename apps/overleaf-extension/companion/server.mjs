@@ -5,7 +5,15 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { patchEnvFile, ROOT_ENV_PATH } from "../../../scripts/env.mjs";
+import { patchEnvFile, readDotEnv, ROOT_ENV_PATH } from "../../../scripts/env.mjs";
+import {
+  DEFAULT_LEA_MODEL,
+  LEA_MODEL_BY_VALUE,
+  LEA_MODEL_FAMILIES,
+  LEA_MODEL_FAMILY_BY_ID,
+  LEA_MODEL_OPTIONS,
+  normalizeModelFamilyId
+} from "../../../packages/lea-model-catalog/index.mjs";
 import {
   buildLeaLatexActiveTexPath,
   buildLeaLatexContextManifestPath,
@@ -33,7 +41,6 @@ const ENV_PATH = ROOT_ENV_PATH;
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
-const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8000";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
@@ -53,24 +60,8 @@ const SHARED_SETTING_ENV_FIELDS = {
   leaTheoremTranslationMaxRetries: "LEA_THEOREM_TRANSLATION_MAX_RETRIES",
   leaJobTimeoutSeconds: "LEA_JOB_TIMEOUT_SECONDS"
 };
-const LEA_MODEL_FAMILIES = [
-  { id: "openai", label: "OpenAI", envVars: ["OPENAI_API_KEY"] },
-  { id: "gemini", label: "Gemini", envVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY"] },
-  { id: "anthropic", label: "Anthropic", envVars: ["ANTHROPIC_API_KEY"] }
-];
-export const LEA_MODEL_OPTIONS = [
-  { id: "o4-mini", label: "o4-mini", family: "openai", tag: "Current default" },
-  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", family: "openai", tag: "Fast" },
-  { id: "gpt-5.4", label: "GPT-5.4", family: "openai", tag: "Balanced" },
-  { id: "gpt-5.5", label: "GPT-5.5", family: "openai", tag: "Most capable" },
-  { id: "gemini/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", family: "gemini", tag: "Research" },
-  { id: "gemini/gemini-2.5-pro", label: "Gemini 2.5 Pro", family: "gemini", tag: "Capable" },
-  { id: "gemini/gemini-2.5-flash", label: "Gemini 2.5 Flash", family: "gemini", tag: "Fast" },
-  { id: "anthropic/claude-opus-4-8", label: "Claude Opus 4.8", family: "anthropic", tag: "Most capable" },
-  { id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "anthropic", tag: "Balanced" }
-];
-const LEA_MODEL_BY_ID = new Map(LEA_MODEL_OPTIONS.map((model) => [model.id, model]));
-const LEA_MODEL_FAMILY_BY_ID = new Map(LEA_MODEL_FAMILIES.map((family) => [family.id, family]));
+export { LEA_MODEL_OPTIONS };
+const LEA_MODEL_BY_ID = LEA_MODEL_BY_VALUE;
 const LEGACY_LEA_MODEL_ALIASES = new Map([
   ["anthropic/claude-opus-4-20250514", "anthropic/claude-opus-4-8"],
   ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"]
@@ -598,6 +589,7 @@ async function routeRequest(request, response, state) {
 }
 
 export function buildSettingsResponse(state) {
+  refreshSettingsFromEnv(state);
   const leaRepoPath = state.settings.leaRepoPath || "";
   const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL);
   const modelInfo = LEA_MODEL_BY_ID.get(model) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
@@ -610,7 +602,7 @@ export function buildSettingsResponse(state) {
     leaProvider: modelInfo.family,
     leaProviderFamily: modelInfo.family,
     leaProviderKeys: buildProviderKeyStatus(state),
-    leaModel: modelInfo.id,
+    leaModel: modelInfo.value,
     leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
@@ -633,6 +625,7 @@ function buildProviderKeyStatus(state) {
 }
 
 function getProviderApiKey(state, familyId) {
+  familyId = normalizeProviderFamilyId(familyId);
   const family = LEA_MODEL_FAMILY_BY_ID.get(familyId);
   for (const envVar of family?.envVars || []) {
     const value = String(state.env?.[envVar] || "").trim();
@@ -649,6 +642,7 @@ async function validateProviderApiKeys({ fetchImpl, providerEnvPatch, selectedFa
     requests.set(`${family.id}:${apiKey}`, { familyId: family.id, apiKey });
   }
 
+  selectedFamilyId = normalizeProviderFamilyId(selectedFamilyId);
   const selectedApiKey = getProviderApiKey(state, selectedFamilyId);
   if (selectedApiKey) {
     requests.set(`${selectedFamilyId}:${selectedApiKey}`, {
@@ -665,6 +659,7 @@ async function validateProviderApiKeys({ fetchImpl, providerEnvPatch, selectedFa
 }
 
 async function validateProviderApiKey(fetchImpl, { familyId, apiKey }) {
+  familyId = normalizeProviderFamilyId(familyId);
   const family = LEA_MODEL_FAMILY_BY_ID.get(familyId);
   const label = family?.label || familyId;
   const controller = new AbortController();
@@ -703,8 +698,9 @@ async function validateProviderApiKey(fetchImpl, { familyId, apiKey }) {
 }
 
 function providerValidationUrl(familyId, apiKey) {
+  familyId = normalizeProviderFamilyId(familyId);
   if (familyId === "openai") return "https://api.openai.com/v1/models";
-  if (familyId === "gemini") {
+  if (familyId === "google") {
     return `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
   }
   if (familyId === "anthropic") return "https://api.anthropic.com/v1/models";
@@ -712,6 +708,7 @@ function providerValidationUrl(familyId, apiKey) {
 }
 
 function providerValidationHeaders(familyId, apiKey) {
+  familyId = normalizeProviderFamilyId(familyId);
   if (familyId === "openai") {
     return { Authorization: `Bearer ${apiKey}` };
   }
@@ -725,6 +722,7 @@ function providerValidationHeaders(familyId, apiKey) {
 }
 
 function providerKeyVerificationError(familyId, label) {
+  familyId = normalizeProviderFamilyId(familyId);
   return {
     ok: false,
     error: `${familyId}_key_verification_failed`,
@@ -737,9 +735,10 @@ function buildProviderEnvPatch(patchKeys) {
   if (!patchKeys || typeof patchKeys !== "object" || Array.isArray(patchKeys)) {
     return patch;
   }
-  for (const family of LEA_MODEL_FAMILIES) {
-    if (!Object.prototype.hasOwnProperty.call(patchKeys, family.id)) continue;
-    const value = String(patchKeys[family.id] || "").trim();
+  for (const [rawFamilyId, rawValue] of Object.entries(patchKeys)) {
+    const family = LEA_MODEL_FAMILY_BY_ID.get(normalizeProviderFamilyId(rawFamilyId));
+    if (!family) continue;
+    const value = String(rawValue || "").trim();
     if (!value) continue;
     const envVar = family.envVars[0];
     patch[envVar] = value;
@@ -755,7 +754,8 @@ function buildLegacyProviderEnvPatch(state) {
   }
   for (const family of LEA_MODEL_FAMILIES) {
     if (getProviderApiKey(state, family.id)) continue;
-    const value = String(patchKeys[family.id] || "").trim();
+    const rawValue = patchKeys[family.id] ?? patchKeys[family.aliases?.[0]];
+    const value = String(rawValue || "").trim();
     if (value) {
       patch[family.envVars[0]] = value;
     }
@@ -773,7 +773,7 @@ function buildSharedSettingsEnvPatch(settings) {
     if (!Object.prototype.hasOwnProperty.call(settings || {}, settingKey)) continue;
     const value = settings[settingKey];
     if (value === undefined) continue;
-    patch[envKey] = settingKey === "leaModel" ? normalizeLeaModelId(value) : value;
+    patch[envKey] = normalizeSharedSettingValue(settingKey, value);
   }
   return patch;
 }
@@ -785,9 +785,15 @@ function buildLegacySharedSettingsEnvPatch(settings, env) {
     if (env?.[envKey] !== undefined && String(env[envKey]).trim() !== "") continue;
     const value = settings[settingKey];
     if (value === undefined || value === "") continue;
-    patch[envKey] = settingKey === "leaModel" ? normalizeLeaModelId(value) : value;
+    patch[envKey] = normalizeSharedSettingValue(settingKey, value);
   }
   return patch;
+}
+
+function normalizeSharedSettingValue(settingKey, value) {
+  if (settingKey === "leaModel") return normalizeLeaModelId(value);
+  if (settingKey === "leaProvider") return normalizeProviderFamilyId(value);
+  return value;
 }
 
 function applyEnvPatchToState(env, patch) {
@@ -803,6 +809,18 @@ function applyEnvPatchToState(env, patch) {
 function normalizeLeaModelId(modelId) {
   const raw = String(modelId || DEFAULT_LEA_MODEL);
   return LEGACY_LEA_MODEL_ALIASES.get(raw) || raw;
+}
+
+function normalizeProviderFamilyId(familyId) {
+  return normalizeModelFamilyId(familyId);
+}
+
+function refreshSettingsFromEnv(state) {
+  if (!state) return;
+  const env = { ...(state.env || {}) };
+  Object.assign(env, readDotEnv(state.envPath || ENV_PATH));
+  state.env = env;
+  state.settings = applyEnvDefaults(state.settings || {}, env);
 }
 
 function sanitizeRuntimeSettings(settings) {
@@ -1091,7 +1109,7 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,
     leaProviderFamily: modelInfo.family,
-    leaModel: modelInfo.id,
+    leaModel: modelInfo.value,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
     leaCurrentTurn: null,
@@ -1208,6 +1226,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     onRunStarted: async (apiRunId) => {
       job.apiRunId = apiRunId;
       await writeJson(state.jobsPath, state.jobs);
+      await spawnLeaRecorder({ state, job, target, apiRunId, prompt });
     },
     onUsageUpdated: async (usage) => {
       return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "formalization" });
@@ -1390,6 +1409,7 @@ async function createStubJob({ state, job, target, theoremText, theoremContext =
     onRunStarted: async (apiRunId) => {
       job.apiRunId = apiRunId;
       await writeJson(state.jobsPath, state.jobs);
+      await spawnLeaRecorder({ state, job, target, apiRunId, prompt });
     },
     onUsageUpdated: async (usage) => {
       return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "stub" });
@@ -1941,6 +1961,119 @@ async function cancelLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId }) {
     if (!/HTTP 404|HTTP 405/.test(result.error || "")) break;
   }
   return { ok: false, error: lastError || "Lea API cancellation endpoint is unavailable." };
+}
+
+export function parseRecorderResult(stdout) {
+  const lines = String(stdout || "").trim().split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    try {
+      const parsed = JSON.parse(lines[i]);
+      if (parsed && typeof parsed === "object" && parsed.session_id) return parsed;
+    } catch {
+      // Ignore non-JSON log lines.
+    }
+  }
+  return null;
+}
+
+export function buildRecorderArgs({ job, target, apiRunId, prompt }) {
+  const externalRef = {
+    overleaf_project_id: target.overleafProjectId || null,
+    theorem_label: target.theoremLabel || null,
+    companion_job_id: job.jobId || null
+  };
+  const args = [
+    "-m", "app.recorder",
+    "--api-run-id", String(apiRunId),
+    "--origin", "overleaf",
+    "--task", String(prompt || ""),
+    "--title", String(target.theoremLabel || job.jobId || "Overleaf formalization"),
+    "--external-ref", JSON.stringify(externalRef)
+  ];
+  if (job.leaModel) args.push("--model", String(job.leaModel));
+  if (job.leaMaxTurns) args.push("--max-turns", String(job.leaMaxTurns));
+  if (target.projectSlug) {
+    args.push("--project-slug", String(target.projectSlug));
+    args.push("--project-title", String(target.projectSlug));
+    if (target.relativePath) args.push("--project-path", String(target.relativePath));
+  }
+  return args;
+}
+
+// Spawns the shared-state recorder (the Lea UI server's `app.recorder` module),
+// which attaches to the already-started API run as an additional event-stream
+// subscriber and persists the full process timeline into the shared database so
+// the formalization is visible in the UI exactly like a UI-originated run. This
+// is best-effort and never blocks or fails the companion's own job.
+export async function spawnLeaRecorder({ state, job, target, apiRunId, prompt }) {
+  if (!state?.settings?.leaSharedState || !apiRunId) return null;
+  if (job.recorderSpawned) return null;
+  job.recorderSpawned = true;
+
+  const python = state.settings.leaRecorderPython;
+  const serverDir = state.settings.leaUiServerDir;
+  if (!python || !serverDir) return null;
+
+  const spawnImpl = state.spawnImpl || spawn;
+  const args = buildRecorderArgs({ job, target, apiRunId, prompt });
+
+  let child;
+  try {
+    child = spawnImpl(python, args, {
+      cwd: serverDir,
+      env: {
+        ...process.env,
+        PYTHONPATH: [job.leaRepoPath, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  } catch (error) {
+    await appendLog(
+      job.logPath,
+      `[backend] Failed to start shared-state recorder: ${error instanceof Error ? error.message : String(error)}\n`
+    );
+    return null;
+  }
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+  child.on("error", async (error) => {
+    await appendLog(
+      job.logPath,
+      `[backend] Shared-state recorder error: ${error instanceof Error ? error.message : String(error)}\n`
+    );
+  });
+  child.on("close", async (code) => {
+    if (stderr.trim()) {
+      await appendLog(job.logPath, `[recorder] ${stderr.trim()}\n`);
+    }
+    const parsed = parseRecorderResult(stdout);
+    if (parsed) {
+      job.recorderSessionId = parsed.session_id;
+      job.recorderRunId = parsed.run_id;
+      await appendLog(
+        job.logPath,
+        `[backend] Shared-state recorder linked session ${parsed.session_id} (status ${parsed.status}).\n`
+      );
+    } else if (code !== 0) {
+      await appendLog(job.logPath, `[backend] Shared-state recorder exited with code ${code}.\n`);
+    }
+    try {
+      await writeJson(state.jobsPath, state.jobs);
+    } catch {
+      // jobs.json write is best-effort here.
+    }
+  });
+
+  job.recorderPid = child.pid || null;
+  try {
+    await writeJson(state.jobsPath, state.jobs);
+  } catch {
+    // best-effort
+  }
+  return child;
 }
 
 async function tailLeaRunUsageEvents({

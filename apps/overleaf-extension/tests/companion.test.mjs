@@ -77,7 +77,7 @@ test("settings response includes model families and key status", async () => {
   const response = buildSettingsResponse(state);
 
   assert.deepEqual(response.leaModelOptions, LEA_MODEL_OPTIONS);
-  assert.deepEqual(response.leaModelOptions.map((model) => model.id), [
+  assert.deepEqual(response.leaModelOptions.map((model) => model.value), [
     "o4-mini",
     "gpt-5.4-mini",
     "gpt-5.4",
@@ -88,15 +88,34 @@ test("settings response includes model families and key status", async () => {
     "anthropic/claude-opus-4-8",
     "anthropic/claude-sonnet-4-6"
   ]);
-  assert.equal(response.leaModelOptions.find((model) => model.id === "o4-mini").family, "openai");
-  assert.equal(response.leaModelOptions.find((model) => model.id === "gemini/gemini-2.5-pro").family, "gemini");
+  assert.equal(response.leaModelOptions.find((model) => model.value === "o4-mini").family, "openai");
+  assert.equal(response.leaModelOptions.find((model) => model.value === "gemini/gemini-2.5-pro").family, "google");
   assert.equal(response.leaProviderKeys.openai.configured, true);
-  assert.equal(response.leaProviderKeys.gemini.configured, false);
+  assert.equal(response.leaProviderKeys.google.configured, false);
   assert.equal(response.leaProviderKeys.anthropic.configured, true);
   assert.equal(response.leaTheoremTranslationMaxRetries, 3);
   assert.equal(response.leaLatexContextMode, "off");
   assert.equal(response.leaMaxSpendUsd, 0.5);
   assert.equal(response.leaCurrentSpendUsd, 0.125);
+});
+
+test("settings response reloads model selection from env file", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaModel: "o4-mini",
+    env: { OPENAI_API_KEY: "openai-key", ANTHROPIC_API_KEY: "anthropic-key" }
+  });
+  await fs.writeFile(
+    state.envPath,
+    "LEA_MODEL=anthropic/claude-sonnet-4-6\nANTHROPIC_API_KEY=anthropic-key\n",
+    "utf8"
+  );
+
+  const response = buildSettingsResponse(state);
+
+  assert.equal(response.leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal(response.leaProvider, "anthropic");
 });
 
 test("settings reject unsupported models and missing family keys", async () => {
@@ -119,7 +138,7 @@ test("settings reject unsupported models and missing family keys", async () => {
   assert.equal(badModel.statusCode, 400);
   assert.equal(badModel.body.error, "invalid_lea_model");
   assert.equal(missingGeminiKey.statusCode, 400);
-  assert.equal(missingGeminiKey.body.error, "missing_gemini_key");
+  assert.equal(missingGeminiKey.body.error, "missing_google_key");
 });
 
 test("settings save supported models when their family key is configured", async () => {
@@ -156,7 +175,7 @@ test("settings save supported models when their family key is configured", async
   assert.equal(openAiResult.body.leaTheoremTranslationMaxRetries, 8);
   assert.equal(openAiResult.body.leaLatexContextMode, "active_file");
   assert.equal(geminiResult.statusCode, 200);
-  assert.equal(geminiResult.body.leaProvider, "gemini");
+  assert.equal(geminiResult.body.leaProvider, "google");
   assert.equal(geminiResult.body.leaModel, "gemini/gemini-2.5-flash");
   assert.equal(anthropicResult.statusCode, 200);
   assert.equal(anthropicResult.body.leaProvider, "anthropic");
@@ -370,7 +389,7 @@ test("settings reject invalid submitted Gemini keys before persistence", async (
   const state = await makeState({
     leaRepoPath: leaRepo,
     env: { OPENAI_API_KEY: "openai-key" },
-    fetchImpl: makeProviderValidationFetch(calls, { gemini: 401 })
+    fetchImpl: makeProviderValidationFetch(calls, { google: 401 })
   });
 
   const result = await handleUpdateLeaSettings({
@@ -382,11 +401,11 @@ test("settings reject invalid submitted Gemini keys before persistence", async (
   }, state);
 
   assert.equal(result.statusCode, 400);
-  assert.equal(result.body.error, "invalid_gemini_key");
-  assert.match(result.body.message, /Gemini API key was rejected/);
+  assert.equal(result.body.error, "invalid_google_key");
+  assert.match(result.body.message, /Google AI API key was rejected/);
   assert.equal(state.env.GEMINI_API_KEY, undefined);
   assert.equal(await fileExists(state.envPath), false);
-  assert.deepEqual(calls.map((call) => call.family), ["gemini"]);
+  assert.deepEqual(calls.map((call) => call.family), ["google"]);
 });
 
 test("settings reject invalid existing key for selected provider family", async () => {
@@ -395,7 +414,7 @@ test("settings reject invalid existing key for selected provider family", async 
   const state = await makeState({
     leaRepoPath: leaRepo,
     env: { GEMINI_API_KEY: "bad-gemini-key" },
-    fetchImpl: makeProviderValidationFetch(calls, { gemini: 403 })
+    fetchImpl: makeProviderValidationFetch(calls, { google: 403 })
   });
 
   const result = await handleUpdateLeaSettings({
@@ -406,9 +425,9 @@ test("settings reject invalid existing key for selected provider family", async 
   }, state);
 
   assert.equal(result.statusCode, 400);
-  assert.equal(result.body.error, "invalid_gemini_key");
+  assert.equal(result.body.error, "invalid_google_key");
   assert.equal(state.settings.leaModel, "o4-mini");
-  assert.deepEqual(calls.map((call) => call.family), ["gemini"]);
+  assert.deepEqual(calls.map((call) => call.family), ["google"]);
 });
 
 test("settings validate newly entered non-selected provider keys", async () => {
@@ -452,9 +471,9 @@ test("settings save valid submitted keys after provider verification", async () 
   }, state);
 
   assert.equal(result.statusCode, 200);
-  assert.equal(result.body.leaProviderKeys.gemini.configured, true);
+  assert.equal(result.body.leaProviderKeys.google.configured, true);
   assert.equal(state.env.GEMINI_API_KEY, "valid-gemini-key");
-  assert.deepEqual(calls.map((call) => call.family), ["gemini"]);
+  assert.deepEqual(calls.map((call) => call.family), ["google"]);
 
   const envFile = await fs.readFile(state.envPath, "utf8");
   assert.match(envFile, /GEMINI_API_KEY=valid-gemini-key/);
@@ -2464,7 +2483,7 @@ function makeProviderValidationFetch(calls, statuses = {}) {
 function inferProviderValidationFamily(url) {
   const text = String(url);
   if (text.startsWith("https://api.openai.com/")) return "openai";
-  if (text.startsWith("https://generativelanguage.googleapis.com/")) return "gemini";
+  if (text.startsWith("https://generativelanguage.googleapis.com/")) return "google";
   if (text.startsWith("https://api.anthropic.com/")) return "anthropic";
   return "";
 }

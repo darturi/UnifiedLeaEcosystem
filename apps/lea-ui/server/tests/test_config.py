@@ -12,7 +12,7 @@ def test_load_config_defaults_to_local_lea_api(tmp_path):
     config = load_config(env_path=env_path, environ={})
 
     assert config.lea_api_base_url == "http://127.0.0.1:8000"
-    assert config.model == "gemini/gemini-3.1-pro-preview"
+    assert config.model == "o4-mini"
     assert config.max_turns is None
     assert config.max_spend_usd is None
     assert config.lea_api_key is None

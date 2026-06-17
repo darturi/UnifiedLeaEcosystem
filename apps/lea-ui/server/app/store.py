@@ -6,23 +6,40 @@ from uuid import uuid4
 
 from typing import Any
 
-from .db import ROOT, connect, row_to_dict, utc_now
+from .db import connect, event_log_dir, row_to_dict, utc_now
 
 
-RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+RAW_EVENT_LOG_DIR = event_log_dir()
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 
 
-def create_session(title: str, project_id: str | None = None) -> dict:
+def create_session(
+    title: str,
+    project_id: str | None = None,
+    origin: str = "ui",
+    external_ref: dict[str, Any] | None = None,
+) -> dict:
     now = utc_now()
     session_id = str(uuid4())
     with connect() as conn:
         conn.execute(
-            "insert into sessions (id, project_id, title, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?)",
-            (session_id, project_id, title[:120] or "Untitled theorem", "running", now, now),
+            """
+            insert into sessions (id, project_id, title, status, origin, external_ref, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                project_id,
+                title[:120] or "Untitled theorem",
+                "running",
+                origin or "ui",
+                json.dumps(external_ref) if external_ref else None,
+                now,
+                now,
+            ),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
-    return row_to_dict(row)
+    return _normalize_session(row_to_dict(row))
 
 
 def touch_session(session_id: str, status: str | None = None) -> None:
@@ -40,7 +57,20 @@ def touch_session(session_id: str, status: str | None = None) -> None:
 def get_session(session_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
-    return row_to_dict(row) if row else None
+    return _normalize_session(row_to_dict(row)) if row else None
+
+
+def _normalize_session(row: dict) -> dict:
+    row["origin"] = row.get("origin") or "ui"
+    raw_ref = row.get("external_ref")
+    if isinstance(raw_ref, str) and raw_ref:
+        try:
+            row["external_ref"] = json.loads(raw_ref)
+        except json.JSONDecodeError:
+            row["external_ref"] = None
+    elif not isinstance(raw_ref, dict):
+        row["external_ref"] = None
+    return row
 
 
 def list_sessions() -> list[dict]:
@@ -91,16 +121,17 @@ def create_run(
     provider: str | None,
     max_turns: int | None,
     project_id: str | None = None,
+    origin: str = "ui",
 ) -> dict:
     now = utc_now()
     run_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into runs (id, session_id, project_id, status, model, provider, max_turns, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into runs (id, session_id, project_id, status, origin, model, provider, max_turns, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, session_id, project_id, "pending", model, provider, max_turns, now, now),
+            (run_id, session_id, project_id, "pending", origin or "ui", model, provider, max_turns, now, now),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
     return row_to_dict(row)
@@ -116,6 +147,25 @@ def get_project(project_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(row) if row else None
+
+
+def get_project_by_slug(slug: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select * from projects where slug = ?", (slug,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def find_or_create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+    """Return the project for ``slug``, creating it if absent.
+
+    Used by externally-originated runs (e.g. the Overleaf extension) so a
+    formalization is attributed to the same project the UI would use.
+    """
+    slug = validate_project_slug(slug)
+    existing = get_project_by_slug(slug)
+    if existing:
+        return existing
+    return create_project(slug=slug, title=title, path=path)
 
 
 def create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
@@ -611,6 +661,8 @@ def _normalize_usage_session(row: dict) -> dict:
     row["cost_usd"] = float(row.get("cost_usd") or 0)
     row["started_at"] = row.get("started_at")
     row["ended_at"] = row.get("ended_at")
+    if "origin" in row or "external_ref" in row:
+        _normalize_session(row)
     return row
 
 

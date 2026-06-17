@@ -1,0 +1,77 @@
+{
+  "default_model": "o4-mini",
+  "families": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "env_vars": ["OPENAI_API_KEY"]
+    },
+    {
+      "id": "google",
+      "label": "Google AI",
+      "env_vars": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+      "aliases": ["gemini"]
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "env_vars": ["ANTHROPIC_API_KEY"]
+    }
+  ],
+  "models": [
+    {
+      "value": "o4-mini",
+      "label": "o4-mini",
+      "family": "openai",
+      "tag": "Current default"
+    },
+    {
+      "value": "gpt-5.4-mini",
+      "label": "GPT-5.4 Mini",
+      "family": "openai",
+      "tag": "Fast"
+    },
+    {
+      "value": "gpt-5.4",
+      "label": "GPT-5.4",
+      "family": "openai",
+      "tag": "Balanced"
+    },
+    {
+      "value": "gpt-5.5",
+      "label": "GPT-5.5",
+      "family": "openai",
+      "tag": "Most capable"
+    },
+    {
+      "value": "gemini/gemini-3.1-pro-preview",
+      "label": "Gemini 3.1 Pro Preview",
+      "family": "google",
+      "tag": "Research"
+    },
+    {
+      "value": "gemini/gemini-2.5-pro",
+      "label": "Gemini 2.5 Pro",
+      "family": "google",
+      "tag": "Capable"
+    },
+    {
+      "value": "gemini/gemini-2.5-flash",
+      "label": "Gemini 2.5 Flash",
+      "family": "google",
+      "tag": "Fast"
+    },
+    {
+      "value": "anthropic/claude-opus-4-8",
+      "label": "Claude Opus 4.8",
+      "family": "anthropic",
+      "tag": "Most capable"
+    },
+    {
+      "value": "anthropic/claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6",
+      "family": "anthropic",
+      "tag": "Balanced"
+    }
+  ]
+}

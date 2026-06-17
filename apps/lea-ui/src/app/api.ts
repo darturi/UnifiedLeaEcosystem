@@ -31,6 +31,8 @@ export interface SessionSummary {
   project_path?: string | null;
   title: string;
   status: SessionStatus;
+  origin?: string | null;
+  external_ref?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
   input_tokens: number;
@@ -236,8 +238,10 @@ export interface UsageStats {
 
 export interface ModelOption {
   value: string;
+  id?: string;
   label: string;
   family: 'openai' | 'anthropic' | 'google' | string;
+  tag?: string;
 }
 
 export interface ApiKeyStatus {

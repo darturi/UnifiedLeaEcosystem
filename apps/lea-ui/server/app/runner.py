@@ -13,13 +13,14 @@ from typing import Any
 
 from . import settings as settings_service
 from . import store
-from .config import ROOT, LeaConfig
+from .config import LeaConfig
+from .db import event_log_dir
 from .lea_api_client import LeaApiClient, LeaApiError
 from .project_usage import detect_used_project_formalizations
 
 
 active_run_lock = Lock()
-RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+RAW_EVENT_LOG_DIR = event_log_dir()
 WRITE_TOOL_NAMES = {"write_file", "edit_file"}
 PATH_KEYS = ("path", "file", "file_path", "relative_path", "filename", "name")
 CODE_KEYS = ("code", "content", "source", "text")
@@ -962,6 +963,305 @@ def _start_api_run(client: LeaApiClient, task: str, project: dict[str, Any] | No
 
 def _is_timeout(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError | socket.timeout) or "timed out" in str(exc).lower()
+
+
+def record_run(context: RunnerContext, api_run_id: str, *, from_seq: int = 0) -> str:
+    """Record an already-started Lea API run into the shared store.
+
+    Unlike :func:`run_lea`, this is an *observer*: the run is started and driven
+    elsewhere (the Overleaf companion owns the lifecycle, theorem-translation
+    approvals, and spend enforcement). This function attaches as an additional
+    event-stream subscriber and persists the same rich process state the UI
+    records — messages, code steps, status events, approvals, usage breakdown,
+    and the raw event log — so the run is indistinguishable from a UI run when
+    viewed in the UI. It does not acquire the global run lock, start the run,
+    resolve approvals, or cancel on spend.
+
+    Returns the terminal status.
+    """
+    client = context.client or LeaApiClient(context.config)
+    assistant_chunks: list[str] = []
+    assistant_turn_chunks: list[str] = []
+    persisted_assistant_texts: list[str] = []
+    final_text: str | None = None
+    last_seq = from_seq - 1
+    emitted_files: set[tuple[str, int, int]] = set()
+    emitted_payloads: set[tuple[str, str]] = set()
+    terminal_status: str | None = None
+    terminal_error: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | None = None
+    code_step_emitted = False
+    terminal_run_status: dict[str, Any] | None = None
+    terminal_transcript: Any = None
+    transcript_url: str | None = None
+    tool_tracker = ToolTracker()
+    usage_breakdown = UsageBreakdownCollector()
+
+    try:
+        store.set_run_api_run_id(context.run_id, api_run_id)
+        store.update_run(context.run_id, "running")
+        store.touch_session(context.session_id, "running")
+        log_status(
+            context,
+            f"Recording Lea API run {api_run_id} from {context.config.lea_api_base_url}",
+            status="recording",
+            api_run_id=api_run_id,
+        )
+
+        started = time.monotonic()
+        attempts = 0
+        while terminal_status is None and attempts < 2:
+            attempts += 1
+            timeout = max(1.0, context.config.lea_job_timeout_seconds - (time.monotonic() - started))
+            for frame in client.stream_events(api_run_id, from_seq=last_seq + 1, timeout=timeout):
+                _log_api_frame(context, api_run_id, frame)
+                seq = _seq(frame)
+                if seq is not None:
+                    last_seq = max(last_seq, seq)
+
+                frame_type = _event_type(frame)
+                if frame_type == "approval_requested":
+                    usage_breakdown.notice_approval(frame)
+                    _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+                    payload = _approval_payload(frame, frame_type)
+                    store.set_run_pending_approval(context.run_id, payload)
+                    emit(context.events, "approval_requested", payload)
+                    candidate = payload.get("candidate")
+                    candidate_suffix = f" candidate {candidate}" if candidate is not None else ""
+                    log_status(
+                        context,
+                        f"Theorem translation approval requested{candidate_suffix}.",
+                        status="approval_requested",
+                    )
+                    continue
+                if frame_type == "approval_resolved":
+                    payload = _approval_payload(frame, frame_type)
+                    store.set_run_pending_approval(context.run_id, None)
+                    emit(context.events, "approval_resolved", payload)
+                    decision = payload.get("decision") or "resolved"
+                    log_status(context, f"Theorem translation {decision}.", status="approval_resolved")
+                    continue
+
+                if frame_type == "turn_started":
+                    usage_breakdown.notice_turn(frame)
+                    _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+
+                delta = _text_delta(frame)
+                if delta:
+                    assistant_chunks.append(delta)
+                    assistant_turn_chunks.append(delta)
+                    emit(context.events, "assistant_delta", {"text": delta})
+
+                if frame_type in {"tool_call", "tool_called"}:
+                    _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+
+                frame_steps = _emit_code_payload(
+                    context=context,
+                    frame=frame,
+                    emitted=emitted_files,
+                    emitted_payloads=emitted_payloads,
+                )
+                if frame_steps:
+                    code_step_emitted = True
+
+                tracked_steps = _track_tool_frame(
+                    context=context,
+                    api_run_id=api_run_id,
+                    frame=frame,
+                    tracker=tool_tracker,
+                    emitted=emitted_files,
+                    emitted_payloads=emitted_payloads,
+                )
+                if tracked_steps:
+                    frame_steps.extend(tracked_steps)
+                    code_step_emitted = True
+
+                message = _status_message(frame)
+                if message:
+                    status_payload: dict[str, Any] = {"status": _event_type(frame) or "status"}
+                    if frame_steps:
+                        status_payload["step_number"] = frame_steps[-1]["step_number"]
+                    log_status(context, message, **status_payload)
+
+                frame_input_tokens, frame_output_tokens = _usage(frame)
+                frame_cost_usd = _cost(frame)
+                if frame_type == "usage_updated":
+                    usage_breakdown.add_usage(frame_input_tokens, frame_output_tokens, frame_cost_usd)
+                    if frame_input_tokens is not None:
+                        input_tokens = (input_tokens or 0) + frame_input_tokens
+                    if frame_output_tokens is not None:
+                        output_tokens = (output_tokens or 0) + frame_output_tokens
+                    if frame_cost_usd is not None:
+                        cost_usd = (cost_usd or 0.0) + frame_cost_usd
+                    store.update_run(
+                        context.run_id,
+                        "running",
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cost_usd=cost_usd,
+                    )
+                    store.replace_run_usage_breakdown(
+                        context.run_id,
+                        usage_breakdown.final_rows(input_tokens, output_tokens, cost_usd),
+                    )
+                    emit(
+                        context.events,
+                        "usage_updated",
+                        {
+                            "run_id": context.run_id,
+                            "session_id": context.session_id,
+                            "input_tokens": input_tokens or 0,
+                            "output_tokens": output_tokens or 0,
+                            "total_tokens": int(input_tokens or 0) + int(output_tokens or 0),
+                            "cost_usd": cost_usd or 0.0,
+                            "delta_input_tokens": frame_input_tokens or 0,
+                            "delta_output_tokens": frame_output_tokens or 0,
+                            "delta_cost_usd": frame_cost_usd or 0.0,
+                        },
+                    )
+                else:
+                    input_tokens = _merge_usage_total(input_tokens, frame_input_tokens)
+                    output_tokens = _merge_usage_total(output_tokens, frame_output_tokens)
+                    cost_usd = _merge_cost_total(cost_usd, frame_cost_usd)
+
+                if terminal_status is None:
+                    terminal_status = _terminal_status(frame)
+                if terminal_status is not None:
+                    final_text = _final_text(frame) or final_text
+                    transcript_url = _first_string(frame, "transcript_url") or transcript_url
+                    if terminal_status == "failed" and _event_type(frame) == "error":
+                        terminal_error = final_text or "Lea API reported an error."
+                    break
+
+            if terminal_status is None:
+                terminal_run_status = client.get_run(api_run_id)
+                _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
+                terminal_status = _api_run_terminal_status(terminal_run_status)
+                status_input_tokens, status_output_tokens = _usage(terminal_run_status)
+                input_tokens = _merge_usage_total(input_tokens, status_input_tokens)
+                output_tokens = _merge_usage_total(output_tokens, status_output_tokens)
+                status_cost_usd = _cost(terminal_run_status)
+                cost_usd = _merge_cost_total(cost_usd, status_cost_usd)
+                final_text = _final_text(terminal_run_status) or final_text
+                transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
+                if terminal_status is None:
+                    log_status(context, f"Resuming Lea API stream from seq {last_seq + 1}.", status="stream_resume")
+
+        if terminal_status is None:
+            terminal_status = "failed"
+            final_text = final_text or "Lea API stream ended before a terminal event."
+
+        final_text = final_text or "".join(assistant_chunks).strip()
+        try:
+            terminal_run_status = client.get_run(api_run_id)
+            _log_api_frame(context, api_run_id, {"type": "run_status", **terminal_run_status})
+            status_input_tokens, status_output_tokens = _usage(terminal_run_status)
+            input_tokens = _merge_usage_total(input_tokens, status_input_tokens)
+            output_tokens = _merge_usage_total(output_tokens, status_output_tokens)
+            status_cost_usd = _cost(terminal_run_status)
+            cost_usd = _merge_cost_total(cost_usd, status_cost_usd)
+            transcript_url = _first_string(terminal_run_status, "transcript_url") or transcript_url
+        except Exception as status_exc:
+            log_status(
+                context,
+                f"Could not fetch final Lea API run status: {status_exc}",
+                status="status_fetch_failed",
+            )
+
+        try:
+            terminal_transcript = client.get_transcript(api_run_id, transcript_url=transcript_url)
+            _log_api_frame(context, api_run_id, {"type": "transcript", "transcript": terminal_transcript})
+        except Exception as transcript_exc:
+            log_status(
+                context,
+                f"Could not fetch final Lea API transcript: {transcript_exc}",
+                status="transcript_fetch_failed",
+            )
+
+        if _reconcile_terminal_artifacts(
+            context=context,
+            run_status=terminal_run_status,
+            transcript=terminal_transcript,
+            final_text=final_text,
+            emitted=emitted_files,
+            emitted_payloads=emitted_payloads,
+        ):
+            code_step_emitted = True
+
+        if terminal_status == "success" and not code_step_emitted:
+            _emit_terminal_no_code_step(context, api_run_id)
+            terminal_status = "failed"
+            terminal_error = (
+                "Lea API reported completion, but no readable Lean file or code artifact was exposed, "
+                "so the proof could not be verified."
+            )
+            log_status(context, terminal_error, status="missing_lean_artifact", api_run_id=api_run_id)
+        elif terminal_status == "max_turns" and not code_step_emitted:
+            _emit_terminal_no_code_step(context, api_run_id)
+
+        terminal_status, tool_check_failure = _terminal_status_after_tool_checks(terminal_status, tool_tracker)
+        if tool_check_failure:
+            terminal_error = tool_check_failure
+            log_status(context, tool_check_failure, status="lean_check_failed", api_run_id=api_run_id)
+
+        _flush_assistant_turn(context, assistant_turn_chunks, persisted_assistant_texts)
+        assistant_text = "".join(assistant_chunks).strip()
+        if not persisted_assistant_texts and not assistant_text and terminal_transcript is not None:
+            transcript_assistant_text = _assistant_text_from_transcript(terminal_transcript)
+            if transcript_assistant_text:
+                _emit_chat_message(context, "assistant", transcript_assistant_text)
+                persisted_assistant_texts.append(transcript_assistant_text)
+        terminal_notice = terminal_error or (
+            final_text if terminal_status in {"failed", "max_turns", "max_spend"} else None
+        )
+        display_text = _display_terminal_text(terminal_status, terminal_error or final_text)
+
+        if display_text and display_text not in persisted_assistant_texts:
+            _emit_chat_message(context, "system" if terminal_notice else "assistant", display_text)
+        if terminal_status == "failed":
+            emit(context.events, "run_error", {"message": display_text or "Lea API run failed."})
+
+        store.update_run(
+            context.run_id,
+            terminal_status,
+            final_text=final_text,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+        )
+        store.replace_run_usage_breakdown(
+            context.run_id,
+            usage_breakdown.final_rows(input_tokens, output_tokens, cost_usd),
+        )
+        store.set_run_pending_approval(context.run_id, None)
+        store.touch_session(context.session_id, terminal_status)
+        emit(
+            context.events,
+            "done",
+            {
+                "status": terminal_status,
+                "api_run_id": api_run_id,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
+            },
+        )
+        return terminal_status
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        store.add_message(context.session_id, "system", message, context.run_id)
+        store.update_run(context.run_id, "failed", final_text=message)
+        store.replace_run_usage_breakdown(
+            context.run_id,
+            usage_breakdown.final_rows(input_tokens, output_tokens, cost_usd),
+        )
+        store.set_run_pending_approval(context.run_id, None)
+        store.touch_session(context.session_id, "failed")
+        emit(context.events, "run_error", {"message": message})
+        emit(context.events, "done", {"status": "failed", "api_run_id": api_run_id})
+        return "failed"
 
 
 def run_lea(context: RunnerContext) -> None:

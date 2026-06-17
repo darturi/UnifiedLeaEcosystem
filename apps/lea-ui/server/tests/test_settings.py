@@ -12,7 +12,7 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
     env_path = tmp_path / ".env"
     env_path.write_text(
         """
-        LEA_MODEL=gpt-4o
+        LEA_MODEL=o4-mini
         LEA_MAX_TURNS=12
         LEA_MAX_SPEND_USD=20.0
         LEA_PERMISSION_TIER=theorem_translation
@@ -23,12 +23,24 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
 
     payload = settings_service.settings_payload(env_path)
 
-    assert payload["model"] == "gpt-4o"
+    assert payload["model"] == "o4-mini"
     assert payload["max_turns"] == 12
     assert payload["max_spend_usd"] == 20.0
     assert payload["theorem_translation_max_retries"] == 4
     assert payload["api_keys"]["openai"] == {"configured": True, "last4": "1234"}
     assert payload["api_keys"]["anthropic"] == {"configured": False, "last4": None}
+    assert [model["value"] for model in payload["model_options"]] == [
+        "o4-mini",
+        "gpt-5.4-mini",
+        "gpt-5.4",
+        "gpt-5.5",
+        "gemini/gemini-3.1-pro-preview",
+        "gemini/gemini-2.5-pro",
+        "gemini/gemini-2.5-flash",
+        "anthropic/claude-opus-4-8",
+        "anthropic/claude-sonnet-4-6",
+    ]
+    assert payload["model_options"][4]["family"] == "google"
 
 
 def test_update_settings_writes_root_env_values(tmp_path, monkeypatch):
@@ -47,7 +59,7 @@ def test_update_settings_writes_root_env_values(tmp_path, monkeypatch):
 
     payload = settings_service.update_settings(
         {
-            "model": "claude-sonnet-4-6",
+            "model": "anthropic/claude-sonnet-4-6",
             "max_turns": 30,
             "max_spend_usd": 9.5,
             "permission_tier": "stepwise",
@@ -61,18 +73,36 @@ def test_update_settings_writes_root_env_values(tmp_path, monkeypatch):
     )
     text = env_path.read_text()
 
-    assert payload["model"] == "claude-sonnet-4-6"
+    assert payload["model"] == "anthropic/claude-sonnet-4-6"
     assert payload["permission_tier"] == "stepwise"
     assert payload["theorem_translation_max_retries"] == 7
     # Unrelated config is preserved.
     assert "LEA_ROOT=vendor/lea-prover" in text
-    assert "LEA_MODEL=claude-sonnet-4-6" in text
+    assert "LEA_MODEL=anthropic/claude-sonnet-4-6" in text
     assert "LEA_MAX_TURNS=30" in text
     assert "LEA_MAX_SPEND_USD=9.5" in text
     assert "LEA_PERMISSION_TIER=stepwise" in text
     assert "LEA_THEOREM_TRANSLATION_MAX_RETRIES=7" in text
     assert "OPENAI_API_KEY" not in text
     assert "ANTHROPIC_API_KEY=sk-ant-secret123456" in text
+
+
+def test_update_settings_accepts_all_supported_models_with_family_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(settings_service, "_verify_api_key_credentials", lambda family, value, config, model=None: None)
+    db.init_db()
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        """
+        OPENAI_API_KEY=sk-openai-secret
+        GEMINI_API_KEY=AIza12345678901234567890
+        ANTHROPIC_API_KEY=sk-ant-secret
+        """
+    )
+
+    for option in settings_service.MODEL_OPTIONS:
+        payload = settings_service.update_settings({"model": option["value"]}, env_path)
+        assert payload["model"] == option["value"]
 
 
 def test_update_settings_rejects_invalid_theorem_translation_retries(tmp_path, monkeypatch):
@@ -101,7 +131,7 @@ def test_update_settings_rejects_selected_model_without_api_key(tmp_path, monkey
     )
 
     try:
-        settings_service.update_settings({"model": "claude-sonnet-4-6"}, env_path)
+        settings_service.update_settings({"model": "anthropic/claude-sonnet-4-6"}, env_path)
     except settings_service.SettingsValidationError as exc:
         assert str(exc) == "An API key for Anthropic is required before saving this model."
         assert exc.field == "api_keys.anthropic"
@@ -123,7 +153,7 @@ def test_update_settings_rejects_malformed_api_key(tmp_path, monkeypatch):
     try:
         settings_service.update_settings(
             {
-                "model": "gpt-4o",
+                "model": "o4-mini",
                 "api_keys": {"openai": {"value": "not-a-real-key"}},
             },
             env_path,
@@ -149,14 +179,14 @@ def test_update_settings_allows_anthropic_prefix_then_defers_to_provider_verific
     env_path = tmp_path / ".env"
     env_path.write_text(
         """
-        LEA_MODEL=gpt-4o
+        LEA_MODEL=o4-mini
         LEA_MAX_TURNS=12
         """
     )
 
     settings_service.update_settings(
         {
-            "model": "claude-sonnet-4-6",
+            "model": "anthropic/claude-sonnet-4-6",
             "api_keys": {"anthropic": {"value": "sk-ant-api03-test.value/with+chars"}},
         },
         env_path,
@@ -165,7 +195,7 @@ def test_update_settings_allows_anthropic_prefix_then_defers_to_provider_verific
     assert seen == {
         "family": "anthropic",
         "value": "sk-ant-api03-test.value/with+chars",
-        "model": "claude-sonnet-4-6",
+        "model": "anthropic/claude-sonnet-4-6",
     }
     assert "ANTHROPIC_API_KEY=sk-ant-api03-test.value/with+chars" in env_path.read_text()
 
@@ -175,7 +205,7 @@ def test_anthropic_verification_uses_messages_endpoint_with_selected_model(tmp_p
         "anthropic",
         "sk-ant-api03-test",
         settings_service.load_config(tmp_path / "missing.env"),
-        "claude-sonnet-4-6",
+        "anthropic/claude-sonnet-4-6",
     )
 
     assert request is not None
@@ -186,7 +216,7 @@ def test_anthropic_verification_uses_messages_endpoint_with_selected_model(tmp_p
     assert request.headers["Content-type"] == "application/json"
     body = json.loads(request.data.decode("utf-8"))
     assert body == {
-        "model": "claude-sonnet-4-6",
+        "model": "anthropic/claude-sonnet-4-6",
         "max_tokens": 1,
         "messages": [{"role": "user", "content": "ping"}],
     }
@@ -234,7 +264,7 @@ def test_update_settings_rejects_provider_rejected_api_key(tmp_path, monkeypatch
     env_path = tmp_path / ".env"
     env_path.write_text(
         """
-        LEA_MODEL=gpt-4o
+        LEA_MODEL=o4-mini
         LEA_MAX_TURNS=12
         """
     )
@@ -250,7 +280,7 @@ def test_update_settings_rejects_provider_rejected_api_key(tmp_path, monkeypatch
     try:
         settings_service.update_settings(
             {
-                "model": "gpt-4o",
+                "model": "o4-mini",
                 "api_keys": {"openai": {"value": "sk-validlooking123456"}},
             },
             env_path,

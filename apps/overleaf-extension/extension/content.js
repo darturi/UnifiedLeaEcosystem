@@ -7,19 +7,11 @@
   const LATEX_CONTEXT_SYNC_DELAY_MS = 750;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
-    gemini: "Gemini",
+    google: "Google AI",
     anthropic: "Anthropic"
   };
   const DEFAULT_MODEL_OPTIONS = [
-    { id: "o4-mini", label: "o4-mini", family: "openai", tag: "Current default" },
-    { id: "gpt-5.4-mini", label: "GPT-5.4 Mini", family: "openai", tag: "Fast" },
-    { id: "gpt-5.4", label: "GPT-5.4", family: "openai", tag: "Balanced" },
-    { id: "gpt-5.5", label: "GPT-5.5", family: "openai", tag: "Most capable" },
-    { id: "gemini/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro Preview", family: "gemini", tag: "Research" },
-    { id: "gemini/gemini-2.5-pro", label: "Gemini 2.5 Pro", family: "gemini", tag: "Capable" },
-    { id: "gemini/gemini-2.5-flash", label: "Gemini 2.5 Flash", family: "gemini", tag: "Fast" },
-    { id: "anthropic/claude-opus-4-8", label: "Claude Opus 4.8", family: "anthropic", tag: "Most capable" },
-    { id: "anthropic/claude-sonnet-4-6", label: "Claude Sonnet 4.6", family: "anthropic", tag: "Balanced" }
+    { value: DEFAULT_LEA_MODEL, label: DEFAULT_LEA_MODEL, family: "openai" }
   ];
   let activePopover = null;
   let statusRefreshTimer = null;
@@ -886,7 +878,7 @@
     select.replaceChildren();
     const byFamily = new Map();
     for (const model of options) {
-      const family = model.family || "openai";
+      const family = normalizeFamily(model.family || "openai");
       if (!byFamily.has(family)) {
         byFamily.set(family, []);
       }
@@ -899,9 +891,9 @@
       const familyConfigured = Boolean(providerKeys[family]?.configured);
       for (const model of models) {
         const option = document.createElement("option");
-        option.value = model.id;
+        option.value = model.value || model.id;
         option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
-        option.disabled = !familyConfigured && model.id !== selectedModel;
+        option.disabled = !familyConfigured && option.value !== selectedModel;
         group.appendChild(option);
       }
       select.appendChild(group);
@@ -961,7 +953,11 @@
   }
 
   function getModelFamily(options, modelId) {
-    return options.find((model) => model.id === modelId)?.family || "openai";
+    return normalizeFamily(options.find((model) => (model.value || model.id) === modelId)?.family || "openai");
+  }
+
+  function normalizeFamily(family) {
+    return family === "gemini" ? "google" : family;
   }
 
   function collectProviderApiKeyPatch(popover) {

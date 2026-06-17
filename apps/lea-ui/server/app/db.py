@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -8,7 +9,38 @@ from typing import Iterator
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = ROOT / "data" / "lea-interface.sqlite3"
+MONOREPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _resolve_env_path(env_key: str, default: Path) -> Path:
+    """Resolve a path from an env var, relative paths anchored at the monorepo root."""
+    value = os.environ.get(env_key)
+    if not value:
+        return default
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (MONOREPO_ROOT / path)
+
+
+def shared_data_dir() -> Path:
+    """Directory holding the shared database and raw event logs.
+
+    Defaults to the existing UI data directory so the UI and the Overleaf
+    extension share one store with no migration. Override with
+    ``LEA_SHARED_DATA_DIR`` (relative paths are anchored at the monorepo root).
+    """
+    return _resolve_env_path("LEA_SHARED_DATA_DIR", MONOREPO_ROOT / "apps" / "lea-ui" / "data")
+
+
+def db_path() -> Path:
+    return _resolve_env_path("LEA_DB_PATH", shared_data_dir() / "lea-interface.sqlite3")
+
+
+def event_log_dir() -> Path:
+    return _resolve_env_path("LEA_EVENT_LOG_DIR", shared_data_dir() / "lea-api-events")
+
+
+# Module-level so callers/tests can monkeypatch a single attribute.
+DB_PATH = db_path()
 
 
 def utc_now() -> str:
@@ -20,6 +52,10 @@ def connect() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # WAL lets the UI server and the Overleaf recorder write concurrently
+    # (one writer + many readers) against the shared database file.
+    conn.execute("pragma journal_mode=WAL")
+    conn.execute("pragma busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -36,6 +72,8 @@ def init_db() -> None:
                 project_id text references projects(id),
                 title text not null,
                 status text not null,
+                origin text not null default 'ui',
+                external_ref text,
                 created_at text not null,
                 updated_at text not null
             );
@@ -54,6 +92,7 @@ def init_db() -> None:
                 session_id text not null references sessions(id),
                 project_id text references projects(id),
                 status text not null,
+                origin text not null default 'ui',
                 api_run_id text,
                 pending_approval text,
                 model text not null,
@@ -142,6 +181,8 @@ def init_db() -> None:
             conn.execute("alter table runs add column pending_approval text")
         if "project_id" not in run_columns:
             conn.execute("alter table runs add column project_id text references projects(id)")
+        if "origin" not in run_columns:
+            conn.execute("alter table runs add column origin text not null default 'ui'")
 
         session_columns = {
             row["name"]
@@ -149,6 +190,10 @@ def init_db() -> None:
         }
         if "project_id" not in session_columns:
             conn.execute("alter table sessions add column project_id text references projects(id)")
+        if "origin" not in session_columns:
+            conn.execute("alter table sessions add column origin text not null default 'ui'")
+        if "external_ref" not in session_columns:
+            conn.execute("alter table sessions add column external_ref text")
 
 
 def row_to_dict(row: sqlite3.Row) -> dict:

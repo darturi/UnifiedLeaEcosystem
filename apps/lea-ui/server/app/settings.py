@@ -13,6 +13,7 @@ from typing import Any
 from .config import ROOT_ENV_PATH, LeaConfig, load_config
 from .env import patch_dotenv
 from . import store
+from .model_catalog import model_options
 
 
 CONFIG_PATH = ROOT_ENV_PATH
@@ -37,17 +38,7 @@ PROVIDER_LABELS = {
     "anthropic": "Anthropic",
     "google": "Google",
 }
-MODEL_OPTIONS = [
-    {"value": "gpt-4o", "label": "GPT-4o", "family": "openai"},
-    {"value": "gpt-4o-mini", "label": "GPT-4o Mini", "family": "openai"},
-    {"value": "gpt-4-turbo", "label": "GPT-4 Turbo", "family": "openai"},
-    {"value": "claude-opus-4-7", "label": "Claude Opus 4.7", "family": "anthropic"},
-    {"value": "claude-sonnet-4-6", "label": "Claude Sonnet 4.6", "family": "anthropic"},
-    {"value": "claude-haiku-4-5", "label": "Claude Haiku 4.5", "family": "anthropic"},
-    {"value": "gemini-2.0-flash", "label": "Gemini 2.0 Flash", "family": "google"},
-    {"value": "gemini-1.5-pro", "label": "Gemini 1.5 Pro", "family": "google"},
-    {"value": "gemini/gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro Preview", "family": "google"},
-]
+MODEL_OPTIONS = model_options()
 MODEL_FAMILY_BY_VALUE = {str(option["value"]): str(option["family"]) for option in MODEL_OPTIONS}
 KEY_VALIDATORS = {
     "openai": re.compile(r"^sk-[A-Za-z0-9_-]{8,}$"),
@@ -100,6 +91,8 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
         model = str(values["model"]).strip()
         if not model:
             raise ValueError("model must not be empty")
+        if model not in MODEL_FAMILY_BY_VALUE:
+            raise ValueError("model must be one of the supported models")
         updates["model"] = model
 
     if "permission_tier" in values and values["permission_tier"] is not None:
