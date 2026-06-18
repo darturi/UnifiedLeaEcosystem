@@ -44,7 +44,8 @@ chrome.storage.sync.get(
     renderModelOptions(DEFAULT_MODEL_OPTIONS, settings.leaModel || DEFAULT_LEA_MODEL, latestProviderKeys);
     renderProviderKeyStatus(latestProviderKeys);
     leaMaxTurnsInput.value = settings.leaMaxTurns;
-    leaLatexContextModeInput.value = settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    // LaTeX context is locked to "off" until the feature is implemented.
+    leaLatexContextModeInput.value = DEFAULT_LEA_LATEX_CONTEXT_MODE;
     loadCompanionSettings({ silent: true });
   }
 );
@@ -62,7 +63,9 @@ form.addEventListener("submit", async (event) => {
   const leaApiBaseUrl = leaApiBaseUrlInput.value.trim().replace(/\/+$/, "");
   const leaModel = leaModelInput.value.trim() || DEFAULT_LEA_MODEL;
   const leaMaxTurns = Number.parseInt(leaMaxTurnsInput.value, 10) || 20;
-  const leaLatexContextMode = leaLatexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+  // LaTeX context is locked to "off" until the feature is implemented; never send
+  // active_file regardless of any stored value.
+  const leaLatexContextMode = DEFAULT_LEA_LATEX_CONTEXT_MODE;
   const leaProviderApiKeys = collectProviderApiKeyPatch();
   try {
     const leaResponse = await fetch(`${companionUrl}/settings/lea`, {
@@ -117,7 +120,8 @@ async function loadCompanionSettings({ silent }) {
     renderProviderKeyStatus(latestProviderKeys);
     renderModelOptions(latestModelOptions, payload.leaModel || leaModelInput.value || DEFAULT_LEA_MODEL, latestProviderKeys);
     leaMaxTurnsInput.value = payload.leaMaxTurns || leaMaxTurnsInput.value || 20;
-    leaLatexContextModeInput.value = payload.leaLatexContextMode || leaLatexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    // LaTeX context stays locked to "off" regardless of what the companion reports.
+    leaLatexContextModeInput.value = DEFAULT_LEA_LATEX_CONTEXT_MODE;
 
     await chrome.storage.sync.set({
       companionUrl,

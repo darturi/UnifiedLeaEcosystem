@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from uuid import uuid4
 
 from typing import Any
@@ -78,6 +79,11 @@ def list_sessions() -> list[dict]:
                     limit 1
                 ) as latest_check_status,
                 (select count(*) from code_steps cs where cs.session_id = s.id) as code_step_count,
+                (
+                    select count(*)
+                    from runs r3
+                    where r3.session_id = s.id and r3.status in ('pending', 'running')
+                ) as active_run_count,
                 max(0, cast((julianday(s.updated_at) - julianday(s.created_at)) * 86400 as integer)) as duration_seconds
             from sessions s
             left join runs r on r.session_id = s.id
@@ -91,10 +97,36 @@ def list_sessions() -> list[dict]:
     for row in rows:
         data = row_to_dict(row)
         data["status"] = _derive_session_status(
-            data.pop("latest_check_status", None), int(data.pop("code_step_count", 0) or 0)
+            data.pop("latest_check_status", None),
+            int(data.pop("code_step_count", 0) or 0),
+            bool(data.pop("active_run_count", 0)),
         )
         sessions.append(_normalize_usage_session(data))
     return sessions
+
+
+def sessions_digest() -> str:
+    """A cheap fingerprint of the session-list state, for the `/api/sessions/events`
+    SSE feed to poll. Changes whenever a session is created or touched (max
+    updated_at + count) or a run enters/leaves the active set (so a status flip from
+    'running' → 'ok'/'error' is also detected). Deliberately avoids running the full
+    `list_sessions` aggregate on every tick — that query only fires when this digest
+    moves."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select
+                (select count(*) from sessions) as session_count,
+                (select coalesce(max(updated_at), '') from sessions) as max_updated_at,
+                (select count(*) from runs where status in ('pending', 'running')) as active_runs,
+                (select coalesce(max(updated_at), '') from runs) as max_run_updated_at
+            """
+        ).fetchone()
+    data = row_to_dict(row)
+    return "|".join(
+        str(data.get(key, ""))
+        for key in ("session_count", "max_updated_at", "active_runs", "max_run_updated_at")
+    )
 
 
 def create_run(
@@ -129,6 +161,31 @@ def get_project(project_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(row) if row else None
+
+
+def get_project_by_slug(slug: str) -> dict | None:
+    value = validate_project_slug(slug)
+    with connect() as conn:
+        row = conn.execute("select * from projects where slug = ?", (value,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def get_or_create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+    """Return the project with this slug, creating it on first use. Used by the
+    Overleaf path to tag runs with the document namespace so per-document usage can
+    be aggregated. `slug` is unique, so a concurrent create just re-reads the
+    winner."""
+    existing = get_project_by_slug(slug)
+    if existing:
+        return existing
+    try:
+        return create_project(slug, title=title, path=path)
+    except sqlite3.IntegrityError:
+        # Lost a create race on the unique slug — read back the winner.
+        winner = get_project_by_slug(slug)
+        if winner:
+            return winner
+        raise
 
 
 def create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
@@ -644,7 +701,9 @@ def session_detail(session_id: str) -> dict | None:
     return {
         **session,
         **usage,
-        "status": _derive_session_status(latest_check_status, len(code_steps)),
+        "status": _derive_session_status(
+            latest_check_status, len(code_steps), active_run is not None
+        ),
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
         "status_events": [row_to_dict(row) for row in status_events],
@@ -657,13 +716,23 @@ def session_detail(session_id: str) -> dict | None:
     }
 
 
-def _derive_session_status(latest_check_status: str | None, code_step_count: int) -> str:
+def _derive_session_status(
+    latest_check_status: str | None,
+    code_step_count: int,
+    has_active_run: bool = False,
+) -> str:
     """A session's status is its working-copy verdict (D14), derived — never stored.
-    No code yet → 'empty'; a step whose verdict hasn't landed → 'unchecked'; else the
-    latest code_step's check_status ('ok' | 'error')."""
-    if not code_step_count:
-        return "empty"
-    return latest_check_status or "unchecked"
+    Once any code exists the verdict rules (latest step's check_status, or
+    'unchecked' before it lands) — run lifecycle stays out of it, per D14. The one
+    addition: a session with *no code yet* but an active run (pending/running) reads
+    'running' instead of 'empty', so a freshly registered formalization — including
+    an Overleaf-driven one whose first file hasn't been written yet — surfaces as
+    in-progress in the session list and stats the moment it starts."""
+    if code_step_count:
+        return latest_check_status or "unchecked"
+    if has_active_run:
+        return "running"
+    return "empty"
 
 
 def _safe_verify_summary(run: dict) -> dict | None:

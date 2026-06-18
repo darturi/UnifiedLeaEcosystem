@@ -289,6 +289,58 @@ def test_usage_stats_global_daily_and_model_rollups(tmp_path, monkeypatch):
     assert stats["models"][0]["session_count"] == 1
 
 
+def test_get_or_create_project_is_idempotent_by_slug(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    first = store.get_or_create_project("doc-a", title="Doc A")
+    again = store.get_or_create_project("doc-a", title="ignored second title")
+
+    assert first["id"] == again["id"]
+    assert first["slug"] == "doc-a"
+    assert again["title"] == "Doc A"  # not overwritten on the second call
+    assert len(store.list_projects()) == 1
+    assert store.get_project_by_slug("doc-a")["id"] == first["id"]
+    assert store.get_project_by_slug("missing") is None
+
+
+def test_usage_stats_sessions_carry_project_slug_for_per_document_totals(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    project = store.get_or_create_project("doc-a", title="Doc A")
+
+    # Two sessions tagged to the same Overleaf document (two formalized theorems).
+    s1 = store.create_session("thm_one", project_id=project["id"])
+    r1 = store.create_run(s1["id"], "gpt-4o", "openai", 3, project_id=project["id"])
+    store.update_run(r1["id"], "success", input_tokens=200, output_tokens=50, cost_usd=0.10)
+
+    s2 = store.create_session("thm_two", project_id=project["id"])
+    r2 = store.create_run(s2["id"], "gpt-4o", "openai", 3, project_id=project["id"])
+    store.update_run(r2["id"], "success", input_tokens=300, output_tokens=75, cost_usd=0.20)
+
+    # An untagged session (e.g. interactive UI run) must not count toward the doc.
+    s3 = store.create_session("loose")
+    r3 = store.create_run(s3["id"], "gpt-4o", "openai", 3)
+    store.update_run(r3["id"], "success", input_tokens=400, output_tokens=100, cost_usd=0.30)
+
+    stats = store.usage_stats()
+
+    doc_sessions = [s for s in stats["sessions"] if s["project_slug"] == "doc-a"]
+    assert len(doc_sessions) == 2
+    doc_input = sum(s["input_tokens"] for s in doc_sessions)
+    doc_output = sum(s["output_tokens"] for s in doc_sessions)
+    doc_cost = sum(s["cost_usd"] for s in doc_sessions)
+    assert doc_input == 500
+    assert doc_output == 125
+    assert abs(doc_cost - 0.30) < 1e-9
+
+    # All-time still includes every run (the untagged one too).
+    assert stats["global"]["input_tokens"] == 900
+    assert stats["global"]["output_tokens"] == 225
+    assert abs(stats["global"]["cost_usd"] - 0.60) < 1e-9
+
+
 def test_latest_agent_code_step_and_edit_notes_since(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

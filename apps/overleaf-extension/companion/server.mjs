@@ -32,7 +32,13 @@ import {
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeLeaLatexContextMode } from "./config.mjs";
-import { isApiFlavor, runApiProofJob } from "./leaApiClient.mjs";
+import {
+  fetchAdapterSettings,
+  fetchAdapterUsageStats,
+  isApiFlavor,
+  putAdapterSettings,
+  runApiProofJob
+} from "./leaApiClient.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 31245;
@@ -56,6 +62,12 @@ const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
 const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
 const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
+// Settings the companion mirrors to `.env`. On the `api` flavor (the default) the
+// shared scalars (leaModel/leaMaxTurns/leaMaxSpendUsd) and provider keys are *also*
+// pushed to the adapter, which is their single source of truth: reads overlay the
+// adapter's values (see syncSharedSettingsFromAdapter) and adapter-driven runs use
+// its TOML, so the `.env` copy is an inert secondary there. We keep writing it so
+// the legacy `v1` flavor — which has no adapter to delegate to — still works.
 const SHARED_SETTING_ENV_FIELDS = {
   leaRepoPath: "LEA_ROOT",
   leaApiBaseUrl: "LEA_API_BASE_URL",
@@ -73,8 +85,24 @@ export { LEA_MODEL_OPTIONS };
 const LEA_MODEL_BY_ID = LEA_MODEL_BY_VALUE;
 const LEGACY_LEA_MODEL_ALIASES = new Map([
   ["anthropic/claude-opus-4-20250514", "anthropic/claude-opus-4-8"],
-  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"]
+  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"],
+  // The lea-standalone adapter stores bare Anthropic IDs (no provider prefix);
+  // map them back to the companion catalog's prefixed form when reading shared
+  // settings so the model round-trips between the two settings UIs.
+  ["claude-opus-4-8", "anthropic/claude-opus-4-8"],
+  ["claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"]
 ]);
+
+// The settings whose single source of truth is the lea-standalone adapter's
+// `config/lea.local.toml` (served by GET/PUT /api/settings). The companion no
+// longer persists these to `.env`; it reads them from and writes them to the
+// adapter so both settings UIs stay in lockstep. Keys map companion field ->
+// adapter field.
+const ADAPTER_SHARED_SCALARS = {
+  leaModel: "model",
+  leaMaxTurns: "max_turns",
+  leaMaxSpendUsd: "max_spend_usd"
+};
 
 export async function createServer({
   settingsPath = SETTINGS_PATH,
@@ -166,6 +194,11 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
   }
 
+  // Pull the latest shared settings (max-spend cap, key status) from the adapter
+  // before validating and launching, so a limit raised/lowered in either UI is
+  // honored on this run.
+  await syncSharedSettingsFromAdapter(state);
+
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
@@ -251,6 +284,8 @@ export async function handleStub(payload, state) {
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
   }
+
+  await syncSharedSettingsFromAdapter(state);
 
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) {
@@ -385,6 +420,10 @@ export async function handleUpdateLeaSettings(payload, state) {
     return errorResponse(400, "invalid_lea_path", validation.message);
   }
 
+  // Refresh adapter-held shared settings/key status so the checks below can see a
+  // key configured only in the lea-standalone UI.
+  await syncSharedSettingsFromAdapter(state);
+
   const model = normalizeLeaModelId(payload.leaModel || DEFAULT_LEA_MODEL);
   const modelInfo = LEA_MODEL_BY_ID.get(model);
   if (!modelInfo) {
@@ -442,11 +481,11 @@ export async function handleUpdateLeaSettings(payload, state) {
     )
   };
   const nextState = { ...state, settings: nextSettings, env: { ...(state.env || {}), ...providerEnvPatch } };
-  if (!getProviderApiKey(nextState, modelInfo.family)) {
+  if (!isProviderKeyConfigured(nextState, modelInfo.family)) {
     return errorResponse(
       400,
       `missing_${modelInfo.family}_key`,
-      `${LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family)?.label || modelInfo.family} API key must be set in .env or the companion process environment before selecting this model.`
+      `${LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family)?.label || modelInfo.family} API key must be set in the lea-standalone settings, .env, or the companion process environment before selecting this model.`
     );
   }
   const keyValidation = await validateProviderApiKeys({
@@ -458,6 +497,43 @@ export async function handleUpdateLeaSettings(payload, state) {
   if (!keyValidation.ok) {
     return errorResponse(400, keyValidation.error, keyValidation.message);
   }
+  // Push the shared settings to the adapter — the single source of truth — so the
+  // change also appears in the lea-standalone UI and governs adapter-driven runs.
+  // Infra settings stay local (handled via the env patch below). Skipped on the
+  // legacy v1 flavor, which has no adapter to delegate to.
+  if (isApiFlavor(nextSettings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
+    const adapterBody = {
+      model,
+      max_turns: nextSettings.leaMaxTurns,
+      max_spend_usd: nextSettings.leaMaxSpendUsd
+    };
+    const apiKeyPatch = buildAdapterApiKeyPatch(payload.leaProviderApiKeys, nextState, modelInfo.family);
+    if (Object.keys(apiKeyPatch).length > 0) adapterBody.api_keys = apiKeyPatch;
+    const pushed = await putAdapterSettings({
+      fetchImpl: state.fetchImpl || fetch,
+      baseUrl: leaApiBaseUrl,
+      body: adapterBody
+    });
+    if (!pushed.ok) {
+      // An HTTP response with a status means the adapter is reachable but rejected
+      // the values (e.g. a 422 from key/model validation) — surface that to the
+      // user. A missing status means a transport failure (adapter down): degrade
+      // gracefully and still save local/infra settings so the user isn't blocked.
+      if (typeof pushed.status === "number") {
+        const detail = pushed.body?.detail;
+        const structured = detail && typeof detail === "object" ? detail : null;
+        const message =
+          (structured ? structured.message : detail) ||
+          pushed.error ||
+          "The Lea adapter rejected these settings.";
+        return errorResponse(pushed.status, "adapter_settings_rejected", message, structured?.field);
+      }
+      console.warn(`Could not reach the Lea adapter to sync settings: ${pushed.error}`);
+    } else if (pushed.body && typeof pushed.body === "object") {
+      state.adapterSettings = pushed.body;
+    }
+  }
+
   const sharedEnvPatch = buildSharedSettingsEnvPatch(nextSettings);
   const envPatch = { ...sharedEnvPatch, ...providerEnvPatch };
   if (Object.keys(envPatch).length > 0) {
@@ -467,13 +543,40 @@ export async function handleUpdateLeaSettings(payload, state) {
   }
   state.settings = nextSettings;
   await writeJson(state.settingsPath, sanitizeSettingsForStorage(state.settings));
-  return { statusCode: 200, body: buildSettingsResponse(state) };
+  return { statusCode: 200, body: await buildSettingsResponse(state) };
 }
 
-export function handleGetUsage(payload, state) {
+// Usage shown in the Overleaf popover. The single source of truth is the
+// lea-standalone adapter's GET /api/stats (the shared DB), so the popover shows
+// the exact same numbers as the lea-standalone Stats page:
+//   - All-time  ← stats.global
+//   - This project ← sum of stats.sessions whose project_slug matches the
+//     Overleaf document namespace (slugProjectId(overleafProjectId)).
+// If the adapter is unreachable (or we're on the legacy v1 flavor) we fall back
+// to the companion's in-memory job tally so the popover degrades instead of
+// erroring.
+export async function handleGetUsage(payload, state) {
   const overleafProjectId = String(payload.overleafProjectId || "unknown");
-  const allTime = aggregateUsage(state.jobs || {}, {});
   const leaMaxSpendUsd = normalizeLeaMaxSpendUsd(state.settings?.leaMaxSpendUsd);
+
+  const adapterUsage = await fetchAdapterUsageForPopover(state, overleafProjectId);
+  if (adapterUsage) {
+    const currentSpend = adapterUsage.allTime.costUsd;
+    return {
+      statusCode: 200,
+      body: {
+        project: adapterUsage.project,
+        allTime: adapterUsage.allTime,
+        leaMaxSpendUsd,
+        leaCurrentSpendUsd: currentSpend,
+        leaSpendLimitReached:
+          leaMaxSpendUsd !== null && currentSpend >= leaMaxSpendUsd
+      }
+    };
+  }
+
+  // Fallback: adapter unreachable — use the in-memory job tally.
+  const allTime = aggregateUsage(state.jobs || {}, {});
   return {
     statusCode: 200,
     body: {
@@ -484,6 +587,57 @@ export function handleGetUsage(payload, state) {
       leaSpendLimitReached: spendLimitReached(state)
     }
   };
+}
+
+// Fetch the adapter's /api/stats and reshape it into the popover's usage contract
+// ({ inputTokens, outputTokens, totalTokens, costUsd, runCount }). Returns null
+// when the adapter is not the active backend or cannot be reached.
+async function fetchAdapterUsageForPopover(state, overleafProjectId) {
+  if (!isApiFlavor(state.settings?.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
+    return null;
+  }
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return null;
+  }
+  const result = await fetchAdapterUsageStats({ fetchImpl: state.fetchImpl || fetch, baseUrl });
+  if (!result.ok || !result.body || typeof result.body !== "object") {
+    return null;
+  }
+  const stats = result.body;
+  const projectSlug = overleafProjectId ? slugProjectId(overleafProjectId) : "";
+  const sessions = Array.isArray(stats.sessions) ? stats.sessions : [];
+
+  const project = sessions.reduce(
+    (acc, session) => {
+      if (!session || session.project_slug !== projectSlug) return acc;
+      const inputTokens = toNonNegativeNumber(session.input_tokens);
+      const outputTokens = toNonNegativeNumber(session.output_tokens);
+      acc.inputTokens += inputTokens;
+      acc.outputTokens += outputTokens;
+      acc.totalTokens += inputTokens + outputTokens;
+      acc.costUsd += toNonNegativeNumber(session.cost_usd);
+      acc.runCount += toNonNegativeNumber(session.run_count);
+      return acc;
+    },
+    { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0, runCount: 0 }
+  );
+  project.costUsd = Number(project.costUsd.toFixed(6));
+
+  const global = stats.global && typeof stats.global === "object" ? stats.global : {};
+  const allInput = toNonNegativeNumber(global.input_tokens);
+  const allOutput = toNonNegativeNumber(global.output_tokens);
+  const allTime = {
+    inputTokens: allInput,
+    outputTokens: allOutput,
+    totalTokens: toNonNegativeNumber(global.total_tokens) || allInput + allOutput,
+    costUsd: Number(toNonNegativeNumber(global.cost_usd).toFixed(6)),
+    runCount: toNonNegativeNumber(global.session_count)
+  };
+
+  return { project, allTime };
 }
 
 export async function validateLeaRepo(leaRepoPath) {
@@ -550,7 +704,7 @@ async function routeRequest(request, response, state) {
   }
 
   if (request.method === "GET" && url.pathname === "/settings") {
-    sendJson(response, 200, buildSettingsResponse(state));
+    sendJson(response, 200, await buildSettingsResponse(state));
     return;
   }
 
@@ -561,7 +715,7 @@ async function routeRequest(request, response, state) {
   }
 
   if (request.method === "GET" && url.pathname === "/usage") {
-    const result = handleGetUsage({
+    const result = await handleGetUsage({
       overleafProjectId: url.searchParams.get("overleafProjectId") || "unknown"
     }, state);
     sendJson(response, result.statusCode, result.body);
@@ -609,8 +763,9 @@ async function routeRequest(request, response, state) {
   sendJson(response, 404, { error: "not_found", message: "Unknown endpoint." });
 }
 
-export function buildSettingsResponse(state) {
+export async function buildSettingsResponse(state) {
   refreshSettingsFromEnv(state);
+  await syncSharedSettingsFromAdapter(state);
   const leaRepoPath = state.settings.leaRepoPath || "";
   const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL);
   const modelInfo = LEA_MODEL_BY_ID.get(model) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
@@ -620,7 +775,7 @@ export function buildSettingsResponse(state) {
     leaWorkspacePath: leaRepoPath ? buildLeaWorkspacePath(leaRepoPath) : "",
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
+    leaApiKeyConfigured: isProviderKeyConfigured(state, modelInfo.family),
     leaProvider: modelInfo.family,
     leaProviderFamily: modelInfo.family,
     leaProviderKeys: buildProviderKeyStatus(state),
@@ -641,10 +796,65 @@ function buildProviderKeyStatus(state) {
   for (const family of LEA_MODEL_FAMILIES) {
     status[family.id] = {
       label: family.label,
-      configured: Boolean(getProviderApiKey(state, family.id))
+      configured: isProviderKeyConfigured(state, family.id)
     };
   }
   return status;
+}
+
+// The adapter is the source of truth for provider keys, so a key configured in
+// the lea-standalone UI (stored in the adapter TOML) must count as configured
+// here too — even though its raw value never leaves the adapter. We treat a
+// family as configured if the companion env has the key OR the adapter reports
+// one of the family's env vars as configured.
+function isProviderKeyConfigured(state, familyId) {
+  if (getProviderApiKey(state, familyId)) return true;
+  const apiKeys = state.adapterSettings?.api_keys || {};
+  const family = LEA_MODEL_FAMILY_BY_ID.get(normalizeProviderFamilyId(familyId));
+  for (const envVar of family?.envVars || []) {
+    if (apiKeys[envVar]?.configured) return true;
+  }
+  return false;
+}
+
+// Pull the shared settings (model, max_turns, max_spend_usd, provider key status)
+// from the adapter and overlay them onto local state, so GET /settings and the
+// run preflight reflect whatever was last saved in EITHER UI. Best-effort: if the
+// adapter is unreachable (or we're on the legacy v1 flavor) we keep local values.
+async function syncSharedSettingsFromAdapter(state) {
+  if (!isApiFlavor(state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
+    state.adapterSettings = null;
+    return null;
+  }
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    state.adapterSettings = null;
+    return null;
+  }
+  const result = await fetchAdapterSettings({ fetchImpl: state.fetchImpl || fetch, baseUrl });
+  if (!result.ok || !result.body || typeof result.body !== "object") {
+    state.adapterSettings = null;
+    return null;
+  }
+  const adapter = result.body;
+  state.adapterSettings = adapter;
+  if (typeof adapter.max_turns === "number") {
+    state.settings.leaMaxTurns = adapter.max_turns;
+  }
+  if (adapter.max_spend_usd === null || typeof adapter.max_spend_usd === "number") {
+    state.settings.leaMaxSpendUsd = adapter.max_spend_usd;
+  }
+  if (adapter.model) {
+    const mapped = normalizeLeaModelId(String(adapter.model));
+    // Only adopt the adapter's model if it maps to a model the companion knows,
+    // so we never overlay an ID the run preflight would reject as unsupported.
+    if (LEA_MODEL_BY_ID.has(mapped)) {
+      state.settings.leaModel = mapped;
+    }
+  }
+  return adapter;
 }
 
 function getProviderApiKey(state, familyId) {
@@ -751,6 +961,38 @@ function providerKeyVerificationError(familyId, label) {
     error: `${familyId}_key_verification_failed`,
     message: `Could not verify ${label} API key. Check your network connection or try again.`
   };
+}
+
+// The adapter's first-class provider env-var names (its `/api/settings` api_keys
+// are keyed by these). Note google maps to GOOGLE_API_KEY — the adapter's
+// recognized name — even though the companion catalog lists GEMINI_API_KEY first.
+const ADAPTER_KEY_ENV_BY_FAMILY = {
+  openai: "OPENAI_API_KEY",
+  anthropic: "ANTHROPIC_API_KEY",
+  google: "GOOGLE_API_KEY"
+};
+
+// Build the `api_keys` patch for the adapter's PUT /api/settings from the keys a
+// user just entered in the Overleaf options form, plus (if available) the raw key
+// for the selected model's family — so the adapter, the single source of truth,
+// always ends up holding the key the selected model needs.
+function buildAdapterApiKeyPatch(patchKeys, state, selectedFamilyId) {
+  const patch = {};
+  if (patchKeys && typeof patchKeys === "object" && !Array.isArray(patchKeys)) {
+    for (const [rawFamilyId, rawValue] of Object.entries(patchKeys)) {
+      const familyId = normalizeProviderFamilyId(rawFamilyId);
+      const env = ADAPTER_KEY_ENV_BY_FAMILY[familyId];
+      const value = String(rawValue || "").trim();
+      if (env && value) patch[env] = { value };
+    }
+  }
+  const selected = normalizeProviderFamilyId(selectedFamilyId);
+  const selectedEnv = ADAPTER_KEY_ENV_BY_FAMILY[selected];
+  if (selectedEnv && !patch[selectedEnv]) {
+    const value = getProviderApiKey(state, selected);
+    if (value) patch[selectedEnv] = { value };
+  }
+  return patch;
 }
 
 function buildProviderEnvPatch(patchKeys) {
@@ -1086,13 +1328,13 @@ function validateLeaRuntime(state, { requireApiKey }) {
   if (!modelInfo) {
     return { ok: false, error: "invalid_lea_model", message: "Lea model must be one of the supported models." };
   }
-  if (requireApiKey && !getProviderApiKey(state, modelInfo.family)) {
+  if (requireApiKey && !isProviderKeyConfigured(state, modelInfo.family)) {
     const family = LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family);
     const envList = family?.envVars?.join(" or ") || "provider API key";
     return {
       ok: false,
       error: `missing_${modelInfo.family}_key`,
-      message: `${family?.label || modelInfo.family} API key must be set in .env or the companion process environment as ${envList}.`
+      message: `${family?.label || modelInfo.family} API key must be set in the lea-standalone settings, .env, or the companion process environment as ${envList}.`
     };
   }
   return { ok: true };
@@ -1230,9 +1472,9 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
 // "api"  → the standalone adapter (apps/lea-standalone/adapter). Config (model,
 //          max_turns) is server-side; tool-approval gates are auto-approved so the
 //          run is autonomous; usage is read back from the run row at the end.
-//          NOTE: project recording is deferred adapter-side (a TODO from
-//          docs/migrate-to-standalone.md §4), so the formalized/unformalized
-//          status derived from project markdown does not update yet.
+//          The session+run are tagged with the Overleaf document namespace
+//          (`target.projectSlug`) so the popover's "This project" usage can be
+//          summed per document from the shared DB.
 // "v1"   → the legacy vendored Lea API (retired; kept for rollback only).
 async function runLeaProofJobForJob({ state, job, target, prompt }) {
   if (isApiFlavor(job.leaApiFlavor)) {
@@ -1246,6 +1488,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt }) {
       maxTurns: job.leaMaxTurns,
       timeoutMs: job.leaJobTimeoutSeconds * 1000,
       autoApprove: true,
+      projectSlug: target.projectSlug || null,
+      projectTitle: target.projectSlug || null,
       appendLog,
       logPath: job.logPath,
       onRunStarted: async (apiRunId, sessionId) => {
@@ -1303,19 +1547,94 @@ async function runLeaProofJobForJob({ state, job, target, prompt }) {
   });
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
-  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
-  const prompt = buildLeaPrompt({
-    projectSlug: target.projectSlug,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    theoremContext,
-    declarationNameHint: job.declarationNameHint || "",
-    resolvedUses,
-    latexContext
-  });
-  const exit = await runLeaProofJobForJob({ state, job, target, prompt });
-  if (job.finalStatus === "max_spend") return;
+// Single source of truth for turning a finished Lea run into a theorem outcome.
+//
+// The Lea adapter is the producer and the authority on whether a proof passed:
+// its terminal `done` status (surfaced here as `exit.ok`) is `success` only when
+// the agent cleared Lea's own final Lean verification. Local filesystem
+// inspection (`localStatus`) is used purely to ENRICH the result — locate the
+// proof file, surface the Lean statement, detect a leftover sorry — or as a
+// FALLBACK when the run itself failed. It is never allowed to override a run the
+// adapter reported as successful. This matters because the `/api` flavor defers
+// project-markdown recording, so the companion frequently cannot locate the
+// proof on disk even though the run genuinely formalized the theorem; trusting
+// the adapter is what keeps the Overleaf tag truthful.
+//
+// `artifactError` is set when the run succeeded but the companion recorded
+// multiple candidate proofs and could not disambiguate which one belongs to this
+// theorem — distinct from the deferred-recording case (no candidates at all),
+// where we trust the adapter.
+//
+// Returns: { jobStatus, finalStatus, effectiveStatus, leanCheck, error }.
+export async function resolveProofOutcome({ job, localStatus, exit, artifactError = null }) {
+  const local = localStatus && localStatus.status ? localStatus : { status: "unformalized" };
+
+  // A located sorry/admit is never a complete formalization, whatever the run
+  // outcome: record the run as failed but carry the sorry_stub effective status
+  // so the UI can still offer stub-based actions. (Unchanged prior behaviour.)
+  if (local.status === "sorry_stub") {
+    return {
+      jobStatus: "failed",
+      finalStatus: "sorry_stub",
+      effectiveStatus: local,
+      leanCheck: null,
+      error: exit.ok
+        ? `Lea reported success but ${job.theoremLabel} still uses sorry/admit.`
+        : (exit.error || null)
+    };
+  }
+
+  // The run did not succeed (errored, timed out, or ended non-success). Keep the
+  // best file-derived status as the effective status for the UI.
+  if (!exit.ok) {
+    return {
+      jobStatus: "failed",
+      finalStatus: local.status || "unformalized",
+      effectiveStatus: local,
+      leanCheck: null,
+      error: exit.error || `Lea API run completed but final status is ${local.status}.`
+    };
+  }
+
+  // Run succeeded, but we recorded multiple candidate proofs and cannot safely
+  // attribute the verified proof to this theorem. Record as failed and surface
+  // the ambiguity rather than guessing.
+  if (artifactError) {
+    return {
+      jobStatus: "failed",
+      finalStatus: local.status || "unformalized",
+      effectiveStatus: local,
+      leanCheck: null,
+      error: artifactError
+    };
+  }
+
+  // exit.ok and no leftover sorry: the adapter passed its own final verification,
+  // so the theorem IS formalized. Run a local lean check for diagnostics only
+  // when we happened to locate the proof file — a missing or failing local
+  // toolchain must NOT downgrade a run the adapter already verified.
+  let leanCheck = null;
+  if (local.status === "formalized" && local.absolutePath) {
+    leanCheck = await runLeanCheck(job.leaWorkspacePath, local.absolutePath);
+  }
+  const effectiveStatus = local.status === "formalized" ? local : { ...local, status: "formalized" };
+  return {
+    jobStatus: "formalized",
+    finalStatus: "formalized",
+    effectiveStatus,
+    leanCheck,
+    error: null
+  };
+}
+
+// Shared finalization for a completed Lea proof run, used by every flavor and by
+// both the initial-run and approval-resume paths. It computes the best local,
+// file-derived status as enrichment, then defers the verdict to
+// `resolveProofOutcome`. This is the single place a run's terminal job status is
+// decided, so the badge, the job record, and the polling resolver can never
+// disagree about whether a theorem was formalized.
+async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses }) {
+  const uses = Array.isArray(resolvedUses) ? resolvedUses : (job.theoremUses || []);
 
   const artifact = exit.ok
     ? await identifyLeaArtifact({
@@ -1356,7 +1675,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
         theoremLabel: target.theoremLabel,
         jobs: {}
       });
-  const effectiveStatus = (
+  const localStatus = (
     status.status === "unformalized" &&
     job.declarationName &&
     job.recordedProofPath
@@ -1371,38 +1690,53 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
       }
     })
     : status;
-  let proofComplete = effectiveStatus.status === "formalized";
-  if (proofComplete && effectiveStatus.absolutePath) {
-    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, effectiveStatus.absolutePath);
-    proofComplete = job.leanCheck.ok;
+
+  const outcome = await resolveProofOutcome({ job, localStatus, exit, artifactError: artifact?.error || null });
+  if (outcome.leanCheck) {
+    job.leanCheck = outcome.leanCheck;
   }
-  const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
-  job.stubbedTheoremUses = nextJobStatus === "formalized"
+  job.stubbedTheoremUses = outcome.jobStatus === "formalized"
     ? await findImportedStubbedTheoremUses({
-      proofPath: effectiveStatus.absolutePath,
-      resolvedUses
+      proofPath: outcome.effectiveStatus.absolutePath,
+      resolvedUses: uses
     })
     : [];
-  job.finalStatus = effectiveStatus.status;
-  job.apiRunId = exit.apiRunId || null;
-  job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
+  job.finalStatus = outcome.finalStatus;
+  job.apiRunId = exit.apiRunId || job.apiRunId || null;
+  job.exitCode = outcome.jobStatus === "formalized" ? 0 : 1;
   job.timedOut = exit.timedOut;
-  if (nextJobStatus === "failed") {
-    job.error = exit.error ||
-      artifact?.error ||
-      job.leanCheck?.message ||
-      `Lea API run completed but final status is ${effectiveStatus.status}.`;
+  if (outcome.error) {
+    job.error = outcome.error;
+  } else {
+    delete job.error;
   }
   job.finishedAt = new Date().toISOString();
   const exitSummary = exit.timedOut
     ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
     : `Lea API run ${exit.ok ? "completed" : "failed"}`;
-  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${effectiveStatus.status}\n`);
+  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${outcome.finalStatus}\n`);
   if (job.error) {
     await appendLog(job.logPath, `[backend] ${job.error}\n`);
   }
-  job.status = nextJobStatus;
+  job.status = outcome.jobStatus;
   await writeJson(state.jobsPath, state.jobs);
+}
+
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
+  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
+  const prompt = buildLeaPrompt({
+    projectSlug: target.projectSlug,
+    theoremLabel: target.theoremLabel,
+    theoremText,
+    theoremContext,
+    declarationNameHint: job.declarationNameHint || "",
+    resolvedUses,
+    latexContext
+  });
+  const exit = await runLeaProofJobForJob({ state, job, target, prompt });
+  if (job.finalStatus === "max_spend") return;
+
+  await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 }
 
 async function maybeResumeStubFormalization({ state, target, theoremText, theoremContext = "", theoremUses = [] }) {
@@ -1565,92 +1899,7 @@ async function runLeaJobFromApproval({ state, job, target }) {
 }
 
 async function finishLeaProofJob({ state, job, target, beforeMarkers, exit }) {
-  const artifact = exit.ok
-    ? await identifyLeaArtifact({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      beforeMarkers,
-      job
-    })
-    : null;
-
-  if (artifact?.ok) {
-    job.declarationName = artifact.entry.name;
-    job.recordedProofPath = artifact.entry.proofPath;
-    job.moduleName = artifact.entry.moduleName || null;
-  }
-  recordJobUsage(job, exit);
-
-  const status = artifact?.ok
-    ? await getLeaProofStatusFromEntry({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      entry: artifact.entry
-    })
-    : artifact?.error
-      ? {
-        status: "unformalized",
-        theoremLabel: target.theoremLabel,
-        declarationName: target.declarationName,
-        relativePath: target.relativePath,
-        absolutePath: target.absolutePath,
-        projectId: target.projectId,
-        projectSlug: target.projectSlug,
-        projectMarkdownPath: target.projectMarkdownPath
-      }
-      : await getTheoremStatus({
-        leaRepoPath: state.settings.leaRepoPath,
-        overleafProjectId: target.overleafProjectId,
-        theoremLabel: target.theoremLabel,
-        jobs: {}
-      });
-  const effectiveStatus = (
-    status.status === "unformalized" &&
-    job.declarationName &&
-    job.recordedProofPath
-  )
-    ? await getLeaProofStatusFromEntry({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      entry: {
-        name: job.declarationName,
-        proofPath: job.recordedProofPath,
-        moduleName: job.moduleName || null
-      }
-    })
-    : status;
-  let proofComplete = effectiveStatus.status === "formalized";
-  if (proofComplete && effectiveStatus.absolutePath) {
-    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, effectiveStatus.absolutePath);
-    proofComplete = job.leanCheck.ok;
-  }
-  const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
-  job.stubbedTheoremUses = nextJobStatus === "formalized"
-    ? await findImportedStubbedTheoremUses({
-      proofPath: effectiveStatus.absolutePath,
-      resolvedUses: job.theoremUses || []
-    })
-    : [];
-  job.finalStatus = effectiveStatus.status;
-  job.apiRunId = exit.apiRunId || job.apiRunId || null;
-  job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
-  job.timedOut = exit.timedOut;
-  if (nextJobStatus === "failed") {
-    job.error = exit.error ||
-      artifact?.error ||
-      job.leanCheck?.message ||
-      `Lea API run completed but final status is ${effectiveStatus.status}.`;
-  }
-  job.finishedAt = new Date().toISOString();
-  const exitSummary = exit.timedOut
-    ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
-    : `Lea API run ${exit.ok ? "completed" : "failed"}`;
-  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${effectiveStatus.status}\n`);
-  if (job.error) {
-    await appendLog(job.logPath, `[backend] ${job.error}\n`);
-  }
-  job.status = nextJobStatus;
-  await writeJson(state.jobsPath, state.jobs);
+  await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses: job.theoremUses || [] });
 }
 
 function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], latexContext = null }) {
@@ -2820,6 +3069,7 @@ async function getTheoremStatus({
     includeStubbedTheoremUses: true
   });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
+  const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
   const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
   const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
 
@@ -2845,6 +3095,20 @@ async function getTheoremStatus({
 
   if (directProofStatus?.status === "formalized") {
     return withLeaSession(directProofStatus);
+  }
+
+  // Authoritative outcome: a finished job the finalizer recorded as `formalized`
+  // means the adapter verified the proof, even when project-markdown recording is
+  // deferred and no local file evidence (mapped/project/direct) could be found.
+  // Surface it as formalized so the Overleaf tag matches the job record. Guard on
+  // recency so a later failed re-run is not shadowed by a stale success.
+  if (
+    formalizedJob &&
+    (!failedJob ||
+      String(formalizedJob.finishedAt || formalizedJob.startedAt) >=
+        String(failedJob.finishedAt || failedJob.startedAt))
+  ) {
+    return withLeaSession(buildJobResponse({ job: formalizedJob, status: "formalized", target }));
   }
 
   if (failedJob) {
@@ -3547,8 +3811,10 @@ function setCorsHeaders(response) {
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function errorResponse(statusCode, error, message) {
-  return { statusCode, body: { error, message } };
+function errorResponse(statusCode, error, message, field) {
+  const body = { error, message };
+  if (field) body.field = field;
+  return { statusCode, body };
 }
 
 const isMain = fileURLToPath(import.meta.url) === process.argv[1];

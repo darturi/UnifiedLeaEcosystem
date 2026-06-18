@@ -49,6 +49,12 @@ export default function App() {
   const [runStatusById, setRunStatusById] = useState<Record<string, string>>({});
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  // Separate, always-on stream that watches the *session list* (not a single run),
+  // so a session started anywhere — including an Overleaf-driven formalization the
+  // companion creates via the adapter's POST /api/runs — appears live without a
+  // manual refresh. Kept distinct from eventSourceRef, which is per-run and gets
+  // closed/reopened as the user navigates sessions.
+  const sessionsEventSourceRef = useRef<EventSource | null>(null);
   const runStatusRef = useRef<RunStatus>();
   runStatusRef.current = runStatus;
 
@@ -79,6 +85,24 @@ export default function App() {
     };
     restore().catch((err) => setError(err instanceof Error ? err.message : String(err)));
     return () => eventSourceRef.current?.close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Subscribe once to the session-list feed. Each `sessions_changed` event just
+  // re-fetches the list; this only swaps the sidebar array and never touches the
+  // open session's detail/streaming state (selection is keyed by id), so it can't
+  // clobber a live run or steal focus. The browser EventSource auto-reconnects if
+  // the capped server stream recycles.
+  useEffect(() => {
+    const source = new EventSource('/api/sessions/events');
+    sessionsEventSourceRef.current = source;
+    source.addEventListener('sessions_changed', () => {
+      refreshSessions().catch(() => {});
+    });
+    return () => {
+      source.close();
+      if (sessionsEventSourceRef.current === source) sessionsEventSourceRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -362,6 +386,7 @@ export default function App() {
           }
           onNewSession={resetForNewSession}
           onOpenSettings={() => setView('settings')}
+          onOpenStats={() => setView('stats')}
         />
 
         <div className={`main-area ${canvasCollapsed ? 'canvas-collapsed' : ''}`}>

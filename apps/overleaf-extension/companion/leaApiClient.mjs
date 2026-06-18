@@ -113,20 +113,67 @@ async function fetchJson(fetchImpl, url, options) {
     }
   }
   if (!response.ok) {
-    const detail = body?.detail || body?.error || text || `HTTP ${response.status}`;
-    return { ok: false, status: response.status, error: `HTTP ${response.status}: ${detail}` };
+    const rawDetail = body?.detail ?? body?.error ?? text ?? `HTTP ${response.status}`;
+    const detail =
+      rawDetail && typeof rawDetail === "object"
+        ? rawDetail.message || JSON.stringify(rawDetail)
+        : rawDetail;
+    return { ok: false, status: response.status, error: `HTTP ${response.status}: ${detail}`, body };
   }
   return { ok: true, status: response.status, body };
 }
 
-export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true }) {
+// --- Shared settings delegation -------------------------------------------
+// The adapter's `config/lea.local.toml` (served by GET/PUT /api/settings) is the
+// single source of truth for the settings shared with the lea-standalone UI:
+// `model`, `max_turns`, `max_spend_usd`, and provider `api_keys`. The companion
+// reads them here and writes them via `putAdapterSettings`, instead of keeping
+// its own divergent copies, so a change in either UI shows up in both.
+
+export function fetchAdapterSettings({ fetchImpl, baseUrl }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/settings`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+export function putAdapterSettings({ fetchImpl, baseUrl, body }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/settings`, {
+    method: "PUT",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body || {}),
+  });
+}
+
+// The adapter's GET /api/stats (store.usage_stats) is the single source of truth
+// for usage the lea-standalone Stats page renders: `global` all-time rollups and
+// per-`sessions` rows (each carrying `project_slug`). The companion reads it here
+// so the Overleaf popover shows the exact same numbers instead of its own
+// in-memory job tally.
+export function fetchAdapterUsageStats({ fetchImpl, baseUrl }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/stats`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
   // end-to-end with zero human interaction. (The client also auto-resolves any
   // approval events below as a belt-and-suspenders, but an autonomous run emits
   // none.) Defaults true because this client is the autonomous Overleaf path.
+  //
+  // `projectSlug` is the Overleaf document namespace (slugProjectId). When present
+  // the adapter tags the session+run with a project of that slug, so the popover's
+  // "This project" usage can be summed per document. Omitted for the interactive
+  // UI path, which stays project-less.
   const body = { message, autonomous };
   if (sessionId) body.session_id = sessionId;
+  if (projectSlug) {
+    body.project_slug = projectSlug;
+    body.project_title = projectTitle || projectSlug;
+  }
   return fetchJson(fetchImpl, `${baseUrl}/api/runs`, {
     method: "POST",
     headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -265,6 +312,8 @@ export async function runApiProofJob({
   timeoutMs = 900000,
   autoApprove = true,
   autonomous = true,
+  projectSlug = null,
+  projectTitle = null,
   appendLog = null,
   logPath = null,
   onRunStarted = null,
@@ -274,7 +323,7 @@ export async function runApiProofJob({
     if (appendLog && logPath) await appendLog(logPath, line);
   };
 
-  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous });
+  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
   const runId = start.body?.run_id;

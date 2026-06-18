@@ -58,6 +58,30 @@ logger = logging.getLogger("lea-interface.bridge")
 # and the warm LSP daemon. A second concurrent run is rejected, not queued.
 active_run_lock = Lock()
 
+# The run_id currently being driven (holding `active_run_lock`), or None. Lets the
+# SSE endpoint tell "start + drive this run" apart from "a second viewer attaching
+# to a run already in flight" (e.g. the lea-standalone UI opening an Overleaf run
+# the companion is driving). Without this, every extra connection spawned another
+# runner that lost the lock and emitted run_error+done(failed), which the UI's
+# reconcile→reattach cycle turned into a request storm. Guarded by its own lock so
+# reads from the async endpoint never tear against the run thread's write.
+_active_run_guard = Lock()
+_active_run_id: str | None = None
+
+
+def current_active_run_id() -> str | None:
+    """The run_id currently being driven, or None. Used by the SSE endpoint to
+    route a second connection for the same run to a passive (read-only) view
+    instead of spawning a competing runner."""
+    with _active_run_guard:
+        return _active_run_id
+
+
+def _set_active_run_id(run_id: str | None) -> None:
+    global _active_run_id
+    with _active_run_guard:
+        _active_run_id = run_id
+
 # Per-run cooperative stop flags (D18). The run registers its Event when it starts
 # and the interrupt endpoint sets it; the agent checks it at each turn boundary and
 # stops cleanly. `setdefault` everywhere makes the order race-free — whoever touches
@@ -258,6 +282,9 @@ def run_lea(context: RunnerContext) -> None:
         emit(events, "run_error", {"message": "Another Lea run is already active."})
         emit(events, "done", {"status": "failed"})
         return
+    # We hold the slot — record which run is being driven so a second connection
+    # for THIS run attaches passively instead of spawning a doomed competitor.
+    _set_active_run_id(run_id)
 
     # Register (or adopt) this run's cooperative stop flag — the interrupt endpoint
     # may have created+set it already if Stop was hit before we got here (D18).
@@ -407,5 +434,6 @@ def run_lea(context: RunnerContext) -> None:
     finally:
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
+        _set_active_run_id(None)
         active_run_lock.release()
         emit(events, "done", {"status": final_status})

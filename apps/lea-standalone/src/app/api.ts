@@ -6,7 +6,10 @@
 // frontend never reconstructs ordering — it merges on `seq`.
 
 // ── Session-level status (derived in store.list_sessions) ──────────────────────
-export type SessionStatus = 'empty' | 'unchecked' | 'ok' | 'error';
+// 'running' = a session with no code yet but an active run, so a freshly registered
+// formalization (including an Overleaf-driven one) shows as in-progress immediately;
+// once code exists the working-copy verdict takes over.
+export type SessionStatus = 'empty' | 'unchecked' | 'ok' | 'error' | 'running';
 // ── Run-level status (a single proof attempt) ─────────────────────────────────
 // 'success' = the agent passed the final verification gate (theorem proved — this
 // is what shows the green "Proved" milestone). 'answered' = a chat / QA / sketch
@@ -320,11 +323,52 @@ export interface ModelRequirements {
   satisfied: boolean;
 }
 
+// A session row as returned by GET /api/stats. Same shape as SessionSummary, but
+// a live session can report status 'running' (used to drive the stats live-refresh).
+export interface UsageSessionSummary extends Omit<SessionSummary, 'status'> {
+  status: SessionStatus | 'running';
+}
+
+// All-time rollups (store.usage_stats → "global"). Internal to UsageStats.
+interface UsageGlobals {
+  session_count: number;
+  message_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  average_tokens_per_session: number;
+  average_cost_per_session: number;
+  average_messages_per_session: number;
+}
+
+// One calendar day of run usage (store.usage_stats → "daily"). Internal to UsageStats.
+interface UsageDay {
+  day: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  run_count: number;
+  session_count: number;
+}
+
+// Per-model rollup across runs (store.usage_stats → "models"). Internal to UsageStats.
+interface UsageModelRow {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  run_count: number;
+  session_count: number;
+}
+
 export interface UsageStats {
-  sessions: SessionSummary[];
-  global: Record<string, number>;
-  daily: Record<string, number>[];
-  models: Record<string, unknown>[];
+  sessions: UsageSessionSummary[];
+  global: UsageGlobals;
+  daily: UsageDay[];
+  models: UsageModelRow[];
 }
 
 export async function getSettings(): Promise<AppSettings> {

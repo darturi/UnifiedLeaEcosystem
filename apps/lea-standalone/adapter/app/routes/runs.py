@@ -29,6 +29,12 @@ class RunRequest(BaseModel):
     # human interaction (the Overleaf path). Defaults false → the interactive UI
     # behavior (gated tools + collaborator prompt) is unchanged.
     autonomous: bool = False
+    # Project namespace (the Overleaf document slug). When present, a new session is
+    # tagged with a project of this slug (created on first use) so per-document usage
+    # can be aggregated for the Overleaf popover's "This project" total. Absent for
+    # the interactive UI path, which stays project-less.
+    project_slug: str | None = None
+    project_title: str | None = None
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -49,15 +55,32 @@ def create_run(request: RunRequest) -> dict:
     if settings_service.spend_limit_reached(config.max_spend_usd):
         raise HTTPException(status_code=402, detail="Max spend limit has been reached.")
 
+    # Resolve the project namespace (Overleaf path) so the session + run are tagged
+    # and per-document usage can be summed. Invalid slugs are ignored rather than
+    # failing the run (best-effort association).
+    project_id: str | None = None
+    if request.project_slug:
+        try:
+            project = store.get_or_create_project(
+                request.project_slug, title=request.project_title
+            )
+            project_id = project["id"]
+        except ValueError:
+            project_id = None
+
     if request.session_id:
         session = store.get_session(request.session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        # Backfill the project on an existing session that has none yet (e.g. the
+        # first tagged run for a session created project-less).
+        if project_id and not session.get("project_id"):
+            store.assign_session_project(session["id"], project_id)
     else:
-        session = store.create_session(message)
+        session = store.create_session(message, project_id=project_id)
 
     run = store.create_run(session["id"], config.model, None, config.max_turns,
-                           autonomous=request.autonomous)
+                           project_id=project_id, autonomous=request.autonomous)
     user_message = store.add_message(session["id"], "user", message, run["id"])
     return {"session_id": session["id"], "run_id": run["id"], "message": user_message}
 
@@ -96,6 +119,37 @@ async def run_events(run_id: str) -> StreamingResponse:
         raise HTTPException(status_code=404, detail="Run not found")
     if run["status"] not in {"pending", "running"}:
         raise HTTPException(status_code=409, detail="Run has already completed")
+
+    # A second connection for a run already being driven (e.g. the lea-standalone
+    # UI opening an Overleaf run the companion is driving) must NOT spawn a second
+    # runner — that competitor loses the single-run lock and emits run_error +
+    # done(failed), which the UI's reconcile→reattach cycle turns into a request
+    # storm. Instead, attach as a passive viewer: tail the run's status and emit a
+    # single terminal `done` once it actually finishes. The run keeps making
+    # progress under its real driver; this connection just observes.
+    active_run_id = bridge.current_active_run_id()
+    if active_run_id is not None and active_run_id != run_id:
+        # A different run holds the single-run slot. Reject up front (409) instead
+        # of spawning a runner that loses the lock and emits done(failed) — the
+        # latter drives the UI's reconcile→reattach loop into a request storm.
+        raise HTTPException(status_code=409, detail="Another Lea run is already active.")
+
+    if active_run_id == run_id:
+        async def passive_view():
+            # Cap the wait so a wedged run can't hold the connection forever; the
+            # browser EventSource simply reconnects (and re-tails) if we time out.
+            for _ in range(36000):  # ~3h at 0.3s/iter
+                current = store.get_run(run_id)
+                if not current:
+                    yield sse("done", {"status": "failed"})
+                    return
+                if current["status"] not in {"pending", "running"}:
+                    yield sse("done", {"status": current["status"]})
+                    return
+                await asyncio.sleep(0.3)
+            yield sse("done", {"status": "running"})
+
+        return StreamingResponse(passive_view(), media_type="text/event-stream")
 
     queue: Queue[dict] = Queue()
     session = store.session_detail(run["session_id"])

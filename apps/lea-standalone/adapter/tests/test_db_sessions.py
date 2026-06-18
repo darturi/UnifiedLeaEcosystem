@@ -60,6 +60,53 @@ def test_step_without_verdict_is_unchecked(tmp_path, monkeypatch):
     assert _list_status(session["id"]) == "unchecked"
 
 
+def test_session_with_active_run_and_no_code_is_running(tmp_path, monkeypatch):
+    # A freshly registered formalization (e.g. an Overleaf-driven run) has a
+    # pending/running run but no code step yet -> it should read 'running' rather
+    # than 'empty', so it surfaces as in-progress in the list the moment it starts.
+    _fresh_db(tmp_path, monkeypatch)
+    session = store.create_session("Just started")
+    store.create_run(session["id"], "gpt-4o", "openai", 3)  # status defaults to 'pending'
+    assert store.session_detail(session["id"])["status"] == "running"
+    assert _list_status(session["id"]) == "running"
+
+
+def test_active_run_does_not_override_an_existing_verdict(tmp_path, monkeypatch):
+    # D14 still holds once code exists: the working-copy verdict wins even while a
+    # run is active — run lifecycle does not leak into a session that has content.
+    _fresh_db(tmp_path, monkeypatch)
+    session = store.create_session("Has code, still running")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)  # stays 'pending'
+    store.add_code_step(session["id"], run["id"], "p.lean", commit_sha="9" * 40, check_status="ok")
+    assert store.session_detail(session["id"])["status"] == "ok"
+    assert _list_status(session["id"]) == "ok"
+
+
+def test_running_flips_to_verdict_when_run_finishes(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    session = store.create_session("Lifecycle")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    assert _list_status(session["id"]) == "running"  # no code yet, active run
+    store.update_run(run["id"], "success")
+    assert _list_status(session["id"]) == "empty"  # run no longer active, still no code
+
+
+def test_sessions_digest_changes_on_create_and_run_state(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    empty = store.sessions_digest()
+    session = store.create_session("D")
+    after_create = store.sessions_digest()
+    assert after_create != empty  # a new session moves the digest
+
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    after_run = store.sessions_digest()
+    assert after_run != after_create  # an active run moves it
+
+    store.update_run(run["id"], "success")
+    after_finish = store.sessions_digest()
+    assert after_finish != after_run  # leaving the active set moves it too
+
+
 def test_user_edit_verdict_overrides_after_a_run(tmp_path, monkeypatch):
     # P2: a user edit after the run completes changes the working-copy verdict
     _fresh_db(tmp_path, monkeypatch)

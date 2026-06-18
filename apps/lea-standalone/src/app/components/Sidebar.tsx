@@ -1,3 +1,4 @@
+import { BarChart3 } from 'lucide-react';
 import type { SessionSummary } from '../api';
 
 // Left rail: brand, new-proof, (search stub), date-grouped loose chats, footer.
@@ -11,6 +12,7 @@ export function Sidebar({
   onSelectSession,
   onNewSession,
   onOpenSettings,
+  onOpenStats,
 }: {
   sessions: SessionSummary[];
   selectedSessionId?: string;
@@ -19,6 +21,7 @@ export function Sidebar({
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onOpenSettings: () => void;
+  onOpenStats: () => void;
 }) {
   const groups = groupByDate(sessions);
 
@@ -61,7 +64,15 @@ export function Sidebar({
 
       <div className="sidebar-foot">
         <span>{userEmail || 'local'}</span>
-        <button className="gear" onClick={onOpenSettings} title="Settings">
+        <button
+          className="gear stats"
+          onClick={onOpenStats}
+          title="Usage & statistics"
+          aria-label="Usage & statistics"
+        >
+          <BarChart3 size={15} strokeWidth={1.75} />
+        </button>
+        <button className="gear" onClick={onOpenSettings} title="Settings" aria-label="Settings">
           ⚙
         </button>
       </div>

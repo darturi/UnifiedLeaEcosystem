@@ -29,10 +29,12 @@ import {
   getUsageStats,
 } from '../api';
 
-const INPUT_COLOR = '#6366f1';
-const OUTPUT_COLOR = '#22d3ee';
-const MONEY_COLOR = '#34d399';
-const MODEL_COLORS = ['#6366f1', '#22d3ee', '#f59e0b', '#34d399', '#a855f7', '#ef4444'];
+// Warm-paper palette (mirrors src/styles/lea-v2.css) so charts read like the
+// main chat panel rather than the old neon shadcn dashboard.
+const INPUT_COLOR = '#c96442'; // --accent (terracotta)
+const OUTPUT_COLOR = '#2f6f9f'; // --fn (blue)
+const MONEY_COLOR = '#4f8a5b'; // --green
+const MODEL_COLORS = ['#c96442', '#2f6f9f', '#4f8a5b', '#b8842a', '#9a3e8f', '#c0564a'];
 const LIVE_STATS_REFRESH_MS = 1000;
 
 function fmtNumber(value: number, digits = 0) {
@@ -87,7 +89,7 @@ function fmtDuration(seconds: number) {
 
 function modelColor(model: string | null | undefined) {
   if (!model) {
-    return '#717182';
+    return '#8a8983'; // --muted
   }
   let hash = 0;
   for (const char of model) {
@@ -514,6 +516,22 @@ function GlobalStatsPane({ stats }: { stats?: UsageStats }) {
             )}
           </div>
 
+          {/* Placeholder: direct (UI) vs Overleaf-extension usage. Origin is not
+              tracked yet (no `source` on runs), so these read as not-yet-available
+              until that backend support lands. Layout home reserved here. */}
+          <div className="flex flex-col gap-2">
+            <span className="text-[0.65rem] uppercase tracking-widest text-muted-foreground">
+              By source
+            </span>
+            <div className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-4">
+              <Row label="Direct (UI)" value="—" />
+              <Row label="Overleaf extension" value="—" />
+              <span className="text-xs text-muted-foreground">
+                Source tracking isn't wired up yet — direct vs Overleaf usage will appear here in a later pass.
+              </span>
+            </div>
+          </div>
+
           <div className="flex flex-col gap-2 rounded-lg border border-border p-4">
             <span className="text-[0.65rem] uppercase tracking-widest text-muted-foreground">
               Averages per session
@@ -714,7 +732,7 @@ export function StatsPage({ onBack }: { onBack: () => void }) {
   }, [selectedId, selectedSummary, sessionDetails]);
 
   return (
-    <div className="flex size-full flex-col bg-background text-foreground">
+    <div className="lea-app stats-scope flex size-full flex-col bg-background text-foreground">
       <header className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
         <button
           type="button"
