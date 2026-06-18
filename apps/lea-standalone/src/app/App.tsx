@@ -5,6 +5,7 @@ import { Canvas, type CheckOutcome } from './components/Canvas';
 import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
 import { buildTimeline, sortCodeSteps } from './timeline.mjs';
+import { pickInitialSession, stripSessionParam } from './sessionDeepLink.mjs';
 import {
   type ApprovalDecision,
   type ChatMessage,
@@ -79,9 +80,32 @@ export default function App() {
       getSettings()
         .then((s) => setModel(typeof s.model === 'string' ? s.model : undefined))
         .catch(() => {});
-      const savedId = window.localStorage.getItem(SELECTED_SESSION_KEY);
-      const saved = savedId ? loaded.find((s) => s.id === savedId) : undefined;
-      if (saved) await loadSession(saved.id);
+      // The Overleaf extension's "View in Lea UI" action opens <ui>/?session=<id>;
+      // that deep-link takes precedence over the last-opened session.
+      const { sessionId: initialSessionId, source } = pickInitialSession({
+        search: window.location.search,
+        savedId: window.localStorage.getItem(SELECTED_SESSION_KEY),
+        sessions: loaded,
+      });
+      if (source === 'deep-link') {
+        // Strip the param so a later reload falls back to the saved-session restore.
+        const cleaned = stripSessionParam(window.location.search);
+        window.history.replaceState(
+          {},
+          '',
+          `${window.location.pathname}${cleaned}${window.location.hash}`,
+        );
+      }
+      if (initialSessionId) {
+        try {
+          await loadSession(initialSessionId);
+        } catch (err) {
+          // A stale saved id is unexpected (it was just found in the list); a bad
+          // deep-link id is plausible — in that case leave the user on a fresh
+          // session rather than surfacing an error.
+          if (source !== 'deep-link') throw err;
+        }
+      }
     };
     restore().catch((err) => setError(err instanceof Error ? err.message : String(err)));
     return () => eventSourceRef.current?.close();
