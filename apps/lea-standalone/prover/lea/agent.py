@@ -24,10 +24,8 @@ from .events import (
     FileChanged,
     CheckResult,
     UsageUpdated,
-    ProjectEntryUpdated,
     Finished,
 )
-from .project import ProjectContext, record_project_entry
 
 
 _NARRATE_TOOL_STEPS_INSTRUCTION = """
@@ -300,7 +298,7 @@ def run_events(
     config: LeaConfig,
     messages: list,
     *,
-    project: dict | ProjectContext | None = None,
+    namespace: str | None = None,
     session_id: str | None = None,
     working_dir: str | None = None,
     should_stop=None,
@@ -342,7 +340,7 @@ def run_events(
         mcp_manager.start()
     try:
         yield from _run_events_inner(
-            config, messages, project=project, session_id=session_id,
+            config, messages, namespace=namespace, session_id=session_id,
             working_dir=working_dir, should_stop=should_stop, gate=gate,
         )
     finally:
@@ -354,13 +352,17 @@ def _run_events_inner(
     config: LeaConfig,
     messages: list,
     *,
-    project: dict | ProjectContext | None = None,
+    namespace: str | None = None,
     session_id: str | None = None,
     working_dir: str | None = None,
     should_stop=None,
     gate=None,
 ):
-    system = load_system_prompt(config.prompt_variant, config.skills, workspace=working_dir)
+    # `namespace` (e.g. "Lea.Foo") lets the adapter state the active write
+    # namespace for a project run (D32); None keeps the default Lea.Misc block.
+    system = load_system_prompt(
+        config.prompt_variant, config.skills, workspace=working_dir, namespace=namespace,
+    )
     if config.narrate_tool_steps:
         system += _NARRATE_TOOL_STEPS_INSTRUCTION
     model = config.model
@@ -369,13 +371,6 @@ def _run_events_inner(
     # tools register, then select per config (None → all registered tools).
     import_tool_modules(config.tool_modules)
     tools_schema, tool_handlers = build_toolset(config.tools)
-    if isinstance(project, dict):
-        project = ProjectContext(
-            project_id=str(project.get("project_id") or ""),
-            project_path=project.get("project_path"),
-            project_context=project.get("project_context"),
-            record_on_success=bool(project.get("record_on_success", True)),
-        )
 
     # Stateless (D16): the caller owns the transcript. Work on a private copy so we
     # never mutate the caller's list in place; the final state rides out via the
@@ -386,16 +381,8 @@ def _run_events_inner(
     if session_id is None:
         session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     total_usage = Usage()
-    # The original request — first plain-text user message. Used only for project
-    # recording on success (a v2.1-deferred path the D-group reworks).
-    task = next(
-        (m["content"] for m in messages
-         if m.get("role") == "user" and isinstance(m.get("content"), str)),
-        "",
-    )
 
     total_cost = 0.0
-    accepted_signature: str | None = None
     proof_state = ProofVerificationState()
 
     def transcript(turns: int) -> dict:
@@ -519,7 +506,7 @@ def _run_events_inner(
             text = "".join(p["text"] for p in assistant_parts if p["type"] == "text")
             if assistant_mode:
                 # Chat/assistant turn — not a formalization run, so skip the
-                # proof gate and project recording entirely.
+                # final proof gate entirely.
                 yield Finished("assistant", text or "(no response)", turn, session_id, model,
                                total_usage, total_cost, transcript(turn))
                 return
@@ -580,27 +567,6 @@ def _run_events_inner(
                 continue
 
             final_transcript = transcript(turn)
-            if project:
-                try:
-                    update = record_project_entry(
-                        project=project,
-                        task=task,
-                        transcript=final_transcript,
-                        signature=accepted_signature,
-                    )
-                    if update:
-                        yield ProjectEntryUpdated(
-                            update.project_id,
-                            update.project_path,
-                            update.theorem_name,
-                            update.proof_path,
-                            update.entry_action,
-                            update.module_name,
-                        )
-                except Exception as exc:
-                    yield AssistantTextDelta(
-                        f"\n\nProject recording failed: {type(exc).__name__}: {exc}"
-                    )
             yield Finished("completed", text or "(no response)", turn, session_id, model,
                            total_usage, total_cost, final_transcript)
             return

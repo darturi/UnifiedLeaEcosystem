@@ -79,8 +79,8 @@
     (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
   </div>
 
-  <div class="bar"><i style="width:20%"></i></div>
-  <div class="counts"><b>5 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 1 complete</b> — create · list · open a project (P1–P3 green · F1–F2 confirmed in the UI)</div>
+  <div class="bar"><i style="width:24%"></i></div>
+  <div class="counts"><b>6 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · Slice 1 complete · Q1 done — prover is project-agnostic (project.py deleted; prompt namespace parameterized)</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -127,14 +127,14 @@
     <h2>Slice 2 · Sessions in a project</h2>
     <div class="ghint">Run real proofs inside a project that chain sibling lemmas. Ends with: start a proof from the project, it lands in the project repo, the chat/canvas work unchanged.</div>
 
-    <div class="todo is-planned">
+    <div class="todo is-done">
       <div class="top"><span class="id">Q1</span><span class="title">Prover goes project-agnostic</span>
-        <span class="tag be">backend</span><span class="dec">D32</span><span class="badge b-planned">Planned (next)</span></div>
+        <span class="tag be">backend</span><span class="dec">D32</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Delete <code>prover/lea/project.py</code> + the <code>project=</code> param of <code>run_events</code>; parameterize the prompt's hardcoded <code>Lea.Misc</code> workspace/namespace block so the adapter states the active namespace. Prover suite stays green.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-planned">
       <div class="top"><span class="id">Q2</span><span class="title">Create-session-in-project + context compose</span>
-        <span class="tag be">backend</span><span class="dec">D23/D24/D25/D33</span><span class="badge b-queued">Queued</span></div>
+        <span class="tag be">backend</span><span class="dec">D23/D24/D25/D33</span><span class="badge b-planned">Planned (next)</span></div>
       <div class="scope"><code>POST /api/projects/{id}/sessions</code> (working dir = project repo). Bridge resolves the project repo + composes & <b>prepends one context message</b> (instructions + memory + blueprint + file inventory); asset writes → "blueprint updated" graph signal, not canvas snapshots.</div>
     </div>
     <div class="todo">

@@ -38,7 +38,7 @@ def test_events_are_same_classes():
     # re-exports must be the *same* classes, so isinstance() across the boundary works
     for name in ("AssistantTextDelta", "TurnStarted", "ToolCalled", "ToolResulted",
                  "ToolApprovalRequested", "UsageUpdated", "FileChanged", "CheckResult",
-                 "VerifyResult", "Error", "Finished", "ProjectEntryUpdated", "AgentEvent"):
+                 "VerifyResult", "Error", "Finished", "AgentEvent"):
         check(f"{name} is events.{name}", getattr(interface, name) is getattr(events, name))
 
 
