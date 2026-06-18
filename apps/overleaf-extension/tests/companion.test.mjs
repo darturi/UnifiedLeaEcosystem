@@ -873,6 +873,80 @@ test("completed formalization status keeps Lea UI session link", async () => {
   assert.equal(statuses.body.statuses.linked_done_test.leaSessionUrl, "http://localhost:5173/?session=sess-done");
 });
 
+test("in-progress status links Lea UI session from leaSessionId (no recorder)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  state.jobs.active_link = {
+    jobId: "active_link",
+    jobKey: "project-1:in_progress_test",
+    status: "in_progress",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    theoremLabel: "in_progress_test",
+    declarationName: "in_progress_test",
+    // Adapter session id from run start; recorder CLI never ran.
+    leaSessionId: "sess-running",
+    recorderSessionId: null,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "in_progress_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.in_progress_test.status, "in_progress");
+  assert.equal(statuses.body.statuses.in_progress_test.leaSessionId, "sess-running");
+  assert.equal(statuses.body.statuses.in_progress_test.leaSessionUrl, "http://localhost:5173/?session=sess-running");
+});
+
+test("formalization status links Lea UI session from leaSessionId when no recorder session exists", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "adapter_session_test.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem adapter_session_test : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "adapter_session_test",
+    proofPath,
+    moduleName: "Lea.Project1.adapter_session_test"
+  });
+  state.jobs.adapter_link = {
+    jobId: "adapter_link",
+    jobKey: "project-1:adapter_session_test",
+    status: "success",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    theoremLabel: "adapter_session_test",
+    declarationName: "adapter_session_test",
+    // Real adapter session id (set on run start); recorder CLI never ran.
+    leaSessionId: "sess-adapter",
+    recorderSessionId: null,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "adapter_session_test", theoremText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.adapter_session_test.status, "formalized");
+  assert.equal(statuses.body.statuses.adapter_session_test.leaSessionId, "sess-adapter");
+  assert.equal(statuses.body.statuses.adapter_session_test.leaSessionUrl, "http://localhost:5173/?session=sess-adapter");
+});
+
 test("stub starts Lea in theorem translation approval mode and records a sorry stub", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];

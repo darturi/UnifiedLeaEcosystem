@@ -2915,7 +2915,7 @@ async function readLogTail(logPath, maxChars = 4000) {
 
 function buildJobResponse({ job, status, target }) {
   const declarationName = job.declarationName || target.declarationName || target.theoremLabel;
-  const leaSessionId = job.recorderSessionId || null;
+  const leaSessionId = job.leaSessionId || job.recorderSessionId || null;
   const response = {
     status,
     jobId: job.jobId,
@@ -3362,17 +3362,22 @@ async function getLatestMappedJobStatus({
 }
 
 function addLeaSessionLink(status, job) {
-  if (!status || !job?.recorderSessionId) {
+  // Prefer the adapter session id (set on run start, what the Lea UI lists and
+  // deep-links by) and fall back to the recorder session id. The recorder CLI is
+  // a stub in many setups, so keying only off recorderSessionId left formalized
+  // theorems with no session link (and no "View in Lea UI" button).
+  const sessionId = job?.leaSessionId || job?.recorderSessionId || null;
+  if (!status || !sessionId) {
     return status;
   }
-  status.leaSessionId = job.recorderSessionId;
-  status.leaSessionUrl = buildLeaSessionUrl(job.leaUiBaseUrl, job.recorderSessionId);
+  status.leaSessionId = sessionId;
+  status.leaSessionUrl = buildLeaSessionUrl(job.leaUiBaseUrl, sessionId);
   return status;
 }
 
 function findLatestJobWithLeaSession(jobs, jobKey) {
   return Object.values(jobs || {})
-    .filter((job) => job.jobKey === jobKey && job.recorderSessionId)
+    .filter((job) => job.jobKey === jobKey && (job.leaSessionId || job.recorderSessionId))
     .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
 }
 

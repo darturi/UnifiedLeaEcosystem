@@ -166,18 +166,28 @@
     }
 
     const leaSession = getLeaSessionLink(statusInfo);
-    if (leaSession) {
+    // Offer "View in Lea UI" whenever the theorem is formalized, in progress, or
+    // its status is unknown, even if no session link resolved yet, so the action
+    // is reliably discoverable. With a session link it deep-links to that session;
+    // without one it falls back to opening the Lea UI home. Unlike the formalize/
+    // check actions, viewing the session is valid even while a run is in progress,
+    // so it stays enabled (only the action buttons are disabled mid-run).
+    const showLeaUiButton =
+      Boolean(leaSession) || ["formalized", "in_progress", "unknown"].includes(actionStatus);
+    if (showLeaUiButton) {
+      const leaUiLink = leaSession || getLeaUiBaseLink(statusInfo);
       const sessionButton = document.createElement("button");
       sessionButton.type = "button";
-      sessionButton.textContent = "Open Lea session";
+      sessionButton.textContent = "View in Lea UI";
       sessionButton.dataset.role = "open-lea-session";
+      sessionButton.disabled = isExtensionContextInvalidated();
       sessionButton.addEventListener("click", async (event) => {
         event.preventDefault();
         event.stopPropagation();
-        status.textContent = "Opening Lea session...";
+        status.textContent = leaUiLink.sessionId ? "Opening Lea session..." : "Opening Lea UI...";
         try {
-          await openLeaSession(leaSession);
-          status.textContent = "Opened Lea session.";
+          await openLeaSession(leaUiLink);
+          status.textContent = leaUiLink.sessionId ? "Opened Lea session." : "Opened Lea UI.";
         } catch (error) {
           status.textContent = error instanceof Error ? error.message : String(error);
         }
@@ -820,6 +830,11 @@
       baseUrl,
       url: sessionUrl || buildLeaSessionUrl(baseUrl, sessionId)
     };
+  }
+
+  function getLeaUiBaseLink(statusInfo) {
+    const baseUrl = String(statusInfo?.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL).replace(/\/+$/, "");
+    return { sessionId: "", baseUrl, url: baseUrl };
   }
 
   function buildLeaSessionUrl(baseUrl, sessionId) {
