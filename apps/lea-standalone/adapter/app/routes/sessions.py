@@ -10,9 +10,12 @@ route is the composition layer over DB + git.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from lea.interface import check as interface_check, verify as interface_verify
@@ -39,6 +42,47 @@ class FileWriteRequest(BaseModel):
 @router.get("/api/sessions")
 def list_sessions() -> dict:
     return {"sessions": store.list_sessions()}
+
+
+# How often the sessions feed re-checks the digest, and how long one connection
+# lives before the browser EventSource transparently reconnects (~3h).
+_SESSIONS_POLL_SECONDS = 1.0
+_SESSIONS_MAX_TICKS = 10800
+
+
+@router.get("/api/sessions/events")
+async def session_list_events() -> StreamingResponse:
+    """SSE feed that fires `sessions_changed` whenever the session list changes —
+    a session is created/touched or a run enters/leaves the active set. The UI
+    subscribes once and re-fetches `/api/sessions` on each event, so a run started
+    from anywhere (including an Overleaf-driven formalization, which the companion
+    creates via this adapter's own `POST /api/runs`) appears live without a manual
+    refresh.
+
+    Implemented as a capped digest poll (the same passive-observer shape as
+    `/api/runs/{id}/events`): the cheap `store.sessions_digest()` runs each tick and
+    the expensive list query only re-runs client-side when the digest actually
+    moves. One long-lived connection per client instead of the UI polling the full
+    list on a timer."""
+
+    async def stream():
+        last_digest: str | None = None
+        for _ in range(_SESSIONS_MAX_TICKS):
+            try:
+                digest = store.sessions_digest()
+            except Exception:  # pragma: no cover - defensive; never wedge the stream
+                logger.exception("sessions_digest failed")
+                digest = last_digest
+            if digest != last_digest:
+                last_digest = digest
+                yield f"event: sessions_changed\ndata: {json.dumps({})}\n\n"
+            else:
+                # Comment line doubles as a keep-alive so idle connections (and any
+                # proxy in between) don't time out between real changes.
+                yield ": keep-alive\n\n"
+            await asyncio.sleep(_SESSIONS_POLL_SECONDS)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @router.get("/api/stats")

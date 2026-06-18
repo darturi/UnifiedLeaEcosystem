@@ -7,6 +7,8 @@ session reads from the DB — so the route must hydrate each step via
 git-free (pointer-only).
 """
 
+import asyncio
+
 import pytest
 from fastapi import HTTPException
 from lea.interface import CheckResult, VerifyResult
@@ -149,6 +151,22 @@ def test_write_file_no_op_save_creates_no_step(tmp_path, monkeypatch):
     assert again["unchanged"] is True and again["code_step"] is None
     # only the first save made a step
     assert len(store.session_detail(session["id"])["code_steps"]) == 1
+
+
+def test_session_list_events_emits_initial_sessions_changed(tmp_path, monkeypatch):
+    # The feed fires `sessions_changed` on connect (digest goes None -> current), so
+    # a client that connects mid-change still re-syncs. We pull only the first frame;
+    # the generator yields it before its first sleep.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    async def first_frame():
+        response = await sessions_route.session_list_events()
+        return await response.body_iterator.__anext__()
+
+    first = asyncio.run(first_frame())
+
+    assert "event: sessions_changed" in first
 
 
 def test_write_file_rejects_path_escape(tmp_path, monkeypatch):

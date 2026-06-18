@@ -6,7 +6,10 @@
 // frontend never reconstructs ordering — it merges on `seq`.
 
 // ── Session-level status (derived in store.list_sessions) ──────────────────────
-export type SessionStatus = 'empty' | 'unchecked' | 'ok' | 'error';
+// 'running' = a session with no code yet but an active run, so a freshly registered
+// formalization (including an Overleaf-driven one) shows as in-progress immediately;
+// once code exists the working-copy verdict takes over.
+export type SessionStatus = 'empty' | 'unchecked' | 'ok' | 'error' | 'running';
 // ── Run-level status (a single proof attempt) ─────────────────────────────────
 // 'success' = the agent passed the final verification gate (theorem proved — this
 // is what shows the green "Proved" milestone). 'answered' = a chat / QA / sketch
