@@ -128,6 +128,8 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
         return {"unchanged": True, "code_step": None, "note": None}
 
     step = store.add_code_step(session_id, None, request.path, commit_sha=sha, author="user")
+    # A human edit changes the proof, so any prior SafeVerify verdict is stale.
+    store.set_session_safe_verify(session_id, None, None)
     note_message = None
     if request.note and request.note.strip():
         note_message = store.add_message(
@@ -155,6 +157,8 @@ def verify_session(session_id: str, request: PathRequest) -> dict:
     audit, no run, D2). status: ok | rejected | error | unavailable."""
     abs_path, rel = _resolve_proof_path(session_id, request.path)
     result = interface_verify(abs_path)
+    # Persist the verdict so it survives reload (surfaced as session_detail.safe_verify).
+    store.set_session_safe_verify(session_id, result.status, result.detail)
     return {"path": rel, "status": result.status, "detail": result.detail}
 
 

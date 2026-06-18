@@ -55,7 +55,9 @@ from . import store
 logger = logging.getLogger("lea-interface.bridge")
 
 # Only one Lea activation may run at a time — they share the on-disk workspace
-# and the warm LSP daemon. A second concurrent run is rejected, not queued.
+# and the warm LSP daemon. A new run doesn't queue or get rejected; it supersedes
+# whatever holds the lock (most often a run parked on an unanswered approval whose
+# event stream is gone), so the UI is never permanently blocked (M15).
 active_run_lock = Lock()
 
 # The run_id currently being driven (holding `active_run_lock`), or None. Lets the
@@ -66,7 +68,7 @@ active_run_lock = Lock()
 # reconcile→reattach cycle turned into a request storm. Guarded by its own lock so
 # reads from the async endpoint never tear against the run thread's write.
 _active_run_guard = Lock()
-_active_run_id: str | None = None
+_active_run_id: str | None = None  # the run currently holding active_run_lock
 
 
 def current_active_run_id() -> str | None:
@@ -279,9 +281,17 @@ def run_lea(context: RunnerContext) -> None:
     run_id = context.run_id
 
     if not active_run_lock.acquire(blocking=False):
-        emit(events, "run_error", {"message": "Another Lea run is already active."})
-        emit(events, "done", {"status": "failed"})
-        return
+        # A prior run still holds the lock — usually one parked on an approval
+        # nobody answered (its event stream is gone). Supersede it: ask it to stop
+        # (its approval wait + turn loop are stop-aware) and take over once it
+        # releases, so starting a new run is never permanently blocked (M15).
+        stuck = current_active_run_id()
+        if stuck and stuck != run_id:
+            request_stop(stuck)
+        if not active_run_lock.acquire(timeout=15):
+            emit(events, "run_error", {"message": "A previous run is still finishing — try again in a moment."})
+            emit(events, "done", {"status": "failed"})
+            return
     # We hold the slot — record which run is being driven so a second connection
     # for THIS run attaches passively instead of spawning a doomed competitor.
     _set_active_run_id(run_id)
@@ -434,6 +444,7 @@ def run_lea(context: RunnerContext) -> None:
     finally:
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
-        _set_active_run_id(None)
+        if current_active_run_id() == run_id:
+            _set_active_run_id(None)
         active_run_lock.release()
         emit(events, "done", {"status": final_status})

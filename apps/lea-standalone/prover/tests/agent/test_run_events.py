@@ -473,6 +473,37 @@ _PRIOR_CONVERSATION = [
 ]
 
 
+def test_interactive_sorry_skeleton_is_not_proved():
+    """A skeleton that compiles only because of `sorry` must NOT finish as
+    'completed' (a false "Proved"). `sorry` is a warning, not an error, so the
+    gate has to detect it; in interactive mode the run ends as a chat turn so the
+    user can decide to fill the sorrys."""
+    calls = {"n": 0, "tmpdir": tempfile.TemporaryDirectory()}
+    proof_path = str(Path(calls["tmpdir"].name) / "Skel.lean")
+
+    def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield TextDelta("I'll write the skeleton.")
+            yield ToolCall("write_file", {"path": proof_path, "content": "theorem t : True := by\n  sorry\n"})
+            yield _ToolMeta("w")
+            yield ToolCall("lean_check", {"path": proof_path})
+            yield _ToolMeta("c")
+            yield Done(Usage(10, 5), 0.001)
+            return
+        yield TextDelta("Would you like me to fill the sorry now?")
+        yield Done(Usage(3, 2), 0.0002)
+
+    agent.stream = fake_stream
+    agent._tools.lean_check = lambda path: "Skel.lean:2:2: warning: declaration uses 'sorry'"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None: f"SYS[{variant}]"
+    events = list(agent.run_events(cfg_interactive(), msgs("prove t")))
+    fin = events[-1]
+    check("sorry skeleton is NOT 'completed'", isinstance(fin, Finished) and fin.reason != "completed")
+    check("sorry skeleton ends as a chat turn (no false Proved)", fin.reason == "assistant")
+    check("sorry skeleton hands back to the user", "fill the sorry" in fin.text)
+
+
 def test_interactive_assistant_turn_routes_to_chat_and_keeps_tools():
     calls = install_interactive_fake("ASSISTANT")
     events = list(agent.run_events(cfg_interactive(), list(_PRIOR_CONVERSATION)))
@@ -557,6 +588,7 @@ def main():
     test_successful_explicit_check_skips_duplicate_final_gate()
     test_edit_after_successful_check_rechecks_final_gate()
     test_project_entry_recorded_after_final_gate_passes()
+    test_interactive_sorry_skeleton_is_not_proved()
     test_interactive_assistant_turn_routes_to_chat_and_keeps_tools()
     test_text_only_history_serializes_for_provider()
     test_run_events_uses_caller_messages_verbatim()

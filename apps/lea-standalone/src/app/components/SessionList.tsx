@@ -1,5 +1,5 @@
 import { CheckCircle, XCircle, Circle, CircleDashed, Loader2 } from 'lucide-react';
-import type { SessionSummary } from '../api';
+import type { SessionSummary } from '../lib/api';
 
 // v2 session status is derived from the latest code step's verdict:
 //   running → a run is active · ok → compiles · error → has errors ·

@@ -60,15 +60,3 @@ export function buildTimeline({ messages = [], codeSteps = [] }) {
   items.sort(compare);
   return { items, codeSteps: sorted };
 }
-
-// The terminal (final) assistant message of a finished run — the one the chat
-// highlights green/red. Null while a run is live or when there is no assistant
-// message. `finished` is true once the run has stopped (success or failure) or
-// when an already-completed session is reloaded.
-export function terminalMessageId({ messages = [], finished }) {
-  if (!finished) return null;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i].role === 'assistant') return messages[i].id;
-  }
-  return null;
-}

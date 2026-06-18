@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Check, ChevronsUpDown } from 'lucide-react';
-import type { ModelCatalogEntry, ModelOption } from '../api';
+import type { ModelCatalogEntry, ModelOption } from '../lib/api';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover';
 import {
   Command,

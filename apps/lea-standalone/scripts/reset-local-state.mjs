@@ -6,7 +6,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dryRun = process.argv.includes("--dry-run");
 
 const dataDir = path.join(root, "data");
-const workspaceDir = path.join(root, "external", "lea-prover", "workspace");
+// The prover is vendored at prover/ (it was once the external/lea-prover submodule).
+const workspaceDir = path.join(root, "prover", "workspace");
 const projectsDir = path.join(workspaceDir, "projects");
 const proofsDir = path.join(workspaceDir, "proofs");
 

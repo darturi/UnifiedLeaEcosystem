@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { highlightLine } from './leanHighlight.mjs';
+import { highlightLine } from './lib/leanHighlight.mjs';
 
 const text = (spans) => spans.map((s) => s.text).join('');
 const clsOf = (spans, word) => spans.find((s) => s.text === word)?.cls;
