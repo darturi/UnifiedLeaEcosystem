@@ -81,9 +81,7 @@
     settingsButton.setAttribute("aria-label", "Open Lea settings and usage");
     settingsButton.title = "Lea settings and usage";
     settingsButton.innerHTML = `
-      <span class="ol-lean-slider-line"><span></span></span>
-      <span class="ol-lean-slider-line"><span></span></span>
-      <span class="ol-lean-slider-line"><span></span></span>
+      <span class="ol-lean-trigger-mark">L</span>
     `;
     settingsButton.addEventListener("click", (event) => {
       event.preventDefault();

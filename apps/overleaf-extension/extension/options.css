@@ -1,8 +1,31 @@
+:root {
+  --ol-bg: #f5f4ef;
+  --ol-panel: #ffffff;
+  --ol-panel-2: #faf9f6;
+  --ol-ink: #1f1e1d;
+  --ol-ink-2: #3d3c39;
+  --ol-muted: #8a8983;
+  --ol-line: #e9e7e0;
+  --ol-line-2: #efede7;
+  --ol-accent: #c96442;
+  --ol-accent-soft: #f3e3db;
+  --ol-accent-ink: #a44f33;
+  --ol-green: #4f8a5b;
+  --ol-green-soft: #e6f0e7;
+  --ol-red: #c0564a;
+  --ol-red-soft: #f6e3e0;
+  --ol-red-ink: #9a3f35;
+  --ol-radius: 12px;
+  --ol-radius-sm: 8px;
+  --ol-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --ol-serif: Georgia, "Times New Roman", serif;
+}
+
 body {
   margin: 0;
-  color: #172033;
-  background: #f6f7fb;
-  font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ol-ink);
+  background: var(--ol-bg);
+  font: 14px/1.5 var(--ol-sans);
 }
 
 main {
@@ -11,23 +34,39 @@ main {
 }
 
 h1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin: 0 0 24px;
   font-size: 24px;
+  font-weight: 600;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  color: #ffffff;
+  background: var(--ol-accent);
+  font: 700 17px/1 var(--ol-serif);
 }
 
 form {
   display: grid;
   gap: 16px;
   padding: 20px;
-  background: #ffffff;
-  border: 1px solid rgba(23, 32, 51, 0.12);
-  border-radius: 8px;
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
 }
 
 label {
   display: grid;
   gap: 6px;
   font-weight: 700;
+  color: var(--ol-ink);
 }
 
 fieldset {
@@ -35,18 +74,20 @@ fieldset {
   gap: 12px;
   margin: 0;
   padding: 14px;
-  border: 1px solid rgba(23, 32, 51, 0.12);
-  border-radius: 8px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel-2);
 }
 
 legend {
   padding: 0 6px;
   font-weight: 800;
+  color: var(--ol-ink);
 }
 
 fieldset p {
   margin: 0;
-  color: #607089;
+  color: var(--ol-muted);
   font-size: 13px;
 }
 
@@ -60,49 +101,76 @@ fieldset p {
 
 .provider-key-status li {
   padding: 6px 8px;
-  border: 1px solid rgba(23, 32, 51, 0.12);
+  border: 1px solid var(--ol-red);
   border-radius: 6px;
-  color: #9f1d1d;
-  background: #fff7f7;
+  color: var(--ol-red-ink);
+  background: var(--ol-red-soft);
   font-weight: 700;
 }
 
 .provider-key-status li[data-configured="true"] {
-  color: #285729;
-  background: #f1fbf1;
+  border-color: var(--ol-green);
+  color: var(--ol-green);
+  background: var(--ol-green-soft);
 }
 
 input,
 select {
   height: 38px;
   padding: 0 10px;
-  border: 1px solid rgba(23, 32, 51, 0.2);
-  border-radius: 6px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  color: var(--ol-ink);
+  background: var(--ol-panel);
   font: inherit;
+}
+
+input:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: 2px solid rgba(201, 100, 66, 0.55);
+  outline-offset: 2px;
 }
 
 button {
   width: fit-content;
   height: 38px;
   padding: 0 14px;
-  border: 1px solid #2357d9;
-  border-radius: 6px;
-  background: #2f65f6;
+  border: 1px solid var(--ol-accent);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-accent);
   color: #ffffff;
   font: inherit;
   font-weight: 700;
   cursor: pointer;
 }
 
+button:hover {
+  border-color: var(--ol-accent-ink);
+  background: var(--ol-accent-ink);
+}
+
+#load-companion-settings {
+  border-color: var(--ol-line);
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+}
+
+#load-companion-settings:hover {
+  border-color: var(--ol-accent);
+  background: var(--ol-panel-2);
+}
+
 #status {
   min-height: 20px;
   margin: 16px 0 0;
+  color: var(--ol-ink-2);
 }
 
 .field-hint {
   display: block;
   margin-top: 4px;
-  color: #6b7280;
+  color: var(--ol-muted);
   font-size: 12px;
 }
 
