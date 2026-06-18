@@ -35,6 +35,13 @@ export default defineConfig({
     proxy: {
       '/api': 'http://localhost:8001',
     },
+    // The vendored prover holds huge Lean build trees (workspace + SafeVerify
+    // .lake/ oleans, the ~189MB safe_verify binary). The frontend never imports
+    // from there, so keep the file watcher out of it — otherwise the dev server
+    // thrashes with full-reloads on Mathlib/SafeVerify artifacts.
+    watch: {
+      ignored: ['**/prover/**'],
+    },
   },
 
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.

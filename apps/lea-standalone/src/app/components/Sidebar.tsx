@@ -1,15 +1,18 @@
-import { BarChart3, PanelLeftClose } from 'lucide-react';
+import { BarChart3, PanelLeftClose, Plus } from 'lucide-react';
 import type { SessionSummary } from '../lib/api';
 import { useSessions } from '../stores/sessions';
+import { useProjects } from '../stores/projects';
 
-// Left rail: brand, new-proof, (search stub), date-grouped loose chats, footer.
-// Projects are deferred to v2.1 — the mockup's Projects group is intentionally
-// omitted here until that feature lands.
+// Left rail: brand, new-proof, (search stub), Projects group, date-grouped loose
+// chats, footer. The Projects group (v2.1 F1) lists projects; loose chats are the
+// `project_id IS NULL` sessions.
 export function Sidebar({
   runningSessionId,
   userEmail,
   onSelectSession,
   onNewSession,
+  onSelectProject,
+  onNewProject,
   onOpenSettings,
   onOpenStats,
   onCollapse,
@@ -18,6 +21,8 @@ export function Sidebar({
   userEmail?: string;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
+  onSelectProject: (id: string) => void;
+  onNewProject: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
   onCollapse: () => void;
@@ -26,6 +31,9 @@ export function Sidebar({
   const sessions = useSessions((s) => s.sessions);
   const selectedSessionId = useSessions((s) => s.selectedSessionId);
   const groups = groupByDate(sessions);
+  // F1: projects list + which one is open, from the projects store.
+  const projects = useProjects((s) => s.projects);
+  const selectedProjectId = useProjects((s) => s.selectedProjectId);
 
   return (
     <aside className="sidebar">
@@ -45,6 +53,33 @@ export function Sidebar({
       </div>
 
       <div className="sb-scroll">
+        <div className="proj-group">
+          <div className="group-label proj-head">
+            Projects
+            <button className="proj-add" onClick={onNewProject} title="New project" aria-label="New project">
+              <Plus size={13} />
+            </button>
+          </div>
+          {projects.length === 0 ? (
+            <div className="proj-empty">No projects yet.</div>
+          ) : (
+            projects.map((project) => (
+              <button
+                key={project.id}
+                className={`row ${selectedProjectId === project.id ? 'active' : ''}`}
+                onClick={() => onSelectProject(project.id)}
+              >
+                <span className="picon">∑</span>
+                <span className="rtitle">{project.title}</span>
+                {typeof project.session_count === 'number' && project.session_count > 0 && (
+                  <span className="count">{project.session_count}</span>
+                )}
+              </button>
+            ))
+          )}
+        </div>
+
+        {sessions.length > 0 && <div className="group-label">Chats</div>}
         {sessions.length === 0 && (
           <div className="group-label" style={{ textTransform: 'none', letterSpacing: 0 }}>
             No proofs yet — start one below.

@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="refresh" content="8" />
+<title>LeaUI v2.1 — Projects Progress (backend + frontend)</title>
+<style>
+  :root {
+    --bg: #f5f4ef; --panel: #fffefb; --ink: #2a2724; --muted: #8a847c;
+    --line: #e6e2da; --accent: #c96442; --green: #4f8a5b; --red: #c0564a;
+    --amber: #b8842a; --blue: #4a6fa5;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: 32px 0 80px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+  header { margin-bottom: 8px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .intro { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 16px; margin: 18px 0 8px; font-size: 13px; color: #4a463f; }
+  .intro b { color: var(--ink); }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 18px 0 6px; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+  .counts { color: var(--muted); font-size: 12.5px; margin-bottom: 26px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 14px 0 28px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 99px; display: inline-block; }
+  .d-queued { background: #cdc8be; } .d-planned { background: var(--amber); }
+  .d-prog { background: var(--blue); } .d-tested { background: #7aa37f; } .d-done { background: var(--green); }
+
+  .group { margin-bottom: 30px; }
+  .group > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    margin: 0 0 4px; font-weight: 600; }
+  .group > .ghint { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+
+  .todo { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 15px; margin-bottom: 9px; }
+  .todo.is-planned { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(184,132,42,.15); }
+  .todo.is-done { opacity: .62; }
+  .todo .top { display: flex; align-items: center; gap: 10px; }
+  .id { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+  .id.fe { color: var(--accent); border-color: #e7cabd; background: #fbf1ec; }
+  .title { font-weight: 550; flex: 1; }
+  .tag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+    padding: 1px 7px; border-radius: 99px; }
+  .tag.be { background: #eef0ec; color: #6a7d63; }
+  .tag.fe { background: #fbf1ec; color: var(--accent); }
+  .dec { color: var(--muted); font-size: 11.5px; font-family: ui-monospace, monospace; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 99px; white-space: nowrap; }
+  .b-queued { background: #efece6; color: #8a847c; }
+  .b-planned { background: #f7ecd6; color: var(--amber); }
+  .b-prog { background: #e4ecf6; color: var(--blue); }
+  .b-tested { background: #e2efe4; color: #5a8a62; }
+  .b-done { background: #dcefe1; color: var(--green); }
+  .scope { color: var(--muted); font-size: 13px; margin: 6px 0 0 0; }
+  code { background: #f0ede6; border-radius: 4px; padding: 1px 5px; font: 12px ui-monospace, monospace; }
+  footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LeaUI v2.1 — Projects</h1>
+    <div class="sub">Live progress · <b>backend + frontend interleaved</b>, built in vertical slices · backend
+      <code>v2.1-projects-architecture.md</code> (D21–D34) · UI <code>v2.1-ui-design.md</code> (D35–D43) · auto-refreshes every 8s</div>
+  </header>
+
+  <div class="intro">
+    <b>Build rhythm:</b> one slice at a time, each ending in something <b>clickable on the UI</b> — backend
+    todo(s) (<code class="dec">P1…V1</code>) then the frontend that consumes them (<code class="dec">F1…F9</code>):
+    plan → your input → build + tests → tested → done. A <b>project</b> = a shared dir + git repo + DB index;
+    Instructions/Memory/Blueprint are three uniform <code>.lea/*.md</code> files (agent + human co-author Memory &
+    Blueprint); the dependency <b>graph</b> is derived live from the Lean state; the prover stays project-agnostic
+    (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
+  </div>
+
+  <div class="bar"><i style="width:20%"></i></div>
+  <div class="counts"><b>5 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 1 complete</b> — create · list · open a project (P1–P3 green · F1–F2 confirmed in the UI)</div>
+
+  <div class="legend">
+    <span><i class="dot d-queued"></i> Queued</span>
+    <span><i class="dot d-planned"></i> Planned (next)</span>
+    <span><i class="dot d-prog"></i> Built (not yet confirmed)</span>
+    <span><i class="dot d-tested"></i> Tested ✓</span>
+    <span style="margin-left:auto"><span class="tag be">backend</span> &nbsp; <span class="tag fe">frontend</span></span>
+  </div>
+
+  <!-- ============ SLICE 1 ============ -->
+  <div class="group">
+    <h2>Slice 1 · Project shell</h2>
+    <div class="ghint">Create · list · open a project. Ends with: a Projects group in the sidebar and an (empty) project window you can open.</div>
+
+    <div class="todo is-done">
+      <div class="top"><span class="id">P1</span><span class="title">Schema deltas + store queries</span>
+        <span class="tag be">backend</span><span class="dec">D30</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>projects</code> fields (slug, namespace, repo_path, <code>remote_url</code>, description) + new <code>project_files</code> table + loose/in-project session listing split (<code>list_loose_sessions</code>/<code>list_project_sessions</code>). <b>No</b> <code>project_memory</code>/<code>project_nodes</code>/<code>instructions</code> columns — those are <code>.lea/*.md</code>. Slug→<code>Lea.&lt;Project&gt;</code>→<code>proofs/Lea/&lt;Project&gt;</code> derivation backs the NOT-NULL defaults so the live Overleaf tag-path stays intact. <b>6 new store tests; full 115-test adapter suite green.</b></div>
+    </div>
+    <div class="todo is-done">
+      <div class="top"><span class="id">P2</span><span class="title">Project service + gitstore generalization</span>
+        <span class="tag be">backend</span><span class="dec">D21/D22/D24</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">Create <code>proofs/Lea/&lt;Project&gt;/</code> + git repo + <code>.lea/</code> (seed the three <code>.md</code>); <code>repo_for_session</code> resolver; generalize <code>gitstore</code> so a project session resolves to the shared repo, loose → its own. Tests.</div>
+    </div>
+    <div class="todo is-done">
+      <div class="top"><span class="id">P3</span><span class="title">Project CRUD routes</span>
+        <span class="tag be">backend</span><span class="dec">D31</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>GET/POST /api/projects</code>, <code>GET/PUT/DELETE /api/projects/{id}</code> (delete = rm -rf repo + cascade, confirm-guarded). Route tests.</div>
+    </div>
+    <div class="todo is-done">
+      <div class="top"><span class="id fe">F1</span><span class="title">Projects store + Sidebar Projects group</span>
+        <span class="tag fe">frontend</span><span class="dec">D35/D36</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">New <code>stores/projects.ts</code> + <code>lib/api.ts</code> fetchers/types. Add the <b>Projects group</b> to <code>Sidebar.tsx</code> (list, status/proof count); selecting one sets the open project. <code>App.tsx</code> gains the loose-vs-project view switch.</div>
+    </div>
+    <div class="todo is-done">
+      <div class="top"><span class="id fe">F2</span><span class="title">Create-project flow + project window shell</span>
+        <span class="tag fe">frontend</span><span class="dec">D37</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">New-project dialog → <code>POST /api/projects</code>. <code>ProjectWindow.tsx</code>: hero (<code>∑ name · namespace Lea.&lt;Project&gt;</code> + description), breadcrumb back to Chats, and the <b>tab strip</b> (Overview · Blueprint · Filesystem) scaffolded. Tabs empty for now.</div>
+    </div>
+  </div>
+
+  <!-- ============ SLICE 2 ============ -->
+  <div class="group">
+    <h2>Slice 2 · Sessions in a project</h2>
+    <div class="ghint">Run real proofs inside a project that chain sibling lemmas. Ends with: start a proof from the project, it lands in the project repo, the chat/canvas work unchanged.</div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id">Q1</span><span class="title">Prover goes project-agnostic</span>
+        <span class="tag be">backend</span><span class="dec">D32</span><span class="badge b-planned">Planned (next)</span></div>
+      <div class="scope">Delete <code>prover/lea/project.py</code> + the <code>project=</code> param of <code>run_events</code>; parameterize the prompt's hardcoded <code>Lea.Misc</code> workspace/namespace block so the adapter states the active namespace. Prover suite stays green.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">Q2</span><span class="title">Create-session-in-project + context compose</span>
+        <span class="tag be">backend</span><span class="dec">D23/D24/D25/D33</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>POST /api/projects/{id}/sessions</code> (working dir = project repo). Bridge resolves the project repo + composes & <b>prepends one context message</b> (instructions + memory + blueprint + file inventory); asset writes → "blueprint updated" graph signal, not canvas snapshots.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">Q3</span><span class="title">Real project-run chaining smoke</span>
+        <span class="tag be">backend</span><span class="dec">D22/D23</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">End-to-end: a proof lands in <code>proofs/Lea/&lt;Project&gt;/</code> and <code>import</code>s/uses an already-proved sibling lemma. Confirms the chaining requirement that dictated the layout.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F3</span><span class="title">Overview tab: composer + sessions list</span>
+        <span class="tag fe">frontend</span><span class="dec">D37</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Overview tab body: "new proof in this project" composer (→ create-session-in-project) + the project's <b>sessions list</b> (title · fully-qualified lemma · status dot · time). Opening a row loads the normal Chat+Canvas, scoped to the project (reuses the v2 run stack unchanged).</div>
+    </div>
+  </div>
+
+  <!-- ============ SLICE 3 ============ -->
+  <div class="group">
+    <h2>Slice 3 · Instructions &amp; Memory</h2>
+    <div class="ghint">The two user-facing <code>.lea/*.md</code> docs. Ends with: editable Instructions &amp; Memory rail cards that the agent reads (and writes, for Memory).</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">R1</span><span class="title">Instructions = <code>.lea/instructions.md</code></span>
+        <span class="tag be">backend</span><span class="dec">D25</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>GET/PUT /api/projects/{id}/instructions</code> (raw md, user-authored, write+commit) + injection into the composed run context.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">R2</span><span class="title">Memory = <code>.lea/memory.md</code></span>
+        <span class="tag be">backend</span><span class="dec">D26</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>GET/PUT /api/projects/{id}/memory</code> (raw md, agent + human, write+commit) + injection. The composed context tells the agent to maintain it with <code>write_file</code>/<code>edit_file</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F4</span><span class="title"><code>MarkdownDoc</code> + Instructions &amp; Memory cards</span>
+        <span class="tag fe">frontend</span><span class="dec">D39</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">One reusable <code>MarkdownDoc.tsx</code> (rendered view via <code>markdownParser</code>/<code>mathRenderer</code> + edit mode → PUT), backing both rail cards. Memory is <code>agentWritten</code> → refreshes when a run touches it.</div>
+    </div>
+  </div>
+
+  <!-- ============ SLICE 4 ============ -->
+  <div class="group">
+    <h2>Slice 4 · Files</h2>
+    <div class="ghint">Upload reference docs (pdf/tex/docx/images) the agent can read. Ends with: drag-drop upload + a file list + download in the Files card.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">S1</span><span class="title">Multipart upload + store + download</span>
+        <span class="tag be">backend</span><span class="dec">D27</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>POST /api/projects/{id}/files</code> (multipart; adds <code>python-multipart</code>) → MIME allowlist + size cap + filename sanitize → write to <code>.lea/files/</code> + <code>commit_write</code> + <code>project_files</code> row. <code>GET …/files/{fid}</code> download; <code>DELETE</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">S2</span><span class="title">Tiered text extraction</span>
+        <span class="tag be">backend</span><span class="dec">D27</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Native text used directly; pdf/docx → <code>.txt</code> sidecar (<code>pdfminer.six</code>/<code>python-docx</code>); images stored-only. One-line inventory folded into the run context; agent reads via the existing <code>read_file</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F5</span><span class="title">Files card: upload + list + download</span>
+        <span class="tag fe">frontend</span><span class="dec">D40</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Overview rail <b>Files</b> card: drag-drop / picker upload (FormData), the file list with kind/meta, download, delete. Shares the upload/download client core with the Filesystem tab (F8).</div>
+    </div>
+  </div>
+
+  <!-- ============ SLICE 5 ============ -->
+  <div class="group">
+    <h2>Slice 5 · Blueprint &amp; graph <span style="color:var(--accent)">— the centerpiece</span></h2>
+    <div class="ghint">The lemma decomposition + the interactive dependency graph. Ends with: a graph (shape=kind, color=live status) you can click into the sessions that built each node.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">T1</span><span class="title">Blueprint format + parser + GET/PUT</span>
+        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>.lea/blueprint.md</code> format (<code>## key</code> section + <code>kind</code>/<code>lean</code>/<code>uses</code> header lines + prose). Per-section line-scan parser → nodes + <code>uses</code> edges (no prose regex). <code>GET/PUT /blueprint</code>; context tells the agent the format + to keep it current.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">T2</span><span class="title">Derived status + session attribution → <code>/graph</code></span>
+        <span class="tag be">backend</span><span class="dec">D28/D29</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Status derived from live Lean (decl resolves? <code>check</code>/<code>verify</code>? <code>sorry</code> scan? dep readiness). <b>Session attribution derived</b> from <code>code_steps</code> (locate node's <code>lean:</code> decl → file → committing sessions; newest = <code>last_modified_by</code>). <code>GET /graph → {nodes(kind,status,sessions,last_modified_by), edges}</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F6</span><span class="title">Blueprint tab: markdown authoring view</span>
+        <span class="tag fe">frontend</span><span class="dec">D39</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Blueprint tab's authoring sub-view = reuse <code>MarkdownDoc</code> on <code>/blueprint</code> (agent + human, live). Graph ⇄ raw-markdown toggle within the tab.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F7</span><span class="title">Dependency graph (React Flow + dagre)</span>
+        <span class="tag fe">frontend</span><span class="dec">D38/D42</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">New dep: <code>@xyflow/react</code> + <code>dagre</code>. <code>ProjectGraph.tsx</code> renders <code>/graph</code> top-down: <b>box=def · ellipse=lemma/theorem</b>, color = live status (white/blue/green/red), legend. Click a node → side panel with statement + <b>attributed sessions</b> (open → Chat+Canvas). Live refresh on the run's asset signal (poll fallback).</div>
+    </div>
+  </div>
+
+  <!-- ============ SLICE 6 ============ -->
+  <div class="group">
+    <h2>Slice 6 · Filesystem &amp; sharing</h2>
+    <div class="ghint">See/edit the whole repo, download it, push to GitHub. Ends with: a Filesystem tab + an explicit "Push to GitHub" with a token in Settings.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">U1</span><span class="title">File tree + read + edit-any-file</span>
+        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>GET /tree</code> (hide <code>.git/</code>, <code>.lake/</code>, oleans — source + assets only), <code>GET /file?path=</code>, <code>PUT /file</code> (write + commit, path-escape guarded). Editing a <code>.lean</code> re-uses <code>check</code>; editing the blueprint refreshes the graph.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">U2</span><span class="title">Export (zip / git bundle)</span>
+        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>GET /export</code> streams the repo as a zip (or <code>git bundle</code>, preserving history).</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">U3</span><span class="title">GitHub token + remote + push</span>
+        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>github_token</code> in <code>config/lea.local.toml</code> + <code>/api/settings</code> (regex-validated, <b>redacted</b> — presence only, never returned/logged). <code>PUT /git/remote</code> (per-project URL on the <code>projects</code> row); <code>POST /git/push</code> = explicit <code>git push</code> using the token.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F8</span><span class="title">Filesystem tab + push UI + token field</span>
+        <span class="tag fe">frontend</span><span class="dec">D40/D43</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>FilesystemTab.tsx</code>: repo tree + file viewer/editor (write+commit; <code>.lean</code> verdict), upload, <b>Download</b> (export), set-remote inline + <b>Push to GitHub</b> (explicit button + target confirm, disabled w/o token). Add the redacted <b>GitHub token</b> field to <code>SettingsPage.tsx</code>.</div>
+    </div>
+  </div>
+
+  <!-- ============ SLICE 7 ============ -->
+  <div class="group">
+    <h2>Slice 7 · Search</h2>
+    <div class="ghint">The only way to reach a hidden project session from outside its window. Ends with: ⌘K global search across loose + project sessions.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">V1</span><span class="title">Global search endpoint</span>
+        <span class="tag be">backend</span><span class="dec">D31</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>GET /api/search?q=</code> across loose + project sessions, each tagged with its project (SQLite LIKE first; FTS5 later).</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">F9</span><span class="title">⌘K global search overlay</span>
+        <span class="tag fe">frontend</span><span class="dec">D41</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>SearchOverlay.tsx</code>: centered modal, sectioned results (Loose chats / Inside projects, project-tagged), keyboard-driven (⌘K · ↑/↓ · Enter · Esc). Realizes the v2 mockup's search overlay.</div>
+    </div>
+  </div>
+
+  <footer>LeaUI v2.1 · backend + frontend interleaved · git owns project content, the DB is a rebuildable index, the graph is derived live</footer>
+</div>
+</body>
+</html>

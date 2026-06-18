@@ -362,6 +362,112 @@ def test_get_or_create_project_is_idempotent_by_slug(tmp_path, monkeypatch):
     assert store.get_project_by_slug("missing") is None
 
 
+def test_create_project_derives_namespace_and_repo_path_from_slug(tmp_path, monkeypatch):
+    # D22/D30: namespace + repo_path are NOT NULL and derived from the slug when not
+    # given explicitly (the Overleaf tag-only path supplies neither).
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    p = store.create_project("eps-delta", title="Epsilon Delta")
+    assert p["namespace"] == "Lea.EpsDelta"          # slug -> UpperCamel module segment
+    assert p["repo_path"] == "proofs/Lea/EpsDelta"   # namespace -> shared dir/repo
+    assert p["description"] is None
+    assert p["remote_url"] is None
+
+
+def test_create_project_accepts_explicit_namespace_repo_and_description(tmp_path, monkeypatch):
+    # P2's project service passes computed values explicitly.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    p = store.create_project(
+        "my-proj",
+        title="My Proj",
+        description="a test project",
+        namespace="Lea.MyProj",
+        repo_path="proofs/Lea/MyProj",
+    )
+    assert p["namespace"] == "Lea.MyProj"
+    assert p["repo_path"] == "proofs/Lea/MyProj"
+    assert p["description"] == "a test project"
+
+
+def test_project_namespace_derivation_handles_digit_initial_slug(tmp_path, monkeypatch):
+    # A Lean module segment can't start with a digit — guard with a prefix.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    assert store.project_namespace_for_slug("2cat") == "Lea.P2cat"
+    assert store.repo_path_for_namespace("Lea.P2cat") == "proofs/Lea/P2cat"
+
+
+def test_update_project_edits_metadata_only(tmp_path, monkeypatch):
+    # D31: title/description/remote_url are editable; the slug/namespace/repo_path
+    # chain is immutable (D22) and must survive an update untouched.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    p = store.create_project("proj-x", title="Proj X")
+    updated = store.update_project(
+        p["id"], title="Renamed", description="now described",
+        remote_url="https://github.com/me/proj-x.git",
+    )
+    assert updated["title"] == "Renamed"
+    assert updated["description"] == "now described"
+    assert updated["remote_url"] == "https://github.com/me/proj-x.git"
+    assert updated["slug"] == "proj-x"                 # immutable
+    assert updated["namespace"] == p["namespace"]      # immutable
+    assert updated["repo_path"] == p["repo_path"]      # immutable
+    # Passing None leaves a field untouched.
+    again = store.update_project(p["id"], title="Renamed Twice")
+    assert again["description"] == "now described"
+    assert store.update_project("no-such-id") is None
+
+
+def test_project_files_crud(tmp_path, monkeypatch):
+    # D27: project_files is an index over bytes that live in the project repo.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    p = store.create_project("files-proj", title="Files Proj")
+    assert store.list_project_files(p["id"]) == []
+
+    f = store.create_project_file(
+        p["id"], filename="paper.pdf", stored_path=".lea/files/paper.pdf",
+        mime="application/pdf", kind="upload", extracted_path=".lea/files/paper.pdf.txt",
+    )
+    assert f["filename"] == "paper.pdf"
+    assert f["kind"] == "upload"
+    assert f["extracted_path"] == ".lea/files/paper.pdf.txt"
+
+    listed = store.list_project_files(p["id"])
+    assert len(listed) == 1 and listed[0]["id"] == f["id"]
+    assert store.get_project_file(f["id"])["filename"] == "paper.pdf"
+
+    assert store.delete_project_file(f["id"]) is True
+    assert store.delete_project_file(f["id"]) is False
+    assert store.list_project_files(p["id"]) == []
+
+
+def test_session_listing_splits_loose_vs_in_project(tmp_path, monkeypatch):
+    # D30: loose (project_id IS NULL) = the sidebar Chats group; in-project sessions
+    # are reached through the project window, not the sidebar.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    proj = store.create_project("grp", title="Group")
+    loose = store.create_session("loose one")
+    in_proj = store.create_session("in project", project_id=proj["id"])
+
+    loose_ids = {s["id"] for s in store.list_loose_sessions()}
+    proj_ids = {s["id"] for s in store.list_project_sessions(proj["id"])}
+    all_ids = {s["id"] for s in store.list_sessions()}
+
+    assert loose["id"] in loose_ids and in_proj["id"] not in loose_ids
+    assert in_proj["id"] in proj_ids and loose["id"] not in proj_ids
+    assert {loose["id"], in_proj["id"]} <= all_ids
+
+
 def test_usage_stats_sessions_carry_project_slug_for_per_document_totals(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

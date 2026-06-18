@@ -93,3 +93,37 @@ If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A fai
 - Local Lea file snapshots: configured by `lea_root`
 
 Do not commit `config/lea.local.toml`; rotate any API key that is pasted into logs or chat.
+
+## Upgrading an existing checkout (database schema)
+
+The app DB (`data/lea-interface.sqlite3`) is created with `CREATE TABLE IF NOT
+EXISTS` and there are **no in-place `ALTER` migrations** — by design, the schema is
+treated as disposable/rebuildable for a single local user. So when you pull a change
+that alters the schema (e.g. the v2.1 Projects tables — new `projects` columns and a
+`project_files` table), an **already-existing** `lea-interface.sqlite3` will *not*
+auto-upgrade, and the affected endpoint fails with an error like:
+
+```
+sqlite3.OperationalError: table projects has no column named description
+```
+
+Fixes, from simplest to most surgical:
+
+- **Fresh DB (sanctioned):** `npm run reset:local` clears local run state (proofs,
+  logs, SQLite) so the next start rebuilds the schema. Preview with
+  `npm run reset:local -- --dry-run`. This **discards existing sessions**.
+- **Preserve sessions (surgical):** if only feature tables changed and you want to
+  keep your chat/run history, drop just the changed tables and let `init_db`
+  recreate them from the authoritative schema — e.g. for the v2.1 Projects change:
+
+  ```sh
+  sqlite3 data/lea-interface.sqlite3 'drop table if exists projects; drop table if exists project_files;'
+  cd adapter && ./.venv/bin/python -c "from app.db import init_db; init_db()"
+  ```
+
+  (Safe here because `projects`/`project_files` hold no essential local data on an
+  existing UI checkout; don't drop `sessions`/`runs`/`code_steps`/`messages`.)
+
+A fresh `npm run setup` on a new machine is unaffected — it starts from an empty DB.
+A proper cross-version migration path that **preserves user data** across web-app
+updates is planned; until then, use one of the two fixes above.

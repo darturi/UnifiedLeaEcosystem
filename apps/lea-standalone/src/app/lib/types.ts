@@ -53,6 +53,30 @@ export interface SessionSummary {
   duration_seconds: number;
 }
 
+// ── Projects (v2.1) ───────────────────────────────────────────────────────────
+// A project is a shared dir + git repo + this index row (D21). The slug is
+// immutable and determines the namespace `Lea.<Project>` + repo path (D22).
+// `session_count` is present on the list endpoint; `description`/`remote_url` are
+// nullable metadata. Instructions/Memory/Blueprint are `.lea/*.md` files, not
+// fields here.
+export interface Project {
+  id: string;
+  slug: string;
+  title: string;
+  description?: string | null;
+  namespace: string;
+  repo_path: string;
+  remote_url?: string | null;
+  created_at: string;
+  updated_at: string;
+  session_count?: number;
+}
+
+// GET /api/projects/{id}: the project meta plus its sessions (the project window).
+export interface ProjectDetail extends Project {
+  sessions: SessionSummary[];
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;

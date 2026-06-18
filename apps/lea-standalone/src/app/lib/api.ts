@@ -12,6 +12,8 @@ import type {
   CodeStep,
   SafeVerifyStatus,
   SessionDetail,
+  Project,
+  ProjectDetail,
 } from './types';
 
 export * from './types';
@@ -78,6 +80,54 @@ export async function interruptRun(runId: string): Promise<void> {
   const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/interrupt`, { method: 'POST' });
   if (!response.ok && response.status !== 409) {
     throw new Error(await detailMessage(response, `Failed to interrupt run: ${response.statusText}`));
+  }
+}
+
+// ── Projects (v2.1) ────────────────────────────────────────────────────────────
+export async function listProjects(): Promise<Project[]> {
+  const response = await fetch('/api/projects');
+  if (!response.ok) throw new Error(`Failed to load projects: ${response.statusText}`);
+  const data = await response.json();
+  return Array.isArray(data.projects) ? data.projects : [];
+}
+
+export async function getProject(projectId: string): Promise<ProjectDetail> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`);
+  if (!response.ok) throw new Error(`Failed to load project: ${response.statusText}`);
+  return response.json();
+}
+
+export async function createProject(title: string, description?: string): Promise<Project> {
+  const response = await fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, description }),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to create project: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function updateProject(
+  projectId: string,
+  update: { title?: string; description?: string },
+): Promise<Project> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to update project: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to delete project: ${response.statusText}`));
   }
 }
 

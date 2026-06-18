@@ -43,13 +43,35 @@ def init_db() -> None:
                 updated_at text not null
             );
 
+            -- A project is a shared dir + git repo + this index row (D21). The DB
+            -- never stores Instructions/Memory/Blueprint content — those are the
+            -- three canonical `.lea/*.md` files (D25/D26/D28); only short metadata
+            -- lives here. `slug` is immutable (it determines the namespace + dir,
+            -- D22); `namespace`/`repo_path` are derivable-but-cached for queries.
             create table if not exists projects (
                 id text primary key,
-                slug text not null unique,
+                slug text not null unique,        -- immutable; → namespace Lea.<Project> (D22)
                 title text not null,
-                path text not null,
+                description text,                  -- short metadata for the project list/cards
+                namespace text not null,          -- cached 'Lea.<Project>' (derivable; cached)
+                repo_path text not null,          -- 'proofs/Lea/<Project>' — the shared dir/repo (D22)
+                remote_url text,                  -- per-project GitHub remote for push (D34; nullable)
                 created_at text not null,
                 updated_at text not null
+            );
+
+            -- Uploaded/extracted project files (D27). Index only: the bytes live in
+            -- the project repo under `.lea/files/` (git-canonical). `kind` tags the
+            -- role; `extracted_path` points at the tiered text sidecar when present.
+            create table if not exists project_files (
+                id text primary key,
+                project_id text not null references projects(id),
+                filename text not null,
+                stored_path text not null,        -- path within the project repo (.lea/files/<name>)
+                mime text,
+                kind text not null default 'upload',   -- 'upload' | 'blueprint' | 'extract'
+                extracted_path text,              -- tiered text sidecar (.lea/files/<name>.txt)
+                created_at text not null
             );
 
             create table if not exists runs (

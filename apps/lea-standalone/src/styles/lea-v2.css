@@ -231,6 +231,11 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .badge.bad { color: var(--red); background: var(--red-soft); }
 .badge.idle { color: var(--amber); background: var(--amber-soft); }
 .err-detail { color: var(--red); font-family: ui-monospace, monospace; font-size: 11.5px; white-space: pre-wrap; }
+/* A SafeVerify failure: badge on its own line with the full detail below it
+   (scrollable so a long kernel-audit dump can't blow out the canvas footer). */
+.sv-fail { display: flex; flex-direction: column; gap: 6px; flex-basis: 100%; min-width: 0; }
+.sv-fail .badge { align-self: flex-start; }
+.sv-fail .err-detail { max-height: 160px; overflow: auto; max-width: 100%; }
 .canvas-empty { flex: 1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
 
 /* ---------- Stats / Usage panel ----------
@@ -262,3 +267,70 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
   --ring: #c96442;                /* --accent */
   --radius: 12px;
 }
+
+/* ============================================================================
+   v2.1 — Projects (sidebar group · create dialog · project window)
+   ========================================================================== */
+
+/* Sidebar Projects group */
+.proj-group { margin-bottom: 6px; }
+.group-label.proj-head { display: flex; align-items: center; }
+.proj-add { margin-left: auto; cursor: pointer; background: none; border: none; color: var(--muted);
+  display: inline-flex; align-items: center; padding: 2px; border-radius: 6px; }
+.proj-add:hover { color: var(--accent); background: var(--panel-2); }
+.proj-empty { font-size: 12.5px; color: var(--muted); padding: 2px 10px 6px; }
+
+/* Create-project modal */
+.modal-overlay { position: fixed; inset: 0; background: rgba(31,30,29,.34); z-index: 50;
+  display: flex; align-items: center; justify-content: center; padding: 24px; }
+.modal { width: 100%; max-width: 460px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: 0 18px 48px rgba(31,30,29,.18); padding: 20px 22px;
+  display: flex; flex-direction: column; }
+.modal-head { font-size: 16px; font-weight: 600; color: var(--ink); }
+.modal-sub { font-size: 12.5px; color: var(--muted); margin: 4px 0 14px; line-height: 1.45; }
+.modal-label { font-size: 12px; font-weight: 600; color: var(--ink-2); margin: 8px 0 5px; }
+.modal-opt { font-weight: 400; color: var(--muted); }
+.modal-input { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--panel-2); color: var(--ink); font: inherit; font-size: 14px; }
+.modal-input:focus { outline: none; border-color: var(--accent); background: var(--panel); }
+.modal-textarea { resize: vertical; min-height: 64px; }
+.modal-error { color: var(--red); font-size: 12.5px; margin-top: 10px; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.modal-btn { padding: 8px 14px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink-2); font: inherit; font-size: 13.5px; cursor: pointer; }
+.modal-btn:hover:not(:disabled) { background: var(--panel-2); }
+.modal-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.modal-btn.primary:hover:not(:disabled) { filter: brightness(1.05); }
+.modal-btn:disabled { opacity: .55; cursor: default; }
+
+/* Project window (full page) */
+.project-window { height: 100%; overflow-y: auto; background: var(--bg); }
+.pw-bar { display: flex; align-items: center; gap: 8px; padding: 14px 28px; border-bottom: 1px solid var(--line);
+  font-size: 13px; color: var(--muted); position: sticky; top: 0; background: var(--bg); z-index: 1; }
+.pw-back { display: inline-flex; align-items: center; gap: 2px; background: none; border: none; cursor: pointer;
+  color: var(--ink-2); font: inherit; font-size: 13px; padding: 2px 4px; border-radius: 7px; }
+.pw-back:hover { background: var(--panel-2); color: var(--ink); }
+.pw-crumb-sep { color: var(--line); }
+.pw-crumb { color: var(--ink); font-weight: 550; }
+.pw-hero { padding: 26px 28px 14px; max-width: 900px; }
+.pw-title { font-size: 24px; font-weight: 650; letter-spacing: -.01em; color: var(--ink);
+  display: flex; align-items: center; gap: 10px; margin: 0; }
+.pw-sigma { color: var(--accent); }
+.pw-ns { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent);
+  background: var(--accent-soft); border-radius: 6px; padding: 2px 8px; font-weight: 500; }
+.pw-desc { margin: 10px 0 0; color: var(--ink-2); font-size: 14px; max-width: 720px; line-height: 1.5; }
+.pw-tabs { display: flex; gap: 2px; padding: 0 28px; border-bottom: 1px solid var(--line); }
+.pw-tab { background: none; border: none; cursor: pointer; font: inherit; font-size: 13.5px; color: var(--muted);
+  padding: 11px 14px; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.pw-tab:hover { color: var(--ink-2); }
+.pw-tab.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 550; }
+.pw-body { padding: 22px 28px; max-width: 900px; }
+.pw-sec-label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 10px; }
+.pw-empty { color: var(--muted); font-size: 13.5px; line-height: 1.55; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+.pw-empty code { font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; }
+.pw-session-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.pw-session-row { display: flex; align-items: center; gap: 9px; padding: 9px 11px; border-radius: 9px; }
+.pw-session-row:hover { background: var(--panel-2); }
+.pw-session-row .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.pw-session-title { color: var(--ink-2); font-size: 14px; }

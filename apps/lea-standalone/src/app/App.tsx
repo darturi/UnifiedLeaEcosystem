@@ -4,10 +4,13 @@ import { ChatThread } from './components/ChatThread';
 import { Canvas, type CheckOutcome } from './components/Canvas';
 import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
+import { ProjectWindow } from './components/ProjectWindow';
+import { NewProjectDialog } from './components/NewProjectDialog';
 import { sortCodeSteps } from './lib/timeline.mjs';
 import { pickInitialSession, stripSessionParam } from './sessionDeepLink.mjs';
 import { useProofSession } from './stores/proofSession';
 import { useSessions } from './stores/sessions';
+import { useProjects } from './stores/projects';
 import { useModel } from './stores/model';
 import { useProofStream } from './hooks/useProofStream';
 import { useLayout } from './hooks/useLayout';
@@ -36,6 +39,13 @@ export default function App() {
   const selectedSessionId = useSessions((s) => s.selectedSessionId);
   const setSelectedSessionId = useSessions((s) => s.setSelectedSessionId);
   const refreshSessions = useSessions((s) => s.refreshSessions);
+  // F1: projects store — the list, the open project's detail, and open/close.
+  const currentProject = useProjects((s) => s.currentProject);
+  const refreshProjects = useProjects((s) => s.refreshProjects);
+  const openProject = useProjects((s) => s.openProject);
+  const closeProject = useProjects((s) => s.closeProject);
+  const createAndOpenProject = useProjects((s) => s.createAndOpen);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
   // messages + statusEvents (chat thread content) now live in the proofSession
   // store (R1c-2a): App writes them; ChatThread reads them + derives the timeline.
   const setMessages = useProofSession((s) => s.setMessages);
@@ -105,6 +115,7 @@ export default function App() {
   useEffect(() => {
     const restore = async () => {
       const loaded = await refreshSessions();
+      refreshProjects().catch(() => {});
       useModel.getState().syncFromSettings();
       useModel.getState().loadCatalog();
       // The Overleaf extension's "View in Lea UI" action opens <ui>/?session=<id>;
@@ -159,6 +170,26 @@ export default function App() {
     const detail = await getSession(sessionId);
     applyDetail(detail);
     window.localStorage.setItem(SELECTED_SESSION_KEY, detail.id);
+  };
+
+  // Open a project's window (F1/F2). Loading its detail also sets it as the
+  // selected project (sidebar highlight); the view switch reveals the window.
+  const openProjectWindow = (projectId: string) => {
+    openProject(projectId)
+      .then(() => setView('project'))
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+
+  const handleCreateProject = async (title: string, description?: string) => {
+    await createAndOpenProject(title, description);
+    setNewProjectOpen(false);
+    setView('project');
+  };
+
+  // Leaving a project window back to the loose-chat view.
+  const leaveProject = () => {
+    closeProject();
+    setView('main');
   };
 
   const resetForNewSession = () => {
@@ -253,6 +284,8 @@ export default function App() {
     return result;
   };
 
+  if (view === 'project' && currentProject)
+    return <ProjectWindow project={currentProject} onBack={leaveProject} />;
   if (view === 'stats') return <StatsPage onBack={() => setView('main')} />;
   if (view === 'settings')
     return (
@@ -267,13 +300,24 @@ export default function App() {
 
   return (
     <div className="lea-app">
+      <NewProjectDialog
+        open={newProjectOpen}
+        onClose={() => setNewProjectOpen(false)}
+        onCreate={handleCreateProject}
+      />
       <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         <Sidebar
           runningSessionId={isRunning ? selectedSessionId : undefined}
-          onSelectSession={(id) =>
-            loadSession(id).catch((err) => setError(err instanceof Error ? err.message : String(err)))
-          }
-          onNewSession={resetForNewSession}
+          onSelectSession={(id) => {
+            closeProject();
+            loadSession(id).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+          }}
+          onNewSession={() => {
+            closeProject();
+            resetForNewSession();
+          }}
+          onSelectProject={openProjectWindow}
+          onNewProject={() => setNewProjectOpen(true)}
           onOpenSettings={() => setView('settings')}
           onOpenStats={() => setView('stats')}
           onCollapse={() => setSidebarCollapsed(true)}
