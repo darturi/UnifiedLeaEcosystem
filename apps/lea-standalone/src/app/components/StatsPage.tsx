@@ -27,7 +27,7 @@ import {
   UsageStats,
   getSession,
   getUsageStats,
-} from '../api';
+} from '../lib/api';
 
 const INPUT_COLOR = '#6366f1';
 const OUTPUT_COLOR = '#22d3ee';

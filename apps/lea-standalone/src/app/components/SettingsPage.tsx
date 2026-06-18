@@ -11,7 +11,7 @@ import {
   fetchModelRequirements,
   getSettings,
   saveSettings,
-} from '../api';
+} from '../lib/api';
 import { ModelCombobox } from './ModelCombobox';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
 import { Slider } from './ui/slider';

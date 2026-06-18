@@ -1,5 +1,5 @@
 import { CheckCircle, XCircle, Circle, CircleDashed } from 'lucide-react';
-import type { SessionSummary } from '../api';
+import type { SessionSummary } from '../lib/api';
 
 // v2 session status is derived from the latest code step's verdict:
 //   ok → compiles · error → has errors · unchecked → written but not checked · empty

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { renderTex } from './mathRenderer.js';
-import { parseInlineMarkdown, parseMarkdownBlocks } from './markdownParser.js';
+import { renderTex } from './lib/mathRenderer.js';
+import { parseInlineMarkdown, parseMarkdownBlocks } from './lib/markdownParser.js';
 
 test('parses inline math delimiters', () => {
   const segments = parseInlineMarkdown('Show \\( n^2 \\) and $k + 1$.');

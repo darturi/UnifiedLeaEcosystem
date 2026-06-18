@@ -34,6 +34,58 @@ def test_init_db_creates_the_authoritative_v2_schema(tmp_path, monkeypatch):
     assert "cost_usd" in usage_columns
 
 
+def test_session_status_ignores_scratch_files(tmp_path, monkeypatch):
+    """M14: a session is 'ok' only when a real proof compiles — a throwaway
+    scratch/probe file (exact?/apply? scratchpad) that compiles must not mask
+    the real proof's verdict, nor count as the session having a proof."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    session = store.create_session("Prove something")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    # The real proof errored…
+    store.add_code_step(session["id"], run["id"], "Lea/Misc/Foo.lean",
+                        commit_sha="a" * 40, check_status="error")
+    # …then a later scratch probe compiled cleanly.
+    store.add_code_step(session["id"], run["id"], "Lea/Misc/scratch.lean",
+                        commit_sha="b" * 40, check_status="ok")
+
+    detail = store.session_detail(session["id"])
+    assert detail["status"] == "error", "scratch 'ok' must not mask the real proof's error"
+    summary = next(s for s in store.list_sessions() if s["id"] == session["id"])
+    assert summary["status"] == "error"
+    assert len(detail["code_steps"]) == 2  # the canvas still shows both
+
+
+def test_safe_verify_persists_on_latest_run(tmp_path, monkeypatch):
+    """M24: a standalone /verify verdict is stored on the session's latest run and
+    surfaced as session_detail.safe_verify, so it survives a reload."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Verify me")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(session["id"], run["id"], "Lea/Misc/Foo.lean",
+                        commit_sha="a" * 40, check_status="ok")
+
+    assert store.session_detail(session["id"])["safe_verify"] is None
+    store.set_session_safe_verify(session["id"], "ok", None)
+    sv = store.session_detail(session["id"])["safe_verify"]
+    assert sv["status"] == "ok" and sv["run_id"] == run["id"]
+
+
+def test_session_status_scratch_only_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Probes only")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(session["id"], run["id"], "Lea/Misc/Scratch.lean",  # capital → case-insensitive
+                        commit_sha="c" * 40, check_status="ok")
+    detail = store.session_detail(session["id"])
+    assert detail["status"] == "empty", "only scratch probes means no real proof yet"
+    summary = next(s for s in store.list_sessions() if s["id"] == session["id"])
+    assert summary["status"] == "empty"
+
+
 def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

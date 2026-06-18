@@ -1,10 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { ChatThread } from './components/ChatThread';
 import { Canvas, type CheckOutcome } from './components/Canvas';
 import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
-import { buildTimeline, sortCodeSteps } from './timeline.mjs';
+import { sortCodeSteps } from './lib/timeline.mjs';
+import { useProofSession } from './stores/proofSession';
+import { useSessions } from './stores/sessions';
+import { useModel } from './stores/model';
+import { useProofStream } from './hooks/useProofStream';
+import { useLayout } from './hooks/useLayout';
 import {
   type ApprovalDecision,
   type ChatMessage,
@@ -12,45 +17,76 @@ import {
   type PendingApproval,
   type RunStatus,
   type SessionDetail,
-  type SessionSummary,
   type StatusEvent,
   createRun,
   getSession,
-  getSettings,
   interruptRun,
   leanCheckSession,
-  listSessions,
   submitApproval,
   verifySession,
   writeSessionFile,
-} from './api';
+} from './lib/api';
 
 const SELECTED_SESSION_KEY = 'lea:selectedSessionId';
 
 export default function App() {
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [selectedSessionId, setSelectedSessionId] = useState<string>();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [codeSteps, setCodeSteps] = useState<CodeStep[]>([]);
-  const [statusEvents, setStatusEvents] = useState<StatusEvent[]>([]);
-  const [codeIndex, setCodeIndex] = useState(0);
-  const [isRunning, setIsRunning] = useState(false);
-  const [currentRunId, setCurrentRunId] = useState<string>();
-  const [runStatus, setRunStatus] = useState<RunStatus>();
-  const [pendingApproval, setPendingApproval] = useState<PendingApproval>();
-  const [approvalBusy, setApprovalBusy] = useState(false);
-  const [error, setError] = useState<string>();
+  // Session list + selection now live in the sessions store (R3).
+  const sessions = useSessions((s) => s.sessions);
+  const selectedSessionId = useSessions((s) => s.selectedSessionId);
+  const setSelectedSessionId = useSessions((s) => s.setSelectedSessionId);
+  const refreshSessions = useSessions((s) => s.refreshSessions);
+  // messages + statusEvents (chat thread content) now live in the proofSession
+  // store (R1c-2a): App writes them; ChatThread reads them + derives the timeline.
+  const setMessages = useProofSession((s) => s.setMessages);
+  const setStatusEvents = useProofSession((s) => s.setStatusEvents);
+  // codeSteps + codeIndex (canvas snapshots + stepper) now live in the
+  // proofSession store (R1c): App writes them; Canvas reads them directly.
+  const codeSteps = useProofSession((s) => s.codeSteps);
+  const setCodeSteps = useProofSession((s) => s.setCodeSteps);
+  const setCodeIndex = useProofSession((s) => s.setCodeIndex);
+  // Run lifecycle + approvals (M13/M16) now live in the proofSession store
+  // (R1c-2b): App drives them; ChatThread/Canvas read them directly. App still
+  // reads several here for its handlers (guards, the run to act on, pending
+  // approval). runStatusById is write-only from App.
+  const isRunning = useProofSession((s) => s.isRunning);
+  const setIsRunning = useProofSession((s) => s.setIsRunning);
+  const currentRunId = useProofSession((s) => s.currentRunId);
+  const setCurrentRunId = useProofSession((s) => s.setCurrentRunId);
+  const runStatus = useProofSession((s) => s.runStatus);
+  const setRunStatus = useProofSession((s) => s.setRunStatus);
+  const setRunStatusById = useProofSession((s) => s.setRunStatusById);
+  const approvals = useProofSession((s) => s.approvals);
+  const setApprovals = useProofSession((s) => s.setApprovals);
+  const approvalBusy = useProofSession((s) => s.approvalBusy);
+  const setApprovalBusy = useProofSession((s) => s.setApprovalBusy);
+  // error (chat error banner) now lives in the proofSession store (R1b); App
+  // sets it, ChatThread reads it.
+  const setError = useProofSession((s) => s.setError);
   const [draft, setDraft] = useState('');
-  const [view, setView] = useState<'main' | 'stats' | 'settings'>('main');
-  const [canvasCollapsed, setCanvasCollapsed] = useState(false);
-  const [model, setModel] = useState<string>();
-  // run_id -> final/active status, so the thread can place the "Proved" milestone
-  // after the run that actually completed (M16). Filled on reload + live `done`.
-  const [runStatusById, setRunStatusById] = useState<Record<string, string>>({});
-
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const runStatusRef = useRef<RunStatus>();
-  runStatusRef.current = runStatus;
+  // View/render UI state (page, sidebar/canvas collapse, canvas resize) lives in
+  // the useLayout hook now (R5).
+  const {
+    view,
+    setView,
+    canvasCollapsed,
+    setCanvasCollapsed,
+    sidebarCollapsed,
+    setSidebarCollapsed,
+    canvasWidth,
+    dragging,
+    setDragging,
+    mainAreaRef,
+  } = useLayout();
+  // editedPath (M20 canvas-edit nudge) now lives in the proofSession store
+  // (v2.0.1 R1a): App sets it; ChatThread reads it straight from the store.
+  const setEditedPath = useProofSession((s) => s.setEditedPath);
+  // safeVerify (persisted SafeVerify verdict, survives reload via
+  // session_detail.safe_verify; M24) now lives in the proofSession store (R1b);
+  // App sets it, Canvas reads it.
+  const setSafeVerify = useProofSession((s) => s.setSafeVerify);
+  // Model state (active model, catalog, featured, key-missing) lives in the model
+  // store (R4); ChatThread reads it directly. App only kicks off the startup load
+  // (in the restore effect) + re-sync on returning from Settings.
 
   const selectedSession = useMemo(
     () => sessions.find((s) => s.id === selectedSessionId),
@@ -58,73 +94,35 @@ export default function App() {
   );
   const title = selectedSession?.title || 'New theorem session';
 
-  const { items } = useMemo(() => buildTimeline({ messages, codeSteps }), [messages, codeSteps]);
   const sortedCode = useMemo(() => sortCodeSteps(codeSteps), [codeSteps]);
+  const pendingApproval = approvals.find((a) => !a.decision);
 
-  const refreshSessions = async () => {
-    const loaded = await listSessions();
-    setSessions(loaded);
-    return loaded;
-  };
+  // The run EventSource lifecycle + session-detail hydration live in a hook now
+  // (R2); it reads the proofSession + sessions stores directly.
+  const { attachStream, applyDetail, reconcile, closeStream } = useProofStream();
 
   useEffect(() => {
     const restore = async () => {
       const loaded = await refreshSessions();
-      getSettings()
-        .then((s) => setModel(typeof s.model === 'string' ? s.model : undefined))
-        .catch(() => {});
+      useModel.getState().syncFromSettings();
+      useModel.getState().loadCatalog();
       const savedId = window.localStorage.getItem(SELECTED_SESSION_KEY);
       const saved = savedId ? loaded.find((s) => s.id === savedId) : undefined;
       if (saved) await loadSession(saved.id);
     };
     restore().catch((err) => setError(err instanceof Error ? err.message : String(err)));
-    return () => eventSourceRef.current?.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const applyDetail = (detail: SessionDetail) => {
-    setSelectedSessionId(detail.id);
-    setMessages(detail.messages);
-    setCodeSteps(detail.code_steps);
-    setStatusEvents(detail.status_events || []);
-    setCodeIndex(Math.max(0, sortCodeSteps(detail.code_steps).length - 1));
-    setError(undefined);
-    const active = detail.active_run;
-    setCurrentRunId(active?.id);
-    setIsRunning(Boolean(active));
-    setRunStatus((active?.status as RunStatus) || undefined);
-    setPendingApproval(
-      active?.pending_approval
-        ? { ...active.pending_approval, session_id: detail.id, run_id: active.id }
-        : undefined,
-    );
-    setApprovalBusy(false);
-    const statuses: Record<string, string> = {};
-    for (const r of detail.runs || []) statuses[r.id] = r.status;
-    if (active) statuses[active.id] = active.status;
-    setRunStatusById(statuses);
-    if (active && (active.status === 'running' || active.status === 'pending')) {
-      attachStream(active.id, detail.id);
-    }
-  };
-
   const loadSession = async (sessionId: string) => {
-    eventSourceRef.current?.close();
+    closeStream();
     const detail = await getSession(sessionId);
     applyDetail(detail);
     window.localStorage.setItem(SELECTED_SESSION_KEY, detail.id);
   };
 
-  const reconcile = async (sessionId: string) => {
-    const detail = await getSession(sessionId);
-    const finished = runStatusRef.current;
-    applyDetail(detail);
-    if (finished) setRunStatus(finished);
-  };
-
   const resetForNewSession = () => {
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
+    closeStream();
     setSelectedSessionId(undefined);
     setMessages([]);
     setCodeSteps([]);
@@ -133,163 +131,27 @@ export default function App() {
     setIsRunning(false);
     setCurrentRunId(undefined);
     setRunStatus(undefined);
-    setPendingApproval(undefined);
+    setRunStatusById({});
+    setApprovals([]);
     setApprovalBusy(false);
     setError(undefined);
     setDraft('');
+    setEditedPath(undefined);
+    setSafeVerify(null);
     window.localStorage.removeItem(SELECTED_SESSION_KEY);
-  };
-
-  const attachStream = (runId: string, sessionId: string) => {
-    eventSourceRef.current?.close();
-    const source = new EventSource(`/api/runs/${runId}/events`);
-    eventSourceRef.current = source;
-    const liveId = `live-${runId}`;
-    let sawDone = false;
-
-    source.addEventListener('assistant_delta', (event) => {
-      const { text } = JSON.parse((event as MessageEvent).data) as { text: string };
-      setMessages((current) => {
-        const existing = current.find((m) => m.id === liveId);
-        if (existing) {
-          return current.map((m) => (m.id === liveId ? { ...m, content: m.content + text } : m));
-        }
-        return [
-          ...current,
-          {
-            id: liveId,
-            session_id: sessionId,
-            run_id: runId,
-            role: 'assistant',
-            content: text,
-            created_at: new Date().toISOString(),
-            live: true,
-          } as ChatMessage,
-        ];
-      });
-    });
-
-    source.addEventListener('message', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as ChatMessage;
-      setMessages((current) => {
-        const live = current.find((m) => m.id === liveId);
-        const replacesLive =
-          payload.role === 'assistant' &&
-          !!live &&
-          (payload.content.includes(live.content) || live.content.includes(payload.content));
-        const base = replacesLive ? current.filter((m) => m.id !== liveId) : current;
-        if (base.some((m) => m.id === payload.id)) return base;
-        return [...base, payload];
-      });
-    });
-
-    source.addEventListener('code_step', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as CodeStep;
-      setCodeSteps((current) => {
-        if (current.some((s) => s.id === payload.id)) {
-          return current.map((s) => (s.id === payload.id ? { ...s, ...payload } : s));
-        }
-        const next = sortCodeSteps([...current, payload]);
-        const idx = next.findIndex((s) => s.id === payload.id);
-        if (idx >= 0) setCodeIndex(idx);
-        return next;
-      });
-    });
-
-    source.addEventListener('status', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as Partial<StatusEvent>;
-      setStatusEvents((current) => [
-        ...current,
-        {
-          id: payload.id || `${runId}-${current.length}-${Date.now()}`,
-          session_id: payload.session_id || sessionId,
-          run_id: payload.run_id || runId,
-          status: payload.status || null,
-          message: payload.message || payload.status || 'status update',
-          turn: payload.turn ?? null,
-          check_status: payload.check_status ?? null,
-          check_detail: payload.check_detail ?? null,
-          created_at: payload.created_at || new Date().toISOString(),
-        },
-      ]);
-    });
-
-    source.addEventListener('approval_requested', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as PendingApproval;
-      setPendingApproval({ ...payload, session_id: sessionId, run_id: runId });
-      setApprovalBusy(false);
-    });
-
-    source.addEventListener('approval_resolved', (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as { approval_id?: string };
-      setPendingApproval((current) =>
-        current && current.approval_id === payload.approval_id ? undefined : current,
-      );
-      setApprovalBusy(false);
-    });
-
-    source.addEventListener('run_error', (event) => {
-      const data = (event as MessageEvent).data;
-      if (!data) return;
-      const payload = JSON.parse(data) as { message?: string };
-      setError(payload.message || 'Lea reported an error.');
-    });
-
-    source.addEventListener('done', (event) => {
-      sawDone = true;
-      source.close();
-      eventSourceRef.current = null;
-      let status: RunStatus = 'success';
-      try {
-        status = (JSON.parse((event as MessageEvent).data || '{}').status as RunStatus) || 'success';
-      } catch {
-        /* keep default */
-      }
-      setIsRunning(false);
-      setRunStatus(status);
-      runStatusRef.current = status;
-      setRunStatusById((prev) => ({ ...prev, [runId]: status }));
-      setCurrentRunId(undefined);
-      setPendingApproval(undefined);
-      setApprovalBusy(false);
-      reconcile(sessionId)
-        .then(() => refreshSessions())
-        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
-    });
-
-    source.onerror = async () => {
-      if (eventSourceRef.current !== source || source.readyState === EventSource.CLOSED) return;
-      if (sawDone) {
-        source.close();
-        eventSourceRef.current = null;
-        return;
-      }
-      source.close();
-      eventSourceRef.current = null;
-      setIsRunning(false);
-      setCurrentRunId(undefined);
-      try {
-        const detail = await getSession(sessionId);
-        applyDetail(detail);
-        await refreshSessions();
-        if (detail.active_run) setError('Lost connection to the Lea backend.');
-      } catch {
-        setError('Lost connection to the Lea backend.');
-      }
-    };
   };
 
   const handleSubmit = async () => {
     const content = draft.trim();
     if (!content || isRunning) return;
     setError(undefined);
-    setPendingApproval(undefined);
+    setEditedPath(undefined);
+    setApprovals((prev) => prev.filter((a) => a.decision));
     try {
       const run = await createRun(content, selectedSessionId);
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       setRunStatus('running');
-      runStatusRef.current = 'running';
       setRunStatusById((prev) => ({ ...prev, [run.run_id]: 'running' }));
       setIsRunning(true);
       setMessages((current) => [...current, run.message]);
@@ -338,49 +200,57 @@ export default function App() {
     const result = await leanCheckSession(selectedSessionId, path);
     await reconcile(selectedSessionId);
     await refreshSessions();
+    setEditedPath(path); // after reconcile (which clears it) — surface the nudge
+    setSafeVerify(null); // the edit invalidates any prior SafeVerify verdict
     return result;
   };
 
   const handleVerify = async (): Promise<CheckOutcome> => {
     const path = sortedCode[sortedCode.length - 1]?.path;
     if (!selectedSessionId) return { status: 'error', detail: 'No session.' };
-    return verifySession(selectedSessionId, path);
+    const result = await verifySession(selectedSessionId, path);
+    setSafeVerify({ status: result.status, detail: result.detail });
+    return result;
   };
 
   if (view === 'stats') return <StatsPage onBack={() => setView('main')} />;
-  if (view === 'settings') return <SettingsPage onBack={() => setView('main')} />;
+  if (view === 'settings')
+    return (
+      <SettingsPage
+        onBack={() => {
+          setView('main');
+          // re-sync model + key state after the user may have added a key
+          useModel.getState().syncFromSettings();
+        }}
+      />
+    );
 
   return (
     <div className="lea-app">
-      <div className="app">
+      <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         <Sidebar
-          sessions={sessions}
-          selectedSessionId={selectedSessionId}
           runningSessionId={isRunning ? selectedSessionId : undefined}
           onSelectSession={(id) =>
             loadSession(id).catch((err) => setError(err instanceof Error ? err.message : String(err)))
           }
           onNewSession={resetForNewSession}
           onOpenSettings={() => setView('settings')}
+          onCollapse={() => setSidebarCollapsed(true)}
         />
 
-        <div className={`main-area ${canvasCollapsed ? 'canvas-collapsed' : ''}`}>
+        <div
+          ref={mainAreaRef}
+          className={`main-area ${canvasCollapsed ? 'canvas-collapsed' : ''}`}
+          style={{ gridTemplateColumns: canvasCollapsed ? '1fr 0' : `minmax(0,1fr) ${canvasWidth}%` }}
+        >
           <ChatThread
             title={title}
-            model={model}
+            sidebarCollapsed={sidebarCollapsed}
+            onExpandSidebar={() => setSidebarCollapsed(false)}
             session={selectedSession}
-            runStatus={runStatus}
-            runStatusById={runStatusById}
-            isRunning={isRunning}
-            currentRunId={currentRunId}
-            items={items}
-            statusEvents={statusEvents}
-            activeCodeIndex={codeIndex}
             onSelectStep={selectStep}
-            pendingApproval={pendingApproval}
-            approvalBusy={approvalBusy}
             onDecide={handleDecide}
-            error={error}
+            onOpenSettings={() => setView('settings')}
             draft={draft}
             onDraftChange={setDraft}
             onSubmit={handleSubmit}
@@ -389,11 +259,19 @@ export default function App() {
             onToggleCanvas={() => setCanvasCollapsed((v) => !v)}
           />
 
+          {!canvasCollapsed && (
+            <div
+              className={`col-resizer ${dragging ? 'dragging' : ''}`}
+              style={{ right: `${canvasWidth}%` }}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                setDragging(true);
+              }}
+              title="Drag to resize"
+            />
+          )}
+
           <Canvas
-            codeSteps={sortedCode}
-            index={codeIndex}
-            onIndexChange={setCodeIndex}
-            isRunning={isRunning}
             onClose={() => setCanvasCollapsed(true)}
             onSaveAndCheck={handleSaveAndCheck}
             onVerify={handleVerify}

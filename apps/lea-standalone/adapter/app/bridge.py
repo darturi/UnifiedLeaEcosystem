@@ -55,8 +55,11 @@ from . import store
 logger = logging.getLogger("lea-interface.bridge")
 
 # Only one Lea activation may run at a time — they share the on-disk workspace
-# and the warm LSP daemon. A second concurrent run is rejected, not queued.
+# and the warm LSP daemon. A new run doesn't queue or get rejected; it supersedes
+# whatever holds the lock (most often a run parked on an unanswered approval whose
+# event stream is gone), so the UI is never permanently blocked (M15).
 active_run_lock = Lock()
+_active_run_id: str | None = None  # the run currently holding active_run_lock
 
 # Per-run cooperative stop flags (D18). The run registers its Event when it starts
 # and the interrupt endpoint sets it; the agent checks it at each turn boundary and
@@ -240,15 +243,25 @@ def run_lea(context: RunnerContext) -> None:
     Always terminates the stream with a `done` event (the SSE endpoint breaks on
     it), even on failure — so the browser's EventSource never hangs.
     """
+    global _active_run_id
     events = context.events
     cfg = context.config
     session_id = context.session_id
     run_id = context.run_id
 
     if not active_run_lock.acquire(blocking=False):
-        emit(events, "run_error", {"message": "Another Lea run is already active."})
-        emit(events, "done", {"status": "failed"})
-        return
+        # A prior run still holds the lock — usually one parked on an approval
+        # nobody answered (its event stream is gone). Supersede it: ask it to stop
+        # (its approval wait + turn loop are stop-aware) and take over once it
+        # releases, so starting a new run is never permanently blocked (M15).
+        stuck = _active_run_id
+        if stuck and stuck != run_id:
+            request_stop(stuck)
+        if not active_run_lock.acquire(timeout=15):
+            emit(events, "run_error", {"message": "A previous run is still finishing — try again in a moment."})
+            emit(events, "done", {"status": "failed"})
+            return
+    _active_run_id = run_id
 
     # Register (or adopt) this run's cooperative stop flag — the interrupt endpoint
     # may have created+set it already if Stop was hit before we got here (D18).
@@ -395,5 +408,7 @@ def run_lea(context: RunnerContext) -> None:
     finally:
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
+        if _active_run_id == run_id:
+            _active_run_id = None
         active_run_lock.release()
         emit(events, "done", {"status": final_status})

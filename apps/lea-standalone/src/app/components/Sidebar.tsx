@@ -1,25 +1,28 @@
-import type { SessionSummary } from '../api';
+import { PanelLeftClose } from 'lucide-react';
+import type { SessionSummary } from '../lib/api';
+import { useSessions } from '../stores/sessions';
 
 // Left rail: brand, new-proof, (search stub), date-grouped loose chats, footer.
 // Projects are deferred to v2.1 — the mockup's Projects group is intentionally
 // omitted here until that feature lands.
 export function Sidebar({
-  sessions,
-  selectedSessionId,
   runningSessionId,
   userEmail,
   onSelectSession,
   onNewSession,
   onOpenSettings,
+  onCollapse,
 }: {
-  sessions: SessionSummary[];
-  selectedSessionId?: string;
   runningSessionId?: string;
   userEmail?: string;
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onOpenSettings: () => void;
+  onCollapse: () => void;
 }) {
+  // R3: session list + selection from the store, not props.
+  const sessions = useSessions((s) => s.sessions);
+  const selectedSessionId = useSessions((s) => s.selectedSessionId);
   const groups = groupByDate(sessions);
 
   return (
@@ -28,6 +31,9 @@ export function Sidebar({
         <div className="logo">L</div>
         <div className="name">Lea</div>
         <div className="ver">v2</div>
+        <button className="icon-btn" style={{ marginLeft: 8 }} onClick={onCollapse} title="Collapse sidebar">
+          <PanelLeftClose size={15} />
+        </button>
       </div>
       <button className="newbtn" onClick={onNewSession}>
         <span className="plus">+</span> New proof

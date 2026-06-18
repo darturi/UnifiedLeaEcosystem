@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildTimeline, sortCodeSteps, terminalMessageId } from './timeline.mjs';
+import { buildTimeline, sortCodeSteps } from './lib/timeline.mjs';
 
 const msg = (id, seq, role = 'assistant', extra = {}) => ({
   id,
@@ -56,11 +56,4 @@ test('sortCodeSteps falls back to created_at then id when seq ties', () => {
   const a = code('a', 1, { created_at: '2026-06-16T00:00:02Z' });
   const b = code('b', 1, { created_at: '2026-06-16T00:00:01Z' });
   assert.deepEqual(sortCodeSteps([a, b]).map((c) => c.id), ['b', 'a']);
-});
-
-test('terminalMessageId is the last assistant message of a finished run', () => {
-  const messages = [msg('u', 0, 'user'), msg('a1', 1), msg('a2', 2)];
-  assert.equal(terminalMessageId({ messages, finished: true }), 'a2');
-  assert.equal(terminalMessageId({ messages, finished: false }), null);
-  assert.equal(terminalMessageId({ messages: [msg('u', 0, 'user')], finished: true }), null);
 });
