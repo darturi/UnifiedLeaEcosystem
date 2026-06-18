@@ -13,7 +13,7 @@ from .config import LeaConfig
 from .prompt import load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
-from .tools import _lean_check_has_error, _first_error_line, _tool_result_ok
+from .tools import _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok
 from .registry import build_toolset, import_tool_modules
 from .events import (
     TurnStarted,
@@ -175,7 +175,10 @@ class ProofVerificationState:
                 self.unchecked_write = True
             return
         if tool_name == "lean_check":
-            passed = not _lean_check_has_error(result)
+            # A proof is only verified if it compiles with no errors AND no `sorry`
+            # — `sorry` is a warning, so checking errors alone would accept a
+            # skeleton as a finished proof (a false "Proved").
+            passed = not _lean_check_has_error(result) and not _lean_check_has_sorry(result)
             self.latest_check_path = path
             self.latest_check_output = result
             self.latest_check_passed = passed
@@ -564,6 +567,14 @@ def _run_events_inner(
                 tool_result["tool_call_id"] = gate_call_id
                 messages.append({"role": "user", "content": [tool_result]})
             if proof_state.latest_proof_path and not proof_state.latest_proof_verified():
+                if config.prompt_variant == "interactive":
+                    # Collaborator: the proof isn't actually done (errors, or still
+                    # has a `sorry` — e.g. a skeleton the agent is asking you about).
+                    # End cleanly as a chat turn — never a false "Proved" — and let
+                    # the user steer the next step instead of barreling ahead.
+                    yield Finished("assistant", text or "(no response)", turn, session_id,
+                                   model, total_usage, total_cost, transcript(turn))
+                    return
                 diagnostic = proof_state.latest_check_output or "No successful lean_check was observed."
                 messages.append({"role": "user", "content": f"{_FINAL_GATE_FAILURE_MESSAGE}\n\n{diagnostic}"})
                 continue

@@ -74,11 +74,14 @@ def list_sessions() -> list[dict]:
                 (
                     select cs.check_status
                     from code_steps cs
-                    where cs.session_id = s.id
+                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
                     order by cs.seq desc
                     limit 1
                 ) as latest_check_status,
-                (select count(*) from code_steps cs where cs.session_id = s.id) as code_step_count,
+                (
+                    select count(*) from code_steps cs
+                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
+                ) as code_step_count,
                 (
                     select count(*)
                     from runs r3
@@ -288,25 +291,6 @@ def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
         )
 
 
-def set_session_api_session_id(session_id: str, api_session_id: str) -> None:
-    now = utc_now()
-    with connect() as conn:
-        conn.execute(
-            "update sessions set api_session_id = ?, updated_at = ? where id = ?",
-            (api_session_id, now, session_id),
-        )
-
-
-def set_run_messages_kind(run_id: str, kind: str, role: str = "assistant") -> None:
-    now = utc_now()
-    with connect() as conn:
-        conn.execute(
-            "update messages set kind = ? where run_id = ? and role = ?",
-            (kind, run_id, role),
-        )
-        conn.execute("update runs set updated_at = ? where id = ?", (now, run_id))
-
-
 def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None:
     now = utc_now()
     value = json.dumps(pending_approval) if pending_approval is not None else None
@@ -317,27 +301,21 @@ def set_run_pending_approval(run_id: str, pending_approval: dict | None) -> None
         )
 
 
-def set_run_safe_verify(run_id: str, status: str, detail: str | None) -> None:
-    now = utc_now()
+def set_session_safe_verify(session_id: str, status: str, detail: str | None) -> None:
+    """Persist a standalone /verify verdict on the session's latest run, so it
+    survives reload (the endpoint is run-less; the latest run is the proof run,
+    and session_detail surfaces it as `safe_verify`)."""
     with connect() as conn:
+        row = conn.execute(
+            "select id from runs where session_id = ? order by created_at desc, id desc limit 1",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return
         conn.execute(
             "update runs set safe_verify_status = ?, safe_verify_detail = ?, updated_at = ? where id = ?",
-            (status, detail, now, run_id),
+            (status, detail, utc_now(), row["id"]),
         )
-
-
-def last_lean_code_step_for_run(run_id: str) -> dict | None:
-    """The final `.lean` proof snapshot for a run (used as the SafeVerify submission)."""
-    with connect() as conn:
-        rows = conn.execute(
-            "select * from code_steps where run_id = ? order by seq desc, created_at desc",
-            (run_id,),
-        ).fetchall()
-    for row in rows:
-        step = row_to_dict(row)
-        if str(step.get("kind") or "code") == "code" and str(step.get("path") or "").endswith(".lean"):
-            return step
-    return None
 
 
 def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
@@ -696,13 +674,16 @@ def session_detail(session_id: str) -> dict | None:
             "duration_seconds": _duration_seconds(session["created_at"], session["updated_at"]),
         }
     )
-    # working-copy verdict, derived from the latest code_step (code_steps is asc)
-    latest_check_status = code_steps[-1]["check_status"] if code_steps else None
+    # working-copy verdict, derived from the latest *real* code_step (asc by seq).
+    # Scratch/probe files (exact?/apply? scratchpads) are excluded so a session is
+    # only 'ok' when an actual proof compiles, not when a throwaway probe does (M14).
+    real_steps = [c for c in code_steps if "scratch" not in (c["path"] or "").lower()]
+    latest_check_status = real_steps[-1]["check_status"] if real_steps else None
     return {
         **session,
         **usage,
         "status": _derive_session_status(
-            latest_check_status, len(code_steps), active_run is not None
+            latest_check_status, len(real_steps), active_run is not None
         ),
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],

@@ -27,7 +27,7 @@ import {
   UsageStats,
   getSession,
   getUsageStats,
-} from '../api';
+} from '../lib/api';
 
 // Warm-paper palette (mirrors src/styles/lea-v2.css) so charts read like the
 // main chat panel rather than the old neon shadcn dashboard.

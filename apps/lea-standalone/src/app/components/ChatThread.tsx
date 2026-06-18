@@ -1,68 +1,83 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { PanelLeftOpen } from 'lucide-react';
 import type {
   ApprovalDecision,
+  ApprovalRecord,
   ChatMessage,
   CodeStep,
   PendingApproval,
-  RunStatus,
   SessionSummary,
-  SessionStatus,
   StatusEvent,
-} from '../api';
+  TimelineItem,
+} from '../lib/api';
 import { MarkdownMessage } from './MarkdownMessage';
+import { ModelPicker } from './ModelPicker';
+import { buildTimeline } from '../lib/timeline.mjs';
+import { useProofSession } from '../stores/proofSession';
+import { useModel } from '../stores/model';
 
-type TimelineItem =
-  | { kind: 'message'; key: string; message: ChatMessage }
-  | { kind: 'code'; key: string; step: CodeStep; codeIndex: number };
+type MergedNode =
+  | { kind: 'message'; key: string; runId: string | null; seqKey: number; message: ChatMessage }
+  | { kind: 'code'; key: string; runId: string | null; seqKey: number; step: CodeStep; codeIndex: number }
+  | { kind: 'approval'; key: string; runId: string | null; seqKey: number; approval: ApprovalRecord };
 
 export function ChatThread({
   title,
-  model,
+  sidebarCollapsed,
+  onExpandSidebar,
   session,
-  runStatus,
-  runStatusById,
-  isRunning,
-  currentRunId,
-  items,
-  statusEvents,
-  activeCodeIndex,
   onSelectStep,
-  pendingApproval,
-  approvalBusy,
   onDecide,
-  error,
   draft,
   onDraftChange,
   onSubmit,
   onInterrupt,
+  onOpenSettings,
   canvasCollapsed,
   onToggleCanvas,
 }: {
   title: string;
-  model?: string;
+  sidebarCollapsed?: boolean;
+  onExpandSidebar?: () => void;
   session?: SessionSummary;
-  runStatus?: RunStatus;
-  runStatusById: Record<string, string>;
-  isRunning: boolean;
-  currentRunId?: string;
-  items: TimelineItem[];
-  statusEvents: StatusEvent[];
-  activeCodeIndex: number;
   onSelectStep: (codeIndex: number) => void;
-  pendingApproval?: PendingApproval;
-  approvalBusy: boolean;
   onDecide: (decision: ApprovalDecision) => void;
-  error?: string;
   draft: string;
   onDraftChange: (value: string) => void;
   onSubmit: () => void;
   onInterrupt: () => void;
+  onOpenSettings?: () => void;
   canvasCollapsed: boolean;
   onToggleCanvas: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  // R4: model picker state + key-missing nudge from the model store.
+  const model = useModel((s) => s.model);
+  const modelCatalog = useModel((s) => s.modelCatalog);
+  const modelFeatured = useModel((s) => s.modelFeatured);
+  const keyMissing = useModel((s) => s.keyMissing);
+  const onModelChange = useModel((s) => s.changeModel);
+  // R1a/R1b/R1c: read shared proof-session state straight from the store (no props).
+  const editedPath = useProofSession((s) => s.editedPath);
+  const error = useProofSession((s) => s.error);
+  const activeCodeIndex = useProofSession((s) => s.codeIndex);
+  const messages = useProofSession((s) => s.messages);
+  const codeSteps = useProofSession((s) => s.codeSteps);
+  const statusEvents = useProofSession((s) => s.statusEvents);
+  // R1c-2b: run lifecycle + approvals from the store.
+  const runStatus = useProofSession((s) => s.runStatus);
+  const runStatusById = useProofSession((s) => s.runStatusById);
+  const isRunning = useProofSession((s) => s.isRunning);
+  const currentRunId = useProofSession((s) => s.currentRunId);
+  const approvals = useProofSession((s) => s.approvals);
+  const approvalBusy = useProofSession((s) => s.approvalBusy);
+  // R1c-2a: the timeline is derived here from store messages + codeSteps.
+  const { items } = useMemo<{ items: TimelineItem[] }>(
+    () => buildTimeline({ messages, codeSteps }),
+    [messages, codeSteps],
+  );
 
   // M8: grow the composer with its content up to a cap, then scroll inside.
   useEffect(() => {
@@ -83,7 +98,7 @@ export function ChatThread({
   }, []);
   useEffect(() => {
     if (autoScroll) requestAnimationFrame(scrollToBottom);
-  }, [autoScroll, scrollToBottom, items, statusEvents, pendingApproval, error]);
+  }, [autoScroll, scrollToBottom, items, statusEvents, approvals, error]);
 
   // tool chips for a step come from that turn's tool_call / lean_check status events.
   const toolsByTurn = useMemo(() => {
@@ -114,15 +129,45 @@ export function ChatThread({
   // drop the green milestone card; a failed run gets a red one. The card is keyed
   // on the run's outcome, never on a message — so it lands once and stays (M16).
   const runGroups = useMemo(() => {
-    const groups: { runId: string | null; items: TimelineItem[] }[] = [];
-    for (const item of items) {
-      const rid = item.kind === 'message' ? item.message.run_id ?? null : item.step.run_id ?? null;
+    const nodes: MergedNode[] = [];
+    for (const it of items) {
+      if (it.kind === 'message') {
+        nodes.push({
+          kind: 'message',
+          key: it.key,
+          runId: it.message.run_id ?? null,
+          seqKey: it.message.seq ?? Number.MAX_SAFE_INTEGER,
+          message: it.message,
+        });
+      } else {
+        nodes.push({
+          kind: 'code',
+          key: it.key,
+          runId: it.step.run_id ?? null,
+          seqKey: it.step.seq ?? Number.MAX_SAFE_INTEGER,
+          step: it.step,
+          codeIndex: it.codeIndex,
+        });
+      }
+    }
+    for (const a of approvals) {
+      nodes.push({
+        kind: 'approval',
+        key: `a:${a.approval_id}`,
+        runId: a.run_id ?? null,
+        seqKey: typeof a.seq === 'number' ? a.seq : Number.MAX_SAFE_INTEGER,
+        approval: a,
+      });
+    }
+    nodes.sort((x, y) => x.seqKey - y.seqKey || x.key.localeCompare(y.key));
+    const groups: { runId: string | null; nodes: MergedNode[] }[] = [];
+    for (const node of nodes) {
       const last = groups[groups.length - 1];
-      if (last && last.runId === rid) last.items.push(item);
-      else groups.push({ runId: rid, items: [item] });
+      if (last && last.runId === node.runId) last.nodes.push(node);
+      else groups.push({ runId: node.runId, nodes: [node] });
     }
     return groups;
-  }, [items]);
+  }, [items, approvals]);
 
   const sessionProved = useMemo(
     () => Object.values(runStatusById).includes('success'),
@@ -142,9 +187,10 @@ export function ChatThread({
   // streaming text (the gap after submit + between turns while a tool runs) and
   // we're not paused on an approval. The live bubble (live:true) means text is
   // already flowing, so the indicator yields to it.
+  const hasPendingApproval = approvals.some((a) => !a.decision);
   const thinking =
     isRunning &&
-    !pendingApproval &&
+    !hasPendingApproval &&
     !items.some((i) => i.kind === 'message' && i.message.live);
 
   // M17: the tool Lea is currently running (all tools), scoped to the active run
@@ -166,12 +212,23 @@ export function ChatThread({
     }
   };
 
-  const renderItem = (item: TimelineItem) => {
-    if (item.kind === 'message') {
-      const m = item.message;
+  const renderNode = (node: MergedNode) => {
+    if (node.kind === 'approval') {
+      return (
+        <ApprovalCard
+          key={node.key}
+          approval={node.approval}
+          decision={node.approval.decision}
+          busy={approvalBusy}
+          onDecide={onDecide}
+        />
+      );
+    }
+    if (node.kind === 'message') {
+      const m = node.message;
       if (m.role === 'user') {
         return (
-          <div className="msg" key={item.key}>
+          <div className="msg" key={node.key}>
             <div className="role">
               <span className="avatar you">Y</span> You
             </div>
@@ -182,7 +239,7 @@ export function ChatThread({
       // Folded into its step card (M11) — don't render it as prose too.
       if (foldedNarration.has(`${m.run_id || ''}|${m.content.trim()}`)) return null;
       return (
-        <div className="msg assistant" key={item.key}>
+        <div className="msg assistant" key={node.key}>
           <div className="role">
             <span className="avatar lea">L</span> Lea
           </div>
@@ -190,16 +247,16 @@ export function ChatThread({
         </div>
       );
     }
-    const step = item.step;
+    const step = node.step;
     const tools = step.turn != null ? toolsByTurn.get(step.turn) || [] : [];
     return (
       <button
-        key={item.key}
-        className={`step ${item.codeIndex === activeCodeIndex ? 'active' : ''}`}
-        onClick={() => onSelectStep(item.codeIndex)}
+        key={node.key}
+        className={`step ${node.codeIndex === activeCodeIndex ? 'active' : ''}`}
+        onClick={() => onSelectStep(node.codeIndex)}
       >
         <div className="step-head">
-          <span className="step-num">{item.codeIndex + 1}</span>
+          <span className="step-num">{node.codeIndex + 1}</span>
           <span className="step-title">{stepTitle(step)}</span>
           <span className="step-jump">view snapshot →</span>
         </div>
@@ -223,10 +280,20 @@ export function ChatThread({
   return (
     <main className="chat">
       <div className="pane-head">
+        {sidebarCollapsed && (
+          <button className="icon-btn" onClick={onExpandSidebar} title="Open sidebar">
+            <PanelLeftOpen size={15} />
+          </button>
+        )}
         <span className="ttl">{title}</span>
         {headChip && <span className={`chip ${headChip.cls}`}>{headChip.text}</span>}
         <span className="head-spacer" />
-        {model && <span className="chip model">{model}</span>}
+        <ModelPicker
+          value={model || ''}
+          onChange={onModelChange}
+          catalog={modelCatalog}
+          featured={modelFeatured}
+        />
         <button className="canvas-toggle" onClick={onToggleCanvas}>
           ◧ {canvasCollapsed ? 'Show canvas' : 'Canvas'}
         </button>
@@ -244,10 +311,10 @@ export function ChatThread({
             const isLastGroup = gi === runGroups.length - 1;
             const finished = !(isRunning && isLastGroup);
             const status = group.runId ? runStatusById[group.runId] : undefined;
-            const steps = group.items.filter((i) => i.kind === 'code').length;
+            const steps = group.nodes.filter((n) => n.kind === 'code').length;
             return (
               <Fragment key={group.runId ?? `g${gi}`}>
-                {group.items.map(renderItem)}
+                {group.nodes.map(renderNode)}
                 {finished && status === 'success' && <ProvedCard steps={steps} session={session} />}
                 {finished && (status === 'failed' || status === 'max_turns') && (
                   <FailedCard status={status} />
@@ -268,27 +335,42 @@ export function ChatThread({
             </div>
           )}
 
-          {pendingApproval && (
-            <ApprovalCard approval={pendingApproval} busy={approvalBusy} onDecide={onDecide} />
-          )}
-
           {error && <div className="err-banner">{error}</div>}
         </div>
       </div>
 
       <div className="composer">
+        {keyMissing && (
+          <div className="key-nudge">
+            <span>
+              👋 To start proving, add your model preference and API key.
+            </span>
+            <button className="key-nudge-btn" onClick={onOpenSettings}>
+              Open Settings
+            </button>
+          </div>
+        )}
+        {editedPath && (
+          <div className="edit-badge">
+            ✎ You edited <code>{editedPath.split('/').pop()}</code> — describe your change so Lea
+            picks up where you left off.
+          </div>
+        )}
         <div className="composer-inner">
           <textarea
             ref={textareaRef}
             value={draft}
             onChange={(e) => onDraftChange(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Ask a follow-up, or state a theorem to prove…"
+            placeholder={
+              editedPath
+                ? 'What did you change? A short note helps Lea pick up where you left off.'
+                : 'Ask a follow-up, or state a theorem to prove…'
+            }
             rows={1}
           />
           <div className="crow">
             <span className="mode" title="Lea routes the request automatically">⚙ auto</span>
-            {model && <span className="mode">{model}</span>}
             {isRunning ? (
               <button className="send stop" onClick={onInterrupt} title="Stop the run">
                 ◼
@@ -353,37 +435,75 @@ function FailedCard({ status }: { status: string }) {
 
 function ApprovalCard({
   approval,
+  decision,
   busy,
   onDecide,
 }: {
   approval: PendingApproval;
+  decision?: string | null;
   busy: boolean;
   onDecide: (decision: ApprovalDecision) => void;
 }) {
   const preview = approvalPreview(approval);
+  const resolved = !!decision;
   return (
-    <div className="approval">
-      <div className="ahead">🛡 Approve {approval.tool_name}?</div>
-      {preview && <div className="acode">{preview}</div>}
-      <div className="actions">
-        <button className="btn accept" disabled={busy} onClick={() => onDecide('allow')}>
-          Allow once
-        </button>
-        <button className="btn session" disabled={busy} onClick={() => onDecide('always_session')}>
-          Always this session
-        </button>
-        <button className="btn reject" disabled={busy} onClick={() => onDecide('deny')}>
-          Deny
-        </button>
+    <div className={`approval ${resolved ? 'resolved' : ''}`}>
+      <div className="ahead">
+        🛡{' '}
+        {resolved
+          ? decisionHeadline(decision as string, approval.tool_name)
+          : `Approve ${approval.tool_name}?`}
       </div>
+      {preview && <div className="acode">{preview}</div>}
+      {resolved ? (
+        <span
+          className="resolved-tag"
+          style={decision === 'deny' ? { color: 'var(--red)' } : undefined}
+        >
+          {decisionTag(decision as string)}
+        </span>
+      ) : (
+        <div className="actions">
+          <button className="btn accept" disabled={busy} onClick={() => onDecide('allow')}>
+            Allow once
+          </button>
+          <button className="btn session" disabled={busy} onClick={() => onDecide('always_session')}>
+            Always this session
+          </button>
+          <button className="btn reject" disabled={busy} onClick={() => onDecide('deny')}>
+            Deny
+          </button>
+        </div>
+      )}
     </div>
   );
+}
+
+function decisionHeadline(decision: string, tool: string): string {
+  if (decision === 'allow') return `Allowed ${tool} once`;
+  if (decision === 'always_session') return `Always allowing ${tool} this session`;
+  if (decision === 'deny') return `Denied ${tool}`;
+  return `${tool} — resolved`;
+}
+
+function decisionTag(decision: string): string {
+  if (decision === 'allow') return '✓ you allowed this once';
+  if (decision === 'always_session') return '✓ you allowed this for the session';
+  if (decision === 'deny') return '⛔ you denied this';
+  return 'resolved';
+}
+
+// Absolute proof paths are long and noisy. Show only what matters: the path
+// relative to the session repo (everything after `proofs/<session-id>/`).
+function shortPath(p: string): string {
+  const m = p.match(/[/\\]proofs[/\\][^/\\]+[/\\](.+)$/);
+  return m ? m[1].replace(/\\/g, '/') : p;
 }
 
 function approvalPreview(approval: PendingApproval): string {
   const args = approval.args || {};
   if (approval.tool_name === 'bash' && typeof args.command === 'string') return args.command;
-  const path = typeof args.path === 'string' ? args.path : '';
+  const path = typeof args.path === 'string' ? shortPath(args.path) : '';
   const content =
     typeof args.content === 'string'
       ? args.content

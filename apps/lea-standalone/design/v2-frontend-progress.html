@@ -60,8 +60,8 @@
     <div class="sub">Live progress tracker · React UI rebuilt to <code>design/v2-mockup.html</code> on the v2 backend · auto-refreshes every 8s</div>
   </header>
 
-  <div class="bar"><i style="width:52%"></i></div>
-  <div class="counts"><b>10 tested</b> · <b>1</b> built (M5, untested) · <b>9</b> open + cleanup · next: M16–M18 (test-loop UX), then M9 / M13–M15 / M6 · M7 → v2.1</div>
+  <div class="bar"><i style="width:82%"></i></div>
+  <div class="counts"><b>22 tested ✓</b> · <b>5</b> open — M6 settings/stats · M7 projects→v2.1 · M17b persist tool activity · M19 first-run key · F7 cleanup</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -126,12 +126,12 @@
       <div class="scope">Mockup composer (textarea + auto/model chips + send/stop). Per-tool gate restyled to the amber <code>.approval</code> card (Allow once / Always this session / Deny) → <code>POST /runs/{id}/approvals/{id}</code>. Stop → <code>/interrupt</code>.</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M5</span>
         <span class="title">Writeable canvas — edit → lean_check → verify</span>
         <span class="dec">canvas</span>
-        <span class="badge b-prog">Built</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">Edit the latest snapshot in place → <code>POST /sessions/{id}/file</code> (commits <code>author=user</code> + edit note) → <code>lean-check</code>; verdict shown in the foot. SafeVerify button on a compiling proof.</div>
     </div>
@@ -170,12 +170,12 @@
       <div class="scope">The chat input now grows with content (ref + reset-to-<code>scrollHeight</code> on each keystroke) up to a 200px cap, then scrolls inside (<code>overflow-y:auto</code>). No more scrolling at the 2nd <code>\n</code>.</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M9</span>
         <span class="title">Model picker in the main page (searchable)</span>
         <span class="dec">UX</span>
-        <span class="badge b-queued">Queued</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">The <code>model: gemini/gemini-3.1-pro-preview</code> chip in the chat head should be a searchable select + dropdown (reuse <code>ModelCombobox</code> from settings) right in the main page so switching models is one click. Keep the model selector in Settings too; both write the same <code>model</code> via <code>PUT /api/settings</code>.</div>
     </div>
@@ -220,32 +220,32 @@
       <div class="scope">Reworded the deny tool-result (<code>agent.py</code>) so a declined tool tells the model to explain what it was about to do and ask how to proceed — not silently retry or switch steps — and wait. Added a matching "a denied action is a redirect, not a failure" clause to the collaborator prompt.</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M13</span>
-        <span class="title">Denied approval should stay visible in the thread</span>
+        <span class="title">Resolved approvals stay visible in the thread</span>
         <span class="dec">UI</span>
-        <span class="badge b-queued">Queued</span>
+        <span class="badge b-done">Tested</span>
       </div>
-      <div class="scope">Right now resolving an approval (allow/deny) clears the card and it vanishes — so there's no record you rejected something. Keep a resolved card in the thread (mockup's <code>.approval.resolved</code> with a "you denied this" tag), tied to that point in the timeline, instead of removing it.</div>
+      <div class="scope">Approvals are now history: each carries a <code>decision</code> once resolved, so the card stays (faded <code>.approval.resolved</code> with a "⛔ you denied this" / "✓ allowed once / for the session" tag) instead of vanishing. Rendered inside its run group at the point it happened. Live this session; reload persistence is a follow-up (like M17b).</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M14</span>
-        <span class="title">Scratch files shouldn't drive session status / "Proved"</span>
-        <span class="dec">store + UI</span>
-        <span class="badge b-queued">Queued</span>
+        <span class="title">Scratch files don't drive session status</span>
+        <span class="dec">store</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">A run that only wrote <code>scratch.lean</code> (an <code>exact?</code> probe) showed session status <b>ok</b> and the NL sketch as a green "✓ Proved" card. Partly fixed in UI (FinalCard now needs a real non-scratch compiling step). Backend follow-up: <code>store</code> session-status derivation should ignore scratch/probe files so a session isn't "ok" without a real proof.</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M15</span>
-        <span class="title">Abandoned/paused run shouldn't lock out all new runs</span>
+        <span class="title">A new run supersedes a stuck/abandoned one</span>
         <span class="dec">bridge UX</span>
-        <span class="badge b-queued">Queued</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">A run paused on an approval (or whose SSE client navigated away) keeps holding the global <code>active_run_lock</code>, so every new run fails with the cryptic <i>"Another Lea run is already active."</i> Fixes: auto-interrupt an orphaned run when its event stream disconnects (release the lock), and/or surface the active run in the UI with a Cancel button, and/or time out <code>_await_decision</code>. For now a backend restart clears it.</div>
     </div>
@@ -255,7 +255,7 @@
         <span class="id">M16</span>
         <span class="title">"Proved" is a milestone card keyed on run completion</span>
         <span class="dec">bridge + store + UI</span>
-        <span class="badge b-done">Built</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">The green "Proved" box was styling on the terminal message, so it moved/duplicated and leaked onto Q&amp;A turns. Reworked into a <b>milestone card keyed on the run's outcome</b>: bridge un-flattens <code>completed→success</code> (proved) vs <code>assistant→answered</code> (chat/pause); <code>session_detail</code> exposes <code>runs[]</code> for reload; the thread groups items by run and drops one green card after a <code>success</code> run (red after <code>failed</code>/<code>max_turns</code>). Shows once, never on intermediate checks, persists through later chat + reload. Removed <code>terminalMessageId</code>/<code>hasRealProof</code>.</div>
     </div>
@@ -265,7 +265,7 @@
         <span class="id">M17</span>
         <span class="title">Live tool-activity indicator (all tools)</span>
         <span class="dec">UI</span>
-        <span class="badge b-done">Built</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">The "thinking" indicator now names the current tool for <b>every</b> tool — 🔍 search_mathlib, 💻 bash, 📖 read_file, ✎ write/edit, ⚙ lean_check, fallback for any other — driven by the latest <code>tool_call</code>/<code>lean_check</code> status event scoped to the active run. So a <code>search</code> in a Q&amp;A turn (no step card) is now visible live. Falls back to "Lea is thinking" when no tool is active.</div>
     </div>
@@ -285,27 +285,27 @@
         <span class="id">M18</span>
         <span class="title">"Lea is thinking…" indicator after submit</span>
         <span class="dec">UX</span>
-        <span class="badge b-done">Built</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">Between sending a prompt and the first <code>assistant_delta</code>, there's no feedback — it feels like nothing happened. Show a blinking "Lea is thinking…" indicator in the thread while a run is active and no streaming text has arrived yet, so the user knows the request reached the backend and the model is working.</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M19</span>
         <span class="title">First-run onboarding — point users to add a key</span>
         <span class="dec">UX</span>
-        <span class="badge b-queued">Queued</span>
+        <span class="badge b-done">Built</span>
       </div>
       <div class="scope">A brand-new user with no provider key configured has no idea where to go (and a run would just fail). When no key is set, show a small card above the composer — e.g. "Add your model preference and API key <b>[Open settings]</b>" — linking straight to Settings. Detect via <code>/api/settings</code> (<code>api_keys[*].configured</code> / model requirements). Pairs with M6 (Settings page for v2).</div>
     </div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top">
         <span class="id">M20</span>
         <span class="title">Canvas edit — signal the pending edit + ask for a summary</span>
         <span class="dec">UX</span>
-        <span class="badge b-queued">Queued</span>
+        <span class="badge b-done">Tested</span>
       </div>
       <div class="scope">After editing the proof in the canvas, there's no signal that an unsent human edit is staged. Show a badge near the composer (e.g. "✎ you edited <code>DivSix.lean</code>") and swap the input placeholder to prompt for context — "What did you change? A short note helps Lea pick up where you left off." That note is exactly the divergence context (D12) Lea consumes on the next run, so the summary improves the handoff.</div>
     </div>
@@ -321,16 +321,126 @@
     </div>
   </div>
 
-  <div class="group">
-    <h2>Cleanup (after you confirm the new UI works)</h2>
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M23</span>
+        <span class="title">Trim long absolute file paths in the UI</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">The approval card showed the full absolute path (<code>/Users/&hellip;/proofs/&lt;session&gt;/Lea/Misc/Divisibility.lean</code>). Now trimmed to the part under the session repo — <code>Lea/Misc/Divisibility.lean</code>. (Step cards / canvas already use the repo-relative path.)</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M22</span>
+        <span class="title">Final gate must reject <code>sorry</code> (no false "Proved")</span>
+        <span class="dec">prover bug</span>
+        <span class="badge b-done">Tested</span>
+      </div>
+      <div class="scope">A <code>sorry</code>-skeleton that compiled was finishing as <code>completed</code> → a green "Proved — 0 sorry" card, while Lea was asking "shall I fill the sorrys?". <code>sorry</code> is a <i>warning</i>, so the gate's error-only check missed it. Added <code>_lean_check_has_sorry</code>; a proof is verified only with no errors AND no <code>sorry</code>. In interactive mode a not-verified text-only turn now <b>pauses</b> (<code>answered</code>, no card) so the agent's question reaches you. Also fixes a latent eval false-accept. Regression test added.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M24</span>
+        <span class="title">SafeVerify verdict survives reload</span>
+        <span class="dec">store + UI</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">The standalone <code>/verify</code> endpoint ran SafeVerify but persisted nothing — the canvas held it in local state, so a reload lost it ("Run SafeVerify" again). Now it stores the verdict on the session's latest run (<code>set_session_safe_verify</code>), surfaced as <code>session_detail.safe_verify</code>; App reads it and the canvas shows the persisted ✓ on the latest snapshot. A human canvas edit invalidates it (frontend + <code>/file</code> endpoint) so a reload-after-edit doesn't show a stale ✓. Store test added.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M25</span>
+        <span class="title">Thin the scrollbars</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">The default scrollbars were too wide. Thinned app-wide to 8px (<code>::-webkit-scrollbar</code> + <code>scrollbar-width: thin</code>) scoped to <code>.lea-app</code>.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M26</span>
+        <span class="title">Adjustable canvas width (draggable divider)</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">The chat | canvas split is fixed at <code>1fr / 46%</code>. Add a draggable divider so the user can resize the canvas (persist the chosen width). Likely re-introduce a lightweight resizer between the two grid columns of <code>.main-area</code>.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M27</span>
+        <span class="title">Collapsible sessions sidebar (Claude-style)</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">Add a close/open toggle for the left sidebar like the Claude web app — collapse it to reclaim width, with a button to reopen. Remember the state.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">M28</span>
+        <span class="title">Spotlight-style model picker (replaces the cramped popover)</span>
+        <span class="dec">UX</span>
+        <span class="badge b-done">Built</span>
+      </div>
+      <div class="scope">The model chip in the chat head now opens a centered macOS-Spotlight-style search overlay (big input, scrollable filterable list over the full LiteLLM catalog, ↑/↓ + Enter, Esc, type any custom model ID) instead of the small popover. New <code>ModelPicker</code>; <code>ModelCombobox</code> still used in Settings. Picking persists via PUT /api/settings (same as M9).</div>
+    </div>
+
     <div class="todo">
       <div class="top">
-        <span class="id">F7</span>
-        <span class="title">Delete superseded files</span>
-        <span class="dec">housekeeping</span>
+        <span class="id">M29</span>
+        <span class="title">Canvas edit — a "Save" button distinct from "Run lean_check"</span>
+        <span class="dec">UX</span>
         <span class="badge b-queued">Queued</span>
       </div>
-      <div class="scope">Now unused (not bundled): <code>ChatInterface.tsx</code>, <code>CodeViewer.tsx</code>, <code>TheoremApprovalPanel.tsx</code>, <code>runAttempts.ts</code>, <code>stepTimeline.mjs</code>, <code>timelineTarget.mjs</code>, <code>projectAssociation.mjs</code>, <code>projectTags.js</code>, plus their tests. Kept on disk this pass so you can diff; deleted once the rebuild is confirmed.</div>
+      <div class="scope">While editing in the canvas, offer <b>Save</b> (commit the edit via <code>POST /sessions/{id}/file</code> only) alongside <b>Run lean_check</b> (save + check). Lets the user make several small edits and commit them incrementally, then run lean_check once at the end. Today the only button (Run lean_check) always does both.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M30</span>
+        <span class="title">Canvas open/close — one control each, not two</span>
+        <span class="dec">UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">When the canvas is open there are two ways to close-ish it: the <code>[x]</code> in the canvas <i>and</i> the "Canvas" toggle button. Drop the redundant toggle: keep <code>[x]</code> as the only <b>close</b>, and use the "Show canvas" button only to <b>open</b> it when collapsed.</div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M31</span>
+        <span class="title">Stale "writing the proof…" indicator after a denied tool</span>
+        <span class="dec">UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">After you <b>deny</b> a write/edit, the thinking indicator keeps showing the last activity ("writing the proof…") until the next event. Cosmetic — the deny itself works. Clear/replace the activity label when a tool is denied (the run is re-planning, not writing). <i>(M17/M18 activity logic.)</i></div>
+    </div>
+
+    <div class="todo">
+      <div class="top">
+        <span class="id">M32</span>
+        <span class="title">Show the <code>search_mathlib</code> query, not just the tool name</span>
+        <span class="dec">UX</span>
+        <span class="badge b-queued">Queued</span>
+      </div>
+      <div class="scope">The "worked via" tool chips / activity show <code>search_mathlib</code> but not <i>what</i> was searched. Surface the query argument (e.g. "searched Mathlib for <code>Nat.dvd_sub</code>") so the user can see what Lea looked for and redirect it when the search is off. Needs the tool <b>args</b> to flow through the tool_call/status events to the chip. (Same plumbing would help other tools — e.g. the <code>bash</code> command.)</div>
+    </div>
+
+  <div class="group">
+    <h2>Cleanup (after you confirm the new UI works)</h2>
+    <div class="todo is-done">
+      <div class="top">
+        <span class="id">F7</span>
+        <span class="title">Delete superseded files + dead functions</span>
+        <span class="dec">housekeeping</span>
+        <span class="badge b-done">Done</span>
+      </div>
+      <div class="scope">Deleted 12 superseded frontend files (<code>ChatInterface</code>, <code>CodeViewer</code>, <code>TheoremApprovalPanel</code>, <code>SafeVerifyBadge</code>, <code>runAttempts</code>, <code>stepTimeline</code>, <code>timelineTarget</code>, <code>projectAssociation</code>, <code>projectTags</code> + tests) and dead code: <code>timeline.terminalMessageId</code>, 4 dead <code>store</code> funcs (api-id setters, <code>set_run_safe_verify</code>, <code>last_lean_code_step_for_run</code>), <code>adapter/app/safe_verify.py</code>, prover <code>sketch.py</code> + the unused sketch/fill/reflect prompt variants. Kept project scaffolding (store project funcs, <code>_deferred/</code>) for v2.1. All suites green (FE 21 · adapter 94 · prover 80).</div>
     </div>
   </div>
 

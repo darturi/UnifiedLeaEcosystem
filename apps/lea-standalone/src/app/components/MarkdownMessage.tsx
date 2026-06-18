@@ -1,6 +1,6 @@
 import { Fragment, type ReactNode } from 'react';
-import { renderTex } from '../mathRenderer.js';
-import { parseInlineMarkdown, parseMarkdownBlocks } from '../markdownParser.js';
+import { renderTex } from '../lib/mathRenderer.js';
+import { parseInlineMarkdown, parseMarkdownBlocks } from '../lib/markdownParser.js';
 
 type MarkdownBlock =
   | { type: 'paragraph'; text: string }

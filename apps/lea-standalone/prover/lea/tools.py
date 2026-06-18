@@ -191,6 +191,17 @@ def _lean_check_has_error(output: str) -> bool:
     return bool(re.search(r"(^|\n).*error[:\s]", output, re.IGNORECASE))
 
 
+def _lean_check_has_sorry(output: str) -> bool:
+    """True if lean_check's output shows the proof still relies on `sorry`/`admit`.
+
+    Lean reports these as a *warning* (`declaration uses 'sorry'`), not an error,
+    so `_lean_check_has_error` misses them — but a final proof with a `sorry` is
+    NOT done. `admit` and a bare `sorry` both surface as "uses 'sorry'";
+    `sorryAx` is the kernel axiom they elaborate to."""
+    lowered = output.lower()
+    return "uses 'sorry'" in lowered or "sorryax" in lowered
+
+
 def _tool_result_ok(output: str) -> bool:
     return bool(output.strip()) and not output.strip().lower().startswith("error:")
 

@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { CodeStep, SafeVerifyStatus } from '../api';
-import { diffForStep } from '../codeDiff';
-import { highlightLine } from '../leanHighlight.mjs';
+import type { CodeStep, SafeVerifyStatus } from '../lib/api';
+import { diffForStep } from '../lib/codeDiff';
+import { highlightLine } from '../lib/leanHighlight.mjs';
+import { sortCodeSteps } from '../lib/timeline.mjs';
+import { useProofSession } from '../stores/proofSession';
 
 export interface CheckOutcome {
   status: string;
@@ -13,22 +15,22 @@ export interface CheckOutcome {
 // latest snapshot. Network calls are delegated to the parent (which owns the
 // session id + state) via onSaveAndCheck / onVerify.
 export function Canvas({
-  codeSteps,
-  index,
-  onIndexChange,
-  isRunning,
   onClose,
   onSaveAndCheck,
   onVerify,
 }: {
-  codeSteps: CodeStep[];
-  index: number;
-  onIndexChange: (index: number) => void;
-  isRunning: boolean;
   onClose: () => void;
   onSaveAndCheck: (content: string) => Promise<CheckOutcome>;
   onVerify: () => Promise<CheckOutcome>;
 }) {
+  // R1b/R1c: canvas state (verdict, snapshots, stepper position, run-active flag)
+  // comes straight from the store now — no props from App.
+  const persistedVerify = useProofSession((s) => s.safeVerify);
+  const isRunning = useProofSession((s) => s.isRunning);
+  const rawSteps = useProofSession((s) => s.codeSteps);
+  const codeSteps = useMemo(() => sortCodeSteps(rawSteps), [rawSteps]);
+  const index = useProofSession((s) => s.codeIndex);
+  const onIndexChange = useProofSession((s) => s.setCodeIndex);
   const total = codeSteps.length;
   const safeIndex = Math.min(Math.max(index, 0), Math.max(total - 1, 0));
   const step = codeSteps[safeIndex];
@@ -101,6 +103,10 @@ export function Canvas({
     : step?.check_status === 'error'
     ? { cls: 'err', text: '✗ errors' }
     : { cls: 'idle', text: '○ not checked' };
+
+  // Live result (this session) wins; otherwise fall back to the persisted verdict
+  // when viewing the latest snapshot, so a reload still shows SafeVerify ✓ (M24).
+  const shownVerify = verify ?? (isLatest ? persistedVerify ?? null : null);
 
   return (
     <section className="canvas">
@@ -211,14 +217,14 @@ export function Canvas({
           <span className="badge idle">○ not checked yet</span>
         )}
 
-        {verify ? (
-          verify.status === 'running' ? (
+        {shownVerify ? (
+          shownVerify.status === 'running' ? (
             <span className="badge idle">🛡 SafeVerify…</span>
-          ) : verify.status === 'ok' ? (
+          ) : shownVerify.status === 'ok' ? (
             <span className="badge sv">🛡 SafeVerify ✓</span>
           ) : (
-            <span className="badge bad" title={verify.detail || ''}>
-              🛡 SafeVerify {verify.status}
+            <span className="badge bad" title={shownVerify.detail || ''}>
+              🛡 SafeVerify {shownVerify.status}
             </span>
           )
         ) : (
