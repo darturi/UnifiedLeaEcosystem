@@ -15,6 +15,7 @@ import {
   handleStub,
   handleUpdateLeaSettings,
   recoverInterruptedJobs,
+  resolveProofOutcome,
   validateLeaRepo
 } from "../companion/server.mjs";
 import {
@@ -2933,4 +2934,118 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
   assert.ok(runCall.body.message.includes("project project-1"));
   assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
+});
+
+test("resolveProofOutcome trusts an adapter-verified run even with no local proof file", async () => {
+  // The /api flavor defers project-markdown recording, so the companion often
+  // cannot locate the proof on disk (localStatus === unformalized). A successful
+  // run (exit.ok) must still resolve to `formalized` — this is the core fix.
+  const job = { theoremLabel: "t1", leaWorkspacePath: "/tmp/does-not-matter" };
+  const outcome = await resolveProofOutcome({
+    job,
+    localStatus: { status: "unformalized" },
+    exit: { ok: true }
+  });
+
+  assert.equal(outcome.jobStatus, "formalized");
+  assert.equal(outcome.finalStatus, "formalized");
+  assert.equal(outcome.effectiveStatus.status, "formalized");
+  assert.equal(outcome.error, null);
+  assert.equal(outcome.leanCheck, null);
+});
+
+test("resolveProofOutcome keeps a verified run formalized when local evidence is also formalized", async () => {
+  const job = { theoremLabel: "t2", leaWorkspacePath: "/tmp/x" };
+  const localStatus = { status: "formalized", leanStatement: "theorem t2 : True" };
+  const outcome = await resolveProofOutcome({ job, localStatus, exit: { ok: true } });
+
+  assert.equal(outcome.jobStatus, "formalized");
+  assert.equal(outcome.finalStatus, "formalized");
+  assert.equal(outcome.effectiveStatus, localStatus);
+  // No absolutePath, so no local lean check is attempted.
+  assert.equal(outcome.leanCheck, null);
+});
+
+test("resolveProofOutcome records a leftover sorry as a failed run with sorry_stub effective status", async () => {
+  const job = { theoremLabel: "t3", leaWorkspacePath: "/tmp/x" };
+  const localStatus = { status: "sorry_stub", absolutePath: "/tmp/x/t3.lean" };
+  const outcome = await resolveProofOutcome({ job, localStatus, exit: { ok: true } });
+
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "sorry_stub");
+  assert.equal(outcome.effectiveStatus.status, "sorry_stub");
+  assert.match(outcome.error, /sorry\/admit/);
+});
+
+test("resolveProofOutcome marks a failed run as failed and surfaces the run error", async () => {
+  const job = { theoremLabel: "t4", leaWorkspacePath: "/tmp/x" };
+  const outcome = await resolveProofOutcome({
+    job,
+    localStatus: { status: "unformalized" },
+    exit: { ok: false, error: "Lea run ended with status: failed" }
+  });
+
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "unformalized");
+  assert.equal(outcome.error, "Lea run ended with status: failed");
+});
+
+test("formalize on the /api backend tags the theorem formalized when the run succeeds (regression)", async () => {
+  // The /api adapter defers project-markdown recording, so the companion finds no
+  // recorded artifact after the run. Before the fix the theorem was tagged
+  // "failed" despite a verified proof; now the adapter's terminal `done: success`
+  // is authoritative and the tag must read "formalized".
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls)
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "t_api_success",
+    theoremText: "A theorem."
+  }, state);
+
+  await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+  const job = state.jobs[result.body.jobId];
+  assert.equal(job.exitCode, 0);
+  assert.equal(job.error, undefined);
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "t_api_success", theoremText: "A theorem." }]
+  }, state);
+  assert.equal(statuses.statusCode, 200);
+  assert.equal(statuses.body.statuses.t_api_success.status, "formalized");
+});
+
+test("formalize on the /api backend tags the theorem failed when the run does not succeed", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls, { doneStatus: "failed" })
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "t_api_failure",
+    theoremText: "A theorem."
+  }, state);
+
+  await waitFor(() => state.jobs[result.body.jobId]?.status === "failed");
+  const job = state.jobs[result.body.jobId];
+  assert.equal(job.exitCode, 1);
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "t_api_failure", theoremText: "A theorem." }]
+  }, state);
+  assert.equal(statuses.body.statuses.t_api_failure.status, "failed");
 });

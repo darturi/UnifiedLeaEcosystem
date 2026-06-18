@@ -1547,19 +1547,94 @@ async function runLeaProofJobForJob({ state, job, target, prompt }) {
   });
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
-  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
-  const prompt = buildLeaPrompt({
-    projectSlug: target.projectSlug,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    theoremContext,
-    declarationNameHint: job.declarationNameHint || "",
-    resolvedUses,
-    latexContext
-  });
-  const exit = await runLeaProofJobForJob({ state, job, target, prompt });
-  if (job.finalStatus === "max_spend") return;
+// Single source of truth for turning a finished Lea run into a theorem outcome.
+//
+// The Lea adapter is the producer and the authority on whether a proof passed:
+// its terminal `done` status (surfaced here as `exit.ok`) is `success` only when
+// the agent cleared Lea's own final Lean verification. Local filesystem
+// inspection (`localStatus`) is used purely to ENRICH the result — locate the
+// proof file, surface the Lean statement, detect a leftover sorry — or as a
+// FALLBACK when the run itself failed. It is never allowed to override a run the
+// adapter reported as successful. This matters because the `/api` flavor defers
+// project-markdown recording, so the companion frequently cannot locate the
+// proof on disk even though the run genuinely formalized the theorem; trusting
+// the adapter is what keeps the Overleaf tag truthful.
+//
+// `artifactError` is set when the run succeeded but the companion recorded
+// multiple candidate proofs and could not disambiguate which one belongs to this
+// theorem — distinct from the deferred-recording case (no candidates at all),
+// where we trust the adapter.
+//
+// Returns: { jobStatus, finalStatus, effectiveStatus, leanCheck, error }.
+export async function resolveProofOutcome({ job, localStatus, exit, artifactError = null }) {
+  const local = localStatus && localStatus.status ? localStatus : { status: "unformalized" };
+
+  // A located sorry/admit is never a complete formalization, whatever the run
+  // outcome: record the run as failed but carry the sorry_stub effective status
+  // so the UI can still offer stub-based actions. (Unchanged prior behaviour.)
+  if (local.status === "sorry_stub") {
+    return {
+      jobStatus: "failed",
+      finalStatus: "sorry_stub",
+      effectiveStatus: local,
+      leanCheck: null,
+      error: exit.ok
+        ? `Lea reported success but ${job.theoremLabel} still uses sorry/admit.`
+        : (exit.error || null)
+    };
+  }
+
+  // The run did not succeed (errored, timed out, or ended non-success). Keep the
+  // best file-derived status as the effective status for the UI.
+  if (!exit.ok) {
+    return {
+      jobStatus: "failed",
+      finalStatus: local.status || "unformalized",
+      effectiveStatus: local,
+      leanCheck: null,
+      error: exit.error || `Lea API run completed but final status is ${local.status}.`
+    };
+  }
+
+  // Run succeeded, but we recorded multiple candidate proofs and cannot safely
+  // attribute the verified proof to this theorem. Record as failed and surface
+  // the ambiguity rather than guessing.
+  if (artifactError) {
+    return {
+      jobStatus: "failed",
+      finalStatus: local.status || "unformalized",
+      effectiveStatus: local,
+      leanCheck: null,
+      error: artifactError
+    };
+  }
+
+  // exit.ok and no leftover sorry: the adapter passed its own final verification,
+  // so the theorem IS formalized. Run a local lean check for diagnostics only
+  // when we happened to locate the proof file — a missing or failing local
+  // toolchain must NOT downgrade a run the adapter already verified.
+  let leanCheck = null;
+  if (local.status === "formalized" && local.absolutePath) {
+    leanCheck = await runLeanCheck(job.leaWorkspacePath, local.absolutePath);
+  }
+  const effectiveStatus = local.status === "formalized" ? local : { ...local, status: "formalized" };
+  return {
+    jobStatus: "formalized",
+    finalStatus: "formalized",
+    effectiveStatus,
+    leanCheck,
+    error: null
+  };
+}
+
+// Shared finalization for a completed Lea proof run, used by every flavor and by
+// both the initial-run and approval-resume paths. It computes the best local,
+// file-derived status as enrichment, then defers the verdict to
+// `resolveProofOutcome`. This is the single place a run's terminal job status is
+// decided, so the badge, the job record, and the polling resolver can never
+// disagree about whether a theorem was formalized.
+async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses }) {
+  const uses = Array.isArray(resolvedUses) ? resolvedUses : (job.theoremUses || []);
 
   const artifact = exit.ok
     ? await identifyLeaArtifact({
@@ -1600,7 +1675,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
         theoremLabel: target.theoremLabel,
         jobs: {}
       });
-  const effectiveStatus = (
+  const localStatus = (
     status.status === "unformalized" &&
     job.declarationName &&
     job.recordedProofPath
@@ -1615,38 +1690,53 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
       }
     })
     : status;
-  let proofComplete = effectiveStatus.status === "formalized";
-  if (proofComplete && effectiveStatus.absolutePath) {
-    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, effectiveStatus.absolutePath);
-    proofComplete = job.leanCheck.ok;
+
+  const outcome = await resolveProofOutcome({ job, localStatus, exit, artifactError: artifact?.error || null });
+  if (outcome.leanCheck) {
+    job.leanCheck = outcome.leanCheck;
   }
-  const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
-  job.stubbedTheoremUses = nextJobStatus === "formalized"
+  job.stubbedTheoremUses = outcome.jobStatus === "formalized"
     ? await findImportedStubbedTheoremUses({
-      proofPath: effectiveStatus.absolutePath,
-      resolvedUses
+      proofPath: outcome.effectiveStatus.absolutePath,
+      resolvedUses: uses
     })
     : [];
-  job.finalStatus = effectiveStatus.status;
-  job.apiRunId = exit.apiRunId || null;
-  job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
+  job.finalStatus = outcome.finalStatus;
+  job.apiRunId = exit.apiRunId || job.apiRunId || null;
+  job.exitCode = outcome.jobStatus === "formalized" ? 0 : 1;
   job.timedOut = exit.timedOut;
-  if (nextJobStatus === "failed") {
-    job.error = exit.error ||
-      artifact?.error ||
-      job.leanCheck?.message ||
-      `Lea API run completed but final status is ${effectiveStatus.status}.`;
+  if (outcome.error) {
+    job.error = outcome.error;
+  } else {
+    delete job.error;
   }
   job.finishedAt = new Date().toISOString();
   const exitSummary = exit.timedOut
     ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
     : `Lea API run ${exit.ok ? "completed" : "failed"}`;
-  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${effectiveStatus.status}\n`);
+  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${outcome.finalStatus}\n`);
   if (job.error) {
     await appendLog(job.logPath, `[backend] ${job.error}\n`);
   }
-  job.status = nextJobStatus;
+  job.status = outcome.jobStatus;
   await writeJson(state.jobsPath, state.jobs);
+}
+
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
+  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
+  const prompt = buildLeaPrompt({
+    projectSlug: target.projectSlug,
+    theoremLabel: target.theoremLabel,
+    theoremText,
+    theoremContext,
+    declarationNameHint: job.declarationNameHint || "",
+    resolvedUses,
+    latexContext
+  });
+  const exit = await runLeaProofJobForJob({ state, job, target, prompt });
+  if (job.finalStatus === "max_spend") return;
+
+  await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 }
 
 async function maybeResumeStubFormalization({ state, target, theoremText, theoremContext = "", theoremUses = [] }) {
@@ -1809,92 +1899,7 @@ async function runLeaJobFromApproval({ state, job, target }) {
 }
 
 async function finishLeaProofJob({ state, job, target, beforeMarkers, exit }) {
-  const artifact = exit.ok
-    ? await identifyLeaArtifact({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      beforeMarkers,
-      job
-    })
-    : null;
-
-  if (artifact?.ok) {
-    job.declarationName = artifact.entry.name;
-    job.recordedProofPath = artifact.entry.proofPath;
-    job.moduleName = artifact.entry.moduleName || null;
-  }
-  recordJobUsage(job, exit);
-
-  const status = artifact?.ok
-    ? await getLeaProofStatusFromEntry({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      entry: artifact.entry
-    })
-    : artifact?.error
-      ? {
-        status: "unformalized",
-        theoremLabel: target.theoremLabel,
-        declarationName: target.declarationName,
-        relativePath: target.relativePath,
-        absolutePath: target.absolutePath,
-        projectId: target.projectId,
-        projectSlug: target.projectSlug,
-        projectMarkdownPath: target.projectMarkdownPath
-      }
-      : await getTheoremStatus({
-        leaRepoPath: state.settings.leaRepoPath,
-        overleafProjectId: target.overleafProjectId,
-        theoremLabel: target.theoremLabel,
-        jobs: {}
-      });
-  const effectiveStatus = (
-    status.status === "unformalized" &&
-    job.declarationName &&
-    job.recordedProofPath
-  )
-    ? await getLeaProofStatusFromEntry({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      entry: {
-        name: job.declarationName,
-        proofPath: job.recordedProofPath,
-        moduleName: job.moduleName || null
-      }
-    })
-    : status;
-  let proofComplete = effectiveStatus.status === "formalized";
-  if (proofComplete && effectiveStatus.absolutePath) {
-    job.leanCheck = await runLeanCheck(job.leaWorkspacePath, effectiveStatus.absolutePath);
-    proofComplete = job.leanCheck.ok;
-  }
-  const nextJobStatus = exit.ok && proofComplete ? "formalized" : "failed";
-  job.stubbedTheoremUses = nextJobStatus === "formalized"
-    ? await findImportedStubbedTheoremUses({
-      proofPath: effectiveStatus.absolutePath,
-      resolvedUses: job.theoremUses || []
-    })
-    : [];
-  job.finalStatus = effectiveStatus.status;
-  job.apiRunId = exit.apiRunId || job.apiRunId || null;
-  job.exitCode = nextJobStatus === "formalized" ? 0 : 1;
-  job.timedOut = exit.timedOut;
-  if (nextJobStatus === "failed") {
-    job.error = exit.error ||
-      artifact?.error ||
-      job.leanCheck?.message ||
-      `Lea API run completed but final status is ${effectiveStatus.status}.`;
-  }
-  job.finishedAt = new Date().toISOString();
-  const exitSummary = exit.timedOut
-    ? `Lea timed out after ${job.leaJobTimeoutSeconds} seconds`
-    : `Lea API run ${exit.ok ? "completed" : "failed"}`;
-  await appendLog(job.logPath, `\n[backend] ${exitSummary}; final status ${effectiveStatus.status}\n`);
-  if (job.error) {
-    await appendLog(job.logPath, `[backend] ${job.error}\n`);
-  }
-  job.status = nextJobStatus;
-  await writeJson(state.jobsPath, state.jobs);
+  await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses: job.theoremUses || [] });
 }
 
 function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], latexContext = null }) {
@@ -3064,6 +3069,7 @@ async function getTheoremStatus({
     includeStubbedTheoremUses: true
   });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
+  const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
   const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
   const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
 
@@ -3089,6 +3095,20 @@ async function getTheoremStatus({
 
   if (directProofStatus?.status === "formalized") {
     return withLeaSession(directProofStatus);
+  }
+
+  // Authoritative outcome: a finished job the finalizer recorded as `formalized`
+  // means the adapter verified the proof, even when project-markdown recording is
+  // deferred and no local file evidence (mapped/project/direct) could be found.
+  // Surface it as formalized so the Overleaf tag matches the job record. Guard on
+  // recency so a later failed re-run is not shadowed by a stale success.
+  if (
+    formalizedJob &&
+    (!failedJob ||
+      String(formalizedJob.finishedAt || formalizedJob.startedAt) >=
+        String(failedJob.finishedAt || failedJob.startedAt))
+  ) {
+    return withLeaSession(buildJobResponse({ job: formalizedJob, status: "formalized", target }));
   }
 
   if (failedJob) {
