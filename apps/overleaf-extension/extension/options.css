@@ -98,3 +98,15 @@ button {
   min-height: 20px;
   margin: 16px 0 0;
 }
+
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

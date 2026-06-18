@@ -362,6 +362,7 @@ export default function App() {
           }
           onNewSession={resetForNewSession}
           onOpenSettings={() => setView('settings')}
+          onOpenStats={() => setView('stats')}
         />
 
         <div className={`main-area ${canvasCollapsed ? 'canvas-collapsed' : ''}`}>

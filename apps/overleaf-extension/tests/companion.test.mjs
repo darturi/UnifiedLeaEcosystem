@@ -75,7 +75,7 @@ test("settings response includes model families and key status", async () => {
     costUsd: 0.125
   });
 
-  const response = buildSettingsResponse(state);
+  const response = await buildSettingsResponse(state);
 
   assert.deepEqual(response.leaModelOptions, LEA_MODEL_OPTIONS);
   assert.deepEqual(response.leaModelOptions.map((model) => model.value), [
@@ -114,7 +114,7 @@ test("settings response reloads model selection from env file", async () => {
     "utf8"
   );
 
-  const response = buildSettingsResponse(state);
+  const response = await buildSettingsResponse(state);
 
   assert.equal(response.leaModel, "anthropic/claude-sonnet-4-6");
   assert.equal(response.leaProvider, "anthropic");
@@ -314,7 +314,7 @@ test("settings normalize legacy Anthropic model ids", async () => {
     env: { ANTHROPIC_API_KEY: "anthropic-key" }
   });
 
-  assert.equal(buildSettingsResponse(state).leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal((await buildSettingsResponse(state)).leaModel, "anthropic/claude-sonnet-4-6");
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
@@ -383,6 +383,95 @@ test("settings save provider key patches to env file without settings persistenc
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaProviderApiKeys"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaModel"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxTurns"), false);
+});
+
+test("api flavor: settings read overlays the adapter's shared values and key status", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapter = makeAdapterStore({
+    model: "anthropic/claude-sonnet-4-6",
+    max_turns: 55,
+    max_spend_usd: 7.5,
+    api_keys: { ANTHROPIC_API_KEY: keyStatus("dcba") }
+  });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    leaModel: "o4-mini",
+    env: { OPENAI_API_KEY: "env-openai" },
+    fetchImpl: makeAdapterFetch(adapter, calls)
+  });
+
+  const response = await buildSettingsResponse(state);
+
+  // The adapter (single source of truth) wins for the shared scalars...
+  assert.equal(response.leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal(response.leaMaxTurns, 55);
+  assert.equal(response.leaMaxSpendUsd, 7.5);
+  // ...and a key configured only in the adapter (lea-standalone UI) reads as configured.
+  assert.equal(response.leaProviderKeys.anthropic.configured, true);
+  // while a key in the companion env is still recognized.
+  assert.equal(response.leaProviderKeys.openai.configured, true);
+  assert.ok(calls.some((call) => call.method === "GET" && call.url.endsWith("/api/settings")));
+});
+
+test("api flavor: saving settings forwards the shared fields to the adapter", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapter = makeAdapterStore({ api_keys: { OPENAI_API_KEY: keyStatus("akey") } });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    env: { OPENAI_API_KEY: "env-openai" },
+    fetchImpl: makeAdapterFetch(adapter, calls)
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaModel: "gpt-5.4-mini",
+    leaMaxTurns: 42,
+    leaMaxSpendUsd: 3.5
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  const put = calls.find((call) => call.method === "PUT");
+  assert.ok(put, "expected a PUT to /api/settings");
+  assert.equal(put.body.model, "gpt-5.4-mini");
+  assert.equal(put.body.max_turns, 42);
+  assert.equal(put.body.max_spend_usd, 3.5);
+  // the selected model's key is forwarded so the adapter holds what the model needs
+  assert.equal(put.body.api_keys.OPENAI_API_KEY.value, "env-openai");
+  // and the adapter store actually moved
+  assert.equal(adapter.settings.model, "gpt-5.4-mini");
+  assert.equal(adapter.settings.max_turns, 42);
+});
+
+test("api flavor: an adapter validation rejection surfaces as a 422", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapter = makeAdapterStore({
+    api_keys: { ANTHROPIC_API_KEY: keyStatus("good") },
+    reject: { field: "api_keys.ANTHROPIC_API_KEY", message: "The Anthropic API key was rejected by the provider." }
+  });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    env: {},
+    fetchImpl: makeAdapterFetch(adapter, calls)
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaModel: "anthropic/claude-sonnet-4-6",
+    leaMaxTurns: 20
+  }, state);
+
+  assert.equal(result.statusCode, 422);
+  assert.equal(result.body.error, "adapter_settings_rejected");
+  assert.equal(result.body.field, "api_keys.ANTHROPIC_API_KEY");
+  assert.match(result.body.message, /rejected by the provider/);
 });
 
 test("settings reject invalid submitted Gemini keys before persistence", async () => {
@@ -1800,7 +1889,7 @@ test("usage reflects live Lea event costs while a run is in progress", async () 
   });
   assert.equal(job.costUsd, 0.02);
 
-  const usage = handleGetUsage({ overleafProjectId: "project-1" }, state);
+  const usage = await handleGetUsage({ overleafProjectId: "project-1" }, state);
   assert.deepEqual(usage.body.project, {
     inputTokens: 400,
     outputTokens: 50,
@@ -1951,8 +2040,10 @@ test("formalize after stub cancels and fails when resumed usage crosses max spen
   assert.ok(resumeCalls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
 });
 
-test("usage aggregates project and all-time completed run totals", async () => {
+test("usage falls back to in-memory job totals when the adapter is unavailable", async () => {
   const leaRepo = await makeLeaRepo();
+  // Default flavor here is "v1" (no adapter), so handleGetUsage uses the in-memory
+  // job tally fallback rather than GET /api/stats.
   const state = await makeState({ leaRepoPath: leaRepo, leaMaxSpendUsd: 1 });
   state.jobs.project_a_first = makeUsageJob({
     jobId: "project_a_first",
@@ -1982,7 +2073,7 @@ test("usage aggregates project and all-time completed run totals", async () => {
     projectSlug: "project-a"
   };
 
-  const result = handleGetUsage({ overleafProjectId: "project-a" }, state);
+  const result = await handleGetUsage({ overleafProjectId: "project-a" }, state);
 
   assert.equal(result.statusCode, 200);
   assert.deepEqual(result.body.project, {
@@ -2002,6 +2093,79 @@ test("usage aggregates project and all-time completed run totals", async () => {
   assert.equal(result.body.leaMaxSpendUsd, 1);
   assert.equal(result.body.leaCurrentSpendUsd, 0.48);
   assert.equal(result.body.leaSpendLimitReached, false);
+});
+
+test("usage sourced from the adapter matches /api/stats (all-time + this project)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const projectSlug = slugProjectId("doc-a");
+  const stats = {
+    global: {
+      input_tokens: 1000,
+      output_tokens: 250,
+      total_tokens: 1250,
+      cost_usd: 0.7,
+      session_count: 4
+    },
+    sessions: [
+      // Two sessions for this Overleaf doc → summed into "This project".
+      { project_slug: projectSlug, input_tokens: 200, output_tokens: 50, cost_usd: 0.10, run_count: 1 },
+      { project_slug: projectSlug, input_tokens: 300, output_tokens: 75, cost_usd: 0.20, run_count: 2 },
+      // A different doc and an untagged session → excluded from "This project".
+      { project_slug: slugProjectId("doc-b"), input_tokens: 400, output_tokens: 100, cost_usd: 0.30, run_count: 1 },
+      { project_slug: null, input_tokens: 100, output_tokens: 25, cost_usd: 0.10, run_count: 1 }
+    ]
+  };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaMaxSpendUsd: 1,
+    fetchImpl: makeStatsFetch(stats)
+  });
+  // An in-memory job exists but must be ignored once the adapter is the source.
+  state.jobs.stale = makeUsageJob({
+    jobId: "stale", projectId: "doc-a", inputTokens: 9, outputTokens: 9, costUsd: 9
+  });
+
+  const result = await handleGetUsage({ overleafProjectId: "doc-a" }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(result.body.project, {
+    inputTokens: 500,
+    outputTokens: 125,
+    totalTokens: 625,
+    costUsd: 0.3,
+    runCount: 3
+  });
+  assert.deepEqual(result.body.allTime, {
+    inputTokens: 1000,
+    outputTokens: 250,
+    totalTokens: 1250,
+    costUsd: 0.7,
+    runCount: 4
+  });
+  assert.equal(result.body.leaCurrentSpendUsd, 0.7);
+  assert.equal(result.body.leaSpendLimitReached, false);
+});
+
+test("usage from the adapter flags the spend cap from all-time cost", async () => {
+  const leaRepo = await makeLeaRepo();
+  const stats = {
+    global: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cost_usd: 0.5, session_count: 1 },
+    sessions: []
+  };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaApiFlavor: "api",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaMaxSpendUsd: 0.5,
+    fetchImpl: makeStatsFetch(stats)
+  });
+
+  const result = await handleGetUsage({ overleafProjectId: "doc-a" }, state);
+
+  assert.equal(result.body.leaCurrentSpendUsd, 0.5);
+  assert.equal(result.body.leaSpendLimitReached, true);
 });
 
 test("formalize cleans previous failed Lea artifacts before retrying", async () => {
@@ -2559,6 +2723,68 @@ function makeLeaApiFetch(calls, options = {}) {
       await options.onStatusRequest();
     }
     return jsonResponse(200, options.statusBody || { run_id: "api-run-1", status: "running" });
+  };
+}
+
+// Serves the lea-standalone adapter's GET /api/stats with a fixed payload so the
+// popover-usage path can be exercised without a live adapter.
+function makeStatsFetch(stats) {
+  return async (url) => {
+    if (String(url).endsWith("/api/stats")) {
+      return jsonResponse(200, stats);
+    }
+    return jsonResponse(404, { detail: "not found" });
+  };
+}
+
+function keyStatus(last4, label) {
+  return { configured: true, last4, label: label || null };
+}
+
+function makeAdapterStore(overrides = {}) {
+  return {
+    settings: {
+      model: overrides.model || "o4-mini",
+      max_turns: overrides.max_turns ?? 20,
+      max_spend_usd: overrides.max_spend_usd ?? null,
+      current_spend_usd: 0,
+      api_keys: overrides.api_keys || {},
+      model_options: []
+    },
+    reject: overrides.reject || null
+  };
+}
+
+// Simulates the lea-standalone adapter's GET/PUT /api/settings, plus falls through
+// to provider-key validation URLs (api.openai.com, …) for the companion's own
+// pre-save key checks.
+function makeAdapterFetch(adapter, calls = []) {
+  return async (url, requestOptions = {}) => {
+    const u = String(url);
+    if (u.endsWith("/api/settings")) {
+      const method = requestOptions.method || "GET";
+      if (method === "GET") {
+        calls.push({ method: "GET", url: u });
+        return jsonResponse(200, adapter.settings);
+      }
+      if (method === "PUT") {
+        const body = requestOptions.body ? JSON.parse(requestOptions.body) : {};
+        calls.push({ method: "PUT", url: u, body });
+        if (adapter.reject) {
+          return jsonResponse(422, { detail: { message: adapter.reject.message, field: adapter.reject.field } });
+        }
+        if (typeof body.max_turns === "number") adapter.settings.max_turns = body.max_turns;
+        if (body.max_spend_usd === null || typeof body.max_spend_usd === "number") {
+          adapter.settings.max_spend_usd = body.max_spend_usd;
+        }
+        if (body.model) adapter.settings.model = body.model;
+        for (const [env, patch] of Object.entries(body.api_keys || {})) {
+          if (patch?.value) adapter.settings.api_keys[env] = keyStatus(String(patch.value).slice(-4), env);
+        }
+        return jsonResponse(200, adapter.settings);
+      }
+    }
+    return makeProviderValidationFetch(calls)(url, requestOptions);
   };
 }
 

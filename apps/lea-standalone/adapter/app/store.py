@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 from uuid import uuid4
 
 from typing import Any
@@ -129,6 +130,31 @@ def get_project(project_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(row) if row else None
+
+
+def get_project_by_slug(slug: str) -> dict | None:
+    value = validate_project_slug(slug)
+    with connect() as conn:
+        row = conn.execute("select * from projects where slug = ?", (value,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def get_or_create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+    """Return the project with this slug, creating it on first use. Used by the
+    Overleaf path to tag runs with the document namespace so per-document usage can
+    be aggregated. `slug` is unique, so a concurrent create just re-reads the
+    winner."""
+    existing = get_project_by_slug(slug)
+    if existing:
+        return existing
+    try:
+        return create_project(slug, title=title, path=path)
+    except sqlite3.IntegrityError:
+        # Lost a create race on the unique slug — read back the winner.
+        winner = get_project_by_slug(slug)
+        if winner:
+            return winner
+        raise
 
 
 def create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
