@@ -1,6 +1,38 @@
+/* ---------------------------------------------------------------------------
+   Lea Formalizer — warm-paper design system.
+   Tokens ported from apps/lea-standalone/src/styles/lea-v2.css so the Overleaf
+   extension reads as the same product as the lea-standalone chat UI.
+   Prefixed --ol-* so nothing collides with Overleaf's own page variables.
+   --------------------------------------------------------------------------- */
+:root {
+  --ol-bg: #f5f4ef;
+  --ol-panel: #ffffff;
+  --ol-panel-2: #faf9f6;
+  --ol-ink: #1f1e1d;
+  --ol-ink-2: #3d3c39;
+  --ol-muted: #8a8983;
+  --ol-line: #e9e7e0;
+  --ol-line-2: #efede7;
+  --ol-accent: #c96442;
+  --ol-accent-soft: #f3e3db;
+  --ol-accent-ink: #a44f33;
+  --ol-green: #4f8a5b;
+  --ol-green-soft: #e6f0e7;
+  --ol-red: #c0564a;
+  --ol-red-soft: #f6e3e0;
+  --ol-red-ink: #9a3f35;
+  --ol-amber: #b8842a;
+  --ol-amber-soft: #f6ecd8;
+  --ol-radius: 12px;
+  --ol-radius-sm: 8px;
+  --ol-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --ol-sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --ol-serif: Georgia, "Times New Roman", serif;
+}
+
 .ol-lean-theorem {
-  background: rgba(124, 58, 237, 0.12);
-  border-bottom: 1px solid rgba(124, 58, 237, 0.6);
+  background: rgba(201, 100, 66, 0.12);
+  border-bottom: 1px solid rgba(201, 100, 66, 0.55);
   cursor: pointer;
 }
 
@@ -18,11 +50,11 @@
   gap: 4px;
   height: 18px;
   padding: 0 6px;
-  border: 1px solid rgba(17, 24, 39, 0.12);
+  border: 1px solid var(--ol-line);
   border-radius: 6px;
-  color: #4b5563;
-  background: #ffffff;
-  font: 700 11px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  font: 700 11px/1 var(--ol-sans);
   white-space: nowrap;
   pointer-events: auto;
   cursor: pointer;
@@ -44,9 +76,9 @@
   min-width: 12px;
   height: 12px;
   border-radius: 999px;
-  color: #92400e;
-  background: #fde68a;
-  font: 800 9px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #ffffff;
+  background: var(--ol-amber);
+  font: 800 9px/1 var(--ol-sans);
 }
 
 @keyframes ol-lean-status-progress-pulse {
@@ -66,45 +98,46 @@
 .ol-lean-popover button:focus-visible,
 .ol-lean-popover select:focus-visible,
 .ol-lean-popover input:focus-visible {
-  outline: 2px solid rgba(124, 58, 237, 0.55);
+  outline: 2px solid rgba(201, 100, 66, 0.55);
   outline-offset: 2px;
 }
 
 .ol-lean-status-unformalized {
-  color: #92400e;
-  background: #fef3c7;
-  border-color: #f59e0b;
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+  border-color: var(--ol-amber);
 }
 
 .ol-lean-status-in_progress {
-  color: #1d4ed8;
-  background: #dbeafe;
-  border-color: #93c5fd;
+  color: var(--ol-accent);
+  background: var(--ol-accent-soft);
+  border-color: var(--ol-accent);
 }
 
 .ol-lean-status-formalized {
-  color: #15803d;
-  background: #dcfce7;
-  border-color: #86efac;
+  color: var(--ol-green);
+  background: var(--ol-green-soft);
+  border-color: var(--ol-green);
 }
 
 .ol-lean-status-sorry_stub {
-  color: #c2410c;
-  background: #ffedd5;
-  border-color: #fdba74;
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+  border-color: var(--ol-amber);
+  border-style: dashed;
 }
 
 .ol-lean-status-offline,
 .ol-lean-status-failed {
-  color: #b91c1c;
-  background: #fee2e2;
-  border-color: #fca5a5;
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+  border-color: var(--ol-red);
 }
 
 .ol-lean-status-unavailable {
-  color: #7e22ce;
-  background: #f3e8ff;
-  border-color: #d8b4fe;
+  color: var(--ol-muted);
+  background: var(--ol-line-2);
+  border-color: var(--ol-line);
 }
 
 .ol-lean-settings-trigger {
@@ -112,53 +145,32 @@
   right: 20px;
   bottom: 20px;
   z-index: 2147483646;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
+  display: grid;
+  place-items: center;
   width: 38px;
   height: 38px;
-  padding: 0 9px;
-  border: 1px solid #e5e7eb;
+  padding: 0;
+  border: 1px solid var(--ol-line);
   border-radius: 999px;
-  background: #ffffff;
-  box-shadow: 0 8px 24px rgba(17, 24, 39, 0.16), 0 1px 4px rgba(17, 24, 39, 0.08);
+  background: var(--ol-panel);
+  box-shadow: 0 8px 24px rgba(31, 30, 29, 0.16), 0 1px 4px rgba(31, 30, 29, 0.08);
   cursor: pointer;
 }
 
 .ol-lean-settings-trigger:hover {
-  border-color: #c4b5fd;
-  background: #faf9ff;
+  border-color: var(--ol-accent);
+  background: var(--ol-panel-2);
 }
 
-.ol-lean-slider-line {
-  position: relative;
-  display: block;
-  height: 2px;
-  border-radius: 999px;
-  background: #7c3aed;
-}
-
-.ol-lean-slider-line span {
-  position: absolute;
-  top: 50%;
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: #7c3aed;
-  transform: translateY(-50%);
-}
-
-.ol-lean-slider-line:nth-child(1) span {
-  left: 3px;
-}
-
-.ol-lean-slider-line:nth-child(2) span {
-  right: 2px;
-}
-
-.ol-lean-slider-line:nth-child(3) span {
-  left: 9px;
+.ol-lean-trigger-mark {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  color: #ffffff;
+  background: var(--ol-accent);
+  font: 700 14px/1 var(--ol-serif);
 }
 
 .ol-lean-theorem-popover {
@@ -167,53 +179,63 @@
   min-width: 260px;
   max-width: 360px;
   padding: 12px;
-  color: #172033;
-  background: #ffffff;
-  border: 1px solid rgba(23, 32, 51, 0.18);
-  border-radius: 8px;
-  box-shadow: 0 12px 32px rgba(23, 32, 51, 0.22);
-  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
+  box-shadow: 0 12px 32px rgba(31, 30, 29, 0.18);
+  font: 13px/1.45 var(--ol-sans);
 }
 
 .ol-lean-popover-title {
   margin: 0 0 8px;
+  color: var(--ol-ink);
   font-weight: 700;
 }
 
 .ol-lean-popover-meta {
   margin: 0 0 10px;
-  color: #536078;
+  color: var(--ol-muted);
   word-break: break-word;
 }
 
 .ol-lean-theorem-popover button {
   height: 32px;
   padding: 0 12px;
-  border: 1px solid rgba(23, 32, 51, 0.16);
-  border-radius: 6px;
-  background: #f8f9fc;
-  color: #172033;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel-2);
+  color: var(--ol-ink);
   font: inherit;
   font-weight: 600;
   cursor: pointer;
 }
 
+.ol-lean-theorem-popover button:hover {
+  background: var(--ol-line-2);
+}
+
 .ol-lean-theorem-popover button[data-primary="true"] {
-  border-color: #2357d9;
-  background: #2f65f6;
+  border-color: var(--ol-accent);
+  background: var(--ol-accent);
   color: #ffffff;
+}
+
+.ol-lean-theorem-popover button[data-primary="true"]:hover {
+  background: var(--ol-accent-ink);
+  border-color: var(--ol-accent-ink);
 }
 
 .ol-lean-popover {
   position: fixed;
   z-index: 2147483647;
   width: 280px;
-  color: #111827;
-  background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 12px;
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08), 0 1px 4px rgba(0, 0, 0, 0.05);
-  font: 12px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
+  box-shadow: 0 4px 24px rgba(31, 30, 29, 0.10), 0 1px 4px rgba(31, 30, 29, 0.06);
+  font: 12px/1.45 var(--ol-sans);
 }
 
 .ol-lean-popover-arrow {
@@ -222,9 +244,9 @@
   left: 18px;
   width: 10px;
   height: 10px;
-  background: #ffffff;
-  border-left: 1px solid #e5e7eb;
-  border-top: 1px solid #e5e7eb;
+  background: var(--ol-panel);
+  border-left: 1px solid var(--ol-line);
+  border-top: 1px solid var(--ol-line);
   transform: rotate(45deg);
 }
 
@@ -235,8 +257,8 @@
   left: auto;
   border-top: 0;
   border-left: 0;
-  border-right: 1px solid #e5e7eb;
-  border-bottom: 1px solid #e5e7eb;
+  border-right: 1px solid var(--ol-line);
+  border-bottom: 1px solid var(--ol-line);
 }
 
 .ol-lean-cost-cap-notice {
@@ -248,12 +270,12 @@
   width: min(280px, calc(100vw - 24px));
   box-sizing: border-box;
   padding: 10px 10px 10px 12px;
-  color: #7f1d1d;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+  border: 1px solid var(--ol-red);
   border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(127, 29, 29, 0.16);
-  font: 12px/1.35 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 8px 24px rgba(192, 86, 74, 0.16);
+  font: 12px/1.35 var(--ol-sans);
 }
 
 .ol-lean-cost-cap-notice div {
@@ -267,7 +289,7 @@
 
 .ol-lean-cost-cap-notice strong {
   margin-bottom: 2px;
-  color: #991b1b;
+  color: var(--ol-red-ink);
   font-weight: 700;
 }
 
@@ -278,15 +300,15 @@
   padding: 0;
   border: 0;
   border-radius: 6px;
-  color: #991b1b;
+  color: var(--ol-red-ink);
   background: transparent;
   cursor: pointer;
-  font: 700 14px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 700 14px/1 var(--ol-sans);
 }
 
 .ol-lean-cost-cap-notice button:hover,
 .ol-lean-cost-cap-notice button:focus-visible {
-  background: #fee2e2;
+  background: rgba(192, 86, 74, 0.16);
 }
 
 .ol-lean-popover-header {
@@ -295,15 +317,15 @@
   justify-content: space-between;
   gap: 8px;
   padding: 10px 12px 9px;
-  border-bottom: 1px solid #f3f4f6;
+  border-bottom: 1px solid var(--ol-line-2);
 }
 
 .ol-lean-popover-kicker {
   display: flex;
   align-items: center;
   gap: 7px;
-  color: #9ca3af;
-  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--ol-muted);
+  font: 700 10px/1 var(--ol-mono);
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
@@ -315,8 +337,8 @@
   width: 16px;
   height: 16px;
   border-radius: 5px;
-  color: #7c3aed;
-  background: #ede9fe;
+  color: var(--ol-accent);
+  background: var(--ol-accent-soft);
 }
 
 .ol-lean-icon-button {
@@ -324,14 +346,14 @@
   height: 22px;
   border: 0;
   border-radius: 6px;
-  color: #9ca3af;
+  color: var(--ol-muted);
   background: transparent;
   cursor: pointer;
 }
 
 .ol-lean-icon-button:hover {
-  color: #374151;
-  background: #f3f4f6;
+  color: var(--ol-ink-2);
+  background: var(--ol-line-2);
 }
 
 .ol-lean-popover-body {
@@ -344,9 +366,9 @@
 .ol-lean-theorem-card,
 .ol-lean-usage-panel,
 .ol-lean-settings-panel {
-  border: 1px solid #f3f4f6;
-  border-radius: 8px;
-  background: #f9fafb;
+  border: 1px solid var(--ol-line-2);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel-2);
 }
 
 .ol-lean-theorem-card {
@@ -362,8 +384,8 @@
 
 .ol-lean-field-label {
   margin: 0 0 2px;
-  color: #9ca3af;
-  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--ol-muted);
+  font: 700 9px/1 var(--ol-mono);
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
@@ -372,7 +394,7 @@
   max-width: 160px;
   margin: 0;
   overflow-wrap: anywhere;
-  color: #111827;
+  color: var(--ol-ink);
   font-weight: 700;
 }
 
@@ -381,53 +403,53 @@
   max-width: 96px;
   padding: 3px 7px;
   border-radius: 999px;
-  color: #4b5563;
-  background: #eef2f8;
-  font: 700 10px/1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ol-ink-2);
+  background: var(--ol-line-2);
+  font: 700 10px/1 var(--ol-sans);
   text-transform: lowercase;
 }
 
 .ol-lean-status-chip-unformalized {
-  color: #92400e;
-  background: #fef3c7;
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
 }
 
 .ol-lean-status-chip-in_progress {
-  color: #1d4ed8;
-  background: #dbeafe;
+  color: var(--ol-accent);
+  background: var(--ol-accent-soft);
 }
 
 .ol-lean-status-chip-formalized {
-  color: #15803d;
-  background: #dcfce7;
+  color: var(--ol-green);
+  background: var(--ol-green-soft);
 }
 
 .ol-lean-status-chip-sorry_stub {
-  color: #c2410c;
-  background: #ffedd5;
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
 }
 
 .ol-lean-status-chip-offline,
 .ol-lean-status-chip-failed {
-  color: #b91c1c;
-  background: #fee2e2;
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
 }
 
 .ol-lean-status-chip-unavailable {
-  color: #7e22ce;
-  background: #f3e8ff;
+  color: var(--ol-muted);
+  background: var(--ol-line-2);
 }
 
 .ol-lean-popover-detail,
 .ol-lean-popover-warning,
 .ol-lean-popover-status {
   margin: 8px 0 0;
-  color: #6b7280;
+  color: var(--ol-muted);
   overflow-wrap: anywhere;
 }
 
 .ol-lean-popover-warning {
-  color: #92400e;
+  color: var(--ol-amber);
   font-weight: 700;
 }
 
@@ -442,11 +464,11 @@
   margin: 9px 0 0;
   padding: 8px;
   overflow: auto;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--ol-line);
   border-radius: 7px;
-  background: #ffffff;
-  color: #374151;
-  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  background: var(--ol-panel);
+  color: var(--ol-ink-2);
+  font: 11px/1.45 var(--ol-mono);
   white-space: pre-wrap;
 }
 
@@ -471,19 +493,23 @@
   flex: 1;
   border: 0;
   color: #ffffff;
-  background: #7c3aed;
+  background: var(--ol-accent);
 }
 
 .ol-lean-primary-button:hover:not(:disabled),
 .ol-lean-save-button:hover:not(:disabled) {
-  background: #6d28d9;
+  background: var(--ol-accent-ink);
 }
 
 .ol-lean-secondary-button {
   padding: 0 10px;
-  border: 1px solid #e5e7eb;
-  color: #374151;
-  background: #ffffff;
+  border: 1px solid var(--ol-line);
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+}
+
+.ol-lean-secondary-button:hover:not(:disabled) {
+  background: var(--ol-panel-2);
 }
 
 .ol-lean-primary-button:disabled,
@@ -511,14 +537,14 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  color: #9ca3af;
-  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--ol-muted);
+  font: 700 10px/1 var(--ol-mono);
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 
 .ol-lean-usage-row-head strong {
-  color: #7c3aed;
+  color: var(--ol-accent);
   font-size: 13px;
   letter-spacing: 0;
   text-transform: none;
@@ -533,37 +559,37 @@
   flex: 1;
   padding: 5px 8px;
   border-radius: 5px;
-  background: #f3f4f6;
+  background: var(--ol-line-2);
 }
 
 .ol-lean-usage-metrics small {
   display: block;
   margin-bottom: 2px;
-  color: #9ca3af;
+  color: var(--ol-muted);
   font-size: 9px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
 .ol-lean-usage-metrics strong {
-  color: #374151;
-  font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--ol-ink-2);
+  font: 700 12px/1 var(--ol-mono);
 }
 
 .ol-lean-usage-separator {
   height: 1px;
-  background: #e5e7eb;
+  background: var(--ol-line);
 }
 
 .ol-lean-usage-cap {
   margin: 8px 0 0;
-  color: #6b7280;
+  color: var(--ol-muted);
   font-size: 11px;
   line-height: 1.35;
 }
 
 .ol-lean-usage-cap[data-reached="true"] {
-  color: #b91c1c;
+  color: var(--ol-red);
 }
 
 .ol-lean-provider-panel {
@@ -571,12 +597,12 @@
   flex-direction: column;
   gap: 8px;
   padding: 10px 12px;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--ol-line);
 }
 
 .ol-lean-provider-title {
-  color: #6b7280;
-  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--ol-muted);
+  font: 700 10px/1 var(--ol-mono);
   letter-spacing: 0.07em;
   text-transform: uppercase;
 }
@@ -586,14 +612,14 @@
   flex-direction: column;
   gap: 6px;
   padding: 7px 8px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--ol-line);
   border-radius: 7px;
-  background: #f9fafb;
+  background: var(--ol-panel-2);
 }
 
 .ol-lean-provider-row[data-configured="true"] {
-  border-color: #c7d2fe;
-  background: #eef2ff;
+  border-color: var(--ol-accent);
+  background: var(--ol-accent-soft);
 }
 
 .ol-lean-provider-row-head,
@@ -606,41 +632,41 @@
 
 .ol-lean-provider-note {
   margin: 0;
-  color: #6b7280;
+  color: var(--ol-muted);
   font-size: 11px;
   line-height: 1.35;
 }
 
 .ol-lean-provider-row-head span {
-  color: #374151;
+  color: var(--ol-ink-2);
   font-size: 12px;
   font-weight: 700;
 }
 
 .ol-lean-provider-row-head strong {
-  color: #b91c1c;
-  font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  color: var(--ol-red);
+  font: 700 10px/1 var(--ol-mono);
   letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
 .ol-lean-provider-row[data-configured="true"] .ol-lean-provider-row-head strong {
-  color: #4338ca;
+  color: var(--ol-accent-ink);
 }
 
 .ol-lean-provider-key-button {
   min-height: 26px;
   padding: 4px 8px;
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--ol-line);
   border-radius: 6px;
-  color: #374151;
-  background: #ffffff;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
   font-size: 11px;
 }
 
 .ol-lean-provider-key-button:hover {
-  border-color: #7c3aed;
-  color: #6d28d9;
+  border-color: var(--ol-accent);
+  color: var(--ol-accent-ink);
 }
 
 .ol-lean-provider-key-controls input {
@@ -653,14 +679,14 @@
   flex-direction: column;
   gap: 10px;
   padding: 10px 12px;
-  background: #ffffff;
+  background: var(--ol-panel);
 }
 
 .ol-lean-settings-panel label {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  color: #6b7280;
+  color: var(--ol-muted);
   font-size: 11px;
   letter-spacing: 0.03em;
 }
@@ -671,16 +697,16 @@
   box-sizing: border-box;
   min-height: 32px;
   padding: 6px 9px;
-  border: 1px solid #d1d5db;
-  border-radius: 7px;
-  color: #111827;
-  background: #ffffff;
-  font: 12px/1.3 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  font: 12px/1.3 var(--ol-sans);
 }
 
 .ol-lean-settings-panel input {
   width: 72px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-family: var(--ol-mono);
   text-align: center;
 }
 
@@ -688,13 +714,13 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid #e5e7eb;
-  color: #9ca3af;
-  background: #f9fafb;
+  border: 1px solid var(--ol-line);
+  color: var(--ol-muted);
+  background: var(--ol-panel-2);
 }
 
 .ol-lean-save-button:not(:disabled) {
-  border-color: #7c3aed;
+  border-color: var(--ol-accent);
   color: #ffffff;
-  background: #7c3aed;
+  background: var(--ol-accent);
 }
