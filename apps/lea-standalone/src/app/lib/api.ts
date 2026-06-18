@@ -131,6 +131,28 @@ export async function deleteProject(projectId: string): Promise<void> {
   }
 }
 
+export interface ProjectSession {
+  id: string;
+  title: string;
+  project_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Create a session that lives inside the project (D23). The run started for it
+// resolves the shared project repo + namespace server-side.
+export async function createSessionInProject(projectId: string, title?: string): Promise<ProjectSession> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to create session: ${response.statusText}`));
+  }
+  return response.json();
+}
+
 // ── Writeable canvas + manual checks (F5 wires the UI to these) ────────────────
 export interface FileWriteResult {
   unchanged: boolean;

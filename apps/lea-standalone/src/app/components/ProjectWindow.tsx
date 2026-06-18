@@ -10,19 +10,37 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'filesystem', label: 'Filesystem' },
 ];
 
-// The project window (v2.1 F2). A full-page view — breadcrumb back to Chats, a
-// hero (∑ title · namespace + description), and the tab strip. Slice 1 scaffolds
-// the tabs with placeholders; the composer + sessions wiring (Overview), the
-// dependency graph (Blueprint) and the file tree (Filesystem) land in later slices.
+// The project window (v2.1 F2/F3). A full-page view — breadcrumb back to Chats, a
+// hero (∑ title · namespace + description), and the tab strip. The Overview tab
+// (F3) has the "new proof in this project" composer + the project's sessions list;
+// opening a row loads the normal Chat+Canvas. Blueprint/Filesystem are later slices.
 export function ProjectWindow({
   project,
   onBack,
+  onStartProof,
+  onOpenSession,
 }: {
   project: ProjectDetail;
   onBack: () => void;
+  onStartProof: (message: string) => Promise<void> | void;
+  onOpenSession: (sessionId: string) => void;
 }) {
   const [tab, setTab] = useState<Tab>('overview');
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
   const sessions = project.sessions ?? [];
+
+  const submit = async () => {
+    const message = draft.trim();
+    if (!message || busy) return;
+    setBusy(true);
+    try {
+      await onStartProof(message);
+      setDraft('');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="project-window">
@@ -57,19 +75,40 @@ export function ProjectWindow({
       <div className="pw-body">
         {tab === 'overview' ? (
           <div className="pw-overview">
-            <div className="pw-sec-label">Sessions</div>
+            <div className="pw-composer">
+              <div className="pw-sec-label">New proof in this project</div>
+              <textarea
+                className="pw-composer-input"
+                placeholder={`Prove a theorem in ${project.namespace}… (it can import sibling lemmas)`}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) submit();
+                }}
+              />
+              <div className="pw-composer-foot">
+                <span className="pw-hint">⌘↵ to start</span>
+                <button className="pw-start" onClick={submit} disabled={busy || !draft.trim()}>
+                  {busy ? 'Starting…' : 'Prove in this project'}
+                </button>
+              </div>
+            </div>
+
+            <div className="pw-sec-label" style={{ marginTop: 22 }}>Sessions</div>
             {sessions.length === 0 ? (
               <div className="pw-empty">
-                No proofs in this project yet. Starting a proof inside a project
-                lands in <code>{project.repo_path}</code> so its lemmas can chain —
-                coming in the next slice.
+                No proofs yet. Start one above — it lands in <code>{project.repo_path}</code> so
+                its lemmas can chain.
               </div>
             ) : (
               <ul className="pw-session-list">
                 {sessions.map((s) => (
-                  <li key={s.id} className="pw-session-row">
-                    <span className={`dot ${s.status === 'ok' ? 'ok' : s.status === 'error' ? 'fail' : 'idle'}`} />
-                    <span className="pw-session-title">{s.title}</span>
+                  <li key={s.id}>
+                    <button className="pw-session-row" onClick={() => onOpenSession(s.id)}>
+                      <span className={`dot ${s.status === 'ok' ? 'ok' : s.status === 'error' ? 'fail' : s.status === 'running' ? 'run' : 'idle'}`} />
+                      <span className="pw-session-title">{s.title}</span>
+                      <span className="pw-session-when">{new Date(s.updated_at).toLocaleString()}</span>
+                    </button>
                   </li>
                 ))}
               </ul>

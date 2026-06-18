@@ -30,7 +30,10 @@ export function Sidebar({
   // R3: session list + selection from the store, not props.
   const sessions = useSessions((s) => s.sessions);
   const selectedSessionId = useSessions((s) => s.selectedSessionId);
-  const groups = groupByDate(sessions);
+  // D36: the sidebar's Chats group is loose sessions only — in-project sessions
+  // live in the project window (reachable there or via search), not here.
+  const looseSessions = sessions.filter((s) => !s.project_id);
+  const groups = groupByDate(looseSessions);
   // F1: projects list + which one is open, from the projects store.
   const projects = useProjects((s) => s.projects);
   const selectedProjectId = useProjects((s) => s.selectedProjectId);
@@ -79,8 +82,8 @@ export function Sidebar({
           )}
         </div>
 
-        {sessions.length > 0 && <div className="group-label">Chats</div>}
-        {sessions.length === 0 && (
+        {looseSessions.length > 0 && <div className="group-label">Chats</div>}
+        {looseSessions.length === 0 && (
           <div className="group-label" style={{ textTransform: 'none', letterSpacing: 0 }}>
             No proofs yet — start one below.
           </div>

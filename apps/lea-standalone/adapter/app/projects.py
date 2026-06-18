@@ -59,6 +59,76 @@ def repo_for_session(session: dict, proofs_root: Path, project: dict | None = No
     return proofs_root / session["id"]
 
 
+def resolve_git(session_id: str, proofs_root: Path) -> tuple[GitStore, str] | None:
+    """Resolve a session to its (GitStore, repo_key) so every git primitive operates
+    on the right repo (D24), without changing GitStore's session-keyed API. The trick:
+    root the store at the repo's *parent* and key by the repo's dir name —
+    loose → ``(proofs, <session-id>)`` (identical to before); project →
+    ``(proofs/Lea, <Project>)`` (the shared repo). Returns None if the session is gone.
+
+    Callers use the real ``session_id`` for DB rows and ``repo_key`` for git calls."""
+    session = store.get_session(session_id)
+    if session is None:
+        return None
+    project = (
+        store.get_project(session["project_id"]) if session.get("project_id") else None
+    )
+    repo = repo_for_session(session, proofs_root, project)
+    return GitStore(repo.parent), repo.name
+
+
+# Sentinel marking the composed project-context message, so a stale copy can be
+# stripped from the replayed transcript before a fresh one is prepended (D25).
+CONTEXT_MARKER = "<!-- lea:project-context -->"
+
+
+def _read_lea_doc(repo: Path, name: str) -> str:
+    path = repo / ".lea" / name
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def compose_context_message(project: dict, repo: Path) -> dict | None:
+    """Assemble the project's standing context into ONE user message (D25): the
+    Instructions / Memory / Blueprint `.lea/*.md` docs + a file inventory, prepended
+    to the run's messages by the bridge. The prover stays project-agnostic — this is
+    pure adapter-side composition. Returns None when there's no project."""
+    if not project:
+        return None
+    namespace = project.get("namespace", "")
+    instructions = _read_lea_doc(repo, "instructions.md") or "(none yet)"
+    memory = _read_lea_doc(repo, "memory.md") or "(none yet)"
+    blueprint = _read_lea_doc(repo, "blueprint.md") or "(none yet)"
+
+    files_dir = repo / ".lea" / "files"
+    inventory = "(none)"
+    if files_dir.is_dir():
+        names = sorted(p.name for p in files_dir.iterdir() if p.is_file())
+        if names:
+            inventory = "\n".join(f"- `.lea/files/{n}`" for n in names)
+
+    content = (
+        f"{CONTEXT_MARKER}\n"
+        f"You are working in project **{project.get('title', namespace)}** "
+        f"(namespace `{namespace}`). Reuse already-proved sibling lemmas in this "
+        f"project by importing them. The following is standing project context.\n\n"
+        f"## Project Instructions\n{instructions}\n\n"
+        f"## Project Memory\n{memory}\n\n"
+        f"## Blueprint (planned decomposition)\n{blueprint}\n\n"
+        f"## Project files\n{inventory}"
+    )
+    return {"role": "user", "content": content}
+
+
+def is_context_message(message: dict) -> bool:
+    """True if a transcript message is a composed project-context message (D25), so
+    the bridge can strip a stale copy before prepending a fresh one."""
+    content = message.get("content")
+    return isinstance(content, str) and content.startswith(CONTEXT_MARKER)
+
+
 def _seed_docs(title: str, namespace: str) -> dict[str, str]:
     """The three canonical ``.lea/*.md`` docs seeded into a fresh project. Plain
     markdown with a format-reminder comment; agent + human co-author them after

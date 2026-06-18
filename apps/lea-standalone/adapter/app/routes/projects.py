@@ -31,6 +31,10 @@ class ProjectUpdate(BaseModel):
     description: str | None = None
 
 
+class SessionCreate(BaseModel):
+    title: str | None = None
+
+
 def _proofs_root() -> Path:
     """The git proofs root (`<lea_root>/workspace/proofs`) project repos live under.
     Mirrors how the session routes build their GitStore root."""
@@ -69,6 +73,19 @@ def update_project(project_id: str, request: ProjectUpdate) -> dict:
     if updated is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return updated
+
+
+@router.post("/api/projects/{project_id}/sessions", status_code=201)
+def create_session_in_project(project_id: str, request: SessionCreate) -> dict:
+    """Create a session that lives inside the project (D23). The session is tagged
+    with `project_id`; the run it later starts resolves the shared project repo +
+    namespace from that tag (the bridge does this, D24/D25). Proofs land in
+    `proofs/Lea/<Project>/` from turn 1, able to import sibling lemmas."""
+    project = store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    title = (request.title or "").strip() or "Untitled theorem"
+    return store.create_session(title, project_id=project_id)
 
 
 @router.delete("/api/projects/{project_id}")

@@ -71,6 +71,44 @@ def test_repo_for_session_loose_vs_in_project(tmp_path, monkeypatch):
     )
 
 
+def test_resolve_git_loose_vs_project(tmp_path, monkeypatch):
+    # D24: the resolver returns (GitStore, repo_key) so git ops hit the right repo —
+    # loose roots at proofs/ keyed by session id; project roots at proofs/Lea keyed
+    # by <Project> (the shared repo).
+    _init_db(tmp_path, monkeypatch)
+    proofs = tmp_path / "proofs"
+    project = projects.provision_project("Graphs", proofs)
+    loose = store.create_session("loose")
+    in_proj = store.create_session("in", project_id=project["id"])
+
+    gs_l, key_l = projects.resolve_git(loose["id"], proofs)
+    gs_p, key_p = projects.resolve_git(in_proj["id"], proofs)
+    assert gs_l.root == proofs and key_l == loose["id"]
+    assert gs_p.root == proofs / "Lea" and key_p == "Graphs"
+    assert projects.resolve_git("missing-session", proofs) is None
+
+
+def test_compose_context_message(tmp_path, monkeypatch):
+    # D25: one marked user message folding instructions + memory + blueprint + files.
+    _init_db(tmp_path, monkeypatch)
+    proofs = tmp_path / "proofs"
+    project = projects.provision_project("Eps", proofs)
+    repo = proofs / "Lea" / "Eps"
+    (repo / ".lea" / "instructions.md").write_text("# Instructions\nProve continuity.")
+    (repo / ".lea" / "files").mkdir()
+    (repo / ".lea" / "files" / "paper.txt").write_text("notes")
+
+    msg = projects.compose_context_message(project, repo)
+    assert msg["role"] == "user"
+    assert msg["content"].startswith(projects.CONTEXT_MARKER)
+    assert "Lea.Eps" in msg["content"]
+    assert "Prove continuity." in msg["content"]
+    assert "`.lea/files/paper.txt`" in msg["content"]  # inventory line
+    assert projects.is_context_message(msg) is True
+    assert projects.is_context_message({"role": "user", "content": "hi"}) is False
+    assert projects.compose_context_message(None, repo) is None
+
+
 def test_delete_project_removes_tree_and_cascades_rows(tmp_path, monkeypatch):
     _init_db(tmp_path, monkeypatch)
     proofs = tmp_path / "proofs"

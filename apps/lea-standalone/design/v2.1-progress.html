@@ -23,6 +23,11 @@
   .intro { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 13px 16px; margin: 18px 0 8px; font-size: 13px; color: #4a463f; }
   .intro b { color: var(--ink); }
+  .gaps { background: #fbf4e6; border: 1px solid #ecdcbb; border-left: 3px solid var(--amber);
+    border-radius: 10px; padding: 12px 16px; margin: 14px 0 26px; font-size: 12.5px; color: #5a4a2a; }
+  .gaps h3 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--amber); }
+  .gaps b { color: var(--ink); }
+  .gaps .fix { color: #7a6a44; }
   .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 18px 0 6px; }
   .bar > i { display: block; height: 100%; background: var(--green); }
   .counts { color: var(--muted); font-size: 12.5px; margin-bottom: 26px; }
@@ -79,8 +84,8 @@
     (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
   </div>
 
-  <div class="bar"><i style="width:24%"></i></div>
-  <div class="counts"><b>6 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · Slice 1 complete · Q1 done — prover is project-agnostic (project.py deleted; prompt namespace parameterized)</div>
+  <div class="bar"><i style="width:36%"></i></div>
+  <div class="counts"><b>9 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 2 complete</b> — proofs run inside a project &amp; chain sibling lemmas (Q1–Q3 · F3 confirmed live in the UI)</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -88,6 +93,21 @@
     <span><i class="dot d-prog"></i> Built (not yet confirmed)</span>
     <span><i class="dot d-tested"></i> Tested ✓</span>
     <span style="margin-left:auto"><span class="tag be">backend</span> &nbsp; <span class="tag fe">frontend</span></span>
+  </div>
+
+  <div class="gaps">
+    <h3>Known gaps · deferred (not blocking)</h3>
+    <b>SafeVerify can't audit a project proof that imports a sibling lemma.</b> A project
+    submission that does <code>import Lea.&lt;Project&gt;.Foo</code> fails SafeVerify with
+    <code>unknown module prefix 'Lea'</code>: <code>safe_verify</code> replays oleans inside its own
+    Lake project (<code>third_party/SafeVerify</code>), whose search path has only its packages +
+    Mathlib — not the main workspace's compiled <code>Lea.*</code> oleans
+    (<code>workspace/.lake/build/lib/lean</code>). Loose proofs (single file, Mathlib-only imports)
+    are unaffected; chaining proofs surfaced it (Q2/F3 testing). <span class="fix"><b>Fix
+    direction:</b> when the submission imports project modules, add the workspace build lib to
+    <code>safe_verify</code>'s <code>LEAN_PATH</code> (and ensure the sibling olean is built) in
+    <code>prover/lea/safeverify.py</code> → <code>verify_proof</code> (the <code>lake exe safe_verify</code>
+    invocation, <code>cwd=SAFE_VERIFY_DIR</code>).</span>
   </div>
 
   <!-- ============ SLICE 1 ============ -->
@@ -132,19 +152,19 @@
         <span class="tag be">backend</span><span class="dec">D32</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Delete <code>prover/lea/project.py</code> + the <code>project=</code> param of <code>run_events</code>; parameterize the prompt's hardcoded <code>Lea.Misc</code> workspace/namespace block so the adapter states the active namespace. Prover suite stays green.</div>
     </div>
-    <div class="todo is-planned">
+    <div class="todo is-done">
       <div class="top"><span class="id">Q2</span><span class="title">Create-session-in-project + context compose</span>
-        <span class="tag be">backend</span><span class="dec">D23/D24/D25/D33</span><span class="badge b-planned">Planned (next)</span></div>
+        <span class="tag be">backend</span><span class="dec">D23/D24/D25/D33</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope"><code>POST /api/projects/{id}/sessions</code> (working dir = project repo). Bridge resolves the project repo + composes & <b>prepends one context message</b> (instructions + memory + blueprint + file inventory); asset writes → "blueprint updated" graph signal, not canvas snapshots.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id">Q3</span><span class="title">Real project-run chaining smoke</span>
-        <span class="tag be">backend</span><span class="dec">D22/D23</span><span class="badge b-queued">Queued</span></div>
+        <span class="tag be">backend</span><span class="dec">D22/D23</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">End-to-end: a proof lands in <code>proofs/Lea/&lt;Project&gt;/</code> and <code>import</code>s/uses an already-proved sibling lemma. Confirms the chaining requirement that dictated the layout.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id fe">F3</span><span class="title">Overview tab: composer + sessions list</span>
-        <span class="tag fe">frontend</span><span class="dec">D37</span><span class="badge b-queued">Queued</span></div>
+        <span class="tag fe">frontend</span><span class="dec">D37</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Overview tab body: "new proof in this project" composer (→ create-session-in-project) + the project's <b>sessions list</b> (title · fully-qualified lemma · status dot · time). Opening a row loads the normal Chat+Canvas, scoped to the project (reuses the v2 run stack unchanged).</div>
     </div>
   </div>
@@ -154,9 +174,9 @@
     <h2>Slice 3 · Instructions &amp; Memory</h2>
     <div class="ghint">The two user-facing <code>.lea/*.md</code> docs. Ends with: editable Instructions &amp; Memory rail cards that the agent reads (and writes, for Memory).</div>
 
-    <div class="todo">
+    <div class="todo is-planned">
       <div class="top"><span class="id">R1</span><span class="title">Instructions = <code>.lea/instructions.md</code></span>
-        <span class="tag be">backend</span><span class="dec">D25</span><span class="badge b-queued">Queued</span></div>
+        <span class="tag be">backend</span><span class="dec">D25</span><span class="badge b-planned">Planned (next)</span></div>
       <div class="scope"><code>GET/PUT /api/projects/{id}/instructions</code> (raw md, user-authored, write+commit) + injection into the composed run context.</div>
     </div>
     <div class="todo">

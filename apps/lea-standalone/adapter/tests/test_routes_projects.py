@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from app import db, store
 from app.config import LeaConfig
 from app.routes import projects as projects_route
-from app.routes.projects import ProjectCreate, ProjectUpdate
+from app.routes.projects import ProjectCreate, ProjectUpdate, SessionCreate
 
 
 def _setup(tmp_path, monkeypatch):
@@ -53,6 +53,25 @@ def test_detail_includes_project_sessions(tmp_path, monkeypatch):
     detail = projects_route.get_project(project["id"])
     assert [s["id"] for s in detail["sessions"]] == [sess["id"]]
     assert projects_route.list_projects()["projects"][0]["session_count"] == 1
+
+
+def test_create_session_in_project(tmp_path, monkeypatch):
+    # D23: a session created inside a project is tagged with project_id and appears
+    # in the project's session list.
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Topology"))
+
+    sess = projects_route.create_session_in_project(project["id"], SessionCreate(title="lemma A"))
+    assert sess["project_id"] == project["id"]
+    assert sess["title"] == "lemma A"
+    assert [s["id"] for s in projects_route.get_project(project["id"])["sessions"]] == [sess["id"]]
+
+    # blank title falls back; missing project → 404
+    fallback = projects_route.create_session_in_project(project["id"], SessionCreate())
+    assert fallback["title"] == "Untitled theorem"
+    with pytest.raises(HTTPException) as exc:
+        projects_route.create_session_in_project("nope", SessionCreate(title="x"))
+    assert exc.value.status_code == 404
 
 
 def test_update_edits_title_and_description(tmp_path, monkeypatch):

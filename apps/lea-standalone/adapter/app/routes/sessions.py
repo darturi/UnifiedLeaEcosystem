@@ -21,8 +21,7 @@ from pydantic import BaseModel
 from lea.interface import check as interface_check, verify as interface_verify
 
 from ..config import load_config
-from ..gitstore import GitStore
-from .. import store
+from .. import projects, store
 
 router = APIRouter()
 logger = logging.getLogger("lea-interface.sessions")
@@ -112,18 +111,21 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     if not request.path:
         raise HTTPException(status_code=400, detail="path is required")
 
-    gs = GitStore(config.lea_root / "workspace" / "proofs")
-    repo = gs.init_session(session_id)
+    resolved = projects.resolve_git(session_id, config.lea_root / "workspace" / "proofs")
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    gs, repo_key = resolved  # D24: project session → the shared repo; loose → its own
+    repo = gs.init_session(repo_key)
     abs_path = (repo / request.path).resolve()
     try:
         abs_path.relative_to(repo.resolve())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="path escapes the session directory") from exc
 
-    before = gs.head(session_id)
+    before = gs.head(repo_key)
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(request.content)
-    sha = gs.commit_write(session_id, turn=None, author="user", tool="edit")
+    sha = gs.commit_write(repo_key, turn=None, author="user", tool="edit")
     if sha == before:
         return {"unchanged": True, "code_step": None, "note": None}
 
@@ -173,7 +175,11 @@ def _resolve_proof_path(session_id: str, path: str | None) -> tuple[str, str]:
     rel = path or _latest_proof_path(session_id)
     if not rel:
         raise HTTPException(status_code=404, detail="No proof file in this session yet")
-    repo = GitStore(config.lea_root / "workspace" / "proofs").session_repo(session_id)
+    resolved = projects.resolve_git(session_id, config.lea_root / "workspace" / "proofs")
+    if resolved is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    gs, repo_key = resolved
+    repo = gs.session_repo(repo_key)
     return str(repo / rel), rel
 
 
@@ -189,14 +195,17 @@ def _hydrate_code(session_id: str, code_steps: list[dict]) -> None:
     lea_root = config.lea_root
     if lea_root is None:
         return
-    gs = GitStore(lea_root / "workspace" / "proofs")
+    resolved = projects.resolve_git(session_id, lea_root / "workspace" / "proofs")
+    if resolved is None:
+        return
+    gs, repo_key = resolved
     for step in code_steps:
         sha, path = step.get("commit_sha"), step.get("path")
         if not sha or not path:
             step["code"] = ""
             continue
         try:
-            step["code"] = gs.snapshot(session_id, sha, path)
+            step["code"] = gs.snapshot(repo_key, sha, path)
         except Exception:  # noqa: BLE001 — a missing repo/blob shouldn't 500 the read
             logger.debug("Could not hydrate code for %s @ %s:%s", session_id, sha, path, exc_info=True)
             step["code"] = ""

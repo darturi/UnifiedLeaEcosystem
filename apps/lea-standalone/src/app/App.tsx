@@ -23,6 +23,7 @@ import {
   type SessionDetail,
   type StatusEvent,
   createRun,
+  createSessionInProject,
   getSession,
   interruptRun,
   leanCheckSession,
@@ -192,6 +193,39 @@ export default function App() {
     setView('main');
   };
 
+  // F3: start a proof inside the open project — create a project session (working
+  // dir = the project repo, server-side), then run it like a normal submit and drop
+  // the user into Chat+Canvas. The project stays selected (sidebar highlight).
+  const handleStartProjectProof = async (message: string) => {
+    const content = message.trim();
+    if (!content || !currentProject) return;
+    const projectId = currentProject.id;
+    setError(undefined);
+    try {
+      const session = await createSessionInProject(projectId, content.slice(0, 120));
+      resetForNewSession(); // clear the proof view for the fresh session
+      const run = await createRun(content, session.id);
+      setSelectedSessionId(run.session_id);
+      setCurrentRunId(run.run_id);
+      setRunStatus('running');
+      setRunStatusById((prev) => ({ ...prev, [run.run_id]: 'running' }));
+      setIsRunning(true);
+      setMessages([run.message]);
+      window.localStorage.setItem(SELECTED_SESSION_KEY, run.session_id);
+      setView('main');
+      await refreshSessions();
+      attachStream(run.run_id, run.session_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to start the proof.');
+    }
+  };
+
+  // F3: open an existing project session into the normal Chat+Canvas view.
+  const handleOpenProjectSession = (sessionId: string) => {
+    setView('main');
+    loadSession(sessionId).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+
   const resetForNewSession = () => {
     closeStream();
     setSelectedSessionId(undefined);
@@ -285,7 +319,14 @@ export default function App() {
   };
 
   if (view === 'project' && currentProject)
-    return <ProjectWindow project={currentProject} onBack={leaveProject} />;
+    return (
+      <ProjectWindow
+        project={currentProject}
+        onBack={leaveProject}
+        onStartProof={handleStartProjectProof}
+        onOpenSession={handleOpenProjectSession}
+      />
+    );
   if (view === 'stats') return <StatsPage onBack={() => setView('main')} />;
   if (view === 'settings')
     return (

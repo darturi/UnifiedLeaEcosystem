@@ -50,7 +50,7 @@ from lea.interface import (
 
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import store
+from . import projects, store
 
 logger = logging.getLogger("lea-interface.bridge")
 
@@ -169,7 +169,6 @@ class RunnerContext:
     task: str
     config: LeaConfig
     events: Queue[dict[str, Any]]
-    project: dict[str, Any] | None = None
     # Autonomous (D19): no approval gate + the non-interactive `default` prompt
     # variant, so the run formalizes with zero human interaction (Overleaf path).
     autonomous: bool = False
@@ -192,16 +191,19 @@ _FINISH_STATUS = {
 }
 
 
-def _divergence_context(session_id: str, gs: GitStore) -> str | None:
+def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | None:
     """Diff-on-divergence (D12): if the human edited the proof since the agent last
     acted, return a context block (the `git diff` + any edit notes) to fold into the
     next run's task — so the agent sees and acknowledges the changes (D13). None
-    when nothing diverged (cold start, or no edits since the agent's last write)."""
+    when nothing diverged (cold start, or no edits since the agent's last write).
+
+    The DB lookup keys on the real ``session_id``; the git diff keys on ``repo_key``
+    (the resolved repo's dir name — D24), so a project session diffs its shared repo."""
     agent_step = store.latest_agent_code_step(session_id)
     if not agent_step:
         return None
     try:
-        diff = gs.diff(session_id, agent_step["commit_sha"], "HEAD")
+        diff = gs.diff(repo_key, agent_step["commit_sha"], "HEAD")
     except GitStoreError:
         return None
     if not diff.strip():
@@ -301,8 +303,23 @@ def run_lea(context: RunnerContext) -> None:
     stop_event = _stop_events.setdefault(run_id, Event())
 
     lea_root = cfg.lea_root or (Path(__file__).resolve().parents[2] / "prover")
-    gs = GitStore(Path(lea_root) / "workspace" / "proofs")
-    repo = gs.init_session(session_id)
+    proofs_root = Path(lea_root) / "workspace" / "proofs"
+    # Resolve the session's repo (D24): a project session writes the shared
+    # proofs/Lea/<Project> repo; a loose session its own proofs/<session-id>. Root
+    # the GitStore at the repo's parent and key by its dir name, so every
+    # session-keyed primitive below operates on the right repo unchanged. The real
+    # session_id still keys all DB rows.
+    session = store.get_session(session_id)
+    project = (
+        store.get_project(session["project_id"])
+        if session and session.get("project_id") else None
+    )
+    repo = projects.repo_for_session(session or {"id": session_id}, proofs_root, project)
+    gs = GitStore(repo.parent)
+    repo_key = repo.name
+    gs.init_repo(repo)  # idempotent; a project repo already exists from provisioning
+    # Project namespace for the prompt (D32): None → the default Lea.Misc block.
+    namespace = project["namespace"] if project else None
 
     narration: list[str] = []
     current_turn = 0
@@ -312,6 +329,11 @@ def run_lea(context: RunnerContext) -> None:
     # write is trying to do" on the step card (M11).
     last_intent: str | None = None
     step_id_by_path: dict[str, str] = {}
+    # The path of the most recent write_file/edit_file, captured at ToolCalled so the
+    # ToolResulted handler can tell a project asset write (.lea/*.md) from a .lean
+    # proof write (D33): the latter is a canvas snapshot via FileChanged; the former
+    # is committed quietly and refreshes the project graph, never the canvas.
+    last_write_path: str | None = None
     usage = _UsageByTurn()
     last_persisted: str | None = None
     final_status = "failed"
@@ -341,18 +363,25 @@ def run_lea(context: RunnerContext) -> None:
         # the agent last acted, prepend their diff (+ notes) to the task so the agent
         # works from the current canvas, not its stale memory.
         task_content = context.task
-        divergence = _divergence_context(session_id, gs)
+        divergence = _divergence_context(session_id, repo_key, gs)
         if divergence:
             task_content = f"{divergence}\n\n{context.task}"
-        messages = prior + [{"role": "user", "content": task_content}]
+        # Project context (D25): prepend ONE composed message (instructions + memory +
+        # blueprint + file inventory). Strip any stale copy from the replayed
+        # transcript first, so exactly one — always current — leads the messages.
+        # Loose runs: ctx is None and this is a no-op.
+        ctx = projects.compose_context_message(project, repo) if project else None
+        if ctx:
+            prior = [m for m in prior if not projects.is_context_message(m)]
+        messages = ([ctx] if ctx else []) + prior + [{"role": "user", "content": task_content}]
 
         # Drive the generator manually (not `for`): the per-tool gate (D19) is a
         # two-way exchange — the prover yields ToolApprovalRequested and we feed the
         # human's decision back via gen.send(). A plain for-loop can't send.
         # Autonomous (D19): gate=None → no tool ever pauses for human approval, so
         # the run is fully unattended. Interactive UI runs keep the per-tool gate.
-        gen = run_events(cfg, messages, session_id=session_id, working_dir=str(repo),
-                         should_stop=stop_event.is_set,
+        gen = run_events(cfg, messages, namespace=namespace, session_id=session_id,
+                         working_dir=str(repo), should_stop=stop_event.is_set,
                          gate=(None if context.autonomous else _make_gate(session_id)))
         to_send = None
         while True:
@@ -383,17 +412,18 @@ def run_lea(context: RunnerContext) -> None:
                 if intent:
                     last_intent = intent if len(intent) <= 280 else None
                 last_tool = ev.name
+                last_write_path = ev.args.get("path") if ev.name in ("write_file", "edit_file") else None
                 emit(events, "status", {"status": "tool_call", "message": f"Running {ev.name}", "turn": current_turn})
 
             elif isinstance(ev, FileChanged):
                 rel = _relativize(ev.path, repo)
-                sha = gs.commit_write(session_id, turn=current_turn, author="agent", tool=last_tool or "write_file")
+                sha = gs.commit_write(repo_key, turn=current_turn, author="agent", tool=last_tool or "write_file")
                 step = store.add_code_step(
                     session_id, run_id, rel, commit_sha=sha, author="agent", turn=current_turn,
                     summary=last_intent,
                 )
                 step_id_by_path[rel] = step["id"]
-                emit(events, "code_step", {**step, "code": gs.snapshot(session_id, sha, rel)})
+                emit(events, "code_step", {**step, "code": gs.snapshot(repo_key, sha, rel)})
 
             elif isinstance(ev, CheckResult):
                 rel = _relativize(ev.path, repo)
@@ -402,7 +432,7 @@ def run_lea(context: RunnerContext) -> None:
                     updated = store.set_code_step_check(step_id, ev.status, ev.detail)
                     if updated:
                         emit(events, "code_step", {
-                            **updated, "code": gs.snapshot(session_id, updated["commit_sha"], rel),
+                            **updated, "code": gs.snapshot(repo_key, updated["commit_sha"], rel),
                         })
                 emit(events, "status", {
                     "status": "lean_check", "message": f"lean_check: {ev.status}",
@@ -413,7 +443,24 @@ def run_lea(context: RunnerContext) -> None:
                 usage.add(current_turn, ev.input_tokens, ev.output_tokens, ev.cost)
 
             elif isinstance(ev, ToolResulted):
-                pass  # display-only; the status chip + code steps already cover it
+                # A project asset write (D33): a non-.lean write_file/edit_file in a
+                # project (e.g. .lea/blueprint.md). The prover emits FileChanged only
+                # for .lean (A2), so this never became a canvas snapshot. Commit it
+                # quietly (git add -A covers any file) and emit a light graph-refresh
+                # signal — no code_step, no canvas pollution. .lean writes are handled
+                # by FileChanged above, so they're excluded here.
+                if (
+                    project
+                    and ev.name in ("write_file", "edit_file")
+                    and last_write_path
+                    and not str(last_write_path).endswith(".lean")
+                ):
+                    asset_rel = _relativize(last_write_path, repo)
+                    sha = gs.commit_all(repo, f"agent {ev.name}: {asset_rel}")
+                    emit(events, "project_updated", {
+                        "project_id": project["id"], "path": asset_rel, "commit_sha": sha,
+                    })
+                last_write_path = None
 
             elif isinstance(ev, Error):
                 emit(events, "run_error", {"message": ev.message})

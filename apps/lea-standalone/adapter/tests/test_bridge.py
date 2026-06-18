@@ -21,12 +21,13 @@ from lea.interface import (
     Finished,
     ToolApprovalRequested,
     ToolCalled,
+    ToolResulted,
     TurnStarted,
     UsageUpdated,
 )
 from lea.providers import Usage
 
-from app import bridge, db, store
+from app import bridge, db, projects, store
 from app.config import LeaConfig
 
 
@@ -54,7 +55,7 @@ def _fake_run_events(events):
     """Build a fake run_events that writes a file into working_dir then replays
     `events` (a callable taking the absolute proof path, returning the sequence)."""
 
-    def fake(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
         proof = Path(working_dir) / "Lea" / "Misc" / "proof.lean"
         proof.parent.mkdir(parents=True, exist_ok=True)
         proof.write_text("import Mathlib\n\ntheorem t : True := by trivial\n")
@@ -119,11 +120,75 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
     assert types[-1] == "done"
 
 
+def test_project_run_uses_shared_repo_namespace_and_context(tmp_path, monkeypatch):
+    # Q2 (D23/D24/D25/D32/D33): a project session writes the shared project repo, the
+    # prompt gets the project namespace, the composed context message leads the
+    # messages, and an asset write becomes a graph signal (not a canvas snapshot).
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    proofs_root = tmp_path / "workspace" / "proofs"
+    project = projects.provision_project("Epsilon", proofs_root, description="ε–δ")
+    session = store.create_session("prove foo", project_id=project["id"])
+    run = store.create_run(session["id"], "gemini/test", None, 3, project_id=project["id"])
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="prove foo", config=config, events=queue,
+    )
+    captured: dict = {}
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        captured["namespace"] = namespace
+        captured["working_dir"] = working_dir
+        captured["messages"] = list(messages)
+        # A proof written directly in the project dir (importable as Lea.Epsilon.Foo).
+        proof = Path(working_dir) / "Foo.lean"
+        proof.write_text("import Mathlib\nnamespace Lea.Epsilon\ntheorem foo : True := by trivial\nend Lea.Epsilon\n")
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": str(proof)})
+        yield FileChanged(str(proof))
+        yield CheckResult(str(proof), "ok", None)
+        # The agent also revises the blueprint — an asset write (D33).
+        bp = Path(working_dir) / ".lea" / "blueprint.md"
+        bp.write_text("# Blueprint — Epsilon\n\n## foo\n- kind: theorem\n- lean: `Lea.Epsilon.foo`\n")
+        yield ToolCalled("edit_file", {"path": str(bp)})
+        yield ToolResulted("edit_file", "ok", "ok")
+        yield Finished("completed", "Proved.", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    # D32/D24: the prompt namespace + working dir point at the project repo.
+    assert captured["namespace"] == "Lea.Epsilon"
+    assert captured["working_dir"].replace("\\", "/").endswith("/proofs/Lea/Epsilon")
+    # D25: the composed project-context message leads the messages.
+    first = captured["messages"][0]
+    assert first["content"].startswith(projects.CONTEXT_MARKER)
+    assert "## Project Instructions" in first["content"] and "Lea.Epsilon" in first["content"]
+
+    # D24: the proof committed to the SHARED project repo, not proofs/<session-id>.
+    detail = store.session_detail(session["id"])
+    steps = detail["code_steps"]
+    assert len(steps) == 1 and steps[0]["path"] == "Foo.lean"
+    assert not (proofs_root / session["id"]).exists()  # no loose per-session repo
+    gs = bridge.GitStore(proofs_root / "Lea")
+    assert "theorem foo" in gs.snapshot("Epsilon", steps[0]["commit_sha"], "Foo.lean")
+
+    # D33: the asset write emitted a project_updated signal and NO extra code_step.
+    events = _drain(queue)
+    updated = [e for e in events if e["type"] == "project_updated"]
+    assert len(updated) == 1
+    assert updated[0]["payload"]["path"] == ".lea/blueprint.md"
+    assert updated[0]["payload"]["project_id"] == project["id"]
+    assert sum(1 for e in events if e["type"] == "code_step") == 2  # proof write + verdict only
+
+
 def _policy_recording_fake(received: dict):
     """A fake run_events that records the prompt_variant + gate it was handed,
     then finishes cleanly. Lets us assert the autonomous policy without a model."""
 
-    def fake(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
         received["prompt_variant"] = config.prompt_variant
         received["gate"] = gate
         yield TurnStarted(1)
@@ -180,7 +245,7 @@ def test_interactive_run_keeps_gate_and_config_variant(tmp_path, monkeypatch):
 def test_done_emitted_and_run_failed_on_exception(tmp_path, monkeypatch):
     ctx, queue = _context(tmp_path, monkeypatch)
 
-    def boom(config, messages, *, session_id=None, working_dir=None, gate=None):
+    def boom(config, messages, *, namespace=None, session_id=None, working_dir=None, gate=None):
         yield TurnStarted(1)
         raise RuntimeError("model exploded")
 
@@ -200,7 +265,7 @@ def _recording_fake(received: list, transcript_messages: list):
     """A fake run_events that records the `messages` it was handed, then Finishes
     with a given transcript (so the bridge persists it for the next activation)."""
 
-    def fake(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
         received.append(messages)
         yield TurnStarted(1)
         yield Finished("completed", "done", 1, session_id, "gemini/test",
@@ -261,7 +326,7 @@ def test_followup_replays_prior_transcript(tmp_path, monkeypatch):
 def test_interrupt_maps_finished_interrupted_to_cancelled(tmp_path, monkeypatch):
     ctx, queue = _context(tmp_path, monkeypatch)
 
-    def interrupted(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+    def interrupted(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
         yield TurnStarted(1)
         yield Finished("interrupted", "Run interrupted by the user.", 1, session_id,
                        "gemini/test", Usage(input_tokens=2, output_tokens=1), 0.0, {"messages": []})
@@ -280,7 +345,7 @@ def test_request_stop_flag_reaches_the_run(tmp_path, monkeypatch):
     # Stop was hit before the run loop got going — the endpoint pre-set the flag.
     bridge.request_stop(ctx.run_id)
 
-    def stops_when_asked(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+    def stops_when_asked(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
         # the agent honors should_stop at its turn boundary
         if should_stop():
             yield Finished("interrupted", "stopped", 0, session_id, "gemini/test",
@@ -327,7 +392,7 @@ def test_resolve_approval_matches_and_rejects_stale():
 def _gated_fake(received: dict, decision_sink: str = "decision"):
     """A fake run_events that gates one bash call, records the decision it gets
     back, then Finishes."""
-    def fake(config, messages, *, session_id=None, working_dir=None, should_stop=None, gate=None):
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
         received[decision_sink] = yield ToolApprovalRequested("bash", {"command": "ls"})
         yield Finished("completed", "done", 1, session_id, "gemini/test",
                        Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
