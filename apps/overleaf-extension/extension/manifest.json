@@ -14,6 +14,11 @@
       "js": ["content.js"],
       "css": ["content.css"],
       "run_at": "document_start"
+    },
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*"],
+      "js": ["uiBridge.js"],
+      "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [

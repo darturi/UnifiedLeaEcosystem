@@ -89,6 +89,60 @@ test("runApiProofJob: success done → ok with usage read back from the run row"
   assert.ok(progress.some((p) => p.currentTurn === 1));
 });
 
+test("runApiProofJob: forwards origin/origin_url + project tags to POST /api/runs", async () => {
+  let postBody = null;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      postBody = JSON.parse(options.body);
+      return jsonResponse({ session_id: "sess-o", run_id: "run-o" });
+    }
+    if (url.includes("/api/runs/run-o/events")) {
+      return sseResponse([frame("done", { status: "success" })]);
+    }
+    if (url.includes("/api/sessions/sess-o")) {
+      return jsonResponse({ runs: [{ id: "run-o", input_tokens: 0, output_tokens: 0, cost_usd: 0 }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize foo",
+    timeoutMs: 5000,
+    projectSlug: "doc-a",
+    projectTitle: "Doc A",
+    origin: "overleaf",
+    originUrl: "https://www.overleaf.com/project/doc-a",
+  });
+
+  assert.equal(postBody.origin, "overleaf");
+  assert.equal(postBody.origin_url, "https://www.overleaf.com/project/doc-a");
+  assert.equal(postBody.project_slug, "doc-a");
+});
+
+test("runApiProofJob: omits origin fields when not provided (interactive parity)", async () => {
+  let postBody = null;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      postBody = JSON.parse(options.body);
+      return jsonResponse({ session_id: "sess-n", run_id: "run-n" });
+    }
+    if (url.includes("/api/runs/run-n/events")) {
+      return sseResponse([frame("done", { status: "success" })]);
+    }
+    if (url.includes("/api/sessions/sess-n")) {
+      return jsonResponse({ runs: [] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  await runApiProofJob({ fetchImpl, baseUrl: "http://127.0.0.1:8001", message: "go", timeoutMs: 5000 });
+
+  assert.equal("origin" in postBody, false);
+  assert.equal("origin_url" in postBody, false);
+});
+
 test("runApiProofJob: auto-approves a gated tool call so the run stays autonomous", async () => {
   const approvalCalls = [];
   const fetchImpl = async (url, options = {}) => {

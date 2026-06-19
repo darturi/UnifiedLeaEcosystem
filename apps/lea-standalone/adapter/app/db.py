@@ -39,6 +39,15 @@ def init_db() -> None:
                 project_id text references projects(id),
                 title text not null,
                 api_session_id text,
+                -- Session origin / providence (P-origin): where this formalization was
+                -- spawned from. 'ui' = the interactive Lea UI (default); 'overleaf' =
+                -- the Overleaf extension. `origin_url` is the canonical Overleaf
+                -- document URL for an Overleaf-originated session (NULL otherwise), so
+                -- the UI can open/focus the source document. Deliberately stored on the
+                -- session — NOT on `projects` — so it stays independent of the future
+                -- projects feature that owns that table.
+                origin text not null default 'ui',
+                origin_url text,
                 created_at text not null,
                 updated_at text not null
             );

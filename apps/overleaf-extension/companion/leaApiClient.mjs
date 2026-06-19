@@ -157,7 +157,7 @@ export function fetchAdapterUsageStats({ fetchImpl, baseUrl }) {
   });
 }
 
-export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null }) {
+export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, origin = null, originUrl = null }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
   // end-to-end with zero human interaction. (The client also auto-resolves any
@@ -168,12 +168,18 @@ export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, session
   // the adapter tags the session+run with a project of that slug, so the popover's
   // "This project" usage can be summed per document. Omitted for the interactive
   // UI path, which stays project-less.
+  //
+  // `origin` / `originUrl` record session providence: 'overleaf' + the canonical
+  // Overleaf document URL, so the Lea UI can show an origin indicator and open/focus
+  // the source document. Independent of the project usage-namespace above.
   const body = { message, autonomous };
   if (sessionId) body.session_id = sessionId;
   if (projectSlug) {
     body.project_slug = projectSlug;
     body.project_title = projectTitle || projectSlug;
   }
+  if (origin) body.origin = origin;
+  if (originUrl) body.origin_url = originUrl;
   return fetchJson(fetchImpl, `${baseUrl}/api/runs`, {
     method: "POST",
     headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -314,6 +320,8 @@ export async function runApiProofJob({
   autonomous = true,
   projectSlug = null,
   projectTitle = null,
+  origin = null,
+  originUrl = null,
   appendLog = null,
   logPath = null,
   onRunStarted = null,
@@ -323,7 +331,7 @@ export async function runApiProofJob({
     if (appendLog && logPath) await appendLog(logPath, line);
   };
 
-  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle });
+  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle, origin, originUrl });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
   const runId = start.body?.run_id;

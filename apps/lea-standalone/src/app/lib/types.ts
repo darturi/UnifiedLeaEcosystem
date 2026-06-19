@@ -36,6 +36,11 @@ export interface SessionSummary {
   project_id?: string | null;
   title: string;
   status: SessionStatus;
+  // Session origin / providence: 'ui' = interactive Lea UI (default), 'overleaf' =
+  // spawned from the Overleaf extension. `origin_url` is the canonical Overleaf
+  // document URL for an Overleaf-originated session (used to open/focus the source).
+  origin?: 'ui' | 'overleaf' | string;
+  origin_url?: string | null;
   created_at: string;
   updated_at: string;
   started_at?: string | null;

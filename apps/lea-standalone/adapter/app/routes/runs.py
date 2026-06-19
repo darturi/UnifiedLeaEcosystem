@@ -35,6 +35,13 @@ class RunRequest(BaseModel):
     # the interactive UI path, which stays project-less.
     project_slug: str | None = None
     project_title: str | None = None
+    # Session origin / providence. 'overleaf' (with `origin_url` = the canonical
+    # Overleaf document URL) marks a formalization spawned from the Overleaf
+    # extension, so the UI can show an origin indicator and open/focus the source
+    # document. Omitted for the interactive UI path → the session defaults to 'ui'.
+    # Independent of `project_slug` (usage namespacing) by design.
+    origin: str | None = None
+    origin_url: str | None = None
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -81,7 +88,12 @@ def create_run(request: RunRequest) -> dict:
         if project_id is None and session.get("project_id"):
             project_id = session["project_id"]
     else:
-        session = store.create_session(message, project_id=project_id)
+        session = store.create_session(
+            message,
+            project_id=project_id,
+            origin=(request.origin or "ui"),
+            origin_url=request.origin_url,
+        )
 
     run = store.create_run(session["id"], config.model, None, config.max_turns,
                            project_id=project_id, autonomous=request.autonomous)
