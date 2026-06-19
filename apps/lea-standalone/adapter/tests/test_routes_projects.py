@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from app import db, store
 from app.config import LeaConfig
 from app.routes import projects as projects_route
-from app.routes.projects import ProjectCreate, ProjectUpdate, SessionCreate
+from app.routes.projects import DocUpdate, ProjectCreate, ProjectUpdate, SessionCreate
 
 
 def _setup(tmp_path, monkeypatch):
@@ -104,7 +104,47 @@ def test_missing_project_is_404(tmp_path, monkeypatch):
         lambda: projects_route.get_project("nope"),
         lambda: projects_route.update_project("nope", ProjectUpdate(title="x")),
         lambda: projects_route.delete_project("nope"),
+        lambda: projects_route.get_instructions("nope"),
+        lambda: projects_route.put_instructions("nope", DocUpdate(content="x")),
+        lambda: projects_route.get_memory("nope"),
+        lambda: projects_route.put_memory("nope", DocUpdate(content="x")),
     ):
         with pytest.raises(HTTPException) as exc:
             call()
         assert exc.value.status_code == 404
+
+
+@pytest.mark.parametrize("doc", ["instructions", "memory"])
+def test_doc_get_returns_seeded_then_roundtrips_put(tmp_path, monkeypatch, doc):
+    # R1/R2: GET returns the seeded template; PUT writes+commits; GET returns the
+    # new content; and the composed run context reflects the edit.
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    get = getattr(projects_route, f"get_{doc}")
+    put = getattr(projects_route, f"put_{doc}")
+
+    seeded = get(project["id"])["content"]
+    assert doc[:4].lower() in seeded.lower()  # "inst"/"memo" header present
+
+    result = put(project["id"], DocUpdate(content="# Edited\n\n- a durable fact\n"))
+    assert result["content"].startswith("# Edited")
+    assert len(result["commit_sha"]) == 40  # a real commit landed
+
+    assert get(project["id"])["content"] == "# Edited\n\n- a durable fact\n"
+    on_disk = proofs / "Lea" / "Analysis" / ".lea" / f"{doc}.md"
+    assert on_disk.read_text() == "# Edited\n\n- a durable fact\n"
+
+
+def test_put_doc_feeds_composed_context(tmp_path, monkeypatch):
+    # The edited Instructions/Memory must show up in the next run's context (D25/D26).
+    from app import projects as project_service
+
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    projects_route.put_instructions(project["id"], DocUpdate(content="Prove √2 is irrational."))
+    projects_route.put_memory(project["id"], DocUpdate(content="- explicit witnesses preferred"))
+
+    repo = proofs / "Lea" / "Analysis"
+    msg = project_service.compose_context_message(store.get_project(project["id"]), repo)
+    assert "Prove √2 is irrational." in msg["content"]
+    assert "explicit witnesses preferred" in msg["content"]

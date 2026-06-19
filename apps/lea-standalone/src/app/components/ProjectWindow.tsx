@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ChevronLeft } from 'lucide-react';
 import type { ProjectDetail } from '../lib/api';
+import { MarkdownDoc } from './MarkdownDoc';
 
 type Tab = 'overview' | 'blueprint' | 'filesystem';
 
@@ -29,6 +30,9 @@ export function ProjectWindow({
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const sessions = project.sessions ?? [];
+  // Memory is agent-written: a run advances its session's `updated_at`, so when the
+  // project detail is re-fetched the Memory card re-loads memory.md (F4/D39).
+  const docSignal = sessions.reduce((max, s) => Math.max(max, Date.parse(s.updated_at) || 0), 0);
 
   const submit = async () => {
     const message = draft.trim();
@@ -74,6 +78,7 @@ export function ProjectWindow({
 
       <div className="pw-body">
         {tab === 'overview' ? (
+          <div className="pw-overview-grid">
           <div className="pw-overview">
             <div className="pw-composer">
               <div className="pw-sec-label">New proof in this project</div>
@@ -113,6 +118,27 @@ export function ProjectWindow({
                 ))}
               </ul>
             )}
+          </div>
+
+          <aside className="pw-rail">
+            <MarkdownDoc
+              projectId={project.id}
+              doc="instructions"
+              title="Instructions"
+              icon="📋"
+              refreshSignal={docSignal}
+              emptyHint="No instructions yet — add your project's goal and any conventions so Lea follows them on every run."
+            />
+            <MarkdownDoc
+              projectId={project.id}
+              doc="memory"
+              title="Memory"
+              icon="🧠"
+              agentWritten
+              refreshSignal={docSignal}
+              emptyHint="No memory for this project yet — jot down facts, witnesses, and dead ends here; Lea reads it and adds to it as it works."
+            />
+          </aside>
           </div>
         ) : (
           <div className="pw-empty">

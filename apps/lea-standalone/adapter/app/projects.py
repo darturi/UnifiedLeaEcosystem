@@ -116,6 +116,16 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         f"project by importing them. The following is standing project context.\n\n"
         f"## Project Instructions\n{instructions}\n\n"
         f"## Project Memory\n{memory}\n\n"
+        f"**Maintaining this memory is part of your job.** `.lea/memory.md` (in your "
+        f"working directory) is a durable, bulleted record that persists across runs "
+        f"and is shown to you at the start of every run. Keep it current with "
+        f"`edit_file` — append a new bullet, never discard existing notes — whenever:\n"
+        f"- the user states a preference or instruction (e.g. \"prefer short proofs\", "
+        f"\"explain each step\", \"avoid `simp` here\") — record it verbatim as a rule to follow,\n"
+        f"- you find a lemma, tactic, or witness worth reusing in this project,\n"
+        f"- an approach fails in a way worth not repeating.\n"
+        f"Do this proactively, the moment it happens — don't wait to be asked, and "
+        f"don't only mention it in chat. One short bullet per entry.\n\n"
         f"## Blueprint (planned decomposition)\n{blueprint}\n\n"
         f"## Project files\n{inventory}"
     )
@@ -129,6 +139,39 @@ def is_context_message(message: dict) -> bool:
     return isinstance(content, str) and content.startswith(CONTEXT_MARKER)
 
 
+# The user/agent-editable `.lea/*.md` docs exposed over GET/PUT (D25/D26). A fixed
+# whitelist so a doc name can never escape `.lea/` or address an arbitrary path.
+# (Blueprint joins this in T1.)
+EDITABLE_DOCS = {"instructions.md", "memory.md"}
+
+
+def read_doc(project: dict, proofs_root: Path, name: str) -> str:
+    """The raw text of a project's ``.lea/<name>`` doc (D25/D26) — un-stripped so the
+    editor shows the seeded template verbatim. Missing file → ``""`` (a fresh, never-
+    written doc). ``name`` must be in :data:`EDITABLE_DOCS`."""
+    if name not in EDITABLE_DOCS:
+        raise ValueError(f"not an editable project doc: {name!r}")
+    path = project_repo_dir(project, proofs_root) / ".lea" / name
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
+def write_doc(project: dict, proofs_root: Path, name: str, content: str) -> str:
+    """Write a project's ``.lea/<name>`` doc and commit it (D8), returning the SHA.
+    The human-edit counterpart to the agent's ``write_file`` on the same files; both
+    land in the project repo and feed the composed context (D25). ``name`` must be in
+    :data:`EDITABLE_DOCS`."""
+    if name not in EDITABLE_DOCS:
+        raise ValueError(f"not an editable project doc: {name!r}")
+    repo = project_repo_dir(project, proofs_root)
+    lea_dir = repo / ".lea"
+    lea_dir.mkdir(parents=True, exist_ok=True)
+    (lea_dir / name).write_text(content)
+    return GitStore(proofs_root).commit_all(repo, f"edit .lea/{name}")
+
+
 def _seed_docs(title: str, namespace: str) -> dict[str, str]:
     """The three canonical ``.lea/*.md`` docs seeded into a fresh project. Plain
     markdown with a format-reminder comment; agent + human co-author them after
@@ -136,15 +179,13 @@ def _seed_docs(title: str, namespace: str) -> dict[str, str]:
     return {
         "instructions.md": (
             f"# Instructions — {title}\n\n"
-            "<!-- Your project goal + rules for Lea. The agent reads this every run; "
-            "edit it in the project window. Describe what you want proved and any "
-            "conventions to follow. -->\n\n"
-            "Describe this project's goal here.\n"
+            "Your project goal and any rules for Lea. The agent reads this on every "
+            "run, so describe what you want proved and the conventions to follow.\n"
         ),
         "memory.md": (
             f"# Memory — {title}\n\n"
-            "<!-- Durable facts, learnings, and preferences. Both you and Lea append "
-            "here: what worked, what failed, witnesses to prefer, dead ends to avoid. -->\n"
+            "Durable facts, learnings, and preferences. Both you and Lea append here — "
+            "what worked, what failed, witnesses to prefer, dead ends to avoid.\n"
         ),
         "blueprint.md": (
             f"# Blueprint — {title}\n\n"

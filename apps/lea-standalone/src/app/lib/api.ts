@@ -153,6 +153,41 @@ export async function createSessionInProject(projectId: string, title?: string):
   return response.json();
 }
 
+// ── Project docs: Instructions & Memory (.lea/*.md, R1/R2) ─────────────────────
+// One pair of calls backs both rail editors (D39). `doc` is the route segment
+// ('instructions' | 'memory'); content is raw markdown in/out.
+export type ProjectDocName = 'instructions' | 'memory';
+
+export async function getProjectDoc(projectId: string, doc: ProjectDocName): Promise<string> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/${doc}`,
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to load ${doc}: ${response.statusText}`));
+  }
+  const data = await response.json();
+  return typeof data.content === 'string' ? data.content : '';
+}
+
+export async function putProjectDoc(
+  projectId: string,
+  doc: ProjectDocName,
+  content: string,
+): Promise<{ content: string; commit_sha?: string }> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/${doc}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to save ${doc}: ${response.statusText}`));
+  }
+  return response.json();
+}
+
 // ── Writeable canvas + manual checks (F5 wires the UI to these) ────────────────
 export interface FileWriteResult {
   unchanged: boolean;

@@ -35,6 +35,10 @@ class SessionCreate(BaseModel):
     title: str | None = None
 
 
+class DocUpdate(BaseModel):
+    content: str
+
+
 def _proofs_root() -> Path:
     """The git proofs root (`<lea_root>/workspace/proofs`) project repos live under.
     Mirrors how the session routes build their GitStore root."""
@@ -86,6 +90,48 @@ def create_session_in_project(project_id: str, request: SessionCreate) -> dict:
         raise HTTPException(status_code=404, detail="Project not found")
     title = (request.title or "").strip() or "Untitled theorem"
     return store.create_session(title, project_id=project_id)
+
+
+# ── Instructions & Memory: the two user/agent-editable .lea/*.md docs (R1/R2) ────
+# Raw markdown in, raw markdown out. Instructions (D25) is user-authored; Memory
+# (D26) is co-authored — the agent also writes memory.md with its own write_file
+# during a run. Both GETs return the seeded template when never edited; both PUTs
+# write+commit and the new content feeds the next run's composed context.
+
+
+def _get_doc(project_id: str, name: str) -> dict:
+    project = store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"content": project_service.read_doc(project, _proofs_root(), name)}
+
+
+def _put_doc(project_id: str, name: str, content: str) -> dict:
+    project = store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    sha = project_service.write_doc(project, _proofs_root(), name, content)
+    return {"content": content, "commit_sha": sha}
+
+
+@router.get("/api/projects/{project_id}/instructions")
+def get_instructions(project_id: str) -> dict:
+    return _get_doc(project_id, "instructions.md")
+
+
+@router.put("/api/projects/{project_id}/instructions")
+def put_instructions(project_id: str, request: DocUpdate) -> dict:
+    return _put_doc(project_id, "instructions.md", request.content)
+
+
+@router.get("/api/projects/{project_id}/memory")
+def get_memory(project_id: str) -> dict:
+    return _get_doc(project_id, "memory.md")
+
+
+@router.put("/api/projects/{project_id}/memory")
+def put_memory(project_id: str, request: DocUpdate) -> dict:
+    return _put_doc(project_id, "memory.md", request.content)
 
 
 @router.delete("/api/projects/{project_id}")

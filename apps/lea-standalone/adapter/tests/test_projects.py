@@ -104,6 +104,9 @@ def test_compose_context_message(tmp_path, monkeypatch):
     assert "Lea.Eps" in msg["content"]
     assert "Prove continuity." in msg["content"]
     assert "`.lea/files/paper.txt`" in msg["content"]  # inventory line
+    # D26: the agent is told, concretely, to keep memory.md current with edit_file.
+    assert ".lea/memory.md" in msg["content"]
+    assert "edit_file" in msg["content"]
     assert projects.is_context_message(msg) is True
     assert projects.is_context_message({"role": "user", "content": "hi"}) is False
     assert projects.compose_context_message(None, repo) is None
