@@ -227,10 +227,10 @@
     <h2>Slice 5 · Blueprint &amp; graph <span style="color:var(--accent)">— the centerpiece</span></h2>
     <div class="ghint">The lemma decomposition + the interactive dependency graph. Ends with: a graph (shape=kind, color=live status) you can click into the sessions that built each node.</div>
 
-    <div class="todo is-planned">
-      <div class="top"><span class="id">T1</span><span class="title">Blueprint format + parser + GET/PUT</span>
-        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-planned">Planned (next)</span></div>
-      <div class="scope"><code>.lea/blueprint.md</code> format (<code>## key</code> section + <code>kind</code>/<code>lean</code>/<code>uses</code> header lines + prose). Per-section line-scan parser → nodes + <code>uses</code> edges (no prose regex). <code>GET/PUT /blueprint</code>; context tells the agent the format + to keep it current.</div>
+    <div class="todo">
+      <div class="top"><span class="id">T1</span><span class="title">Blueprint format + parser + validator + GET/PUT</span>
+        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-prog">Built · tests green</span></div>
+      <div class="scope"><code>.lea/blueprint.md</code> format (<code>## key</code> section + <code>kind</code>/<code>lean</code>/<code>uses</code> header lines + prose). <b>Fence-aware</b> per-section line-scan parser (<code>app/blueprint.py</code>) → nodes + <code>uses</code> edges (no prose regex; a ```-fenced example never spawns a phantom node). A <b>validator returns advisory warnings</b> (duplicate keys · missing/unknown <code>kind</code> · dangling <code>uses</code> edge) — never blocks the save. <code>GET/PUT /blueprint</code> attach <code>warnings</code>; seed reworded (plain prose, no HTML comment); composed context tells the agent the exact format + to keep it current. <i>10 parser/validator unit tests + route round-trip; 155 adapter tests green.</i></div>
     </div>
     <div class="todo">
       <div class="top"><span class="id">T2</span><span class="title">Derived status + session attribution → <code>/graph</code></span>

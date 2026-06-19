@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..config import load_config
+from .. import blueprint as blueprint_doc
 from .. import projects as project_service
 from .. import store
 from .. import uploads
@@ -134,6 +135,27 @@ def get_memory(project_id: str) -> dict:
 @router.put("/api/projects/{project_id}/memory")
 def put_memory(project_id: str, request: DocUpdate) -> dict:
     return _put_doc(project_id, "memory.md", request.content)
+
+
+# ── Blueprint: the canonical .lea/blueprint.md decomposition (T1, D28) ────────────
+# Same raw-markdown GET/PUT as the other docs, but each response also carries the
+# parser's advisory `warnings` (duplicate keys, missing/unknown kind, dangling edges)
+# so the authoring view can flag structure problems without blocking the save. The
+# parsed graph (nodes + derived status) is a separate `/graph` endpoint in T2.
+
+
+@router.get("/api/projects/{project_id}/blueprint")
+def get_blueprint(project_id: str) -> dict:
+    project = _require_project(project_id)
+    content = project_service.read_doc(project, _proofs_root(), "blueprint.md")
+    return {"content": content, "warnings": blueprint_doc.validate(content)}
+
+
+@router.put("/api/projects/{project_id}/blueprint")
+def put_blueprint(project_id: str, request: DocUpdate) -> dict:
+    project = _require_project(project_id)
+    sha = project_service.write_doc(project, _proofs_root(), "blueprint.md", request.content)
+    return {"content": request.content, "commit_sha": sha, "warnings": blueprint_doc.validate(request.content)}
 
 
 # ── Files: upload / list / download / delete (S1/S2, D27) ────────────────────────

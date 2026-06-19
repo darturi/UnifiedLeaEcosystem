@@ -41,8 +41,8 @@ def test_provision_creates_repo_with_committed_seed_docs(tmp_path, monkeypatch):
     lea = repo / ".lea"
     for name in ("instructions.md", "memory.md", "blueprint.md"):
         assert (lea / name).is_file(), f"{name} should be seeded"
-    # The blueprint seed points the agent at the real namespace.
-    assert "Lea.Continuity.<decl>" in (lea / "blueprint.md").read_text()
+    # The blueprint seed points the agent at the real namespace (example decl).
+    assert "Lea.Continuity.continuous_sq" in (lea / "blueprint.md").read_text()
 
     # The seeds are committed (not just on disk): the working tree is clean.
     status = subprocess.run(

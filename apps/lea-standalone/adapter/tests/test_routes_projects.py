@@ -119,13 +119,15 @@ def test_missing_project_is_404(tmp_path, monkeypatch):
         lambda: projects_route.put_instructions("nope", DocUpdate(content="x")),
         lambda: projects_route.get_memory("nope"),
         lambda: projects_route.put_memory("nope", DocUpdate(content="x")),
+        lambda: projects_route.get_blueprint("nope"),
+        lambda: projects_route.put_blueprint("nope", DocUpdate(content="x")),
     ):
         with pytest.raises(HTTPException) as exc:
             call()
         assert exc.value.status_code == 404
 
 
-@pytest.mark.parametrize("doc", ["instructions", "memory"])
+@pytest.mark.parametrize("doc", ["instructions", "memory", "blueprint"])
 def test_doc_get_returns_seeded_then_roundtrips_put(tmp_path, monkeypatch, doc):
     # R1/R2: GET returns the seeded template; PUT writes+commits; GET returns the
     # new content; and the composed run context reflects the edit.
@@ -186,6 +188,22 @@ def test_file_routes_404_on_missing_project_or_file(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as e3:
         projects_route.delete_file(pid, "no-such-file")
     assert e3.value.status_code == 404
+
+
+def test_blueprint_route_returns_validator_warnings(tmp_path, monkeypatch):
+    # T1: PUT/GET /blueprint attach advisory warnings (a dangling `uses` edge), but
+    # still save (warnings never block the write).
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+
+    bad = "## a\n- kind: lemma\n- uses: ghost\n\nstatement\n"
+    put = projects_route.put_blueprint(pid, DocUpdate(content=bad))
+    assert len(put["commit_sha"]) == 40  # the malformed blueprint still committed
+    assert any("ghost" in w["message"] for w in put["warnings"])
+
+    # The warning is recomputed on GET too, not just returned from the PUT.
+    assert any("ghost" in w["message"] for w in projects_route.get_blueprint(pid)["warnings"])
 
 
 def test_put_doc_feeds_composed_context(tmp_path, monkeypatch):

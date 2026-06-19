@@ -138,7 +138,22 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         f"- an approach fails in a way worth not repeating.\n"
         f"Do this proactively, the moment it happens — don't wait to be asked, and "
         f"don't only mention it in chat. One short bullet per entry.\n\n"
-        f"## Blueprint (planned decomposition)\n{blueprint}\n\n"
+        f"## Project Blueprint (the decomposition)\n{blueprint}\n\n"
+        f"`.lea/blueprint.md` (in your working directory) is the project's living proof "
+        f"plan — the dependency graph of its definitions and lemmas. **Keeping it current "
+        f"is part of your job:** with `edit_file`, add a `## <key>` section the moment you "
+        f"plan a new lemma, and fill in its `lean:` name once you've formalized the decl. "
+        f"One section per node, header then a one-line statement:\n"
+        f"```\n"
+        f"## continuous_sq\n"
+        f"- kind: lemma            (definition | lemma | theorem)\n"
+        f"- lean: `{namespace}.continuous_sq`   (the decl once named; omit until then)\n"
+        f"- uses: helper_key, other_key   (keys of the nodes this one depends on)\n"
+        f"\n"
+        f"One-line statement in prose or LaTeX.\n"
+        f"```\n"
+        f"The `uses` lines are the edges that chain the proof — point them at the keys of "
+        f"sibling nodes you build on, and reuse nodes already proved.\n\n"
         f"## Project files\n{inventory}"
     )
     return {"role": "user", "content": content}
@@ -153,8 +168,7 @@ def is_context_message(message: dict) -> bool:
 
 # The user/agent-editable `.lea/*.md` docs exposed over GET/PUT (D25/D26). A fixed
 # whitelist so a doc name can never escape `.lea/` or address an arbitrary path.
-# (Blueprint joins this in T1.)
-EDITABLE_DOCS = {"instructions.md", "memory.md"}
+EDITABLE_DOCS = {"instructions.md", "memory.md", "blueprint.md"}
 
 
 def read_doc(project: dict, proofs_root: Path, name: str) -> str:
@@ -201,11 +215,18 @@ def _seed_docs(title: str, namespace: str) -> dict[str, str]:
         ),
         "blueprint.md": (
             f"# Blueprint — {title}\n\n"
-            "<!-- The proof decomposition. One `## ` section per node, with header lines:\n"
-            "       - kind: definition | lemma | theorem\n"
-            f"       - lean: `{namespace}.<decl>`   (omit until the decl is named)\n"
-            "       - uses: other_node_keys, comma_separated\n"
-            "     then a prose statement. Lea co-authors this as it plans + formalizes. -->\n"
+            "The proof decomposition — one `## ` section per node. Lea co-authors this "
+            "as it plans and formalizes, and you can edit it too. Each node has a short "
+            "header then a prose statement:\n\n"
+            "```\n"
+            "## continuous_sq\n"
+            "- kind: lemma                # definition | lemma | theorem\n"
+            f"- lean: `{namespace}.continuous_sq`   # the Lean decl, once it exists\n"
+            "- uses: tendsto_iff_eps      # keys of the nodes this one depends on\n"
+            "\n"
+            "The function x ↦ x² is continuous in the ε–δ sense.\n"
+            "```\n\n"
+            "Add your first node below.\n"
         ),
     }
 
