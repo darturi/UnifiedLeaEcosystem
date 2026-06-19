@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -49,6 +49,16 @@ class DocUpdate(BaseModel):
 class FilePut(BaseModel):
     path: str
     content: str
+
+
+class MirrorFile(BaseModel):
+    path: str
+    content: str
+
+
+class MirrorRequest(BaseModel):
+    files: list[MirrorFile]
+    source: str = "overleaf"
 
 
 def _proofs_root() -> Path:
@@ -256,6 +266,27 @@ def _require_project(project_id: str) -> dict:
 def list_files(project_id: str) -> dict:
     _require_project(project_id)
     return {"files": store.list_project_files(project_id)}
+
+
+@router.post("/api/projects/by-slug/{slug}/mirror")
+def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: BackgroundTasks) -> dict:
+    """Mirror the Overleaf project's `.tex` sources into the matching project's
+    `.lea/files/overleaf/` (resolving/creating the project by slug, like `/api/runs`).
+    Reconcile is synchronous (files on disk + indexed before returning); the git commit
+    is **deferred** to a background task so the formalize path never waits on git."""
+    try:
+        project = store.get_or_create_project(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    proofs_root = _proofs_root()
+    incoming = [{"path": f.path, "content": f.content} for f in request.files]
+    try:
+        summary = uploads.sync_overleaf_tex(project, proofs_root, incoming, commit=False)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=_UPLOAD_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
+    if summary.get("changed"):
+        background_tasks.add_task(uploads.commit_mirror, project, proofs_root)
+    return {"project_id": project["id"], "slug": project["slug"], **summary}
 
 
 @router.post("/api/projects/{project_id}/files", status_code=201)

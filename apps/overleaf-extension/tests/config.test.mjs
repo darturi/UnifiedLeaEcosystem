@@ -45,13 +45,12 @@ test("shared environment defaults replace explicit local settings", () => {
       leaMaxTurns: 3,
       leaMaxSpendUsd: 3.25,
       leaApiKey: "legacy-openai-key",
-      leaLatexContextMode: "active_file",
+      leaTexMirrorEnabled: false,
     },
     {
       LEA_REPO_PATH: "/tmp/lea",
       LEA_MODEL: "env-model",
       LEA_MAX_TURNS: "7",
-      LEA_LATEX_CONTEXT_MODE: "off",
       LEA_MAX_SPEND_USD: "12.5"
     }
   );
@@ -59,7 +58,7 @@ test("shared environment defaults replace explicit local settings", () => {
   assert.equal(settings.leaRepoPath, "/tmp/lea");
   assert.equal(settings.leaModel, "env-model");
   assert.equal(settings.leaMaxTurns, 7);
-  assert.equal(settings.leaLatexContextMode, "active_file");
+  assert.equal(settings.leaTexMirrorEnabled, false);
   assert.equal(settings.leaMaxSpendUsd, 12.5);
   assert.equal(settings.leaApiKey, "legacy-openai-key");
   assert.equal(settings.leaProviderApiKeys, undefined);
@@ -81,18 +80,17 @@ test("negative max spend is rejected", () => {
   );
 });
 
-test("invalid latex context mode is rejected", () => {
-  assert.throws(
-    () => applyEnvDefaults({}, { LEA_LATEX_CONTEXT_MODE: "project" }),
-    /leaLatexContextMode/
-  );
+test("tex mirror defaults on and is overridable via env", () => {
+  assert.equal(applyEnvDefaults({}, {}).leaTexMirrorEnabled, true);
+  assert.equal(applyEnvDefaults({ leaTexMirrorEnabled: false }, {}).leaTexMirrorEnabled, false);
+  assert.equal(applyEnvDefaults({}, { LEA_TEX_MIRROR: "off" }).leaTexMirrorEnabled, false);
 });
 
 test("derives local path defaults when env values are absent", () => {
   const settings = applyEnvDefaults({}, {});
 
   assert.equal(settings.leaRepoPath, path.resolve(PROJECT_ROOT, "../..", "apps", "lea-standalone", "prover"));
-  assert.equal(settings.leaLatexContextMode, "off");
+  assert.equal(settings.leaTexMirrorEnabled, true);
   assert.equal(settings.leaMaxSpendUsd, null);
 });
 

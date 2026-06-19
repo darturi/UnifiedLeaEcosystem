@@ -82,12 +82,33 @@
     if (activeView) publishTheorems(activeView);
   }, 1500);
 
+  // Best-effort path of the currently open document, used only to overlay the live
+  // editor buffer onto the matching mirrored file. Wrapped in try/catch and returns
+  // "" on any failure — the consumer skips the overlay when it's empty, and never
+  // invents a path from it, so a wrong/missing value is harmless.
+  function getActiveDocPath() {
+    try {
+      const ide = window._ide;
+      const ft = ide && ide.fileTreeManager;
+      const docId = ide && ide.editorManager &&
+        (ide.editorManager.getCurrentDocId ? ide.editorManager.getCurrentDocId() : ide.editorManager.openDocId);
+      if (!docId || !ft) return "";
+      const entity = ft.findEntityById ? ft.findEntityById(docId) : null;
+      if (!entity) return "";
+      if (ft.getEntityPath) return ft.getEntityPath(entity) || "";
+      return entity.path || "";
+    } catch (error) {
+      return "";
+    }
+  }
+
   function publishTheorems(view) {
     const source = view.state.doc.toString();
     const theorems = parseTheorems(source);
     window.postMessage({
       type: "OL_LEAN_THEOREMS_VISIBLE",
       activeTex: source,
+      activePath: getActiveDocPath(),
       theorems: theorems.map((theorem) => ({
         label: theorem.label,
         text: theorem.text,

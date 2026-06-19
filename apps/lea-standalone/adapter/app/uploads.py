@@ -20,6 +20,7 @@ testable against a scratch dir; it never imports config itself.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
@@ -199,3 +200,227 @@ def delete_file(project: dict, proofs_root: Path, file_row: dict) -> bool:
                 p.unlink()
     GitStore(proofs_root).commit_all(repo, f"delete {file_row['stored_path']}")
     return store.delete_project_file(file_row["id"])
+
+
+# ── Overleaf .tex mirror (background sync, D27 extended) ───────────────────────────
+# The Overleaf extension mirrors the project's .tex sources into a dedicated subtree
+# of `.lea/files/` so they surface to the prover exactly like an uploaded reference
+# doc — but with UPDATE-by-path semantics (not the `-2`/`-3` collision rename a fresh
+# upload gets) and tagged `kind="overleaf"` so they can never clobber a user upload
+# (which lives at the `.lea/files/` top level). The git commit is the slow step and is
+# deferred by the route (`commit=False`) off the run-start path; the composed-context
+# inventory reads files from disk, not git, so a run never waits on the commit.
+
+OVERLEAF_KIND = "overleaf"
+OVERLEAF_SUBDIR = "overleaf"  # under .lea/files/
+
+
+def overleaf_dir(project: dict, proofs_root: Path) -> Path:
+    """The project's ``.lea/files/overleaf/`` mirror subtree."""
+    return files_dir(project, proofs_root) / OVERLEAF_SUBDIR
+
+
+# Only mirrored `.tex` sources (and this `.gitignore`) belong in the overleaf subtree.
+# `*` ignores everything; `!*/` lets git descend into nested folders; `!*.tex` re-includes
+# the sources at any depth. This stops commit-on-write (D8, ``git add -A``) from ever
+# capturing LaTeX build artifacts (`.pdf`/`.synctex.gz`/`.aux`/`.log`/`.fls`/`.fdb_latexmk`)
+# that the agent may generate by compiling the mirrored document.
+OVERLEAF_GITIGNORE = "*\n!*/\n!*.tex\n!.gitignore\n"
+
+
+def _gitignore_ok(base: Path) -> bool:
+    gi = base / ".gitignore"
+    try:
+        return gi.is_file() and gi.read_text() == OVERLEAF_GITIGNORE
+    except OSError:
+        return False
+
+
+def _write_gitignore(base: Path) -> bool:
+    """Ensure the subtree's ``.gitignore`` has the canonical content; True if (re)written."""
+    base.mkdir(parents=True, exist_ok=True)
+    if _gitignore_ok(base):
+        return False
+    (base / ".gitignore").write_text(OVERLEAF_GITIGNORE)
+    return True
+
+
+def _subtree_files(base: Path) -> list[Path]:
+    """Every file under the mirror subtree except the ``.gitignore`` (mirror-owned set)."""
+    if not base.is_dir():
+        return []
+    return [p for p in base.rglob("*") if p.is_file() and p.name != ".gitignore"]
+
+
+def _prune_empty_dirs(base: Path) -> None:
+    """Remove directories left empty after pruning (deepest first), keeping ``base``."""
+    if not base.is_dir():
+        return
+    for p in sorted(base.rglob("*"), key=lambda x: len(x.parts), reverse=True):
+        if p.is_dir() and not any(p.iterdir()):
+            try:
+                p.rmdir()
+            except OSError:
+                pass
+
+
+def _normalize_tex_relpath(path: str) -> str:
+    """An Overleaf-relative path → a safe POSIX subpath under the mirror dir. Rejects
+    absolutes/escapes and non-``.tex``; folds unsafe characters per path segment.
+    Raises :class:`UploadError` on a bad or non-``.tex`` path."""
+    raw = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if not raw.lower().endswith(".tex"):
+        raise UploadError(f"not a .tex path: {path!r}", code="unsupported")
+    parts: list[str] = []
+    for seg in raw.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            raise UploadError("path escapes the project", code="invalid")
+        parts.append(re.sub(r"[^A-Za-z0-9._-]+", "-", seg).strip("-._") or "file")
+    if not parts:
+        raise UploadError("empty .tex path", code="invalid")
+    return "/".join(parts)
+
+
+def _mirror_signature(items: dict[str, str]) -> str:
+    """Order-independent content hash of a {relpath: content} set, for the no-op
+    short-circuit (skip all I/O + commit when nothing changed)."""
+    h = hashlib.sha256()
+    for rel, content in sorted(items.items()):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(content.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _current_mirror(project: dict, proofs_root: Path) -> dict[str, str]:
+    """The mirror's current on-disk state as {relpath: content}."""
+    base = overleaf_dir(project, proofs_root)
+    out: dict[str, str] = {}
+    if base.is_dir():
+        for p in sorted(base.rglob("*.tex")):
+            if p.is_file():
+                try:
+                    out[p.relative_to(base).as_posix()] = p.read_text()
+                except OSError:
+                    continue
+    return out
+
+
+def ensure_overleaf_gitignore(project: dict, proofs_root: Path) -> bool:
+    """Ensure the ``.gitignore`` guard exists in an existing overleaf mirror subtree, so a
+    run's commit-on-write never captures LaTeX build artifacts the agent may generate by
+    compiling. No-op when the subtree doesn't exist yet. Returns True if (re)written.
+
+    Called at run start (the bridge) so protection holds even before the first post-fix
+    mirror sync writes the file itself."""
+    base = overleaf_dir(project, proofs_root)
+    if not base.is_dir():
+        return False
+    return _write_gitignore(base)
+
+
+def commit_mirror(project: dict, proofs_root: Path) -> str:
+    """Commit the project repo after a mirror reconcile (run as a deferred background
+    task by the route, so the request returns before git runs)."""
+    repo = project_repo_dir(project, proofs_root)
+    return GitStore(proofs_root).commit_all(repo, "overleaf: mirror .tex sources")
+
+
+def sync_overleaf_tex(
+    project: dict,
+    proofs_root: Path,
+    files: list[dict],
+    *,
+    commit: bool = True,
+) -> dict:
+    """Reconcile the project's mirrored ``.lea/files/overleaf/**`` against the incoming
+    ``.tex`` set: upsert changed files, index new rows (``kind="overleaf"``), drop rows
+    for removed ones. The subtree is treated as **exclusively mirror-owned** — only the
+    incoming ``.tex`` (plus a ``.gitignore``) survive, so any LaTeX build artifacts the
+    agent generated by compiling the document are pruned, and the ``.gitignore`` stops
+    commit-on-write from capturing new ones. Idempotent and order-independent.
+
+    Short-circuits to a no-op only when the ``.tex`` are byte-identical to disk AND the
+    subtree is already clean (nothing to prune, ``.gitignore`` present). When
+    ``commit=False`` the git commit is deferred to the caller; the returned ``changed``
+    flag says whether a commit is needed. Returns a summary dict."""
+    # Normalize + validate incoming (last write wins on a normalized-path clash).
+    incoming: dict[str, str] = {}
+    for f in files or []:
+        path = f["path"] if isinstance(f, dict) else getattr(f, "path", "")
+        content = str((f.get("content") if isinstance(f, dict) else getattr(f, "content", "")) or "")
+        rel = _normalize_tex_relpath(path)
+        if len(content.encode("utf-8")) > MAX_UPLOAD_BYTES:
+            raise UploadError(f"{rel} is too large (cap {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).", code="too_large")
+        incoming[rel] = content
+
+    base = overleaf_dir(project, proofs_root)
+    desired_abs = {base / rel for rel in incoming}
+    stray = [p for p in _subtree_files(base) if p not in desired_abs]
+
+    # Fast path: .tex unchanged AND nothing to prune AND the .gitignore is in place.
+    if (
+        _mirror_signature(incoming) == _mirror_signature(_current_mirror(project, proofs_root))
+        and not stray
+        and _gitignore_ok(base)
+    ):
+        return {"written": 0, "updated": 0, "deleted": 0, "pruned": 0,
+                "unchanged": len(incoming), "changed": False, "committed": False}
+
+    repo = project_repo_dir(project, proofs_root)
+    GitStore(proofs_root).init_repo(repo)  # idempotent; provisions tag-only projects
+    base.mkdir(parents=True, exist_ok=True)
+    gitignore_written = _write_gitignore(base)
+
+    existing = {r["stored_path"]: r for r in store.list_project_files_by_kind(project["id"], OVERLEAF_KIND)}
+
+    written = updated = unchanged = deleted = 0
+    desired_stored: set[str] = set()
+    for rel, content in incoming.items():
+        stored_rel = f".lea/files/{OVERLEAF_SUBDIR}/{rel}"
+        desired_stored.add(stored_rel)
+        abs_path = base / rel
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
+        prior = abs_path.read_text() if abs_path.is_file() else None
+        if prior == content:
+            unchanged += 1
+        elif prior is None:
+            abs_path.write_text(content)
+            written += 1
+        else:
+            abs_path.write_text(content)
+            updated += 1
+        if stored_rel not in existing:
+            store.create_project_file(
+                project["id"], filename=rel, stored_path=stored_rel,
+                mime="text/x-tex", kind=OVERLEAF_KIND, extracted_path=None,
+            )
+
+    # Prune everything in the subtree that isn't a desired .tex — build artifacts the
+    # agent produced by compiling, plus any .tex removed from Overleaf. (.gitignore kept.)
+    pruned = 0
+    for p in _subtree_files(base):
+        if p not in desired_abs:
+            try:
+                p.unlink()
+                pruned += 1
+            except OSError:
+                pass
+    _prune_empty_dirs(base)
+
+    # Drop index rows for .tex no longer present.
+    for stored_rel, row in existing.items():
+        if stored_rel not in desired_stored:
+            store.delete_project_file(row["id"])
+            deleted += 1
+
+    changed = bool(written or updated or deleted or pruned or gitignore_written)
+    committed = False
+    if changed and commit:
+        commit_mirror(project, proofs_root)
+        committed = True
+    return {"written": written, "updated": updated, "deleted": deleted, "pruned": pruned,
+            "unchanged": unchanged, "changed": changed, "committed": committed}

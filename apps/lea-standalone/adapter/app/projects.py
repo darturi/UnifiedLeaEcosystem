@@ -121,6 +121,28 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         if lines:
             inventory = "\n".join(lines)
 
+    # Mirrored Overleaf .tex sources live under .lea/files/overleaf/ (kind="overleaf",
+    # written by the mirror sync). List them recursively as their own section so the
+    # agent knows the LaTeX source is available and where to read it.
+    ol_dir = files_dir / "overleaf"
+    overleaf_section = ""
+    if ol_dir.is_dir():
+        ol_lines = [
+            f"- `{p.relative_to(repo).as_posix()}`"
+            for p in sorted(ol_dir.rglob("*.tex"))
+            if p.is_file()
+        ]
+        if ol_lines:
+            overleaf_section = (
+                "\n\n## Overleaf LaTeX source\n"
+                "The project's LaTeX sources, mirrored from Overleaf and kept current. "
+                "Consult them for the prose statements, notation, and definitions behind "
+                "the theorems. These are **read-only reference copies**, managed "
+                "automatically — do not edit them, and do not compile or run LaTeX "
+                "(`pdflatex`/`latexmk`) on them; that only produces build artifacts and "
+                "wastes the run:\n" + "\n".join(ol_lines)
+            )
+
     content = (
         f"{CONTEXT_MARKER}\n"
         f"You are working in project **{project.get('title', namespace)}** "
@@ -154,7 +176,7 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         f"```\n"
         f"The `uses` lines are the edges that chain the proof — point them at the keys of "
         f"sibling nodes you build on, and reuse nodes already proved.\n\n"
-        f"## Project files\n{inventory}"
+        f"## Project files\n{inventory}{overleaf_section}"
     )
     return {"role": "user", "content": content}
 

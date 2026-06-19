@@ -37,7 +37,10 @@ export function applyEnvDefaults(settings, env = process.env) {
     leaModel: env.LEA_MODEL || settings.leaModel || "o4-mini",
     leaMaxTurns: parseInt(env.LEA_MAX_TURNS || settings.leaMaxTurns || "20", 10),
     leaJobTimeoutSeconds: parseInt(env.LEA_JOB_TIMEOUT_SECONDS || settings.leaJobTimeoutSeconds || "900", 10),
-    leaLatexContextMode: normalizeLeaLatexContextMode(settings.leaLatexContextMode || env.LEA_LATEX_CONTEXT_MODE || "off"),
+    leaTexMirrorEnabled: normalizeBoolean(
+      env.LEA_TEX_MIRROR !== undefined ? env.LEA_TEX_MIRROR : settings.leaTexMirrorEnabled,
+      true
+    ),
     leaMaxSpendUsd
   };
 }
@@ -54,12 +57,6 @@ export function normalizeBoolean(value, fallback = false) {
   if (["true", "1", "yes", "on"].includes(text)) return true;
   if (["false", "0", "no", "off"].includes(text)) return false;
   return fallback;
-}
-
-export function normalizeLeaLatexContextMode(value) {
-  const mode = String(value || "off").trim();
-  if (mode === "off" || mode === "active_file") return mode;
-  throw new Error("leaLatexContextMode must be off or active_file");
 }
 
 function normalizeOptionalNonNegativeNumber(value, fieldName) {

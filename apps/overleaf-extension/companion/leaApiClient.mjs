@@ -132,6 +132,19 @@ export function fetchAdapterUsageStats({ fetchImpl, baseUrl }) {
   });
 }
 
+// Mirror the Overleaf project's .tex sources into the matching adapter project's
+// `.lea/files/overleaf/` (resolved by slug, get-or-create — same slug the run uses).
+// The adapter reconciles synchronously and defers the git commit, so this returns
+// quickly; `files` is `[{ path, content }]` (.tex only). Best-effort: a transport
+// failure surfaces as `{ ok:false }` and the caller logs/ignores it.
+export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/mirror`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ source: "overleaf", files: files || [] }),
+  });
+}
+
 export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, origin = null, originUrl = null }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes

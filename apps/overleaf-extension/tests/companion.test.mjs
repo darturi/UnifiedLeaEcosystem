@@ -11,15 +11,13 @@ import {
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
-  handleLatexContext,
+  handleMirrorTex,
   handleUpdateLeaSettings,
   recoverInterruptedJobs,
   resolveProofOutcome,
   validateLeaRepo
 } from "../companion/server.mjs";
 import {
-  buildLeaLatexActiveTexPath,
-  buildLeaLatexContextManifestPath,
   buildLeaProjectMarkdownPath,
   buildLeaWorkspacePath,
   slugProjectId
@@ -106,7 +104,7 @@ test("settings response includes model families and key status", async () => {
   assert.equal(response.leaProviderKeys.openai.configured, true);
   assert.equal(response.leaProviderKeys.google.configured, false);
   assert.equal(response.leaProviderKeys.anthropic.configured, true);
-  assert.equal(response.leaLatexContextMode, "off");
+  assert.equal(response.leaTexMirrorEnabled, true);
   assert.equal(response.leaMaxSpendUsd, 0.5);
   assert.equal(response.leaCurrentSpendUsd, 0.125);
 });
@@ -163,8 +161,7 @@ test("settings save supported models when their family key is configured", async
     leaModel: "gpt-5.4-mini",
     leaMaxTurns: 34,
     leaMaxSpendUsd: 9.5,
-    leaTheoremTranslationMaxRetries: 8,
-    leaLatexContextMode: "active_file"
+    leaTheoremTranslationMaxRetries: 8
   }, state);
   const geminiResult = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
@@ -184,7 +181,7 @@ test("settings save supported models when their family key is configured", async
   assert.equal(openAiResult.body.leaModel, "gpt-5.4-mini");
   assert.equal(openAiResult.body.leaMaxTurns, 34);
   assert.equal(openAiResult.body.leaMaxSpendUsd, 9.5);
-  assert.equal(openAiResult.body.leaLatexContextMode, "active_file");
+  assert.equal(openAiResult.body.leaTexMirrorEnabled, true);
   assert.equal(geminiResult.statusCode, 200);
   assert.equal(geminiResult.body.leaProvider, "google");
   assert.equal(geminiResult.body.leaModel, "gemini/gemini-2.5-flash");
@@ -201,10 +198,10 @@ test("settings save supported models when their family key is configured", async
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaModel"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxTurns"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxSpendUsd"), false);
-  assert.equal(saved.leaLatexContextMode, "active_file");
+  assert.equal(saved.leaTexMirrorEnabled, true);
 });
 
-test("settings reject unsupported latex context modes", async () => {
+test("settings persist the tex-mirror toggle off", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo, env: { OPENAI_API_KEY: "openai-key" } });
 
@@ -213,75 +210,60 @@ test("settings reject unsupported latex context modes", async () => {
     leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "o4-mini",
     leaMaxTurns: 20,
-    leaLatexContextMode: "project"
+    leaTexMirrorEnabled: false
   }, state);
 
-  assert.equal(result.statusCode, 400);
-  assert.equal(result.body.error, "invalid_latex_context_mode");
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.leaTexMirrorEnabled, false);
+  const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
+  assert.equal(saved.leaTexMirrorEnabled, false);
 });
 
-test("latex context endpoint mirrors the active file into Lea workspace", async () => {
+function makeMirrorFetch(captured) {
+  return async (url, options = {}) => {
+    if (String(url).includes("/mirror")) {
+      captured.push({ url: String(url), body: JSON.parse(options.body || "{}") });
+      return { ok: true, status: 200, text: async () => JSON.stringify({ written: 2, changed: true, committed: false }) };
+    }
+    return { ok: true, status: 200, text: async () => "{}" };
+  };
+}
+
+test("mirror-tex forwards the project's .tex set to the adapter by slug", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
+  const captured = [];
+  const state = await makeState({ leaRepoPath: leaRepo, fetchImpl: makeMirrorFetch(captured) });
 
-  const first = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: "\\section{First}\n\\theorem[label=foo]{A}"
-  }, state);
-  const second = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: "\\section{Second}\n\\theorem[label=foo]{B}"
+  const res = await handleMirrorTex({
+    overleafProjectId: "Project-1",
+    files: [
+      { path: "main.tex", content: "A" },
+      { path: "", content: "dropped" },
+      { path: "sections/intro.tex", content: "B" }
+    ]
   }, state);
 
-  assert.equal(first.statusCode, 200);
-  assert.equal(second.statusCode, 200);
-  assert.equal(
-    await fs.readFile(buildLeaLatexActiveTexPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }), "utf8"),
-    "\\section{Second}\n\\theorem[label=foo]{B}"
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(captured.length, 1);
+  assert.match(captured[0].url, /\/api\/projects\/by-slug\/Project-1\/mirror$/);
+  assert.equal(captured[0].body.source, "overleaf");
+  assert.deepEqual(captured[0].body.files.map((file) => file.path), ["main.tex", "sections/intro.tex"]);
+});
+
+test("mirror-tex rejects a missing project id and respects the disable toggle", async () => {
+  const leaRepo = await makeLeaRepo();
+
+  const missing = await handleMirrorTex({ files: [] }, await makeState({ leaRepoPath: leaRepo }));
+  assert.equal(missing.statusCode, 400);
+  assert.equal(missing.body.error, "missing_project_id");
+
+  const disabled = await handleMirrorTex(
+    { overleafProjectId: "p1", files: [] },
+    await makeState({ leaRepoPath: leaRepo, leaTexMirrorEnabled: false })
   );
-  const manifest = JSON.parse(await fs.readFile(
-    buildLeaLatexContextManifestPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }),
-    "utf8"
-  ));
-  assert.equal(manifest.overleafProjectId, "project-1");
-  assert.equal(manifest.projectSlug, "project-1");
-  assert.equal(manifest.mode, "active_file");
-  assert.equal(manifest.files[0].path, "tex/active.tex");
-  assert.equal(manifest.files[0].sourceKind, "active_file");
-  assert.equal(manifest.files[0].bytes, Buffer.byteLength("\\section{Second}\n\\theorem[label=foo]{B}", "utf8"));
-
-  const projectMarkdown = await fs.readFile(buildLeaProjectMarkdownPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }), "utf8");
-  assert.match(projectMarkdown, /## LaTeX Context/);
-  assert.match(projectMarkdown, /workspace\/context\/overleaf\/project-1\/manifest\.json/);
-});
-
-test("latex context endpoint rejects disabled mode and invalid payloads", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
-
-  const disabled = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "off",
-    activeTex: "A"
-  }, state);
-  const missingProject = await handleLatexContext({
-    mode: "active_file",
-    activeTex: "A"
-  }, state);
-  const invalidTex = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: 1
-  }, state);
-
   assert.equal(disabled.statusCode, 400);
-  assert.equal(disabled.body.error, "latex_context_disabled");
-  assert.equal(missingProject.statusCode, 400);
-  assert.equal(missingProject.body.error, "missing_project_id");
-  assert.equal(invalidTex.statusCode, 400);
-  assert.equal(invalidTex.body.error, "invalid_active_tex");
+  assert.equal(disabled.body.error, "tex_mirror_disabled");
 });
 
 test("settings clear max spend and reject negative caps", async () => {
@@ -2015,7 +1997,7 @@ async function makeState(overrides = {}) {
         ...(overrides.leaApiKey ? { leaApiKey: overrides.leaApiKey } : {}),
         leaMaxTurns: 20,
         leaMaxSpendUsd: overrides.leaMaxSpendUsd ?? null,
-        leaLatexContextMode: overrides.leaLatexContextMode || "off",
+        leaTexMirrorEnabled: overrides.leaTexMirrorEnabled ?? true,
         ...(overrides.leaJobTimeoutSeconds ? {
           leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
         } : {})

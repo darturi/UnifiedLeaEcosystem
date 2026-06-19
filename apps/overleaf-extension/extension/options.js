@@ -1,5 +1,5 @@
 const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
-const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
+const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
 const MODEL_FAMILY_LABELS = {
   openai: "OpenAI",
   google: "Google AI",
@@ -16,7 +16,7 @@ const leaRepoPathInput = document.querySelector("#lea-repo-path");
 const leaApiBaseUrlInput = document.querySelector("#lea-api-base-url");
 const leaModelInput = document.querySelector("#lea-model");
 const leaMaxTurnsInput = document.querySelector("#lea-max-turns");
-const leaLatexContextModeInput = document.querySelector("#lea-latex-context-mode");
+const leaTexMirrorInput = document.querySelector("#lea-tex-mirror");
 const providerStatusList = document.querySelector("#provider-key-status");
 const providerKeyInputs = {
   openai: document.querySelector("#openai-api-key"),
@@ -35,7 +35,7 @@ chrome.storage.sync.get(
     leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: DEFAULT_LEA_MODEL,
     leaMaxTurns: 20,
-    leaLatexContextMode: DEFAULT_LEA_LATEX_CONTEXT_MODE
+    leaTexMirrorEnabled: DEFAULT_LEA_TEX_MIRROR_ENABLED
   },
   (settings) => {
     companionUrlInput.value = settings.companionUrl;
@@ -44,8 +44,7 @@ chrome.storage.sync.get(
     renderModelOptions(DEFAULT_MODEL_OPTIONS, settings.leaModel || DEFAULT_LEA_MODEL, latestProviderKeys);
     renderProviderKeyStatus(latestProviderKeys);
     leaMaxTurnsInput.value = settings.leaMaxTurns;
-    // LaTeX context is locked to "off" until the feature is implemented.
-    leaLatexContextModeInput.value = DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    if (leaTexMirrorInput) leaTexMirrorInput.checked = settings.leaTexMirrorEnabled !== false;
     loadCompanionSettings({ silent: true });
   }
 );
@@ -63,9 +62,7 @@ form.addEventListener("submit", async (event) => {
   const leaApiBaseUrl = leaApiBaseUrlInput.value.trim().replace(/\/+$/, "");
   const leaModel = leaModelInput.value.trim() || DEFAULT_LEA_MODEL;
   const leaMaxTurns = Number.parseInt(leaMaxTurnsInput.value, 10) || 20;
-  // LaTeX context is locked to "off" until the feature is implemented; never send
-  // active_file regardless of any stored value.
-  const leaLatexContextMode = DEFAULT_LEA_LATEX_CONTEXT_MODE;
+  const leaTexMirrorEnabled = leaTexMirrorInput ? leaTexMirrorInput.checked : DEFAULT_LEA_TEX_MIRROR_ENABLED;
   const leaProviderApiKeys = collectProviderApiKeyPatch();
   try {
     const leaResponse = await fetch(`${companionUrl}/settings/lea`, {
@@ -76,7 +73,7 @@ form.addEventListener("submit", async (event) => {
         leaApiBaseUrl,
         leaModel,
         leaMaxTurns,
-        leaLatexContextMode,
+        leaTexMirrorEnabled,
         leaProviderApiKeys
       })
     });
@@ -91,7 +88,7 @@ form.addEventListener("submit", async (event) => {
       leaApiBaseUrl: leaPayload.leaApiBaseUrl,
       leaModel: leaPayload.leaModel,
       leaMaxTurns: leaPayload.leaMaxTurns,
-      leaLatexContextMode: leaPayload.leaLatexContextMode
+      leaTexMirrorEnabled: leaPayload.leaTexMirrorEnabled
     });
     latestProviderKeys = leaPayload.leaProviderKeys || latestProviderKeys;
     renderProviderKeyStatus(latestProviderKeys);
@@ -120,8 +117,7 @@ async function loadCompanionSettings({ silent }) {
     renderProviderKeyStatus(latestProviderKeys);
     renderModelOptions(latestModelOptions, payload.leaModel || leaModelInput.value || DEFAULT_LEA_MODEL, latestProviderKeys);
     leaMaxTurnsInput.value = payload.leaMaxTurns || leaMaxTurnsInput.value || 20;
-    // LaTeX context stays locked to "off" regardless of what the companion reports.
-    leaLatexContextModeInput.value = DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    if (leaTexMirrorInput) leaTexMirrorInput.checked = payload.leaTexMirrorEnabled !== false;
 
     await chrome.storage.sync.set({
       companionUrl,
@@ -129,7 +125,7 @@ async function loadCompanionSettings({ silent }) {
       leaApiBaseUrl: leaApiBaseUrlInput.value,
       leaModel: leaModelInput.value,
       leaMaxTurns: Number.parseInt(leaMaxTurnsInput.value, 10) || 20,
-      leaLatexContextMode: leaLatexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE
+      leaTexMirrorEnabled: leaTexMirrorInput ? leaTexMirrorInput.checked : DEFAULT_LEA_TEX_MIRROR_ENABLED
     });
 
     if (!silent) {

@@ -15,9 +15,6 @@ import {
   normalizeModelFamilyId
 } from "../../../packages/lea-model-catalog/index.mjs";
 import {
-  buildLeaLatexActiveTexPath,
-  buildLeaLatexContextManifestPath,
-  buildLeaLatexContextRoot,
   buildLeaProjectMarkdownPath,
   buildLeaProofPath,
   buildLeaWorkspacePath,
@@ -31,11 +28,12 @@ import {
   inferLeanDeclarationName,
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
-import { applyEnvDefaults, loadDotEnv, normalizeLeaLatexContextMode } from "./config.mjs";
+import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   interruptApiRun,
+  mirrorProjectTexFiles,
   putAdapterSettings,
   runApiProofJob
 } from "./leaApiClient.mjs";
@@ -52,7 +50,7 @@ const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8001";
 const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
-const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
+const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
 const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
 const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
@@ -218,12 +216,10 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, usesResolution.error, usesResolution.message);
   }
 
-  const latexContext = await maybePrepareLatexContext({
-    state,
-    payload,
-    overleafProjectId
-  });
-
+  // The Overleaf project's .tex sources are mirrored into the project's
+  // `.lea/files/overleaf/` by the extension's background sync (flushed before this
+  // request), so the adapter's composed context already surfaces them to Lea. No
+  // per-run LaTeX prep happens here anymore.
   const cleanup = await cleanupPreviousRunArtifacts({
     leaRepoPath: state.settings.leaRepoPath,
     target,
@@ -231,12 +227,11 @@ export async function handleFormalize(payload, state) {
     jobs: state.jobs || {}
   });
   const job = await createLeaJob({ state, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses });
-  job.latexContext = latexContext;
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
-  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses, latexContext }).catch(async (error) => {
+  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
     job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
@@ -250,41 +245,47 @@ export async function handleFormalize(payload, state) {
   };
 }
 
-export async function handleLatexContext(payload, state) {
+// Mirror the Overleaf project's .tex sources into the matching adapter project's
+// `.lea/files/overleaf/` (D27-extended). Driven by the extension's background sync
+// (and a flush before formalize), so the run's composed context surfaces the .tex.
+// `payload.files` is `[{ path, content }]`, .tex only; the adapter reconciles +
+// upserts and defers the commit. Disabled when the mirror toggle is off.
+export async function handleMirrorTex(payload, state) {
   const leaValidation = validateLeaRuntime(state, { requireApiKey: false });
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
-
-  let mode;
-  try {
-    mode = normalizeLeaLatexContextMode(payload.mode || state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE);
-  } catch {
-    return errorResponse(400, "invalid_latex_context_mode", "LaTeX context mode must be off or active_file.");
-  }
-  if (mode !== "active_file") {
-    return errorResponse(400, "latex_context_disabled", "LaTeX context mirroring is disabled.");
+  if (state.settings.leaTexMirrorEnabled === false) {
+    return errorResponse(400, "tex_mirror_disabled", "Overleaf .tex mirroring is disabled.");
   }
 
   const overleafProjectId = String(payload.overleafProjectId || "");
   if (!overleafProjectId.trim()) {
     return errorResponse(400, "missing_project_id", "overleafProjectId is required.");
   }
-  if (typeof payload.activeTex !== "string") {
-    return errorResponse(400, "invalid_active_tex", "activeTex must be a string.");
+  const files = Array.isArray(payload.files)
+    ? payload.files
+        .map((file) => ({ path: String(file?.path || ""), content: String(file?.content ?? "") }))
+        .filter((file) => file.path.trim())
+    : [];
+
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
   }
 
-  const context = await writeActiveLatexContext({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId,
-    activeTex: payload.activeTex
+  const result = await mirrorProjectTexFiles({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    slug: slugProjectId(overleafProjectId),
+    files
   });
-  await upsertProjectLatexContextEntry({
-    projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId }),
-    projectId: overleafProjectId,
-    context
-  });
-  return { statusCode: 200, body: { ok: true, context } };
+  if (!result.ok) {
+    return errorResponse(result.status || 502, "mirror_failed", result.error || "Could not mirror .tex to the Lea adapter.");
+  }
+  return { statusCode: 200, body: { ok: true, summary: result.body } };
 }
 
 export async function handleUpdateLeaSettings(payload, state) {
@@ -324,16 +325,9 @@ export async function handleUpdateLeaSettings(payload, state) {
   } catch {
     return errorResponse(400, "invalid_max_spend", "Lea max spend must be greater than or equal to 0.");
   }
-  let leaLatexContextMode;
-  try {
-    leaLatexContextMode = normalizeLeaLatexContextMode(
-      Object.prototype.hasOwnProperty.call(payload, "leaLatexContextMode")
-        ? payload.leaLatexContextMode
-        : state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE
-    );
-  } catch {
-    return errorResponse(400, "invalid_latex_context_mode", "LaTeX context mode must be off or active_file.");
-  }
+  const leaTexMirrorEnabled = Object.prototype.hasOwnProperty.call(payload, "leaTexMirrorEnabled")
+    ? normalizeBoolean(payload.leaTexMirrorEnabled, true)
+    : (state.settings.leaTexMirrorEnabled !== false);
   const nextSettings = {
     ...state.settings,
     leaRepoPath: path.resolve(leaRepoPath),
@@ -343,7 +337,7 @@ export async function handleUpdateLeaSettings(payload, state) {
     leaModel: model,
     leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
     leaMaxSpendUsd,
-    leaLatexContextMode,
+    leaTexMirrorEnabled,
     leaJobTimeoutSeconds: Number.parseInt(
     String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
     10
@@ -587,8 +581,8 @@ async function routeRequest(request, response, state) {
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/latex-context") {
-    const result = await handleLatexContext(await readBodyJson(request), state);
+  if (request.method === "POST" && url.pathname === "/mirror-tex") {
+    const result = await handleMirrorTex(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -638,7 +632,7 @@ export async function buildSettingsResponse(state) {
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
     leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
-    leaLatexContextMode: normalizeLeaLatexContextMode(state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE),
+    leaTexMirrorEnabled: state.settings.leaTexMirrorEnabled !== false,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
 }
@@ -954,7 +948,7 @@ function sanitizeRuntimeSettings(settings) {
   } = settings || {};
   return {
     ...rest,
-    leaLatexContextMode: normalizeLeaLatexContextMode(rest.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE)
+    leaTexMirrorEnabled: rest.leaTexMirrorEnabled !== false
   };
 }
 
@@ -984,80 +978,6 @@ function validateLeaPayload(payload) {
     return { ok: false, error: "missing_theorem_text", message: "Theorem text is required." };
   }
   return { ok: true, overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext };
-}
-
-async function maybePrepareLatexContext({ state, payload, overleafProjectId }) {
-  const mode = normalizeLeaLatexContextMode(state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE);
-  if (mode !== "active_file") return null;
-
-  if (typeof payload.activeTex === "string") {
-    const context = await writeActiveLatexContext({
-      leaRepoPath: state.settings.leaRepoPath,
-      overleafProjectId,
-      activeTex: payload.activeTex
-    });
-    await upsertProjectLatexContextEntry({
-      projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId }),
-      projectId: overleafProjectId,
-      context
-    });
-    return context;
-  }
-
-  return readExistingLatexContext({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId
-  });
-}
-
-async function writeActiveLatexContext({ leaRepoPath, overleafProjectId, activeTex }) {
-  const projectSlug = slugProjectId(overleafProjectId);
-  const rootPath = buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId });
-  const activeTexPath = buildLeaLatexActiveTexPath({ leaRepoPath, overleafProjectId });
-  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
-  const activeRelativePath = path.relative(rootPath, activeTexPath).split(path.sep).join("/");
-  const updatedAt = new Date().toISOString();
-  const bytes = Buffer.byteLength(activeTex, "utf8");
-  const sha256 = createHash("sha256").update(activeTex).digest("hex");
-  const manifest = {
-    overleafProjectId,
-    projectSlug,
-    mode: "active_file",
-    updatedAt,
-    files: [{
-      path: activeRelativePath,
-      sourceKind: "active_file",
-      sha256,
-      bytes,
-      lastSeenAt: updatedAt
-    }]
-  };
-
-  await atomicWriteFile(activeTexPath, activeTex, "utf8");
-  await atomicWriteJson(manifestPath, manifest);
-  return buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest });
-}
-
-async function readExistingLatexContext({ leaRepoPath, overleafProjectId }) {
-  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
-  try {
-    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-    return buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest });
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-function buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest }) {
-  const rootPath = buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId });
-  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
-  return {
-    mode: "active_file",
-    rootPath: relativeToLeaRepo({ leaRepoPath, absolutePath: rootPath }),
-    manifestPath: relativeToLeaRepo({ leaRepoPath, absolutePath: manifestPath }),
-    updatedAt: manifest.updatedAt || null
-  };
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -1525,7 +1445,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
   await writeJson(state.jobsPath, state.jobs);
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
   const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
     projectSlug: target.projectSlug,
@@ -1533,8 +1453,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     theoremText,
     theoremContext,
     declarationNameHint: job.declarationNameHint || "",
-    resolvedUses,
-    latexContext
+    resolvedUses
   });
   const exit = await runLeaProofJobForJob({ state, job, target, prompt });
   if (job.finalStatus === "max_spend") return;
@@ -1542,7 +1461,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 }
 
-function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], latexContext = null }) {
+function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [] }) {
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -1555,9 +1474,6 @@ function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext
   const formalizationGuidance = theoremContext.trim()
     ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
     : "";
-  const latexContextGuidance = latexContext?.manifestPath
-    ? `\nAdditional Overleaf LaTeX context is available in Lea's workspace at:\n${latexContext.manifestPath}\n\nConsult it if theorem statements, notation, definitions, or surrounding exposition are unclear.\n`
-    : "";
 
   return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
 ${naming}
@@ -1565,7 +1481,6 @@ ${usesGuidance}
 
 ${theoremText}
 ${formalizationGuidance}
-${latexContextGuidance}
 
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a statement for approval. If a detail is ambiguous (for example which number type to use), pick the most natural interpretation and proceed without waiting. Do everything in this run: write the Lean file under Lea's workspace and carry the proof through to completion.
 
@@ -2420,61 +2335,6 @@ async function upsertProjectTheoremEntry({
     : `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
   await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
   await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
-}
-
-async function upsertProjectLatexContextEntry({ projectMarkdownPath, projectId, context }) {
-  let existing;
-  try {
-    existing = await fs.readFile(projectMarkdownPath, "utf8");
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-    existing = `# Lea Project: ${projectId}\n\n<!-- lea:project id="${escapeHtmlAttribute(projectId)}" -->\n`;
-  }
-
-  const entry = renderProjectLatexContextEntry(context);
-  const section = findProjectLatexContextSection(existing);
-  let next;
-  if (section) {
-    next = `${existing.slice(0, section.start).trimEnd()}\n\n${entry.trimEnd()}\n${existing.slice(section.end).trimStart() ? `\n${existing.slice(section.end).trimStart()}` : ""}`;
-  } else {
-    const firstTheorem = existing.search(/\n## Theorem:/);
-    if (firstTheorem === -1) {
-      next = `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
-    } else {
-      next = `${existing.slice(0, firstTheorem).trimEnd()}\n\n${entry.trimEnd()}\n\n${existing.slice(firstTheorem).trimStart()}`;
-    }
-  }
-  await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
-  await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
-}
-
-function renderProjectLatexContextEntry(context) {
-  const rootPath = context?.rootPath || "";
-  const manifestPath = context?.manifestPath || "";
-  const attrs = [
-    `root="${escapeHtmlAttribute(rootPath)}"`,
-    `manifest="${escapeHtmlAttribute(manifestPath)}"`,
-    context?.updatedAt ? `updated="${escapeHtmlAttribute(context.updatedAt)}"` : ""
-  ].filter(Boolean).join(" ");
-  return `## LaTeX Context
-
-<!-- lea:latex-context ${attrs} -->
-
-Available project LaTeX mirror:
-\`${manifestPath}\`
-`;
-}
-
-function findProjectLatexContextSection(markdown) {
-  const text = String(markdown || "");
-  const marker = text.search(/<!--\s*lea:latex-context\b[^>]*-->/);
-  if (marker === -1) return null;
-  const headingStart = findNamedSectionHeadingStart(text, marker, "LaTeX Context");
-  const nextHeading = text.slice(marker).search(/\n## /);
-  return {
-    start: headingStart,
-    end: nextHeading === -1 ? text.length : marker + nextHeading
-  };
 }
 
 function renderProjectTheoremEntry({
