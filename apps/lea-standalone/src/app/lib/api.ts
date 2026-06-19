@@ -207,11 +207,23 @@ interface UsageModelRow {
   session_count: number;
 }
 
+// Per-origin rollup across sessions (store.usage_stats → "origins"): Direct (UI) vs
+// Overleaf extension. Internal to UsageStats.
+interface UsageOriginRow {
+  origin: 'ui' | 'overleaf' | string;
+  session_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
 export interface UsageStats {
   sessions: UsageSessionSummary[];
   global: UsageGlobals;
   daily: UsageDay[];
   models: UsageModelRow[];
+  origins: UsageOriginRow[];
 }
 
 export async function getSettings(): Promise<AppSettings> {

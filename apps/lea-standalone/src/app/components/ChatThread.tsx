@@ -12,6 +12,7 @@ import type {
 } from '../lib/api';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ModelPicker } from './ModelPicker';
+import { OriginBadge } from './OriginBadge';
 import { buildTimeline } from '../lib/timeline.mjs';
 import { useProofSession } from '../stores/proofSession';
 import { useModel } from '../stores/model';
@@ -287,6 +288,7 @@ export function ChatThread({
         )}
         <span className="ttl">{title}</span>
         {headChip && <span className={`chip ${headChip.cls}`}>{headChip.text}</span>}
+        <OriginBadge origin={session?.origin} originUrl={session?.origin_url} />
         <span className="head-spacer" />
         <ModelPicker
           value={model || ''}

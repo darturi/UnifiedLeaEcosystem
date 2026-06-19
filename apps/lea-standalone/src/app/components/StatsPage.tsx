@@ -28,6 +28,7 @@ import {
   getSession,
   getUsageStats,
 } from '../lib/api';
+import { OriginBadge } from './OriginBadge';
 
 // Warm-paper palette (mirrors src/styles/lea-v2.css) so charts read like the
 // main chat panel rather than the old neon shadcn dashboard.
@@ -107,6 +108,18 @@ function modelLabel(model: string | null | undefined) {
     .replace(/^openai\//, '')
     .replace(/^google\//, '')
     .replace(/-/g, ' ');
+}
+
+function originLabel(origin: string) {
+  if (origin === 'ui') return 'Direct (UI)';
+  if (origin === 'overleaf') return 'Overleaf extension';
+  return origin || 'Unknown';
+}
+
+function originColor(origin: string) {
+  if (origin === 'overleaf') return INPUT_COLOR; // terracotta accent
+  if (origin === 'ui') return OUTPUT_COLOR; // blue
+  return '#8a8983'; // --muted
 }
 
 function groupSessions(sessions: UsageSessionSummary[]) {
@@ -253,6 +266,7 @@ function SessionDetailPane({ session }: { session?: StatsSessionDetail }) {
               >
                 {modelLabel(session.primary_model)}
               </span>
+              <OriginBadge origin={session.origin} originUrl={session.origin_url} showDirect />
               <span className="text-xs text-muted-foreground">{fmtDate(session.started_at)}</span>
               <span className="text-xs text-muted-foreground">{fmtDuration(session.duration_seconds)}</span>
               <span className="text-xs text-muted-foreground">{session.run_count} runs</span>
@@ -516,20 +530,42 @@ function GlobalStatsPane({ stats }: { stats?: UsageStats }) {
             )}
           </div>
 
-          {/* Placeholder: direct (UI) vs Overleaf-extension usage. Origin is not
-              tracked yet (no `source` on runs), so these read as not-yet-available
-              until that backend support lands. Layout home reserved here. */}
+          {/* Direct (UI) vs Overleaf-extension usage, from store.usage_stats().origins
+              (aggregated from the same sessions the global totals use). */}
           <div className="flex flex-col gap-2">
             <span className="text-[0.65rem] uppercase tracking-widest text-muted-foreground">
-              By source
+              By origin
             </span>
-            <div className="flex flex-col gap-2 rounded-lg border border-dashed border-border p-4">
-              <Row label="Direct (UI)" value="—" />
-              <Row label="Overleaf extension" value="—" />
-              <span className="text-xs text-muted-foreground">
-                Source tracking isn't wired up yet — direct vs Overleaf usage will appear here in a later pass.
-              </span>
-            </div>
+            {(stats.origins ?? []).every((row) => row.session_count === 0) ? (
+              <div className="text-sm text-muted-foreground">No sessions recorded yet.</div>
+            ) : (
+              (stats.origins ?? []).map((row) => {
+                const pct = global.cost_usd
+                  ? Math.round((row.cost_usd / global.cost_usd) * 100)
+                  : global.session_count
+                  ? Math.round((row.session_count / global.session_count) * 100)
+                  : 0;
+                const color = originColor(row.origin);
+                return (
+                  <div key={row.origin} className="flex flex-col gap-1">
+                    <div className="flex min-w-0 items-center justify-between gap-3">
+                      <span className="truncate text-xs" style={{ color }}>
+                        {originLabel(row.origin)}
+                      </span>
+                      <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                        {row.session_count} sess - {fmtNumber(row.total_tokens)} tok - {fmtCost(row.cost_usd, 2)}
+                      </span>
+                    </div>
+                    <div className="h-1 rounded-full bg-muted">
+                      <div
+                        className="h-full rounded-full"
+                        style={{ width: `${Math.max(2, pct)}%`, background: color }}
+                      />
+                    </div>
+                  </div>
+                );
+              })
+            )}
           </div>
 
           <div className="flex flex-col gap-2 rounded-lg border border-border p-4">

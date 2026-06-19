@@ -14,13 +14,24 @@ RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 
 
-def create_session(title: str, project_id: str | None = None) -> dict:
+def create_session(
+    title: str,
+    project_id: str | None = None,
+    origin: str = "ui",
+    origin_url: str | None = None,
+) -> dict:
+    """Create a session. `origin` records providence ('ui' | 'overleaf'); for an
+    Overleaf-spawned session `origin_url` is the canonical Overleaf document URL so
+    the UI can open/focus the source document. Both default to the interactive-UI
+    case so the existing path is unchanged."""
     now = utc_now()
     session_id = str(uuid4())
+    origin_value = (origin or "ui").strip() or "ui"
     with connect() as conn:
         conn.execute(
-            "insert into sessions (id, project_id, title, created_at, updated_at) values (?, ?, ?, ?, ?)",
-            (session_id, project_id, title[:120] or "Untitled theorem", now, now),
+            "insert into sessions (id, project_id, title, origin, origin_url, created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, project_id, title[:120] or "Untitled theorem", origin_value, origin_url, now, now),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
     return row_to_dict(row)
@@ -767,6 +778,7 @@ def usage_stats() -> dict:
 
     return {
         "sessions": sessions,
+        "origins": _origin_rollup(sessions),
         "global": {
             "session_count": total_sessions,
             "message_count": total_messages,
@@ -781,6 +793,46 @@ def usage_stats() -> dict:
         "daily": [_normalize_usage_day(row_to_dict(row)) for row in daily_rows],
         "models": [_normalize_usage_model(row_to_dict(row)) for row in model_rows],
     }
+
+
+def _origin_rollup(sessions: list[dict]) -> list[dict]:
+    """Per-origin usage rollup for the Stats "By origin" tab (Direct UI vs Overleaf).
+
+    Aggregated from the same `sessions` rows the `global` totals come from, so the two
+    always agree. Both 'ui' and 'overleaf' rows are always emitted (zeros when absent)
+    so the UI layout is stable. An unexpected origin value falls back to 'ui'."""
+    buckets: dict[str, dict] = {
+        origin: {
+            "origin": origin,
+            "session_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        }
+        for origin in ("ui", "overleaf")
+    }
+    for session in sessions:
+        origin = str(session.get("origin") or "ui")
+        bucket = buckets.setdefault(
+            origin,
+            {
+                "origin": origin,
+                "session_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        )
+        bucket["session_count"] += 1
+        bucket["input_tokens"] += int(session.get("input_tokens") or 0)
+        bucket["output_tokens"] += int(session.get("output_tokens") or 0)
+        bucket["total_tokens"] += int(session.get("total_tokens") or 0)
+        bucket["cost_usd"] += float(session.get("cost_usd") or 0)
+    # 'ui' and 'overleaf' first (stable UI order), then any unexpected origins.
+    ordered = ["ui", "overleaf"] + [k for k in buckets if k not in ("ui", "overleaf")]
+    return [buckets[k] for k in ordered]
 
 
 def _normalize_usage_session(row: dict) -> dict:

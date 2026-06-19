@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   LEA_MODEL_OPTIONS,
+  buildOverleafDocumentUrl,
   buildSettingsResponse,
   ensureStartupLeaRuntime,
   handleFormalize,
@@ -25,6 +26,17 @@ import {
   buildLeaWorkspacePath,
   slugProjectId
 } from "../shared/leanStub.mjs";
+
+test("buildOverleafDocumentUrl builds the canonical public-Overleaf URL", () => {
+  assert.equal(
+    buildOverleafDocumentUrl("abc123"),
+    "https://www.overleaf.com/project/abc123"
+  );
+  // Empty / unknown ids yield no link (the session shows the badge without a click target).
+  assert.equal(buildOverleafDocumentUrl(""), null);
+  assert.equal(buildOverleafDocumentUrl("unknown"), null);
+  assert.equal(buildOverleafDocumentUrl(null), null);
+});
 
 test("validates a Lea repo and derives its workspace", async () => {
   const leaRepo = await makeLeaRepo();

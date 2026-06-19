@@ -1226,6 +1226,16 @@ async function atomicWriteFile(filePath, content, encoding) {
   await fs.rename(tmpPath, filePath);
 }
 
+// Canonical public-Overleaf document URL for an `overleafProjectId`. Sent to the
+// adapter as the session's `origin_url` so the Lea UI can open/focus the source
+// document. Host is www.overleaf.com (public-host-only decision); the `/project/<id>`
+// path is Overleaf's own URL shape. Returns null for an unknown/empty id.
+export function buildOverleafDocumentUrl(overleafProjectId) {
+  const id = String(overleafProjectId || "").trim();
+  if (!id || id === "unknown") return null;
+  return `https://www.overleaf.com/project/${encodeURIComponent(id)}`;
+}
+
 function buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel }) {
   const projectSlug = slugProjectId(overleafProjectId);
   const projectMarkdownPath = buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId });
@@ -1490,6 +1500,11 @@ async function runLeaProofJobForJob({ state, job, target, prompt }) {
       autoApprove: true,
       projectSlug: target.projectSlug || null,
       projectTitle: target.projectSlug || null,
+      // Mark the adapter session as Overleaf-originated and hand it the canonical
+      // document URL, so the Lea UI can show an origin indicator and open/focus the
+      // source document. Independent of the project usage-namespace above.
+      origin: "overleaf",
+      originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
       appendLog,
       logPath: job.logPath,
       onRunStarted: async (apiRunId, sessionId) => {

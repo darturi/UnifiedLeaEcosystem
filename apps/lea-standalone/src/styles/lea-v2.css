@@ -96,6 +96,26 @@
 .chip.model.model-trigger:hover { background: var(--panel-2); }
 .chip.model.model-trigger .caret { color: var(--muted); }
 
+/* Session origin badge (providence): chat header + Stats. Mirrors the .chip look so
+   it sits naturally beside the status chips, with an Overleaf-accent clickable
+   variant and a muted Direct (UI) variant. Scoped vars are global, so the same
+   markup reads correctly in the warm-paper chat and the Stats page. */
+/* NOTE: text colors are literal warm-palette hex, NOT var(--accent)/var(--muted).
+   The Stats page wraps this in `.stats-scope`, which re-points the shadcn tokens
+   --accent (#f3e3db) and --muted (#efede7) to near-white fills — so the var()
+   forms render light-on-light (illegible) there. The literals match the :root warm
+   values (#c96442 accent, #8a8983 muted) and read correctly in both contexts. */
+.origin-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+  padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink-2); white-space: nowrap; line-height: 1.6; }
+.origin-badge.origin-overleaf { color: #c96442; border-color: var(--accent-soft);
+  background: var(--accent-soft); cursor: pointer; }
+.origin-badge.origin-overleaf:hover:not(:disabled) { background: #eccdbf; }
+.origin-badge.origin-overleaf:disabled { cursor: default; }
+.origin-badge.origin-ui { color: #8a8983; }
+.origin-badge .origin-badge-glyph { flex: none; }
+.origin-badge .origin-badge-out { flex: none; opacity: 0.7; }
+
 /* Spotlight-style model search overlay (M9) */
 .model-overlay { position: fixed; inset: 0; background: rgba(31,30,29,.34); display: flex;
   align-items: flex-start; justify-content: center; padding-top: 110px; z-index: 100; }

@@ -47,6 +47,34 @@ def test_create_run_tags_session_and_run_with_project_slug(tmp_path, monkeypatch
     assert len(doc_sessions) == 2
 
 
+def test_create_run_records_overleaf_origin(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _patch_config(monkeypatch, tmp_path)
+
+    url = "https://www.overleaf.com/project/doc-a"
+    result = runs_route.create_run(
+        RunRequest(message="prove thm_one", autonomous=True,
+                   project_slug="doc-a", project_title="Doc A",
+                   origin="overleaf", origin_url=url)
+    )
+
+    session = store.get_session(result["session_id"])
+    assert session["origin"] == "overleaf"
+    assert session["origin_url"] == url
+
+
+def test_create_run_without_origin_defaults_to_ui(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _patch_config(monkeypatch, tmp_path)
+
+    result = runs_route.create_run(RunRequest(message="interactive run"))
+    session = store.get_session(result["session_id"])
+    assert session["origin"] == "ui"
+    assert session["origin_url"] is None
+
+
 def test_create_run_without_slug_stays_project_less(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
