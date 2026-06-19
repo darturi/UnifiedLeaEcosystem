@@ -2,7 +2,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   parseSseFrame,
-  isApiFlavor,
   runApiProofJob,
 } from "../companion/leaApiClient.mjs";
 
@@ -30,13 +29,6 @@ function sseResponse(frames, { chunkSize = null } = {}) {
 function frame(type, payload) {
   return `event: ${type}\ndata: ${JSON.stringify(payload)}`;
 }
-
-test("isApiFlavor recognizes the api wire", () => {
-  assert.equal(isApiFlavor("api"), true);
-  assert.equal(isApiFlavor("API"), true);
-  assert.equal(isApiFlavor("v1"), false);
-  assert.equal(isApiFlavor(undefined), false);
-});
 
 test("parseSseFrame reads the event name off the event: line, not the data body", () => {
   const { type, data } = parseSseFrame("event: code_step\ndata: {\"id\":\"s1\",\"turn\":2}");

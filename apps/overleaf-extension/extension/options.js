@@ -32,7 +32,7 @@ chrome.storage.sync.get(
   {
     companionUrl: DEFAULT_COMPANION_URL,
     leaRepoPath: "",
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: DEFAULT_LEA_MODEL,
     leaMaxTurns: 20,
     leaLatexContextMode: DEFAULT_LEA_LATEX_CONTEXT_MODE
@@ -114,7 +114,7 @@ async function loadCompanionSettings({ silent }) {
 
     companionUrlInput.value = companionUrl;
     leaRepoPathInput.value = payload.leaRepoPath || leaRepoPathInput.value;
-    leaApiBaseUrlInput.value = payload.leaApiBaseUrl || leaApiBaseUrlInput.value || "http://127.0.0.1:8000";
+    leaApiBaseUrlInput.value = payload.leaApiBaseUrl || leaApiBaseUrlInput.value || "http://127.0.0.1:8001";
     latestModelOptions = payload.leaModelOptions || DEFAULT_MODEL_OPTIONS;
     latestProviderKeys = payload.leaProviderKeys || {};
     renderProviderKeyStatus(latestProviderKeys);

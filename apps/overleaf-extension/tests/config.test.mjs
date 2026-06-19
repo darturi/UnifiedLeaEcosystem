@@ -51,7 +51,6 @@ test("shared environment defaults replace explicit local settings", () => {
       LEA_REPO_PATH: "/tmp/lea",
       LEA_MODEL: "env-model",
       LEA_MAX_TURNS: "7",
-      LEA_THEOREM_TRANSLATION_MAX_RETRIES: "5",
       LEA_LATEX_CONTEXT_MODE: "off",
       LEA_MAX_SPEND_USD: "12.5"
     }
@@ -60,7 +59,6 @@ test("shared environment defaults replace explicit local settings", () => {
   assert.equal(settings.leaRepoPath, "/tmp/lea");
   assert.equal(settings.leaModel, "env-model");
   assert.equal(settings.leaMaxTurns, 7);
-  assert.equal(settings.leaTheoremTranslationMaxRetries, 5);
   assert.equal(settings.leaLatexContextMode, "active_file");
   assert.equal(settings.leaMaxSpendUsd, 12.5);
   assert.equal(settings.leaApiKey, "legacy-openai-key");
@@ -93,7 +91,7 @@ test("invalid latex context mode is rejected", () => {
 test("derives local path defaults when env values are absent", () => {
   const settings = applyEnvDefaults({}, {});
 
-  assert.equal(settings.leaRepoPath, path.resolve(PROJECT_ROOT, "../..", "vendor", "lea-prover"));
+  assert.equal(settings.leaRepoPath, path.resolve(PROJECT_ROOT, "../..", "apps", "lea-standalone", "prover"));
   assert.equal(settings.leaLatexContextMode, "off");
   assert.equal(settings.leaMaxSpendUsd, null);
 });

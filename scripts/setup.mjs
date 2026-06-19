@@ -8,7 +8,7 @@ import { MONOREPO_ROOT, ROOT_ENV_PATH, patchEnvFile, readDotEnv } from "./env.mj
 // Unified monorepo setup.
 //
 // The backend is now the standalone app (apps/lea-standalone): a FastAPI adapter
-// that drives the modern prover in-process. There is no separate `vendor/lea-prover`
+// that drives the modern prover in-process. There is no separate vendored-prover
 // submodule and no separate lea-ui server — the Lea Python environment + Lean cache
 // are provisioned by the standalone app's own `setup:api`, which we delegate to.
 
@@ -25,7 +25,6 @@ const DEFAULT_ENV = {
   LEA_ROOT: "apps/lea-standalone/prover",
   // The standalone adapter is the single backend; both apps talk to it on :8001.
   LEA_API_BASE_URL: "http://127.0.0.1:8001",
-  LEA_API_FLAVOR: "api",
   OVERLEAF_COMPANION_URL: "http://127.0.0.1:31245",
   LEA_PROVIDER: "openai",
   LEA_MODEL: "o4-mini",
@@ -100,7 +99,6 @@ async function writeOverleafSettings() {
     leaRepoPath: LEA_ROOT,
     leaWorkspacePath: LEA_WORKSPACE,
     leaApiBaseUrl: settings.leaApiBaseUrl || env.LEA_API_BASE_URL || DEFAULT_ENV.LEA_API_BASE_URL,
-    leaApiFlavor: settings.leaApiFlavor || env.LEA_API_FLAVOR || DEFAULT_ENV.LEA_API_FLAVOR,
     leaProvider: settings.leaProvider || env.LEA_PROVIDER || DEFAULT_ENV.LEA_PROVIDER,
     leaModel: settings.leaModel || env.LEA_MODEL || DEFAULT_ENV.LEA_MODEL,
     leaMaxTurns: settings.leaMaxTurns || Number(env.LEA_MAX_TURNS || DEFAULT_ENV.LEA_MAX_TURNS),

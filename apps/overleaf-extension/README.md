@@ -11,8 +11,7 @@ Overleaf page -> Chrome extension -> companion (:31245) -> FastAPI adapter (:800
 ```
 
 The adapter then drives the vendored prover at `apps/lea-standalone/prover/`
-in-process. The companion does not start its own prover backend in the current
-`LEA_API_FLAVOR=api` mode.
+in-process. The companion does not start its own prover backend.
 
 For beta testers installing from a pinned release tag, see
 [BETA_INSTALL.md](BETA_INSTALL.md).
@@ -52,7 +51,7 @@ The optional argument also accepts `uses={...}` and `context={...}`.
 Use `uses={...}` when a theorem should depend on earlier theorems from the same
 Overleaf project. Values are Overleaf labels, not Lean theorem names. Each
 referenced theorem must already be formalized, or at least have a saved sorry
-stub from the legacy flow, before Lea starts the new run.
+stub from an older build, before Lea starts the new run.
 
 ```tex
 \theorem[label=my_next_theorem, uses={my_prior_theorem, another_prior_theorem}]{
@@ -124,7 +123,6 @@ Current default environment values:
 ```text
 LEA_ROOT=apps/lea-standalone/prover
 LEA_API_BASE_URL=http://127.0.0.1:8001
-LEA_API_FLAVOR=api
 LEA_UI_BASE_URL=http://localhost:5173
 OVERLEAF_COMPANION_URL=http://127.0.0.1:31245
 ```
@@ -193,11 +191,6 @@ autonomous adapter run. The adapter records the session, run, messages, code
 steps, and usage, so **View in Lea UI** can deep-link to the standalone proof
 timeline.
 
-The **Stub** / statement-approval flow is currently not available on the
-standalone `/api` backend. If the companion is using `LEA_API_FLAVOR=api`, the
-stub endpoint returns a clear unsupported response instead of launching a run.
-That legacy flow remains relevant only to rollback configurations.
-
 ## Generated Lean Work
 
 Project records and proof files are written in the standalone prover workspace:
@@ -225,9 +218,8 @@ with artifact mapping.
 
 ## Usage And Session Links
 
-In the current `/api` mode, usage comes from the standalone adapter's persisted
-stats endpoint. The companion falls back to its local job index only when the
-adapter is unreachable.
+Usage comes from the standalone adapter's persisted stats endpoint. The
+companion falls back to its local job index only when the adapter is unreachable.
 
 The extension opens Lea sessions through:
 

@@ -54,12 +54,11 @@ OPENAI_API_KEY=sk-...
 Leave these defaults unless Daniel tells you otherwise:
 
 ```text
-LEA_API_BASE_URL=http://127.0.0.1:8000
+LEA_API_BASE_URL=http://127.0.0.1:8001
 LEA_PROVIDER=openai
 LEA_MODEL=o4-mini
 LEA_MAX_TURNS=20
 LEA_JOB_TIMEOUT_SECONDS=900
-LEA_THEOREM_TRANSLATION_MAX_RETRIES=3
 ```
 
 ## 4. Check Your Install
@@ -74,10 +73,10 @@ Every required check should show a checkmark. If anything shows an `x`, fix that
 
 Open two terminal windows or tabs in the repository root.
 
-In the first terminal, start the Lea API:
+In the first terminal, start the shared Lea adapter:
 
 ```sh
-npm run dev:lea
+npm run start:adapter
 ```
 
 In the second terminal, start the Overleaf companion:
@@ -102,7 +101,7 @@ Keep both terminals running while you use the extension.
 http://127.0.0.1:31245
 ```
 
-8. Confirm the Lea repo path points to the monorepo root `vendor/lea-prover` folder.
+8. Confirm the Lea repo path points to `apps/lea-standalone/prover`.
 
 ## 7. Use It In Overleaf
 
@@ -130,7 +129,7 @@ npm run doctor
 Then restart both local services:
 
 ```sh
-npm run dev:lea
+npm run start:adapter
 npm run dev:overleaf
 ```
 
@@ -145,6 +144,6 @@ If setup or doctor fails, send Daniel:
 
 ```sh
 git rev-parse --short HEAD
-git -C vendor/lea-prover rev-parse --short HEAD
+git -C apps/lea-standalone/prover rev-parse --short HEAD
 npm run doctor
 ```

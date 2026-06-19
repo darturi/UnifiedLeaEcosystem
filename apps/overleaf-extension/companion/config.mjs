@@ -6,7 +6,7 @@ import { normalizeModelFamilyId } from "../../../packages/lea-model-catalog/inde
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MONOREPO_ROOT = path.resolve(PROJECT_ROOT, "../..");
-const DEFAULT_LEA_REPO_PATH = path.resolve(MONOREPO_ROOT, "vendor", "lea-prover");
+const DEFAULT_LEA_REPO_PATH = path.resolve(MONOREPO_ROOT, "apps", "lea-standalone", "prover");
 
 export function loadDotEnv(projectRoot = MONOREPO_ROOT, target = process.env) {
   const envRoot = projectRoot === PROJECT_ROOT ? MONOREPO_ROOT : projectRoot;
@@ -24,33 +24,18 @@ export function applyEnvDefaults(settings, env = process.env) {
       : settings.leaMaxSpendUsd,
     "leaMaxSpendUsd"
   );
-  const leaUiServerDir = resolveUnderMonorepo(
-    env.LEA_UI_SERVER_DIR || settings.leaUiServerDir,
-    path.join("apps", "lea-ui", "server")
-  );
   return {
     ...settings,
     leaRepoPath: resolveLeaRoot(env.LEA_REPO_PATH || env.LEA_ROOT || settings.leaRepoPath),
-    leaSharedState: normalizeBoolean(
-      env.LEA_SHARED_STATE !== undefined ? env.LEA_SHARED_STATE : settings.leaSharedState,
-      false
-    ),
     leaNarrateToolSteps: normalizeBoolean(
       env.LEA_NARRATE_TOOL_STEPS !== undefined ? env.LEA_NARRATE_TOOL_STEPS : settings.leaNarrateToolSteps,
       true
     ),
-    leaUiServerDir,
-    leaRecorderPython:
-      env.LEA_RECORDER_PYTHON ||
-      settings.leaRecorderPython ||
-      path.join(leaUiServerDir, ".venv", "bin", "python"),
     leaApiBaseUrl: env.LEA_API_BASE_URL || settings.leaApiBaseUrl || "http://127.0.0.1:8001",
-    leaApiFlavor: normalizeLeaApiFlavor(env.LEA_API_FLAVOR || settings.leaApiFlavor || "api"),
     leaUiBaseUrl: env.LEA_UI_BASE_URL || settings.leaUiBaseUrl || "http://localhost:5173",
     leaProvider: normalizeModelFamilyId(env.LEA_PROVIDER || settings.leaProvider || "openai"),
     leaModel: env.LEA_MODEL || settings.leaModel || "o4-mini",
     leaMaxTurns: parseInt(env.LEA_MAX_TURNS || settings.leaMaxTurns || "20", 10),
-    leaTheoremTranslationMaxRetries: parseInt(env.LEA_THEOREM_TRANSLATION_MAX_RETRIES || settings.leaTheoremTranslationMaxRetries || "3", 10),
     leaJobTimeoutSeconds: parseInt(env.LEA_JOB_TIMEOUT_SECONDS || settings.leaJobTimeoutSeconds || "900", 10),
     leaLatexContextMode: normalizeLeaLatexContextMode(settings.leaLatexContextMode || env.LEA_LATEX_CONTEXT_MODE || "off"),
     leaMaxSpendUsd
@@ -62,11 +47,6 @@ function resolveLeaRoot(value) {
   return path.isAbsolute(value) ? value : path.resolve(MONOREPO_ROOT, value);
 }
 
-function resolveUnderMonorepo(value, fallbackRelative) {
-  const target = value || fallbackRelative;
-  return path.isAbsolute(target) ? target : path.resolve(MONOREPO_ROOT, target);
-}
-
 export function normalizeBoolean(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
   if (typeof value === "boolean") return value;
@@ -74,12 +54,6 @@ export function normalizeBoolean(value, fallback = false) {
   if (["true", "1", "yes", "on"].includes(text)) return true;
   if (["false", "0", "no", "off"].includes(text)) return false;
   return fallback;
-}
-
-export function normalizeLeaApiFlavor(value) {
-  const flavor = String(value || "api").trim().toLowerCase();
-  if (flavor === "api" || flavor === "v1") return flavor;
-  throw new Error("leaApiFlavor must be 'api' (standalone adapter) or 'v1' (legacy vendored API)");
 }
 
 export function normalizeLeaLatexContextMode(value) {

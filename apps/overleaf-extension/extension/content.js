@@ -3,7 +3,6 @@
   const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
-  const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
   const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
   const LATEX_CONTEXT_SYNC_DELAY_MS = 750;
   const MODEL_FAMILY_LABELS = {
@@ -204,12 +203,6 @@
     if (status === "unformalized") {
       return [
         {
-          role: "theorem-stub",
-          label: "Stub",
-          pendingText: "Asking Lea for a sorry stub...",
-          run: stub
-        },
-        {
           role: "theorem-action",
           label: "Formalize",
           primary: true,
@@ -223,7 +216,7 @@
         role: "theorem-action",
         label: "Formalize",
         primary: true,
-        pendingText: "Approving Lea stub and starting proof search...",
+        pendingText: "Starting Lea...",
         run: formalize
       }];
     }
@@ -314,10 +307,6 @@
             <input type="number" min="0" step="0.01" data-role="max-spend" placeholder="None">
           </label>
           <label>
-            <span>Translation retries</span>
-            <input type="number" min="1" max="50" data-role="theorem-translation-max-retries">
-          </label>
-          <label>
             <span>LaTeX context</span>
             <select data-role="latex-context-mode">
               <option value="off">Off</option>
@@ -335,7 +324,6 @@
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
     const maxSpendInput = popover.querySelector("[data-role='max-spend']");
-    const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
     const latexContextModeInput = popover.querySelector("[data-role='latex-context-mode']");
     const saveButton = popover.querySelector("[data-role='save-settings']");
 
@@ -343,7 +331,6 @@
     modelSelect.addEventListener("change", markSettingsDirty);
     maxTurnsInput.addEventListener("input", markSettingsDirty);
     maxSpendInput.addEventListener("input", markSettingsDirty);
-    theoremTranslationMaxRetriesInput.addEventListener("input", markSettingsDirty);
     latexContextModeInput.addEventListener("change", markSettingsDirty);
     for (const button of popover.querySelectorAll("[data-role='provider-key-toggle']")) {
       button.addEventListener("click", () => {
@@ -367,7 +354,6 @@
         popover.dataset.savedModel = settings.leaModel;
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
         popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
-        popover.dataset.savedTheoremTranslationMaxRetries = String(settings.leaTheoremTranslationMaxRetries);
         popover.dataset.savedLatexContextMode = settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE;
         renderProviderKeys(popover, settings.leaProviderKeys || {});
         clearProviderKeyInputs(popover);
@@ -402,7 +388,6 @@
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
         String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
         normalizeMaxSpendInput(maxSpendInput.value) !== (popover.dataset.savedMaxSpend || "") ||
-        String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES) !== popover.dataset.savedTheoremTranslationMaxRetries ||
         latexContextModeInput.value !== (popover.dataset.savedLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE) ||
         hasProviderKeyInput(popover);
       saveButton.disabled = !dirty || !selectedFamilyConfigured;
@@ -481,30 +466,6 @@
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        overleafProjectId: extractOverleafProjectId(),
-        theoremLabel: theorem.label,
-        theoremText: theorem.text,
-        theoremUses: theorem.uses || [],
-        theoremContext: theorem.context || "",
-        sourceHash: await sha256(normalizeTheoremText(theorem.text))
-      })
-    });
-
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
-    }
-    return payload;
-  }
-
-  async function stub(theorem) {
-    await syncLatexContextNow({ force: true });
-    const settings = await getSettings();
-    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
-    const response = await fetch(`${baseUrl}/stub`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -880,12 +841,11 @@
     return chrome.storage.sync.get({
       companionUrl: DEFAULT_COMPANION_URL,
       leaRepoPath: "",
-      leaApiBaseUrl: "http://127.0.0.1:8000",
+      leaApiBaseUrl: "http://127.0.0.1:8001",
       leaUiBaseUrl: DEFAULT_LEA_UI_BASE_URL,
       leaModel: DEFAULT_LEA_MODEL,
       leaMaxTurns: DEFAULT_LEA_MAX_TURNS,
       leaMaxSpendUsd: null,
-      leaTheoremTranslationMaxRetries: DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
       leaLatexContextMode: DEFAULT_LEA_LATEX_CONTEXT_MODE
     });
   }
@@ -902,13 +862,12 @@
       const settings = {
         companionUrl: baseUrl,
         leaRepoPath: payload.leaRepoPath || stored.leaRepoPath || "",
-        leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
+        leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8001",
         leaUiBaseUrl: payload.leaUiBaseUrl || stored.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL,
         leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
         leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
         leaMaxSpendUsd: payload.leaMaxSpendUsd ?? stored.leaMaxSpendUsd ?? null,
         leaCurrentSpendUsd: payload.leaCurrentSpendUsd ?? 0,
-        leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries || stored.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
         leaLatexContextMode: payload.leaLatexContextMode || stored.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE,
         leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
         leaProviderKeys: payload.leaProviderKeys || {}
@@ -921,7 +880,6 @@
         leaModel: settings.leaModel,
         leaMaxTurns: settings.leaMaxTurns,
         leaMaxSpendUsd: settings.leaMaxSpendUsd,
-        leaTheoremTranslationMaxRetries: settings.leaTheoremTranslationMaxRetries,
         leaLatexContextMode: settings.leaLatexContextMode
       });
       return settings;
@@ -940,7 +898,6 @@
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
     const maxSpendInput = popover.querySelector("[data-role='max-spend']");
-    const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
     const latexContextModeInput = popover.querySelector("[data-role='latex-context-mode']");
     popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
     renderProviderKeys(popover, settings.leaProviderKeys || {});
@@ -952,12 +909,10 @@
     );
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
     maxSpendInput.value = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
-    theoremTranslationMaxRetriesInput.value = String(settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
     latexContextModeInput.value = settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE;
     popover.dataset.savedModel = modelSelect.value;
     popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
     popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
-    popover.dataset.savedTheoremTranslationMaxRetries = String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
     popover.dataset.savedLatexContextMode = latexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
     popover.querySelector("[data-role='save-settings']").disabled = true;
   }
@@ -1075,7 +1030,6 @@
     const leaModel = popover.querySelector("[data-role='model']").value || DEFAULT_LEA_MODEL;
     const leaMaxTurns = Number.parseInt(popover.querySelector("[data-role='max-turns']").value, 10) || DEFAULT_LEA_MAX_TURNS;
     const leaMaxSpendUsd = parseMaxSpendInput(popover.querySelector("[data-role='max-spend']").value);
-    const leaTheoremTranslationMaxRetries = Number.parseInt(popover.querySelector("[data-role='theorem-translation-max-retries']").value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
     const leaLatexContextMode = popover.querySelector("[data-role='latex-context-mode']").value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
     const response = await fetch(`${baseUrl}/settings/lea`, {
       method: "POST",
@@ -1086,7 +1040,6 @@
         leaModel,
         leaMaxTurns,
         leaMaxSpendUsd,
-        leaTheoremTranslationMaxRetries,
         leaLatexContextMode,
         leaProviderApiKeys: collectProviderApiKeyPatch(popover)
       })
