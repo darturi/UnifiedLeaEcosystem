@@ -115,17 +115,22 @@
     explicit Push, target-confirm, disabled w/o token) + the redacted token field in the fixed Settings page
     (D43). Push is outward-facing → always an explicit button, never automatic.</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
-    <b>SafeVerify can't audit a project proof that imports a sibling lemma.</b> A project
-    submission that does <code>import Lea.&lt;Project&gt;.Foo</code> fails SafeVerify with
+    <b style="color:#2e7d32">✓ RESOLVED — SafeVerify now audits a project proof that imports a sibling lemma.</b>
+    Previously a submission that did <code>import Lea.&lt;Project&gt;.Foo</code> failed SafeVerify with
     <code>unknown module prefix 'Lea'</code>: <code>safe_verify</code> replays oleans inside its own
-    Lake project (<code>third_party/SafeVerify</code>), whose search path has only its packages +
+    Lake project (<code>third_party/SafeVerify</code>), whose search path had only its packages +
     Mathlib — not the main workspace's compiled <code>Lea.*</code> oleans
     (<code>workspace/.lake/build/lib/lean</code>). Loose proofs (single file, Mathlib-only imports)
-    are unaffected; chaining proofs surfaced it (Q2/F3 testing). <span class="fix"><b>Fix
-    direction:</b> when the submission imports project modules, add the workspace build lib to
-    <code>safe_verify</code>'s <code>LEAN_PATH</code> (and ensure the sibling olean is built) in
-    <code>prover/lea/safeverify.py</code> → <code>verify_proof</code> (the <code>lake exe safe_verify</code>
-    invocation, <code>cwd=SAFE_VERIFY_DIR</code>).</span>
+    were unaffected; chaining proofs surfaced it (Q2/F3 testing). <span class="fix"><b>Fix shipped:</b>
+    a <code>_replay_env(lake_project)</code> helper in <code>prover/lea/safeverify.py</code> prepends
+    <code>&lt;lake_project&gt;/.lake/build/lib/lean</code> to <code>LEAN_PATH</code> for the
+    <code>lake exe safe_verify</code> replay only (<code>lake exe</code> preserves + appends to an inherited
+    <code>LEAN_PATH</code>), so the kernel resolves sibling <code>Lea.*</code> oleans; Mathlib resolution is
+    untouched (the build lib holds only <code>Lea/*</code>) and it's a no-op when the dir is absent. The
+    "ensure the olean is built" half is already enforced by the gating submission-compile step (a missing
+    sibling fails there first with a clear <code>Submission compile failed</code>). Verified end-to-end
+    through <code>interface.verify()</code> (sibling-import → ok, Mathlib-only → ok, <code>sorry</code> →
+    rejected) + 3 new tests in <code>tests/interface/test_verify.py</code> (2 fast, 1 opt-in real-binary).</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>Blueprint graph: distinguish "Proved" from "SafeVerify-audited" (correctness, low priority).</b>
     A node's <code>proved</code> status today means the standalone <b>Lean check</b> passed (no
@@ -133,12 +138,11 @@
     SafeVerify is the stronger, audit-grade verdict (kernel replay + per-decl match + axiom
     whitelist) and should take precedence: a node is truly <b>Proved</b> only once SafeVerify passes;
     a Lean-check-clean-but-unaudited node should read as something like <b>"check ✓ · audit pending."</b>
-    (Blocked in practice by the SafeVerify project-import gap above — sibling-importing proofs can't be
-    audited yet.) <span class="fix"><b>Fix direction:</b> add a SafeVerify verdict source feeding
+    (<b>Now unblocked</b> — the SafeVerify project-import gap above is resolved, so sibling-importing
+    proofs are auditable.) <span class="fix"><b>Fix direction:</b> add a SafeVerify verdict source feeding
     <code>graph.py</code> <code>_base_status</code> (a new status above <code>proved</code>, e.g.
     <code>verified</code>, or a <code>verified: bool</code> flag on the node); surface it in
-    <code>BlueprintGraph.tsx</code> (<code>STATUS_LABEL</code> + a swatch) and the node detail. Resolve
-    the LEAN_PATH gap first so project proofs are auditable.</span>
+    <code>BlueprintGraph.tsx</code> (<code>STATUS_LABEL</code> + a swatch) and the node detail.</span>
   </div>
 
   <!-- ============ SLICE 1 ============ -->

@@ -28,6 +28,7 @@ detects and accepts that specific false-positive class (`_universe_alpha_equiv`)
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -141,6 +142,31 @@ def _universe_alpha_equiv(safe_verify_output: str) -> bool:
     return expected == got
 
 
+def _replay_env(lake_project: Path) -> dict[str, str]:
+    """Subprocess env for the `lake exe safe_verify` replay, with the main
+    workspace's compiled `Lea.*` oleans added to `LEAN_PATH`.
+
+    The replay runs under SafeVerify's own Lake project, whose search path knows
+    only its packages + Mathlib — not the workspace where project proofs live. A
+    submission that `import`s a sibling lemma (`import Lea.<Project>.Foo`) would
+    otherwise fail with `unknown module prefix 'Lea'`. `lake exe` preserves and
+    appends to an inherited `LEAN_PATH`, so prepending the workspace build lib
+    lets the kernel resolve those oleans without disturbing Mathlib resolution
+    (the build lib holds only `Lea/*`). Mathlib-only proofs are unaffected — the
+    extra entry is consulted only when an earlier one doesn't satisfy the import.
+
+    The sibling olean must already be built; the gating submission-compile step
+    (`lake env lean`, which sees the same build lib) enforces this — a missing
+    sibling fails there first with a clear `Submission compile failed`.
+    """
+    env = dict(os.environ)
+    build_lib = lake_project / ".lake" / "build" / "lib" / "lean"
+    if build_lib.is_dir():
+        existing = env.get("LEAN_PATH")
+        env["LEAN_PATH"] = str(build_lib.resolve()) + (os.pathsep + existing if existing else "")
+    return env
+
+
 def _compile_to_olean(source: Path, out: Path, lake_project: Path, timeout: int) -> tuple[bool, str]:
     try:
         result = subprocess.run(
@@ -197,7 +223,7 @@ def verify_proof(
                  str(target_olean.resolve()), str(submission_olean.resolve()),
                  "--disallow-partial", "-s", str(report_path.resolve())],
                 capture_output=True, text=True, timeout=safe_verify_timeout,
-                cwd=str(SAFE_VERIFY_DIR),
+                cwd=str(SAFE_VERIFY_DIR), env=_replay_env(lake_project),
             )
         except subprocess.TimeoutExpired:
             return False, f"SafeVerify timed out ({safe_verify_timeout}s)"
