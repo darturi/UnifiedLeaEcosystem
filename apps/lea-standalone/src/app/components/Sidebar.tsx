@@ -13,6 +13,7 @@ export function Sidebar({
   onNewSession,
   onSelectProject,
   onNewProject,
+  onOpenSearch,
   onOpenSettings,
   onOpenStats,
   onCollapse,
@@ -23,6 +24,7 @@ export function Sidebar({
   onNewSession: () => void;
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
+  onOpenSearch: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
   onCollapse: () => void;
@@ -51,9 +53,9 @@ export function Sidebar({
       <button className="newbtn" onClick={onNewSession}>
         <span className="plus">+</span> New proof
       </button>
-      <div className="searchbtn" title="Search is coming in a later pass" style={{ opacity: 0.6 }}>
+      <button className="searchbtn" onClick={onOpenSearch} title="Search all proofs (⌘K)">
         🔍 Search all proofs <span className="kbd">⌘K</span>
-      </div>
+      </button>
 
       <div className="sb-scroll">
         <div className="proj-group">

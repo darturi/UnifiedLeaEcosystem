@@ -58,6 +58,35 @@ def list_project_sessions(project_id: str) -> list[dict]:
     return _list_sessions("s.project_id = ?", (project_id,))
 
 
+# Fields the search endpoint returns per hit — the session plus its project tag. A
+# light projection of the full `_list_sessions` dict (the overlay needs no usage rollups).
+_SEARCH_FIELDS = (
+    "id", "title", "status", "updated_at",
+    "project_id", "project_title", "project_namespace",
+)
+
+
+def _escape_like(text: str) -> str:
+    """Escape a user query for a LIKE pattern (so `%`/`_` are literal, not wildcards)."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_sessions(query: str, limit: int = 30) -> list[dict]:
+    """Sessions whose title — or whose project's title — matches `query`, newest first
+    (D31/D41). Backs `GET /api/search`: the only way to reach a project session, which
+    the sidebar hides. Case-insensitive SQLite LIKE (FTS5 is a later upgrade). Each hit
+    carries its project tag so the overlay can section loose vs in-project. Blank → []."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{_escape_like(q)}%"
+    rows = _list_sessions(
+        "(s.title like ? escape '\\' or p.title like ? escape '\\')",
+        (like, like),
+    )
+    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows[:limit]]
+
+
 def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
     where_sql = f"where {extra_where}" if extra_where else ""
     with connect() as conn:

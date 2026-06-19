@@ -18,6 +18,7 @@ import type {
   ProjectGraph,
   BlueprintWarning,
   TreeEntry,
+  SearchResult,
 } from './types';
 
 export * from './types';
@@ -297,6 +298,16 @@ export async function putProjectFile(
 // The browser navigates here to download the project as a zip.
 export function projectExportUrl(projectId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/export`;
+}
+
+// ── Global search (Slice 7, D41) ──────────────────────────────────────────────
+// Sessions matching the query by their own title or their project's title, each
+// tagged with its project. The only way to reach a project session (sidebar-hidden).
+export async function searchSessions(query: string): Promise<SearchResult[]> {
+  const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+  if (!response.ok) throw new Error(await detailMessage(response, `Search failed: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.results) ? data.results : [];
 }
 
 // ── Writeable canvas + manual checks (F5 wires the UI to these) ────────────────

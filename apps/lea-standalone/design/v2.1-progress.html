@@ -85,8 +85,8 @@
     (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
   </div>
 
-  <div class="bar"><i style="width:88%"></i></div>
-  <div class="counts"><b>22 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 6 · 6a complete</b> — the project repo is browsable + editable: a new <code>filesystem.py</code> service + routes give a tree + read/edit-any-file (write+commit, path-escape guarded, <code>.lean</code> → <code>check</code> verdict) + zip export (U1/U2), wired into a two-pane <b>Filesystem tab</b> (F8 — tree · viewer/editor · Export), <b>confirmed live</b>. <b>6b deferred</b>: GitHub push + the Settings token field (U3) wait on the <code>SettingsPage.tsx</code> fix — see Known gaps.</div>
+  <div class="bar"><i style="width:96%"></i></div>
+  <div class="counts"><b>24 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 7 complete</b> — ⌘K global search: <code>GET /api/search?q=</code> matches a session by its own or its project's title, each hit project-tagged (V1, <code>store.search_sessions</code> + <code>routes/search.py</code>, 7 tests); a <b>spotlight overlay</b> (F9 — debounced, sectioned Loose chats / Inside projects, ↑/↓/↵/esc) mounted across every view and wired to both ⌘K and the sidebar button, the only path to a sidebar-hidden project session. <b>Confirmed live.</b> All seven slices land; the one remaining item is <b>6b — deferred</b> (GitHub push + Settings token / U3) pending the <code>SettingsPage.tsx</code> fix (see Known gaps).</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -320,15 +320,15 @@
     <h2>Slice 7 · Search</h2>
     <div class="ghint">The only way to reach a hidden project session from outside its window. Ends with: ⌘K global search across loose + project sessions.</div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id">V1</span><span class="title">Global search endpoint</span>
-        <span class="tag be">backend</span><span class="dec">D31</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><code>GET /api/search?q=</code> across loose + project sessions, each tagged with its project (SQLite LIKE first; FTS5 later).</div>
+        <span class="tag be">backend</span><span class="dec">D31</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>GET /api/search?q=</code> across loose + project sessions, matching a session by its own title <b>or</b> its project's title, each hit tagged with its project (<code>store.search_sessions</code> reuses <code>_list_sessions</code>, so results arrive pre-tagged + status-derived; LIKE with wildcard-escaping, FTS5 later). New <code>routes/search.py</code>. <b>7 new tests; full 182-test adapter suite green.</b> Confirmed live in the UI.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id fe">F9</span><span class="title">⌘K global search overlay</span>
-        <span class="tag fe">frontend</span><span class="dec">D41</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><code>SearchOverlay.tsx</code>: centered modal, sectioned results (Loose chats / Inside projects, project-tagged), keyboard-driven (⌘K · ↑/↓ · Enter · Esc). Realizes the v2 mockup's search overlay.</div>
+        <span class="tag fe">frontend</span><span class="dec">D41</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>SearchOverlay.tsx</code>: spotlight modal, debounced query, sectioned results (Loose chats / Inside projects, project-tagged), keyboard-driven (⌘K/Ctrl+K toggle · ↑/↓ · ↵ open · esc). Mounted across every view in <code>App.tsx</code> (global ⌘K listener) so it opens from anywhere; a hit opens the session in Chat+Canvas (<code>searchSessions</code> + <code>SearchResult</code> in <code>api.ts</code>). Also wired the sidebar's <b>Search all proofs</b> button (a dead stub) to the overlay. <b>Confirmed live — both ⌘K and the button open it.</b></div>
     </div>
   </div>
 

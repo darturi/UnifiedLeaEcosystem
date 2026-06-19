@@ -6,6 +6,7 @@ import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
 import { ProjectWindow } from './components/ProjectWindow';
 import { NewProjectDialog } from './components/NewProjectDialog';
+import { SearchOverlay } from './components/SearchOverlay';
 import { sortCodeSteps } from './lib/timeline.mjs';
 import { pickInitialSession, stripSessionParam } from './sessionDeepLink.mjs';
 import { useProofSession } from './stores/proofSession';
@@ -47,6 +48,8 @@ export default function App() {
   const closeProject = useProjects((s) => s.closeProject);
   const createAndOpenProject = useProjects((s) => s.createAndOpen);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
+  // F9: ⌘K global search overlay — the only path to a sidebar-hidden project session.
+  const [searchOpen, setSearchOpen] = useState(false);
   // messages + statusEvents (chat thread content) now live in the proofSession
   // store (R1c-2a): App writes them; ChatThread reads them + derives the timeline.
   const setMessages = useProofSession((s) => s.setMessages);
@@ -226,6 +229,26 @@ export default function App() {
     loadSession(sessionId).catch((err) => setError(err instanceof Error ? err.message : String(err)));
   };
 
+  // F9: open a search hit — leave any project window, drop into its Chat+Canvas.
+  // Works for loose and project sessions alike (loadSession is keyed only by id).
+  const handleOpenSearchResult = (sessionId: string) => {
+    closeProject();
+    setView('main');
+    loadSession(sessionId).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+
+  // F9: ⌘K (and Ctrl+K) toggles the global search overlay, from any view.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setSearchOpen((v) => !v);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const resetForNewSession = () => {
     closeStream();
     setSelectedSessionId(undefined);
@@ -318,29 +341,51 @@ export default function App() {
     return result;
   };
 
+  // F9: the overlay rides alongside every view so ⌘K works from anywhere.
+  const searchOverlay = (
+    <SearchOverlay
+      open={searchOpen}
+      onClose={() => setSearchOpen(false)}
+      onOpenSession={handleOpenSearchResult}
+    />
+  );
+
   if (view === 'project' && currentProject)
     return (
-      <ProjectWindow
-        project={currentProject}
-        onBack={leaveProject}
-        onStartProof={handleStartProjectProof}
-        onOpenSession={handleOpenProjectSession}
-      />
+      <>
+        {searchOverlay}
+        <ProjectWindow
+          project={currentProject}
+          onBack={leaveProject}
+          onStartProof={handleStartProjectProof}
+          onOpenSession={handleOpenProjectSession}
+        />
+      </>
     );
-  if (view === 'stats') return <StatsPage onBack={() => setView('main')} />;
+  if (view === 'stats')
+    return (
+      <>
+        {searchOverlay}
+        <StatsPage onBack={() => setView('main')} />
+      </>
+    );
   if (view === 'settings')
     return (
-      <SettingsPage
-        onBack={() => {
-          setView('main');
-          // re-sync model + key state after the user may have added a key
-          useModel.getState().syncFromSettings();
-        }}
-      />
+      <>
+        {searchOverlay}
+        <SettingsPage
+          onBack={() => {
+            setView('main');
+            // re-sync model + key state after the user may have added a key
+            useModel.getState().syncFromSettings();
+          }}
+        />
+      </>
     );
 
   return (
     <div className="lea-app">
+      {searchOverlay}
       <NewProjectDialog
         open={newProjectOpen}
         onClose={() => setNewProjectOpen(false)}
@@ -359,6 +404,7 @@ export default function App() {
           }}
           onSelectProject={openProjectWindow}
           onNewProject={() => setNewProjectOpen(true)}
+          onOpenSearch={() => setSearchOpen(true)}
           onOpenSettings={() => setView('settings')}
           onOpenStats={() => setView('stats')}
           onCollapse={() => setSidebarCollapsed(true)}

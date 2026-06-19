@@ -132,6 +132,20 @@ export interface ProjectGraph {
   edges: GraphEdge[];
 }
 
+// ── Global search (v2.1 Slice 7, D41) ─────────────────────────────────────────
+// A search hit is a session, tagged with its project (null for loose chats) so the
+// ⌘K overlay can section "Loose chats" vs "Inside projects". The only path to a
+// project session, which the sidebar hides.
+export interface SearchResult {
+  id: string;
+  title: string;
+  status: SessionStatus;
+  updated_at: string;
+  project_id: string | null;
+  project_title?: string | null;
+  project_namespace?: string | null;
+}
+
 // ── Filesystem tab (v2.1 Slice 6, D34) ────────────────────────────────────────
 // The project repo as a browsable tree. A dir carries `children`; a file carries
 // `size`. `path` is repo-relative POSIX. `.git/`/`.lake/` are hidden server-side.
