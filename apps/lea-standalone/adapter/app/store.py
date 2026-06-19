@@ -476,6 +476,22 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     return row_to_dict(row) if row else None
 
 
+def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
+    """Every code_step for a file across a project's sessions, newest first — the raw
+    material for a blueprint node's status + session attribution (D29). Joins on the
+    session's project_id so loose sessions never leak in. Ordered by `created_at`
+    (cross-session recency; `seq` is only meaningful within one session), so the first
+    row is the latest verdict and the distinct session order is newest-touched-first."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select c.* from code_steps c join sessions s on s.id = c.session_id "
+            "where s.project_id = ? and c.path = ? "
+            "order by c.created_at desc, c.seq desc",
+            (project_id, path),
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
 def latest_agent_code_step(session_id: str) -> dict | None:
     """The most recent agent-authored code_step — the proof state the agent last
     'knew' (D12). Diffing its commit against HEAD reveals any human edits since."""

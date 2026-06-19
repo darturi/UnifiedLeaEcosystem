@@ -234,8 +234,8 @@
     </div>
     <div class="todo">
       <div class="top"><span class="id">T2</span><span class="title">Derived status + session attribution → <code>/graph</code></span>
-        <span class="tag be">backend</span><span class="dec">D28/D29</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope">Status derived from live Lean (decl resolves? <code>check</code>/<code>verify</code>? <code>sorry</code> scan? dep readiness). <b>Session attribution derived</b> from <code>code_steps</code> (locate node's <code>lean:</code> decl → file → committing sessions; newest = <code>last_modified_by</code>). <code>GET /graph → {nodes(kind,status,sessions,last_modified_by), edges}</code>.</div>
+        <span class="tag be">backend</span><span class="dec">D28/D29</span><span class="badge b-prog">Built · tests green</span></div>
+      <div class="scope"><code>app/graph.py</code>: namespace-aware <code>.lean</code> scan → <code>FQN→file</code> map resolves each node's <code>lean:</code> decl; status derived from the <b>stored verdict</b> (<code>code_step.check_status</code>, no recompile) <b>+ a decl-span <code>sorry</code> scan</b> — <code>planned · stated · ready · proved · failed</code>, with <code>ready</code> overlaid when every dep is proved. <b>Session attribution derived</b> from <code>code_steps</code> (new <code>store.code_steps_for_project_path</code>: node's file → committing sessions newest-first; newest = <code>last_modified_by</code>). <code>GET /graph → {nodes(kind,status,sessions,last_modified_by,file), edges}</code>. <i>Live-verified on Real Analysis — correctly caught that <code>sorry</code>-bearing proofs that compile <code>ok</code> are</i> stated, <i>not</i> proved. <i>4 graph unit + route test; 160 adapter tests green.</i></div>
     </div>
     <div class="todo">
       <div class="top"><span class="id fe">F6</span><span class="title">Blueprint tab: markdown authoring view</span>

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from ..config import load_config
 from .. import blueprint as blueprint_doc
+from .. import graph as graph_service
 from .. import projects as project_service
 from .. import store
 from .. import uploads
@@ -156,6 +157,14 @@ def put_blueprint(project_id: str, request: DocUpdate) -> dict:
     project = _require_project(project_id)
     sha = project_service.write_doc(project, _proofs_root(), "blueprint.md", request.content)
     return {"content": request.content, "commit_sha": sha, "warnings": blueprint_doc.validate(request.content)}
+
+
+@router.get("/api/projects/{project_id}/graph")
+def get_graph(project_id: str) -> dict:
+    # T2: parse the blueprint + derive each node's live status and session
+    # attribution (D28/D29). Cheap — reuses stored verdicts, never recompiles.
+    project = _require_project(project_id)
+    return graph_service.build_graph(project, _proofs_root())
 
 
 # ── Files: upload / list / download / delete (S1/S2, D27) ────────────────────────

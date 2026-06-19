@@ -206,6 +206,29 @@ def test_blueprint_route_returns_validator_warnings(tmp_path, monkeypatch):
     assert any("ghost" in w["message"] for w in projects_route.get_blueprint(pid)["warnings"])
 
 
+def test_graph_route_derives_node_status(tmp_path, monkeypatch):
+    # T2: GET /graph parses the blueprint and derives status from the stored verdict.
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+    repo = proofs / "Lea" / "Analysis"
+
+    (repo / "helper.lean").write_text("import Mathlib\nnamespace Lea.Analysis\nlemma helper : True := trivial\nend Lea.Analysis\n")
+    projects_route.put_blueprint(pid, DocUpdate(content="## helper\n- kind: lemma\n- lean: `Lea.Analysis.helper`\n\nA helper.\n"))
+    sess = store.create_session("w", project_id=pid)["id"]
+    store.add_code_step(sess, None, "helper.lean", commit_sha="a" * 40, check_status="ok")
+
+    result = projects_route.get_graph(pid)
+    node = result["nodes"][0]
+    assert node["key"] == "helper"
+    assert node["status"] == "proved"
+    assert node["last_modified_by"] == sess
+
+    with pytest.raises(HTTPException) as exc:
+        projects_route.get_graph("nope")
+    assert exc.value.status_code == 404
+
+
 def test_put_doc_feeds_composed_context(tmp_path, monkeypatch):
     # The edited Instructions/Memory must show up in the next run's context (D25/D26).
     from app import projects as project_service
