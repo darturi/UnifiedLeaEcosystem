@@ -274,11 +274,11 @@ def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: Bac
     `.lea/files/overleaf/` (resolving/creating the project by slug, like `/api/runs`).
     Reconcile is synchronous (files on disk + indexed before returning); the git commit
     is **deferred** to a background task so the formalize path never waits on git."""
+    proofs_root = _proofs_root()
     try:
-        project = store.get_or_create_project(slug)
+        project = project_service.ensure_project(slug, proofs_root)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    proofs_root = _proofs_root()
     incoming = [{"path": f.path, "content": f.content} for f in request.files]
     try:
         summary = uploads.sync_overleaf_tex(project, proofs_root, incoming, commit=False)

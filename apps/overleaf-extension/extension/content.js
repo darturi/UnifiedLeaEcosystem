@@ -22,6 +22,7 @@
   let latestActiveTexProjectId = "";
   let lastMirrorFiles = null;
   let lastMirrorProjectId = "";
+  let texMirrorActivatedProjectId = "";
   let texMirrorDirty = false;
   let texMirrorSyncedOnce = false;
   let texMirrorSyncTimer = null;
@@ -552,6 +553,11 @@
   // companion's /mirror-tex → adapter). Driven in the background as the document
   // changes; `force` flushes a pending sync before a formalize. Skips all work when
   // nothing has changed since the last successful mirror (the formalize fast path).
+  //
+  // Lazy project creation: a Lea project must only come into being once the user
+  // actually formalizes — never from merely opening or editing an Overleaf tab. So a
+  // `force` sync (the formalize flush) ACTIVATES mirroring for this project; background
+  // syncs stay completely inert (no zip fetch, no /mirror-tex, no project) until then.
   async function syncTexMirrorNow({ force }) {
     clearTimeout(texMirrorSyncTimer);
     texMirrorSyncTimer = null;
@@ -563,6 +569,12 @@
 
     const projectId = latestActiveTexProjectId || extractOverleafProjectId();
     if (!projectId || projectId === "unknown") return null;
+
+    if (force) {
+      texMirrorActivatedProjectId = projectId;  // formalizing activates this project
+    } else if (texMirrorActivatedProjectId !== projectId) {
+      return null;  // background activity never creates/mirrors before the first formalize
+    }
 
     // Fast path: nothing changed since the last mirror for this project.
     if (!force && !texMirrorDirty && texMirrorSyncedOnce && lastMirrorProjectId === projectId) {
