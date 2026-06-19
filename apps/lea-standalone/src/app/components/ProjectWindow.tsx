@@ -3,6 +3,7 @@ import { ChevronLeft } from 'lucide-react';
 import type { ProjectDetail } from '../lib/api';
 import { MarkdownDoc } from './MarkdownDoc';
 import { FilesCard } from './FilesCard';
+import { BlueprintTab } from './BlueprintTab';
 
 type Tab = 'overview' | 'blueprint' | 'filesystem';
 
@@ -142,11 +143,10 @@ export function ProjectWindow({
             <FilesCard projectId={project.id} refreshSignal={docSignal} />
           </aside>
           </div>
+        ) : tab === 'blueprint' ? (
+          <BlueprintTab projectId={project.id} onOpenSession={onOpenSession} refreshSignal={docSignal} />
         ) : (
-          <div className="pw-empty">
-            The {tab === 'blueprint' ? 'Blueprint' : 'Filesystem'} tab arrives in a
-            later slice.
-          </div>
+          <div className="pw-empty">The Filesystem tab arrives in a later slice.</div>
         )}
       </div>
     </div>

@@ -84,8 +84,8 @@
     (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
   </div>
 
-  <div class="bar"><i style="width:60%"></i></div>
-  <div class="counts"><b>15 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 4 complete</b> — upload reference docs (pdf/tex/docx/images) into a project; pdf/docx text-extracted for the agent (S1, S2, F5 confirmed live — agent read an uploaded .tex)</div>
+  <div class="bar"><i style="width:76%"></i></div>
+  <div class="counts"><b>19 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 5 complete</b> — the blueprint decomposition + interactive dependency graph: <code>.lea/blueprint.md</code> parsed + validated (T1), node status &amp; session attribution derived live from the Lean state (T2), Graph ⇄ Markdown tab with a warnings banner (F6) and a hand-rolled SVG graph — shape = kind, color = live status, click a node → its sessions (F7, confirmed live)</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -117,6 +117,14 @@
     direction:</b> add an <code>expand</code> affordance + modal mode to <code>MarkdownDoc.tsx</code>
     (reuse the existing <code>.modal-*</code> styles from <code>NewProjectDialog</code>); the inline and
     modal editors share one <code>draft</code>/<code>save()</code> so either entry point works.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Blueprint graph: give the graph canvas more width (UX, low priority).</b> The graph
+    currently shares the Blueprint tab in a two-column layout (canvas + a 280px detail/legend
+    rail), so a wide decomposition feels cramped. Give the canvas more room. <span class="fix"><b>Fix
+    direction:</b> in <code>lea-v2.css</code>, widen <code>.bp-graph</code> (raise the
+    <code>.pw-body</code> max-width for the blueprint tab, and/or move the legend/detail rail below
+    the canvas on wide graphs so the SVG spans full width); optionally make the detail panel a
+    dismissible overlay rather than a fixed column.</span>
   </div>
 
   <!-- ============ SLICE 1 ============ -->
@@ -229,23 +237,23 @@
 
     <div class="todo">
       <div class="top"><span class="id">T1</span><span class="title">Blueprint format + parser + validator + GET/PUT</span>
-        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-prog">Built · tests green</span></div>
+        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope"><code>.lea/blueprint.md</code> format (<code>## key</code> section + <code>kind</code>/<code>lean</code>/<code>uses</code> header lines + prose). <b>Fence-aware</b> per-section line-scan parser (<code>app/blueprint.py</code>) → nodes + <code>uses</code> edges (no prose regex; a ```-fenced example never spawns a phantom node). A <b>validator returns advisory warnings</b> (duplicate keys · missing/unknown <code>kind</code> · dangling <code>uses</code> edge) — never blocks the save. <code>GET/PUT /blueprint</code> attach <code>warnings</code>; seed reworded (plain prose, no HTML comment); composed context tells the agent the exact format + to keep it current. <i>10 parser/validator unit tests + route round-trip; 155 adapter tests green.</i></div>
     </div>
     <div class="todo">
       <div class="top"><span class="id">T2</span><span class="title">Derived status + session attribution → <code>/graph</code></span>
-        <span class="tag be">backend</span><span class="dec">D28/D29</span><span class="badge b-prog">Built · tests green</span></div>
+        <span class="tag be">backend</span><span class="dec">D28/D29</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope"><code>app/graph.py</code>: namespace-aware <code>.lean</code> scan → <code>FQN→file</code> map resolves each node's <code>lean:</code> decl; status derived from the <b>stored verdict</b> (<code>code_step.check_status</code>, no recompile) <b>+ a decl-span <code>sorry</code> scan</b> — <code>planned · stated · ready · proved · failed</code>, with <code>ready</code> overlaid when every dep is proved. <b>Session attribution derived</b> from <code>code_steps</code> (new <code>store.code_steps_for_project_path</code>: node's file → committing sessions newest-first; newest = <code>last_modified_by</code>). <code>GET /graph → {nodes(kind,status,sessions,last_modified_by,file), edges}</code>. <i>Live-verified on Real Analysis — correctly caught that <code>sorry</code>-bearing proofs that compile <code>ok</code> are</i> stated, <i>not</i> proved. <i>4 graph unit + route test; 160 adapter tests green.</i></div>
     </div>
     <div class="todo">
-      <div class="top"><span class="id fe">F6</span><span class="title">Blueprint tab: markdown authoring view</span>
-        <span class="tag fe">frontend</span><span class="dec">D39</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope">Blueprint tab's authoring sub-view = reuse <code>MarkdownDoc</code> on <code>/blueprint</code> (agent + human, live). Graph ⇄ raw-markdown toggle within the tab.</div>
+      <div class="top"><span class="id fe">F6</span><span class="title">Blueprint tab: markdown authoring view + warnings</span>
+        <span class="tag fe">frontend</span><span class="dec">D39</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>BlueprintTab.tsx</code>: Graph ⇄ Markdown toggle (D33) over the one <code>.lea/blueprint.md</code>. Markdown sub-view reuses <code>MarkdownDoc</code> on <code>/blueprint</code> (agent + human, live; <code>onSaved</code> re-derives the graph). A <b>structural-warnings banner</b> surfaces the validator's advisories (dangling edges, unknown kind) above both views.</div>
     </div>
     <div class="todo">
-      <div class="top"><span class="id fe">F7</span><span class="title">Dependency graph (React Flow + dagre)</span>
-        <span class="tag fe">frontend</span><span class="dec">D38/D42</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope">New dep: <code>@xyflow/react</code> + <code>dagre</code>. <code>ProjectGraph.tsx</code> renders <code>/graph</code> top-down: <b>box=def · ellipse=lemma/theorem</b>, color = live status (white/blue/green/red), legend. Click a node → side panel with statement + <b>attributed sessions</b> (open → Chat+Canvas). Live refresh on the run's asset signal (poll fallback).</div>
+      <div class="top"><span class="id fe">F7</span><span class="title">Dependency graph (hand-rolled SVG, no new deps)</span>
+        <span class="tag fe">frontend</span><span class="dec">D38/D42</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>BlueprintGraph.tsx</code> renders <code>/graph</code> with a <b>hand-rolled layered-DAG layout</b> (longest-dependency-path levels — foundations at the bottom, theorems on top; no <code>@xyflow</code>/<code>dagre</code> dependency). SVG: <b>box = definition · ellipse = lemma/theorem</b>, color = live status (planned/stated/ready/proved/failed) + legend. Click a node → side panel with statement + <code>lean:</code> + <b>attributed sessions</b> (click → opens Chat+Canvas). Re-derives on the project's asset signal + after a markdown save.</div>
     </div>
   </div>
 

@@ -420,3 +420,81 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
   cursor: pointer; text-decoration: none; }
 .file-act:hover { color: var(--ink); background: var(--line); }
 .file-act:disabled { opacity: .4; cursor: default; }
+
+/* ── Blueprint tab: graph + markdown authoring (F6/F7) ──────────────────────── */
+.bp-tab-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; flex-wrap: wrap; }
+.bp-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.bp-seg-btn { display: inline-flex; align-items: center; gap: 5px; padding: 6px 13px; background: var(--panel);
+  border: none; cursor: pointer; font: inherit; font-size: 12.5px; color: var(--muted); }
+.bp-seg-btn:hover { color: var(--ink-2); }
+.bp-seg-btn.active { background: var(--accent-soft); color: var(--ink); font-weight: 550; }
+.bp-seg-btn + .bp-seg-btn { border-left: 1px solid var(--line); }
+.bp-tab-hint { font-size: 12px; color: var(--muted); }
+.bp-tab-hint code, .bp-graph-empty code { font-size: 11.5px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+
+.bp-warns { border: 1px solid var(--amber); background: var(--amber-soft); border-radius: 10px;
+  padding: 10px 14px; margin-bottom: 14px; }
+.bp-warns-head { display: flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--amber); }
+.bp-warns ul { margin: 6px 0 0; padding-left: 20px; }
+.bp-warns li { font-size: 12.5px; color: var(--ink-2); margin: 2px 0; }
+
+.bp-graph { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 18px; align-items: start; }
+@media (max-width: 940px) { .bp-graph { grid-template-columns: 1fr; } }
+.bp-graph-canvas { border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2);
+  overflow: auto; max-height: 70vh; padding: 10px; }
+.bp-graph-side { display: flex; flex-direction: column; gap: 14px; }
+.bp-graph-msg { color: var(--muted); font-size: 13px; padding: 24px; }
+.bp-graph-err { color: var(--red); }
+.bp-graph-empty { border: 1px dashed var(--line); border-radius: 12px; padding: 30px; text-align: center; color: var(--ink-2); }
+.bp-graph-empty p { margin: 0 0 8px; }
+.bp-graph-empty-hint { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+
+/* SVG nodes — fill = status, shape (rect vs ellipse) = kind, set in the component. */
+.bp-node-g { cursor: pointer; }
+.bp-node { stroke-width: 1.5; transition: filter .1s ease; }
+.bp-node-g:hover .bp-node { filter: brightness(0.97); }
+.bp-node.is-selected { stroke-width: 3; }
+.bp-node.bp-planned { fill: #faf9f6; stroke: #d4cfc5; }
+.bp-node.bp-stated  { fill: #eaf0f7; stroke: #9fb6d4; }
+.bp-node.bp-ready   { fill: #e7f1ec; stroke: #6aab8a; }
+.bp-node.bp-proved  { fill: var(--green-soft); stroke: var(--green); }
+.bp-node.bp-failed  { fill: var(--red-soft); stroke: var(--red); }
+.bp-node-key { text-anchor: middle; font-size: 12.5px; font-weight: 600; fill: var(--ink); pointer-events: none; }
+.bp-node-kind { text-anchor: middle; font-size: 10px; fill: var(--muted); pointer-events: none; }
+.bp-edge { fill: none; stroke: #cdc9c0; stroke-width: 1.5; }
+.bp-arrowhead { fill: #cdc9c0; }
+
+.bp-legend { list-style: none; margin: 0; padding: 12px 14px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--panel); display: flex; flex-direction: column; gap: 7px;
+  font-size: 12px; color: var(--ink-2); }
+.bp-legend li { display: flex; align-items: center; gap: 8px; }
+.bp-swatch { width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid; flex: none; }
+.bp-swatch.bp-planned { background: #faf9f6; border-color: #d4cfc5; }
+.bp-swatch.bp-stated  { background: #eaf0f7; border-color: #9fb6d4; }
+.bp-swatch.bp-ready   { background: #e7f1ec; border-color: #6aab8a; }
+.bp-swatch.bp-proved  { background: var(--green-soft); border-color: var(--green); }
+.bp-swatch.bp-failed  { background: var(--red-soft); border-color: var(--red); }
+.bp-legend-shape { color: var(--muted); }
+.bp-shape-ellipse { width: 18px; height: 12px; border: 1.5px solid var(--muted); border-radius: 50%; flex: none; }
+.bp-shape-box { width: 16px; height: 12px; border: 1.5px solid var(--muted); border-radius: 3px; flex: none; }
+
+.bp-detail { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 14px; }
+.bp-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.bp-detail-key { font-weight: 600; font-size: 13.5px; color: var(--ink); word-break: break-word; }
+.bp-detail-status { font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 99px;
+  border: 1px solid; white-space: nowrap; flex: none; }
+.bp-detail-status.bp-planned { color: var(--muted); border-color: #d4cfc5; background: #faf9f6; }
+.bp-detail-status.bp-stated  { color: #3a5f8a; border-color: #9fb6d4; background: #eaf0f7; }
+.bp-detail-status.bp-ready   { color: #3f7d63; border-color: #6aab8a; background: #e7f1ec; }
+.bp-detail-status.bp-proved  { color: var(--green); border-color: var(--green); background: var(--green-soft); }
+.bp-detail-status.bp-failed  { color: var(--red); border-color: var(--red); background: var(--red-soft); }
+.bp-detail-meta { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.bp-detail-meta code { font-size: 11px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.bp-detail-stmt { margin: 10px 0 0; font-size: 13px; color: var(--ink-2); line-height: 1.5; }
+.bp-detail-sub { margin-top: 14px; font-size: 11px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); }
+.bp-detail-sessions { list-style: none; margin: 7px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.bp-session-link { text-align: left; background: none; padding: 5px 9px; border-radius: 6px; cursor: pointer;
+  font: inherit; font-size: 12.5px; color: var(--accent); border: 1px solid var(--line); width: 100%; }
+.bp-session-link:hover { background: var(--accent-soft); border-color: var(--accent); }
+.bp-detail-empty { font-size: 12.5px; color: var(--muted); padding: 6px 0; line-height: 1.5; }
+.bp-md { max-width: 760px; }

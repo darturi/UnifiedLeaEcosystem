@@ -16,6 +16,7 @@ export function MarkdownDoc({
   agentWritten = false,
   refreshSignal = 0,
   emptyHint,
+  onSaved,
 }: {
   projectId: string;
   doc: ProjectDocName;
@@ -24,6 +25,9 @@ export function MarkdownDoc({
   agentWritten?: boolean;
   refreshSignal?: number;
   emptyHint?: string;
+  // Fired after a successful save — lets a parent re-derive dependent views (e.g.
+  // the Blueprint tab refetches its warnings + graph once blueprint.md changes).
+  onSaved?: () => void;
 }) {
   const [content, setContent] = useState('');
   const [draft, setDraft] = useState('');
@@ -70,6 +74,7 @@ export function MarkdownDoc({
       const result = await putProjectDoc(projectId, doc, draft);
       setContent(result.content);
       setEditing(false);
+      onSaved?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {

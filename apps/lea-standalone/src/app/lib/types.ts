@@ -91,6 +91,47 @@ export interface ProjectFile {
   created_at: string;
 }
 
+// ── Blueprint & derived graph (v2.1 Slice 5, D28/D29) ─────────────────────────
+// The blueprint is `.lea/blueprint.md` (markdown-canonical); the graph is parsed +
+// derived on read. Status is derived from live Lean state, never stored.
+export type BlueprintStatus = 'planned' | 'stated' | 'ready' | 'proved' | 'failed';
+
+// A structural warning from the validator (advisory — never blocks a save). `node`
+// is the section key it concerns, or null for whole-file issues.
+export interface BlueprintWarning {
+  node: string | null;
+  message: string;
+}
+
+// One session that committed a node's `lean:` file, newest first (D29).
+export interface GraphNodeSession {
+  session_id: string;
+  title: string;
+  last_at: string;
+}
+
+export interface GraphNode {
+  key: string;
+  kind: string | null;        // definition | lemma | theorem (shape)
+  lean: string | null;        // the live decl, once named
+  uses: string[];             // dependency keys (edges)
+  statement: string;
+  file: string | null;        // repo-relative file resolved for the decl, if any
+  status: BlueprintStatus;    // derived from live state (color)
+  sessions: GraphNodeSession[];
+  last_modified_by: string | null;
+}
+
+export interface GraphEdge {
+  from: string;               // dependent node key
+  to: string;                 // dependency node key
+}
+
+export interface ProjectGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;

@@ -15,6 +15,8 @@ import type {
   Project,
   ProjectDetail,
   ProjectFile,
+  ProjectGraph,
+  BlueprintWarning,
 } from './types';
 
 export * from './types';
@@ -190,10 +192,11 @@ export function projectFileDownloadUrl(projectId: string, fileId: string): strin
   return `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}`;
 }
 
-// ── Project docs: Instructions & Memory (.lea/*.md, R1/R2) ─────────────────────
-// One pair of calls backs both rail editors (D39). `doc` is the route segment
-// ('instructions' | 'memory'); content is raw markdown in/out.
-export type ProjectDocName = 'instructions' | 'memory';
+// ── Project docs: Instructions / Memory / Blueprint (.lea/*.md) ────────────────
+// One pair of calls backs the markdown editors (D39). `doc` is the route segment;
+// content is raw markdown in/out. Blueprint shares the same content round-trip
+// (its responses also carry `warnings`, fetched separately via getProjectBlueprint).
+export type ProjectDocName = 'instructions' | 'memory' | 'blueprint';
 
 export async function getProjectDoc(projectId: string, doc: ProjectDocName): Promise<string> {
   const response = await fetch(
@@ -223,6 +226,31 @@ export async function putProjectDoc(
     throw new Error(await detailMessage(response, `Failed to save ${doc}: ${response.statusText}`));
   }
   return response.json();
+}
+
+// ── Blueprint authoring + derived graph (Slice 5, D28/D29) ─────────────────────
+// The blueprint's content round-trips through getProjectDoc/putProjectDoc('blueprint');
+// these two add the blueprint-specific extras: structural `warnings` (advisory) and
+// the parsed-and-derived dependency `graph` (node status + session attribution).
+
+export async function getProjectBlueprint(
+  projectId: string,
+): Promise<{ content: string; warnings: BlueprintWarning[] }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/blueprint`);
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to load blueprint: ${response.statusText}`));
+  }
+  const data = await response.json();
+  return { content: typeof data.content === 'string' ? data.content : '', warnings: data.warnings ?? [] };
+}
+
+export async function getProjectGraph(projectId: string): Promise<ProjectGraph> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/graph`);
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to load graph: ${response.statusText}`));
+  }
+  const data = await response.json();
+  return { nodes: Array.isArray(data.nodes) ? data.nodes : [], edges: Array.isArray(data.edges) ? data.edges : [] };
 }
 
 // ── Writeable canvas + manual checks (F5 wires the UI to these) ────────────────
