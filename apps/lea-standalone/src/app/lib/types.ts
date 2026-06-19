@@ -132,6 +132,17 @@ export interface ProjectGraph {
   edges: GraphEdge[];
 }
 
+// ── Filesystem tab (v2.1 Slice 6, D34) ────────────────────────────────────────
+// The project repo as a browsable tree. A dir carries `children`; a file carries
+// `size`. `path` is repo-relative POSIX. `.git/`/`.lake/` are hidden server-side.
+export interface TreeEntry {
+  name: string;
+  path: string;
+  type: 'dir' | 'file';
+  size?: number;
+  children?: TreeEntry[];
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;

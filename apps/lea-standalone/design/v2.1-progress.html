@@ -60,6 +60,7 @@
   .b-queued { background: #efece6; color: #8a847c; }
   .b-planned { background: #f7ecd6; color: var(--amber); }
   .b-prog { background: #e4ecf6; color: var(--blue); }
+  .b-built { background: #e4ecf6; color: var(--blue); }
   .b-tested { background: #e2efe4; color: #5a8a62; }
   .b-done { background: #dcefe1; color: var(--green); }
   .scope { color: var(--muted); font-size: 13px; margin: 6px 0 0 0; }
@@ -84,8 +85,8 @@
     (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
   </div>
 
-  <div class="bar"><i style="width:76%"></i></div>
-  <div class="counts"><b>19 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 5 complete</b> — the blueprint decomposition + interactive dependency graph: <code>.lea/blueprint.md</code> parsed + validated (T1), node status &amp; session attribution derived live from the Lean state (T2), Graph ⇄ Markdown tab with a warnings banner (F6) and a hand-rolled SVG graph — shape = kind, color = live status, click a node → its sessions (F7, confirmed live)</div>
+  <div class="bar"><i style="width:88%"></i></div>
+  <div class="counts"><b>22 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 6 · 6a complete</b> — the project repo is browsable + editable: a new <code>filesystem.py</code> service + routes give a tree + read/edit-any-file (write+commit, path-escape guarded, <code>.lean</code> → <code>check</code> verdict) + zip export (U1/U2), wired into a two-pane <b>Filesystem tab</b> (F8 — tree · viewer/editor · Export), <b>confirmed live</b>. <b>6b deferred</b>: GitHub push + the Settings token field (U3) wait on the <code>SettingsPage.tsx</code> fix — see Known gaps.</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -97,6 +98,23 @@
 
   <div class="gaps">
     <h3>Known gaps · deferred (not blocking)</h3>
+    <b>Slice 6 · 6b — GitHub sharing (U3 + push UI) deferred pending a <code>SettingsPage.tsx</code> fix.</b>
+    The sharing half of the Filesystem slice — set a project's GitHub remote and <b>Push to GitHub</b> with a
+    user-supplied token — is held because its token field belongs in Settings, and <code>SettingsPage.tsx</code>
+    currently doesn't typecheck (it imports <code>ApiKeyStatus</code>/<code>PermissionTier</code> from
+    <code>lib/api</code> which aren't exported, and sends a <code>permission_tier</code> the
+    <code>SettingsUpdate</code> type doesn't define). The page will be reworked first, then the GitHub
+    functionality added on top. <b>6a (browse/edit/export) is done + tested and unaffected.</b>
+    <span class="fix"><b>Fix direction:</b> (1) repair <code>SettingsPage.tsx</code> + its <code>lib/api.ts</code>
+    types so it compiles; (2) backend U3 — add a redacted <code>github_token</code> to <code>settings.py</code>
+    (mirror the provider-key mask/validate/redact path; presence-only in <code>settings_payload</code>) + a
+    read-only <code>github_token()</code> getter in <code>config.py</code>, plus <code>PUT /git/remote</code>
+    (writes the existing <code>projects.remote_url</code> via <code>store.update_project</code>) and
+    <code>POST /git/push</code> (a <code>gitstore</code> push helper that injects the token into the push URL
+    only, never persisting it); (3) frontend — a Share bar in <code>FilesystemTab.tsx</code> (set-remote +
+    explicit Push, target-confirm, disabled w/o token) + the redacted token field in the fixed Settings page
+    (D43). Push is outward-facing → always an explicit button, never automatic.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>SafeVerify can't audit a project proof that imports a sibling lemma.</b> A project
     submission that does <code>import Lea.&lt;Project&gt;.Foo</code> fails SafeVerify with
     <code>unknown module prefix 'Lea'</code>: <code>safe_verify</code> replays oleans inside its own
@@ -125,6 +143,19 @@
     <code>.pw-body</code> max-width for the blueprint tab, and/or move the legend/detail rail below
     the canvas on wide graphs so the SVG spans full width); optionally make the detail panel a
     dismissible overlay rather than a fixed column.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Blueprint graph: distinguish "Proved" from "SafeVerify-audited" (correctness, low priority).</b>
+    A node's <code>proved</code> status today means the standalone <b>Lean check</b> passed (no
+    <code>sorry</code>) on the stored <code>code_step</code> verdict — <i>not</i> a SafeVerify audit.
+    SafeVerify is the stronger, audit-grade verdict (kernel replay + per-decl match + axiom
+    whitelist) and should take precedence: a node is truly <b>Proved</b> only once SafeVerify passes;
+    a Lean-check-clean-but-unaudited node should read as something like <b>"check ✓ · audit pending."</b>
+    (Blocked in practice by the SafeVerify project-import gap above — sibling-importing proofs can't be
+    audited yet.) <span class="fix"><b>Fix direction:</b> add a SafeVerify verdict source feeding
+    <code>graph.py</code> <code>_base_status</code> (a new status above <code>proved</code>, e.g.
+    <code>verified</code>, or a <code>verified: bool</code> flag on the node); surface it in
+    <code>BlueprintGraph.tsx</code> (<code>STATUS_LABEL</code> + a swatch) and the node detail. Resolve
+    the LEAN_PATH gap first so project proofs are auditable.</span>
   </div>
 
   <!-- ============ SLICE 1 ============ -->
@@ -262,25 +293,25 @@
     <h2>Slice 6 · Filesystem &amp; sharing</h2>
     <div class="ghint">See/edit the whole repo, download it, push to GitHub. Ends with: a Filesystem tab + an explicit "Push to GitHub" with a token in Settings.</div>
 
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id">U1</span><span class="title">File tree + read + edit-any-file</span>
-        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><code>GET /tree</code> (hide <code>.git/</code>, <code>.lake/</code>, oleans — source + assets only), <code>GET /file?path=</code>, <code>PUT /file</code> (write + commit, path-escape guarded). Editing a <code>.lean</code> re-uses <code>check</code>; editing the blueprint refreshes the graph.</div>
+        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">New <code>filesystem.py</code> service + routes: <code>GET /tree</code> (nested, dirs-first; hides <code>.git/</code>, <code>.lake/</code> — source + assets only), <code>GET /file?path=</code> (text; binary → 415), <code>PUT /file</code> (write + commit, path-escape guarded like the v2 canvas; <code>.lean</code> → <code>check</code> verdict). <b>13 new tests (service + routes); full 175-test adapter suite green.</b> Confirmed live in the Filesystem tab.</div>
+    </div>
+    <div class="todo is-done">
+      <div class="top"><span class="id">U2</span><span class="title">Export (zip)</span>
+        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>GET /export</code> streams the repo as a zip (<code>filesystem.export_zip</code>), pruning <code>.git/</code>/<code>.lake/</code> so it's source + assets only. Confirmed live — Export downloads the project zip.</div>
     </div>
     <div class="todo">
-      <div class="top"><span class="id">U2</span><span class="title">Export (zip / git bundle)</span>
-        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><code>GET /export</code> streams the repo as a zip (or <code>git bundle</code>, preserving history).</div>
+      <div class="top"><span class="id">U3</span><span class="title">GitHub token + remote + push <span class="dec">· 6b</span></span>
+        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Deferred</span></div>
+      <div class="scope"><code>github_token</code> in <code>config/lea.local.toml</code> + <code>/api/settings</code> (regex-validated, <b>redacted</b> — presence only, never returned/logged). <code>PUT /git/remote</code> (per-project URL on the <code>projects</code> row); <code>POST /git/push</code> = explicit <code>git push</code> using the token. <b>Deferred</b> — the Settings token field needs the <code>SettingsPage.tsx</code> fix first; see Known gaps.</div>
     </div>
-    <div class="todo">
-      <div class="top"><span class="id">U3</span><span class="title">GitHub token + remote + push</span>
-        <span class="tag be">backend</span><span class="dec">D34</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><code>github_token</code> in <code>config/lea.local.toml</code> + <code>/api/settings</code> (regex-validated, <b>redacted</b> — presence only, never returned/logged). <code>PUT /git/remote</code> (per-project URL on the <code>projects</code> row); <code>POST /git/push</code> = explicit <code>git push</code> using the token.</div>
-    </div>
-    <div class="todo">
-      <div class="top"><span class="id fe">F8</span><span class="title">Filesystem tab + push UI + token field</span>
-        <span class="tag fe">frontend</span><span class="dec">D40/D43</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><code>FilesystemTab.tsx</code>: repo tree + file viewer/editor (write+commit; <code>.lean</code> verdict), upload, <b>Download</b> (export), set-remote inline + <b>Push to GitHub</b> (explicit button + target confirm, disabled w/o token). Add the redacted <b>GitHub token</b> field to <code>SettingsPage.tsx</code>.</div>
+    <div class="todo is-done">
+      <div class="top"><span class="id fe">F8</span><span class="title">Filesystem tab — tree · viewer/editor · export</span>
+        <span class="tag fe">frontend</span><span class="dec">D40</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>6a (tested ✓):</b> new <code>FilesystemTab.tsx</code> — two-pane repo <b>tree</b> (recursive, auto-expanded, dirs-first) + <b>viewer/editor</b> (click a file → view; Edit → write+commit; <code>.lean</code> shows the <code>check</code> verdict; binary files steer to download) + an <b>Export</b> button (zip). New <code>getProjectTree/getProjectFile/putProjectFile/projectExportUrl</code> in <code>api.ts</code> + <code>TreeEntry</code> type; swapped into <code>ProjectWindow.tsx</code>. <b>6b (deferred):</b> the set-remote inline + <b>Push to GitHub</b> button live here, but land with U3 — deferred pending the <code>SettingsPage.tsx</code> fix (see Known gaps).</div>
     </div>
   </div>
 

@@ -11,7 +11,7 @@ from starlette.datastructures import Headers
 from app import db, store
 from app.config import LeaConfig
 from app.routes import projects as projects_route
-from app.routes.projects import DocUpdate, ProjectCreate, ProjectUpdate, SessionCreate
+from app.routes.projects import DocUpdate, FilePut, ProjectCreate, ProjectUpdate, SessionCreate
 
 
 def _upload(project_id, filename, data, content_type=None):
@@ -227,6 +227,92 @@ def test_graph_route_derives_node_status(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         projects_route.get_graph("nope")
     assert exc.value.status_code == 404
+
+
+def test_filesystem_tree_read_edit_export_roundtrip(tmp_path, monkeypatch):
+    # U1/U2: the project repo is browsable, any file is readable + editable
+    # (write+commit), and the whole thing exports as a zip (D34).
+    import io
+    import zipfile
+
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+
+    # Tree: the seeded .lea/ dir shows; .git is hidden.
+    tree = projects_route.get_tree(pid)["tree"]
+    names = [e["name"] for e in tree]
+    assert ".lea" in names and ".git" not in names
+
+    # Read a seeded doc through the generic file endpoint.
+    bp = projects_route.read_project_file(pid, ".lea/blueprint.md")
+    assert bp["content"].startswith("# Blueprint")
+    assert bp["lean"] is False
+
+    # Edit a brand-new file → write + commit; reading it back returns the content.
+    put = projects_route.write_project_file(pid, FilePut(path="notes/scratch.md", content="# hi\n"))
+    assert len(put["commit_sha"]) == 40
+    assert put["check"] is None  # not a .lean file
+    assert projects_route.read_project_file(pid, "notes/scratch.md")["content"] == "# hi\n"
+
+    # Export: a zip carrying the source + assets, excluding internals.
+    resp = projects_route.export_project(pid)
+    assert resp.media_type == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(resp.body)) as zf:
+        entries = zf.namelist()
+    assert any(n.endswith("/.lea/blueprint.md") for n in entries)
+    assert any(n.endswith("/notes/scratch.md") for n in entries)
+    assert not any("/.git/" in n for n in entries)
+
+
+def test_write_lean_file_returns_check_verdict(tmp_path, monkeypatch):
+    # A .lean edit re-uses the standalone check for a verdict (like the v2 canvas, D2).
+    # interface_check is patched so the route doesn't invoke real Lean.
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+
+    class _Result:
+        status = "ok"
+        detail = None
+
+    monkeypatch.setattr(projects_route, "interface_check", lambda _path: _Result())
+    put = projects_route.write_project_file(
+        project["id"], FilePut(path="Foo.lean", content="theorem foo : True := trivial\n")
+    )
+    assert put["check"] == {"status": "ok", "detail": None}
+
+
+def test_filesystem_path_guard_and_404s(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+
+    # Path escape → 400 on both read and write.
+    with pytest.raises(HTTPException) as e1:
+        projects_route.read_project_file(pid, "../escape.txt")
+    assert e1.value.status_code == 400
+    with pytest.raises(HTTPException) as e2:
+        projects_route.write_project_file(pid, FilePut(path="../sneaky.txt", content="x"))
+    assert e2.value.status_code == 400
+
+    # Missing file → 404; hidden dir → 400.
+    with pytest.raises(HTTPException) as e3:
+        projects_route.read_project_file(pid, "ghost.lean")
+    assert e3.value.status_code == 404
+    with pytest.raises(HTTPException) as e4:
+        projects_route.read_project_file(pid, ".git/config")
+    assert e4.value.status_code == 400
+
+    # Missing project → 404 across all filesystem routes.
+    for call in (
+        lambda: projects_route.get_tree("nope"),
+        lambda: projects_route.read_project_file("nope", "x"),
+        lambda: projects_route.write_project_file("nope", FilePut(path="x", content="y")),
+        lambda: projects_route.export_project("nope"),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            call()
+        assert exc.value.status_code == 404
 
 
 def test_put_doc_feeds_composed_context(tmp_path, monkeypatch):

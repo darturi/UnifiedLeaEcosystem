@@ -17,6 +17,7 @@ import type {
   ProjectFile,
   ProjectGraph,
   BlueprintWarning,
+  TreeEntry,
 } from './types';
 
 export * from './types';
@@ -251,6 +252,51 @@ export async function getProjectGraph(projectId: string): Promise<ProjectGraph> 
   }
   const data = await response.json();
   return { nodes: Array.isArray(data.nodes) ? data.nodes : [], edges: Array.isArray(data.edges) ? data.edges : [] };
+}
+
+// ── Filesystem tab: tree / read / edit / export the project repo (Slice 6, D34) ─
+// The project is already a git repo, so this is mostly exposure: browse the tree,
+// read/edit any file (write+commit, path-guarded), download the whole thing.
+
+export async function getProjectTree(projectId: string): Promise<TreeEntry[]> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/tree`);
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to load files: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.tree) ? data.tree : [];
+}
+
+// A binary/undecodable file comes back as 415; we surface that as `binary: true`
+// (the viewer offers a download instead of garbled text) rather than throwing.
+export async function getProjectFile(
+  projectId: string,
+  path: string,
+): Promise<{ path: string; content: string; lean: boolean; binary: boolean }> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}`,
+  );
+  if (response.status === 415) return { path, content: '', lean: false, binary: true };
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to load ${path}: ${response.statusText}`));
+  const data = await response.json();
+  return { path: data.path ?? path, content: data.content ?? '', lean: !!data.lean, binary: false };
+}
+
+export async function putProjectFile(
+  projectId: string,
+  path: string,
+  content: string,
+): Promise<{ path: string; commit_sha: string; check: { status: 'ok' | 'error'; detail?: string | null } | null }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/file`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, content }),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to save ${path}: ${response.statusText}`));
+  return response.json();
+}
+
+// The browser navigates here to download the project as a zip.
+export function projectExportUrl(projectId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/export`;
 }
 
 // ── Writeable canvas + manual checks (F5 wires the UI to these) ────────────────

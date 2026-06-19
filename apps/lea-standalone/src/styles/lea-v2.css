@@ -498,3 +498,67 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .bp-session-link:hover { background: var(--accent-soft); border-color: var(--accent); }
 .bp-detail-empty { font-size: 12.5px; color: var(--muted); padding: 6px 0; line-height: 1.5; }
 .bp-md { max-width: 760px; }
+
+/* ── Filesystem tab (F8 / D34): tree + viewer/editor + export ──────────────── */
+.pw-body:has(.fs) { max-width: 1180px; }
+.fs { display: flex; flex-direction: column; gap: 14px; }
+.fs-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.fs-bar-hint { font-size: 12.5px; color: var(--muted); }
+.fs-export { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600;
+  color: var(--ink-2); background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 6px 12px; cursor: pointer; text-decoration: none; flex: none; }
+.fs-export:hover { border-color: var(--accent); color: var(--accent); }
+
+.fs-body { display: grid; grid-template-columns: 264px minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 880px) { .fs-body { grid-template-columns: 1fr; } }
+
+.fs-tree { border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2);
+  padding: 7px; max-height: 70vh; overflow: auto; }
+.fs-row { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; background: none;
+  border: none; border-radius: 6px; cursor: pointer; font: inherit; font-size: 13px; color: var(--ink-2);
+  padding: 5px 8px; }
+.fs-row:hover { background: var(--accent-soft); }
+.fs-row .fs-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fs-file.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.fs-dir { color: var(--ink); font-weight: 600; }
+.fs-chevron { flex: none; transition: transform .12s ease; }
+.fs-chevron.open { transform: rotate(90deg); }
+.fs-row svg { flex: none; color: var(--muted); }
+.fs-file.active svg { color: var(--accent); }
+
+.fs-viewer { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+  min-height: 200px; max-height: 70vh; display: flex; flex-direction: column; overflow: hidden; }
+.fs-file-pane { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.fs-view-head { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--line); flex: none; }
+.fs-view-path { font-family: ui-monospace, monospace; font-size: 12.5px; color: var(--ink-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fs-edit { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600;
+  color: var(--ink-2); background: none; border: 1px solid var(--line); border-radius: 7px;
+  padding: 4px 10px; cursor: pointer; flex: none; }
+.fs-edit:hover { border-color: var(--accent); color: var(--accent); }
+
+.fs-check { margin: 10px 14px 0; font-size: 12px; font-weight: 600; padding: 6px 10px; border-radius: 8px; }
+.fs-check.ok { color: var(--green); background: var(--green-soft); }
+.fs-check.err { color: var(--red); background: var(--red-soft); }
+.fs-check-detail { margin: 6px 0 0; font-weight: 400; font-family: ui-monospace, monospace; font-size: 11px;
+  white-space: pre-wrap; max-height: 160px; overflow: auto; }
+
+.fs-code { margin: 0; padding: 14px; font-family: ui-monospace, monospace; font-size: 12.6px; line-height: 1.6;
+  color: var(--ink); background: var(--code-bg); overflow: auto; flex: 1; min-height: 0; white-space: pre; }
+.fs-editor { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 12px; gap: 10px; }
+.fs-textarea { flex: 1; min-height: 280px; resize: vertical; font-family: ui-monospace, monospace; font-size: 12.6px;
+  line-height: 1.6; color: var(--ink); background: var(--code-bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 12px; }
+.fs-textarea:focus { outline: none; border-color: var(--accent); }
+.fs-editor-foot { display: flex; justify-content: flex-end; gap: 8px; flex: none; }
+.fs-cancel, .fs-save { font-size: 12.5px; font-weight: 600; border-radius: 8px; padding: 7px 14px; cursor: pointer; }
+.fs-cancel { color: var(--ink-2); background: none; border: 1px solid var(--line); }
+.fs-cancel:hover { border-color: var(--ink-2); }
+.fs-save { color: #fff; background: var(--accent); border: 1px solid var(--accent); }
+.fs-save:disabled, .fs-cancel:disabled { opacity: .55; cursor: default; }
+
+.fs-muted { font-size: 12.5px; color: var(--muted); padding: 14px; }
+.fs-err { color: var(--red); }
+.fs-empty { font-size: 13px; color: var(--ink-2); padding: 22px; line-height: 1.5; }
+.fs-empty a { color: var(--accent); }

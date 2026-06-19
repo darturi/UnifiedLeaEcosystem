@@ -12,11 +12,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
+
+from lea.interface import check as interface_check
 
 from ..config import load_config
 from .. import blueprint as blueprint_doc
+from .. import filesystem as fs_service
 from .. import graph as graph_service
 from .. import projects as project_service
 from .. import store
@@ -40,6 +43,11 @@ class SessionCreate(BaseModel):
 
 
 class DocUpdate(BaseModel):
+    content: str
+
+
+class FilePut(BaseModel):
+    path: str
     content: str
 
 
@@ -165,6 +173,68 @@ def get_graph(project_id: str) -> dict:
     # attribution (D28/D29). Cheap — reuses stored verdicts, never recompiles.
     project = _require_project(project_id)
     return graph_service.build_graph(project, _proofs_root())
+
+
+# ── Filesystem: tree / read / edit / export the project repo (U1/U2, D34) ─────────
+# A project is already a git repo (D21/D22), so this is mostly *exposure*: a tree of
+# the repo (hiding .git/.lake), a text read of any file, an edit that funnels through
+# the same commit-on-write primitive as the v2 canvas (path-guarded), and a zip
+# export. A `.lean` edit re-uses the standalone `check` for a verdict (like D2).
+
+# Filesystem service error codes → HTTP status (path escape, missing, non-text).
+_FS_ERROR_STATUS = {"bad_path": 400, "not_found": 404, "binary": 415}
+
+
+@router.get("/api/projects/{project_id}/tree")
+def get_tree(project_id: str) -> dict:
+    project = _require_project(project_id)
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    return {"tree": fs_service.build_tree(repo)}
+
+
+@router.get("/api/projects/{project_id}/file")
+def read_project_file(project_id: str, path: str) -> dict:
+    project = _require_project(project_id)
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    try:
+        content = fs_service.read_text_file(repo, path)
+    except fs_service.FilesystemError as exc:
+        raise HTTPException(status_code=_FS_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
+    return {"path": path, "content": content, "lean": path.endswith(".lean")}
+
+
+@router.put("/api/projects/{project_id}/file")
+def write_project_file(project_id: str, request: FilePut) -> dict:
+    """Write + commit any file under the project repo (path-guarded, author=user).
+    Editing a `.lean` returns its standalone `check` verdict so the editor can flag
+    a broken proof; editing `.lea/blueprint.md` lets the next `/graph` fetch re-derive."""
+    project = _require_project(project_id)
+    proofs_root = _proofs_root()
+    try:
+        sha = fs_service.write_text_file(project, proofs_root, request.path, request.content)
+    except fs_service.FilesystemError as exc:
+        raise HTTPException(status_code=_FS_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
+    check = None
+    if request.path.endswith(".lean"):
+        repo = project_service.project_repo_dir(project, proofs_root)
+        result = interface_check(str(repo / request.path))
+        check = {"status": result.status, "detail": result.detail}
+    return {"path": request.path, "commit_sha": sha, "check": check}
+
+
+@router.get("/api/projects/{project_id}/export")
+def export_project(project_id: str) -> Response:
+    """Stream a zip of the whole project repo (source + .lea assets; .git/.lake
+    excluded) so the project is shareable as a single download (D34)."""
+    project = _require_project(project_id)
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    data = fs_service.export_zip(repo)
+    filename = f"{project['slug']}.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── Files: upload / list / download / delete (S1/S2, D27) ────────────────────────
