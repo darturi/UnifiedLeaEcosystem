@@ -24,6 +24,21 @@ const STATUS_LABEL: Record<string, string> = {
   failed: 'Failed',
 };
 
+// A `proved` node splits on the audit-grade verdict: SafeVerify-cleared reads as a
+// sealed "Proved ✓"; a Lean-check-only pass reads as "check ✓ · audit pending" (the
+// node compiles + has no sorry, but the kernel/axiom audit hasn't confirmed it).
+function statusLabel(n: GraphNode): string {
+  if (n.status === 'proved') return n.verified ? 'Proved ✓' : 'check ✓ · audit pending';
+  return STATUS_LABEL[n.status] ?? n.status;
+}
+
+// Status class for color, refined for proved: audited keeps the strong green;
+// unaudited gets a paler, dashed treatment so it doesn't read as fully sealed.
+function statusClass(n: GraphNode): string {
+  if (n.status === 'proved') return n.verified ? 'bp-proved bp-audited' : 'bp-proved bp-unaudited';
+  return `bp-${n.status}`;
+}
+
 interface Placed {
   node: GraphNode;
   x: number;
@@ -168,7 +183,7 @@ export function BlueprintGraph({
             const p = layout!.placed.get(key)!;
             const n = p.node;
             const isDef = n.kind === 'definition';
-            const cls = `bp-node bp-${n.status}${selected === key ? ' is-selected' : ''}`;
+            const cls = `bp-node ${statusClass(n)}${selected === key ? ' is-selected' : ''}`;
             return (
               <g
                 key={key}
@@ -185,7 +200,7 @@ export function BlueprintGraph({
                   {truncate(n.key)}
                 </text>
                 <text className="bp-node-kind" x={NODE_W / 2} y={NODE_H / 2 + 13}>
-                  {n.kind ?? '—'} · {STATUS_LABEL[n.status] ?? n.status}
+                  {n.kind ?? '—'} · {statusLabel(n)}
                 </text>
               </g>
             );
@@ -195,7 +210,9 @@ export function BlueprintGraph({
 
       <div className="bp-graph-side">
         <ul className="bp-legend">
-          {(['proved', 'ready', 'stated', 'planned', 'failed'] as const).map((s) => (
+          <li><span className="bp-swatch bp-proved bp-audited" /> Proved ✓ <span className="bp-legend-note">(SafeVerify-audited)</span></li>
+          <li><span className="bp-swatch bp-proved bp-unaudited" /> check ✓ <span className="bp-legend-note">(audit pending)</span></li>
+          {(['ready', 'stated', 'planned', 'failed'] as const).map((s) => (
             <li key={s}>
               <span className={`bp-swatch bp-${s}`} /> {STATUS_LABEL[s]}
             </li>
@@ -225,12 +242,19 @@ function NodeDetail({
     <div className="bp-detail">
       <div className="bp-detail-head">
         <span className="bp-detail-key">{node.key}</span>
-        <span className={`bp-detail-status bp-${node.status}`}>{STATUS_LABEL[node.status] ?? node.status}</span>
+        <span className={`bp-detail-status ${statusClass(node)}`}>{statusLabel(node)}</span>
       </div>
       <div className="bp-detail-meta">
         {node.kind ?? 'node'}
         {node.lean && <> · <code>{node.lean}</code></>}
       </div>
+      {node.status === 'proved' && (
+        <p className={`bp-detail-audit ${node.verified ? 'is-audited' : 'is-pending'}`}>
+          {node.verified
+            ? 'SafeVerify-audited — kernel replay + axiom whitelist confirm this proof.'
+            : 'Lean check passed (compiles, no sorry). SafeVerify audit pending — run Verify on the session to seal it.'}
+        </p>
+      )}
       {node.statement && <p className="bp-detail-stmt">{node.statement}</p>}
 
       <div className="bp-detail-sub">Worked on by</div>
