@@ -41,11 +41,10 @@ One container, one exposed port (`8001`). Inside it:
 
 | Process | Port | Role |
 |---|---|---|
-| Bundled **Lea API** | `127.0.0.1:8000` (internal) | runs the Lean 4 prover agent |
-| **UI adapter** (FastAPI) | `0.0.0.0:8001` (exposed) | normalizes Lea API events into the UI's SSE stream **and** serves the built frontend (same origin) |
+| **UI adapter** (FastAPI) | `0.0.0.0:8001` (exposed) | imports the vendored prover in-process, streams run events, persists the timeline, and serves the built frontend |
 
-The adapter and Lea API share a filesystem (the adapter reads the `.lean` files
-the agent writes), which is why they live in the same container. Lean v4.29.0 +
+The adapter and prover share one filesystem because the prover writes `.lean`
+files and the adapter commits/hydrates those files for the UI. Lean v4.29.0 +
 Mathlib v4.29.0 oleans are baked into the image so proofs compile immediately.
 
 Two host folders are mounted as volumes so nothing is lost on restart:
@@ -56,12 +55,12 @@ Two host folders are mounted as volumes so nothing is lost on restart:
 ### Configuration — all in the app
 
 Configuration is done in the **Settings pane** inside the app (model, API keys,
-max turns, spend cap, approval mode). Saving writes `config/lea.local.toml` in the
-mounted `./config` volume; the adapter reads it on each run and forwards the key
-to the Lea API. There is no key file to edit and no environment variable to set —
-this is why the container starts keyless.
+max turns, spend cap). Saving writes `config/lea.local.toml` in the mounted
+`./config` volume; the adapter reads it on each run and exports provider keys to
+its own process environment for LiteLLM. There is no key file to edit and no
+environment variable to set -- this is why the container starts keyless.
 
-Local (non-Docker) dev works the same way via `npm run dev` (three processes,
+Local (non-Docker) dev works the same way via `npm run dev` (adapter `:8001`,
 frontend on Vite `:5173`), reading/writing the same `config/lea.local.toml`.
 
 ---
@@ -69,7 +68,7 @@ frontend on Vite `:5173`), reading/writing the same `config/lea.local.toml`.
 ## Build & run manually (developers)
 
 ```bash
-# The Lean agent + API is vendored in-repo at prover/ (no submodule to init).
+# The Lean agent is vendored in-repo at prover/.
 cp lea.env.example lea.env                        # then edit lea.env: set your key
 docker compose up --build                         # builds the image, starts the container
 # open http://localhost:8001
@@ -155,8 +154,8 @@ these the hard way.
     restarts (previously only `./data` was mounted).
   - Re-applied the same-origin static-serving change to the merged `main.py`
     (the merge didn't include it), so `:8001` serves the built frontend.
-  - Synced the submodule to the merged pointer (`070eea1`, branch
-    `thrm_permission`) and let `uv sync` pick up the new `certifi` dependency.
+  - Synced the vendored prover checkout and let `uv sync` pick up the new
+    `certifi` dependency.
 - **Takeaway.** One Dockerfile builds whatever branch is checked out; there is no
   per-branch image. Consolidating onto the merged branch = one image again.
 
@@ -186,9 +185,8 @@ Ideas to reduce onboarding friction (not all implemented yet):
 - **Multi-arch image.** This build targets `linux/arm64` only. Add `linux/amd64`
   via `docker buildx build --platform linux/arm64,linux/amd64` so Intel Macs and
   Linux boxes work from the same tag.
-- **Vendored prover.** The Lean agent + API now lives directly in-repo at
-  `prover/` (no submodule), so a plain `git clone` brings everything; there is no
-  `--recurse-submodules` step to forget.
+- **Vendored prover.** The Lean agent lives directly in-repo at `prover/`, so a
+  plain `git clone` brings everything needed for the app.
 - **Shrink the image (partly done).** It bakes Mathlib oleans + two venvs + Lean
   toolchain, so it's large. An in-layer cleanup of the `lake exe cache get` step
   (`rm -rf .lake/packages/*/.git` + `/root/.cache/mathlib`) took it from

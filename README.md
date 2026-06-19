@@ -1,28 +1,41 @@
 # LeaEcosystem
 
-LeaEcosystem is a monorepo that unifies the two front ends for [Lea](https://github.com/darturi/lea-prover) around a single shared backend:
+LeaEcosystem is an npm-workspaces monorepo that wraps
+[Lea](https://github.com/darturi/lea-prover), a Lean 4 theorem-proving agent,
+behind two local front ends and one shared backend.
 
-- **`apps/lea-ui/`** — a local React + FastAPI interface for running Lea, streaming proof progress, and browsing chat/code history.
-- **`apps/overleaf-extension/`** — a Chrome extension and local companion that formalizes labeled theorem blocks directly from an Overleaf document.
+- **`apps/lea-standalone/`** (`lea-interface`) — the React + Vite UI and the
+  FastAPI adapter that drives Lea, streams proof progress, and persists the
+  proof timeline.
+- **`apps/overleaf-extension/`** (`overleaf-lean-stub-mvp`) — a Chrome extension
+  plus local Node companion that formalizes labeled theorem blocks from an
+  Overleaf document.
+- **`packages/lea-model-catalog/`** — the shared provider/model catalog consumed
+  by both apps.
 
-Both apps drive the same bundled Lea API (`vendor/lea-prover`, a git submodule) and, with shared state enabled, write the full process timeline of every run into one shared SQLite database. That means a formalization started from inside Overleaf can be opened and inspected in the Lea UI exactly as if the UI had run it — and the Overleaf extension can deep-link straight to that session in the UI. See [`docs/shared-process-state.md`](docs/shared-process-state.md) for the design.
+The architectural center is the FastAPI adapter on **`http://127.0.0.1:8001`**.
+It imports the vendored prover at `apps/lea-standalone/prover/` in-process and
+maps the prover's typed events onto the browser's SSE stream. There is no
+separate Lea API server to start, and no separate prover checkout to initialize.
 
-Shared building blocks live under `packages/` (e.g. `packages/lea-model-catalog` — the provider/model list both apps use).
+The adapter owns the persistent local timeline: SQLite stores sessions, runs,
+messages, usage, and code-step metadata; git stores proof content under the
+prover workspace. Overleaf-created formalizations go through the same adapter, so
+they appear in the standalone UI and can be opened with a `?session=<id>` link.
 
 ## Setup
 
-Run the unified setup from the monorepo root:
+Run setup from the monorepo root:
 
 ```sh
 npm run setup
 ```
 
-This installs workspace Node dependencies, initializes the shared
-`vendor/lea-prover` submodule, installs the bundled Lea API dependencies,
-downloads and verifies the Lean/Mathlib cache, writes root `.env` defaults, and
-prepares both the Overleaf companion and Lea UI.
+This installs workspace Node dependencies, writes root `.env` defaults, builds
+the standalone adapter/prover Python environments, refreshes the Lean/Mathlib
+cache, and writes Overleaf companion settings.
 
-To set up only one app:
+To provision only one side:
 
 ```sh
 npm run setup -- --target ui
@@ -35,58 +48,80 @@ To refresh Lean dependencies and the Mathlib cache:
 npm run update-lean-deps
 ```
 
-If cloning from scratch, recurse the submodule:
+After setup, add provider keys either in the standalone Settings page or in the
+monorepo root `.env`. The default `.env` points both apps at the adapter:
 
-```sh
-git clone --recurse-submodules https://github.com/darturi/UnifiedLeaEcosystem.git
+```text
+LEA_ROOT=apps/lea-standalone/prover
+LEA_API_BASE_URL=http://127.0.0.1:8001
+LEA_API_FLAVOR=api
+LEA_UI_BASE_URL=http://localhost:5173
+OVERLEAF_COMPANION_URL=http://127.0.0.1:31245
 ```
 
-## Running the apps
+## Running
 
-Start the bundled Lea API (shared by both apps):
-
-```sh
-npm run dev:lea
-```
-
-Then start whichever front end you need:
+Start only the shared backend:
 
 ```sh
-npm run dev:ui        # React UI + FastAPI adapter (see apps/lea-ui/README.md)
-npm run dev:overleaf  # Overleaf companion (see apps/overleaf-extension/README.md)
+npm run start:adapter
 ```
 
-Each app's README covers its own first-run details, including loading the Chrome
-extension for the Overleaf workflow.
-
-## Environment
-
-Private runtime fields are shared through one monorepo-root `.env` file.
+Start the standalone UI in development mode:
 
 ```sh
-cp .env.example .env
+npm run dev:ui
 ```
 
-Set provider keys, Lea paths, model settings, and timeout/spend limits there.
-Shell-exported values override `.env`; older app-local files are read only as
-migration fallbacks.
+`dev:ui` starts the adapter on `:8001` and Vite on `:5173`.
 
-### Shared process state
+Start the Overleaf companion:
 
-Set `LEA_SHARED_STATE=true` to have the Overleaf extension record each run's full
-process timeline (messages, code steps, approvals, usage) into the shared
-database, so Overleaf runs appear in the Lea UI just like UI-originated ones. By
-default both apps share the UI's existing data directory (`apps/lea-ui/data`);
-`LEA_SHARED_DATA_DIR`, `LEA_DB_PATH`, and `LEA_EVENT_LOG_DIR` can override where
-the database and raw event logs live. See `.env.example` for the full set of
-shared-state options and `docs/shared-process-state.md` for the design.
+```sh
+npm run dev:overleaf
+```
 
-## Common commands
+The companion listens on `http://127.0.0.1:31245` and expects the adapter to be
+reachable at `LEA_API_BASE_URL`.
+
+## Common Commands
 
 ```sh
 npm run doctor       # health-check both apps
-npm test             # run the Overleaf and UI test suites
-npm run reset:local  # clear local run state (proofs, logs, SQLite) — keeps Lea deps
+npm test             # Overleaf tests, then standalone frontend tests
+npm run reset:local  # clear local run state; keeps installed dependencies
 ```
 
-Run `npm run reset:local -- --dry-run` to preview what a reset would remove.
+Preview a reset:
+
+```sh
+npm run reset:local -- --dry-run
+```
+
+Adapter Python tests are not included in root `npm test`. Run them from the
+adapter directory:
+
+```sh
+cd apps/lea-standalone/adapter
+./.venv/bin/python -m pytest
+```
+
+## Data And Configuration
+
+- Root `.env` supplies shared defaults for both apps. Shell-exported values still
+  win.
+- `apps/lea-standalone/config/lea.local.toml` is the adapter's runtime config and
+  the source of truth for model, turn limit, spend cap, and provider keys edited
+  through the standalone Settings page.
+- The default SQLite database is
+  `apps/lea-standalone/data/lea-interface.sqlite3`.
+- Local proof repos live under
+  `apps/lea-standalone/prover/workspace/proofs/`.
+- Overleaf companion job logs and local settings live under
+  `apps/overleaf-extension/.overleaf-lean-stub/`.
+
+`LEA_SHARED_DATA_DIR` can relocate the adapter data directory for local
+experiments, but the normal current setup uses the standalone app's data
+directory. The older `LEA_SHARED_STATE` recorder path is legacy-only for the
+retired rollback flavor; on the current `/api` path, the adapter records runs
+directly.

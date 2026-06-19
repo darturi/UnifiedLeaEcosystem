@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from ..config import load_config
 from .. import bridge
 from ..bridge import RunnerContext, run_lea, request_stop
+from .. import projects
 from .. import settings as settings_service
 from .. import store
 
@@ -67,9 +68,13 @@ def create_run(request: RunRequest) -> dict:
     # failing the run (best-effort association).
     project_id: str | None = None
     if request.project_slug:
+        # Provision identically to a UI project (D25): get-or-create the row AND seed the
+        # on-disk repo's .lea/{instructions,memory,blueprint}.md if missing, so an
+        # Overleaf-originated project isn't left doc-less. Best-effort + idempotent.
+        proofs_root = (config.lea_root / "workspace" / "proofs") if config.lea_root else None
         try:
-            project = store.get_or_create_project(
-                request.project_slug, title=request.project_title
+            project = projects.ensure_project(
+                request.project_slug, proofs_root, title=request.project_title
             )
             project_id = project["id"]
         except ValueError:

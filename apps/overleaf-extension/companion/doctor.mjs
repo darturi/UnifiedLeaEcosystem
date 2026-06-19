@@ -37,7 +37,7 @@ const adapterVenv = settings.leaRepoPath
   ? path.resolve(settings.leaRepoPath, "..", "adapter", ".venv", "bin", "python")
   : "";
 checkPath("Lea adapter virtualenv", adapterVenv, () => true, "run `npm run setup` from the monorepo root");
-checkUrl(`Lea adapter URL (flavor: ${settings.leaApiFlavor || "api"})`, settings.leaApiBaseUrl || "http://127.0.0.1:8001");
+checkUrl("Lea adapter URL", settings.leaApiBaseUrl || "http://127.0.0.1:8001");
 
 console.log("Overleaf Lea Formalizer doctor\n");
 console.log(`${dotenv.loaded ? "✓" : "•"} root .env ${dotenv.loaded ? `loaded from ${dotenv.path}` : "not found; using shell/settings only"}`);

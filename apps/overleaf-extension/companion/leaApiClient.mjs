@@ -1,30 +1,9 @@
-// Lea standalone adapter (`/api`) client for the Overleaf companion.
+// Lea standalone adapter client for the Overleaf companion.
 //
-// This replaces the old vendored `/v1` Lea API. The standalone adapter
-// (apps/lea-standalone/adapter, :8001) drives the new prover in-process and is a
-// pure event stream: there is no resumable, seq-numbered wire and no run-status
-// polling endpoint. A run is started with POST /api/runs, then *driven and
-// observed* by opening its SSE event stream — opening the stream is what spawns
-// the run thread adapter-side. We consume the stream to terminal `done`.
-//
-// Differences from `/v1` that the companion must absorb (see
-// docs/migrate-to-standalone.md §4 — deferred TODOs):
-//   * Per-run config (model / max_turns / permission_tier / project) is NOT sent
-//     here; the adapter reads it from config/lea.local.toml. We pass only the
-//     prompt (+ optional session_id for multi-turn continuation).
-//   * There is no `theorem_translation` approval tier. The adapter gates impactful
-//     *tools* (bash / write_file / edit_file) with allow/deny/always_session for
-//     interactive UI runs. For Overleaf we start the run with `autonomous: true`,
-//     which tells the adapter to skip the gate entirely and use the non-interactive
-//     `default` prompt variant — so the run formalizes end-to-end with no human in
-//     the loop. (We still auto-resolve approval events client-side as a fallback,
-//     but an autonomous run emits none.) The "approve the statement, then formalize"
-//     flow is a deferred TODO that lights up when the native tier lands on `/api`.
-//   * Project recording is deferred adapter-side (`project=None`), so the
-//     formalized/unformalized status derived from project markdown will not update
-//     until the coworker's project feature lands. Also a deferred TODO.
-//   * Usage/cost is not streamed; it is persisted on the run row. We read it back
-//     from GET /api/sessions/{id} after the run finishes (best-effort).
+// The adapter (apps/lea-standalone/adapter, :8001) drives the prover in-process.
+// A run is started with POST /api/runs, then driven and observed by opening its
+// SSE event stream. Per-run config lives in config/lea.local.toml; the companion
+// passes the prompt, provenance, and optional session/project metadata.
 
 const TOOL_APPROVAL_DECISION = "always_session";
 
@@ -33,10 +12,6 @@ const TOOL_APPROVAL_DECISION = "always_session";
 // For a *formalization* job only "success" (the agent passed final verification)
 // counts as ok; "answered" finished cleanly but proved nothing.
 const SUCCESS_DONE_STATUS = new Set(["success"]);
-
-export function isApiFlavor(flavor) {
-  return String(flavor || "").toLowerCase() === "api";
-}
 
 function toNonNegativeNumber(value) {
   const n = Number(value);
@@ -69,8 +44,8 @@ async function* iterateResponseBody(body) {
 }
 
 // Parse one SSE frame ("event: <type>\ndata: <json>") into { type, data }.
-// The adapter encodes the event name on the `event:` line and the payload (with
-// NO embedded `type`) on `data:` lines — unlike `/v1`, which inlined `type`.
+// The adapter encodes the event name on the `event:` line and the payload on
+// `data:` lines.
 export function parseSseFrame(frame) {
   let type = "message";
   const dataLines = [];
@@ -154,6 +129,19 @@ export function fetchAdapterUsageStats({ fetchImpl, baseUrl }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/stats`, {
     method: "GET",
     headers: buildHeaders(null),
+  });
+}
+
+// Mirror the Overleaf project's .tex sources into the matching adapter project's
+// `.lea/files/overleaf/` (resolved by slug, get-or-create — same slug the run uses).
+// The adapter reconciles synchronously and defers the git commit, so this returns
+// quickly; `files` is `[{ path, content }]` (.tex only). Best-effort: a transport
+// failure surfaces as `{ ok:false }` and the caller logs/ignores it.
+export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/mirror`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ source: "overleaf", files: files || [] }),
   });
 }
 
@@ -304,10 +292,9 @@ export async function streamApiRun({
   };
 }
 
-// High-level: start a run and drive it to completion, returning the same shape
-// the companion's `/v1` `waitForLeaApiProofJob` produced
-// ({ ok, timedOut, apiRunId, error, usage, costUsd }) so the orchestration in
-// server.mjs is contract-compatible.
+// High-level: start a run and drive it to completion, returning the shape the
+// companion orchestration consumes:
+// { ok, timedOut, apiRunId, error, usage, costUsd }.
 export async function runApiProofJob({
   fetchImpl,
   baseUrl,

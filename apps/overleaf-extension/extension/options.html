@@ -47,12 +47,10 @@
           Lea max turns
           <input id="lea-max-turns" name="leaMaxTurns" type="number" min="1" max="200" required>
         </label>
-        <label>
-          LaTeX context
-          <select id="lea-latex-context-mode" name="leaLatexContextMode" disabled>
-            <option value="off">Off</option>
-          </select>
-          <small class="field-hint">Locked to Off — LaTeX context is not yet implemented.</small>
+        <label class="checkbox-label">
+          <input id="lea-tex-mirror" name="leaTexMirrorEnabled" type="checkbox">
+          Mirror Overleaf .tex into the project
+          <small class="field-hint">Keeps the project's LaTeX sources in sync with Lea so it can read them.</small>
         </label>
         <button type="button" id="load-companion-settings">Load from companion</button>
         <button type="submit">Save settings</button>

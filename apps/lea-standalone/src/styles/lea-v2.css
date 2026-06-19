@@ -1,6 +1,5 @@
-/* LeaUI v2 design system — ported from design/v2-mockup.html.
-   Plain, self-contained CSS that the React components emit class names against.
-   Kept verbatim from the mockup so the live UI matches the approved design. */
+/* LeaUI warm-paper design system.
+   Plain, self-contained CSS that the React components emit class names against. */
 
 :root {
   --bg: #f5f4ef; --panel: #ffffff; --panel-2: #faf9f6;

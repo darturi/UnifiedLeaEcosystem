@@ -15,9 +15,6 @@ import {
   normalizeModelFamilyId
 } from "../../../packages/lea-model-catalog/index.mjs";
 import {
-  buildLeaLatexActiveTexPath,
-  buildLeaLatexContextManifestPath,
-  buildLeaLatexContextRoot,
   buildLeaProjectMarkdownPath,
   buildLeaProofPath,
   buildLeaWorkspacePath,
@@ -31,11 +28,12 @@ import {
   inferLeanDeclarationName,
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
-import { applyEnvDefaults, loadDotEnv, normalizeLeaLatexContextMode } from "./config.mjs";
+import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
-  isApiFlavor,
+  interruptApiRun,
+  mirrorProjectTexFiles,
   putAdapterSettings,
   runApiProofJob
 } from "./leaApiClient.mjs";
@@ -49,36 +47,24 @@ const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8001";
-// Which Lea backend wire to speak. "api" = the standalone adapter's /api
-// (apps/lea-standalone/adapter); "v1" = the legacy vendored Lea API (retired,
-// kept only for one-release rollback). Default is the standalone adapter.
-const DEFAULT_LEA_API_FLAVOR = "api";
 const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
 const DEFAULT_LEA_MAX_TURNS = 20;
-const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
-const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
-const DEFAULT_LEA_MODEL_MAX_TOKENS = 16384;
+const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
 const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
 const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
-// Settings the companion mirrors to `.env`. On the `api` flavor (the default) the
-// shared scalars (leaModel/leaMaxTurns/leaMaxSpendUsd) and provider keys are *also*
-// pushed to the adapter, which is their single source of truth: reads overlay the
-// adapter's values (see syncSharedSettingsFromAdapter) and adapter-driven runs use
-// its TOML, so the `.env` copy is an inert secondary there. We keep writing it so
-// the legacy `v1` flavor — which has no adapter to delegate to — still works.
+// Settings the companion mirrors to `.env`. Shared scalars and provider keys are
+// also pushed to the adapter, which is their single source of truth.
 const SHARED_SETTING_ENV_FIELDS = {
   leaRepoPath: "LEA_ROOT",
   leaApiBaseUrl: "LEA_API_BASE_URL",
-  leaApiFlavor: "LEA_API_FLAVOR",
   leaUiBaseUrl: "LEA_UI_BASE_URL",
   leaProvider: "LEA_PROVIDER",
   leaModel: "LEA_MODEL",
   leaMaxTurns: "LEA_MAX_TURNS",
   leaNarrateToolSteps: "LEA_NARRATE_TOOL_STEPS",
   leaMaxSpendUsd: "LEA_MAX_SPEND_USD",
-  leaTheoremTranslationMaxRetries: "LEA_THEOREM_TRANSLATION_MAX_RETRIES",
   leaJobTimeoutSeconds: "LEA_JOB_TIMEOUT_SECONDS"
 };
 export { LEA_MODEL_OPTIONS };
@@ -220,17 +206,6 @@ export async function handleFormalize(payload, state) {
     };
   }
 
-  const resumed = await maybeResumeStubFormalization({
-    state,
-    target,
-    theoremText,
-    theoremContext,
-    theoremUses
-  });
-  if (resumed) {
-    return resumed;
-  }
-
   const usesResolution = await resolveTheoremUses({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
@@ -241,12 +216,10 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, usesResolution.error, usesResolution.message);
   }
 
-  const latexContext = await maybePrepareLatexContext({
-    state,
-    payload,
-    overleafProjectId
-  });
-
+  // The Overleaf project's .tex sources are mirrored into the project's
+  // `.lea/files/overleaf/` by the extension's background sync (flushed before this
+  // request), so the adapter's composed context already surfaces them to Lea. No
+  // per-run LaTeX prep happens here anymore.
   const cleanup = await cleanupPreviousRunArtifacts({
     leaRepoPath: state.settings.leaRepoPath,
     target,
@@ -254,12 +227,11 @@ export async function handleFormalize(payload, state) {
     jobs: state.jobs || {}
   });
   const job = await createLeaJob({ state, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses });
-  job.latexContext = latexContext;
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
-  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses, latexContext }).catch(async (error) => {
+  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
     job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
@@ -273,144 +245,47 @@ export async function handleFormalize(payload, state) {
   };
 }
 
-export async function handleStub(payload, state) {
-  const validation = validateLeaPayload(payload);
-  if (!validation.ok) {
-    return errorResponse(400, validation.error, validation.message);
-  }
-
-  const { overleafProjectId, theoremLabel, theoremText, theoremContext } = validation;
-  const expectedHash = hashTheoremText(theoremText);
-  if (payload.sourceHash && payload.sourceHash !== expectedHash) {
-    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
-  }
-
-  await syncSharedSettingsFromAdapter(state);
-
-  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
-  if (!leaValidation.ok) {
-    return errorResponse(400, leaValidation.error, leaValidation.message);
-  }
-  // The "stub the statement, approve, then formalize" flow depends on the
-  // theorem-translation approval tier, which the standalone adapter does not
-  // expose yet (deferred — docs/migrate-to-standalone.md §4). Until the native
-  // tier lands on /api, surface a clear, non-failing message instead of starting
-  // a run that cannot pause for approval.
-  if (isApiFlavor(state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
-    return errorResponse(
-      501,
-      "stub_unsupported_on_api",
-      "Theorem-translation approval (stub-then-formalize) is not available on the standalone Lea backend yet. Use Formalize directly for now."
-    );
-  }
-  if (spendLimitReached(state)) {
-    return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
-  }
-
-  const target = buildLeaTarget({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId,
-    theoremLabel
-  });
-  const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
-  if (activeJob) {
-    return errorResponse(409, "job_in_progress", "Lea is already working on this theorem.");
-  }
-
-  const currentStatus = await getTheoremStatus({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId,
-    theoremLabel,
-    jobs: state.jobs || {}
-  });
-  const equivalentStatus = getEquivalentTheoremStatus(currentStatus);
-  if (equivalentStatus.status !== "unformalized") {
-    return errorResponse(409, "not_unformalized", "Stub is only available for unformalized theorems.");
-  }
-
-  const latexContext = await maybePrepareLatexContext({
-    state,
-    payload,
-    overleafProjectId
-  });
-
-  const cleanup = await cleanupPreviousRunArtifacts({
-    leaRepoPath: state.settings.leaRepoPath,
-    target,
-    theoremText,
-    jobs: state.jobs || {}
-  });
-  const job = await createLeaJob({ state, target, theoremText, theoremContext });
-  job.kind = "stub";
-  job.latexContext = latexContext;
-  job.retryCleanup = cleanup;
-  state.jobs[job.jobId] = job;
-  await writeJson(state.jobsPath, state.jobs);
-
-  try {
-    await createStubJob({ state, job, target, theoremText, theoremContext, latexContext });
-    if (job.finalStatus === "max_spend") {
-      return {
-        statusCode: 200,
-        body: buildJobResponse({ job, status: "failed", target })
-      };
-    }
-  } catch (error) {
-    if (job.finalStatus === "max_spend") {
-      return {
-        statusCode: 200,
-        body: buildJobResponse({ job, status: "failed", target })
-      };
-    }
-    job.status = "failed";
-    job.error = error instanceof Error ? error.message : String(error);
-    job.finishedAt = new Date().toISOString();
-    await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
-    await writeJson(state.jobsPath, state.jobs);
-    return errorResponse(500, "stub_failed", job.error);
-  }
-
-  return {
-    statusCode: 200,
-    body: buildJobResponse({ job, status: "sorry_stub", target })
-  };
-}
-
-export async function handleLatexContext(payload, state) {
+// Mirror the Overleaf project's .tex sources into the matching adapter project's
+// `.lea/files/overleaf/` (D27-extended). Driven by the extension's background sync
+// (and a flush before formalize), so the run's composed context surfaces the .tex.
+// `payload.files` is `[{ path, content }]`, .tex only; the adapter reconciles +
+// upserts and defers the commit. Disabled when the mirror toggle is off.
+export async function handleMirrorTex(payload, state) {
   const leaValidation = validateLeaRuntime(state, { requireApiKey: false });
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
-
-  let mode;
-  try {
-    mode = normalizeLeaLatexContextMode(payload.mode || state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE);
-  } catch {
-    return errorResponse(400, "invalid_latex_context_mode", "LaTeX context mode must be off or active_file.");
-  }
-  if (mode !== "active_file") {
-    return errorResponse(400, "latex_context_disabled", "LaTeX context mirroring is disabled.");
+  if (state.settings.leaTexMirrorEnabled === false) {
+    return errorResponse(400, "tex_mirror_disabled", "Overleaf .tex mirroring is disabled.");
   }
 
   const overleafProjectId = String(payload.overleafProjectId || "");
   if (!overleafProjectId.trim()) {
     return errorResponse(400, "missing_project_id", "overleafProjectId is required.");
   }
-  if (typeof payload.activeTex !== "string") {
-    return errorResponse(400, "invalid_active_tex", "activeTex must be a string.");
+  const files = Array.isArray(payload.files)
+    ? payload.files
+        .map((file) => ({ path: String(file?.path || ""), content: String(file?.content ?? "") }))
+        .filter((file) => file.path.trim())
+    : [];
+
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
   }
 
-  const context = await writeActiveLatexContext({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId,
-    activeTex: payload.activeTex
+  const result = await mirrorProjectTexFiles({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    slug: slugProjectId(overleafProjectId),
+    files
   });
-  await upsertProjectLatexContextEntry({
-    projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId }),
-    projectId: overleafProjectId,
-    context
-  });
-  return { statusCode: 200, body: { ok: true, context } };
+  if (!result.ok) {
+    return errorResponse(result.status || 502, "mirror_failed", result.error || "Could not mirror .tex to the Lea adapter.");
+  }
+  return { statusCode: 200, body: { ok: true, summary: result.body } };
 }
 
 export async function handleUpdateLeaSettings(payload, state) {
@@ -450,16 +325,9 @@ export async function handleUpdateLeaSettings(payload, state) {
   } catch {
     return errorResponse(400, "invalid_max_spend", "Lea max spend must be greater than or equal to 0.");
   }
-  let leaLatexContextMode;
-  try {
-    leaLatexContextMode = normalizeLeaLatexContextMode(
-      Object.prototype.hasOwnProperty.call(payload, "leaLatexContextMode")
-        ? payload.leaLatexContextMode
-        : state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE
-    );
-  } catch {
-    return errorResponse(400, "invalid_latex_context_mode", "LaTeX context mode must be off or active_file.");
-  }
+  const leaTexMirrorEnabled = Object.prototype.hasOwnProperty.call(payload, "leaTexMirrorEnabled")
+    ? normalizeBoolean(payload.leaTexMirrorEnabled, true)
+    : (state.settings.leaTexMirrorEnabled !== false);
   const nextSettings = {
     ...state.settings,
     leaRepoPath: path.resolve(leaRepoPath),
@@ -469,12 +337,7 @@ export async function handleUpdateLeaSettings(payload, state) {
     leaModel: model,
     leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
     leaMaxSpendUsd,
-    leaTheoremTranslationMaxRetries: normalizeLeaTheoremTranslationMaxRetries(
-      payload.leaTheoremTranslationMaxRetries ||
-      state.settings.leaTheoremTranslationMaxRetries ||
-      DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES
-    ),
-    leaLatexContextMode,
+    leaTexMirrorEnabled,
     leaJobTimeoutSeconds: Number.parseInt(
     String(payload.leaJobTimeoutSeconds || state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS),
     10
@@ -497,41 +360,35 @@ export async function handleUpdateLeaSettings(payload, state) {
   if (!keyValidation.ok) {
     return errorResponse(400, keyValidation.error, keyValidation.message);
   }
-  // Push the shared settings to the adapter — the single source of truth — so the
-  // change also appears in the lea-standalone UI and governs adapter-driven runs.
-  // Infra settings stay local (handled via the env patch below). Skipped on the
-  // legacy v1 flavor, which has no adapter to delegate to.
-  if (isApiFlavor(nextSettings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
-    const adapterBody = {
-      model,
-      max_turns: nextSettings.leaMaxTurns,
-      max_spend_usd: nextSettings.leaMaxSpendUsd
-    };
-    const apiKeyPatch = buildAdapterApiKeyPatch(payload.leaProviderApiKeys, nextState, modelInfo.family);
-    if (Object.keys(apiKeyPatch).length > 0) adapterBody.api_keys = apiKeyPatch;
-    const pushed = await putAdapterSettings({
-      fetchImpl: state.fetchImpl || fetch,
-      baseUrl: leaApiBaseUrl,
-      body: adapterBody
-    });
-    if (!pushed.ok) {
-      // An HTTP response with a status means the adapter is reachable but rejected
-      // the values (e.g. a 422 from key/model validation) — surface that to the
-      // user. A missing status means a transport failure (adapter down): degrade
-      // gracefully and still save local/infra settings so the user isn't blocked.
-      if (typeof pushed.status === "number") {
-        const detail = pushed.body?.detail;
-        const structured = detail && typeof detail === "object" ? detail : null;
-        const message =
-          (structured ? structured.message : detail) ||
-          pushed.error ||
-          "The Lea adapter rejected these settings.";
-        return errorResponse(pushed.status, "adapter_settings_rejected", message, structured?.field);
-      }
-      console.warn(`Could not reach the Lea adapter to sync settings: ${pushed.error}`);
-    } else if (pushed.body && typeof pushed.body === "object") {
-      state.adapterSettings = pushed.body;
+  const adapterBody = {
+    model,
+    max_turns: nextSettings.leaMaxTurns,
+    max_spend_usd: nextSettings.leaMaxSpendUsd
+  };
+  const apiKeyPatch = buildAdapterApiKeyPatch(payload.leaProviderApiKeys, nextState, modelInfo.family);
+  if (Object.keys(apiKeyPatch).length > 0) adapterBody.api_keys = apiKeyPatch;
+  const pushed = await putAdapterSettings({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: leaApiBaseUrl,
+    body: adapterBody
+  });
+  if (!pushed.ok) {
+    // An HTTP response with a status means the adapter is reachable but rejected
+    // the values (e.g. a 422 from key/model validation) — surface that to the
+    // user. A missing status means a transport failure (adapter down): degrade
+    // gracefully and still save local/infra settings so the user isn't blocked.
+    if (typeof pushed.status === "number") {
+      const detail = pushed.body?.detail;
+      const structured = detail && typeof detail === "object" ? detail : null;
+      const message =
+        (structured ? structured.message : detail) ||
+        pushed.error ||
+        "The Lea adapter rejected these settings.";
+      return errorResponse(pushed.status, "adapter_settings_rejected", message, structured?.field);
     }
+    console.warn(`Could not reach the Lea adapter to sync settings: ${pushed.error}`);
+  } else if (pushed.body && typeof pushed.body === "object") {
+    state.adapterSettings = pushed.body;
   }
 
   const sharedEnvPatch = buildSharedSettingsEnvPatch(nextSettings);
@@ -552,9 +409,8 @@ export async function handleUpdateLeaSettings(payload, state) {
 //   - All-time  ← stats.global
 //   - This project ← sum of stats.sessions whose project_slug matches the
 //     Overleaf document namespace (slugProjectId(overleafProjectId)).
-// If the adapter is unreachable (or we're on the legacy v1 flavor) we fall back
-// to the companion's in-memory job tally so the popover degrades instead of
-// erroring.
+// If the adapter is unreachable we fall back to the companion's in-memory job
+// tally so the popover degrades instead of erroring.
 export async function handleGetUsage(payload, state) {
   const overleafProjectId = String(payload.overleafProjectId || "unknown");
   const leaMaxSpendUsd = normalizeLeaMaxSpendUsd(state.settings?.leaMaxSpendUsd);
@@ -591,11 +447,8 @@ export async function handleGetUsage(payload, state) {
 
 // Fetch the adapter's /api/stats and reshape it into the popover's usage contract
 // ({ inputTokens, outputTokens, totalTokens, costUsd, runCount }). Returns null
-// when the adapter is not the active backend or cannot be reached.
+// when the adapter cannot be reached.
 async function fetchAdapterUsageForPopover(state, overleafProjectId) {
-  if (!isApiFlavor(state.settings?.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
-    return null;
-  }
   let baseUrl;
   try {
     baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
@@ -728,20 +581,14 @@ async function routeRequest(request, response, state) {
     return;
   }
 
-  if (request.method === "POST" && url.pathname === "/latex-context") {
-    const result = await handleLatexContext(await readBodyJson(request), state);
+  if (request.method === "POST" && url.pathname === "/mirror-tex") {
+    const result = await handleMirrorTex(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
 
   if (request.method === "POST" && url.pathname === "/formalize") {
     const result = await handleFormalize(await readBodyJson(request), state);
-    sendJson(response, result.statusCode, result.body);
-    return;
-  }
-
-  if (request.method === "POST" && url.pathname === "/stub") {
-    const result = await handleStub(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -785,8 +632,7 @@ export async function buildSettingsResponse(state) {
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
     leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
-    leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
-    leaLatexContextMode: normalizeLeaLatexContextMode(state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE),
+    leaTexMirrorEnabled: state.settings.leaTexMirrorEnabled !== false,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
 }
@@ -819,13 +665,9 @@ function isProviderKeyConfigured(state, familyId) {
 
 // Pull the shared settings (model, max_turns, max_spend_usd, provider key status)
 // from the adapter and overlay them onto local state, so GET /settings and the
-// run preflight reflect whatever was last saved in EITHER UI. Best-effort: if the
-// adapter is unreachable (or we're on the legacy v1 flavor) we keep local values.
+// run preflight reflect whatever was last saved in either UI. Best-effort: if the
+// adapter is unreachable we keep local values.
 async function syncSharedSettingsFromAdapter(state) {
-  if (!isApiFlavor(state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
-    state.adapterSettings = null;
-    return null;
-  }
   let baseUrl;
   try {
     baseUrl = normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
@@ -1106,7 +948,7 @@ function sanitizeRuntimeSettings(settings) {
   } = settings || {};
   return {
     ...rest,
-    leaLatexContextMode: normalizeLeaLatexContextMode(rest.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE)
+    leaTexMirrorEnabled: rest.leaTexMirrorEnabled !== false
   };
 }
 
@@ -1136,80 +978,6 @@ function validateLeaPayload(payload) {
     return { ok: false, error: "missing_theorem_text", message: "Theorem text is required." };
   }
   return { ok: true, overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext };
-}
-
-async function maybePrepareLatexContext({ state, payload, overleafProjectId }) {
-  const mode = normalizeLeaLatexContextMode(state.settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE);
-  if (mode !== "active_file") return null;
-
-  if (typeof payload.activeTex === "string") {
-    const context = await writeActiveLatexContext({
-      leaRepoPath: state.settings.leaRepoPath,
-      overleafProjectId,
-      activeTex: payload.activeTex
-    });
-    await upsertProjectLatexContextEntry({
-      projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId }),
-      projectId: overleafProjectId,
-      context
-    });
-    return context;
-  }
-
-  return readExistingLatexContext({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId
-  });
-}
-
-async function writeActiveLatexContext({ leaRepoPath, overleafProjectId, activeTex }) {
-  const projectSlug = slugProjectId(overleafProjectId);
-  const rootPath = buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId });
-  const activeTexPath = buildLeaLatexActiveTexPath({ leaRepoPath, overleafProjectId });
-  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
-  const activeRelativePath = path.relative(rootPath, activeTexPath).split(path.sep).join("/");
-  const updatedAt = new Date().toISOString();
-  const bytes = Buffer.byteLength(activeTex, "utf8");
-  const sha256 = createHash("sha256").update(activeTex).digest("hex");
-  const manifest = {
-    overleafProjectId,
-    projectSlug,
-    mode: "active_file",
-    updatedAt,
-    files: [{
-      path: activeRelativePath,
-      sourceKind: "active_file",
-      sha256,
-      bytes,
-      lastSeenAt: updatedAt
-    }]
-  };
-
-  await atomicWriteFile(activeTexPath, activeTex, "utf8");
-  await atomicWriteJson(manifestPath, manifest);
-  return buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest });
-}
-
-async function readExistingLatexContext({ leaRepoPath, overleafProjectId }) {
-  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
-  try {
-    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
-    return buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest });
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-function buildLatexContextInfo({ leaRepoPath, overleafProjectId, manifest }) {
-  const rootPath = buildLeaLatexContextRoot({ leaRepoPath, overleafProjectId });
-  const manifestPath = buildLeaLatexContextManifestPath({ leaRepoPath, overleafProjectId });
-  return {
-    mode: "active_file",
-    rootPath: relativeToLeaRepo({ leaRepoPath, absolutePath: rootPath }),
-    manifestPath: relativeToLeaRepo({ leaRepoPath, absolutePath: manifestPath }),
-    updatedAt: manifest.updatedAt || null
-  };
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -1266,17 +1034,6 @@ function findLatestFinishedJob(jobs, jobKey) {
   return Object.values(jobs || {})
     .filter((job) => job.jobKey === jobKey && job.status !== "in_progress")
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
-}
-
-function findLatestStubJob(jobs, jobKey) {
-  return Object.values(jobs || {})
-    .filter((job) => (
-      job.jobKey === jobKey &&
-      job.status === "sorry_stub" &&
-      job.declarationName &&
-      job.recordedProofPath
-    ))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
 }
 
 async function resolveTheoremUses({ leaRepoPath, overleafProjectId, theoremUses, jobs }) {
@@ -1382,7 +1139,6 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaRepoPath: state.settings.leaRepoPath,
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
-    leaApiFlavor: state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR,
     leaSessionId: null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
@@ -1391,7 +1147,6 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     leaModel: modelInfo.value,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
-    leaTheoremTranslationMaxRetries: state.settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
     leaCurrentTurn: null,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
   };
@@ -1475,91 +1230,45 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
   return sections.map((section) => section.entry.name);
 }
 
-// Run one autonomous proof job against the configured Lea backend, returning the
-// legacy `exit` contract ({ ok, timedOut, apiRunId, error, usage, costUsd }) the
-// rest of the orchestration consumes — regardless of wire flavor.
-//
-// "api"  → the standalone adapter (apps/lea-standalone/adapter). Config (model,
-//          max_turns) is server-side; tool-approval gates are auto-approved so the
-//          run is autonomous; usage is read back from the run row at the end.
-//          The session+run are tagged with the Overleaf document namespace
-//          (`target.projectSlug`) so the popover's "This project" usage can be
-//          summed per document from the shared DB.
-// "v1"   → the legacy vendored Lea API (retired; kept for rollback only).
+// Run one autonomous proof job against the standalone adapter, returning the
+// `exit` contract ({ ok, timedOut, apiRunId, error, usage, costUsd }) the rest of
+// the orchestration consumes.
 async function runLeaProofJobForJob({ state, job, target, prompt }) {
-  if (isApiFlavor(job.leaApiFlavor)) {
-    await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/api/runs\n\n${prompt}\n\n`);
-    const exit = await runApiProofJob({
-      fetchImpl: state.fetchImpl || fetch,
-      baseUrl: job.leaApiBaseUrl,
-      apiKey: state.env?.LEA_API_KEY,
-      message: prompt,
-      sessionId: job.leaSessionId || null,
-      maxTurns: job.leaMaxTurns,
-      timeoutMs: job.leaJobTimeoutSeconds * 1000,
-      autoApprove: true,
-      projectSlug: target.projectSlug || null,
-      projectTitle: target.projectSlug || null,
-      // Mark the adapter session as Overleaf-originated and hand it the canonical
-      // document URL, so the Lea UI can show an origin indicator and open/focus the
-      // source document. Independent of the project usage-namespace above.
-      origin: "overleaf",
-      originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
-      appendLog,
-      logPath: job.logPath,
-      onRunStarted: async (apiRunId, sessionId) => {
-        job.apiRunId = apiRunId;
-        job.leaSessionId = sessionId || job.leaSessionId || null;
-        await writeJson(state.jobsPath, state.jobs);
-      },
-      onProgressUpdated: async (progress) => {
-        if (!recordJobTurnProgress(job, progress)) return;
-        await writeJson(state.jobsPath, state.jobs);
-      }
-    });
-    // No live usage on /api, so enforce the spend limit once, post-run.
-    if (exit.usage || exit.costUsd !== undefined) {
-      await recordUsageAndEnforceSpendLimit({
-        state,
-        job,
-        usage: { ...exit.usage, costUsd: exit.costUsd },
-        mode: "formalization"
-      });
-    }
-    return exit;
-  }
-
-  await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs\n\n${prompt}\n\n`);
-  return runLeaApiProofJob({
+  await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/api/runs\n\n${prompt}\n\n`);
+  const exit = await runApiProofJob({
     fetchImpl: state.fetchImpl || fetch,
     baseUrl: job.leaApiBaseUrl,
     apiKey: state.env?.LEA_API_KEY,
-    model: job.leaModel,
+    message: prompt,
+    sessionId: job.leaSessionId || null,
     maxTurns: job.leaMaxTurns,
-    theoremTranslationMaxRetries: job.leaTheoremTranslationMaxRetries,
-    providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
-    prompt,
-    narrateToolSteps: job.leaNarrateToolSteps !== false,
-    project: {
-      project_id: target.projectSlug,
-      project_path: target.relativePath,
-      record_on_success: true
-    },
-    logPath: job.logPath,
     timeoutMs: job.leaJobTimeoutSeconds * 1000,
-    onRunStarted: async (apiRunId) => {
+    autoApprove: true,
+    projectSlug: target.projectSlug || null,
+    projectTitle: target.projectSlug || null,
+    origin: "overleaf",
+    originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
+    appendLog,
+    logPath: job.logPath,
+    onRunStarted: async (apiRunId, sessionId) => {
       job.apiRunId = apiRunId;
+      job.leaSessionId = sessionId || job.leaSessionId || null;
       await writeJson(state.jobsPath, state.jobs);
-      await spawnLeaRecorder({ state, job, target, apiRunId, prompt });
-    },
-    onUsageUpdated: async (usage) => {
-      return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "formalization" });
     },
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
       await writeJson(state.jobsPath, state.jobs);
     }
   });
+  if (exit.usage || exit.costUsd !== undefined) {
+    await recordUsageAndEnforceSpendLimit({
+      state,
+      job,
+      usage: { ...exit.usage, costUsd: exit.costUsd },
+      mode: "formalization"
+    });
+  }
+  return exit;
 }
 
 // Single source of truth for turning a finished Lea run into a theorem outcome.
@@ -1570,7 +1279,7 @@ async function runLeaProofJobForJob({ state, job, target, prompt }) {
 // inspection (`localStatus`) is used purely to ENRICH the result — locate the
 // proof file, surface the Lean statement, detect a leftover sorry — or as a
 // FALLBACK when the run itself failed. It is never allowed to override a run the
-// adapter reported as successful. This matters because the `/api` flavor defers
+// adapter reported as successful. This matters because the adapter defers
 // project-markdown recording, so the companion frequently cannot locate the
 // proof on disk even though the run genuinely formalized the theorem; trusting
 // the adapter is what keeps the Overleaf tag truthful.
@@ -1586,7 +1295,7 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
 
   // A located sorry/admit is never a complete formalization, whatever the run
   // outcome: record the run as failed but carry the sorry_stub effective status
-  // so the UI can still offer stub-based actions. (Unchanged prior behaviour.)
+  // so historical artifacts remain readable.
   if (local.status === "sorry_stub") {
     return {
       jobStatus: "failed",
@@ -1642,8 +1351,7 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
   };
 }
 
-// Shared finalization for a completed Lea proof run, used by every flavor and by
-// both the initial-run and approval-resume paths. It computes the best local,
+// Shared finalization for a completed Lea proof run. It computes the best local,
 // file-derived status as enrichment, then defers the verdict to
 // `resolveProofOutcome`. This is the single place a run's terminal job status is
 // decided, so the badge, the job record, and the polling resolver can never
@@ -1737,7 +1445,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
   await writeJson(state.jobsPath, state.jobs);
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [], latexContext = null }) {
+async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
   const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
     projectSlug: target.projectSlug,
@@ -1745,8 +1453,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     theoremText,
     theoremContext,
     declarationNameHint: job.declarationNameHint || "",
-    resolvedUses,
-    latexContext
+    resolvedUses
   });
   const exit = await runLeaProofJobForJob({ state, job, target, prompt });
   if (job.finalStatus === "max_spend") return;
@@ -1754,170 +1461,7 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 }
 
-async function maybeResumeStubFormalization({ state, target, theoremText, theoremContext = "", theoremUses = [] }) {
-  const stubJob = findLatestStubJob(state.jobs || {}, target.jobKey);
-  if (!stubJob?.apiRunId || !stubJob?.approvalId) {
-    return null;
-  }
-
-  const run = await getLeaApiRun({
-    fetchImpl: state.fetchImpl || fetch,
-    baseUrl: stubJob.leaApiBaseUrl || state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
-    apiKey: state.env?.LEA_API_KEY,
-    apiRunId: stubJob.apiRunId
-  });
-  const runStatus = String(run.body?.status || run.body?.state || "").toLowerCase();
-  const pendingApprovalId = run.body?.pending_approval?.approval_id;
-  if (!run.ok || runStatus !== "paused" || pendingApprovalId !== stubJob.approvalId) {
-    return null;
-  }
-
-  const usesResolution = await resolveTheoremUses({
-    leaRepoPath: state.settings.leaRepoPath,
-    overleafProjectId: target.overleafProjectId,
-    theoremUses,
-    jobs: state.jobs || {}
-  });
-  if (!usesResolution.ok) {
-    return errorResponse(400, usesResolution.error, usesResolution.message);
-  }
-
-  stubJob.status = "in_progress";
-  stubJob.kind = "formalize_after_stub";
-  stubJob.theoremContext = theoremContext;
-  stubJob.theoremUses = usesResolution.resolvedUses;
-  stubJob.theoremTextHash = hashTheoremText(theoremText);
-  stubJob.startedAt = new Date().toISOString();
-  stubJob.finishedAt = null;
-  stubJob.error = null;
-  stubJob.exitCode = null;
-  await writeJson(state.jobsPath, state.jobs);
-
-  runLeaJobFromApproval({ state, job: stubJob, target }).catch(async (error) => {
-    stubJob.status = "failed";
-    stubJob.error = error instanceof Error ? error.message : String(error);
-    stubJob.finishedAt = new Date().toISOString();
-    await appendLog(stubJob.logPath, `\n[backend] ${stubJob.error}\n`);
-    await writeJson(state.jobsPath, state.jobs);
-  });
-
-  return {
-    statusCode: 200,
-    body: buildJobResponse({ job: stubJob, status: "in_progress", target })
-  };
-}
-
-async function createStubJob({ state, job, target, theoremText, theoremContext = "", latexContext = null }) {
-  const prompt = buildLeaPrompt({
-    projectSlug: target.projectSlug,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    theoremContext,
-    declarationNameHint: job.declarationNameHint || "",
-    resolvedUses: [],
-    latexContext
-  });
-  await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/v1/runs (theorem translation approval)\n\n${prompt}\n\n`);
-  const pause = await runLeaApiApprovalStubJob({
-    fetchImpl: state.fetchImpl || fetch,
-    baseUrl: job.leaApiBaseUrl,
-    apiKey: state.env?.LEA_API_KEY,
-    model: job.leaModel,
-    maxTurns: job.leaMaxTurns,
-    theoremTranslationMaxRetries: job.leaTheoremTranslationMaxRetries,
-    providerApiKey: getProviderApiKey(state, job.leaProviderFamily),
-    prompt,
-    narrateToolSteps: job.leaNarrateToolSteps !== false,
-    project: {
-      project_id: target.projectSlug,
-      project_path: target.relativePath,
-      record_on_success: true
-    },
-    logPath: job.logPath,
-    timeoutMs: job.leaJobTimeoutSeconds * 1000,
-    onRunStarted: async (apiRunId) => {
-      job.apiRunId = apiRunId;
-      await writeJson(state.jobsPath, state.jobs);
-      await spawnLeaRecorder({ state, job, target, apiRunId, prompt });
-    },
-    onUsageUpdated: async (usage) => {
-      return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "stub" });
-    },
-    onProgressUpdated: async (progress) => {
-      if (!recordJobTurnProgress(job, progress)) return;
-      await writeJson(state.jobsPath, state.jobs);
-    }
-  });
-
-  if (!pause.ok) {
-    if (job.finalStatus === "max_spend") return;
-    throw new Error(pause.error || "Lea did not produce a theorem-translation approval.");
-  }
-
-  recordJobUsage(job, pause);
-  const entry = await persistStubApproval({
-    leaRepoPath: state.settings.leaRepoPath,
-    target,
-    theoremText,
-    theoremContext,
-    approval: pause.approval
-  });
-
-  job.status = "sorry_stub";
-  job.finalStatus = "sorry_stub";
-  job.apiRunId = pause.apiRunId;
-  job.approvalId = pause.approval.approval_id;
-  job.declarationName = entry.name;
-  job.recordedProofPath = entry.proofPath;
-  job.moduleName = entry.moduleName || null;
-  job.approvalLeanCode = pause.approval.lean_code;
-  job.approvalCheckResult = pause.approval.check_result || "";
-  job.finishedAt = new Date().toISOString();
-  job.exitCode = 0;
-  await appendLog(job.logPath, `\n[backend] Stub recorded at ${entry.proofPath}; Lea run paused for approval ${job.approvalId}\n`);
-  await writeJson(state.jobsPath, state.jobs);
-}
-
-async function runLeaJobFromApproval({ state, job, target }) {
-  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
-  const resume = await acceptLeaApproval({
-    fetchImpl: state.fetchImpl || fetch,
-    baseUrl: job.leaApiBaseUrl,
-    apiKey: state.env?.LEA_API_KEY,
-    apiRunId: job.apiRunId,
-    approvalId: job.approvalId
-  });
-  if (!resume.ok) {
-    throw new Error(resume.error || "Could not approve the saved Lea theorem translation.");
-  }
-  await appendLog(job.logPath, `\n[backend] Accepted Lea approval ${job.approvalId}; resuming run ${job.apiRunId}\n`);
-
-  const exit = await waitForLeaApiProofJob({
-    fetchImpl: state.fetchImpl || fetch,
-    baseUrl: job.leaApiBaseUrl,
-    apiKey: state.env?.LEA_API_KEY,
-    apiRunId: job.apiRunId,
-    maxTurns: job.leaMaxTurns,
-    logPath: job.logPath,
-    timeoutMs: job.leaJobTimeoutSeconds * 1000,
-    onUsageUpdated: async (usage) => {
-      return recordUsageAndEnforceSpendLimit({ state, job, usage, mode: "approval resume" });
-    },
-    onProgressUpdated: async (progress) => {
-      if (!recordJobTurnProgress(job, progress)) return;
-      await writeJson(state.jobsPath, state.jobs);
-    }
-  });
-  if (job.finalStatus === "max_spend") return;
-
-  await finishLeaProofJob({ state, job, target, beforeMarkers, exit });
-}
-
-async function finishLeaProofJob({ state, job, target, beforeMarkers, exit }) {
-  await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses: job.theoremUses || [] });
-}
-
-function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], latexContext = null }) {
+function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [] }) {
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -1930,9 +1474,6 @@ function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext
   const formalizationGuidance = theoremContext.trim()
     ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
     : "";
-  const latexContextGuidance = latexContext?.manifestPath
-    ? `\nAdditional Overleaf LaTeX context is available in Lea's workspace at:\n${latexContext.manifestPath}\n\nConsult it if theorem statements, notation, definitions, or surrounding exposition are unclear.\n`
-    : "";
 
   return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
 ${naming}
@@ -1940,7 +1481,6 @@ ${usesGuidance}
 
 ${theoremText}
 ${formalizationGuidance}
-${latexContextGuidance}
 
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a statement for approval. If a detail is ambiguous (for example which number type to use), pick the most natural interpretation and proceed without waiting. Do everything in this run: write the Lean file under Lea's workspace and carry the proof through to completion.
 
@@ -1948,687 +1488,6 @@ The final file must compile with no sorry/admit in theorem ${proofTarget}.
 Use the Lea project context to choose the project namespace and proof path.
 Do not edit the project markdown during proof search; Lea will record the final result after the proof succeeds.
 Do not create placeholder files outside Lea's workspace. If you cannot complete the proof, leave the best partial Lean file in the Lea project proof directory.`;
-}
-
-async function runLeaApiProofJob({
-  fetchImpl,
-  baseUrl,
-  apiKey,
-  model,
-  maxTurns,
-  theoremTranslationMaxRetries,
-  providerApiKey,
-  prompt,
-  project,
-  logPath,
-  timeoutMs,
-  narrateToolSteps = true,
-  onRunStarted = null,
-  onUsageUpdated = null,
-  onProgressUpdated = null
-}) {
-  const startResponse = await startLeaApiRun({
-    fetchImpl,
-    baseUrl,
-    apiKey,
-    model,
-    maxTurns,
-    theoremTranslationMaxRetries,
-    providerApiKey,
-    prompt,
-    project,
-    permissionTier: "none",
-    narrateToolSteps
-  });
-  if (!startResponse.ok) {
-    return { ok: false, timedOut: false, error: startResponse.error };
-  }
-
-  const apiRunId = startResponse.body?.run_id;
-  if (!apiRunId) {
-    return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
-  }
-  await appendLog(logPath, `[backend] Lea API run started: ${apiRunId}\n`);
-  if (onRunStarted) await onRunStarted(apiRunId);
-
-  return waitForLeaApiProofJob({
-    fetchImpl,
-    baseUrl,
-    apiKey,
-    apiRunId,
-    maxTurns,
-    logPath,
-    timeoutMs,
-    onUsageUpdated,
-    onProgressUpdated
-  });
-}
-
-async function runLeaApiApprovalStubJob({
-  fetchImpl,
-  baseUrl,
-  apiKey,
-  model,
-  maxTurns,
-  theoremTranslationMaxRetries,
-  providerApiKey,
-  prompt,
-  project,
-  logPath,
-  timeoutMs,
-  narrateToolSteps = true,
-  onRunStarted = null,
-  onUsageUpdated = null,
-  onProgressUpdated = null
-}) {
-  const startResponse = await startLeaApiRun({
-    fetchImpl,
-    baseUrl,
-    apiKey,
-    model,
-    maxTurns,
-    theoremTranslationMaxRetries,
-    providerApiKey,
-    prompt,
-    project,
-    permissionTier: "theorem_translation",
-    narrateToolSteps
-  });
-  if (!startResponse.ok) {
-    return { ok: false, timedOut: false, error: startResponse.error };
-  }
-
-  const apiRunId = startResponse.body?.run_id;
-  if (!apiRunId) {
-    return { ok: false, timedOut: false, error: "Lea API did not return a run_id." };
-  }
-  await appendLog(logPath, `[backend] Lea API theorem-translation run started: ${apiRunId}\n`);
-  if (onRunStarted) await onRunStarted(apiRunId);
-
-  return waitForLeaApiApprovalPause({
-    fetchImpl,
-    baseUrl,
-    apiKey,
-    apiRunId,
-    maxTurns,
-    logPath,
-    timeoutMs,
-    onUsageUpdated,
-    onProgressUpdated
-  });
-}
-
-async function startLeaApiRun({
-  fetchImpl,
-  baseUrl,
-  apiKey,
-  model,
-  maxTurns,
-  theoremTranslationMaxRetries,
-  providerApiKey,
-  prompt,
-  project,
-  permissionTier,
-  narrateToolSteps = true
-}) {
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) {
-    headers.Authorization = `Bearer ${apiKey}`;
-  }
-  const body = {
-    task: prompt,
-    config: {
-      model: {
-        name: model,
-        model_kwargs: {
-          max_tokens: DEFAULT_LEA_MODEL_MAX_TOKENS,
-          ...(providerApiKey ? { api_key: providerApiKey } : {})
-        }
-      },
-      agent: {
-        max_turns: maxTurns,
-        narrate_tool_steps: narrateToolSteps !== false,
-        permission_tier: permissionTier,
-        theorem_translation_max_retries: normalizeLeaTheoremTranslationMaxRetries(theoremTranslationMaxRetries)
-      }
-    },
-    project
-  };
-
-  return fetchJson(fetchImpl, `${baseUrl}/v1/runs`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body)
-  });
-}
-
-async function waitForLeaApiProofJob({
-  fetchImpl,
-  baseUrl,
-  apiKey,
-  apiRunId,
-  maxTurns,
-  logPath,
-  timeoutMs,
-  onUsageUpdated = null,
-  onProgressUpdated = null,
-  refTimers = false
-}) {
-  const started = Date.now();
-  const usageAbort = new AbortController();
-  const stopState = { requested: false, error: null };
-  const eventsPromise = tailLeaRunUsageEvents({
-    fetchImpl,
-    baseUrl,
-    apiKey,
-    apiRunId,
-    logPath,
-    maxTurns,
-    onUsageUpdated,
-    onProgressUpdated,
-    stopState,
-    signal: usageAbort.signal
-  });
-
-  while (Date.now() - started < timeoutMs) {
-    await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))), { ref: refTimers });
-    if (stopState.requested) {
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return { ok: false, timedOut: false, apiRunId, error: stopState.error || "Lea API run stopped." };
-    }
-    const statusResponse = await fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`, {
-      method: "GET",
-      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
-    });
-    if (!statusResponse.ok) {
-      usageAbort.abort();
-      return { ok: false, timedOut: false, apiRunId, error: statusResponse.error };
-    }
-
-    const run = statusResponse.body || {};
-    await notifyTurnProgress(onProgressUpdated, run, maxTurns);
-    const status = String(run.status || run.state || "").toLowerCase();
-    const message = extractRunMessage(run);
-    if (message) {
-      await appendLog(logPath, `[lea-api] ${message}\n`);
-    }
-    if (["completed", "succeeded", "success", "done"].includes(status)) {
-      const reason = String(run.result?.reason || "").toLowerCase();
-      if (reason && !["success", "succeeded", "done", "completed"].includes(reason)) {
-        usageAbort.abort();
-        await settleUsageEvents(eventsPromise);
-        return {
-          ok: false,
-          timedOut: false,
-          apiRunId,
-          error: message || `Lea API completed with reason: ${reason}`,
-          ...extractRunUsage(run)
-        };
-      }
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return { ok: true, timedOut: false, apiRunId, ...extractRunUsage(run) };
-    }
-    if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return {
-        ok: false,
-        timedOut: false,
-        apiRunId,
-        error: message || `Lea API status: ${status}`,
-        ...extractRunUsage(run)
-      };
-    }
-  }
-
-  usageAbort.abort();
-  return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out." };
-}
-
-async function waitForLeaApiApprovalPause({
-  fetchImpl,
-  baseUrl,
-  apiKey,
-  apiRunId,
-  maxTurns,
-  logPath,
-  timeoutMs,
-  onUsageUpdated = null,
-  onProgressUpdated = null,
-  refTimers = true
-}) {
-  const started = Date.now();
-  const usageAbort = new AbortController();
-  const stopState = { requested: false, error: null };
-  const eventsPromise = tailLeaRunUsageEvents({
-    fetchImpl,
-    baseUrl,
-    apiKey,
-    apiRunId,
-    logPath,
-    maxTurns,
-    onUsageUpdated,
-    onProgressUpdated,
-    stopState,
-    signal: usageAbort.signal
-  });
-
-  while (Date.now() - started < timeoutMs) {
-    await delay(Math.min(1000, Math.max(1, timeoutMs - (Date.now() - started))), { ref: refTimers });
-    if (stopState.requested) {
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return { ok: false, timedOut: false, apiRunId, error: stopState.error || "Lea API run stopped." };
-    }
-    const statusResponse = await getLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId });
-    if (!statusResponse.ok) {
-      usageAbort.abort();
-      return { ok: false, timedOut: false, apiRunId, error: statusResponse.error };
-    }
-
-    const run = statusResponse.body || {};
-    await notifyTurnProgress(onProgressUpdated, run, maxTurns);
-    const status = String(run.status || run.state || "").toLowerCase();
-    const message = extractRunMessage(run);
-    if (message) {
-      await appendLog(logPath, `[lea-api] ${message}\n`);
-    }
-    if (status === "paused" && run.pending_approval?.type === "approval_requested") {
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return {
-        ok: true,
-        timedOut: false,
-        apiRunId,
-        approval: run.pending_approval,
-        ...extractRunUsage(run)
-      };
-    }
-    if (["completed", "succeeded", "success", "done"].includes(status)) {
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return {
-        ok: false,
-        timedOut: false,
-        apiRunId,
-        error: message || "Lea completed without pausing for theorem approval.",
-        ...extractRunUsage(run)
-      };
-    }
-    if (["failed", "error", "cancelled", "canceled", "timeout", "timed_out"].includes(status)) {
-      usageAbort.abort();
-      await settleUsageEvents(eventsPromise);
-      return {
-        ok: false,
-        timedOut: false,
-        apiRunId,
-        error: message || `Lea API status: ${status}`,
-        ...extractRunUsage(run)
-      };
-    }
-  }
-
-  usageAbort.abort();
-  return { ok: false, timedOut: true, apiRunId, error: "Lea API run timed out waiting for theorem approval." };
-}
-
-function getLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId }) {
-  return fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`, {
-    method: "GET",
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
-  });
-}
-
-function acceptLeaApproval({ fetchImpl, baseUrl, apiKey, apiRunId, approvalId }) {
-  return fetchJson(fetchImpl, `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/approvals/${encodeURIComponent(approvalId)}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
-    },
-    body: JSON.stringify({ decision: "accept" })
-  });
-}
-
-async function cancelLeaApiRun({ fetchImpl, baseUrl, apiKey, apiRunId }) {
-  const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
-  const candidates = [
-    {
-      url: `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/cancel`,
-      options: { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: "{}" }
-    },
-    {
-      url: `${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}`,
-      options: { method: "DELETE", headers }
-    }
-  ];
-  let lastError = "";
-  for (const candidate of candidates) {
-    const result = await fetchJson(fetchImpl, candidate.url, candidate.options);
-    if (result.ok) return result;
-    lastError = result.error;
-    if (!/HTTP 404|HTTP 405/.test(result.error || "")) break;
-  }
-  return { ok: false, error: lastError || "Lea API cancellation endpoint is unavailable." };
-}
-
-export function parseRecorderResult(stdout) {
-  const lines = String(stdout || "").trim().split(/\r?\n/).filter(Boolean);
-  for (let i = lines.length - 1; i >= 0; i -= 1) {
-    const parsed = parseRecorderJsonLine(lines[i]);
-    if (parsed?.session_id) return parsed;
-  }
-  return null;
-}
-
-export function parseRecorderJsonLine(line) {
-  try {
-    const parsed = JSON.parse(String(line || ""));
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-export function buildRecorderArgs({ job, target, apiRunId, prompt }) {
-  const externalRef = {
-    overleaf_project_id: target.overleafProjectId || null,
-    theorem_label: target.theoremLabel || null,
-    companion_job_id: job.jobId || null
-  };
-  const args = [
-    "-m", "app.recorder",
-    "--api-run-id", String(apiRunId),
-    "--origin", "overleaf",
-    "--task", String(prompt || ""),
-    "--title", String(target.theoremLabel || job.jobId || "Overleaf formalization"),
-    "--emit-session-link",
-    "--external-ref", JSON.stringify(externalRef)
-  ];
-  if (job.leaModel) args.push("--model", String(job.leaModel));
-  if (job.leaMaxTurns) args.push("--max-turns", String(job.leaMaxTurns));
-  if (target.projectSlug) {
-    args.push("--project-slug", String(target.projectSlug));
-    args.push("--project-title", String(target.projectSlug));
-    if (target.relativePath) args.push("--project-path", String(target.relativePath));
-  }
-  return args;
-}
-
-// Spawns the shared-state recorder (the Lea UI server's `app.recorder` module),
-// which attaches to the already-started API run as an additional event-stream
-// subscriber and persists the full process timeline into the shared database so
-// the formalization is visible in the UI exactly like a UI-originated run. This
-// is best-effort and never blocks or fails the companion's own job.
-export async function spawnLeaRecorder({ state, job, target, apiRunId, prompt }) {
-  if (!state?.settings?.leaSharedState || !apiRunId) return null;
-  if (job.recorderSpawned) return null;
-  job.recorderSpawned = true;
-
-  const python = state.settings.leaRecorderPython;
-  const serverDir = state.settings.leaUiServerDir;
-  if (!python || !serverDir) return null;
-
-  const spawnImpl = state.spawnImpl || spawn;
-  const args = buildRecorderArgs({ job, target, apiRunId, prompt });
-
-  let child;
-  try {
-    child = spawnImpl(python, args, {
-      cwd: serverDir,
-      env: {
-        ...process.env,
-        PYTHONPATH: [job.leaRepoPath, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
-      },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-  } catch (error) {
-    await appendLog(
-      job.logPath,
-      `[backend] Failed to start shared-state recorder: ${error instanceof Error ? error.message : String(error)}\n`
-    );
-    return null;
-  }
-
-  let stdout = "";
-  let stdoutRemainder = "";
-  let stderr = "";
-  child.stdout?.on("data", (chunk) => {
-    const text = String(chunk);
-    stdout += text;
-    stdoutRemainder += text;
-    const lines = stdoutRemainder.split(/\r?\n/);
-    stdoutRemainder = lines.pop() || "";
-    for (const line of lines) {
-      const parsed = parseRecorderJsonLine(line);
-      if (parsed?.session_id) {
-        recordLinkedSession({ state, job, parsed, status: parsed.status }).catch(() => {});
-      }
-    }
-  });
-  child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
-  child.on("error", async (error) => {
-    await appendLog(
-      job.logPath,
-      `[backend] Shared-state recorder error: ${error instanceof Error ? error.message : String(error)}\n`
-    );
-  });
-  child.on("close", async (code) => {
-    if (stderr.trim()) {
-      await appendLog(job.logPath, `[recorder] ${stderr.trim()}\n`);
-    }
-    const parsed = parseRecorderResult(stdout);
-    if (parsed) {
-      await recordLinkedSession({ state, job, parsed, status: parsed.status });
-      const recorderStatus = parsed.status || (code === 0 ? "linked" : `exit ${code}`);
-      await appendLog(
-        job.logPath,
-        `[backend] Shared-state recorder linked session ${parsed.session_id} (status ${recorderStatus}).\n`
-      );
-    } else if (code !== 0) {
-      await appendLog(job.logPath, `[backend] Shared-state recorder exited with code ${code}.\n`);
-    }
-    try {
-      await writeJson(state.jobsPath, state.jobs);
-    } catch {
-      // jobs.json write is best-effort here.
-    }
-  });
-
-  job.recorderPid = child.pid || null;
-  try {
-    await writeJson(state.jobsPath, state.jobs);
-  } catch {
-    // best-effort
-  }
-  return child;
-}
-
-async function recordLinkedSession({ state, job, parsed, status }) {
-  if (!parsed?.session_id) return;
-  job.recorderSessionId = parsed.session_id;
-  job.recorderRunId = parsed.run_id || job.recorderRunId || null;
-  if (status) {
-    job.recorderStatus = status;
-  }
-  try {
-    await writeJson(state.jobsPath, state.jobs);
-  } catch {
-    // jobs.json write is best-effort here.
-  }
-}
-
-async function tailLeaRunUsageEvents({
-  fetchImpl,
-  baseUrl,
-  apiKey,
-  apiRunId,
-  logPath,
-  maxTurns,
-  onUsageUpdated,
-  onProgressUpdated,
-  stopState,
-  signal
-}) {
-  if (!onUsageUpdated && !onProgressUpdated) return;
-
-  try {
-    const response = await fetchImpl(`${baseUrl}/v1/runs/${encodeURIComponent(apiRunId)}/events`, {
-      method: "GET",
-      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-      signal
-    });
-    if (!response?.ok || !response.body) {
-      return;
-    }
-
-    let buffer = "";
-    for await (const chunk of iterateResponseBody(response.body)) {
-      buffer += decodeChunk(chunk);
-      const frames = buffer.split(/\r?\n\r?\n/);
-      buffer = frames.pop() || "";
-      for (const frame of frames) {
-        const shouldContinue = await handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated, stopState });
-        if (!shouldContinue) return;
-      }
-    }
-    if (buffer.trim()) {
-      await handleLeaEventFrame(buffer, { maxTurns, onUsageUpdated, onProgressUpdated, stopState });
-    }
-  } catch (error) {
-    if (error?.name === "AbortError") return;
-    await appendLog(logPath, `[backend] Lea usage event stream unavailable: ${error instanceof Error ? error.message : String(error)}\n`);
-  }
-}
-
-async function handleLeaEventFrame(frame, { maxTurns, onUsageUpdated, onProgressUpdated, stopState }) {
-  const data = frame
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice("data:".length).trimStart())
-    .join("\n")
-    .trim();
-  if (!data) return true;
-
-  let event;
-  try {
-    event = JSON.parse(data);
-  } catch {
-    return true;
-  }
-
-  await notifyTurnProgress(onProgressUpdated, event, maxTurns);
-
-  if (event.type === "usage_updated") {
-    if (onUsageUpdated) {
-      const result = await onUsageUpdated({
-        inputTokens: event.input_tokens,
-        outputTokens: event.output_tokens,
-        totalTokens: toNonNegativeNumber(event.input_tokens) + toNonNegativeNumber(event.output_tokens),
-        costUsd: event.cost,
-        delta: true
-      });
-      if (result?.stop) {
-        if (stopState) {
-          stopState.requested = true;
-          stopState.error = result.error || "";
-        }
-        return false;
-      }
-    }
-    return true;
-  }
-  if (event.type === "finished") {
-    if (onUsageUpdated && (event.usage || event.cost !== undefined)) {
-      const result = await onUsageUpdated(extractEventUsage(event));
-      if (result?.stop) {
-        if (stopState) {
-          stopState.requested = true;
-          stopState.error = result.error || "";
-        }
-        return false;
-      }
-    }
-    return false;
-  }
-  if (event.type === "error") {
-    return false;
-  }
-  return true;
-}
-
-function extractEventUsage(event) {
-  const usage = event?.usage || event || {};
-  const inputTokens = toNonNegativeNumber(usage.input_tokens);
-  const outputTokens = toNonNegativeNumber(usage.output_tokens);
-  return {
-    inputTokens,
-    outputTokens,
-    totalTokens: inputTokens + outputTokens,
-    costUsd: toNonNegativeNumber(event?.cost)
-  };
-}
-
-async function notifyTurnProgress(onProgressUpdated, payload, defaultMaxTurns = null) {
-  if (!onProgressUpdated) return;
-  const progress = extractTurnProgress(payload, defaultMaxTurns);
-  if (!progress) return;
-  await onProgressUpdated(progress);
-}
-
-async function settleUsageEvents(eventsPromise) {
-  if (!eventsPromise) return;
-  try {
-    await Promise.race([eventsPromise, delay(25)]);
-  } catch {
-    // Usage events are best-effort; terminal run polling remains authoritative.
-  }
-}
-
-async function* iterateResponseBody(body) {
-  if (body?.[Symbol.asyncIterator]) {
-    yield* body;
-    return;
-  }
-  if (!body?.getReader) return;
-
-  const reader = body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      yield value;
-    }
-  } finally {
-    reader.releaseLock?.();
-  }
-}
-
-function decodeChunk(chunk) {
-  if (typeof chunk === "string") return chunk;
-  if (chunk instanceof Uint8Array) return new TextDecoder().decode(chunk);
-  return String(chunk);
-}
-
-function extractRunMessage(run) {
-  return run.final_text || run.error || run.message || run.result?.text || "";
-}
-
-function extractRunUsage(run) {
-  const usage = run?.result?.usage || {};
-  const inputTokens = toNonNegativeNumber(usage.input_tokens);
-  const outputTokens = toNonNegativeNumber(usage.output_tokens);
-  const costUsd = toNonNegativeNumber(run?.result?.cost);
-  return {
-    usage: {
-      inputTokens,
-      outputTokens,
-      totalTokens: inputTokens + outputTokens
-    },
-    costUsd
-  };
 }
 
 function recordJobUsage(job, exit) {
@@ -2666,8 +1525,8 @@ function recordJobUsageDelta(job, usage) {
 }
 
 function recordJobTurnProgress(job, progress) {
-  const current = toPositiveInteger(progress?.current);
-  const max = toPositiveInteger(progress?.max) || toPositiveInteger(job.leaMaxTurns);
+  const current = toPositiveInteger(progress?.current ?? progress?.currentTurn);
+  const max = toPositiveInteger(progress?.max ?? progress?.maxTurns) || toPositiveInteger(job.leaMaxTurns);
   if (!current || !max) return false;
   if (job.leaCurrentTurn === current && job.leaMaxTurns === max) return false;
   job.leaCurrentTurn = current;
@@ -2760,11 +1619,6 @@ function normalizeLeaMaxTurns(value) {
   return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_MAX_TURNS;
 }
 
-function normalizeLeaTheoremTranslationMaxRetries(value) {
-  const parsed = Number.parseInt(String(value || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES), 10);
-  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
-}
-
 function normalizeLeaMaxSpendUsd(value) {
   if (value === undefined || value === null || value === "") return null;
   const number = Number(value);
@@ -2802,33 +1656,19 @@ async function markJobMaxSpend({ state, job, mode }) {
   job.finishedAt = new Date().toISOString();
   await appendLog(job.logPath, `\n[backend] ${MAX_SPEND_MESSAGE}\n`);
   if (job.apiRunId) {
-    const cancel = await cancelLeaApiRun({
+    const cancel = await interruptApiRun({
       fetchImpl: state.fetchImpl || fetch,
       baseUrl: job.leaApiBaseUrl,
       apiKey: state.env?.LEA_API_KEY,
-      apiRunId: job.apiRunId
+      runId: job.apiRunId
     });
     if (!cancel.ok) {
-      await appendLog(job.logPath, `[backend] Failed to cancel Lea API run ${job.apiRunId}: ${cancel.error}\n`);
+      await appendLog(job.logPath, `[backend] Failed to interrupt Lea adapter run ${job.apiRunId}: ${cancel.error}\n`);
     }
   } else if (mode) {
     await appendLog(job.logPath, `[backend] Cost cap reached before Lea API run id was available for ${mode}.\n`);
   }
   await writeJson(state.jobsPath, state.jobs);
-}
-
-async function fetchJson(fetchImpl, url, options) {
-  try {
-    const response = await fetchImpl(url, options);
-    const text = await response.text();
-    const body = text ? JSON.parse(text) : null;
-    if (!response.ok) {
-      return { ok: false, error: `Lea API returned HTTP ${response.status}: ${text}` };
-    }
-    return { ok: true, body };
-  } catch (error) {
-    return { ok: false, error: error instanceof Error ? error.message : String(error) };
-  }
 }
 
 async function runLeanCheck(leaWorkspacePath, proofPath) {
@@ -3463,73 +2303,6 @@ function selectLeaArtifactCandidate({ candidates, job, ambiguousMessage }) {
   };
 }
 
-async function persistStubApproval({ leaRepoPath, target, theoremText, theoremContext = "", approval }) {
-  const leanCode = String(approval?.lean_code || "").trim();
-  if (!leanCode) {
-    throw new Error("Lea approval did not include Lean code.");
-  }
-  const declarationName = String(approval?.theorem_name || "").trim() ||
-    inferLeanDeclarationName(leanCode) ||
-    inferLeanDeclarationName(theoremText) ||
-    target.theoremLabel;
-  if (!isValidLeanIdentifier(declarationName)) {
-    throw new Error(`Lea approval returned an invalid theorem name: ${declarationName}.`);
-  }
-
-  const proofPath = stubProofPath({ projectSlug: target.projectSlug, declarationName });
-  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
-  if (!absolutePath) {
-    throw new Error("Could not resolve Lea stub proof path.");
-  }
-  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-  await fs.writeFile(absolutePath, `${leanCode}\n`, "utf8");
-
-  const moduleName = moduleNameFromProofPath(proofPath);
-  await upsertProjectTheoremEntry({
-    projectMarkdownPath: target.projectMarkdownPath,
-    projectId: target.projectSlug,
-    theoremName: declarationName,
-    proofPath,
-    moduleName,
-    signature: extractLeanStatement(leanCode, declarationName) || `${declarationName} := by sorry`,
-    description: theoremText,
-    solvingProcess: [
-      "Stub generated from Lea theorem-translation approval.",
-      theoremContext ? `Formalization guidance: ${theoremContext}` : "",
-      approval.check_result ? `Lean check: ${approval.check_result}` : ""
-    ].filter(Boolean).join("\n\n")
-  });
-
-  return { name: declarationName, proofPath, moduleName };
-}
-
-function stubProofPath({ projectSlug, declarationName }) {
-  const projectPart = projectNamespacePart(projectSlug);
-  return path.join("workspace", "proofs", "Lea", projectPart, `${declarationName}.lean`);
-}
-
-function projectNamespacePart(projectSlug) {
-  const part = String(projectSlug || "Project")
-    .split(/[-_]+/)
-    .filter(Boolean)
-    .map((token) => `${token.slice(0, 1).toUpperCase()}${token.slice(1)}`)
-    .join("");
-  const candidate = part || "Project";
-  return /^[A-Za-z_]/.test(candidate) ? candidate : `Project${candidate}`;
-}
-
-function moduleNameFromProofPath(proofPath) {
-  const parts = String(proofPath || "").split(/[\\/]+/);
-  const proofsIndex = parts.indexOf("proofs");
-  if (proofsIndex === -1) return null;
-  const moduleParts = parts.slice(proofsIndex + 1);
-  if (moduleParts.length === 0) return null;
-  moduleParts[moduleParts.length - 1] = moduleParts[moduleParts.length - 1].replace(/\.lean$/, "");
-  return moduleParts.every((part) => /^[A-Za-z_][A-Za-z0-9_']*$/.test(part))
-    ? moduleParts.join(".")
-    : null;
-}
-
 async function upsertProjectTheoremEntry({
   projectMarkdownPath,
   projectId,
@@ -3562,61 +2335,6 @@ async function upsertProjectTheoremEntry({
     : `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
   await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
   await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
-}
-
-async function upsertProjectLatexContextEntry({ projectMarkdownPath, projectId, context }) {
-  let existing;
-  try {
-    existing = await fs.readFile(projectMarkdownPath, "utf8");
-  } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
-    existing = `# Lea Project: ${projectId}\n\n<!-- lea:project id="${escapeHtmlAttribute(projectId)}" -->\n`;
-  }
-
-  const entry = renderProjectLatexContextEntry(context);
-  const section = findProjectLatexContextSection(existing);
-  let next;
-  if (section) {
-    next = `${existing.slice(0, section.start).trimEnd()}\n\n${entry.trimEnd()}\n${existing.slice(section.end).trimStart() ? `\n${existing.slice(section.end).trimStart()}` : ""}`;
-  } else {
-    const firstTheorem = existing.search(/\n## Theorem:/);
-    if (firstTheorem === -1) {
-      next = `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
-    } else {
-      next = `${existing.slice(0, firstTheorem).trimEnd()}\n\n${entry.trimEnd()}\n\n${existing.slice(firstTheorem).trimStart()}`;
-    }
-  }
-  await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
-  await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
-}
-
-function renderProjectLatexContextEntry(context) {
-  const rootPath = context?.rootPath || "";
-  const manifestPath = context?.manifestPath || "";
-  const attrs = [
-    `root="${escapeHtmlAttribute(rootPath)}"`,
-    `manifest="${escapeHtmlAttribute(manifestPath)}"`,
-    context?.updatedAt ? `updated="${escapeHtmlAttribute(context.updatedAt)}"` : ""
-  ].filter(Boolean).join(" ");
-  return `## LaTeX Context
-
-<!-- lea:latex-context ${attrs} -->
-
-Available project LaTeX mirror:
-\`${manifestPath}\`
-`;
-}
-
-function findProjectLatexContextSection(markdown) {
-  const text = String(markdown || "");
-  const marker = text.search(/<!--\s*lea:latex-context\b[^>]*-->/);
-  if (marker === -1) return null;
-  const headingStart = findNamedSectionHeadingStart(text, marker, "LaTeX Context");
-  const nextHeading = text.slice(marker).search(/\n## /);
-  return {
-    start: headingStart,
-    end: nextHeading === -1 ? text.length : marker + nextHeading
-  };
 }
 
 function renderProjectTheoremEntry({

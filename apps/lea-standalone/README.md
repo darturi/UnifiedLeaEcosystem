@@ -1,129 +1,185 @@
-# Theorem Formalization Interface
+# Lea Standalone
 
-Local React UI for running [Lea](https://github.com/shaswatpatel123/lea-prover/tree/lea_api) through the bundled Lea API, streaming proof progress, rendering math-rich explanations, and saving chat/code history in SQLite.
+`apps/lea-standalone` is the canonical local Lea UI and backend. It contains:
 
-## One-Command Dev
+- a React + Vite web app on `http://localhost:5173`;
+- a FastAPI adapter on `http://127.0.0.1:8001`;
+- the vendored Lea prover at `prover/`, imported by the adapter as a Python
+  library.
 
-After setup, start the bundled Lea API, UI adapter API, and web UI with:
-
-```bash
-npm run dev
-```
-
-The launcher:
-
-- checks required local files
-- starts the bundled Lea API from `prover`
-- waits for `http://127.0.0.1:8000/v1/healthz`
-- starts the local FastAPI adapter backend
-- waits for `http://127.0.0.1:8001/api/health`
-- starts Vite with `--host 0.0.0.0`
-- waits for `http://127.0.0.1:5173`
-- prints the browser URL
-
-Stop all local processes with `Ctrl+C`.
+The adapter drives the prover in-process through `lea.interface.run_events(...)`.
+It translates typed prover events into Server-Sent Events for the browser,
+commits proof changes to git, stores timeline metadata in SQLite, and exposes
+manual `lean_check` and SafeVerify endpoints.
 
 ## First-Time Setup
 
-```bash
+From the monorepo root, the recommended setup is:
+
+```sh
+npm run setup
+```
+
+For this app only:
+
+```sh
+npm run setup -- --target ui
+```
+
+Manual app-local setup is:
+
+```sh
 npm install
 cp config/lea.local.example.toml config/lea.local.toml
 npm run setup:api
 ```
 
-The Lea prover is vendored directly in this repo at `prover/`, so there is no submodule to initialize.
+`setup:api` creates the adapter virtualenv, installs the editable prover package,
+sets up the prover environment, and downloads the pinned Mathlib cache so the
+first proof check does not compile Mathlib from scratch.
 
-`npm run setup:api` installs the Python services and downloads the pinned Mathlib build cache. This can take a while on the first run, but it prevents the first proof check from compiling Mathlib during `lean_check`.
+## Development
 
-Edit `config/lea.local.toml` and set `model`, `max_turns`, and one provider key such as `google_api_key`, `anthropic_api_key`, or `openai_api_key`. You can also export provider keys in your shell instead of writing them to the config file.
+Start the adapter and web UI together:
 
-Set `narrate_tool_steps = true` to ask the bundled Lea agent to emit short Markdown/LaTeX progress summaries before it calls tools. This keeps step narration inside Lea rather than synthesizing it in the UI adapter.
-
-Set `permission_tier = "theorem_translation"` to pause each run for approval of the checked top-level Lean theorem skeleton before proof search starts. Use `permission_tier = "none"` to disable approval prompts.
-
-Set `theorem_translation_max_retries = 3` to control how many internal preflight attempts Lea makes to produce a checked Lean theorem statement before surfacing the approval step. This only affects the theorem translation permission tier.
-
-The default config uses the bundled Lea API at `http://127.0.0.1:8000` and resolves Lean file paths relative to the vendored prover at `prover/`:
-
-```toml
-lea_api_base_url = "http://127.0.0.1:8000"
-lea_root = "prover"
+```sh
+npm run dev
 ```
 
-Advanced users can point `lea_api_base_url` at an external Lea API. In that case `npm run dev` will use the configured external service instead of starting the bundled one.
+The launcher:
 
-To install only the bundled agent dependencies manually, run `npm run setup:agent`.
+- checks local prerequisites;
+- starts the FastAPI adapter on `http://127.0.0.1:8001`;
+- waits for `/api/health`;
+- starts Vite with `--host 0.0.0.0` on `http://localhost:5173`;
+- stops both child processes on `Ctrl+C`.
+
+To start only one process:
+
+```sh
+npm run start:api  # FastAPI adapter only
+npm run dev:web    # Vite web server only
+```
+
+From the monorepo root, `npm run start:adapter` is equivalent to this app's
+`npm run start:api`.
+
+## Configuration
+
+The adapter reads `config/lea.local.toml`. The standalone Settings page edits the
+same file, so manual edits and UI edits share one source of truth.
+
+Common fields:
+
+```toml
+lea_root = "prover"
+model = "gemini/gemini-3.1-pro-preview"
+max_turns = 20
+max_spend_usd = 25.00
+narrate_tool_steps = true
+openai_api_key = ""
+anthropic_api_key = ""
+google_api_key = ""
+```
+
+Provider keys are exported into the adapter process environment when config is
+loaded, because LiteLLM reads provider credentials from environment variables.
+The returned `LeaConfig` object does not carry secrets.
+
+The current interactive UI gates impactful tools (`bash`, `write_file`,
+`edit_file`) with allow/deny/always-for-session prompts. Overleaf-originated runs
+are marked autonomous and skip this gate.
 
 ## Using The UI
 
-- The chat panel groups assistant narration by Lea API turns and labels them as `Step 1`, `Step 2`, and so on.
-- The final result summary is not counted as a step. Successful summaries are highlighted green; failures and max-turns notices are highlighted red.
-- The Lean Code panel shows file snapshots recovered from API code artifacts, transcript tool calls, checked Lean file paths, or `lea_root` snapshots.
-- Use the Lean Code arrows to review earlier code steps. The corresponding chat step is outlined.
-- After a run completes, click a chat step to jump the Lean Code panel to the matching code step.
-- Markdown and TeX math in assistant messages are rendered in the chat panel.
+- Chat messages and status chips show the prover's live reasoning, tool calls,
+  checks, and terminal status.
+- The proof canvas shows git-backed file snapshots from each `code_step`; use the
+  stepper to inspect earlier proof states.
+- Human edits in the canvas write to the same working tree, commit as user-authored
+  steps, and can include an edit note for the next run.
+- `lean_check` checks the current file without starting an agent run and
+  back-fills the latest step's verdict.
+- SafeVerify audits a finished proof with kernel replay and axiom checks.
+- Projects create shared proof repos under `prover/workspace/proofs/Lea/<Project>`
+  so sessions can import sibling lemmas.
+- Project Instructions, Memory, Blueprint, uploaded files, and the filesystem tab
+  are all backed by files in that project repo.
+- The Stats page reads persisted usage and cost from SQLite.
 
 ## Health Check
 
 Run:
 
-```bash
+```sh
 npm run doctor
 ```
 
 Manual endpoint checks:
 
-```bash
+```sh
 curl http://127.0.0.1:8001/api/health
 curl http://127.0.0.1:8001/api/sessions
-curl http://127.0.0.1:8000/v1/healthz
 curl -I http://127.0.0.1:5173/
 ```
 
-If `prover/` is missing, the checkout is broken; re-clone the repo.
-
-If a run appears to sit on `lean_check` for minutes, run `npm run doctor`. A failing `Lean workspace Mathlib cache` check means the first check is compiling Mathlib locally; rerun `npm run setup:api` and wait for the cache download to finish.
+If `prover/` is missing, the checkout is incomplete. If a run appears to sit on
+`lean_check` for minutes, run `npm run doctor`; a failing Mathlib cache check
+usually means `npm run setup:api` needs to finish successfully.
 
 ## Data
 
 - App database: `data/lea-interface.sqlite3`
-- Raw Lea API event diagnostics: `data/lea-api-events/`
+- Adapter event/log data: `data/`
 - Local adapter config: `config/lea.local.toml`
-- Bundled Lea API (vendored in-repo): `prover`
-- Local Lea file snapshots: configured by `lea_root`
+- Vendored prover: `prover/`
+- Proof repos and project repos: `prover/workspace/proofs/`
+- Overleaf LaTeX mirror: `prover/workspace/context/overleaf/`
 
-Do not commit `config/lea.local.toml`; rotate any API key that is pasted into logs or chat.
+Do not commit `config/lea.local.toml`; rotate any API key that is pasted into
+logs or chat.
 
-## Upgrading an existing checkout (database schema)
+## Tests
 
-The app DB (`data/lea-interface.sqlite3`) is created with `CREATE TABLE IF NOT
-EXISTS` and there are **no in-place `ALTER` migrations** — by design, the schema is
-treated as disposable/rebuildable for a single local user. So when you pull a change
-that alters the schema (e.g. the v2.1 Projects tables — new `projects` columns and a
-`project_files` table), an **already-existing** `lea-interface.sqlite3` will *not*
-auto-upgrade, and the affected endpoint fails with an error like:
+Frontend unit tests:
 
-```
-sqlite3.OperationalError: table projects has no column named description
+```sh
+npm run test:frontend
 ```
 
-Fixes, from simplest to most surgical:
+TypeScript check:
 
-- **Fresh DB (sanctioned):** `npm run reset:local` clears local run state (proofs,
-  logs, SQLite) so the next start rebuilds the schema. Preview with
-  `npm run reset:local -- --dry-run`. This **discards existing sessions**.
-- **Preserve sessions (surgical):** if only feature tables changed and you want to
-  keep your chat/run history, drop just the changed tables and let `init_db`
-  recreate them from the authoritative schema — e.g. for the v2.1 Projects change:
+```sh
+npm run typecheck
+```
 
-  ```sh
-  sqlite3 data/lea-interface.sqlite3 'drop table if exists projects; drop table if exists project_files;'
-  cd adapter && ./.venv/bin/python -c "from app.db import init_db; init_db()"
-  ```
+Adapter tests:
 
-  (Safe here because `projects`/`project_files` hold no essential local data on an
-  existing UI checkout; don't drop `sessions`/`runs`/`code_steps`/`messages`.)
+```sh
+cd adapter
+./.venv/bin/python -m pytest
+```
 
-A fresh `npm run setup` on a new machine is unaffected — it starts from an empty DB.
-A proper cross-version migration path that **preserves user data** across web-app
-updates is planned; until then, use one of the two fixes above.
+## Upgrading An Existing Checkout
+
+The app database is created from the authoritative schema in `adapter/app/db.py`
+with `CREATE TABLE IF NOT EXISTS`. There are no in-place schema migrations; this
+local app treats the database as disposable/rebuildable.
+
+When pulling a schema-changing update, the simplest fix is:
+
+```sh
+npm run reset:local
+```
+
+Preview first:
+
+```sh
+npm run reset:local -- --dry-run
+```
+
+This clears local sessions, proofs, logs, and SQLite state while keeping installed
+dependencies and caches. For surgical data preservation, inspect the failing table
+and recreate only that feature table from `init_db()`, but do not drop
+`sessions`, `runs`, `code_steps`, or `messages` unless you are intentionally
+discarding run history.

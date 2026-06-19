@@ -50,7 +50,7 @@ from lea.interface import (
 
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import projects, store
+from . import projects, store, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
@@ -318,6 +318,10 @@ def run_lea(context: RunnerContext) -> None:
     gs = GitStore(repo.parent)
     repo_key = repo.name
     gs.init_repo(repo)  # idempotent; a project repo already exists from provisioning
+    # Guard the Overleaf .tex mirror so the agent compiling the document mid-run can't
+    # get its build artifacts (.pdf/.synctex.gz/.aux/...) swept in by commit-on-write.
+    if project:
+        uploads.ensure_overleaf_gitignore(project, proofs_root)
     # Project namespace for the prompt (D32): None → the default Lea.Misc block.
     namespace = project["namespace"] if project else None
 

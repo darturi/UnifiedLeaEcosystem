@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,16 +11,13 @@ import {
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
-  handleLatexContext,
-  handleStub,
+  handleMirrorTex,
   handleUpdateLeaSettings,
   recoverInterruptedJobs,
   resolveProofOutcome,
   validateLeaRepo
 } from "../companion/server.mjs";
 import {
-  buildLeaLatexActiveTexPath,
-  buildLeaLatexContextManifestPath,
   buildLeaProjectMarkdownPath,
   buildLeaWorkspacePath,
   slugProjectId
@@ -108,8 +104,7 @@ test("settings response includes model families and key status", async () => {
   assert.equal(response.leaProviderKeys.openai.configured, true);
   assert.equal(response.leaProviderKeys.google.configured, false);
   assert.equal(response.leaProviderKeys.anthropic.configured, true);
-  assert.equal(response.leaTheoremTranslationMaxRetries, 3);
-  assert.equal(response.leaLatexContextMode, "off");
+  assert.equal(response.leaTexMirrorEnabled, true);
   assert.equal(response.leaMaxSpendUsd, 0.5);
   assert.equal(response.leaCurrentSpendUsd, 0.125);
 });
@@ -139,13 +134,13 @@ test("settings reject unsupported models and missing family keys", async () => {
 
   const badModel = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "anthropic/claude-does-not-exist",
     leaMaxTurns: 20
   }, state);
   const missingGeminiKey = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gemini/gemini-2.5-pro",
     leaMaxTurns: 20
   }, state);
@@ -162,22 +157,21 @@ test("settings save supported models when their family key is configured", async
 
   const openAiResult = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gpt-5.4-mini",
     leaMaxTurns: 34,
     leaMaxSpendUsd: 9.5,
-    leaTheoremTranslationMaxRetries: 8,
-    leaLatexContextMode: "active_file"
+    leaTheoremTranslationMaxRetries: 8
   }, state);
   const geminiResult = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gemini/gemini-2.5-flash",
     leaMaxTurns: 12
   }, state);
   const anthropicResult = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "anthropic/claude-sonnet-4-6",
     leaMaxTurns: 21
   }, state);
@@ -187,8 +181,7 @@ test("settings save supported models when their family key is configured", async
   assert.equal(openAiResult.body.leaModel, "gpt-5.4-mini");
   assert.equal(openAiResult.body.leaMaxTurns, 34);
   assert.equal(openAiResult.body.leaMaxSpendUsd, 9.5);
-  assert.equal(openAiResult.body.leaTheoremTranslationMaxRetries, 8);
-  assert.equal(openAiResult.body.leaLatexContextMode, "active_file");
+  assert.equal(openAiResult.body.leaTexMirrorEnabled, true);
   assert.equal(geminiResult.statusCode, 200);
   assert.equal(geminiResult.body.leaProvider, "google");
   assert.equal(geminiResult.body.leaModel, "gemini/gemini-2.5-flash");
@@ -200,94 +193,77 @@ test("settings save supported models when their family key is configured", async
   assert.match(envFile, /LEA_MODEL=anthropic\/claude-sonnet-4-6/);
   assert.match(envFile, /LEA_MAX_TURNS=21/);
   assert.match(envFile, /LEA_MAX_SPEND_USD=9.5/);
-  assert.match(envFile, /LEA_THEOREM_TRANSLATION_MAX_RETRIES=8/);
 
   const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaModel"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxTurns"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxSpendUsd"), false);
-  assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaTheoremTranslationMaxRetries"), false);
-  assert.equal(saved.leaLatexContextMode, "active_file");
+  assert.equal(saved.leaTexMirrorEnabled, true);
 });
 
-test("settings reject unsupported latex context modes", async () => {
+test("settings persist the tex-mirror toggle off", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo, env: { OPENAI_API_KEY: "openai-key" } });
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "o4-mini",
     leaMaxTurns: 20,
-    leaLatexContextMode: "project"
+    leaTexMirrorEnabled: false
   }, state);
 
-  assert.equal(result.statusCode, 400);
-  assert.equal(result.body.error, "invalid_latex_context_mode");
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.leaTexMirrorEnabled, false);
+  const saved = JSON.parse(await fs.readFile(state.settingsPath, "utf8"));
+  assert.equal(saved.leaTexMirrorEnabled, false);
 });
 
-test("latex context endpoint mirrors the active file into Lea workspace", async () => {
+function makeMirrorFetch(captured) {
+  return async (url, options = {}) => {
+    if (String(url).includes("/mirror")) {
+      captured.push({ url: String(url), body: JSON.parse(options.body || "{}") });
+      return { ok: true, status: 200, text: async () => JSON.stringify({ written: 2, changed: true, committed: false }) };
+    }
+    return { ok: true, status: 200, text: async () => "{}" };
+  };
+}
+
+test("mirror-tex forwards the project's .tex set to the adapter by slug", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
+  const captured = [];
+  const state = await makeState({ leaRepoPath: leaRepo, fetchImpl: makeMirrorFetch(captured) });
 
-  const first = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: "\\section{First}\n\\theorem[label=foo]{A}"
-  }, state);
-  const second = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: "\\section{Second}\n\\theorem[label=foo]{B}"
+  const res = await handleMirrorTex({
+    overleafProjectId: "Project-1",
+    files: [
+      { path: "main.tex", content: "A" },
+      { path: "", content: "dropped" },
+      { path: "sections/intro.tex", content: "B" }
+    ]
   }, state);
 
-  assert.equal(first.statusCode, 200);
-  assert.equal(second.statusCode, 200);
-  assert.equal(
-    await fs.readFile(buildLeaLatexActiveTexPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }), "utf8"),
-    "\\section{Second}\n\\theorem[label=foo]{B}"
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(captured.length, 1);
+  assert.match(captured[0].url, /\/api\/projects\/by-slug\/Project-1\/mirror$/);
+  assert.equal(captured[0].body.source, "overleaf");
+  assert.deepEqual(captured[0].body.files.map((file) => file.path), ["main.tex", "sections/intro.tex"]);
+});
+
+test("mirror-tex rejects a missing project id and respects the disable toggle", async () => {
+  const leaRepo = await makeLeaRepo();
+
+  const missing = await handleMirrorTex({ files: [] }, await makeState({ leaRepoPath: leaRepo }));
+  assert.equal(missing.statusCode, 400);
+  assert.equal(missing.body.error, "missing_project_id");
+
+  const disabled = await handleMirrorTex(
+    { overleafProjectId: "p1", files: [] },
+    await makeState({ leaRepoPath: leaRepo, leaTexMirrorEnabled: false })
   );
-  const manifest = JSON.parse(await fs.readFile(
-    buildLeaLatexContextManifestPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }),
-    "utf8"
-  ));
-  assert.equal(manifest.overleafProjectId, "project-1");
-  assert.equal(manifest.projectSlug, "project-1");
-  assert.equal(manifest.mode, "active_file");
-  assert.equal(manifest.files[0].path, "tex/active.tex");
-  assert.equal(manifest.files[0].sourceKind, "active_file");
-  assert.equal(manifest.files[0].bytes, Buffer.byteLength("\\section{Second}\n\\theorem[label=foo]{B}", "utf8"));
-
-  const projectMarkdown = await fs.readFile(buildLeaProjectMarkdownPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }), "utf8");
-  assert.match(projectMarkdown, /## LaTeX Context/);
-  assert.match(projectMarkdown, /workspace\/context\/overleaf\/project-1\/manifest\.json/);
-});
-
-test("latex context endpoint rejects disabled mode and invalid payloads", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo });
-
-  const disabled = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "off",
-    activeTex: "A"
-  }, state);
-  const missingProject = await handleLatexContext({
-    mode: "active_file",
-    activeTex: "A"
-  }, state);
-  const invalidTex = await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: 1
-  }, state);
-
   assert.equal(disabled.statusCode, 400);
-  assert.equal(disabled.body.error, "latex_context_disabled");
-  assert.equal(missingProject.statusCode, 400);
-  assert.equal(missingProject.body.error, "missing_project_id");
-  assert.equal(invalidTex.statusCode, 400);
-  assert.equal(invalidTex.body.error, "invalid_active_tex");
+  assert.equal(disabled.body.error, "tex_mirror_disabled");
 });
 
 test("settings clear max spend and reject negative caps", async () => {
@@ -300,14 +276,14 @@ test("settings clear max spend and reject negative caps", async () => {
 
   const cleared = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "o4-mini",
     leaMaxTurns: 20,
     leaMaxSpendUsd: null
   }, state);
   const negative = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "o4-mini",
     leaMaxTurns: 20,
     leaMaxSpendUsd: -1
@@ -331,7 +307,7 @@ test("settings normalize legacy Anthropic model ids", async () => {
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "anthropic/claude-opus-4-20250514",
     leaMaxTurns: 20
   }, state);
@@ -376,7 +352,7 @@ test("settings save provider key patches to env file without settings persistenc
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "anthropic/claude-sonnet-4-6",
     leaMaxTurns: 20,
     leaProviderApiKeys: { anthropic: "anthropic-key" }
@@ -398,7 +374,7 @@ test("settings save provider key patches to env file without settings persistenc
   assert.equal(Object.prototype.hasOwnProperty.call(saved, "leaMaxTurns"), false);
 });
 
-test("api flavor: settings read overlays the adapter's shared values and key status", async () => {
+test("adapter settings read overlays shared values and key status", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
   const adapter = makeAdapterStore({
@@ -409,7 +385,6 @@ test("api flavor: settings read overlays the adapter's shared values and key sta
   });
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     leaModel: "o4-mini",
     env: { OPENAI_API_KEY: "env-openai" },
     fetchImpl: makeAdapterFetch(adapter, calls)
@@ -428,13 +403,12 @@ test("api flavor: settings read overlays the adapter's shared values and key sta
   assert.ok(calls.some((call) => call.method === "GET" && call.url.endsWith("/api/settings")));
 });
 
-test("api flavor: saving settings forwards the shared fields to the adapter", async () => {
+test("saving settings forwards shared fields to the adapter", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
   const adapter = makeAdapterStore({ api_keys: { OPENAI_API_KEY: keyStatus("akey") } });
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     env: { OPENAI_API_KEY: "env-openai" },
     fetchImpl: makeAdapterFetch(adapter, calls)
   });
@@ -460,7 +434,7 @@ test("api flavor: saving settings forwards the shared fields to the adapter", as
   assert.equal(adapter.settings.max_turns, 42);
 });
 
-test("api flavor: an adapter validation rejection surfaces as a 422", async () => {
+test("adapter validation rejection surfaces as a 422", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
   const adapter = makeAdapterStore({
@@ -469,7 +443,6 @@ test("api flavor: an adapter validation rejection surfaces as a 422", async () =
   });
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     env: {},
     fetchImpl: makeAdapterFetch(adapter, calls)
   });
@@ -498,7 +471,7 @@ test("settings reject invalid submitted Gemini keys before persistence", async (
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gemini/gemini-2.5-pro",
     leaMaxTurns: 20,
     leaProviderApiKeys: { gemini: "PLACEHOLDER" }
@@ -523,7 +496,7 @@ test("settings reject invalid existing key for selected provider family", async 
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gemini/gemini-2.5-flash",
     leaMaxTurns: 20
   }, state);
@@ -545,7 +518,7 @@ test("settings validate newly entered non-selected provider keys", async () => {
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gpt-5.4-mini",
     leaMaxTurns: 20,
     leaProviderApiKeys: { anthropic: "bad-anthropic-key" }
@@ -568,7 +541,7 @@ test("settings save valid submitted keys after provider verification", async () 
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gemini/gemini-2.5-flash",
     leaMaxTurns: 20,
     leaProviderApiKeys: { gemini: "valid-gemini-key" }
@@ -594,7 +567,7 @@ test("settings reject provider key verification network failures", async () => {
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gpt-5.4-mini",
     leaMaxTurns: 20
   }, state);
@@ -619,230 +592,13 @@ test("settings do not validate untouched non-selected provider keys", async () =
 
   const result = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
-    leaApiBaseUrl: "http://127.0.0.1:8000",
+    leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gpt-5.4",
     leaMaxTurns: 20
   }, state);
 
   assert.equal(result.statusCode, 200);
   assert.deepEqual(calls.map((call) => call.family), ["openai"]);
-});
-
-test("formalize starts Lea without root workspace paths", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "lea_test",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  assert.equal(result.body.status, "in_progress");
-  assert.equal(result.body.relativePath, path.join("workspace", "projects", "project-1.md"));
-  assert.equal(result.body.projectMarkdownPath, path.join(leaRepo, "workspace", "projects", "project-1.md"));
-  await waitFor(() => calls.length > 0);
-  assert.equal(calls[0].url, "http://127.0.0.1:8000/v1/runs");
-  assert.equal(calls[0].body.config.model.name, "o4-mini");
-  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "test-key");
-  assert.equal(calls[0].body.config.model.model_kwargs.max_tokens, 16384);
-  assert.equal(calls[0].body.config.agent.max_turns, 20);
-  assert.deepEqual(calls[0].body.project, {
-    project_id: "project-1",
-    project_path: path.join("workspace", "projects", "project-1.md"),
-    record_on_success: true
-  });
-  assert.match(calls[0].body.task, /project project-1/);
-  assert.match(calls[0].body.task, /A theorem\./);
-  assert.match(calls[0].body.task, /Use the Lea project context/);
-  assert.doesNotMatch(calls[0].body.task, /also record the theorem/);
-});
-
-test("formalize includes mirrored latex context pointer when enabled", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaLatexContextMode: "active_file",
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-
-  await handleLatexContext({
-    overleafProjectId: "project-1",
-    mode: "active_file",
-    activeTex: "\\newcommand{\\dist}{d}"
-  }, state);
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "uses_context",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  await waitFor(() => calls.length > 0);
-  assert.match(calls[0].body.task, /Additional Overleaf LaTeX context is available/);
-  assert.match(calls[0].body.task, /workspace\/context\/overleaf\/project-1\/manifest\.json/);
-  assert.doesNotMatch(calls[0].body.task, /\\newcommand/);
-});
-
-test("formalize includes optional theorem context in the Lea prompt", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "context_test",
-    theoremText: "A theorem.",
-    theoremContext: "Use induction on n."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  await waitFor(() => calls.length > 0);
-  assert.match(calls[0].body.task, /A theorem\.\n\nFormalization Guidance: Use induction on n\./);
-  assert.equal(state.jobs[result.body.jobId].theoremContext, "Use induction on n.");
-});
-
-test("formalize omits blank theorem context from the Lea prompt", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "blank_context_test",
-    theoremText: "A theorem.",
-    theoremContext: "   "
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  await waitFor(() => calls.length > 0);
-  assert.doesNotMatch(calls[0].body.task, /Formalization Guidance:/);
-  assert.equal(state.jobs[result.body.jobId].theoremContext, "");
-});
-
-test("formalize sends the selected model family key to Lea", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaModel: "gemini/gemini-2.5-pro",
-    env: { GEMINI_API_KEY: "gemini-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "gemini_test",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  await waitFor(() => calls.length > 0);
-  assert.equal(calls[0].body.config.model.name, "gemini/gemini-2.5-pro");
-  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "gemini-key");
-  assert.equal(calls[0].body.config.model.model_kwargs.max_tokens, 16384);
-});
-
-test("formalize sends normalized legacy model ids to Lea", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaModel: "anthropic/claude-sonnet-4-20250514",
-    env: { ANTHROPIC_API_KEY: "anthropic-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "anthropic_test",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  await waitFor(() => calls.length > 0);
-  assert.equal(calls[0].body.config.model.name, "anthropic/claude-sonnet-4-6");
-  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "anthropic-key");
-});
-
-test("formalize returns active job instead of starting a duplicate", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls)
-  });
-  const payload = {
-    overleafProjectId: "project-1",
-    theoremLabel: "duplicate_test",
-    theoremText: "A theorem."
-  };
-
-  const first = await handleFormalize(payload, state);
-  const second = await handleFormalize(payload, state);
-  await waitFor(() => calls.length > 0);
-
-  assert.equal(first.statusCode, 200);
-  assert.equal(second.statusCode, 200);
-  assert.equal(second.body.status, "in_progress");
-  assert.equal(second.body.jobId, first.body.jobId);
-  assert.equal(second.body.leaSessionId, null);
-  assert.equal(second.body.leaSessionUrl, null);
-  assert.equal(calls.filter((call) => call.url.endsWith("/v1/runs")).length, 1);
-});
-
-test("active formalization status includes Lea UI session link after recorder handshake", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const child = makeFakeChild();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls),
-  });
-  state.settings.leaSharedState = true;
-  state.settings.leaRecorderPython = "/venv/bin/python";
-  state.settings.leaUiServerDir = "/repo/apps/lea-ui/server";
-  state.settings.leaUiBaseUrl = "http://localhost:5173";
-  state.spawnImpl = () => child;
-
-  const payload = {
-    overleafProjectId: "project-1",
-    theoremLabel: "linked_stream_test",
-    theoremText: "A theorem."
-  };
-
-  const first = await handleFormalize(payload, state);
-  await waitFor(() => state.jobs[first.body.jobId]?.recorderPid === 4242);
-  child.stdout.emit("data", "{\"type\":\"session_link\",\"session_id\":\"sess-stream\",\"run_id\":\"run-stream\"}\n");
-  await waitFor(() => state.jobs[first.body.jobId]?.recorderSessionId === "sess-stream");
-
-  const statuses = await handleGetStatuses({
-    overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "linked_stream_test", theoremText: "A theorem." }]
-  }, state);
-
-  assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.linked_stream_test.status, "in_progress");
-  assert.equal(statuses.body.statuses.linked_stream_test.leaSessionId, "sess-stream");
-  assert.equal(statuses.body.statuses.linked_stream_test.leaSessionUrl, "http://localhost:5173/?session=sess-stream");
 });
 
 test("completed formalization status keeps Lea UI session link", async () => {
@@ -918,128 +674,6 @@ test("in-progress status links Lea UI session from leaSessionId (no recorder)", 
   assert.equal(statuses.body.statuses.in_progress_test.leaSessionUrl, "http://localhost:5173/?session=sess-running");
 });
 
-test("formalization status links Lea UI session from leaSessionId when no recorder session exists", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" }
-  });
-  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "adapter_session_test.lean");
-  await writeLeaProjectProof(leaRepo, proofPath, "theorem adapter_session_test : True := by\n  trivial\n");
-  await writeLeaProjectMarkdown(leaRepo, "project-1", {
-    theoremName: "adapter_session_test",
-    proofPath,
-    moduleName: "Lea.Project1.adapter_session_test"
-  });
-  state.jobs.adapter_link = {
-    jobId: "adapter_link",
-    jobKey: "project-1:adapter_session_test",
-    status: "success",
-    overleafProjectId: "project-1",
-    projectId: "project-1",
-    projectSlug: "project-1",
-    theoremLabel: "adapter_session_test",
-    declarationName: "adapter_session_test",
-    // Real adapter session id (set on run start); recorder CLI never ran.
-    leaSessionId: "sess-adapter",
-    recorderSessionId: null,
-    leaUiBaseUrl: "http://localhost:5173",
-    startedAt: "2026-01-01T00:00:00.000Z",
-    finishedAt: "2026-01-01T00:00:01.000Z"
-  };
-
-  const statuses = await handleGetStatuses({
-    overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "adapter_session_test", theoremText: "A theorem." }]
-  }, state);
-
-  assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.adapter_session_test.status, "formalized");
-  assert.equal(statuses.body.statuses.adapter_session_test.leaSessionId, "sess-adapter");
-  assert.equal(statuses.body.statuses.adapter_session_test.leaSessionUrl, "http://localhost:5173/?session=sess-adapter");
-});
-
-test("stub starts Lea in theorem translation approval mode and records a sorry stub", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaTheoremTranslationMaxRetries: 9,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls, {
-      approval: {
-        leanCode: "import Mathlib\n\ntheorem generated_stub_test : True := by sorry",
-        theoremName: "generated_stub_test"
-      }
-    })
-  });
-
-  const result = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "stub_label",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  assert.equal(result.body.status, "sorry_stub");
-  assert.equal(result.body.declarationName, "generated_stub_test");
-  assert.equal(calls[0].url, "http://127.0.0.1:8000/v1/runs");
-  assert.equal(calls[0].body.config.agent.permission_tier, "theorem_translation");
-  assert.equal(calls[0].body.config.agent.theorem_translation_max_retries, 9);
-  assert.equal(calls[0].body.config.model.model_kwargs.api_key, "test-key");
-  const job = state.jobs[result.body.jobId];
-  assert.equal(job.status, "sorry_stub");
-  assert.equal(job.apiRunId, "api-run-1");
-  assert.equal(job.approvalId, "ap_1");
-  assert.equal(
-    await fs.readFile(path.join(leaRepo, job.recordedProofPath), "utf8"),
-    "import Mathlib\n\ntheorem generated_stub_test : True := by sorry\n"
-  );
-  assert.match(
-    await fs.readFile(path.join(leaRepo, "workspace", "projects", "project-1.md"), "utf8"),
-    /<!-- lea:theorem name="generated_stub_test" proof="workspace\/proofs\/Lea\/Project1\/generated_stub_test\.lean" module="Lea\.Project1\.generated_stub_test" -->/
-  );
-});
-
-test("stub allows retrying failed unformalized theorems", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls, {
-      approval: {
-        leanCode: "import Mathlib\n\ntheorem retried_failed_stub_test : True := by sorry",
-        theoremName: "retried_failed_stub_test"
-      }
-    })
-  });
-  state.jobs.failed_job = {
-    jobId: "failed_job",
-    jobKey: "project-1:failed_stub_retry",
-    status: "failed",
-    theoremLabel: "failed_stub_retry",
-    relativePath: path.join("workspace", "projects", "project-1.md"),
-    absolutePath: path.join(leaRepo, "workspace", "projects", "project-1.md"),
-    logPath: path.join(path.dirname(state.jobsPath), "failed-stub-retry.log"),
-    leaRepoPath: leaRepo,
-    startedAt: "2026-01-01T00:00:00.000Z",
-    finishedAt: "2026-01-01T00:00:01.000Z"
-  };
-  await fs.writeFile(state.jobs.failed_job.logPath, "failed proof\n", "utf8");
-
-  const result = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "failed_stub_retry",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  assert.equal(result.body.status, "sorry_stub");
-  assert.equal(result.body.declarationName, "retried_failed_stub_test");
-  assert.equal(calls[0].body.config.agent.permission_tier, "theorem_translation");
-});
-
 test("statuses report saved sorry stubs", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -1064,91 +698,6 @@ test("statuses report saved sorry stubs", async () => {
   assert.equal(result.body.statuses.saved_stub_test.leanStatement, "theorem saved_stub_test : True");
 });
 
-test("formalize after stub accepts the saved Lea approval and completes proof search", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "generated_stub_test.lean");
-  const restorePath = await installFakeLake();
-  try {
-    const state = await makeState({
-      leaRepoPath: leaRepo,
-      env: { OPENAI_API_KEY: "test-key" },
-      fetchImpl: makeLeaApiFetch(calls, {
-        approval: {
-          leanCode: "import Mathlib\n\ntheorem generated_stub_test : True := by sorry",
-          theoremName: "generated_stub_test"
-        },
-        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
-        onStatusRequest: async () => {
-          await writeLeaProjectProof(
-            leaRepo,
-            proofPath,
-            "theorem generated_stub_test : True := by\n  trivial\n"
-          );
-          await writeLeaProjectMarkdown(leaRepo, "project-1", {
-            theoremName: "generated_stub_test",
-            proofPath,
-            moduleName: "Lea.Project1.generated_stub_test"
-          });
-        }
-      })
-    });
-
-    const stubResult = await handleStub({
-      overleafProjectId: "project-1",
-      theoremLabel: "stub_label",
-      theoremText: "A theorem."
-    }, state);
-    const formalizeResult = await handleFormalize({
-      overleafProjectId: "project-1",
-      theoremLabel: "stub_label",
-      theoremText: "A theorem."
-    }, state);
-
-    assert.equal(stubResult.statusCode, 200);
-    assert.equal(formalizeResult.statusCode, 200);
-    assert.equal(formalizeResult.body.status, "in_progress");
-    await waitFor(() => state.jobs[stubResult.body.jobId]?.status === "formalized");
-    assert.ok(calls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/approvals/ap_1")));
-    assert.equal(state.jobs[stubResult.body.jobId].declarationName, "generated_stub_test");
-    assert.equal(state.jobs[stubResult.body.jobId].recordedProofPath, proofPath);
-  } finally {
-    restorePath();
-  }
-});
-
-test("stub rejects missing provider keys and non-unformalized theorems", async () => {
-  const leaRepo = await makeLeaRepo();
-  const missingKeyState = await makeState({ leaRepoPath: leaRepo, env: {} });
-  const missingKey = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "missing_key_stub",
-    theoremText: "A theorem."
-  }, missingKeyState);
-  assert.equal(missingKey.statusCode, 400);
-  assert.equal(missingKey.body.error, "missing_openai_key");
-
-  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "Already.lean");
-  await writeLeaProjectProof(leaRepo, proofPath, "theorem already_formalized : True := by\n  trivial\n");
-  await writeLeaProjectMarkdown(leaRepo, "project-1", {
-    theoremName: "already_formalized",
-    proofPath
-  });
-  const formalizedState = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch([])
-  });
-  const formalized = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "already_formalized",
-    theoremText: "A theorem."
-  }, formalizedState);
-
-  assert.equal(formalized.statusCode, 409);
-  assert.equal(formalized.body.error, "not_unformalized");
-});
-
 test("statuses report active Lea jobs as in progress", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({
@@ -1170,31 +719,6 @@ test("statuses report active Lea jobs as in progress", async () => {
 
   assert.equal(statuses.statusCode, 200);
   assert.equal(statuses.body.statuses.active_status_test.status, "in_progress");
-});
-
-test("formalize response includes turn progress after Lea events report a current turn", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch([], {
-      eventFrames: [
-        { type: "turn_started", turn: 6 }
-      ]
-    })
-  });
-  const payload = {
-    overleafProjectId: "project-1",
-    theoremLabel: "event_turn_test",
-    theoremText: "A theorem."
-  };
-
-  const first = await handleFormalize(payload, state);
-  await waitFor(() => state.jobs[first.body.jobId]?.leaCurrentTurn === 6);
-  const second = await handleFormalize(payload, state);
-
-  assert.equal(second.statusCode, 200);
-  assert.deepEqual(second.body.turnProgress, { current: 6, max: 20 });
 });
 
 test("statuses include turn progress for active Lea jobs", async () => {
@@ -1222,40 +746,8 @@ test("statuses include turn progress for active Lea jobs", async () => {
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.deepEqual(statuses.body.statuses.active_progress_test.turnProgress, { current: 6, max: 20 });
-});
-
-test("status polling updates active Lea job turn progress when events omit it", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch([], {
-      statusBody: {
-        run_id: "api-run-1",
-        status: "running",
-        progress: {
-          turn: 6
-        }
-      }
-    })
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "poll_turn_test",
-    theoremText: "A theorem."
-  }, state);
-
-  await waitFor(() => state.jobs[result.body.jobId]?.leaCurrentTurn === 6);
-  assert.deepEqual(state.jobs[result.body.jobId].leaMaxTurns, 20);
-
-  const statuses = await handleGetStatuses({
-    overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "poll_turn_test", theoremText: "A theorem." }]
-  }, state);
-
-  assert.deepEqual(statuses.body.statuses.poll_turn_test.turnProgress, { current: 6, max: 20 });
+  assert.equal(state.jobs[result.body.jobId].leaCurrentTurn, 6);
+  assert.equal(state.jobs[result.body.jobId].leaMaxTurns, 20);
 });
 
 test("active Lea job omits turn progress when current turn is unknown or invalid", async () => {
@@ -1947,190 +1439,10 @@ test("formalize persists completed Lea usage and cost", async () => {
   }
 });
 
-test("usage reflects live Lea event costs while a run is in progress", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch([], {
-      eventFrames: [
-        { type: "usage_updated", input_tokens: 321, output_tokens: 45, cost: 0.018 },
-        { type: "usage_updated", input_tokens: 79, output_tokens: 5, cost: 0.002 }
-      ]
-    })
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "live_usage_test",
-    theoremText: "A theorem."
-  }, state);
-
-  await waitFor(() => state.jobs[result.body.jobId]?.usage?.inputTokens === 400);
-  const job = state.jobs[result.body.jobId];
-  assert.equal(job.status, "in_progress");
-  assert.deepEqual(job.usage, {
-    inputTokens: 400,
-    outputTokens: 50,
-    totalTokens: 450
-  });
-  assert.equal(job.costUsd, 0.02);
-
-  const usage = await handleGetUsage({ overleafProjectId: "project-1" }, state);
-  assert.deepEqual(usage.body.project, {
-    inputTokens: 400,
-    outputTokens: 50,
-    totalTokens: 450,
-    costUsd: 0.02,
-    runCount: 1
-  });
-});
-
-test("formalize and stub block when max spend is already reached", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaMaxSpendUsd: 0.1,
-    env: { OPENAI_API_KEY: "test-key" }
-  });
-  state.jobs.previous = makeUsageJob({
-    jobId: "previous",
-    projectId: "project-1",
-    inputTokens: 100,
-    outputTokens: 50,
-    costUsd: 0.1
-  });
-
-  const formalize = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "blocked_formalize",
-    theoremText: "A theorem."
-  }, state);
-  const stub = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "blocked_stub",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(formalize.statusCode, 402);
-  assert.equal(formalize.body.error, "max_spend_reached");
-  assert.equal(stub.statusCode, 402);
-  assert.equal(stub.body.message, "Max spend limit has been reached.");
-});
-
-test("formalize cancels and fails when live usage crosses max spend", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaMaxSpendUsd: 0.01,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls, {
-      eventFrames: [
-        { type: "usage_updated", input_tokens: 10, output_tokens: 5, cost: 0.02 }
-      ]
-    })
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "max_spend_formalize",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  await waitFor(() => state.jobs[result.body.jobId]?.finalStatus === "max_spend");
-  const job = state.jobs[result.body.jobId];
-  assert.equal(job.status, "failed");
-  assert.equal(job.error, "Max spend limit reached. Lea run was cancelled.");
-  assert.equal(job.costUsd, 0.02);
-  assert.ok(calls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
-  assert.match(await fs.readFile(job.logPath, "utf8"), /Max spend limit reached/);
-});
-
-test("stub cancels and fails when live usage crosses max spend", async () => {
-  const leaRepo = await makeLeaRepo();
-  const calls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaMaxSpendUsd: 0.01,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(calls, {
-      eventFrames: [
-        { type: "usage_updated", input_tokens: 10, output_tokens: 5, cost: 0.02 }
-      ],
-      approval: {
-        leanCode: "import Mathlib\n\ntheorem max_spend_stub : True := by sorry",
-        theoremName: "max_spend_stub"
-      }
-    })
-  });
-
-  const result = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "max_spend_stub",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 200);
-  const job = state.jobs[result.body.jobId];
-  assert.equal(result.body.status, "failed");
-  assert.equal(job.finalStatus, "max_spend");
-  assert.equal(job.status, "failed");
-  assert.equal(job.costUsd, 0.02);
-  assert.ok(calls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
-});
-
-test("formalize after stub cancels and fails when resumed usage crosses max spend", async () => {
-  const leaRepo = await makeLeaRepo();
-  const stubCalls = [];
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch(stubCalls, {
-      approval: {
-        leanCode: "import Mathlib\n\ntheorem max_spend_resume : True := by sorry",
-        theoremName: "max_spend_resume"
-      }
-    })
-  });
-  const stubResult = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "max_spend_resume",
-    theoremText: "A theorem."
-  }, state);
-  assert.equal(stubResult.statusCode, 200);
-  assert.equal(stubResult.body.status, "sorry_stub");
-
-  const resumeCalls = [];
-  state.settings.leaMaxSpendUsd = 0.01;
-  state.fetchImpl = makeLeaApiFetch(resumeCalls, {
-    approval: {
-      leanCode: "import Mathlib\n\ntheorem max_spend_resume : True := by sorry",
-      theoremName: "max_spend_resume"
-    },
-    eventFrames: [
-      { type: "usage_updated", input_tokens: 10, output_tokens: 5, cost: 0.02 }
-    ]
-  });
-  const formalizeResult = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "max_spend_resume",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(formalizeResult.statusCode, 200);
-  await waitFor(() => state.jobs[stubResult.body.jobId]?.finalStatus === "max_spend");
-  const job = state.jobs[stubResult.body.jobId];
-  assert.equal(job.status, "failed");
-  assert.equal(job.costUsd, 0.02);
-  assert.ok(resumeCalls.some((call) => String(call.url).endsWith("/v1/runs/api-run-1/cancel")));
-});
-
 test("usage falls back to in-memory job totals when the adapter is unavailable", async () => {
   const leaRepo = await makeLeaRepo();
-  // Default flavor here is "v1" (no adapter), so handleGetUsage uses the in-memory
-  // job tally fallback rather than GET /api/stats.
+  // With the adapter unavailable, handleGetUsage uses the in-memory job tally
+  // fallback rather than GET /api/stats.
   const state = await makeState({ leaRepoPath: leaRepo, leaMaxSpendUsd: 1 });
   state.jobs.project_a_first = makeUsageJob({
     jobId: "project_a_first",
@@ -2204,7 +1516,6 @@ test("usage sourced from the adapter matches /api/stats (all-time + this project
   };
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     leaApiBaseUrl: "http://127.0.0.1:8001",
     leaMaxSpendUsd: 1,
     fetchImpl: makeStatsFetch(stats)
@@ -2243,7 +1554,6 @@ test("usage from the adapter flags the spend cap from all-time cost", async () =
   };
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     leaApiBaseUrl: "http://127.0.0.1:8001",
     leaMaxSpendUsd: 0.5,
     fetchImpl: makeStatsFetch(stats)
@@ -2546,7 +1856,7 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
     leaRepoPath: leaRepo,
     leaJobTimeoutSeconds: 0.01,
     env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch([])
+    fetchImpl: makeLeaApiFetch([], { neverDone: true })
   });
 
   const result = await handleFormalize({
@@ -2572,36 +1882,6 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
   assert.equal(statuses.statusCode, 200);
   assert.equal(statuses.body.statuses.timeout_test.status, "failed");
   assert.match(statuses.body.statuses.timeout_test.logTail, /timed out/);
-});
-
-test("formalize logs max-turn completions as failed jobs", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    env: { OPENAI_API_KEY: "test-key" },
-    fetchImpl: makeLeaApiFetch([], {
-      statusBody: {
-        run_id: "api-run-1",
-        status: "completed",
-        result: {
-          reason: "max_turns",
-          text: "Error: max turns reached without completing the proof."
-        }
-      }
-    })
-  });
-
-  const result = await handleFormalize({
-    overleafProjectId: "project-1",
-    theoremLabel: "max_turn_test",
-    theoremText: "A theorem."
-  }, state);
-
-  await waitFor(() => state.jobs[result.body.jobId]?.status === "failed");
-  const job = state.jobs[result.body.jobId];
-  assert.equal(job.exitCode, 1);
-  assert.match(job.error, /max turns reached/);
-  assert.match(await fs.readFile(job.logPath, "utf8"), /max turns reached/);
 });
 
 test("startup recovery fails interrupted in-progress jobs", async () => {
@@ -2710,22 +1990,14 @@ async function makeState(overrides = {}) {
       ...(overrides.leaRepoPath ? {
         leaRepoPath: overrides.leaRepoPath,
         leaWorkspacePath: buildLeaWorkspacePath(overrides.leaRepoPath),
-        // These tests pin the legacy vendored /v1 contract (POST :8000/v1/runs,
-        // project recording, theorem-translation approval). That path is preserved
-        // for one-release rollback behind leaApiFlavor "v1"; the cutover default is
-        // "api" (the standalone adapter). Run this suite explicitly on v1 so it keeps
-        // validating the rollback path; the /api path is covered by
-        // leaApiClient.test.mjs and the api-flavor tests below.
-        leaApiBaseUrl: overrides.leaApiBaseUrl || "http://127.0.0.1:8000",
-        leaApiFlavor: overrides.leaApiFlavor || "v1",
+        leaApiBaseUrl: overrides.leaApiBaseUrl || "http://127.0.0.1:8001",
         leaProvider: overrides.leaProvider || "openai",
         leaModel: overrides.leaModel || "o4-mini",
         leaProviderApiKeys: overrides.leaProviderApiKeys || {},
         ...(overrides.leaApiKey ? { leaApiKey: overrides.leaApiKey } : {}),
         leaMaxTurns: 20,
         leaMaxSpendUsd: overrides.leaMaxSpendUsd ?? null,
-        leaTheoremTranslationMaxRetries: overrides.leaTheoremTranslationMaxRetries || 3,
-        leaLatexContextMode: overrides.leaLatexContextMode || "off",
+        leaTexMirrorEnabled: overrides.leaTexMirrorEnabled ?? true,
         ...(overrides.leaJobTimeoutSeconds ? {
           leaJobTimeoutSeconds: overrides.leaJobTimeoutSeconds
         } : {})
@@ -2754,14 +2026,6 @@ function makeUsageJob({ jobId, projectId, inputTokens, outputTokens, costUsd }) 
   };
 }
 
-function makeFakeChild() {
-  const child = new EventEmitter();
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.pid = 4242;
-  return child;
-}
-
 async function fileExists(filePath) {
   try {
     await fs.access(filePath);
@@ -2772,44 +2036,63 @@ async function fileExists(filePath) {
 }
 
 function makeLeaApiFetch(calls, options = {}) {
-  let statusRequestHandled = false;
-  let approvalAccepted = false;
+  let eventHookHandled = false;
   return async (url, requestOptions = {}) => {
+    if (String(url).endsWith("/api/settings")) {
+      return jsonResponse(404, { detail: "not found" });
+    }
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
-    calls.push({ url, options: requestOptions, body });
-    if (String(url).endsWith("/cancel") || requestOptions.method === "DELETE") {
-      return jsonResponse(options.cancelStatus || 200, options.cancelBody || { status: "cancelled" });
+    const recordedBody = body?.message ? { ...body, task: body.message } : body;
+    calls.push({ url, options: requestOptions, body: recordedBody });
+    if (String(url).endsWith("/api/runs") && requestOptions.method === "POST") {
+      return jsonResponse(200, { run_id: "api-run-1", session_id: "sess-api-1", status: "running" });
     }
-    if (String(url).endsWith("/v1/runs")) {
-      return jsonResponse(200, { run_id: "api-run-1", status: "running" });
+    if (String(url).includes("/api/runs/") && String(url).endsWith("/events")) {
+      if (!eventHookHandled && options.onStatusRequest) {
+        eventHookHandled = true;
+        await options.onStatusRequest();
+      }
+      if (options.neverDone) {
+        return {
+          ok: true,
+          status: 200,
+          body: (async function* () {
+            await new Promise((_, reject) => {
+              requestOptions.signal?.addEventListener("abort", () => {
+                const error = new Error("aborted");
+                error.name = "AbortError";
+                reject(error);
+              }, { once: true });
+            });
+          })()
+        };
+      }
+      const frames = options.eventFrames
+        ? options.eventFrames.map((event) => ({
+            type: event.type === "usage_updated" ? "status" : event.type,
+            data: event
+          }))
+        : [
+            { type: "status", data: { status: "tool_call", turn: 1 } },
+            { type: "done", data: { status: options.statusBody?.result?.reason || options.doneStatus || "success" } }
+          ];
+      return adapterSseResponse(frames);
     }
-    if (String(url).endsWith("/events")) {
-      return sseResponse(200, options.eventFrames || []);
-    }
-    if (String(url).includes("/approvals/")) {
-      approvalAccepted = true;
-      return jsonResponse(200, { run_id: "api-run-1", approval_id: "ap_1", decision: "accept", status: "running" });
-    }
-    if (options.approval && !approvalAccepted) {
+    if (String(url).includes("/api/sessions/")) {
+      const usage = options.statusBody?.result?.usage || {};
       return jsonResponse(200, {
-        run_id: "api-run-1",
-        status: "paused",
-        pending_approval: {
-          type: "approval_requested",
-          approval_id: "ap_1",
-          tier: "theorem_translation",
-          candidate: 1,
-          lean_code: options.approval.leanCode,
-          theorem_name: options.approval.theoremName,
-          check_result: options.approval.checkResult || "warning: declaration uses 'sorry'"
-        }
+        runs: [{
+          id: "api-run-1",
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          cost_usd: options.statusBody?.result?.cost || 0
+        }]
       });
     }
-    if (!statusRequestHandled && options.onStatusRequest) {
-      statusRequestHandled = true;
-      await options.onStatusRequest();
+    if (String(url).endsWith("/interrupt")) {
+      return jsonResponse(options.cancelStatus || 200, options.cancelBody || { status: "interrupting" });
     }
-    return jsonResponse(200, options.statusBody || { run_id: "api-run-1", status: "running" });
+    return jsonResponse(404, { detail: "not found" });
   };
 }
 
@@ -2902,18 +2185,6 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function sseResponse(status, frames) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    body: (async function* () {
-      for (const frame of frames) {
-        yield new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`);
-      }
-    })()
-  };
-}
-
 function jsonResponse(status, body) {
   return {
     ok: status >= 200 && status < 300,
@@ -2934,14 +2205,7 @@ async function waitFor(predicate) {
   }
 }
 
-// --- New default backend: the standalone adapter (/api) -------------------
-// These cover the cutover default (leaApiFlavor "api"). The deep project-status
-// assertions of the /v1 suite above don't apply here: project recording is
-// deferred adapter-side (docs/migrate-to-standalone.md §4), so we assert the wire
-// (POST /api/runs, no /v1 calls, autonomous run) rather than formalized status.
-
-// An adapter-style SSE response: the event name rides the `event:` line (unlike
-// the /v1 `sseResponse`, which inlines `type` in the data body).
+// An adapter-style SSE response: the event name rides the `event:` line.
 function adapterSseResponse(frames) {
   return {
     ok: true,
@@ -2980,30 +2244,11 @@ function makeAdapterApiFetch(calls, options = {}) {
   };
 }
 
-test("stub-then-formalize is unavailable on the standalone /api backend (deferred TODO)", async () => {
-  const leaRepo = await makeLeaRepo();
-  const state = await makeState({
-    leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
-    env: { OPENAI_API_KEY: "test-key" }
-  });
-
-  const result = await handleStub({
-    overleafProjectId: "project-1",
-    theoremLabel: "t_api_stub",
-    theoremText: "A theorem."
-  }, state);
-
-  assert.equal(result.statusCode, 501);
-  assert.equal(result.body.error, "stub_unsupported_on_api");
-});
-
 test("formalize on the /api backend posts to /api/runs and runs autonomously (no /v1 calls)", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeAdapterApiFetch(calls)
   });
@@ -3023,7 +2268,7 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
 });
 
 test("resolveProofOutcome trusts an adapter-verified run even with no local proof file", async () => {
-  // The /api flavor defers project-markdown recording, so the companion often
+  // The adapter defers project-markdown recording, so the companion often
   // cannot locate the proof on disk (localStatus === unformalized). A successful
   // run (exit.ok) must still resolve to `formalized` — this is the core fix.
   const job = { theoremLabel: "t1", leaWorkspacePath: "/tmp/does-not-matter" };
@@ -3085,7 +2330,6 @@ test("formalize on the /api backend tags the theorem formalized when the run suc
   const calls = [];
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeAdapterApiFetch(calls)
   });
@@ -3114,7 +2358,6 @@ test("formalize on the /api backend tags the theorem failed when the run does no
   const calls = [];
   const state = await makeState({
     leaRepoPath: leaRepo,
-    leaApiFlavor: "api",
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeAdapterApiFetch(calls, { doneStatus: "failed" })
   });

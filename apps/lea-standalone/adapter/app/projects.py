@@ -121,6 +121,28 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         if lines:
             inventory = "\n".join(lines)
 
+    # Mirrored Overleaf .tex sources live under .lea/files/overleaf/ (kind="overleaf",
+    # written by the mirror sync). List them recursively as their own section so the
+    # agent knows the LaTeX source is available and where to read it.
+    ol_dir = files_dir / "overleaf"
+    overleaf_section = ""
+    if ol_dir.is_dir():
+        ol_lines = [
+            f"- `{p.relative_to(repo).as_posix()}`"
+            for p in sorted(ol_dir.rglob("*.tex"))
+            if p.is_file()
+        ]
+        if ol_lines:
+            overleaf_section = (
+                "\n\n## Overleaf LaTeX source\n"
+                "The project's LaTeX sources, mirrored from Overleaf and kept current. "
+                "Consult them for the prose statements, notation, and definitions behind "
+                "the theorems. These are **read-only reference copies**, managed "
+                "automatically — do not edit them, and do not compile or run LaTeX "
+                "(`pdflatex`/`latexmk`) on them; that only produces build artifacts and "
+                "wastes the run:\n" + "\n".join(ol_lines)
+            )
+
     content = (
         f"{CONTEXT_MARKER}\n"
         f"You are working in project **{project.get('title', namespace)}** "
@@ -154,7 +176,7 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         f"```\n"
         f"The `uses` lines are the edges that chain the proof — point them at the keys of "
         f"sibling nodes you build on, and reuse nodes already proved.\n\n"
-        f"## Project files\n{inventory}"
+        f"## Project files\n{inventory}{overleaf_section}"
     )
     return {"role": "user", "content": content}
 
@@ -231,6 +253,28 @@ def _seed_docs(title: str, namespace: str) -> dict[str, str]:
     }
 
 
+def _provision_repo(project: dict, proofs_root: Path, *, overwrite: bool) -> bool:
+    """Ensure a project's on-disk repo exists and its seeded ``.lea/*.md`` docs are
+    present, committing if anything was written. With ``overwrite=False`` a doc is
+    written only when it's missing, so an existing (possibly edited) doc is never
+    clobbered — the idempotent path shared by :func:`ensure_project`. Returns True if a
+    doc was (re)written."""
+    repo = project_repo_dir(project, proofs_root)
+    gs = GitStore(proofs_root)
+    gs.init_repo(repo, subject=f"project init: {project['namespace']}")
+    lea_dir = repo / ".lea"
+    lea_dir.mkdir(parents=True, exist_ok=True)
+    wrote = False
+    for name, content in _seed_docs(project["title"], project["namespace"]).items():
+        path = lea_dir / name
+        if overwrite or not path.exists():
+            path.write_text(content)
+            wrote = True
+    if wrote:
+        gs.commit_all(repo, "project init: seed .lea/ (instructions, memory, blueprint)")
+    return wrote
+
+
 def provision_project(
     title: str,
     proofs_root: Path,
@@ -252,18 +296,31 @@ def provision_project(
         repo_path=repo_path,
     )
     try:
-        repo = project_repo_dir(project, proofs_root)
-        gs = GitStore(proofs_root)
-        gs.init_repo(repo, subject=f"project init: {namespace}")
-        lea_dir = repo / ".lea"
-        lea_dir.mkdir(parents=True, exist_ok=True)
-        for name, content in _seed_docs(project["title"], namespace).items():
-            (lea_dir / name).write_text(content)
-        gs.commit_all(repo, "project init: seed .lea/ (instructions, memory, blueprint)")
+        _provision_repo(project, proofs_root, overwrite=True)
     except Exception:
         # Roll back the index row so a half-provisioned project can't linger.
         store.delete_project_cascade(project["id"])
         raise
+    return project
+
+
+def ensure_project(slug: str, proofs_root: Path | None, title: str | None = None) -> dict:
+    """Get-or-create a project by slug (the Overleaf path) AND ensure its on-disk repo is
+    provisioned with the seeded ``.lea/*.md`` docs — the idempotent, slug-keyed analogue
+    of :func:`provision_project`, so an Overleaf-originated project is provisioned exactly
+    like a UI-created one (D25/D26/D28).
+
+    Seeds each doc only when missing (never clobbers an edited ``memory.md`` /
+    ``blueprint.md``) and commits only when something was written, so it is safe to call
+    on every run/mirror and backfills projects created tag-only before this existed. Disk
+    provisioning is best-effort — the index row is the source of truth and is always
+    returned; a missing ``proofs_root`` (lea_root unconfigured) just skips the disk half."""
+    project = store.get_or_create_project(slug, title=title)
+    if proofs_root is not None:
+        try:
+            _provision_repo(project, proofs_root, overwrite=False)
+        except Exception:
+            pass  # never fail a run/mirror because seeding hiccuped
     return project
 
 

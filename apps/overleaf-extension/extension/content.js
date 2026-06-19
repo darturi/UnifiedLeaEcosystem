@@ -3,9 +3,8 @@
   const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
-  const DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES = 3;
-  const DEFAULT_LEA_LATEX_CONTEXT_MODE = "off";
-  const LATEX_CONTEXT_SYNC_DELAY_MS = 750;
+  const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
+  const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -19,10 +18,15 @@
   let usageRefreshTimer = null;
   let latestTheorems = [];
   let latestActiveTex = "";
+  let latestActiveTexPath = "";
   let latestActiveTexProjectId = "";
-  let latestSyncedLatexContext = { projectId: "", source: "" };
-  let latexContextSyncTimer = null;
-  let latexContextSyncPromise = null;
+  let lastMirrorFiles = null;
+  let lastMirrorProjectId = "";
+  let texMirrorActivatedProjectId = "";
+  let texMirrorDirty = false;
+  let texMirrorSyncedOnce = false;
+  let texMirrorSyncTimer = null;
+  let texMirrorSyncPromise = null;
   let latestStatuses = {};
   let badgeLayer = null;
   let settingsButton = null;
@@ -44,10 +48,12 @@
       const activeTexChanged = nextActiveTex !== latestActiveTex || nextProjectId !== latestActiveTexProjectId;
       latestTheorems = event.data.theorems || [];
       latestActiveTex = nextActiveTex;
+      latestActiveTexPath = typeof event.data.activePath === "string" ? event.data.activePath : latestActiveTexPath;
       latestActiveTexProjectId = nextProjectId;
       renderStatusBadges();
       if (activeTexChanged) {
-        scheduleLatexContextSync();
+        texMirrorDirty = true;
+        scheduleTexMirrorSync();
       }
       scheduleStatusRefresh();
     }
@@ -204,12 +210,6 @@
     if (status === "unformalized") {
       return [
         {
-          role: "theorem-stub",
-          label: "Stub",
-          pendingText: "Asking Lea for a sorry stub...",
-          run: stub
-        },
-        {
           role: "theorem-action",
           label: "Formalize",
           primary: true,
@@ -223,7 +223,7 @@
         role: "theorem-action",
         label: "Formalize",
         primary: true,
-        pendingText: "Approving Lea stub and starting proof search...",
+        pendingText: "Starting Lea...",
         run: formalize
       }];
     }
@@ -313,16 +313,9 @@
             <span>Cost cap (USD)</span>
             <input type="number" min="0" step="0.01" data-role="max-spend" placeholder="None">
           </label>
-          <label>
-            <span>Translation retries</span>
-            <input type="number" min="1" max="50" data-role="theorem-translation-max-retries">
-          </label>
-          <label>
-            <span>LaTeX context</span>
-            <select data-role="latex-context-mode">
-              <option value="off">Off</option>
-              <option value="active_file">Active file</option>
-            </select>
+          <label class="ol-lean-checkbox-field">
+            <input type="checkbox" data-role="tex-mirror">
+            <span>Mirror Overleaf .tex into the project</span>
           </label>
           <button type="button" class="ol-lean-save-button" data-role="save-settings" disabled>Save changes</button>
         </section>
@@ -335,16 +328,14 @@
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
     const maxSpendInput = popover.querySelector("[data-role='max-spend']");
-    const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
-    const latexContextModeInput = popover.querySelector("[data-role='latex-context-mode']");
+    const texMirrorInput = popover.querySelector("[data-role='tex-mirror']");
     const saveButton = popover.querySelector("[data-role='save-settings']");
 
     closeButton.addEventListener("click", closePopover);
     modelSelect.addEventListener("change", markSettingsDirty);
     maxTurnsInput.addEventListener("input", markSettingsDirty);
     maxSpendInput.addEventListener("input", markSettingsDirty);
-    theoremTranslationMaxRetriesInput.addEventListener("input", markSettingsDirty);
-    latexContextModeInput.addEventListener("change", markSettingsDirty);
+    texMirrorInput.addEventListener("change", markSettingsDirty);
     for (const button of popover.querySelectorAll("[data-role='provider-key-toggle']")) {
       button.addEventListener("click", () => {
         const input = popover.querySelector(`[data-role='provider-key-input'][data-family='${button.dataset.family}']`);
@@ -367,13 +358,12 @@
         popover.dataset.savedModel = settings.leaModel;
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
         popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
-        popover.dataset.savedTheoremTranslationMaxRetries = String(settings.leaTheoremTranslationMaxRetries);
-        popover.dataset.savedLatexContextMode = settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+        popover.dataset.savedTexMirror = String(settings.leaTexMirrorEnabled !== false);
         renderProviderKeys(popover, settings.leaProviderKeys || {});
         clearProviderKeyInputs(popover);
         refreshModelAvailability(popover);
         markSettingsDirty();
-        scheduleLatexContextSync();
+        scheduleTexMirrorSync();
         status.textContent = "Settings saved.";
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
@@ -402,8 +392,7 @@
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
         String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
         normalizeMaxSpendInput(maxSpendInput.value) !== (popover.dataset.savedMaxSpend || "") ||
-        String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES) !== popover.dataset.savedTheoremTranslationMaxRetries ||
-        latexContextModeInput.value !== (popover.dataset.savedLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE) ||
+        String(texMirrorInput.checked) !== (popover.dataset.savedTexMirror || "true") ||
         hasProviderKeyInput(popover);
       saveButton.disabled = !dirty || !selectedFamilyConfigured;
     }
@@ -477,34 +466,12 @@
   }
 
   async function formalize(theorem) {
-    await syncLatexContextNow({ force: true });
+    // Flush any pending .tex mirror so the run's context is current (a no-op when
+    // nothing changed since the last background sync).
+    await syncTexMirrorNow({ force: true }).catch(() => {});
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        overleafProjectId: extractOverleafProjectId(),
-        theoremLabel: theorem.label,
-        theoremText: theorem.text,
-        theoremUses: theorem.uses || [],
-        theoremContext: theorem.context || "",
-        sourceHash: await sha256(normalizeTheoremText(theorem.text))
-      })
-    });
-
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
-    }
-    return payload;
-  }
-
-  async function stub(theorem) {
-    await syncLatexContextNow({ force: true });
-    const settings = await getSettings();
-    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
-    const response = await fetch(`${baseUrl}/stub`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -575,61 +542,102 @@
     }
   }
 
-  function scheduleLatexContextSync() {
-    clearTimeout(latexContextSyncTimer);
-    latexContextSyncTimer = setTimeout(() => {
-      syncLatexContextNow({ force: false }).catch(() => {});
-    }, LATEX_CONTEXT_SYNC_DELAY_MS);
+  function scheduleTexMirrorSync() {
+    clearTimeout(texMirrorSyncTimer);
+    texMirrorSyncTimer = setTimeout(() => {
+      syncTexMirrorNow({ force: false }).catch(() => {});
+    }, TEX_MIRROR_SYNC_DELAY_MS);
   }
 
-  async function syncLatexContextNow({ force }) {
-    clearTimeout(latexContextSyncTimer);
-    latexContextSyncTimer = null;
+  // Mirror the project's .tex sources into the matching Lea project (via the
+  // companion's /mirror-tex → adapter). Driven in the background as the document
+  // changes; `force` flushes a pending sync before a formalize. Skips all work when
+  // nothing has changed since the last successful mirror (the formalize fast path).
+  //
+  // Lazy project creation: a Lea project must only come into being once the user
+  // actually formalizes — never from merely opening or editing an Overleaf tab. So a
+  // `force` sync (the formalize flush) ACTIVATES mirroring for this project; background
+  // syncs stay completely inert (no zip fetch, no /mirror-tex, no project) until then.
+  async function syncTexMirrorNow({ force }) {
+    clearTimeout(texMirrorSyncTimer);
+    texMirrorSyncTimer = null;
 
-    if (force && latexContextSyncPromise) {
-      await latexContextSyncPromise;
+    if (texMirrorSyncPromise) {
+      // Coalesce with an in-flight sync; its result may already be current.
+      await texMirrorSyncPromise.catch(() => {});
     }
 
     const projectId = latestActiveTexProjectId || extractOverleafProjectId();
-    const activeTex = latestActiveTex;
-    if (!projectId || typeof activeTex !== "string") return null;
-    if (!force && latestSyncedLatexContext.projectId === projectId && latestSyncedLatexContext.source === activeTex) {
+    if (!projectId || projectId === "unknown") return null;
+
+    if (force) {
+      texMirrorActivatedProjectId = projectId;  // formalizing activates this project
+    } else if (texMirrorActivatedProjectId !== projectId) {
+      return null;  // background activity never creates/mirrors before the first formalize
+    }
+
+    // Fast path: nothing changed since the last mirror for this project.
+    if (!force && !texMirrorDirty && texMirrorSyncedOnce && lastMirrorProjectId === projectId) {
       return null;
     }
 
     const settings = await loadCompanionSettings();
-    if ((settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE) !== "active_file") {
-      return null;
-    }
-    if (latestSyncedLatexContext.projectId === projectId && latestSyncedLatexContext.source === activeTex) {
-      return null;
-    }
-
+    if (settings.leaTexMirrorEnabled === false) return null;
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
-    const request = async () => {
-      const response = await fetch(`${baseUrl}/latex-context`, {
+
+    texMirrorSyncPromise = (async () => {
+      // Re-download + unzip the project only when the content may have changed (an edit
+      // set the dirty flag, a new project, or no cached set yet); otherwise reuse the
+      // cached .tex set so an unchanged formalize skips the expensive zip fetch.
+      const needFetch = texMirrorDirty || !lastMirrorFiles || lastMirrorProjectId !== projectId;
+      const files = needFetch ? await collectProjectTexFiles(projectId) : lastMirrorFiles;
+      // Always POST: the adapter is authoritative and no-ops cheaply on identical
+      // content, so a backend reset (or any client/server divergence) self-heals instead
+      // of being masked by a stale client-side "already synced" cache.
+      const response = await fetch(`${baseUrl}/mirror-tex`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          overleafProjectId: projectId,
-          mode: "active_file",
-          activeTex
-        })
+        body: JSON.stringify({ overleafProjectId: projectId, files })
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
       }
-      latestSyncedLatexContext = { projectId, source: activeTex };
+      lastMirrorFiles = files;
+      lastMirrorProjectId = projectId;
+      texMirrorSyncedOnce = true;
+      texMirrorDirty = false;
       return payload;
-    };
+    })().finally(() => {
+      texMirrorSyncPromise = null;
+    });
 
-    if (!latexContextSyncPromise) {
-      latexContextSyncPromise = request().finally(() => {
-        latexContextSyncPromise = null;
-      });
+    return texMirrorSyncPromise;
+  }
+
+  // Download the project's source archive (authenticated, same-origin) and return
+  // its .tex entries as [{ path, content }]. Overlays the live active-editor buffer
+  // when its path is known, so the file being edited is current even if Overleaf's
+  // saved copy lags. Unzipping uses the dependency-free reader in zipTex.mjs.
+  async function collectProjectTexFiles(projectId) {
+    const response = await fetch(`/project/${encodeURIComponent(projectId)}/download/zip`, {
+      credentials: "same-origin"
+    });
+    if (!response.ok) {
+      throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
     }
-    return latexContextSyncPromise;
+    const buffer = await response.arrayBuffer();
+    const { extractTexFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
+    const files = await extractTexFromZip(buffer);
+
+    if (latestActiveTexPath && typeof latestActiveTex === "string") {
+      // Override only an entry that already exists in the archive — never invent a
+      // path, so a misread active-file path can't inject a spurious mirror file.
+      const wanted = String(latestActiveTexPath).replace(/^\/+/, "");
+      const existing = files.find((file) => file.path === wanted);
+      if (existing) existing.content = latestActiveTex;
+    }
+    return files;
   }
 
   function postStatusError(error) {
@@ -880,13 +888,12 @@
     return chrome.storage.sync.get({
       companionUrl: DEFAULT_COMPANION_URL,
       leaRepoPath: "",
-      leaApiBaseUrl: "http://127.0.0.1:8000",
+      leaApiBaseUrl: "http://127.0.0.1:8001",
       leaUiBaseUrl: DEFAULT_LEA_UI_BASE_URL,
       leaModel: DEFAULT_LEA_MODEL,
       leaMaxTurns: DEFAULT_LEA_MAX_TURNS,
       leaMaxSpendUsd: null,
-      leaTheoremTranslationMaxRetries: DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
-      leaLatexContextMode: DEFAULT_LEA_LATEX_CONTEXT_MODE
+      leaTexMirrorEnabled: DEFAULT_LEA_TEX_MIRROR_ENABLED
     });
   }
 
@@ -902,14 +909,13 @@
       const settings = {
         companionUrl: baseUrl,
         leaRepoPath: payload.leaRepoPath || stored.leaRepoPath || "",
-        leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8000",
+        leaApiBaseUrl: payload.leaApiBaseUrl || stored.leaApiBaseUrl || "http://127.0.0.1:8001",
         leaUiBaseUrl: payload.leaUiBaseUrl || stored.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL,
         leaModel: payload.leaModel || stored.leaModel || DEFAULT_LEA_MODEL,
         leaMaxTurns: payload.leaMaxTurns || stored.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
         leaMaxSpendUsd: payload.leaMaxSpendUsd ?? stored.leaMaxSpendUsd ?? null,
         leaCurrentSpendUsd: payload.leaCurrentSpendUsd ?? 0,
-        leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries || stored.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES,
-        leaLatexContextMode: payload.leaLatexContextMode || stored.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE,
+        leaTexMirrorEnabled: payload.leaTexMirrorEnabled ?? stored.leaTexMirrorEnabled ?? DEFAULT_LEA_TEX_MIRROR_ENABLED,
         leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
         leaProviderKeys: payload.leaProviderKeys || {}
       };
@@ -921,8 +927,7 @@
         leaModel: settings.leaModel,
         leaMaxTurns: settings.leaMaxTurns,
         leaMaxSpendUsd: settings.leaMaxSpendUsd,
-        leaTheoremTranslationMaxRetries: settings.leaTheoremTranslationMaxRetries,
-        leaLatexContextMode: settings.leaLatexContextMode
+        leaTexMirrorEnabled: settings.leaTexMirrorEnabled
       });
       return settings;
     } catch {
@@ -940,8 +945,7 @@
     const modelSelect = popover.querySelector("[data-role='model']");
     const maxTurnsInput = popover.querySelector("[data-role='max-turns']");
     const maxSpendInput = popover.querySelector("[data-role='max-spend']");
-    const theoremTranslationMaxRetriesInput = popover.querySelector("[data-role='theorem-translation-max-retries']");
-    const latexContextModeInput = popover.querySelector("[data-role='latex-context-mode']");
+    const texMirrorInput = popover.querySelector("[data-role='tex-mirror']");
     popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
     renderProviderKeys(popover, settings.leaProviderKeys || {});
     renderModelOptions(
@@ -952,13 +956,11 @@
     );
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
     maxSpendInput.value = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
-    theoremTranslationMaxRetriesInput.value = String(settings.leaTheoremTranslationMaxRetries || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
-    latexContextModeInput.value = settings.leaLatexContextMode || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    texMirrorInput.checked = settings.leaTexMirrorEnabled !== false;
     popover.dataset.savedModel = modelSelect.value;
     popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
     popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
-    popover.dataset.savedTheoremTranslationMaxRetries = String(Number.parseInt(theoremTranslationMaxRetriesInput.value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES);
-    popover.dataset.savedLatexContextMode = latexContextModeInput.value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    popover.dataset.savedTexMirror = String(texMirrorInput.checked);
     popover.querySelector("[data-role='save-settings']").disabled = true;
   }
 
@@ -1075,8 +1077,7 @@
     const leaModel = popover.querySelector("[data-role='model']").value || DEFAULT_LEA_MODEL;
     const leaMaxTurns = Number.parseInt(popover.querySelector("[data-role='max-turns']").value, 10) || DEFAULT_LEA_MAX_TURNS;
     const leaMaxSpendUsd = parseMaxSpendInput(popover.querySelector("[data-role='max-spend']").value);
-    const leaTheoremTranslationMaxRetries = Number.parseInt(popover.querySelector("[data-role='theorem-translation-max-retries']").value, 10) || DEFAULT_LEA_THEOREM_TRANSLATION_MAX_RETRIES;
-    const leaLatexContextMode = popover.querySelector("[data-role='latex-context-mode']").value || DEFAULT_LEA_LATEX_CONTEXT_MODE;
+    const leaTexMirrorEnabled = popover.querySelector("[data-role='tex-mirror']").checked;
     const response = await fetch(`${baseUrl}/settings/lea`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1086,8 +1087,7 @@
         leaModel,
         leaMaxTurns,
         leaMaxSpendUsd,
-        leaTheoremTranslationMaxRetries,
-        leaLatexContextMode,
+        leaTexMirrorEnabled,
         leaProviderApiKeys: collectProviderApiKeyPatch(popover)
       })
     });
@@ -1104,7 +1104,7 @@
       leaMaxTurns: payload.leaMaxTurns,
       leaMaxSpendUsd: payload.leaMaxSpendUsd,
       leaTheoremTranslationMaxRetries: payload.leaTheoremTranslationMaxRetries,
-      leaLatexContextMode: payload.leaLatexContextMode
+      leaTexMirrorEnabled: payload.leaTexMirrorEnabled
     });
     return payload;
   }

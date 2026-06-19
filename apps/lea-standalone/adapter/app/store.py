@@ -387,6 +387,27 @@ def get_project_file(file_id: str) -> dict | None:
     return row_to_dict(row) if row else None
 
 
+def list_project_files_by_kind(project_id: str, kind: str) -> list[dict]:
+    """Project files of one ``kind`` (e.g. ``"overleaf"`` for the mirrored .tex), used
+    by the Overleaf mirror reconcile to diff the desired set against what's indexed."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from project_files where project_id = ? and kind = ? "
+            "order by stored_path asc",
+            (project_id, kind),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_project_file_by_path(project_id: str, stored_path: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "select * from project_files where project_id = ? and stored_path = ?",
+            (project_id, stored_path),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def delete_project_file(file_id: str) -> bool:
     with connect() as conn:
         cur = conn.execute("delete from project_files where id = ?", (file_id,))

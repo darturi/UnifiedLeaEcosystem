@@ -1,27 +1,38 @@
-# Overleaf Lea Formalizer MVP
+# Overleaf Lea Formalizer
 
-This is the Overleaf app within the [LeaEcosystem](../../README.md) monorepo: a
-local MVP for sending labeled Overleaf theorem blocks to Lea and tracking the
-resulting Lean proofs in Lea's own workspace. Setup, the shared Lea API, and the
-shared `.env` are managed from the monorepo root.
+This app is the Overleaf side of the LeaEcosystem monorepo. It provides a Chrome
+extension plus a local Node companion that sends labeled theorem blocks from
+Overleaf to the shared Lea adapter.
 
-For beta testers installing from a pinned release tag, see [BETA_INSTALL.md](BETA_INSTALL.md).
+The default path is:
+
+```text
+Overleaf page -> Chrome extension -> companion (:31245) -> FastAPI adapter (:8001)
+```
+
+The adapter then drives the vendored prover at `apps/lea-standalone/prover/`
+in-process. The companion does not start its own prover backend.
+
+For beta testers installing from a pinned release tag, see
+[BETA_INSTALL.md](BETA_INSTALL.md).
 
 ## Pieces
 
-- `extension/`: Chrome MV3 extension for Overleaf.
-- `companion/`: local HTTP service that starts Lea jobs and tracks statuses.
-- `shared/`: parser and helper logic used by tests and the companion.
+- `extension/`: Chrome MV3 extension injected into Overleaf.
+- `companion/`: local HTTP service that validates theorem payloads, starts Lea
+  runs, tracks jobs, and reads adapter-persisted usage.
+- `shared/`: theorem parser and Lean path helpers used by the companion and tests.
 - `tests/`: Node test suite.
 
-The Lea checkout is shared across the monorepo at the **root** `vendor/lea-prover`
-submodule (not inside this app). All Lean work happens under
-`vendor/lea-prover/workspace`, where paths shown below are relative to the
-monorepo root.
+Generated Lean work happens under:
+
+```text
+apps/lea-standalone/prover/workspace/
+```
 
 ## Theorem Syntax
 
-The MVP requires theorem blocks with extension metadata in the optional argument:
+The extension looks for theorem blocks with metadata in the optional argument:
 
 ```tex
 \theorem[label=my_theorem_name]{
@@ -29,13 +40,18 @@ The MVP requires theorem blocks with extension metadata in the optional argument
 }
 ```
 
-The `label=...` value is used as the Overleaf theorem identifier and fallback generated Lean declaration name. It must be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
+The `label=...` value is used as the Overleaf theorem identifier and fallback
+Lean declaration name. It must be a valid Lean identifier: letters, digits, and
+underscores, with no leading digit.
 
-The optional argument also accepts two optional metadata fields: `uses={...}` and `context={...}`.
+The optional argument also accepts `uses={...}` and `context={...}`.
 
 ### `uses={...}`
 
-Use `uses={...}` when a theorem should depend on one or more earlier theorems from the same Overleaf project. The values are Overleaf labels, not Lean theorem names. Each referenced theorem must already be formalized, or at least have a saved sorry stub, before Lea starts the new run.
+Use `uses={...}` when a theorem should depend on earlier theorems from the same
+Overleaf project. Values are Overleaf labels, not Lean theorem names. Each
+referenced theorem must already be formalized, or at least have a saved sorry
+stub from an older build, before Lea starts the new run.
 
 ```tex
 \theorem[label=my_next_theorem, uses={my_prior_theorem, another_prior_theorem}]{
@@ -43,31 +59,14 @@ Use `uses={...}` when a theorem should depend on one or more earlier theorems fr
 }
 ```
 
-The companion resolves each label to Lea's recorded theorem name, module name, and proof file before sending the prompt. Lea is then instructed to make use of those results during formalization.
-
-Each `uses={...}` entry must be a valid Lean identifier:
-
-```tex
-\theorem[label=final_result, uses={base_case, induction_step}]{
-  The final result follows from the base case and induction step.
-}
-```
-
-If a referenced label cannot be resolved, the extension blocks the run and reports which theorem needs to be formalized first.
+If a referenced label cannot be resolved, the extension blocks the run and
+reports which theorem needs to be formalized first.
 
 ### `context={...}`
 
-Use `context={...}` to pass natural-language guidance to Lea for this specific theorem. This is useful for proof strategy, notation hints, suggested lemmas, or warnings about how to interpret the statement.
-
-```tex
-\theorem[label=my_guided_theorem, context={Use induction on n, then simplify.}]{
-  Prove this with the suggested strategy.
-}
-```
-
-When provided, the context text is added to the Lea prompt as formalization guidance. It does not affect LaTeX rendering.
-
-Use braces around context text that contains commas, square-bracket tactics, or spans multiple lines:
+Use `context={...}` to pass natural-language guidance to Lea for this theorem:
+proof strategy, notation hints, suggested lemmas, or warnings about how to
+interpret the statement.
 
 ```tex
 \theorem[
@@ -78,7 +77,7 @@ Use braces around context text that contains commas, square-bracket tactics, or 
 }
 ```
 
-You can combine `label`, `uses`, and `context` in the same theorem:
+You can combine all fields:
 
 ```tex
 \theorem[
@@ -90,57 +89,52 @@ You can combine `label`, `uses`, and `context` in the same theorem:
 }
 ```
 
-For a minimal test document, define the display macro in the preamble. The optional argument is consumed by the extension and ignored by LaTeX rendering:
+For a minimal test document, define the display macro in the preamble. The
+optional argument is consumed by the extension and ignored by LaTeX rendering:
 
 ```tex
 \usepackage{xparse}
 \NewDocumentCommand{\theorem}{O{} +m}{\paragraph{Theorem.} #2}
 ```
 
-If your document already defines `\theorem`, replace `\NewDocumentCommand` with `\RenewDocumentCommand`.
+If your document already defines `\theorem`, replace `\NewDocumentCommand` with
+`\RenewDocumentCommand`.
 
-## One-Time Local Setup
+## Setup
 
-Run the setup script from the repository root:
+Run setup from the monorepo root:
 
 ```sh
 npm run setup
 ```
 
-This sets up the full monorepo: shared Node dependencies, the bundled Lea API,
-Lean/Mathlib cache, root `.env`, this extension's companion settings, and the
-Lea UI.
-
-If you only need the Overleaf extension:
+For only the Overleaf app:
 
 ```sh
 npm run setup -- --target overleaf
 ```
 
-The unified setup does the one-time local work:
+The unified setup installs workspace Node dependencies, delegates adapter/prover
+setup to `apps/lea-standalone`, downloads the Lean/Mathlib cache, writes root
+`.env` defaults, and writes `.overleaf-lean-stub/settings.json`.
 
-- initializes or updates the Lea submodule at `vendor/lea-prover`
-- runs `npm install` for the monorepo
-- runs `uv sync --extra api` for the bundled Lea API
-- runs `lake update` in `vendor/lea-prover/workspace` when the local Mathlib checkout is missing
-- runs `lake exe cache get` in `vendor/lea-prover/workspace`
-- verifies `import Mathlib` against the compiled cache so first-run cache issues fail during setup
-- writes the monorepo root `.env` for API/runtime settings and `.overleaf-lean-stub/settings.json` for local Lea paths
-
-To force a Lean dependency refresh:
-
-```sh
-npm run update-lean-deps
-```
-
-Then edit the monorepo root `.env` and replace the placeholder API key, or enter provider keys in the extension settings UI. When entered through the UI, keys are written by the local companion to the root `.env`; they are not stored in Chrome or `.overleaf-lean-stub/settings.json`.
+Current default environment values:
 
 ```text
-OPENAI_API_KEY=your_openai_key_here
-ANTHROPIC_API_KEY=your_anthropic_key_here
-GEMINI_API_KEY=your_gemini_key_here
-# GOOGLE_API_KEY is also accepted for Gemini
-LEA_API_BASE_URL=http://127.0.0.1:8000
+LEA_ROOT=apps/lea-standalone/prover
+LEA_API_BASE_URL=http://127.0.0.1:8001
+LEA_UI_BASE_URL=http://localhost:5173
+OVERLEAF_COMPANION_URL=http://127.0.0.1:31245
+```
+
+Add provider keys in the standalone Settings page, the extension settings UI, or
+the monorepo root `.env`:
+
+```text
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+GOOGLE_API_KEY=
 LEA_JOB_TIMEOUT_SECONDS=900
 ```
 
@@ -150,20 +144,27 @@ Check setup:
 npm run doctor
 ```
 
-Fix anything marked with `✗` before starting the companion.
+Fix anything marked as failing before starting a formalization.
 
-## Run The Companion
+## Running
 
-Start the bundled Lea API in one terminal:
+Start the shared adapter from the monorepo root:
+
+```sh
+npm run start:adapter
+```
+
+Or, from `apps/overleaf-extension`, use the workspace helper:
 
 ```sh
 npm run start:lea-api
 ```
 
-Then start the Overleaf companion in another terminal:
+Then start the companion:
 
 ```sh
-npm start
+npm run dev:overleaf       # from the monorepo root
+npm start                  # from apps/overleaf-extension
 ```
 
 The companion listens on:
@@ -176,88 +177,92 @@ http://127.0.0.1:31245
 
 1. Open `chrome://extensions`.
 2. Enable Developer Mode.
-3. Load unpacked extension from the `extension/` directory.
+3. Load the unpacked extension from `apps/overleaf-extension/extension/`.
 4. Open the extension options page.
 5. Confirm the companion URL is `http://127.0.0.1:31245`.
-6. Confirm the Lea repo path points to the monorepo root `vendor/lea-prover`.
+6. Confirm the Lea repo path points to `apps/lea-standalone/prover`.
+7. Confirm the Lea UI base URL is `http://localhost:5173`.
 
-## Run Tests
+## Workflow
+
+When a theorem is visible in Overleaf, the extension adds status badges and a
+popover. The main action is **Formalize**, which asks the companion to create an
+autonomous adapter run. The adapter records the session, run, messages, code
+steps, and usage, so **View in Lea UI** can deep-link to the standalone proof
+timeline.
+
+## Generated Lean Work
+
+Project records and proof files are written in the standalone prover workspace:
+
+```text
+apps/lea-standalone/prover/workspace/projects/
+apps/lea-standalone/prover/workspace/proofs/Lea/<ProjectName>/
+```
+
+Optional mirrored Overleaf context is written under:
+
+```text
+apps/lea-standalone/prover/workspace/context/overleaf/<ProjectSlug>/
+  manifest.json
+  tex/active.tex
+```
+
+Formalization prompts include only the manifest path. Lea can open the mirrored
+`.tex` file if it decides the additional context is useful.
+
+Temporary retry behavior: when a failed theorem is retried, the companion removes
+the prior generated proof file and matching project markdown theorem entry before
+asking Lea to run again. This prevents stale failed artifacts from interfering
+with artifact mapping.
+
+## Usage And Session Links
+
+Usage comes from the standalone adapter's persisted stats endpoint. The
+companion falls back to its local job index only when the adapter is unreachable.
+
+The extension opens Lea sessions through:
+
+```text
+http://localhost:5173/?session=<session_id>
+```
+
+Set `LEA_UI_BASE_URL` if your Vite server is running elsewhere.
+
+## Optional LaTeX Context
+
+The extension can mirror the active Overleaf editor buffer into the Lea workspace
+so the agent can inspect surrounding LaTeX when notation or exposition matters.
+This is off by default and can be enabled from extension settings.
+
+The mirror currently tracks the active editor file, not the full Overleaf file
+tree.
+
+## Tests
+
+Run the Overleaf test suite:
 
 ```sh
 npm test
 ```
 
+From the monorepo root, `npm test` runs this suite first and then the standalone
+frontend suite.
+
 ## Reset Local Run State
 
-Local run state for both apps is reset from the monorepo root with the unified
-script. To clear prior local formalization runs while keeping Lea dependencies
-intact, from the monorepo root:
+From the monorepo root:
 
 ```sh
 npm run reset:local
 ```
 
-This removes Lea project markdowns, Lea proof files, mirrored Overleaf LaTeX context, companion job logs, backups, local job/cache indexes, and the Lea UI SQLite state. Preview the reset without deleting anything:
+This clears Lea project entries, proof entries, mirrored Overleaf LaTeX context,
+companion job logs, companion indexes, and the standalone SQLite database while
+keeping installed dependencies and caches.
+
+Preview first:
 
 ```sh
 npm run reset:local -- --dry-run
 ```
-
-## Shared Process State
-
-When `LEA_SHARED_STATE=true` is set in the monorepo root `.env`, the companion
-records each run's full process timeline (assistant messages, code steps,
-approvals, usage) into the shared database that the Lea UI reads, so an
-Overleaf-originated formalization shows up in the UI exactly like a UI-originated
-run. The extension surfaces an "open in Lea UI" link that deep-links to the
-recorded session (`?session=<id>`). Set `LEA_UI_BASE_URL` (default
-`http://localhost:5173`) so the link targets your running UI. See the monorepo
-root `README.md` and `docs/shared-process-state.md` for the full design and the
-related `.env` options.
-
-## Lea Setup
-
-The main workflow expects:
-
-- the `vendor/lea-prover` submodule initialized from `https://github.com/darturi/lea-prover.git`
-- `uv` available on `PATH`
-- the Lea API reachable at `LEA_API_BASE_URL` (default `http://127.0.0.1:8000`)
-- `OPENAI_API_KEY` in the monorepo root `.env` or exported in the shell that runs `npm start`
-- optional `LEA_JOB_TIMEOUT_SECONDS` in the root `.env` to fail and unblock stalled Lea runs
-- Lean and Lake available on `PATH`
-
-The extension options page stores local companion and Lea runtime settings. API keys stay in the root `.env` or the companion process environment.
-
-## Optional LaTeX Context
-
-Lea can optionally mirror the currently open Overleaf editor buffer into its workspace so proof-search agents can inspect surrounding LaTeX when notation or exposition matters. This is off by default. Enable it from the extension settings. This setting is Overleaf-specific and is not shared with the Lea UI.
-
-The v1 mirror only tracks the active editor file, not the full Overleaf file tree. Mirrored context is written under:
-
-```text
-vendor/lea-prover/workspace/context/overleaf/<ProjectSlug>/
-  manifest.json
-  tex/active.tex
-```
-
-Formalization prompts include only the manifest path. Lea can open the mirrored `.tex` file if it decides the additional context is useful.
-
-## Generated Lean Work
-
-Lea owns all Lean artifacts. Project records live under:
-
-```text
-vendor/lea-prover/workspace/projects/
-```
-
-The companion passes Overleaf project context to Lea's project-aware API. On
-successful runs, Lea records rich markdown entries with theorem metadata,
-signature, solving summary, proof path, and module name.
-
-Project proof files live under Lea's project namespace, for example:
-
-```text
-vendor/lea-prover/workspace/proofs/Lea/<ProjectName>/
-```
-
-Temporary retry behavior: when a failed theorem is retried, the companion removes the prior generated proof file and the matching project markdown theorem entry before asking Lea to run again. This is a stopgap so stale failed Lean files do not interfere with artifact mapping; we should revisit it once we decide how failed Lean files should be retained, archived, or surfaced.

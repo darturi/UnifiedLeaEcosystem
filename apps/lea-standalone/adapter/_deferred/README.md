@@ -1,9 +1,9 @@
 # Deferred to v2.1 — Projects
 
 These modules implement the **Projects** feature (grouping proved theorems into a
-named Lean namespace/module). v2 is deliberately project-free (architecture: see
-`design/v2-architecture.md` §7 "Deferred / future"); this code is parked here,
-out of the active `app/` package and out of the pytest `testpaths`, until v2.1.
+named Lean namespace/module). This older implementation is parked here, out of
+the active `app/` package and out of the pytest `testpaths`, until it is either
+rewritten against the current adapter/project architecture or deleted.
 
 - `project_assignment.py` / `project_unassignment.py` — move a proof into/out of a
   project (rewrite namespace, relocate the `.lean`, update the markdown index,
