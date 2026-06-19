@@ -115,30 +115,37 @@
     explicit Push, target-confirm, disabled w/o token) + the redacted token field in the fixed Settings page
     (D43). Push is outward-facing → always an explicit button, never automatic.</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
-    <b>SafeVerify can't audit a project proof that imports a sibling lemma.</b> A project
-    submission that does <code>import Lea.&lt;Project&gt;.Foo</code> fails SafeVerify with
+    <b style="color:#2e7d32">✓ RESOLVED — SafeVerify now audits a project proof that imports a sibling lemma.</b>
+    Previously a submission that did <code>import Lea.&lt;Project&gt;.Foo</code> failed SafeVerify with
     <code>unknown module prefix 'Lea'</code>: <code>safe_verify</code> replays oleans inside its own
-    Lake project (<code>third_party/SafeVerify</code>), whose search path has only its packages +
+    Lake project (<code>third_party/SafeVerify</code>), whose search path had only its packages +
     Mathlib — not the main workspace's compiled <code>Lea.*</code> oleans
     (<code>workspace/.lake/build/lib/lean</code>). Loose proofs (single file, Mathlib-only imports)
-    are unaffected; chaining proofs surfaced it (Q2/F3 testing). <span class="fix"><b>Fix
-    direction:</b> when the submission imports project modules, add the workspace build lib to
-    <code>safe_verify</code>'s <code>LEAN_PATH</code> (and ensure the sibling olean is built) in
-    <code>prover/lea/safeverify.py</code> → <code>verify_proof</code> (the <code>lake exe safe_verify</code>
-    invocation, <code>cwd=SAFE_VERIFY_DIR</code>).</span>
+    were unaffected; chaining proofs surfaced it (Q2/F3 testing). <span class="fix"><b>Fix shipped:</b>
+    a <code>_replay_env(lake_project)</code> helper in <code>prover/lea/safeverify.py</code> prepends
+    <code>&lt;lake_project&gt;/.lake/build/lib/lean</code> to <code>LEAN_PATH</code> for the
+    <code>lake exe safe_verify</code> replay only (<code>lake exe</code> preserves + appends to an inherited
+    <code>LEAN_PATH</code>), so the kernel resolves sibling <code>Lea.*</code> oleans; Mathlib resolution is
+    untouched (the build lib holds only <code>Lea/*</code>) and it's a no-op when the dir is absent. The
+    "ensure the olean is built" half is already enforced by the gating submission-compile step (a missing
+    sibling fails there first with a clear <code>Submission compile failed</code>). Verified end-to-end
+    through <code>interface.verify()</code> (sibling-import → ok, Mathlib-only → ok, <code>sorry</code> →
+    rejected) + 3 new tests in <code>tests/interface/test_verify.py</code> (2 fast, 1 opt-in real-binary).</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
-    <b>Blueprint graph: distinguish "Proved" from "SafeVerify-audited" (correctness, low priority).</b>
-    A node's <code>proved</code> status today means the standalone <b>Lean check</b> passed (no
-    <code>sorry</code>) on the stored <code>code_step</code> verdict — <i>not</i> a SafeVerify audit.
-    SafeVerify is the stronger, audit-grade verdict (kernel replay + per-decl match + axiom
-    whitelist) and should take precedence: a node is truly <b>Proved</b> only once SafeVerify passes;
-    a Lean-check-clean-but-unaudited node should read as something like <b>"check ✓ · audit pending."</b>
-    (Blocked in practice by the SafeVerify project-import gap above — sibling-importing proofs can't be
-    audited yet.) <span class="fix"><b>Fix direction:</b> add a SafeVerify verdict source feeding
-    <code>graph.py</code> <code>_base_status</code> (a new status above <code>proved</code>, e.g.
-    <code>verified</code>, or a <code>verified: bool</code> flag on the node); surface it in
-    <code>BlueprintGraph.tsx</code> (<code>STATUS_LABEL</code> + a swatch) and the node detail. Resolve
-    the LEAN_PATH gap first so project proofs are auditable.</span>
+    <b style="color:#2e7d32">✓ RESOLVED — Blueprint graph now distinguishes "Proved" from "SafeVerify-audited".</b>
+    A node's <code>proved</code> status only means the standalone <b>Lean check</b> passed (no
+    <code>sorry</code>) on the stored <code>code_step</code> verdict — <i>not</i> a SafeVerify audit
+    (kernel replay + per-decl match + axiom whitelist), which is the stronger, audit-grade verdict.
+    <span class="fix"><b>Fix shipped:</b> each graph node now carries a <code>verified: bool</code>
+    (a flag, not a new status, so the <code>ready</code> overlay that keys off <code>proved</code> is
+    untouched). It's True iff the node is <code>proved</code> <i>and</i> the session owning its file's
+    latest <code>code_step</code> holds a passing SafeVerify verdict on its latest run
+    (<code>store.safe_verify_ok_sessions</code> → <code>graph.build_graph</code>); a human edit or a
+    fresh agent run clears/supersedes that verdict, so it can't go stale. Surfaced in
+    <code>BlueprintGraph.tsx</code>: an audited node reads <b>"Proved ✓"</b> (solid green) while a
+    Lean-check-only node reads <b>"check ✓ · audit pending"</b> (paler, dashed) — split node fill,
+    legend entries, the detail pill, and a per-node explanation line. <b>4 new graph tests; full
+    186-test adapter suite + frontend typecheck green.</b></span>
   </div>
 
   <!-- ============ SLICE 1 ============ -->

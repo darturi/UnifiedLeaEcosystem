@@ -118,6 +118,7 @@ export interface GraphNode {
   statement: string;
   file: string | null;        // repo-relative file resolved for the decl, if any
   status: BlueprintStatus;    // derived from live state (color)
+  verified: boolean;          // proved AND SafeVerify-audited (audit-grade, above proved)
   sessions: GraphNodeSession[];
   last_modified_by: string | null;
 }

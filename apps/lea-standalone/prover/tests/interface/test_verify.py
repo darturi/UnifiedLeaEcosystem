@@ -102,6 +102,48 @@ def test_target_reproduces_submission_namespace():
     check("target keeps the signature + sorry", "theorem div_6" in target and "sorry" in target)
 
 
+# --- pure: replay LEAN_PATH augmentation -------------------------------------
+
+def test_replay_env_adds_workspace_build_lib():
+    """The `lake exe safe_verify` replay runs under SafeVerify's Lake project,
+    which can't see the workspace's compiled `Lea.*` oleans. `_replay_env` must
+    prepend the workspace build lib to LEAN_PATH so a sibling-importing proof
+    (`import Lea.<Project>.Foo`) resolves instead of failing 'unknown module
+    prefix Lea'. Pure: just exercises the path math + env merge."""
+    with tempfile.TemporaryDirectory() as d:
+        proj = Path(d)
+        build_lib = proj / ".lake" / "build" / "lib" / "lean"
+        build_lib.mkdir(parents=True)
+        prior = os.environ.get("LEAN_PATH")
+        os.environ["LEAN_PATH"] = "/pre/existing"
+        try:
+            env = safeverify._replay_env(proj)
+        finally:
+            if prior is None:
+                os.environ.pop("LEAN_PATH", None)
+            else:
+                os.environ["LEAN_PATH"] = prior
+        entries = env["LEAN_PATH"].split(os.pathsep)
+        check("build lib is first on LEAN_PATH", entries[0] == str(build_lib.resolve()))
+        check("inherited LEAN_PATH preserved", "/pre/existing" in entries)
+
+
+def test_replay_env_skips_missing_build_lib():
+    """No build lib (a fresh project, or a non-workspace lake dir) -> LEAN_PATH
+    is left exactly as inherited, never pointed at a nonexistent dir."""
+    with tempfile.TemporaryDirectory() as d:
+        prior = os.environ.get("LEAN_PATH")
+        os.environ["LEAN_PATH"] = "/only/this"
+        try:
+            env = safeverify._replay_env(Path(d))
+        finally:
+            if prior is None:
+                os.environ.pop("LEAN_PATH", None)
+            else:
+                os.environ["LEAN_PATH"] = prior
+        check("LEAN_PATH unchanged when no build lib", env.get("LEAN_PATH") == "/only/this")
+
+
 # --- mapping: (ok, detail) -> VerifyResult ----------------------------------
 
 def test_passed_maps_to_ok():
@@ -159,17 +201,53 @@ def test_integration_real_binary():
         bad.unlink(missing_ok=True)
 
 
+def test_integration_sibling_import():
+    """The LEAN_PATH fix: a project proof that `import`s a sibling lemma must
+    audit, not fail 'unknown module prefix Lea'. Needs the sibling olean built in
+    the workspace; skips cleanly if it isn't, so the gate stays portable."""
+    if os.environ.get("LEA_RUN_SV_INTEGRATION") != "1":
+        print("  skip sibling integration (set LEA_RUN_SV_INTEGRATION=1)")
+        return
+    if not safeverify.is_available():
+        print("  skip sibling integration (SafeVerify binary not built)")
+        return
+    sibling_module = "Lea.RealAnalysis.two_mul_le_sq_add_sq"
+    olean = safeverify.WORKSPACE / ".lake" / "build" / "lib" / "lean" / "Lea" / "RealAnalysis" / "two_mul_le_sq_add_sq.olean"
+    if not olean.exists():
+        print(f"  skip sibling integration (sibling olean not built: {olean})")
+        return
+    scratch = safeverify.WORKSPACE / ".sv_scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    proof = scratch / "A6Sibling.lean"
+    proof.write_text(
+        "import Mathlib\n"
+        f"import {sibling_module}\n\n"
+        "namespace Lea.Misc\n\n"
+        "theorem a6_sibling (a b : Real) : 2 * (a * b) <= a ^ 2 + b ^ 2 := by\n"
+        "  exact Lea.RealAnalysis.two_mul_le_sq_add_sq a b\n\n"
+        "end Lea.Misc\n"
+    )
+    try:
+        r = interface.verify(str(proof))
+        check("integration: sibling-importing proof -> ok", r.status == "ok")
+    finally:
+        proof.unlink(missing_ok=True)
+
+
 def main():
     print("interface.verify (A6) tests:")
     test_theorem_signature()
     test_namespace_context()
     test_target_reproduces_submission_namespace()
+    test_replay_env_adds_workspace_build_lib()
+    test_replay_env_skips_missing_build_lib()
     test_passed_maps_to_ok()
     test_failed_maps_to_rejected()
     test_grader_exception_maps_to_error()
     test_unavailable()
     test_no_theorem_is_error()
     test_integration_real_binary()
+    test_integration_sibling_import()
     print()
     if _FAILURES:
         print(f"FAILED ({len(_FAILURES)}): {', '.join(_FAILURES)}")

@@ -17,6 +17,12 @@ Status values (→ node color in F7):
   ``ready`` (not proved, but every dependency is proved) · ``proved`` (checks ok,
   no ``sorry``) · ``failed`` (latest check errored).
 
+Each node also carries a ``verified`` bool: True iff it is ``proved`` *and*
+SafeVerify (kernel replay + axiom audit) passed for its current state — the
+stronger, audit-grade verdict (a plain ``proved`` is only a Lean-check pass). It's
+a flag, not a status, so the ``ready`` overlay (which keys off ``proved``) is
+untouched. Surfaced as "Proved ✓" vs "check ✓ · audit pending" in the UI.
+
 Known limitation: ``sorry`` detection is a decl-span *text* scan (sound for the
 one-decl-per-file convention these projects use), not a Lean-aware parse.
 """
@@ -147,6 +153,9 @@ def build_graph(project: dict, proofs_root: Path) -> dict:
     parsed = blueprint.parse(text)
     fqn_to_file, file_to_text = _scan_lean_decls(repo)
     titles = {s["id"]: s.get("title") or "session" for s in store.list_project_sessions(project["id"])}
+    # Sessions whose latest run holds a passing SafeVerify verdict (D28): a node is
+    # audited iff the session that owns its file's latest code_step is in this set.
+    verified_sessions = store.safe_verify_ok_sessions(project["id"])
 
     enriched: list[dict] = []
     base: dict[str, str] = {}
@@ -167,12 +176,18 @@ def build_graph(project: dict, proofs_root: Path) -> dict:
                 seen.add(sid)
                 sessions.append({"session_id": sid, "title": titles.get(sid, "session"), "last_at": step["created_at"]})
 
+        last_modified_by = sessions[0]["session_id"] if sessions else None
+        # Audit-grade only: a Lean-check pass (`proved`) that SafeVerify also cleared
+        # for the session holding the current file state. Never True for stated/ready/etc.
+        verified = status == "proved" and last_modified_by in verified_sessions
+
         enriched.append({
             **node,
             "file": file,
             "status": status,
+            "verified": verified,
             "sessions": sessions,
-            "last_modified_by": sessions[0]["session_id"] if sessions else None,
+            "last_modified_by": last_modified_by,
         })
 
     # ``ready`` overlay (D28): a not-yet-proved node whose every dependency is proved.

@@ -521,6 +521,27 @@ def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
     return [row_to_dict(r) for r in rows]
 
 
+def safe_verify_ok_sessions(project_id: str) -> set[str]:
+    """Project session ids whose *latest* run holds a passing SafeVerify verdict.
+
+    The verdict is stored on the session's newest run (`set_session_safe_verify`);
+    a human edit clears it (routes/sessions.py) and a fresh agent run supersedes it
+    (the new latest run carries no verdict), so 'ok' here means the session's
+    current working file was audited — not a stale earlier state. Feeds the blueprint
+    graph's `verified` flag: a node is SafeVerify-audited iff the session that owns
+    its file's latest code_step is in this set."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select s.id from sessions s "
+            "join runs r on r.id = ("
+            "  select id from runs where session_id = s.id order by created_at desc, id desc limit 1"
+            ") "
+            "where s.project_id = ? and r.safe_verify_status = 'ok'",
+            (project_id,),
+        ).fetchall()
+    return {row["id"] for row in rows}
+
+
 def latest_agent_code_step(session_id: str) -> dict | None:
     """The most recent agent-authored code_step — the proof state the agent last
     'knew' (D12). Diffing its commit against HEAD reveals any human edits since."""
