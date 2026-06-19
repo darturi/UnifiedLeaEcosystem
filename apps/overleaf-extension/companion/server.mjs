@@ -293,8 +293,8 @@ export async function handleStub(payload, state) {
   }
   // The "stub the statement, approve, then formalize" flow depends on the
   // theorem-translation approval tier, which the standalone adapter does not
-  // expose yet (deferred — docs/migrate-to-standalone.md §4). Until the native
-  // tier lands on /api, surface a clear, non-failing message instead of starting
+  // expose yet. Until the native tier lands on /api, surface a clear,
+  // non-failing message instead of starting
   // a run that cannot pause for approval.
   if (isApiFlavor(state.settings.leaApiFlavor || DEFAULT_LEA_API_FLAVOR)) {
     return errorResponse(

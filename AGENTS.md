@@ -1,8 +1,8 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
-> Not to be confused with the `CLAUDE.md` one directory up (`lea-agent/CLAUDE.md`),
+> Not to be confused with the `AGENTS.md` one directory up (`lea-agent/AGENTS.md`),
 > which documents the standalone prover checkouts. **This** repo is the
 > `lea-ecosystem` monorepo that wraps the prover behind two front ends.
 
@@ -153,3 +153,5 @@ scripts/              monorepo setup.mjs, env.mjs (.env read/patch), reset-local
   live (editable `uv` path dep); follow that package's own `DESIGN.md` guardrails
   (never modify a theorem statement, no `sorry`/`axiom`/`native_decide` in final
   proofs, Mathlib-search budget, etc.).
+
+## Imported Claude Cowork project instructions

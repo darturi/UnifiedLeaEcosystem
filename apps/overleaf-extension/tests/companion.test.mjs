@@ -2937,7 +2937,7 @@ async function waitFor(predicate) {
 // --- New default backend: the standalone adapter (/api) -------------------
 // These cover the cutover default (leaApiFlavor "api"). The deep project-status
 // assertions of the /v1 suite above don't apply here: project recording is
-// deferred adapter-side (docs/migrate-to-standalone.md §4), so we assert the wire
+// deferred adapter-side, so we assert the wire
 // (POST /api/runs, no /v1 calls, autonomous run) rather than formalized status.
 
 // An adapter-style SSE response: the event name rides the `event:` line (unlike

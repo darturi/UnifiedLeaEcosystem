@@ -7,8 +7,7 @@
 // observed* by opening its SSE event stream — opening the stream is what spawns
 // the run thread adapter-side. We consume the stream to terminal `done`.
 //
-// Differences from `/v1` that the companion must absorb (see
-// docs/migrate-to-standalone.md §4 — deferred TODOs):
+// Differences from the retired `/v1` flow that the companion must absorb:
 //   * Per-run config (model / max_turns / permission_tier / project) is NOT sent
 //     here; the adapter reads it from config/lea.local.toml. We pass only the
 //     prompt (+ optional session_id for multi-turn continuation).
