@@ -84,8 +84,8 @@
     (<code>project.py</code> deleted in Q1). All §11 backend open questions are resolved.
   </div>
 
-  <div class="bar"><i style="width:48%"></i></div>
-  <div class="counts"><b>12 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 3 complete</b> — editable Instructions &amp; Memory rail cards the agent reads + maintains (R1, R2, F4 confirmed live in the UI; agent writes a preference to memory.md)</div>
+  <div class="bar"><i style="width:60%"></i></div>
+  <div class="counts"><b>15 / 25 tested</b> · 16 backend + 9 frontend · 7 slices · <b>Slice 4 complete</b> — upload reference docs (pdf/tex/docx/images) into a project; pdf/docx text-extracted for the agent (S1, S2, F5 confirmed live — agent read an uploaded .tex)</div>
 
   <div class="legend">
     <span><i class="dot d-queued"></i> Queued</span>
@@ -108,6 +108,15 @@
     <code>safe_verify</code>'s <code>LEAN_PATH</code> (and ensure the sibling olean is built) in
     <code>prover/lea/safeverify.py</code> → <code>verify_proof</code> (the <code>lake exe safe_verify</code>
     invocation, <code>cwd=SAFE_VERIFY_DIR</code>).</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>MarkdownDoc: expand-to-modal for long Instructions / Memory (UX, low priority).</b>
+    When the user clicks <b>Edit</b> on an Instructions or Memory card, replace the <b>Edit</b>
+    button with an <b>expand</b> icon that opens the editor in a full modal — so a long
+    <code>.lea/*.md</code> doc is easier to read/edit than the small inline textarea. The modal mirrors
+    the inline editor: same Cancel + Save buttons and PUT behavior. <span class="fix"><b>Fix
+    direction:</b> add an <code>expand</code> affordance + modal mode to <code>MarkdownDoc.tsx</code>
+    (reuse the existing <code>.modal-*</code> styles from <code>NewProjectDialog</code>); the inline and
+    modal editors share one <code>draft</code>/<code>save()</code> so either entry point works.</span>
   </div>
 
   <!-- ============ SLICE 1 ============ -->
@@ -196,20 +205,20 @@
     <h2>Slice 4 · Files</h2>
     <div class="ghint">Upload reference docs (pdf/tex/docx/images) the agent can read. Ends with: drag-drop upload + a file list + download in the Files card.</div>
 
-    <div class="todo is-planned">
+    <div class="todo is-done">
       <div class="top"><span class="id">S1</span><span class="title">Multipart upload + store + download</span>
-        <span class="tag be">backend</span><span class="dec">D27</span><span class="badge b-planned">Planned (next)</span></div>
-      <div class="scope"><code>POST /api/projects/{id}/files</code> (multipart; adds <code>python-multipart</code>) → MIME allowlist + size cap + filename sanitize → write to <code>.lea/files/</code> + <code>commit_write</code> + <code>project_files</code> row. <code>GET …/files/{fid}</code> download; <code>DELETE</code>.</div>
+        <span class="tag be">backend</span><span class="dec">D27</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>POST /api/projects/{id}/files</code> (multipart; adds <code>python-multipart</code>) → MIME allowlist + 25 MB cap + filename sanitize/de-dupe → write to <code>.lea/files/</code> + commit + <code>project_files</code> row. <code>GET …/files</code> list · <code>GET …/files/{fid}</code> download (<code>FileResponse</code>) · <code>DELETE</code>. New <code>uploads.py</code> service; 11 tests green.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id">S2</span><span class="title">Tiered text extraction</span>
-        <span class="tag be">backend</span><span class="dec">D27</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope">Native text used directly; pdf/docx → <code>.txt</code> sidecar (<code>pdfminer.six</code>/<code>python-docx</code>); images stored-only. One-line inventory folded into the run context; agent reads via the existing <code>read_file</code>.</div>
+        <span class="tag be">backend</span><span class="dec">D27</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">Native text (<code>.tex/.md/.txt</code>) used directly; <code>.pdf/.docx</code> → <code>&lt;name&gt;.txt</code> sidecar (<code>pdfminer.six</code>/<code>python-docx</code>); images stored-only. The composed context inventory lists each upload and points the agent at its extracted-text sidecar — <b>confirmed live: agent read an uploaded <code>.tex</code> and explained the problem.</b></div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id fe">F5</span><span class="title">Files card: upload + list + download</span>
-        <span class="tag fe">frontend</span><span class="dec">D40</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope">Overview rail <b>Files</b> card: drag-drop / picker upload (FormData), the file list with kind/meta, download, delete. Shares the upload/download client core with the Filesystem tab (F8).</div>
+        <span class="tag fe">frontend</span><span class="dec">D40</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">Overview rail <b>Files</b> card (<code>FilesCard.tsx</code>): drag-drop / picker upload (FormData), file list with an <code>extracted</code> tag, download, delete. Shares the upload/download client core with the Filesystem tab (F8).</div>
     </div>
   </div>
 
@@ -218,9 +227,9 @@
     <h2>Slice 5 · Blueprint &amp; graph <span style="color:var(--accent)">— the centerpiece</span></h2>
     <div class="ghint">The lemma decomposition + the interactive dependency graph. Ends with: a graph (shape=kind, color=live status) you can click into the sessions that built each node.</div>
 
-    <div class="todo">
+    <div class="todo is-planned">
       <div class="top"><span class="id">T1</span><span class="title">Blueprint format + parser + GET/PUT</span>
-        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-queued">Queued</span></div>
+        <span class="tag be">backend</span><span class="dec">D28</span><span class="badge b-planned">Planned (next)</span></div>
       <div class="scope"><code>.lea/blueprint.md</code> format (<code>## key</code> section + <code>kind</code>/<code>lean</code>/<code>uses</code> header lines + prose). Per-section line-scan parser → nodes + <code>uses</code> edges (no prose regex). <code>GET/PUT /blueprint</code>; context tells the agent the format + to keep it current.</div>
     </div>
     <div class="todo">

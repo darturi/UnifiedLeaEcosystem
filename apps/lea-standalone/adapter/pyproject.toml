@@ -11,6 +11,12 @@ dependencies = [
   "uvicorn[standard]>=0.32.0",
   "pydantic>=2.8.0",
   "litellm>=1.50.0",
+  # Project file uploads (D27, Slice 4): python-multipart is what FastAPI needs to
+  # parse multipart/form-data uploads; pdfminer.six + python-docx do the Tier-2
+  # text extraction (.pdf/.docx → .txt sidecar) the agent reads via read_file.
+  "python-multipart>=0.0.9",
+  "pdfminer.six>=20240706",
+  "python-docx>=1.1.0",
   # The vendored prover, imported in-process as a library (D1/D20). Editable
   # path dep so edits under prover/lea are picked up without re-syncing.
   "lea-prover",

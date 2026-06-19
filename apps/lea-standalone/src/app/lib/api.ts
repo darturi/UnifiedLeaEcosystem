@@ -14,6 +14,7 @@ import type {
   SessionDetail,
   Project,
   ProjectDetail,
+  ProjectFile,
 } from './types';
 
 export * from './types';
@@ -151,6 +152,42 @@ export async function createSessionInProject(projectId: string, title?: string):
     throw new Error(await detailMessage(response, `Failed to create session: ${response.statusText}`));
   }
   return response.json();
+}
+
+// ── Project files: upload / list / download / delete (.lea/files/, S1/S2) ──────
+export async function listProjectFiles(projectId: string): Promise<ProjectFile[]> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`);
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to load files: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.files) ? data.files : [];
+}
+
+export async function uploadProjectFile(projectId: string, file: File): Promise<ProjectFile> {
+  const form = new FormData();
+  form.append('file', file);
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`, {
+    method: 'POST',
+    body: form, // no Content-Type header — the browser sets the multipart boundary
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to upload ${file.name}: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function deleteProjectFile(projectId: string, fileId: string): Promise<void> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to delete file: ${response.statusText}`));
+  }
+}
+
+// The browser navigates here to download; the route streams the stored bytes.
+export function projectFileDownloadUrl(projectId: string, fileId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}`;
 }
 
 // ── Project docs: Instructions & Memory (.lea/*.md, R1/R2) ─────────────────────

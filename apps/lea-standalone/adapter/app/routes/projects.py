@@ -11,12 +11,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..config import load_config
 from .. import projects as project_service
 from .. import store
+from .. import uploads
 
 router = APIRouter()
 
@@ -132,6 +134,61 @@ def get_memory(project_id: str) -> dict:
 @router.put("/api/projects/{project_id}/memory")
 def put_memory(project_id: str, request: DocUpdate) -> dict:
     return _put_doc(project_id, "memory.md", request.content)
+
+
+# ── Files: upload / list / download / delete (S1/S2, D27) ────────────────────────
+# Uploaded reference docs land in the project repo's .lea/files/ (git-versioned) and
+# are indexed in project_files; Tier-2 (.pdf/.docx) also get a .txt sidecar the agent
+# reads. The bytes are canonical in git — these rows are the pointer + metadata.
+
+_UPLOAD_ERROR_STATUS = {"too_large": 413, "unsupported": 415}
+
+
+def _require_project(project_id: str) -> dict:
+    project = store.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@router.get("/api/projects/{project_id}/files")
+def list_files(project_id: str) -> dict:
+    _require_project(project_id)
+    return {"files": store.list_project_files(project_id)}
+
+
+@router.post("/api/projects/{project_id}/files", status_code=201)
+async def upload_file(project_id: str, file: UploadFile = File(...)) -> dict:
+    project = _require_project(project_id)
+    data = await file.read()
+    try:
+        return uploads.save_upload(
+            project, _proofs_root(), file.filename or "file", data, mime=file.content_type
+        )
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=_UPLOAD_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
+
+
+@router.get("/api/projects/{project_id}/files/{file_id}")
+def download_file(project_id: str, file_id: str) -> FileResponse:
+    project = _require_project(project_id)
+    row = store.get_project_file(file_id)
+    if row is None or row["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="File not found")
+    path = uploads.file_disk_path(project, _proofs_root(), row)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File bytes are missing")
+    return FileResponse(path, media_type=row.get("mime") or "application/octet-stream", filename=row["filename"])
+
+
+@router.delete("/api/projects/{project_id}/files/{file_id}")
+def delete_file(project_id: str, file_id: str) -> dict:
+    project = _require_project(project_id)
+    row = store.get_project_file(file_id)
+    if row is None or row["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="File not found")
+    uploads.delete_file(project, _proofs_root(), row)
+    return {"deleted": True, "id": file_id}
 
 
 @router.delete("/api/projects/{project_id}")

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ChevronLeft } from 'lucide-react';
 import type { ProjectDetail } from '../lib/api';
 import { MarkdownDoc } from './MarkdownDoc';
+import { FilesCard } from './FilesCard';
 
 type Tab = 'overview' | 'blueprint' | 'filesystem';
 
@@ -138,6 +139,7 @@ export function ProjectWindow({
               refreshSignal={docSignal}
               emptyHint="No memory for this project yet — jot down facts, witnesses, and dead ends here; Lea reads it and adds to it as it works."
             />
+            <FilesCard projectId={project.id} refreshSignal={docSignal} />
           </aside>
           </div>
         ) : (

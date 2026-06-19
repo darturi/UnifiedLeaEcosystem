@@ -1,13 +1,24 @@
 """P3 tests: project CRUD routes (D31). Route functions are called directly (as the
 other route tests do), with `load_config` patched so the proofs root is a tmp dir."""
 
+import asyncio
+import io
+
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
+from starlette.datastructures import Headers
 
 from app import db, store
 from app.config import LeaConfig
 from app.routes import projects as projects_route
 from app.routes.projects import DocUpdate, ProjectCreate, ProjectUpdate, SessionCreate
+
+
+def _upload(project_id, filename, data, content_type=None):
+    """Call the async upload route directly with a constructed UploadFile."""
+    headers = Headers({"content-type": content_type}) if content_type else None
+    uf = UploadFile(filename=filename, file=io.BytesIO(data), headers=headers)
+    return asyncio.run(projects_route.upload_file(project_id, uf))
 
 
 def _setup(tmp_path, monkeypatch):
@@ -133,6 +144,48 @@ def test_doc_get_returns_seeded_then_roundtrips_put(tmp_path, monkeypatch, doc):
     assert get(project["id"])["content"] == "# Edited\n\n- a durable fact\n"
     on_disk = proofs / "Lea" / "Analysis" / ".lea" / f"{doc}.md"
     assert on_disk.read_text() == "# Edited\n\n- a durable fact\n"
+
+
+def test_file_upload_list_download_delete_roundtrip(tmp_path, monkeypatch):
+    # S1: POST stores+indexes; GET lists; GET/{fid} downloads the bytes; DELETE removes.
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+    assert projects_route.list_files(pid)["files"] == []
+
+    row = _upload(pid, "notes.tex", b"\\section{x}", "text/x-tex")
+    assert row["stored_path"] == ".lea/files/notes.tex"
+    assert [f["id"] for f in projects_route.list_files(pid)["files"]] == [row["id"]]
+
+    resp = projects_route.download_file(pid, row["id"])
+    assert str(resp.path) == str(proofs / "Lea" / "Analysis" / ".lea" / "files" / "notes.tex")
+    assert resp.filename == "notes.tex"
+
+    assert projects_route.delete_file(pid, row["id"])["deleted"] is True
+    assert projects_route.list_files(pid)["files"] == []
+
+
+def test_file_upload_rejects_unsupported_type(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    with pytest.raises(HTTPException) as exc:
+        _upload(project["id"], "evil.sh", b"rm -rf /")
+    assert exc.value.status_code == 415
+
+
+def test_file_routes_404_on_missing_project_or_file(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+    with pytest.raises(HTTPException) as e1:
+        projects_route.list_files("nope")
+    assert e1.value.status_code == 404
+    with pytest.raises(HTTPException) as e2:
+        projects_route.download_file(pid, "no-such-file")
+    assert e2.value.status_code == 404
+    with pytest.raises(HTTPException) as e3:
+        projects_route.delete_file(pid, "no-such-file")
+    assert e3.value.status_code == 404
 
 
 def test_put_doc_feeds_composed_context(tmp_path, monkeypatch):

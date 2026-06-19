@@ -77,6 +77,20 @@ export interface ProjectDetail extends Project {
   sessions: SessionSummary[];
 }
 
+// An uploaded reference doc (D27). Bytes live in the project repo under
+// `.lea/files/`; this row is the pointer + extraction metadata. `extracted_path`
+// is the `.txt` sidecar for Tier-2 (pdf/docx); null for native text + images.
+export interface ProjectFile {
+  id: string;
+  project_id: string;
+  filename: string;
+  stored_path: string;
+  mime?: string | null;
+  kind: string;
+  extracted_path?: string | null;
+  created_at: string;
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;

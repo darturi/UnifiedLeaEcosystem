@@ -105,9 +105,21 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
     files_dir = repo / ".lea" / "files"
     inventory = "(none)"
     if files_dir.is_dir():
-        names = sorted(p.name for p in files_dir.iterdir() if p.is_file())
-        if names:
-            inventory = "\n".join(f"- `.lea/files/{n}`" for n in names)
+        all_names = {p.name for p in files_dir.iterdir() if p.is_file()}
+        # A Tier-2 sidecar is "<upload>.txt" with "<upload>" itself present (D27); list
+        # the upload, not the sidecar, and tell the agent where to read its text.
+        uploads = sorted(
+            n for n in all_names if not (n.endswith(".txt") and n[: -len(".txt")] in all_names)
+        )
+        lines = []
+        for n in uploads:
+            sidecar = f"{n}.txt"
+            if sidecar in all_names:
+                lines.append(f"- `.lea/files/{n}` (read its extracted text at `.lea/files/{sidecar}`)")
+            else:
+                lines.append(f"- `.lea/files/{n}`")
+        if lines:
+            inventory = "\n".join(lines)
 
     content = (
         f"{CONTEXT_MARKER}\n"
