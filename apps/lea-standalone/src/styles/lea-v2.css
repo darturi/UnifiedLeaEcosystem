@@ -356,6 +356,10 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
    Instructions & Memory cards; widen the body to make room. */
 .pw-body:has(.pw-overview-grid) { max-width: 1180px; }
 .pw-overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 24px; align-items: start; }
+/* Blueprint tab: dependency graphs want horizontal room, so give this tab a bit
+   more width than the other wide tabs. Only the graph view benefits — the markdown
+   sub-view stays capped at .bp-md's reading width. */
+.pw-body:has(.bp-tab) { max-width: 1280px; }
 @media (max-width: 940px) { .pw-overview-grid { grid-template-columns: 1fr; } }
 .pw-rail { display: flex; flex-direction: column; gap: 14px; }
 
@@ -444,6 +448,15 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .bp-graph-canvas { border: 1px solid var(--line); border-radius: 12px; background: var(--panel-2);
   overflow: auto; max-height: 70vh; padding: 10px; }
 .bp-graph-side { display: flex; flex-direction: column; gap: 14px; }
+
+/* Full-bleed graph: the dependency graph is the centerpiece, so the populated graph
+   view (a `.bp-graph` element — empty/loading states don't render it) uses the full
+   page width and most of the viewport height. The canvas takes the majority; the
+   legend + node detail ride in the rail alongside it (each scrolls if tall). The
+   Markdown sub-view is unaffected — it keeps its reading width. */
+.pw-body:has(.bp-graph) { max-width: none; padding: 12px 18px 16px; }
+.pw-body:has(.bp-graph) .bp-graph-canvas { height: calc(100vh - 268px); min-height: 420px; max-height: none; }
+.pw-body:has(.bp-graph) .bp-graph-side { max-height: calc(100vh - 268px); overflow: auto; }
 .bp-graph-msg { color: var(--muted); font-size: 13px; padding: 24px; }
 .bp-graph-err { color: var(--red); }
 .bp-graph-empty { border: 1px dashed var(--line); border-radius: 12px; padding: 30px; text-align: center; color: var(--ink-2); }

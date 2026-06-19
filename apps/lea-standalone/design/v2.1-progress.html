@@ -136,14 +136,6 @@
     (reuse the existing <code>.modal-*</code> styles from <code>NewProjectDialog</code>); the inline and
     modal editors share one <code>draft</code>/<code>save()</code> so either entry point works.</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
-    <b>Blueprint graph: give the graph canvas more width (UX, low priority).</b> The graph
-    currently shares the Blueprint tab in a two-column layout (canvas + a 280px detail/legend
-    rail), so a wide decomposition feels cramped. Give the canvas more room. <span class="fix"><b>Fix
-    direction:</b> in <code>lea-v2.css</code>, widen <code>.bp-graph</code> (raise the
-    <code>.pw-body</code> max-width for the blueprint tab, and/or move the legend/detail rail below
-    the canvas on wide graphs so the SVG spans full width); optionally make the detail panel a
-    dismissible overlay rather than a fixed column.</span>
-    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>Blueprint graph: distinguish "Proved" from "SafeVerify-audited" (correctness, low priority).</b>
     A node's <code>proved</code> status today means the standalone <b>Lean check</b> passed (no
     <code>sorry</code>) on the stored <code>code_step</code> verdict — <i>not</i> a SafeVerify audit.
