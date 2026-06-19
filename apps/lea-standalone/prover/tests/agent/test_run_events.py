@@ -20,7 +20,6 @@ from lea.events import (
 )
 
 _FAILURES: list[str] = []
-_ORIGINAL_RECORD_PROJECT_ENTRY = agent.record_project_entry
 
 
 def check(name: str, cond: bool) -> None:
@@ -51,7 +50,7 @@ def install_fakes():
 
     agent.stream = fake_stream
     agent._tools.lean_check = lambda path: "OK — no errors, no warnings."
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
     return calls
 
 
@@ -75,7 +74,7 @@ def install_silent_tool_fake():
 
     agent.stream = fake_stream
     agent._tools.lean_check = lambda path: "OK — no errors, no warnings."
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
     return calls
 
 
@@ -117,7 +116,7 @@ def install_final_gate_fake(*, check_outputs, final_texts=None):
 
     agent.stream = fake_stream
     agent._tools.lean_check = fake_lean_check
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
     return calls, proof_path
 
 
@@ -159,7 +158,7 @@ def install_final_gate_repair_fake():
 
     agent.stream = fake_stream
     agent._tools.lean_check = fake_lean_check
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
     return calls, proof_path
 
 
@@ -194,7 +193,7 @@ def install_no_artifact_repair_fake():
 
     agent.stream = fake_stream
     agent._tools.lean_check = fake_lean_check
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
     return calls, proof_path
 
 
@@ -232,7 +231,7 @@ def install_explicit_check_fake(*, edit_after_check=False):
 
     agent.stream = fake_stream
     agent._tools.lean_check = fake_lean_check
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
     return calls, proof_path
 
 
@@ -403,29 +402,6 @@ def test_edit_after_successful_check_rechecks_final_gate():
     check("edit after check rechecked", calls["checks"] == [proof_path, proof_path])
 
 
-def test_project_entry_recorded_after_final_gate_passes():
-    calls, proof_path = install_final_gate_fake(check_outputs=["OK — no errors, no warnings."])
-    recorded = {"count": 0}
-
-    def fake_record_project_entry(**kwargs):
-        recorded["count"] += 1
-        return None
-
-    agent.record_project_entry = fake_record_project_entry
-    try:
-        events = list(agent.run_events(
-            cfg(),
-            msgs("prove it"),
-            project={"project_id": "epsilon", "project_context": "facts"},
-        ))
-    finally:
-        agent.record_project_entry = _ORIGINAL_RECORD_PROJECT_ENTRY
-    fin = events[-1]
-    check("project final gate run completes", isinstance(fin, Finished) and fin.reason == "completed")
-    check("project entry recorded once after pass", recorded["count"] == 1)
-    check("project final gate checked before recording", calls["checks"] == [proof_path])
-
-
 def cfg_interactive():
     # LeaConfig is frozen now; build with the interactive variant directly
     # (it's also the default, but cfg() pins "default", so override explicitly).
@@ -459,7 +435,7 @@ def install_interactive_fake(decision):
 
     agent.stream = fake_stream
     agent._tools.search_mathlib = lambda *a, **k: "Found: Nat.even_add in Mathlib/Algebra/Parity.lean"
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: f"SYS[{variant}]"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: f"SYS[{variant}]"
     return calls
 
 
@@ -496,7 +472,7 @@ def test_interactive_sorry_skeleton_is_not_proved():
 
     agent.stream = fake_stream
     agent._tools.lean_check = lambda path: "Skel.lean:2:2: warning: declaration uses 'sorry'"
-    agent.load_system_prompt = lambda variant, skills=None, workspace=None: f"SYS[{variant}]"
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: f"SYS[{variant}]"
     events = list(agent.run_events(cfg_interactive(), msgs("prove t")))
     fin = events[-1]
     check("sorry skeleton is NOT 'completed'", isinstance(fin, Finished) and fin.reason != "completed")
@@ -561,11 +537,7 @@ def test_run_events_uses_caller_messages_verbatim():
         {"role": "user", "content": "Existing project facts:\n## Theorem: helper `workspace/proofs/helper.lean`"},
         {"role": "user", "content": "prove it"},
     ]
-    events = list(agent.run_events(
-        cfg(),
-        given,
-        project={"project_id": "epsilon", "project_context": "facts"},  # only used for success-recording now
-    ))
+    events = list(agent.run_events(cfg(), given))
     check("run completes with caller-provided messages", isinstance(events[-1], Finished))
     first_messages = calls["messages"][0]
     # No prepend: the caller's context stays at [0] and the task at [1]. (A prepend
@@ -587,7 +559,6 @@ def main():
     test_final_gate_success_allows_completion()
     test_successful_explicit_check_skips_duplicate_final_gate()
     test_edit_after_successful_check_rechecks_final_gate()
-    test_project_entry_recorded_after_final_gate_passes()
     test_interactive_sorry_skeleton_is_not_proved()
     test_interactive_assistant_turn_routes_to_chat_and_keeps_tools()
     test_text_only_history_serializes_for_provider()

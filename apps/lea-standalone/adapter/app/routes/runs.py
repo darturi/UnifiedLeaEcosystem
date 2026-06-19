@@ -76,6 +76,10 @@ def create_run(request: RunRequest) -> dict:
         # first tagged run for a session created project-less).
         if project_id and not session.get("project_id"):
             store.assign_session_project(session["id"], project_id)
+        # A UI project session (D23) already carries its project_id; tag the run with
+        # it so usage rolls up per project even without an Overleaf slug.
+        if project_id is None and session.get("project_id"):
+            project_id = session["project_id"]
     else:
         session = store.create_session(message, project_id=project_id)
 
@@ -170,7 +174,6 @@ async def run_events(run_id: str) -> StreamingResponse:
         task=task,
         config=load_config(),
         events=queue,
-        project=None,  # project context is deferred to v2.1 (D8)
         autonomous=bool(run.get("autonomous")),
     )
     thread = Thread(target=run_lea, args=(context,), daemon=True)

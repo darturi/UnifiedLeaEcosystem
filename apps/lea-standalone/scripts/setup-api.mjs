@@ -43,4 +43,27 @@ ensure(
   "Lean Mathlib cache is missing after cache download.",
 );
 
+// SafeVerify is a separate Lean project (third_party/SafeVerify) the prover invokes
+// for the kernel-level proof audit (`/verify`). It ships as source only and has its
+// OWN Mathlib dependency, so it needs two things or verify reports failure:
+//   1. its exe built (`safe_verify`), and
+//   2. its own Mathlib oleans, because it replays proofs that `import Mathlib` in its
+//      own Lake project — the workspace cache above does NOT cover it.
+// Toolchain is pinned to the workspace's (v4.29.0); the cache is a prebuilt download.
+const safeVerifyDir = path.join(root, "prover", "third_party", "SafeVerify");
+ensure(
+  "prover/third_party/SafeVerify/lakefile.lean",
+  "prover/third_party/SafeVerify is missing — this is a broken checkout.",
+);
+run("Building SafeVerify audit binary", ["lake", "build", "safe_verify"], safeVerifyDir);
+run("Downloading SafeVerify's Mathlib cache (for proof replay)", ["lake", "exe", "cache", "get"], safeVerifyDir);
+ensure(
+  "prover/third_party/SafeVerify/.lake/build/bin/safe_verify",
+  "SafeVerify binary is missing after build.",
+);
+ensure(
+  "prover/third_party/SafeVerify/.lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean",
+  "SafeVerify's Mathlib cache is missing after cache download.",
+);
+
 console.log("[setup] Done.");

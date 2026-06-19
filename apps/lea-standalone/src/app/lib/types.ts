@@ -53,6 +53,110 @@ export interface SessionSummary {
   duration_seconds: number;
 }
 
+// ── Projects (v2.1) ───────────────────────────────────────────────────────────
+// A project is a shared dir + git repo + this index row (D21). The slug is
+// immutable and determines the namespace `Lea.<Project>` + repo path (D22).
+// `session_count` is present on the list endpoint; `description`/`remote_url` are
+// nullable metadata. Instructions/Memory/Blueprint are `.lea/*.md` files, not
+// fields here.
+export interface Project {
+  id: string;
+  slug: string;
+  title: string;
+  description?: string | null;
+  namespace: string;
+  repo_path: string;
+  remote_url?: string | null;
+  created_at: string;
+  updated_at: string;
+  session_count?: number;
+}
+
+// GET /api/projects/{id}: the project meta plus its sessions (the project window).
+export interface ProjectDetail extends Project {
+  sessions: SessionSummary[];
+}
+
+// An uploaded reference doc (D27). Bytes live in the project repo under
+// `.lea/files/`; this row is the pointer + extraction metadata. `extracted_path`
+// is the `.txt` sidecar for Tier-2 (pdf/docx); null for native text + images.
+export interface ProjectFile {
+  id: string;
+  project_id: string;
+  filename: string;
+  stored_path: string;
+  mime?: string | null;
+  kind: string;
+  extracted_path?: string | null;
+  created_at: string;
+}
+
+// ── Blueprint & derived graph (v2.1 Slice 5, D28/D29) ─────────────────────────
+// The blueprint is `.lea/blueprint.md` (markdown-canonical); the graph is parsed +
+// derived on read. Status is derived from live Lean state, never stored.
+export type BlueprintStatus = 'planned' | 'stated' | 'ready' | 'proved' | 'failed';
+
+// A structural warning from the validator (advisory — never blocks a save). `node`
+// is the section key it concerns, or null for whole-file issues.
+export interface BlueprintWarning {
+  node: string | null;
+  message: string;
+}
+
+// One session that committed a node's `lean:` file, newest first (D29).
+export interface GraphNodeSession {
+  session_id: string;
+  title: string;
+  last_at: string;
+}
+
+export interface GraphNode {
+  key: string;
+  kind: string | null;        // definition | lemma | theorem (shape)
+  lean: string | null;        // the live decl, once named
+  uses: string[];             // dependency keys (edges)
+  statement: string;
+  file: string | null;        // repo-relative file resolved for the decl, if any
+  status: BlueprintStatus;    // derived from live state (color)
+  sessions: GraphNodeSession[];
+  last_modified_by: string | null;
+}
+
+export interface GraphEdge {
+  from: string;               // dependent node key
+  to: string;                 // dependency node key
+}
+
+export interface ProjectGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+// ── Global search (v2.1 Slice 7, D41) ─────────────────────────────────────────
+// A search hit is a session, tagged with its project (null for loose chats) so the
+// ⌘K overlay can section "Loose chats" vs "Inside projects". The only path to a
+// project session, which the sidebar hides.
+export interface SearchResult {
+  id: string;
+  title: string;
+  status: SessionStatus;
+  updated_at: string;
+  project_id: string | null;
+  project_title?: string | null;
+  project_namespace?: string | null;
+}
+
+// ── Filesystem tab (v2.1 Slice 6, D34) ────────────────────────────────────────
+// The project repo as a browsable tree. A dir carries `children`; a file carries
+// `size`. `path` is repo-relative POSIX. `.git/`/`.lake/` are hidden server-side.
+export interface TreeEntry {
+  name: string;
+  path: string;
+  type: 'dir' | 'file';
+  size?: number;
+  children?: TreeEntry[];
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;

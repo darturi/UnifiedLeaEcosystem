@@ -223,8 +223,14 @@ export function Canvas({
           ) : shownVerify.status === 'ok' ? (
             <span className="badge sv">🛡 SafeVerify ✓</span>
           ) : (
-            <span className="badge bad" title={shownVerify.detail || ''}>
-              🛡 SafeVerify {shownVerify.status}
+            // rejected / error / unavailable: show the badge AND the detail inline.
+            // The detail is *why* it failed (kernel-audit output, axiom violation,
+            // build issue) — it must be visible, not hidden in a hover tooltip.
+            <span className="sv-fail">
+              <span className="badge bad">🛡 SafeVerify {shownVerify.status}</span>
+              {shownVerify.detail && (
+                <span className="err-detail">{shownVerify.detail}</span>
+              )}
             </span>
           )
         ) : (

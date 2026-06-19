@@ -49,6 +49,38 @@ class GitStore:
         """The repo path for a session. Pure — no side effects, no I/O."""
         return self.root / session_id
 
+    # ── Generalized primitives (D24) ──────────────────────────────────────────
+    # A repo is just a directory with a `.git`; loose sessions resolve it from the
+    # session id, projects from `proofs/Lea/<Project>` (the shared repo). These two
+    # operate on an explicit path so a project session and a loose session share one
+    # git implementation; the `session_id` methods below delegate to them.
+
+    def init_repo(self, repo: Path, *, subject: str = "repo init") -> Path:
+        """Create (or no-op if present) a git repo at ``repo`` and return its path.
+
+        Idempotent: a second call leaves an existing repo untouched and adds no
+        commit. The empty root commit guarantees ``HEAD`` resolves from the very
+        start, so the read paths never hit the "no commits yet" edge."""
+        if (repo / ".git").is_dir():
+            return repo  # already initialised — re-init/resume is a no-op
+        repo.mkdir(parents=True, exist_ok=True)
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.name", GIT_USER_NAME)
+        self._git(repo, "config", "user.email", GIT_USER_EMAIL)
+        self._git(repo, "commit", "--allow-empty", "-q", "-m", commit_message(subject))
+        return repo
+
+    def commit_all(self, repo: Path, subject: str) -> str:
+        """Stage everything under ``repo`` and commit it with ``subject``; return the
+        new SHA (or the unchanged HEAD when nothing is staged). The single commit
+        primitive every write path funnels through (D8: commit on every write)."""
+        self._git(repo, "add", "-A")
+        staged = self._git(repo, "diff", "--cached", "--name-only").strip()
+        if not staged:
+            return self._git(repo, "rev-parse", "HEAD").strip()
+        self._git(repo, "commit", "-q", "-m", commit_message(subject))
+        return self._git(repo, "rev-parse", "HEAD").strip()
+
     def commit_write(self, session_id: str, *, turn, author: str = "agent", tool: str) -> str:
         """Commit the current state of the session repo and return the new SHA.
 
@@ -64,14 +96,15 @@ class GitStore:
         HEAD — an unchanged file is not a new state.
         """
         repo = self.session_repo(session_id)
+        # Build the subject first; commit_all formats files generically, but the
+        # session label carries author/tool/turn for `git log` readability.
         self._git(repo, "add", "-A")
         staged = self._git(repo, "diff", "--cached", "--name-only").strip()
         if not staged:
             return self._git(repo, "rev-parse", "HEAD").strip()
         files = ", ".join(staged.splitlines())
         suffix = f" (turn {turn})" if turn is not None else ""  # user edits have no turn
-        msg = commit_message(f"{author} {tool}: {files}{suffix}")
-        self._git(repo, "commit", "-q", "-m", msg)
+        self._git(repo, "commit", "-q", "-m", commit_message(f"{author} {tool}: {files}{suffix}"))
         return self._git(repo, "rev-parse", "HEAD").strip()
 
     def head(self, session_id: str) -> str:
@@ -81,19 +114,8 @@ class GitStore:
     def init_session(self, session_id: str) -> Path:
         """Create (or no-op if present) the session's git repo and return its path.
 
-        Idempotent: a second call (e.g. on resume) leaves the repo untouched and
-        adds no commit. The empty root commit guarantees ``HEAD`` resolves from the
-        very start, so the B3/B4 read paths never hit the "no commits yet" edge.
-        """
-        repo = self.session_repo(session_id)
-        if (repo / ".git").is_dir():
-            return repo  # already initialised — resume is a no-op
-        repo.mkdir(parents=True, exist_ok=True)
-        self._git(repo, "init", "-q")
-        self._git(repo, "config", "user.name", GIT_USER_NAME)
-        self._git(repo, "config", "user.email", GIT_USER_EMAIL)
-        self._git(repo, "commit", "--allow-empty", "-q", "-m", commit_message("session init"))
-        return repo
+        Thin wrapper over :meth:`init_repo` for the loose per-session repo."""
+        return self.init_repo(self.session_repo(session_id), subject="session init")
 
     def snapshot(self, session_id: str, sha: str, path: str) -> str:
         """File content at a commit — `git show <sha>:<path>`. The canvas stepper.

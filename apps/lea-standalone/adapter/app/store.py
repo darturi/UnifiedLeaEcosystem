@@ -42,9 +42,56 @@ def get_session(session_id: str) -> dict | None:
 
 
 def list_sessions() -> list[dict]:
+    """All sessions (loose + in-project), newest first. The sidebar uses
+    `list_loose_sessions`; this stays the unfiltered view (usage stats, search)."""
+    return _list_sessions()
+
+
+def list_loose_sessions() -> list[dict]:
+    """Loose sessions only (`project_id IS NULL`) — the sidebar Chats group (D30).
+    In-project sessions are reached through the project window / search, not here."""
+    return _list_sessions("s.project_id is null")
+
+
+def list_project_sessions(project_id: str) -> list[dict]:
+    """Sessions belonging to one project — the project window's session list (D30)."""
+    return _list_sessions("s.project_id = ?", (project_id,))
+
+
+# Fields the search endpoint returns per hit — the session plus its project tag. A
+# light projection of the full `_list_sessions` dict (the overlay needs no usage rollups).
+_SEARCH_FIELDS = (
+    "id", "title", "status", "updated_at",
+    "project_id", "project_title", "project_namespace",
+)
+
+
+def _escape_like(text: str) -> str:
+    """Escape a user query for a LIKE pattern (so `%`/`_` are literal, not wildcards)."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def search_sessions(query: str, limit: int = 30) -> list[dict]:
+    """Sessions whose title — or whose project's title — matches `query`, newest first
+    (D31/D41). Backs `GET /api/search`: the only way to reach a project session, which
+    the sidebar hides. Case-insensitive SQLite LIKE (FTS5 is a later upgrade). Each hit
+    carries its project tag so the overlay can section loose vs in-project. Blank → []."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{_escape_like(q)}%"
+    rows = _list_sessions(
+        "(s.title like ? escape '\\' or p.title like ? escape '\\')",
+        (like, like),
+    )
+    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows[:limit]]
+
+
+def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
+    where_sql = f"where {extra_where}" if extra_where else ""
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             select
                 s.*,
                 coalesce(sum(r.input_tokens), 0) as input_tokens,
@@ -68,7 +115,8 @@ def list_sessions() -> list[dict]:
                 p.id as project_id,
                 p.slug as project_slug,
                 p.title as project_title,
-                p.path as project_path,
+                p.namespace as project_namespace,
+                p.repo_path as project_repo_path,
                 s.created_at as started_at,
                 s.updated_at as ended_at,
                 (
@@ -91,10 +139,12 @@ def list_sessions() -> list[dict]:
             from sessions s
             left join runs r on r.session_id = s.id
             left join projects p on p.id = s.project_id
+            {where_sql}
             group by s.id
             order by s.updated_at desc
             limit 100
-            """
+            """,
+            params,
         ).fetchall()
     sessions = []
     for row in rows:
@@ -155,8 +205,19 @@ def create_run(
 
 
 def list_projects() -> list[dict]:
+    """All projects, newest first, each with a `session_count` (the sidebar shows
+    it). Proof/node counts + status mix come from the live Lean state in later
+    slices (the blueprint graph) — not stored here (DB-as-index, D4)."""
     with connect() as conn:
-        rows = conn.execute("select * from projects order by updated_at desc, title asc").fetchall()
+        rows = conn.execute(
+            """
+            select
+                p.*,
+                (select count(*) from sessions s where s.project_id = p.id) as session_count
+            from projects p
+            order by p.updated_at desc, p.title asc
+            """
+        ).fetchall()
     return [row_to_dict(row) for row in rows]
 
 
@@ -173,7 +234,28 @@ def get_project_by_slug(slug: str) -> dict | None:
     return row_to_dict(row) if row else None
 
 
-def get_or_create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+def project_namespace_for_slug(slug: str) -> str:
+    """Derive the Lean namespace `Lea.<Project>` from a slug (D22). `<Project>` must
+    be a valid Lean module-name segment: UpperCamel, alphanumeric, letter-initial.
+    The slug's `-`/`_`/space separators become CamelCase word boundaries.
+
+    P2's project service (which creates the on-disk `proofs/Lea/<Project>/` dir) is
+    the canonical caller; this lives here so the store can fill the NOT-NULL
+    `namespace`/`repo_path` columns for the Overleaf tag-only path too."""
+    parts = re.split(r"[-_\s]+", str(slug or "").strip())
+    camel = "".join(p[:1].upper() + p[1:] for p in parts if p)
+    camel = re.sub(r"[^A-Za-z0-9]", "", camel)
+    if not camel or not camel[0].isalpha():
+        camel = "P" + camel  # Lean segments can't start with a digit
+    return f"Lea.{camel}"
+
+
+def repo_path_for_namespace(namespace: str) -> str:
+    """The shared dir / git repo for a namespace: `Lea.Foo` → `proofs/Lea/Foo` (D22)."""
+    return "proofs/" + namespace.replace(".", "/")
+
+
+def get_or_create_project(slug: str, title: str | None = None) -> dict:
     """Return the project with this slug, creating it on first use. Used by the
     Overleaf path to tag runs with the document namespace so per-document usage can
     be aggregated. `slug` is unique, so a concurrent create just re-reads the
@@ -182,7 +264,7 @@ def get_or_create_project(slug: str, title: str | None = None, path: str | None 
     if existing:
         return existing
     try:
-        return create_project(slug, title=title, path=path)
+        return create_project(slug, title=title)
     except sqlite3.IntegrityError:
         # Lost a create race on the unique slug — read back the winner.
         winner = get_project_by_slug(slug)
@@ -191,25 +273,45 @@ def get_or_create_project(slug: str, title: str | None = None, path: str | None 
         raise
 
 
-def create_project(slug: str, title: str | None = None, path: str | None = None) -> dict:
+def create_project(
+    slug: str,
+    title: str | None = None,
+    description: str | None = None,
+    namespace: str | None = None,
+    repo_path: str | None = None,
+    remote_url: str | None = None,
+) -> dict:
+    """Insert a project index row (D21/D30). `namespace`/`repo_path` default to the
+    slug-derived values so the Overleaf tag-only path keeps working; P2's project
+    service passes them explicitly when it provisions the real on-disk repo."""
     slug = validate_project_slug(slug)
     now = utc_now()
     project_id = str(uuid4())
     project_title = (title or slug).strip() or slug
-    project_path = path or f"workspace/projects/{slug}.md"
+    ns = namespace or project_namespace_for_slug(slug)
+    repo = repo_path or repo_path_for_namespace(ns)
     with connect() as conn:
         conn.execute(
             """
-            insert into projects (id, slug, title, path, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into projects
+                (id, slug, title, description, namespace, repo_path, remote_url, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, slug, project_title, project_path, now, now),
+            (project_id, slug, project_title, description, ns, repo, remote_url, now, now),
         )
         row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(row)
 
 
-def update_project(project_id: str, title: str | None = None, path: str | None = None) -> dict | None:
+def update_project(
+    project_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    remote_url: str | None = None,
+) -> dict | None:
+    """Update project metadata only (D31): title, description, GitHub remote. The
+    slug → namespace → repo_path chain is immutable (D22), so those never change
+    here. Pass a field as None to leave it untouched."""
     now = utc_now()
     with connect() as conn:
         row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
@@ -219,18 +321,89 @@ def update_project(project_id: str, title: str | None = None, path: str | None =
         conn.execute(
             """
             update projects
-            set title = ?, path = ?, updated_at = ?
+            set title = ?, description = ?, remote_url = ?, updated_at = ?
             where id = ?
             """,
             (
                 (title if title is not None else current["title"]).strip() or current["title"],
-                path if path is not None else current["path"],
+                description if description is not None else current["description"],
+                remote_url if remote_url is not None else current["remote_url"],
                 now,
                 project_id,
             ),
         )
         updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(updated)
+
+
+def create_project_file(
+    project_id: str,
+    filename: str,
+    stored_path: str,
+    mime: str | None = None,
+    kind: str = "upload",
+    extracted_path: str | None = None,
+) -> dict:
+    """Index a project file (D27). The bytes live in the project repo under
+    `.lea/files/` (git-canonical); this row is the pointer + extraction metadata."""
+    now = utc_now()
+    file_id = str(uuid4())
+    with connect() as conn:
+        conn.execute(
+            """
+            insert into project_files
+                (id, project_id, filename, stored_path, mime, kind, extracted_path, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (file_id, project_id, filename, stored_path, mime, kind, extracted_path, now),
+        )
+        row = conn.execute("select * from project_files where id = ?", (file_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_project_files(project_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from project_files where project_id = ? order by created_at asc, filename asc",
+            (project_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def get_project_file(file_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select * from project_files where id = ?", (file_id,)).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def delete_project_file(file_id: str) -> bool:
+    with connect() as conn:
+        cur = conn.execute("delete from project_files where id = ?", (file_id,))
+    return cur.rowcount > 0
+
+
+def delete_project_cascade(project_id: str) -> bool:
+    """Delete a project and every DB row that references it. SQLite foreign keys are
+    not enforced here (no `PRAGMA foreign_keys=ON`), so the cascade is explicit: the
+    project's sessions and all their dependent rows go first, then project_files,
+    then the project. The on-disk repo (`rm -rf`) is the caller's job (the project
+    service) — this is the index half of delete (D31). Returns False if absent."""
+    with connect() as conn:
+        if not conn.execute("select 1 from projects where id = ?", (project_id,)).fetchone():
+            return False
+        session_ids = [
+            r["id"] for r in conn.execute(
+                "select id from sessions where project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if session_ids:
+            marks = ",".join("?" for _ in session_ids)
+            for table in ("messages", "code_steps", "status_events", "run_usage_breakdown", "runs"):
+                conn.execute(f"delete from {table} where session_id in ({marks})", session_ids)
+            conn.execute(f"delete from sessions where id in ({marks})", session_ids)
+        conn.execute("delete from project_files where project_id = ?", (project_id,))
+        conn.execute("delete from projects where id = ?", (project_id,))
+    return True
 
 
 def assign_session_project(session_id: str, project_id: str | None) -> None:
@@ -330,6 +503,22 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
             (session_id, path),
         ).fetchone()
     return row_to_dict(row) if row else None
+
+
+def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
+    """Every code_step for a file across a project's sessions, newest first — the raw
+    material for a blueprint node's status + session attribution (D29). Joins on the
+    session's project_id so loose sessions never leak in. Ordered by `created_at`
+    (cross-session recency; `seq` is only meaningful within one session), so the first
+    row is the latest verdict and the distinct session order is newest-touched-first."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select c.* from code_steps c join sessions s on s.id = c.session_id "
+            "where s.project_id = ? and c.path = ? "
+            "order by c.created_at desc, c.seq desc",
+            (project_id, path),
+        ).fetchall()
+    return [row_to_dict(r) for r in rows]
 
 
 def latest_agent_code_step(session_id: str) -> dict | None:

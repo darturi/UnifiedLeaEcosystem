@@ -22,7 +22,6 @@ from .events import (
     Error,
     FileChanged,
     Finished,
-    ProjectEntryUpdated,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
@@ -50,7 +49,6 @@ __all__ = [
     "VerifyResult",
     "Error",
     "Finished",
-    "ProjectEntryUpdated",
 ]
 
 

@@ -53,7 +53,7 @@ def install_fake():
 
     agent.stream = fake_stream
     agent._tools.lean_check = lambda p: "OK — no errors, no warnings."
-    agent.load_system_prompt = lambda v, skills=None, workspace=None: "SYS"
+    agent.load_system_prompt = lambda v, skills=None, workspace=None, namespace=None: "SYS"
     return calls, proof
 
 

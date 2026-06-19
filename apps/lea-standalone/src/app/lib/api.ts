@@ -12,6 +12,13 @@ import type {
   CodeStep,
   SafeVerifyStatus,
   SessionDetail,
+  Project,
+  ProjectDetail,
+  ProjectFile,
+  ProjectGraph,
+  BlueprintWarning,
+  TreeEntry,
+  SearchResult,
 } from './types';
 
 export * from './types';
@@ -79,6 +86,228 @@ export async function interruptRun(runId: string): Promise<void> {
   if (!response.ok && response.status !== 409) {
     throw new Error(await detailMessage(response, `Failed to interrupt run: ${response.statusText}`));
   }
+}
+
+// ── Projects (v2.1) ────────────────────────────────────────────────────────────
+export async function listProjects(): Promise<Project[]> {
+  const response = await fetch('/api/projects');
+  if (!response.ok) throw new Error(`Failed to load projects: ${response.statusText}`);
+  const data = await response.json();
+  return Array.isArray(data.projects) ? data.projects : [];
+}
+
+export async function getProject(projectId: string): Promise<ProjectDetail> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`);
+  if (!response.ok) throw new Error(`Failed to load project: ${response.statusText}`);
+  return response.json();
+}
+
+export async function createProject(title: string, description?: string): Promise<Project> {
+  const response = await fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title, description }),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to create project: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function updateProject(
+  projectId: string,
+  update: { title?: string; description?: string },
+): Promise<Project> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to update project: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function deleteProject(projectId: string): Promise<void> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to delete project: ${response.statusText}`));
+  }
+}
+
+export interface ProjectSession {
+  id: string;
+  title: string;
+  project_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Create a session that lives inside the project (D23). The run started for it
+// resolves the shared project repo + namespace server-side.
+export async function createSessionInProject(projectId: string, title?: string): Promise<ProjectSession> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to create session: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+// ── Project files: upload / list / download / delete (.lea/files/, S1/S2) ──────
+export async function listProjectFiles(projectId: string): Promise<ProjectFile[]> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`);
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to load files: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.files) ? data.files : [];
+}
+
+export async function uploadProjectFile(projectId: string, file: File): Promise<ProjectFile> {
+  const form = new FormData();
+  form.append('file', file);
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/files`, {
+    method: 'POST',
+    body: form, // no Content-Type header — the browser sets the multipart boundary
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to upload ${file.name}: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function deleteProjectFile(projectId: string, fileId: string): Promise<void> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}`,
+    { method: 'DELETE' },
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to delete file: ${response.statusText}`));
+  }
+}
+
+// The browser navigates here to download; the route streams the stored bytes.
+export function projectFileDownloadUrl(projectId: string, fileId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}`;
+}
+
+// ── Project docs: Instructions / Memory / Blueprint (.lea/*.md) ────────────────
+// One pair of calls backs the markdown editors (D39). `doc` is the route segment;
+// content is raw markdown in/out. Blueprint shares the same content round-trip
+// (its responses also carry `warnings`, fetched separately via getProjectBlueprint).
+export type ProjectDocName = 'instructions' | 'memory' | 'blueprint';
+
+export async function getProjectDoc(projectId: string, doc: ProjectDocName): Promise<string> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/${doc}`,
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to load ${doc}: ${response.statusText}`));
+  }
+  const data = await response.json();
+  return typeof data.content === 'string' ? data.content : '';
+}
+
+export async function putProjectDoc(
+  projectId: string,
+  doc: ProjectDocName,
+  content: string,
+): Promise<{ content: string; commit_sha?: string }> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/${doc}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to save ${doc}: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+// ── Blueprint authoring + derived graph (Slice 5, D28/D29) ─────────────────────
+// The blueprint's content round-trips through getProjectDoc/putProjectDoc('blueprint');
+// these two add the blueprint-specific extras: structural `warnings` (advisory) and
+// the parsed-and-derived dependency `graph` (node status + session attribution).
+
+export async function getProjectBlueprint(
+  projectId: string,
+): Promise<{ content: string; warnings: BlueprintWarning[] }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/blueprint`);
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to load blueprint: ${response.statusText}`));
+  }
+  const data = await response.json();
+  return { content: typeof data.content === 'string' ? data.content : '', warnings: data.warnings ?? [] };
+}
+
+export async function getProjectGraph(projectId: string): Promise<ProjectGraph> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/graph`);
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to load graph: ${response.statusText}`));
+  }
+  const data = await response.json();
+  return { nodes: Array.isArray(data.nodes) ? data.nodes : [], edges: Array.isArray(data.edges) ? data.edges : [] };
+}
+
+// ── Filesystem tab: tree / read / edit / export the project repo (Slice 6, D34) ─
+// The project is already a git repo, so this is mostly exposure: browse the tree,
+// read/edit any file (write+commit, path-guarded), download the whole thing.
+
+export async function getProjectTree(projectId: string): Promise<TreeEntry[]> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/tree`);
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to load files: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.tree) ? data.tree : [];
+}
+
+// A binary/undecodable file comes back as 415; we surface that as `binary: true`
+// (the viewer offers a download instead of garbled text) rather than throwing.
+export async function getProjectFile(
+  projectId: string,
+  path: string,
+): Promise<{ path: string; content: string; lean: boolean; binary: boolean }> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/file?path=${encodeURIComponent(path)}`,
+  );
+  if (response.status === 415) return { path, content: '', lean: false, binary: true };
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to load ${path}: ${response.statusText}`));
+  const data = await response.json();
+  return { path: data.path ?? path, content: data.content ?? '', lean: !!data.lean, binary: false };
+}
+
+export async function putProjectFile(
+  projectId: string,
+  path: string,
+  content: string,
+): Promise<{ path: string; commit_sha: string; check: { status: 'ok' | 'error'; detail?: string | null } | null }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/file`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path, content }),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, `Failed to save ${path}: ${response.statusText}`));
+  return response.json();
+}
+
+// The browser navigates here to download the project as a zip.
+export function projectExportUrl(projectId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/export`;
+}
+
+// ── Global search (Slice 7, D41) ──────────────────────────────────────────────
+// Sessions matching the query by their own title or their project's title, each
+// tagged with its project. The only way to reach a project session (sidebar-hidden).
+export async function searchSessions(query: string): Promise<SearchResult[]> {
+  const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+  if (!response.ok) throw new Error(await detailMessage(response, `Search failed: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.results) ? data.results : [];
 }
 
 // ── Writeable canvas + manual checks (F5 wires the UI to these) ────────────────

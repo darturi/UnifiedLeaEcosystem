@@ -6,11 +6,16 @@ from .skills import load_skills
 
 WORKSPACE = Path(__file__).resolve().parent.parent / "workspace" / "proofs"
 
+# The namespace loose (non-project) proofs live under. A project run passes its own
+# `Lea.<Project>` namespace instead (D32) and the workspace block is rebuilt for it.
+DEFAULT_NAMESPACE = "Lea.Misc"
+
 
 def load_system_prompt(
     variant: str = "default",
     skills: list[str] | None = None,
     workspace: str | Path | None = None,
+    namespace: str | None = None,
 ) -> str:
     """Build the system prompt: base variant + implicit lea.md + configured skills.
 
@@ -24,14 +29,30 @@ def load_system_prompt(
     `workspace/proofs/<session-id>/`, D7), we retarget every mention of the
     default path to it, so the agent writes straight into that repo and the
     adapter's `commit_write` captures it. `None` keeps the default (CLI/tests).
+
+    `namespace` states the active write namespace (D32). `None` or `"Lea.Misc"`
+    keeps the default loose block (write under `<workspace>/Lea/Misc/`, namespace
+    `Lea.Misc`). A project run passes its `Lea.<Project>`; the workspace block is
+    then rebuilt to tell the agent to write proofs directly in the project dir under
+    that namespace and import already-proved siblings (D22/D23). The prover stays
+    project-agnostic — it only swaps a namespace string the adapter hands it.
     """
     prompts = {
         "default": BASE_PROMPT,
         "interactive": INTERACTIVE_PROMPT,
     }
     prompt = prompts[variant]
+    target_workspace = str(workspace) if workspace is not None else str(WORKSPACE)
     if workspace is not None:
         prompt = prompt.replace(str(WORKSPACE), str(workspace))
+    if namespace is not None and namespace != DEFAULT_NAMESPACE:
+        # Swap the default Lea.Misc block for a project-namespace block. Recompute
+        # the default block as it now appears (after the workspace retarget) so the
+        # replace lands; the loose path above is untouched.
+        default_block = _WORKSPACE.replace(str(WORKSPACE), target_workspace)
+        prompt = prompt.replace(
+            default_block, _project_workspace_block(target_workspace, namespace)
+        )
     # Look for lea.md in cwd, then workspace root (implicit, kept for back-compat)
     for candidate in [Path.cwd() / "lea.md", WORKSPACE.parent / "lea.md"]:
         if candidate.exists():
@@ -52,6 +73,17 @@ _WORKSPACE = f"""\
 Write all .lean files to: {WORKSPACE}
 This directory is inside a Lake project with Mathlib available.
 For non-project proofs, write files under `{WORKSPACE}/Lea/Misc/` and wrap declarations in `namespace Lea.Misc` / `end Lea.Misc`. Do not create `Lea.Common`, `Lea.Experimental`, or `Lea.Examples`."""
+
+
+def _project_workspace_block(workspace: str, namespace: str) -> str:
+    """The workspace block for a project run (D32): proofs are written directly in
+    the project's shared dir and wrapped in its `Lea.<Project>` namespace so they
+    import as `{namespace}.<name>` and can chain off already-proved siblings (D22/D23)."""
+    return f"""\
+## Workspace
+Write all .lean files to: {workspace}
+This directory is inside a Lake project with Mathlib available.
+You are working in project namespace `{namespace}`. Write proof files directly in this directory and wrap declarations in `namespace {namespace}` / `end {namespace}`, so each is importable as `{namespace}.<name>`. You may `import` and `open` sibling modules already proved in this project to reuse their lemmas. Do not create `Lea.Common`, `Lea.Experimental`, or `Lea.Examples`."""
 
 
 _TOOLS = """\
