@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react';
-import { Pencil } from 'lucide-react';
+import { Maximize2, Minimize2, Pencil } from 'lucide-react';
 import { getProjectDoc, putProjectDoc, type ProjectDocName } from '../lib/api';
 import { MarkdownMessage } from './MarkdownMessage';
 
 // One reusable editor for a project's `.lea/*.md` docs (D39) — backs the Instructions
-// and Memory rail cards (and, later, Blueprint authoring). Rendered view via
-// MarkdownMessage; an edit mode swaps in a textarea that PUTs on Save. `agentWritten`
-// docs (Memory) re-fetch when `refreshSignal` changes, so a run that edits memory.md
-// shows up without a manual reload.
+// and Memory rail cards and the Blueprint authoring view. Rendered view via
+// MarkdownMessage; an edit mode swaps in a textarea that PUTs on Save. An **expand**
+// affordance pops that same editor into a roomy modal for long docs — inline and modal
+// share one `draft`/`save()`, so either entry point works. `agentWritten` docs (Memory)
+// re-fetch when `refreshSignal` changes, so a run that edits memory.md shows up live.
 export function MarkdownDoc({
   projectId,
   doc,
@@ -32,6 +33,8 @@ export function MarkdownDoc({
   const [content, setContent] = useState('');
   const [draft, setDraft] = useState('');
   const [editing, setEditing] = useState(false);
+  // The modal editor — a roomy pop-out of the same edit session (shares `draft`).
+  const [expanded, setExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -61,8 +64,20 @@ export function MarkdownDoc({
     setEditing(true);
   };
 
+  // Expand opens the modal; from view mode it also enters the (shared) edit session.
+  const openModal = () => {
+    if (!editing) setDraft(content);
+    setError(null);
+    setEditing(true);
+    setExpanded(true);
+  };
+
+  // Collapse pops back to the inline editor, keeping the draft.
+  const collapse = () => setExpanded(false);
+
   const cancel = () => {
     setEditing(false);
+    setExpanded(false);
     setError(null);
   };
 
@@ -74,6 +89,7 @@ export function MarkdownDoc({
       const result = await putProjectDoc(projectId, doc, draft);
       setContent(result.content);
       setEditing(false);
+      setExpanded(false);
       onSaved?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -96,14 +112,19 @@ export function MarkdownDoc({
             </span>
           )}
         </span>
-        {!editing && (
-          <button className="rail-card-edit" onClick={startEdit} title={`Edit ${title}`}>
-            <Pencil size={13} /> Edit
+        <div className="rail-card-actions">
+          {!editing && (
+            <button className="rail-card-edit" onClick={startEdit} title={`Edit ${title}`}>
+              <Pencil size={13} /> Edit
+            </button>
+          )}
+          <button className="rail-card-expand" onClick={openModal} title={`Open ${title} in a larger editor`}>
+            <Maximize2 size={14} />
           </button>
-        )}
+        </div>
       </header>
 
-      {editing ? (
+      {editing && !expanded ? (
         <div className="rail-card-editor">
           <textarea
             className="rail-card-textarea"
@@ -126,7 +147,7 @@ export function MarkdownDoc({
         <div className="rail-card-body">
           {loading ? (
             <div className="rail-card-muted">Loading…</div>
-          ) : error ? (
+          ) : error && !expanded ? (
             <div className="rail-card-error">{error}</div>
           ) : hasContent ? (
             <MarkdownMessage content={content} />
@@ -135,6 +156,38 @@ export function MarkdownDoc({
               {emptyHint ?? `Nothing here yet. Click Edit to add ${title.toLowerCase()}.`}
             </div>
           )}
+        </div>
+      )}
+
+      {expanded && (
+        <div className="modal-overlay" onMouseDown={collapse}>
+          <div className="modal doc-modal" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="doc-modal-head">
+              <span className="doc-modal-title">
+                {icon && <span className="rail-card-icon">{icon}</span>}
+                {title}
+              </span>
+              <button className="doc-modal-collapse" onClick={collapse} title="Collapse to the card">
+                <Minimize2 size={15} />
+              </button>
+            </div>
+            <textarea
+              className="doc-modal-textarea"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder={`# ${title}\n\nMarkdown…`}
+              autoFocus
+            />
+            {error && <div className="modal-error">{error}</div>}
+            <div className="modal-foot">
+              <button className="modal-btn" onClick={cancel} disabled={busy}>
+                Cancel
+              </button>
+              <button className="modal-btn primary" onClick={save} disabled={busy}>
+                {busy ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>

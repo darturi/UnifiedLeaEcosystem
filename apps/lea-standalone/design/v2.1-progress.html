@@ -127,15 +127,6 @@
     <code>prover/lea/safeverify.py</code> → <code>verify_proof</code> (the <code>lake exe safe_verify</code>
     invocation, <code>cwd=SAFE_VERIFY_DIR</code>).</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
-    <b>MarkdownDoc: expand-to-modal for long Instructions / Memory (UX, low priority).</b>
-    When the user clicks <b>Edit</b> on an Instructions or Memory card, replace the <b>Edit</b>
-    button with an <b>expand</b> icon that opens the editor in a full modal — so a long
-    <code>.lea/*.md</code> doc is easier to read/edit than the small inline textarea. The modal mirrors
-    the inline editor: same Cancel + Save buttons and PUT behavior. <span class="fix"><b>Fix
-    direction:</b> add an <code>expand</code> affordance + modal mode to <code>MarkdownDoc.tsx</code>
-    (reuse the existing <code>.modal-*</code> styles from <code>NewProjectDialog</code>); the inline and
-    modal editors share one <code>draft</code>/<code>save()</code> so either entry point works.</span>
-    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>Blueprint graph: distinguish "Proved" from "SafeVerify-audited" (correctness, low priority).</b>
     A node's <code>proved</code> status today means the standalone <b>Lean check</b> passed (no
     <code>sorry</code>) on the stored <code>code_step</code> verdict — <i>not</i> a SafeVerify audit.
