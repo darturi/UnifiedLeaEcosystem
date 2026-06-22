@@ -32,6 +32,7 @@ import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
+  fetchApiSessionDetail,
   interruptApiRun,
   mirrorProjectTexFiles,
   putAdapterSettings,
@@ -220,13 +221,32 @@ export async function handleFormalize(payload, state) {
   // `.lea/files/overleaf/` by the extension's background sync (flushed before this
   // request), so the adapter's composed context already surfaces them to Lea. No
   // per-run LaTeX prep happens here anymore.
-  const cleanup = await cleanupPreviousRunArtifacts({
+  const reusableStub = await findReusableStubForFormalization({
     leaRepoPath: state.settings.leaRepoPath,
     target,
-    theoremText,
     jobs: state.jobs || {}
   });
+  const cleanup = reusableStub
+    ? { removedProofPaths: [], removedProjectEntries: [] }
+    : await cleanupPreviousRunArtifacts({
+        leaRepoPath: state.settings.leaRepoPath,
+        target,
+        theoremText,
+        jobs: state.jobs || {}
+      });
   const job = await createLeaJob({ state, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses });
+  if (reusableStub) {
+    job.leaSessionId = reusableStub.leaSessionId || null;
+    job.recordedProofPath = reusableStub.recordedProofPath;
+    job.declarationName = reusableStub.declarationName || target.theoremLabel;
+    job.moduleName = reusableStub.moduleName || null;
+    job.stubToComplete = {
+      recordedProofPath: reusableStub.recordedProofPath,
+      absolutePath: reusableStub.absolutePath,
+      declarationName: reusableStub.declarationName || target.theoremLabel,
+      leanStatement: reusableStub.leanStatement || ""
+    };
+  }
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
@@ -242,6 +262,86 @@ export async function handleFormalize(payload, state) {
   return {
     statusCode: 200,
     body: buildJobResponse({ job, status: "in_progress", target })
+  };
+}
+
+export async function handleStub(payload, state) {
+  const validation = validateLeaPayload(payload);
+  if (!validation.ok) {
+    return errorResponse(400, validation.error, validation.message);
+  }
+
+  const { overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext } = validation;
+  const expectedHash = hashTheoremText(theoremText);
+  if (payload.sourceHash && payload.sourceHash !== expectedHash) {
+    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
+  }
+
+  await syncSharedSettingsFromAdapter(state);
+
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) {
+    return errorResponse(400, leaValidation.error, leaValidation.message);
+  }
+  if (spendLimitReached(state)) {
+    return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  }
+
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    theoremLabel
+  });
+  const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
+  if (activeJob) {
+    return {
+      statusCode: 200,
+      body: buildJobResponse({ job: activeJob, status: "in_progress", target })
+    };
+  }
+
+  const usesResolution = await resolveTheoremUses({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    theoremUses,
+    jobs: state.jobs || {}
+  });
+  if (!usesResolution.ok) {
+    return errorResponse(400, usesResolution.error, usesResolution.message);
+  }
+
+  const job = await createLeaJob({
+    state,
+    target,
+    theoremText,
+    theoremContext,
+    resolvedUses: usesResolution.resolvedUses,
+    mode: "stub"
+  });
+  state.jobs[job.jobId] = job;
+  await writeJson(state.jobsPath, state.jobs);
+
+  try {
+    await runLeaStubJob({
+      state,
+      job,
+      target,
+      theoremText,
+      theoremContext,
+      resolvedUses: usesResolution.resolvedUses
+    });
+  } catch (error) {
+    job.status = "failed";
+    job.finalStatus = "failed";
+    job.error = error instanceof Error ? error.message : String(error);
+    job.finishedAt = new Date().toISOString();
+    await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
+    await writeJson(state.jobsPath, state.jobs);
+  }
+
+  return {
+    statusCode: job.status === "sorry_stub" ? 200 : 500,
+    body: buildJobResponse({ job, status: job.status, target })
   };
 }
 
@@ -589,6 +689,12 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "POST" && url.pathname === "/formalize") {
     const result = await handleFormalize(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/stub") {
+    const result = await handleStub(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -1020,6 +1126,48 @@ function buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel }) {
   };
 }
 
+function projectNamespaceFromSlug(slug) {
+  const parts = String(slug || "").trim().split(/[-_\s]+/).filter(Boolean);
+  let camel = parts.map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`).join("");
+  camel = camel.replace(/[^A-Za-z0-9]/g, "");
+  if (!camel || !/^[A-Za-z]/.test(camel)) {
+    camel = `P${camel}`;
+  }
+  return `Lea.${camel}`;
+}
+
+function proofPathFromProjectStep({ namespace, stepPath }) {
+  const cleanPath = String(stepPath || "").replace(/^\/+/, "");
+  return path.join("workspace", "proofs", ...String(namespace || "Lea.Misc").split("."), cleanPath);
+}
+
+function moduleNameFromProjectStep({ namespace, stepPath }) {
+  const withoutExt = String(stepPath || "").replace(/\.lean$/i, "");
+  const moduleSuffix = withoutExt.split(/[\\/]+/).filter(Boolean).join(".");
+  return [namespace || "Lea.Misc", moduleSuffix].filter(Boolean).join(".");
+}
+
+async function findReusableStubForFormalization({ leaRepoPath, target, jobs }) {
+  const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+    leaRepoPath,
+    overleafProjectId: target.overleafProjectId,
+    theoremLabel: target.theoremLabel,
+    jobs
+  }));
+  if (status?.status !== "sorry_stub" || !status.recordedProofPath || !status.absolutePath) {
+    return null;
+  }
+  const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
+  return {
+    leaSessionId: status.leaSessionId || linkedJob?.leaSessionId || linkedJob?.recorderSessionId || null,
+    declarationName: status.declarationName || target.theoremLabel,
+    recordedProofPath: status.recordedProofPath,
+    absolutePath: status.absolutePath,
+    moduleName: status.moduleName || null,
+    leanStatement: status.leanStatement || ""
+  };
+}
+
 function findActiveJob(jobs, jobKey) {
   return Object.values(jobs).find((job) => job.jobKey === jobKey && job.status === "in_progress");
 }
@@ -1107,7 +1255,7 @@ function validateLeaRuntime(state, { requireApiKey }) {
   return { ok: true };
 }
 
-async function createLeaJob({ state, target, theoremText, theoremContext = "", resolvedUses = [] }) {
+async function createLeaJob({ state, target, theoremText, theoremContext = "", resolvedUses = [], mode = "formalization" }) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jobId = `${target.theoremLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
@@ -1121,6 +1269,7 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     jobId,
     jobKey: target.jobKey,
     status: "in_progress",
+    mode,
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
@@ -1233,7 +1382,7 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
 // Run one autonomous proof job against the standalone adapter, returning the
 // `exit` contract ({ ok, timedOut, apiRunId, error, usage, costUsd }) the rest of
 // the orchestration consumes.
-async function runLeaProofJobForJob({ state, job, target, prompt }) {
+async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null }) {
   await appendLog(job.logPath, `$ POST ${job.leaApiBaseUrl}/api/runs\n\n${prompt}\n\n`);
   const exit = await runApiProofJob({
     fetchImpl: state.fetchImpl || fetch,
@@ -1250,11 +1399,15 @@ async function runLeaProofJobForJob({ state, job, target, prompt }) {
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
     appendLog,
     logPath: job.logPath,
-    onRunStarted: async (apiRunId, sessionId) => {
+    onRunStarted: async (apiRunId, sessionId, startBody = {}) => {
       job.apiRunId = apiRunId;
       job.leaSessionId = sessionId || job.leaSessionId || null;
+      job.projectNamespace = startBody.project_namespace || job.projectNamespace || null;
+      job.projectSlug = startBody.project_slug || job.projectSlug || target.projectSlug;
+      job.adapterProjectId = startBody.project_id || job.adapterProjectId || null;
       await writeJson(state.jobsPath, state.jobs);
     },
+    onEvent,
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
       await writeJson(state.jobsPath, state.jobs);
@@ -1453,7 +1606,8 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
     theoremText,
     theoremContext,
     declarationNameHint: job.declarationNameHint || "",
-    resolvedUses
+    resolvedUses,
+    stubToComplete: job.stubToComplete || null
   });
   const exit = await runLeaProofJobForJob({ state, job, target, prompt });
   if (job.finalStatus === "max_spend") return;
@@ -1461,7 +1615,122 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 }
 
-function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [] }) {
+async function runLeaStubJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
+  const observedCodeSteps = new Map();
+  const prompt = buildLeaStubPrompt({
+    projectSlug: target.projectSlug,
+    theoremLabel: target.theoremLabel,
+    theoremText,
+    theoremContext,
+    resolvedUses
+  });
+  const exit = await runLeaProofJobForJob({
+    state,
+    job,
+    target,
+    prompt,
+    onEvent: (type, data) => {
+      if (type !== "code_step" || !data?.id) return;
+      observedCodeSteps.set(data.id, { ...(observedCodeSteps.get(data.id) || {}), ...data });
+    }
+  });
+  if (job.finalStatus === "max_spend") return;
+
+  const detail = job.leaSessionId
+    ? await fetchApiSessionDetail({
+        fetchImpl: state.fetchImpl || fetch,
+        baseUrl: job.leaApiBaseUrl,
+        apiKey: state.env?.LEA_API_KEY,
+        sessionId: job.leaSessionId
+      })
+    : { ok: false, error: "Lea adapter did not return a session id." };
+  const sessionDetail = detail.ok ? detail.body : {};
+  const artifact = validateStubArtifact({
+    state,
+    job,
+    target,
+    exit,
+    sessionDetail,
+    observedCodeSteps: [...observedCodeSteps.values()]
+  });
+  recordJobUsage(job, exit);
+  if (!artifact.ok) {
+    job.status = "failed";
+    job.finalStatus = "failed";
+    job.exitCode = 1;
+    job.timedOut = exit.timedOut;
+    job.apiRunId = exit.apiRunId || job.apiRunId || null;
+    job.error = artifact.error || exit.error || "Lea did not produce a valid sorry stub.";
+    job.finishedAt = new Date().toISOString();
+    await appendLog(job.logPath, `\n[backend] Stub generation failed: ${job.error}\n`);
+    await writeJson(state.jobsPath, state.jobs);
+    return;
+  }
+
+  job.status = "sorry_stub";
+  job.finalStatus = "sorry_stub";
+  job.exitCode = 0;
+  job.timedOut = exit.timedOut;
+  job.apiRunId = exit.apiRunId || job.apiRunId || null;
+  job.declarationName = artifact.declarationName;
+  job.recordedProofPath = artifact.recordedProofPath;
+  job.moduleName = artifact.moduleName;
+  job.leanStatement = artifact.leanStatement;
+  job.finishedAt = new Date().toISOString();
+  delete job.error;
+
+  await upsertProjectTheoremEntry({
+    projectMarkdownPath: target.projectMarkdownPath,
+    projectId: target.projectSlug,
+    theoremName: artifact.declarationName,
+    proofPath: artifact.recordedProofPath,
+    moduleName: artifact.moduleName,
+    signature: artifact.leanStatement,
+    description: `Sorry stub generated from Overleaf theorem ${target.theoremLabel}.`,
+    solvingProcess: "Stub only: Lean statement translated and checked; proof intentionally left as `sorry`."
+  });
+  await appendLog(job.logPath, `\n[backend] Stub generated at ${artifact.recordedProofPath}\n`);
+  await writeJson(state.jobsPath, state.jobs);
+}
+
+function validateStubArtifact({ state, job, target, exit, sessionDetail, observedCodeSteps = [] }) {
+  if (exit.timedOut || (!exit.ok && exit.doneStatus !== "answered")) {
+    return { ok: false, error: exit.error || `Lea run ended with status: ${exit.doneStatus || "unknown"}.` };
+  }
+  const stepsById = new Map();
+  for (const step of [...observedCodeSteps, ...(Array.isArray(sessionDetail?.code_steps) ? sessionDetail.code_steps : [])]) {
+    if (!step?.id) continue;
+    stepsById.set(step.id, { ...(stepsById.get(step.id) || {}), ...step });
+  }
+  const steps = [...stepsById.values()]
+    .filter((step) => String(step.path || "").endsWith(".lean"))
+    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+  const candidates = steps.filter((step) => containsDeclaration(String(step.code || ""), target.theoremLabel));
+  const step = candidates[candidates.length - 1];
+  if (!step) {
+    return { ok: false, error: `Lea did not write a .lean file containing theorem ${target.theoremLabel}.` };
+  }
+  const code = String(step.code || "");
+  if (!/\b(sorry|admit)\b/.test(code)) {
+    return { ok: false, error: `The generated file for ${target.theoremLabel} does not contain a sorry/admit stub.` };
+  }
+  if (step.check_status !== "ok") {
+    return { ok: false, error: step.check_detail || "The generated sorry stub did not pass lean_check." };
+  }
+  const namespace = sessionDetail?.project_namespace || job.projectNamespace || projectNamespaceFromSlug(target.projectSlug);
+  const recordedProofPath = proofPathFromProjectStep({ namespace, stepPath: step.path });
+  const absolutePath = buildLeaProofPath({ leaRepoPath: state.settings.leaRepoPath, proofPath: recordedProofPath });
+  return {
+    ok: true,
+    declarationName: target.theoremLabel,
+    recordedProofPath,
+    absolutePath,
+    moduleName: moduleNameFromProjectStep({ namespace, stepPath: step.path }),
+    leanStatement: extractLeanStatement(code, target.theoremLabel)
+  };
+}
+
+function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -1474,6 +1743,14 @@ function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext
   const formalizationGuidance = theoremContext.trim()
     ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
     : "";
+  const stubGuidance = stubToComplete
+    ? `\nExisting sorry stub to complete:
+- Declaration: ${stubToComplete.declarationName}
+- File: ${stubToComplete.absolutePath}
+- Statement: ${stubToComplete.leanStatement || "(see file)"}
+
+Continue from this existing file and replace the sorry/admit in theorem ${stubToComplete.declarationName}. Do not delete, rename, or move the file unless Lean requires a minimal import adjustment.\n`
+    : "";
 
   return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
 ${naming}
@@ -1481,6 +1758,7 @@ ${usesGuidance}
 
 ${theoremText}
 ${formalizationGuidance}
+${stubGuidance}
 
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a statement for approval. If a detail is ambiguous (for example which number type to use), pick the most natural interpretation and proceed without waiting. Do everything in this run: write the Lean file under Lea's workspace and carry the proof through to completion.
 
@@ -1488,6 +1766,36 @@ The final file must compile with no sorry/admit in theorem ${proofTarget}.
 Use the Lea project context to choose the project namespace and proof path.
 Do not edit the project markdown during proof search; Lea will record the final result after the proof succeeds.
 Do not create placeholder files outside Lea's workspace. If you cannot complete the proof, leave the best partial Lean file in the Lea project proof directory.`;
+}
+
+function buildLeaStubPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", resolvedUses = [] }) {
+  const usesGuidance = resolvedUses.length === 0
+    ? ""
+    : `\nAvailable already-recorded support declarations, if needed for the statement imports only:\n${resolvedUses.map((use) => (
+      `- ${use.declarationName} at ${use.absolutePath}`
+    )).join("\n")}\n`;
+  const formalizationGuidance = theoremContext.trim()
+    ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
+    : "";
+
+  return `Create a Lean sorry stub for the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
+
+Translate only the theorem statement into Lean. Use the declaration name exactly \`${theoremLabel}\`.
+Write exactly one .lean file in the active project namespace/directory, containing the translated theorem or lemma with body:
+
+\`\`\`lean
+by
+  sorry
+\`\`\`
+
+Run lean_check on that file. Stop after the stub compiles; do not try to fill the proof, do not remove the sorry, and do not ask for confirmation.
+${usesGuidance}
+
+Overleaf theorem text:
+${theoremText}
+${formalizationGuidance}
+
+The final file must compile with zero errors, but it must intentionally keep the sorry/admit body for theorem ${theoremLabel}.`;
 }
 
 function recordJobUsage(job, exit) {
@@ -1785,6 +2093,7 @@ function buildJobResponse({ job, status, target }) {
     projectMarkdownPath: target.projectMarkdownPath,
     recordedProofPath: job.recordedProofPath || null,
     moduleName: job.moduleName || null,
+    leanStatement: job.leanStatement || "",
     logTail: "",
     message: job.error || "",
     leaSessionId,

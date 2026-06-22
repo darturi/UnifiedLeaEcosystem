@@ -12,6 +12,7 @@ import {
   handleGetStatuses,
   handleGetUsage,
   handleMirrorTex,
+  handleStub,
   handleUpdateLeaSettings,
   recoverInterruptedJobs,
   resolveProofOutcome,
@@ -2223,7 +2224,14 @@ function makeAdapterApiFetch(calls, options = {}) {
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     calls.push({ url, options: requestOptions, body });
     if (String(url).endsWith("/api/runs") && requestOptions.method === "POST") {
-      return jsonResponse(200, { session_id: "sess-api-1", run_id: "api-run-1", message: {} });
+      return jsonResponse(200, {
+        session_id: options.sessionId || "sess-api-1",
+        run_id: options.runId || "api-run-1",
+        message: {},
+        project_id: options.projectId || "adapter-project-1",
+        project_slug: options.projectSlug || body?.project_slug || null,
+        project_namespace: options.projectNamespace || "Lea.Project1"
+      });
     }
     if (String(url).includes("/api/runs/") && String(url).endsWith("/events")) {
       return adapterSseResponse(options.eventFrames || [
@@ -2235,7 +2243,10 @@ function makeAdapterApiFetch(calls, options = {}) {
       return jsonResponse(200, { status: "resolved", decision: "always_session" });
     }
     if (String(url).includes("/api/sessions/")) {
-      return jsonResponse(200, { runs: [{ id: "api-run-1", input_tokens: 10, output_tokens: 5, cost_usd: 0.001 }] });
+      return jsonResponse(200, options.sessionDetail || {
+        runs: [{ id: options.runId || "api-run-1", input_tokens: 10, output_tokens: 5, cost_usd: 0.001 }],
+        code_steps: []
+      });
     }
     if (String(url).endsWith("/interrupt")) {
       return jsonResponse(200, { status: "interrupting" });
@@ -2265,6 +2276,110 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
   assert.ok(runCall.body.message.includes("project project-1"));
   assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
+});
+
+test("stub on the /api backend records a checked sorry stub with a Lea session link", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "GeneratedStub.lean");
+  const code = "namespace Lea.Project1\n\ntheorem generated_stub : True := by\n  sorry\n\nend Lea.Project1\n";
+  await writeLeaProjectProof(leaRepo, proofPath, code);
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls, {
+      doneStatus: "answered",
+      sessionDetail: {
+        project_namespace: "Lea.Project1",
+        runs: [{ id: "api-run-1", input_tokens: 4, output_tokens: 6, cost_usd: 0.002 }],
+        code_steps: [{
+          id: "step-1",
+          seq: 1,
+          path: "GeneratedStub.lean",
+          code,
+          check_status: "ok",
+          check_detail: "warning: declaration uses 'sorry'"
+        }]
+      }
+    })
+  });
+
+  const result = await handleStub({
+    overleafProjectId: "project-1",
+    theoremLabel: "generated_stub",
+    theoremText: "A generated stub theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.status, "sorry_stub");
+  assert.equal(result.body.leanStatement, "theorem generated_stub : True");
+  assert.equal(result.body.leaSessionId, "sess-api-1");
+  assert.equal(result.body.leaSessionUrl, "http://localhost:5173/?session=sess-api-1");
+  assert.equal(state.jobs[result.body.jobId].recordedProofPath, proofPath);
+  assert.match(calls.find((c) => String(c.url).endsWith("/api/runs")).body.message, /Create a Lean sorry stub/);
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    theorems: [{ theoremLabel: "generated_stub", theoremText: "A generated stub theorem." }]
+  }, state);
+  assert.equal(statuses.body.statuses.generated_stub.status, "sorry_stub");
+  assert.equal(statuses.body.statuses.generated_stub.leanStatement, "theorem generated_stub : True");
+});
+
+test("formalize after a saved stub reuses the stub session and proof file", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "ReuseStub.lean");
+  await writeLeaProjectProof(
+    leaRepo,
+    proofPath,
+    "namespace Lea.Project1\n\ntheorem reuse_stub : True := by\n  sorry\n\nend Lea.Project1\n"
+  );
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "reuse_stub",
+    proofPath,
+    moduleName: "Lea.Project1.ReuseStub"
+  });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls, {
+      sessionDetail: { runs: [{ id: "api-run-1", input_tokens: 10, output_tokens: 5, cost_usd: 0.001 }], code_steps: [] }
+    })
+  });
+  state.jobs.stub_job = {
+    jobId: "stub_job",
+    jobKey: "project-1:reuse_stub",
+    status: "sorry_stub",
+    finalStatus: "sorry_stub",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    theoremLabel: "reuse_stub",
+    declarationName: "reuse_stub",
+    recordedProofPath: proofPath,
+    moduleName: "Lea.Project1.ReuseStub",
+    leaRepoPath: leaRepo,
+    leaSessionId: "sess-stub-1",
+    leaUiBaseUrl: "http://localhost:5173",
+    logPath: path.join(path.dirname(state.jobsPath), "stub.log"),
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+  await fs.writeFile(state.jobs.stub_job.logPath, "stub\n", "utf8");
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    theoremLabel: "reuse_stub",
+    theoremText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.equal(runCall.body.session_id, "sess-stub-1");
+  assert.match(runCall.body.message, /Existing sorry stub to complete/);
+  assert.equal(await fileExists(path.join(leaRepo, proofPath)), true);
 });
 
 test("resolveProofOutcome trusts an adapter-verified run even with no local proof file", async () => {

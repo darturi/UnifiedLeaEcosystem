@@ -211,6 +211,13 @@ export async function fetchApiRunUsage({ fetchImpl, baseUrl, apiKey, sessionId, 
   };
 }
 
+export function fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "GET",
+    headers: buildHeaders(apiKey),
+  });
+}
+
 function deriveTurnProgress(payload, defaultMaxTurns) {
   if (!payload || typeof payload !== "object") return null;
   const turn = Number(payload.turn);
@@ -311,6 +318,7 @@ export async function runApiProofJob({
   originUrl = null,
   appendLog = null,
   logPath = null,
+  onEvent = null,
   onRunStarted = null,
   onProgressUpdated = null,
 }) {
@@ -325,7 +333,7 @@ export async function runApiProofJob({
   const newSessionId = start.body?.session_id || sessionId;
   if (!runId) return { ok: false, timedOut: false, error: "Lea adapter did not return a run_id." };
   await log(`[backend] Lea adapter run started: ${runId} (session ${newSessionId})\n`);
-  if (onRunStarted) await onRunStarted(runId, newSessionId);
+  if (onRunStarted) await onRunStarted(runId, newSessionId, start.body || {});
 
   const abort = new AbortController();
   let timedOut = false;
@@ -340,7 +348,7 @@ export async function runApiProofJob({
   try {
     outcome = await streamApiRun({
       fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
-      signal: abort.signal, onProgressUpdated,
+      signal: abort.signal, onEvent, onProgressUpdated,
     });
   } finally {
     clearTimeout(timer);

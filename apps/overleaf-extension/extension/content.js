@@ -177,7 +177,7 @@
     // check actions, viewing the session is valid even while a run is in progress,
     // so it stays enabled (only the action buttons are disabled mid-run).
     const showLeaUiButton =
-      Boolean(leaSession) || ["formalized", "in_progress", "unknown"].includes(actionStatus);
+      Boolean(leaSession) || ["formalized", "in_progress", "unknown", "unformalized", "sorry_stub"].includes(actionStatus);
     if (showLeaUiButton) {
       const leaUiLink = leaSession || getLeaUiBaseLink(statusInfo);
       const sessionButton = document.createElement("button");
@@ -215,6 +215,13 @@
           primary: true,
           pendingText: "Starting Lea...",
           run: formalize
+        },
+        {
+          role: "theorem-stub-action",
+          label: "Stub",
+          primary: false,
+          pendingText: "Creating Lean stub...",
+          run: stubTheorem
         }
       ];
     }
@@ -472,6 +479,32 @@
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        overleafProjectId: extractOverleafProjectId(),
+        theoremLabel: theorem.label,
+        theoremText: theorem.text,
+        theoremUses: theorem.uses || [],
+        theoremContext: theorem.context || "",
+        sourceHash: await sha256(normalizeTheoremText(theorem.text))
+      })
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    }
+    return payload;
+  }
+
+  async function stubTheorem(theorem) {
+    // Stubbing also needs the current .tex mirror because statement translation may
+    // depend on local notation/definitions in the surrounding document.
+    await syncTexMirrorNow({ force: true }).catch(() => {});
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const response = await fetch(`${baseUrl}/stub`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

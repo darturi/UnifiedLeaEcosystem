@@ -35,6 +35,9 @@ def test_create_run_tags_session_and_run_with_project_slug(tmp_path, monkeypatch
     project = store.get_project_by_slug("doc-a")
     assert project is not None
     assert session["project_id"] == project["id"]
+    assert result["project_id"] == project["id"]
+    assert result["project_slug"] == "doc-a"
+    assert result["project_namespace"] == project["namespace"]
 
     # A second run for the same document reuses the same project (no duplicates).
     runs_route.create_run(
@@ -84,6 +87,9 @@ def test_create_run_without_slug_stays_project_less(tmp_path, monkeypatch):
 
     session = store.get_session(result["session_id"])
     assert session["project_id"] is None
+    assert result["project_id"] is None
+    assert result["project_slug"] is None
+    assert result["project_namespace"] is None
     assert store.list_projects() == []
 
 
