@@ -4,7 +4,7 @@
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
-  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "in_progress", "sorry_stub"]);
+  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "disproved", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
@@ -756,6 +756,8 @@
         return "in progress";
       case "formalized":
         return "formalized";
+      case "disproved":
+        return "Counterexample found";
       case "sorry_stub":
         return "sorry stub";
       case "failed":
@@ -840,6 +842,7 @@
       case "in_progress":
         return "Formalizing...";
       case "formalized":
+      case "disproved":
       case "unknown":
         return "Check status";
       case "sorry_stub":

@@ -12,6 +12,7 @@ const CASES = [
   ["unformalized", { status: "unformalized", leaSessionId: "stale-session" }, false],
   ["unknown", { status: "unknown", leaSessionId: "stale-session" }, false],
   ["formalized", { status: "formalized" }, true],
+  ["disproved", { status: "disproved" }, true],
   ["in_progress", { status: "in_progress" }, true],
   ["sorry_stub", { status: "sorry_stub" }, true],
   ["failed with unformalized effective status", { status: "failed", effectiveStatus: "unformalized", leaSessionId: "stale-session" }, false],

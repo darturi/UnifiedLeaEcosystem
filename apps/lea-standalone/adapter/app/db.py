@@ -104,6 +104,8 @@ def init_db() -> None:
                 output_tokens integer default 0,
                 cost_usd real not null default 0,
                 final_text text,
+                result_kind text,
+                result_detail text,
                 -- The faithful prover conversation at this run's end (JSON list of
                 -- messages, with tool_call/tool_result parts) — the model-replay
                 -- transcript fed to the next activation for multi-turn (D16). Distinct

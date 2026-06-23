@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ChevronLeft } from 'lucide-react';
-import type { ProjectDetail } from '../lib/api';
+import type { ProjectDetail, SessionStatus } from '../lib/api';
 import { MarkdownDoc } from './MarkdownDoc';
 import { FilesCard } from './FilesCard';
 import { BlueprintTab } from './BlueprintTab';
@@ -113,7 +113,7 @@ export function ProjectWindow({
                 {sessions.map((s) => (
                   <li key={s.id}>
                     <button className="pw-session-row" onClick={() => onOpenSession(s.id)}>
-                      <span className={`dot ${s.status === 'ok' ? 'ok' : s.status === 'error' ? 'fail' : s.status === 'running' ? 'run' : 'idle'}`} />
+                      <span className={`dot ${sessionDotClass(s.status)}`} />
                       <span className="pw-session-title">{s.title}</span>
                       <span className="pw-session-when">{new Date(s.updated_at).toLocaleString()}</span>
                     </button>
@@ -152,4 +152,11 @@ export function ProjectWindow({
       </div>
     </div>
   );
+}
+
+function sessionDotClass(status: SessionStatus | string): string {
+  if (status === 'ok' || status === 'proved') return 'ok';
+  if (status === 'error') return 'fail';
+  if (status === 'running' || status === 'disproved' || status === 'needs_review') return 'run';
+  return 'idle';
 }

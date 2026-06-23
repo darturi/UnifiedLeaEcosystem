@@ -50,6 +50,28 @@ def test_status_follows_latest_code_step_verdict(tmp_path, monkeypatch):
     assert _list_status(session["id"]) == "ok"
 
 
+def test_checked_agent_step_uses_run_outcome_for_proof_or_disproof(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    proved = store.create_session("Proved")
+    proved_run = store.create_run(proved["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(proved["id"], proved_run["id"], "p.lean", commit_sha="1" * 40, check_status="ok")
+    store.update_run(proved_run["id"], "proved", result_kind="proved")
+    assert store.session_detail(proved["id"])["status"] == "proved"
+    assert _list_status(proved["id"]) == "proved"
+
+    disproved = store.create_session("Disproved")
+    disproved_run = store.create_run(disproved["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(disproved["id"], disproved_run["id"], "d.lean", commit_sha="2" * 40, check_status="ok")
+    store.update_run(disproved_run["id"], "disproved", result_kind="disproved")
+    assert store.session_detail(disproved["id"])["status"] == "disproved"
+    assert _list_status(disproved["id"]) == "disproved"
+
+    # A later human edit is a new working copy with no run outcome attached.
+    store.add_code_step(disproved["id"], None, "d.lean", commit_sha="3" * 40, author="user", check_status="ok")
+    assert store.session_detail(disproved["id"])["status"] == "ok"
+    assert _list_status(disproved["id"]) == "ok"
+
+
 def test_step_without_verdict_is_unchecked(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
     session = store.create_session("Pending check")
@@ -87,7 +109,7 @@ def test_running_flips_to_verdict_when_run_finishes(tmp_path, monkeypatch):
     session = store.create_session("Lifecycle")
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
     assert _list_status(session["id"]) == "running"  # no code yet, active run
-    store.update_run(run["id"], "success")
+    store.update_run(run["id"], "proved")
     assert _list_status(session["id"]) == "empty"  # run no longer active, still no code
 
 
@@ -102,7 +124,7 @@ def test_sessions_digest_changes_on_create_and_run_state(tmp_path, monkeypatch):
     after_run = store.sessions_digest()
     assert after_run != after_create  # an active run moves it
 
-    store.update_run(run["id"], "success")
+    store.update_run(run["id"], "proved")
     after_finish = store.sessions_digest()
     assert after_finish != after_run  # leaving the active set moves it too
 

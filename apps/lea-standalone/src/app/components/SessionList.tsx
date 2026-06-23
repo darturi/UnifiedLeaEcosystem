@@ -1,15 +1,19 @@
-import { CheckCircle, XCircle, Circle, CircleDashed, Loader2 } from 'lucide-react';
+import { AlertCircle, Ban, CheckCircle, XCircle, Circle, CircleDashed, Loader2 } from 'lucide-react';
 import type { SessionSummary } from '../lib/api';
 
-// v2 session status is derived from the latest code step's verdict:
-//   running → a run is active · ok → compiles · error → has errors ·
-//   unchecked → written but not checked · empty
+// v2 session status is derived from the latest code step's verdict plus its run
+// outcome when the latest step is agent-authored.
 function StatusIcon({ status }: { status: SessionSummary['status'] }) {
   switch (status) {
     case 'running':
       return <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />;
+    case 'proved':
     case 'ok':
       return <CheckCircle className="h-4 w-4 text-green-600" />;
+    case 'disproved':
+      return <Ban className="h-4 w-4 text-amber-600" />;
+    case 'needs_review':
+      return <AlertCircle className="h-4 w-4 text-amber-600" />;
     case 'error':
       return <XCircle className="h-4 w-4 text-destructive" />;
     case 'unchecked':

@@ -81,6 +81,33 @@ test("runApiProofJob: success done → ok with usage read back from the run row"
   assert.ok(progress.some((p) => p.currentTurn === 1));
 });
 
+test("runApiProofJob: disproved done → ok with disproof result kind", async () => {
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-d", run_id: "run-d" });
+    }
+    if (url.includes("/api/runs/run-d/events")) {
+      return sseResponse([frame("done", { status: "disproved", result_kind: "disproved", result_detail: "DISPROVED" })]);
+    }
+    if (url.includes("/api/sessions/sess-d")) {
+      return jsonResponse({ runs: [{ id: "run-d", input_tokens: 1, output_tokens: 2, cost_usd: 0.003 }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Find a counterexample",
+    timeoutMs: 5000,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.doneStatus, "disproved");
+  assert.equal(result.resultKind, "disproved");
+  assert.equal(result.resultDetail, "DISPROVED");
+});
+
 test("runApiProofJob: forwards origin/origin_url + project tags to POST /api/runs", async () => {
   let postBody = null;
   const fetchImpl = async (url, options = {}) => {
@@ -163,7 +190,7 @@ test("runApiProofJob: auto-approves a gated tool call so the run stays autonomou
   assert.deepEqual(approvalCalls, [{ decision: "always_session" }]);
 });
 
-test("runApiProofJob: non-success terminal status → not ok with a descriptive error", async () => {
+test("runApiProofJob: non-completed terminal status → not ok with a descriptive error", async () => {
   const fetchImpl = async (url, options = {}) => {
     if (url.endsWith("/api/runs") && options.method === "POST") {
       return jsonResponse({ session_id: "sess-3", run_id: "run-3" });

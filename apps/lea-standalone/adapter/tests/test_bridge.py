@@ -102,22 +102,61 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
     assert "Let me try trivial." in contents
     assert "Done — it compiles." in contents
 
-    # session status derives to the working-copy verdict (C3)
-    assert detail["status"] == "ok"
+    # session status derives to the checked run outcome.
+    assert detail["status"] == "proved"
 
-    # run persisted: success + usage + a per-turn breakdown row
+    # run persisted: proved + usage + a per-turn breakdown row
     run = store.get_run(ctx.run_id)
-    assert run["status"] == "success"
+    assert run["status"] == "proved"
     assert run["input_tokens"] == 10 and run["output_tokens"] == 5
     assert abs(run["cost_usd"] - 0.01) < 1e-9
     assert [r["label"] for r in detail["usage_breakdown"]] == ["Turn 1"]
 
-    # the SSE stream carried the live events and ended with done(success)
+    # the SSE stream carried the live events and ended with done(proved)
     types = [item["type"] for item in _drain(queue)]
     assert "assistant_delta" in types
     assert types.count("code_step") == 2  # write, then verdict back-fill
     assert "message" in types
     assert types[-1] == "done"
+
+
+def test_disproof_result_persists_and_streams_distinct_outcome(tmp_path, monkeypatch):
+    ctx, queue = _context(tmp_path, monkeypatch, task="Find a counterexample")
+
+    def script(proof_path):
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": proof_path})
+        yield FileChanged(proof_path)
+        yield ToolCalled("lean_check", {"path": proof_path})
+        yield CheckResult(proof_path, "ok", None)
+        yield Finished(
+            "completed",
+            "Counterexample verified.",
+            1,
+            ctx.session_id,
+            "gemini/test",
+            Usage(input_tokens=10, output_tokens=5),
+            0.01,
+            {},
+            result_kind="disproved",
+            result_detail="DISPROVED",
+        )
+
+    monkeypatch.setattr(bridge, "run_events", _fake_run_events(script))
+
+    bridge.run_lea(ctx)
+
+    detail = store.session_detail(ctx.session_id)
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "disproved"
+    assert run["result_kind"] == "disproved"
+    assert run["result_detail"] == "DISPROVED"
+    assert detail["status"] == "disproved"
+
+    items = _drain(queue)
+    assert items[-1]["type"] == "done"
+    assert items[-1]["payload"]["status"] == "disproved"
+    assert items[-1]["payload"]["result_kind"] == "disproved"
 
 
 def test_project_run_uses_shared_repo_namespace_and_context(tmp_path, monkeypatch):
@@ -424,7 +463,7 @@ def test_approval_relay_allow(tmp_path, monkeypatch):
     _run_in_thread_and_resolve(ctx, "allow")
 
     assert received["decision"] == "allow"  # the decision reached the generator
-    assert store.get_run(ctx.run_id)["status"] == "success"
+    assert store.get_run(ctx.run_id)["status"] == "proved"
     types = [i["type"] for i in _drain(queue)]
     assert "approval_requested" in types and "approval_resolved" in types
 

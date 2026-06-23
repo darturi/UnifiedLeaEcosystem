@@ -138,6 +138,14 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                     limit 1
                 ) as latest_check_status,
                 (
+                    select rcs.status
+                    from code_steps cs
+                    left join runs rcs on rcs.id = cs.run_id
+                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
+                    order by cs.seq desc
+                    limit 1
+                ) as latest_code_run_status,
+                (
                     select count(*) from code_steps cs
                     where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
                 ) as code_step_count,
@@ -164,6 +172,7 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
             data.pop("latest_check_status", None),
             int(data.pop("code_step_count", 0) or 0),
             bool(data.pop("active_run_count", 0)),
+            data.pop("latest_code_run_status", None),
         )
         sessions.append(_normalize_usage_session(data))
     return sessions
@@ -469,6 +478,8 @@ def update_run(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     cost_usd: float | None = None,
+    result_kind: str | None = None,
+    result_detail: str | None = None,
 ) -> None:
     now = utc_now()
     with connect() as conn:
@@ -477,13 +488,15 @@ def update_run(
             update runs
             set status = ?,
                 final_text = coalesce(?, final_text),
+                result_kind = coalesce(?, result_kind),
+                result_detail = coalesce(?, result_detail),
                 input_tokens = coalesce(?, input_tokens),
                 output_tokens = coalesce(?, output_tokens),
                 cost_usd = coalesce(?, cost_usd),
                 updated_at = ?
             where id = ?
             """,
-            (status, final_text, input_tokens, output_tokens, cost_usd, now, run_id),
+            (status, final_text, result_kind, result_detail, input_tokens, output_tokens, cost_usd, now, run_id),
         )
 
 
@@ -898,7 +911,7 @@ def session_detail(session_id: str) -> dict | None:
         # Per-run outcomes (id + status), so the UI can place the "Proved"
         # milestone after the run that completed — live and on reload (M16).
         runs = conn.execute(
-            "select id, status from runs where session_id = ? order by created_at asc, id asc",
+            "select id, status, result_kind, result_detail from runs where session_id = ? order by created_at asc, id asc",
             (session_id,),
         ).fetchall()
         project = None
@@ -921,11 +934,19 @@ def session_detail(session_id: str) -> dict | None:
     # only 'ok' when an actual proof compiles, not when a throwaway probe does (M14).
     real_steps = [c for c in code_steps if "scratch" not in (c["path"] or "").lower()]
     latest_check_status = real_steps[-1]["check_status"] if real_steps else None
+    latest_code_run_status = None
+    if real_steps and real_steps[-1]["run_id"]:
+        with connect() as conn:
+            run_row = conn.execute(
+                "select status from runs where id = ?",
+                (real_steps[-1]["run_id"],),
+            ).fetchone()
+        latest_code_run_status = run_row["status"] if run_row else None
     return {
         **session,
         **usage,
         "status": _derive_session_status(
-            latest_check_status, len(real_steps), active_run is not None
+            latest_check_status, len(real_steps), active_run is not None, latest_code_run_status
         ),
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
@@ -943,6 +964,7 @@ def _derive_session_status(
     latest_check_status: str | None,
     code_step_count: int,
     has_active_run: bool = False,
+    latest_code_run_status: str | None = None,
 ) -> str:
     """A session's status is its working-copy verdict (D14), derived — never stored.
     Once any code exists the verdict rules (latest step's check_status, or
@@ -952,6 +974,8 @@ def _derive_session_status(
     an Overleaf-driven one whose first file hasn't been written yet — surfaces as
     in-progress in the session list and stats the moment it starts."""
     if code_step_count:
+        if latest_check_status == "ok" and latest_code_run_status in {"proved", "disproved", "needs_review"}:
+            return latest_code_run_status
         return latest_check_status or "unchecked"
     if has_active_run:
         return "running"

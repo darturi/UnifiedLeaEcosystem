@@ -32,7 +32,8 @@ export function latestCodeStep(steps = []) {
 }
 
 export function deriveRunCompletionStatus(runStatus, steps = []) {
-  if (runStatus !== 'success') return runStatus || 'pending';
+  if (runStatus === 'disproved' || runStatus === 'needs_review') return runStatus;
+  if (runStatus !== 'proved' && runStatus !== 'success') return runStatus || 'pending';
   const latest = latestCodeStep(steps);
   const proofStatus = deriveCodeStepProofStatus(latest);
   return proofStatus === 'proved' || proofStatus === 'stubbed' ? proofStatus : 'answered';

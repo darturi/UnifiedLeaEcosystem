@@ -1427,8 +1427,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
 // Single source of truth for turning a finished Lea run into a theorem outcome.
 //
 // The Lea adapter is the producer and the authority on whether a proof passed:
-// its terminal `done` status (surfaced here as `exit.ok`) is `success` only when
-// the agent cleared Lea's own final Lean verification. Local filesystem
+// its terminal `done` status (surfaced here as `exit.ok`) is `proved`/`disproved`
+// only when the agent cleared Lea's own final Lean verification. Local filesystem
 // inspection (`localStatus`) is used purely to ENRICH the result — locate the
 // proof file, surface the Lean statement, detect a leftover sorry — or as a
 // FALLBACK when the run itself failed. It is never allowed to override a run the
@@ -1445,6 +1445,19 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
 // Returns: { jobStatus, finalStatus, effectiveStatus, leanCheck, error }.
 export async function resolveProofOutcome({ job, localStatus, exit, artifactError = null }) {
   const local = localStatus && localStatus.status ? localStatus : { status: "unformalized" };
+  const resultKind = String(exit.resultKind || exit.doneStatus || "").toLowerCase();
+
+  if (resultKind === "disproved") {
+    return {
+      jobStatus: "disproved",
+      finalStatus: "disproved",
+      effectiveStatus: { ...local, status: "disproved" },
+      leanCheck: null,
+      resultKind: "disproved",
+      resultDetail: exit.resultDetail || null,
+      error: null
+    };
+  }
 
   // A located sorry/admit is never a complete formalization, whatever the run
   // outcome: record the run as failed but carry the sorry_stub effective status
@@ -1456,13 +1469,13 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
       effectiveStatus: local,
       leanCheck: null,
       error: exit.ok
-        ? `Lea reported success but ${job.theoremLabel} still uses sorry/admit.`
+        ? `Lea reported a verified outcome but ${job.theoremLabel} still uses sorry/admit.`
         : (exit.error || null)
     };
   }
 
-  // The run did not succeed (errored, timed out, or ended non-success). Keep the
-  // best file-derived status as the effective status for the UI.
+  // The run did not complete with a verified outcome. Keep the best file-derived
+  // status as the effective status for the UI.
   if (!exit.ok) {
     return {
       jobStatus: "failed",
@@ -1499,6 +1512,8 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
     jobStatus: "formalized",
     finalStatus: "formalized",
     effectiveStatus,
+    resultKind: "proved",
+    resultDetail: exit.resultDetail || null,
     leanCheck,
     error: null
   };
@@ -1578,8 +1593,10 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     })
     : [];
   job.finalStatus = outcome.finalStatus;
+  job.resultKind = outcome.resultKind || null;
+  job.resultDetail = outcome.resultDetail || null;
   job.apiRunId = exit.apiRunId || job.apiRunId || null;
-  job.exitCode = outcome.jobStatus === "formalized" ? 0 : 1;
+  job.exitCode = ["formalized", "disproved"].includes(outcome.jobStatus) ? 0 : 1;
   job.timedOut = exit.timedOut;
   if (outcome.error) {
     job.error = outcome.error;
@@ -2095,7 +2112,9 @@ function buildJobResponse({ job, status, target }) {
     moduleName: job.moduleName || null,
     leanStatement: job.leanStatement || "",
     logTail: "",
-    message: job.error || "",
+    message: job.error || job.resultDetail || (status === "disproved" ? "Lea found a verified counterexample or disproof. The original theorem was not proven." : ""),
+    resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "formalized" ? "proved" : null),
+    resultDetail: job.resultDetail || null,
     leaSessionId,
     leaSessionUrl: leaSessionId ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId) : null,
     startedAt: job.startedAt,
@@ -2234,6 +2253,7 @@ async function getTheoremStatus({
   });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
   const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
+  const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
   const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
   const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
 
@@ -2265,14 +2285,29 @@ async function getTheoremStatus({
   // means the adapter verified the proof, even when project-markdown recording is
   // deferred and no local file evidence (mapped/project/direct) could be found.
   // Surface it as formalized so the Overleaf tag matches the job record. Guard on
-  // recency so a later failed re-run is not shadowed by a stale success.
+  // recency so a later failed re-run is not shadowed by a stale verified outcome.
   if (
     formalizedJob &&
     (!failedJob ||
       String(formalizedJob.finishedAt || formalizedJob.startedAt) >=
-        String(failedJob.finishedAt || failedJob.startedAt))
+        String(failedJob.finishedAt || failedJob.startedAt)) &&
+    (!disprovedJob ||
+      String(formalizedJob.finishedAt || formalizedJob.startedAt) >=
+        String(disprovedJob.finishedAt || disprovedJob.startedAt))
   ) {
     return withLeaSession(buildJobResponse({ job: formalizedJob, status: "formalized", target }));
+  }
+
+  if (
+    disprovedJob &&
+    (!failedJob ||
+      String(disprovedJob.finishedAt || disprovedJob.startedAt) >=
+        String(failedJob.finishedAt || failedJob.startedAt)) &&
+    (!formalizedJob ||
+      String(disprovedJob.finishedAt || disprovedJob.startedAt) >=
+        String(formalizedJob.finishedAt || formalizedJob.startedAt))
+  ) {
+    return withLeaSession(buildJobResponse({ job: disprovedJob, status: "disproved", target }));
   }
 
   if (failedJob) {

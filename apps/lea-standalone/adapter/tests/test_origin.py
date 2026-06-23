@@ -59,16 +59,16 @@ def test_usage_stats_origin_rollup(tmp_path, monkeypatch):
     # One UI session and two Overleaf sessions, each with a finished run carrying usage.
     ui = store.create_session("ui thm")
     r_ui = store.create_run(ui["id"], "gpt-4o", "openai", 3)
-    store.update_run(r_ui["id"], "success", input_tokens=100, output_tokens=25, cost_usd=0.10)
+    store.update_run(r_ui["id"], "proved", input_tokens=100, output_tokens=25, cost_usd=0.10)
 
     url = "https://www.overleaf.com/project/doc-a"
     o1 = store.create_session("ov thm one", origin="overleaf", origin_url=url)
     r_o1 = store.create_run(o1["id"], "gpt-4o", "openai", 3)
-    store.update_run(r_o1["id"], "success", input_tokens=200, output_tokens=50, cost_usd=0.20)
+    store.update_run(r_o1["id"], "proved", input_tokens=200, output_tokens=50, cost_usd=0.20)
 
     o2 = store.create_session("ov thm two", origin="overleaf", origin_url=url)
     r_o2 = store.create_run(o2["id"], "gpt-4o", "openai", 3)
-    store.update_run(r_o2["id"], "success", input_tokens=300, output_tokens=75, cost_usd=0.30)
+    store.update_run(r_o2["id"], "proved", input_tokens=300, output_tokens=75, cost_usd=0.30)
 
     stats = store.usage_stats()
     by_origin = {row["origin"]: row for row in stats["origins"]}

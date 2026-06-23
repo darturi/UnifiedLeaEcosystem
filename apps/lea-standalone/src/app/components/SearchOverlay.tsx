@@ -9,7 +9,8 @@ import { searchSessions, type SearchResult } from '../lib/api';
 // is handled by the parent (App owns the ⌘K toggle); this owns everything else.
 
 function statusDot(status: string): string {
-  if (status === 'ok') return 'ok';
+  if (status === 'ok' || status === 'proved') return 'ok';
+  if (status === 'disproved' || status === 'needs_review') return 'run';
   if (status === 'error') return 'fail';
   if (status === 'running') return 'run';
   return 'idle';

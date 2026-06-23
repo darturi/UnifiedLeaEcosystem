@@ -98,7 +98,14 @@ class UsageUpdated:
 
 @dataclass(frozen=True)
 class Finished:
-    """Terminal event. `reason` is "completed" or "max_turns"."""
+    """Terminal event. `reason` is "completed" or "max_turns".
+
+    `result_kind` is set for completed proof artifacts:
+      'proved'       — the user's stated claim was verified
+      'disproved'    — the user's stated claim was shown false
+      'needs_review' — Lean checked an artifact, but its relation to the request
+                       is ambiguous and should not be displayed as proof success
+    """
     reason: str
     text: str
     turns: int
@@ -107,6 +114,8 @@ class Finished:
     usage: Usage
     cost: float
     transcript: dict
+    result_kind: str | None = None
+    result_detail: str | None = None
 
 
 # Union of everything run_events() can yield — handy for type annotations.

@@ -2400,6 +2400,25 @@ test("resolveProofOutcome trusts an adapter-verified run even with no local proo
   assert.equal(outcome.leanCheck, null);
 });
 
+test("resolveProofOutcome maps adapter disproof to disproved status", async () => {
+  const outcome = await resolveProofOutcome({
+    job: { theoremLabel: "false_claim", leaWorkspacePath: "/tmp/does-not-matter" },
+    localStatus: { status: "unformalized" },
+    exit: {
+      ok: true,
+      doneStatus: "disproved",
+      resultKind: "disproved",
+      resultDetail: "DISPROVED"
+    }
+  });
+
+  assert.equal(outcome.jobStatus, "disproved");
+  assert.equal(outcome.finalStatus, "disproved");
+  assert.equal(outcome.effectiveStatus.status, "disproved");
+  assert.equal(outcome.resultKind, "disproved");
+  assert.equal(outcome.error, null);
+});
+
 test("resolveProofOutcome keeps a verified run formalized when local evidence is also formalized", async () => {
   const job = { theoremLabel: "t2", leaWorkspacePath: "/tmp/x" };
   const localStatus = { status: "formalized", leanStatement: "theorem t2 : True" };
@@ -2439,7 +2458,7 @@ test("resolveProofOutcome marks a failed run as failed and surfaces the run erro
 test("formalize on the /api backend tags the theorem formalized when the run succeeds (regression)", async () => {
   // The /api adapter defers project-markdown recording, so the companion finds no
   // recorded artifact after the run. Before the fix the theorem was tagged
-  // "failed" despite a verified proof; now the adapter's terminal `done: success`
+  // "failed" despite a verified proof; now the adapter's terminal `done: proved`
   // is authoritative and the tag must read "formalized".
   const leaRepo = await makeLeaRepo();
   const calls = [];
