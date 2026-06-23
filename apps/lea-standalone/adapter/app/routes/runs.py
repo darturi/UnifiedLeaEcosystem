@@ -103,7 +103,15 @@ def create_run(request: RunRequest) -> dict:
     run = store.create_run(session["id"], config.model, None, config.max_turns,
                            project_id=project_id, autonomous=request.autonomous)
     user_message = store.add_message(session["id"], "user", message, run["id"])
-    return {"session_id": session["id"], "run_id": run["id"], "message": user_message}
+    project = store.get_project(project_id) if project_id else None
+    return {
+        "session_id": session["id"],
+        "run_id": run["id"],
+        "message": user_message,
+        "project_id": project_id,
+        "project_slug": project["slug"] if project else None,
+        "project_namespace": project["namespace"] if project else None,
+    }
 
 
 @router.post("/api/runs/{run_id}/approvals/{approval_id}")

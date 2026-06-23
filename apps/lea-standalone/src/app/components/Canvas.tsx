@@ -2,6 +2,11 @@ import { useEffect, useMemo, useState } from 'react';
 import type { CodeStep, SafeVerifyStatus } from '../lib/api';
 import { diffForStep } from '../lib/codeDiff';
 import { highlightLine } from '../lib/leanHighlight.mjs';
+import {
+  deriveCodeStepProofStatus,
+  hasSorryLikeCheckDetail,
+  hasSorryLikeCode,
+} from '../lib/proofDisplay.mjs';
 import { sortCodeSteps } from '../lib/timeline.mjs';
 import { useProofSession } from '../stores/proofSession';
 
@@ -72,7 +77,13 @@ export function Canvas({
       const result = await onSaveAndCheck(draftCode);
       if (result.status === 'ok') {
         setEditing(false);
-        setFoot({ kind: 'ok', text: 'lean_check: 0 errors · your manual check' });
+        const hasStub = hasSorryLikeCode(draftCode) || hasSorryLikeCheckDetail(result.detail);
+        setFoot({
+          kind: hasStub ? 'idle' : 'ok',
+          text: hasStub
+            ? 'lean_check: 0 errors · contains sorry'
+            : 'lean_check: 0 errors · your manual check',
+        });
       } else {
         setFoot({ kind: 'bad', text: result.detail || 'lean_check reported errors' });
       }
@@ -96,11 +107,14 @@ export function Canvas({
     }
   };
 
+  const proofStatus = deriveCodeStepProofStatus(step);
   const verdict = editing
     ? { cls: 'idle', text: '● editing — unsaved' }
-    : step?.check_status === 'ok'
+    : proofStatus === 'proved'
     ? { cls: 'ok', text: '✓ compiles' }
-    : step?.check_status === 'error'
+    : proofStatus === 'stubbed'
+    ? { cls: 'stub', text: '○ checked stub' }
+    : proofStatus === 'failed'
     ? { cls: 'err', text: '✗ errors' }
     : { cls: 'idle', text: '○ not checked' };
 
@@ -206,11 +220,15 @@ export function Canvas({
             <span className="badge compile">✓ {foot.text}</span>
           ) : foot.kind === 'bad' ? (
             <span className="err-detail">{foot.text}</span>
+          ) : foot.text.includes('contains sorry') ? (
+            <span className="badge stub">✓ {foot.text}</span>
           ) : (
             <span>{foot.text}</span>
           )
-        ) : step?.check_status === 'ok' ? (
+        ) : proofStatus === 'proved' ? (
           <span className="badge compile">✓ lean_check: 0 errors</span>
+        ) : proofStatus === 'stubbed' ? (
+          <span className="badge stub">✓ lean_check: 0 errors · contains sorry</span>
         ) : step?.check_status === 'error' ? (
           <span className="err-detail">{step.check_detail || 'lean_check: errors'}</span>
         ) : (
@@ -238,7 +256,7 @@ export function Canvas({
           isLatest &&
           !editing &&
           !isRunning &&
-          step.check_status === 'ok' && (
+          proofStatus === 'proved' && (
             <button className="cv-btn" onClick={runVerify} disabled={busy}>
               🛡 Run SafeVerify
             </button>

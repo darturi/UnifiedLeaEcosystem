@@ -14,6 +14,12 @@ import { MarkdownMessage } from './MarkdownMessage';
 import { ModelPicker } from './ModelPicker';
 import { OriginBadge } from './OriginBadge';
 import { buildTimeline } from '../lib/timeline.mjs';
+import {
+  deriveCodeStepProofStatus,
+  deriveRunCompletionStatus,
+  hasSorryLikeCheckDetail,
+  latestCodeStep,
+} from '../lib/proofDisplay.mjs';
 import { useProofSession } from '../stores/proofSession';
 import { useModel } from '../stores/model';
 
@@ -76,7 +82,7 @@ export function ChatThread({
   const approvalBusy = useProofSession((s) => s.approvalBusy);
   // R1c-2a: the timeline is derived here from store messages + codeSteps.
   const { items } = useMemo<{ items: TimelineItem[] }>(
-    () => buildTimeline({ messages, codeSteps }),
+    () => (buildTimeline as any)({ messages, codeSteps }) as { items: TimelineItem[] },
     [messages, codeSteps],
   );
 
@@ -170,13 +176,19 @@ export function ChatThread({
     return groups;
   }, [items, approvals]);
 
-  const sessionProved = useMemo(
+  const latestProofStatus = useMemo(
+    () => deriveCodeStepProofStatus(latestCodeStep(codeSteps)),
+    [codeSteps],
+  );
+  const sessionHasSuccessfulRun = useMemo(
     () => Object.values(runStatusById).includes('success'),
     [runStatusById],
   );
   const headChip = isRunning
     ? { cls: 'run', text: '● proving' }
-    : sessionProved
+    : latestProofStatus === 'stubbed'
+    ? { cls: 'run', text: '○ stubbed' }
+    : sessionHasSuccessfulRun && latestProofStatus === 'proved'
     ? { cls: 'ok', text: '✓ proved' }
     : runStatus === 'failed' || runStatus === 'max_turns'
     ? { cls: 'fail', text: '✕ unproved' }
@@ -313,13 +325,19 @@ export function ChatThread({
             const isLastGroup = gi === runGroups.length - 1;
             const finished = !(isRunning && isLastGroup);
             const status = group.runId ? runStatusById[group.runId] : undefined;
-            const steps = group.nodes.filter((n) => n.kind === 'code').length;
+            const codeNodes = group.nodes.filter(
+              (n): n is Extract<MergedNode, { kind: 'code' }> => n.kind === 'code',
+            );
+            const codeStepList = codeNodes.map((n) => n.step);
+            const steps = codeStepList.length;
+            const completion = deriveRunCompletionStatus(status, codeStepList);
             return (
               <Fragment key={group.runId ?? `g${gi}`}>
                 {group.nodes.map(renderNode)}
-                {finished && status === 'success' && <ProvedCard steps={steps} session={session} />}
-                {finished && (status === 'failed' || status === 'max_turns') && (
-                  <FailedCard status={status} />
+                {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
+                {finished && completion === 'stubbed' && <StubCard steps={steps} session={session} />}
+                {finished && (completion === 'failed' || completion === 'max_turns') && (
+                  <FailedCard status={completion} />
                 )}
               </Fragment>
             );
@@ -392,10 +410,13 @@ export function ChatThread({
 function ToolChip({ event }: { event: StatusEvent }) {
   if (event.status === 'lean_check') {
     const ok = event.check_status === 'ok';
+    const stubbed = ok && hasSorryLikeCheckDetail(event.check_detail);
     return (
       <span className="tool">
         <span className="tname">lean_check</span>
-        <span className={`tstat ${ok ? 'ok' : 'err'}`}>{ok ? '✓ 0 errors' : '✗ errors'}</span>
+        <span className={`tstat ${stubbed ? 'stub' : ok ? 'ok' : 'err'}`}>
+          {stubbed ? '✓ 0 errors · sorry' : ok ? '✓ 0 errors' : '✗ errors'}
+        </span>
       </span>
     );
   }
@@ -413,6 +434,22 @@ function ProvedCard({ steps, session }: { steps: number; session?: SessionSummar
   return (
     <div className="final">
       <div className="fhead">✓ Proved — 0 errors, 0 sorry</div>
+      {session && (
+        <div className="meta">
+          <span>{steps} steps</span>
+          {session.total_tokens ? <span>{formatTokens(session.total_tokens)} tokens</span> : null}
+          {session.cost_usd ? <span>${session.cost_usd.toFixed(3)}</span> : null}
+          {session.duration_seconds ? <span>{session.duration_seconds}s</span> : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StubCard({ steps, session }: { steps: number; session?: SessionSummary }) {
+  return (
+    <div className="final stub">
+      <div className="fhead">✓ Stub checked — 0 errors, proof still contains sorry</div>
       {session && (
         <div className="meta">
           <span>{steps} steps</span>

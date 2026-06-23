@@ -4,6 +4,7 @@
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
+  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
@@ -170,14 +171,10 @@
     }
 
     const leaSession = getLeaSessionLink(statusInfo);
-    // Offer "View in Lea UI" whenever the theorem is formalized, in progress, or
-    // its status is unknown, even if no session link resolved yet, so the action
-    // is reliably discoverable. With a session link it deep-links to that session;
-    // without one it falls back to opening the Lea UI home. Unlike the formalize/
-    // check actions, viewing the session is valid even while a run is in progress,
-    // so it stays enabled (only the action buttons are disabled mid-run).
-    const showLeaUiButton =
-      Boolean(leaSession) || ["formalized", "in_progress", "unknown"].includes(actionStatus);
+    // Only statuses that represent a real Lea run or saved proof artifact should
+    // offer a route into the Lea UI. Stale session metadata must not make
+    // unformalized/unknown theorems appear viewable.
+    const showLeaUiButton = canViewInLeaUi(actionStatus);
     if (showLeaUiButton) {
       const leaUiLink = leaSession || getLeaUiBaseLink(statusInfo);
       const sessionButton = document.createElement("button");
@@ -215,6 +212,13 @@
           primary: true,
           pendingText: "Starting Lea...",
           run: formalize
+        },
+        {
+          role: "theorem-stub-action",
+          label: "Stub",
+          primary: false,
+          pendingText: "Creating Lean stub...",
+          run: stubTheorem
         }
       ];
     }
@@ -472,6 +476,32 @@
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        overleafProjectId: extractOverleafProjectId(),
+        theoremLabel: theorem.label,
+        theoremText: theorem.text,
+        theoremUses: theorem.uses || [],
+        theoremContext: theorem.context || "",
+        sourceHash: await sha256(normalizeTheoremText(theorem.text))
+      })
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    }
+    return payload;
+  }
+
+  async function stubTheorem(theorem) {
+    // Stubbing also needs the current .tex mirror because statement translation may
+    // depend on local notation/definitions in the surrounding document.
+    await syncTexMirrorNow({ force: true }).catch(() => {});
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const response = await fetch(`${baseUrl}/stub`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -824,6 +854,10 @@
       return statusInfo.effectiveStatus || "unformalized";
     }
     return statusInfo?.status || "unknown";
+  }
+
+  function canViewInLeaUi(status) {
+    return LEA_UI_VIEW_STATUSES.has(status);
   }
 
   function getLeaSessionLink(statusInfo) {
