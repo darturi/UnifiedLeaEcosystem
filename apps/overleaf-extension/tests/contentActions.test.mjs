@@ -35,7 +35,48 @@ for (const [name, statusInfo, shouldShow] of CASES) {
   });
 }
 
-function createContentHarness(statusInfo) {
+test("diagnostic markers render a non-runnable fix badge and popover", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  const diagnostic = {
+    code: "missing_label",
+    message: "Lea marker is missing an explicit label=... value.",
+    syntax: "diagnostic",
+    coords: { left: 40, top: 50 }
+  };
+  await harness.loadVisibleTheorems({ diagnostics: [diagnostic] });
+
+  assert.equal(harness.hasButtonText("fix marker"), true);
+
+  harness.window.postMessage({
+    type: "OL_LEAN_DIAGNOSTIC_CLICK",
+    diagnostic,
+    clientX: 20,
+    clientY: 20
+  }, "*");
+
+  assert.match(harness.bodyText(), /Lea marker is missing an explicit label/);
+  assert.equal(harness.hasButtonText("Formalize"), false);
+});
+
+test("legacy theorem syntax shows a deprecation warning while remaining runnable", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    { syntax: "legacy", deprecated: true }
+  );
+  await harness.loadStatusForVisibleTheorem();
+
+  harness.window.postMessage({
+    type: "OL_LEAN_THEOREM_CLICK",
+    theorem: harness.theorem,
+    clientX: 16,
+    clientY: 20
+  }, "*");
+
+  assert.match(harness.bodyText(), /legacy \\theorem\[\.\.\.\] syntax still works temporarily/);
+  assert.equal(harness.hasButtonText("Formalize"), true);
+});
+
+function createContentHarness(statusInfo, theoremPatch = {}) {
   const document = new FakeDocument();
   const timers = [];
   let nextTimerId = 1;
@@ -64,7 +105,8 @@ function createContentHarness(statusInfo) {
   const theorem = {
     label: "demo_theorem",
     text: "A theorem.",
-    coords: { left: 12, top: 18 }
+    coords: { left: 12, top: 18 },
+    ...theoremPatch
   };
 
   const context = {
@@ -126,9 +168,13 @@ function createContentHarness(statusInfo) {
     theorem,
     window,
     async loadStatusForVisibleTheorem() {
+      await this.loadVisibleTheorems();
+    },
+    async loadVisibleTheorems({ diagnostics = [] } = {}) {
       window.postMessage({
         type: "OL_LEAN_THEOREMS_VISIBLE",
         theorems: [theorem],
+        diagnostics,
         activeTex: "\\theorem[label=demo_theorem]{A theorem.}",
         activePath: "main.tex"
       }, "*");
@@ -143,6 +189,14 @@ function createContentHarness(statusInfo) {
       return document.body
         .querySelectorAll("button")
         .some((button) => button.dataset.role === "open-lea-session" && button.textContent === "View in Lea UI");
+    },
+    hasButtonText(text) {
+      return document.body
+        .querySelectorAll("button")
+        .some((button) => button.textContent === text);
+    },
+    bodyText() {
+      return document.body.textContent;
     }
   };
 }

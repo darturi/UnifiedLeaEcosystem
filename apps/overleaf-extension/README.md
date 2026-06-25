@@ -32,19 +32,22 @@ apps/lea-standalone/prover/workspace/
 
 ## Theorem Syntax
 
-The extension looks for theorem blocks with metadata in the optional argument:
+The extension looks for `% lea:` comments inside ordinary theorem-like LaTeX
+environments. Mark only the blocks you want Lea to formalize:
 
 ```tex
-\theorem[label=my_theorem_name]{
-  Every finite tree has at least two leaves.
-}
+\begin{theorem}\label{thm:finite-tree-leaves}
+% lea: formalize label=finite_tree_leaves
+Every finite tree has at least two leaves.
+\end{theorem}
 ```
 
-The `label=...` value is used as the Overleaf theorem identifier and fallback
-Lean declaration name. It must be a valid Lean identifier: letters, digits, and
-underscores, with no leading digit.
+The `label=...` value is required. It is used as the Overleaf theorem identifier
+and fallback Lean declaration name. It must be a valid Lean identifier: letters,
+digits, and underscores, with no leading digit.
 
-The optional argument also accepts `uses={...}` and `context={...}`.
+Initially supported environments are `theorem`, `lemma`, `proposition`, and
+`corollary`. Unmarked environments are ignored.
 
 ### `uses={...}`
 
@@ -54,9 +57,10 @@ referenced theorem must already be formalized, or at least have a saved sorry
 stub from an older build, before Lea starts the new run.
 
 ```tex
-\theorem[label=my_next_theorem, uses={my_prior_theorem, another_prior_theorem}]{
-  Prove this using earlier project results.
-}
+\begin{lemma}
+% lea: formalize label=my_next_theorem uses={my_prior_theorem, another_prior_theorem}
+Prove this using earlier project results.
+\end{lemma}
 ```
 
 If a referenced label cannot be resolved, the extension blocks the run and
@@ -69,36 +73,43 @@ proof strategy, notation hints, suggested lemmas, or warnings about how to
 interpret the statement.
 
 ```tex
-\theorem[
-  label=even_square,
-  context={Use the assumption that n is even, rewrite n as 2 * k, then use ring_nf.}
-]{
-  If n is even, then n^2 is even.
-}
+\begin{theorem}
+% lea: formalize label=even_square context={Use the assumption that n is even, rewrite n as 2 * k, then use ring_nf.}
+If n is even, then n^2 is even.
+\end{theorem}
 ```
 
 You can combine all fields:
 
 ```tex
-\theorem[
-  label=main_bound,
-  uses={auxiliary_bound, monotonicity_lemma},
-  context={Start from auxiliary_bound, then apply monotonicity_lemma to compare the two sides.}
-]{
-  The desired main bound holds.
-}
+\begin{proposition}\label{prop:main-bound}
+% lea: formalize label=main_bound uses={auxiliary_bound, monotonicity_lemma} context={Start from auxiliary_bound, then apply monotonicity_lemma to compare the two sides.}
+The desired main bound holds.
+\end{proposition}
 ```
 
-For a minimal test document, define the display macro in the preamble. The
-optional argument is consumed by the extension and ignored by LaTeX rendering:
+Multiline marker metadata is also supported when the `% lea:` lines are adjacent:
 
 ```tex
-\usepackage{xparse}
-\NewDocumentCommand{\theorem}{O{} +m}{\paragraph{Theorem.} #2}
+\begin{corollary}
+% lea: formalize
+% lea: label=main_corollary
+% lea: uses={main_bound}
+% lea: context={Apply the main bound directly.}
+The corollary follows.
+\end{corollary}
 ```
 
-If your document already defines `\theorem`, replace `\NewDocumentCommand` with
-`\RenewDocumentCommand`.
+### Deprecated legacy syntax
+
+The older custom command syntax still works temporarily for existing beta
+documents, but new documents should use `% lea:` comment markers:
+
+```tex
+\theorem[label=my_theorem_name]{
+  Every finite tree has at least two leaves.
+}
+```
 
 ## Setup
 

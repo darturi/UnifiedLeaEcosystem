@@ -18,6 +18,7 @@
   let statusRefreshTimer = null;
   let usageRefreshTimer = null;
   let latestTheorems = [];
+  let latestDiagnostics = [];
   let latestActiveTex = "";
   let latestActiveTexPath = "";
   let latestActiveTexProjectId = "";
@@ -43,11 +44,16 @@
       showTheoremPopover(event.data.clientX, event.data.clientY, event.data.theorem);
       return;
     }
+    if (event.data?.type === "OL_LEAN_DIAGNOSTIC_CLICK") {
+      showDiagnosticPopover(event.data.clientX, event.data.clientY, event.data.diagnostic || event.data.theorem);
+      return;
+    }
     if (event.data?.type === "OL_LEAN_THEOREMS_VISIBLE") {
       const nextActiveTex = typeof event.data.activeTex === "string" ? event.data.activeTex : "";
       const nextProjectId = extractOverleafProjectId();
       const activeTexChanged = nextActiveTex !== latestActiveTex || nextProjectId !== latestActiveTexProjectId;
       latestTheorems = event.data.theorems || [];
+      latestDiagnostics = event.data.diagnostics || [];
       latestActiveTex = nextActiveTex;
       latestActiveTexPath = typeof event.data.activePath === "string" ? event.data.activePath : latestActiveTexPath;
       latestActiveTexProjectId = nextProjectId;
@@ -99,6 +105,10 @@
   }
 
   function showTheoremPopover(clientX, clientY, theorem) {
+    if (theorem?.syntax === "diagnostic") {
+      showDiagnosticPopover(clientX, clientY, theorem);
+      return;
+    }
     closePopover();
 
     const popover = document.createElement("div");
@@ -122,13 +132,45 @@
     const currentStatus = statusInfo.status || "unknown";
     const actionStatus = getActionStatus(statusInfo);
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
-    renderStubbedTheoremUsesWarning(stubbedWarning, statusInfo);
+    renderTheoremWarning(stubbedWarning, theorem, statusInfo);
     renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus, statusInfo);
     if (currentStatus === "in_progress") {
       status.textContent = inProgressMessage(latestStatuses[theorem.label]);
     } else if (isExtensionContextInvalidated()) {
       status.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
     }
+
+    document.body.appendChild(popover);
+    positionPopover(popover, clientX, clientY);
+    activePopover = popover;
+  }
+
+  function showDiagnosticPopover(clientX, clientY, diagnostic) {
+    if (!diagnostic) return;
+    closePopover();
+
+    const popover = document.createElement("div");
+    popover.className = "ol-lean-theorem-popover";
+    popover.innerHTML = `
+      <p class="ol-lean-popover-title">Lea marker problem</p>
+      <p class="ol-lean-popover-meta">Issue: <strong></strong></p>
+      <div class="ol-lean-popover-actions" data-role="theorem-actions"></div>
+      <pre class="ol-lean-popover-lean" hidden></pre>
+      <p class="ol-lean-popover-warning" hidden></p>
+      <p class="ol-lean-popover-status"></p>
+    `;
+
+    popover.dataset.diagnosticCode = diagnostic.code || "marker_error";
+    popover.querySelector("strong").textContent = diagnostic.code || "marker_error";
+    const actions = popover.querySelector("[data-role='theorem-actions']");
+    const status = popover.querySelector(".ol-lean-popover-status");
+    status.textContent = diagnostic.message || "This Lea marker is malformed.";
+
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.textContent = "Close";
+    closeButton.addEventListener("click", closePopover);
+    actions.appendChild(closeButton);
 
     document.body.appendChild(popover);
     positionPopover(popover, clientX, clientY);
@@ -466,7 +508,7 @@
       }
     }
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
-    renderStubbedTheoremUsesWarning(stubbedWarning, statusInfo);
+    renderTheoremWarning(stubbedWarning, theorem, statusInfo);
   }
 
   async function formalize(theorem) {
@@ -712,6 +754,23 @@
     }
 
     badgeLayer.replaceChildren();
+    for (const diagnostic of latestDiagnostics) {
+      const coords = diagnostic.coords || { left: 24, top: 24 };
+      const badge = document.createElement("button");
+      badge.className = "ol-lean-status ol-lean-status-failed";
+      badge.type = "button";
+      badge.appendChild(document.createTextNode("fix marker"));
+      badge.title = diagnostic.message || "This Lea marker is malformed.";
+      badge.setAttribute("aria-label", badge.title);
+      badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
+      badge.style.top = `${coords.top}px`;
+      badge.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        showDiagnosticPopover(event.clientX, event.clientY, diagnostic);
+      });
+      badgeLayer.appendChild(badge);
+    }
     for (const theorem of latestTheorems) {
       const coords = theorem.coords || { left: 24, top: 24 };
       const statusInfo = latestStatuses[theorem.label] || { status: "unknown" };
@@ -818,6 +877,22 @@
     element.textContent = plural
       ? `Proof uses supporting theorems ${names}, which have been sorry stubbed but not fully formalized.`
       : `Proof uses supporting theorem ${names}, which has been sorry stubbed but not fully formalized.`;
+  }
+
+  function renderTheoremWarning(element, theorem, statusInfo) {
+    if (!element) return;
+    const uses = getStubbedTheoremUses(statusInfo);
+    if (uses.length > 0) {
+      renderStubbedTheoremUsesWarning(element, statusInfo);
+      return;
+    }
+    if (theorem?.deprecated) {
+      element.hidden = false;
+      element.textContent = "This legacy \\theorem[...] syntax still works temporarily, but new Overleaf documents should use % lea: comment markers.";
+      return;
+    }
+    element.hidden = true;
+    element.textContent = "";
   }
 
   function getStubbedTheoremUses(statusInfo) {

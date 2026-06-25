@@ -108,12 +108,38 @@ http://127.0.0.1:31245
 Open an Overleaf project and write theorem blocks like this:
 
 ```tex
-\theorem[label=my_theorem_name]{
-  Every finite tree has at least two leaves.
-}
+\begin{theorem}\label{thm:finite-tree-leaves}
+% lea: formalize label=finite_tree_leaves
+Every finite tree has at least two leaves.
+\end{theorem}
 ```
 
-The `label=...` value should be a valid Lean identifier: letters, digits, and underscores, with no leading digit.
+The `label=...` value is required and should be a valid Lean identifier: letters,
+digits, and underscores, with no leading digit.
+
+You can add dependencies and guidance on the same marker line:
+
+```tex
+\begin{lemma}
+% lea: formalize label=main_bound uses={aux_bound, mono_lemma} context={Apply aux_bound, then monotonicity.}
+The desired main bound holds.
+\end{lemma}
+```
+
+Or split metadata across adjacent marker comments:
+
+```tex
+\begin{corollary}
+% lea: formalize
+% lea: label=main_corollary
+% lea: uses={main_bound}
+% lea: context={Apply the main bound directly.}
+The corollary follows.
+\end{corollary}
+```
+
+The older `\theorem[label=...]{...}` command syntax still works temporarily for
+existing beta documents, but new documents should use `% lea:` comment markers.
 
 ## Updating To A New Beta
 
