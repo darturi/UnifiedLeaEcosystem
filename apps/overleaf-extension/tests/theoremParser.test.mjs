@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   inferLeanDeclarationName,
   isValidLeanIdentifier,
+  parseTheoremDocument,
   parseTheorems
 } from "../shared/theoremParser.mjs";
 
@@ -12,6 +13,106 @@ test("detects a labeled theorem", () => {
   assert.equal(theorem.text, "A");
   assert.deepEqual(theorem.uses, []);
   assert.equal(theorem.context, "");
+  assert.equal(theorem.syntax, "legacy");
+  assert.equal(theorem.deprecated, true);
+});
+
+test("detects a comment-marked theorem environment", () => {
+  const source = [
+    "\\begin{theorem}\\label{thm:even-square}",
+    "% lea: formalize label=even_square uses={even_def} context={Use the parity definition first.}",
+    "If $n$ is even, then $n^2$ is even.",
+    "\\end{theorem}"
+  ].join("\n");
+  const result = parseTheoremDocument(source);
+  assert.equal(result.diagnostics.length, 0);
+  assert.equal(result.theorems.length, 1);
+  assert.equal(result.theorems[0].label, "even_square");
+  assert.equal(result.theorems[0].kind, "theorem");
+  assert.equal(result.theorems[0].latexLabel, "thm:even-square");
+  assert.equal(result.theorems[0].syntax, "comment");
+  assert.equal(result.theorems[0].deprecated, false);
+  assert.deepEqual(result.theorems[0].uses, ["even_def"]);
+  assert.equal(result.theorems[0].context, "Use the parity definition first.");
+  assert.equal(result.theorems[0].text, "If $n$ is even, then $n^2$ is even.");
+});
+
+test("detects multiline adjacent Lea marker metadata", () => {
+  const source = [
+    "\\begin{lemma}",
+    "% lea: formalize",
+    "% lea: label=main_bound",
+    "% lea: uses={aux_bound, mono_lemma}",
+    "% lea: context={Apply aux_bound, then use [simp, omega].}",
+    "The desired main bound holds.",
+    "\\end{lemma}"
+  ].join("\n");
+  const [theorem] = parseTheorems(source);
+  assert.equal(theorem.label, "main_bound");
+  assert.deepEqual(theorem.uses, ["aux_bound", "mono_lemma"]);
+  assert.equal(theorem.context, "Apply aux_bound, then use [simp, omega].");
+  assert.equal(theorem.kind, "lemma");
+  assert.equal(theorem.text, "The desired main bound holds.");
+});
+
+test("detects multiple marked theorem blocks independently", () => {
+  const source = [
+    "\\begin{lemma}",
+    "% lea: formalize label=first_result",
+    "First.",
+    "\\end{lemma}",
+    "\\begin{corollary}",
+    "% lea: formalize label=second_result",
+    "Second.",
+    "\\end{corollary}"
+  ].join("\n");
+  assert.deepEqual(parseTheorems(source).map((theorem) => theorem.label), ["first_result", "second_result"]);
+});
+
+test("ignores unmarked theorem environments", () => {
+  assert.deepEqual(parseTheorems("\\begin{theorem}\nUnmarked.\n\\end{theorem}"), []);
+});
+
+test("reports missing and invalid marker labels", () => {
+  const missing = parseTheoremDocument("\\begin{theorem}\n% lea: formalize\nA.\n\\end{theorem}");
+  assert.equal(missing.theorems.length, 0);
+  assert.equal(missing.diagnostics[0].code, "missing_label");
+
+  const invalid = parseTheoremDocument("\\begin{theorem}\n% lea: formalize label=bad-label\nA.\n\\end{theorem}");
+  assert.equal(invalid.theorems.length, 0);
+  assert.equal(invalid.diagnostics[0].code, "invalid_label");
+});
+
+test("reports marker outside a supported theorem environment", () => {
+  const result = parseTheoremDocument("% lea: formalize label=outside\nPlain text.");
+  assert.equal(result.theorems.length, 0);
+  assert.equal(result.diagnostics[0].code, "missing_environment");
+});
+
+test("removes Lea marker comments and LaTeX labels from theorem text", () => {
+  const source = [
+    "\\begin{proposition}",
+    "\\label{prop:clean}",
+    "% lea: formalize label=clean_text",
+    "A statement with $x_{n}$.",
+    "\\end{proposition}"
+  ].join("\n");
+  const [theorem] = parseTheorems(source);
+  assert.equal(theorem.latexLabel, "prop:clean");
+  assert.equal(theorem.text, "A statement with $x_{n}$.");
+});
+
+test("reports duplicate formalize markers in one environment", () => {
+  const source = [
+    "\\begin{theorem}",
+    "% lea: formalize label=first_marker",
+    "A.",
+    "% lea: formalize label=second_marker",
+    "\\end{theorem}"
+  ].join("\n");
+  const result = parseTheoremDocument(source);
+  assert.equal(result.theorems.length, 0);
+  assert.equal(result.diagnostics[0].code, "duplicate_marker");
 });
 
 test("accepts braced scalar metadata values", () => {
