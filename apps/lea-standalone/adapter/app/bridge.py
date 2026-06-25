@@ -178,17 +178,37 @@ def emit(events: Queue[dict[str, Any]], event_type: str, payload: dict[str, Any]
     events.put({"type": event_type, "payload": payload})
 
 
-# A run's final status. "success" means the agent passed the final verification
-# gate — the theorem is actually proved (this is what drives the green "Proved"
-# milestone in the UI). "answered" is a chat / QA / sketch-pause turn that
-# finished cleanly but proved nothing — deliberately NOT "success", so the UI
-# never marks a conversational turn as a completed proof.
+# A run's final status. "proved" / "disproved" / "needs_review" are terminal
+# checked-artifact outcomes. "answered" is a chat / QA / sketch-pause turn that
+# finished cleanly but proved nothing, so the UI never marks a conversational turn
+# as a completed proof.
 _FINISH_STATUS = {
-    "completed": "success",
     "assistant": "answered",
     "max_turns": "max_turns",
     "interrupted": "cancelled",
 }
+
+_COMPLETED_RESULTS = {"proved", "disproved", "needs_review"}
+
+
+def _finished_status(ev: Finished) -> str:
+    if ev.reason == "completed":
+        return ev.result_kind if ev.result_kind in _COMPLETED_RESULTS else "proved"
+    return _FINISH_STATUS.get(ev.reason, "failed")
+
+
+def _final_text_for_result(ev: Finished) -> str:
+    text = ev.text or ""
+    if ev.result_kind != "disproved":
+        return text
+    lower = text.lower()
+    if "disprov" in lower or "counterexample" in lower or "not proven" in lower:
+        return text
+    prefix = (
+        "Lea found a verified counterexample or disproof. "
+        "The original theorem was not proven; the verified result shows the statement is false."
+    )
+    return f"{prefix}\n\n{text}".strip()
 
 
 def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | None:
@@ -341,6 +361,8 @@ def run_lea(context: RunnerContext) -> None:
     usage = _UsageByTurn()
     last_persisted: str | None = None
     final_status = "failed"
+    final_result_kind: str | None = None
+    final_result_detail: str | None = None
 
     def persist_assistant(text: str) -> None:
         nonlocal last_persisted
@@ -471,12 +493,17 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, Finished):
                 flush_narration()
-                persist_assistant(ev.text or "")
-                final_status = _FINISH_STATUS.get(ev.reason, "success")
+                final_text = _final_text_for_result(ev)
+                persist_assistant(final_text)
+                final_status = _finished_status(ev)
+                result_kind = ev.result_kind if ev.result_kind in _COMPLETED_RESULTS else None
+                final_result_kind = result_kind
+                final_result_detail = ev.result_detail
                 store.update_run(
-                    run_id, final_status, final_text=ev.text,
+                    run_id, final_status, final_text=final_text,
                     input_tokens=ev.usage.input_tokens, output_tokens=ev.usage.output_tokens,
                     cost_usd=ev.cost,
+                    result_kind=result_kind, result_detail=ev.result_detail,
                 )
                 store.replace_run_usage_breakdown(run_id, usage.rows())
                 # Persist the faithful conversation for the next activation to replay
@@ -498,4 +525,9 @@ def run_lea(context: RunnerContext) -> None:
         if current_active_run_id() == run_id:
             _set_active_run_id(None)
         active_run_lock.release()
-        emit(events, "done", {"status": final_status})
+        done_payload = {"status": final_status}
+        if final_result_kind:
+            done_payload["result_kind"] = final_result_kind
+        if final_result_detail:
+            done_payload["result_detail"] = final_result_detail
+        emit(events, "done", done_payload)

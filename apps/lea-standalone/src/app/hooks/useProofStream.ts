@@ -229,9 +229,9 @@ export function useProofStream() {
       sawDone = true;
       source.close();
       eventSourceRef.current = null;
-      let status: RunStatus = 'success';
+      let status: RunStatus = 'proved';
       try {
-        status = (JSON.parse((event as MessageEvent).data || '{}').status as RunStatus) || 'success';
+        status = (JSON.parse((event as MessageEvent).data || '{}').status as RunStatus) || 'proved';
       } catch {
         /* keep default */
       }

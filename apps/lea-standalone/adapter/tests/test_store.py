@@ -310,8 +310,8 @@ def test_session_usage_rollups_include_multiple_runs(tmp_path, monkeypatch):
     store.add_message(session["id"], "user", "first", first["id"])
     store.add_message(session["id"], "assistant", "done", first["id"])
     store.add_message(session["id"], "user", "second", second["id"])
-    store.update_run(first["id"], "success", input_tokens=10, output_tokens=5, cost_usd=0.02)
-    store.update_run(second["id"], "success", input_tokens=20, output_tokens=15, cost_usd=0.07)
+    store.update_run(first["id"], "proved", input_tokens=10, output_tokens=5, cost_usd=0.02)
+    store.update_run(second["id"], "proved", input_tokens=20, output_tokens=15, cost_usd=0.07)
 
     summary = next(item for item in store.list_sessions() if item["id"] == session["id"])
     detail = store.session_detail(session["id"])
@@ -334,7 +334,7 @@ def test_usage_stats_global_daily_and_model_rollups(tmp_path, monkeypatch):
     session = store.create_session("Stats")
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
     store.add_message(session["id"], "user", "prove it", run["id"])
-    store.update_run(run["id"], "success", input_tokens=100, output_tokens=25, cost_usd=0.125)
+    store.update_run(run["id"], "proved", input_tokens=100, output_tokens=25, cost_usd=0.125)
 
     stats = store.usage_stats()
 
@@ -477,16 +477,16 @@ def test_usage_stats_sessions_carry_project_slug_for_per_document_totals(tmp_pat
     # Two sessions tagged to the same Overleaf document (two formalized theorems).
     s1 = store.create_session("thm_one", project_id=project["id"])
     r1 = store.create_run(s1["id"], "gpt-4o", "openai", 3, project_id=project["id"])
-    store.update_run(r1["id"], "success", input_tokens=200, output_tokens=50, cost_usd=0.10)
+    store.update_run(r1["id"], "proved", input_tokens=200, output_tokens=50, cost_usd=0.10)
 
     s2 = store.create_session("thm_two", project_id=project["id"])
     r2 = store.create_run(s2["id"], "gpt-4o", "openai", 3, project_id=project["id"])
-    store.update_run(r2["id"], "success", input_tokens=300, output_tokens=75, cost_usd=0.20)
+    store.update_run(r2["id"], "proved", input_tokens=300, output_tokens=75, cost_usd=0.20)
 
     # An untagged session (e.g. interactive UI run) must not count toward the doc.
     s3 = store.create_session("loose")
     r3 = store.create_run(s3["id"], "gpt-4o", "openai", 3)
-    store.update_run(r3["id"], "success", input_tokens=400, output_tokens=100, cost_usd=0.30)
+    store.update_run(r3["id"], "proved", input_tokens=400, output_tokens=100, cost_usd=0.30)
 
     stats = store.usage_stats()
 

@@ -132,9 +132,9 @@ export function ChatThread({
   }, [items]);
 
   // Split the thread into contiguous per-run blocks (runs are sequential in seq
-  // order). After a *finished* run that completed a proof (status 'success'), we
-  // drop the green milestone card; a failed run gets a red one. The card is keyed
-  // on the run's outcome, never on a message — so it lands once and stays (M16).
+  // order). After a *finished* run that completed a checked artifact, we drop the
+  // appropriate outcome card. The card is keyed on the run's outcome, never on a
+  // message — so it lands once and stays (M16).
   const runGroups = useMemo(() => {
     const nodes: MergedNode[] = [];
     for (const it of items) {
@@ -180,16 +180,23 @@ export function ChatThread({
     () => deriveCodeStepProofStatus(latestCodeStep(codeSteps)),
     [codeSteps],
   );
-  const sessionHasSuccessfulRun = useMemo(
-    () => Object.values(runStatusById).includes('success'),
+  const latestRunOutcome = useMemo(
+    () => {
+      const values = Object.values(runStatusById);
+      return values.length ? values[values.length - 1] : undefined;
+    },
     [runStatusById],
   );
   const headChip = isRunning
     ? { cls: 'run', text: '● proving' }
     : latestProofStatus === 'stubbed'
     ? { cls: 'run', text: '○ stubbed' }
-    : sessionHasSuccessfulRun && latestProofStatus === 'proved'
+    : latestRunOutcome === 'disproved' && latestProofStatus === 'proved'
+    ? { cls: 'warn', text: '⊘ disproved' }
+    : (latestRunOutcome === 'proved' || latestRunOutcome === 'success') && latestProofStatus === 'proved'
     ? { cls: 'ok', text: '✓ proved' }
+    : runStatus === 'needs_review' || latestRunOutcome === 'needs_review'
+    ? { cls: 'run', text: '○ review' }
     : runStatus === 'failed' || runStatus === 'max_turns'
     ? { cls: 'fail', text: '✕ unproved' }
     : runStatus === 'cancelled'
@@ -335,6 +342,8 @@ export function ChatThread({
               <Fragment key={group.runId ?? `g${gi}`}>
                 {group.nodes.map(renderNode)}
                 {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
+                {finished && completion === 'disproved' && <DisprovedCard steps={steps} session={session} />}
+                {finished && completion === 'needs_review' && <NeedsReviewCard />}
                 {finished && completion === 'stubbed' && <StubCard steps={steps} session={session} />}
                 {finished && (completion === 'failed' || completion === 'max_turns') && (
                   <FailedCard status={completion} />
@@ -428,7 +437,7 @@ function ToolChip({ event }: { event: StatusEvent }) {
   );
 }
 
-// The "proof is done" milestone — keyed on the run's 'success' outcome, not on a
+// The "proof is done" milestone — keyed on the run's 'proved' outcome, not on a
 // message. Shows once, after the run that completed the proof.
 function ProvedCard({ steps, session }: { steps: number; session?: SessionSummary }) {
   return (
@@ -442,6 +451,30 @@ function ProvedCard({ steps, session }: { steps: number; session?: SessionSummar
           {session.duration_seconds ? <span>{session.duration_seconds}s</span> : null}
         </div>
       )}
+    </div>
+  );
+}
+
+function DisprovedCard({ steps, session }: { steps: number; session?: SessionSummary }) {
+  return (
+    <div className="final disproof">
+      <div className="fhead">⊘ Counterexample found — the original statement was disproven, not proven</div>
+      {session && (
+        <div className="meta">
+          <span>{steps} steps</span>
+          {session.total_tokens ? <span>{formatTokens(session.total_tokens)} tokens</span> : null}
+          {session.cost_usd ? <span>${session.cost_usd.toFixed(3)}</span> : null}
+          {session.duration_seconds ? <span>{session.duration_seconds}s</span> : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NeedsReviewCard() {
+  return (
+    <div className="final stub">
+      <div className="fhead">○ Checked artifact needs review — Lea could not classify it as proof or disproof</div>
     </div>
   );
 }

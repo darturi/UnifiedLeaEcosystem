@@ -155,7 +155,7 @@ def test_run_events_for_an_already_driven_run_attaches_passively(tmp_path, monke
         # Flip the run to terminal shortly after the passive view starts tailing.
         async def finish_soon():
             await asyncio.sleep(0.35)
-            store.update_run(run_id, "success")
+            store.update_run(run_id, "proved")
 
         async def run_case():
             response = await runs_route.run_events(run_id)
@@ -172,7 +172,7 @@ def test_run_events_for_an_already_driven_run_attaches_passively(tmp_path, monke
         bridge._set_active_run_id(None)
 
     assert "event: done" in out
-    assert '"status": "success"' in out
+    assert '"status": "proved"' in out
 
 
 def test_run_events_rejects_when_a_different_run_is_active(tmp_path, monkeypatch):

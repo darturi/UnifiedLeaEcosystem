@@ -8,10 +8,11 @@
 const TOOL_APPROVAL_DECISION = "always_session";
 
 // done.status values the adapter emits (see bridge._FINISH_STATUS + run_lea):
-//   success | answered | max_turns | cancelled | failed
-// For a *formalization* job only "success" (the agent passed final verification)
-// counts as ok; "answered" finished cleanly but proved nothing.
-const SUCCESS_DONE_STATUS = new Set(["success"]);
+//   proved | disproved | needs_review | answered | max_turns | cancelled | failed
+// For a *formalization* job, "proved" and "disproved" are completed checked work;
+// "answered" finished cleanly but proved nothing. "success" is accepted only as a
+// backward-compatible alias for older adapter test doubles.
+const SUCCESS_DONE_STATUS = new Set(["proved", "disproved", "success"]);
 
 function toNonNegativeNumber(value) {
   const n = Number(value);
@@ -255,6 +256,8 @@ export async function streamApiRun({
   }
 
   let doneStatus = null;
+  let resultKind = null;
+  let resultDetail = null;
   let runError = null;
   let buffer = "";
 
@@ -272,6 +275,8 @@ export async function streamApiRun({
       runError = data?.message || "Lea run error.";
     } else if (type === "done") {
       doneStatus = String(data?.status || "").toLowerCase();
+      resultKind = String(data?.result_kind || doneStatus || "").toLowerCase() || null;
+      resultDetail = typeof data?.result_detail === "string" ? data.result_detail : null;
     }
   };
 
@@ -295,6 +300,8 @@ export async function streamApiRun({
   return {
     ok,
     doneStatus,
+    resultKind,
+    resultDetail,
     error: ok ? null : (runError || (doneStatus ? `Lea run ended with status: ${doneStatus}` : "Lea run ended without a terminal status.")),
   };
 }
@@ -357,7 +364,17 @@ export async function runApiProofJob({
   const usage = await fetchApiRunUsage({ fetchImpl, baseUrl, apiKey, sessionId: newSessionId, runId });
 
   if (timedOut) {
-    return { ok: false, timedOut: true, apiRunId: runId, sessionId: newSessionId, error: "Lea adapter run timed out.", ...usage };
+    return {
+      ok: false,
+      timedOut: true,
+      apiRunId: runId,
+      sessionId: newSessionId,
+      doneStatus: outcome?.doneStatus || null,
+      resultKind: outcome?.resultKind || null,
+      resultDetail: outcome?.resultDetail || null,
+      error: "Lea adapter run timed out.",
+      ...usage,
+    };
   }
   return {
     ok: outcome.ok,
@@ -365,6 +382,8 @@ export async function runApiProofJob({
     apiRunId: runId,
     sessionId: newSessionId,
     doneStatus: outcome.doneStatus,
+    resultKind: outcome.resultKind || null,
+    resultDetail: outcome.resultDetail || null,
     error: outcome.ok ? undefined : outcome.error,
     ...usage,
   };

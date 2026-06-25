@@ -120,6 +120,13 @@
   border-color: var(--ol-green);
 }
 
+.ol-lean-status-disproved {
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+  border-color: var(--ol-amber);
+  border-style: dashed;
+}
+
 .ol-lean-status-sorry_stub {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
@@ -422,6 +429,11 @@
 .ol-lean-status-chip-formalized {
   color: var(--ol-green);
   background: var(--ol-green-soft);
+}
+
+.ol-lean-status-chip-disproved {
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
 }
 
 .ol-lean-status-chip-sorry_stub {

@@ -9,15 +9,24 @@
 // 'running' = a session with no code yet but an active run, so a freshly registered
 // formalization (including an Overleaf-driven one) shows as in-progress immediately;
 // once code exists the working-copy verdict takes over.
-export type SessionStatus = 'empty' | 'unchecked' | 'ok' | 'error' | 'running';
+export type SessionStatus =
+  | 'empty'
+  | 'unchecked'
+  | 'ok'
+  | 'error'
+  | 'running'
+  | 'proved'
+  | 'disproved'
+  | 'needs_review';
 // ── Run-level status (a single proof attempt) ─────────────────────────────────
-// 'success' = the agent passed the final verification gate (theorem proved — this
-// is what shows the green "Proved" milestone). 'answered' = a chat / QA / sketch
-// turn that finished cleanly but proved nothing.
+// 'proved' / 'disproved' / 'needs_review' are checked-artifact outcomes.
+// 'answered' = a chat / QA / sketch turn that finished cleanly but proved nothing.
 export type RunStatus =
   | 'pending'
   | 'running'
-  | 'success'
+  | 'proved'
+  | 'disproved'
+  | 'needs_review'
   | 'answered'
   | 'max_turns'
   | 'cancelled'
@@ -26,6 +35,8 @@ export type RunStatus =
 export interface RunSummary {
   id: string;
   status: RunStatus | string;
+  result_kind?: 'proved' | 'disproved' | 'needs_review' | string | null;
+  result_detail?: string | null;
 }
 // ── Per-tool approval gate (D19) ──────────────────────────────────────────────
 export type GatedTool = 'bash' | 'write_file' | 'edit_file';
@@ -262,6 +273,8 @@ export interface ActiveRun {
   status: RunStatus | string;
   model?: string;
   pending_approval?: PendingApproval | null;
+  result_kind?: string | null;
+  result_detail?: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -286,7 +299,11 @@ export interface RunStatusEventPayload {
 }
 export interface ApprovalResolvedEvent { approval_id: string; decision: ApprovalDecision }
 export interface RunErrorEvent { message: string }
-export interface DoneEvent { status: RunStatus }
+export interface DoneEvent {
+  status: RunStatus;
+  result_kind?: string | null;
+  result_detail?: string | null;
+}
 
 // ── Frontend-derived timeline (built from messages + code steps by timeline.mjs) ──
 export type TimelineItem =

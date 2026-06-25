@@ -114,7 +114,7 @@ def _build_context(session_id: str, project: dict[str, Any], config: LeaConfig) 
         raise ProjectAssignmentError(404, {"message": "Session not found."})
     if detail.get("active_run"):
         raise ProjectAssignmentError(409, {"message": "Cannot assign a project while the session is running."})
-    if detail.get("status") != "success":
+    if detail.get("status") != "proved":
         raise ProjectAssignmentError(409, failed_assignment_guidance())
 
     final_step = _final_lean_code_step(detail)

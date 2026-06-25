@@ -8,10 +8,12 @@ so existing callers (CLI, eval) keep working unchanged.
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .config import LeaConfig
 from .prompt import load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
+from . import safeverify
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
 from .tools import _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok
 from .registry import build_toolset, import_tool_modules
@@ -69,6 +71,26 @@ look up a lemma in Mathlib, clarifying a tactic, or otherwise continuing the \
 conversation about existing work.
 
 Output only the single word FORMALIZE or ASSISTANT, with no other text."""
+
+
+_RESULT_CLASSIFIER_PROMPT = """\
+You classify the mathematical outcome of a verified Lean artifact for Lea.
+
+The Lean artifact has already passed the final checker. Your job is only to decide
+what it verified relative to the user's original request.
+
+Reply with exactly one word:
+- PROVED — the artifact proves the user's stated theorem/lemma/conjecture as written.
+- DISPROVED — the artifact proves a negation, contradiction, or counterexample showing
+  the user's stated theorem/lemma/conjecture is false.
+- NEEDS_REVIEW — the relationship is ambiguous, the artifact proves a related but
+  different statement, or you are not certain.
+
+Be conservative. If the user asked for a counterexample and the artifact verifies
+one, reply DISPROVED. If the user asked for a proof but the artifact verifies the
+negation or a counterexample, reply DISPROVED. If unsure, reply NEEDS_REVIEW.
+
+Output only PROVED, DISPROVED, or NEEDS_REVIEW."""
 
 
 def _text_only_history(messages: list, limit: int = 8) -> list[dict]:
@@ -129,6 +151,102 @@ def _classify_intent(model: str, messages: list, config: LeaConfig) -> tuple[str
             cost += event.cost
     decision = "ASSISTANT" if "ASSISTANT" in text.strip().upper() else "FORMALIZE"
     return decision, usage, cost
+
+
+def _content_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                parts.append(str(part.get("text") or ""))
+            elif part.get("type") == "tool_result":
+                continue
+        return " ".join(p for p in parts if p)
+    return ""
+
+
+def _latest_user_request(messages: list) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        text = _content_text(msg.get("content")).strip()
+        if text:
+            return text
+    return ""
+
+
+def _theorem_signature(path: str | None) -> str:
+    if not path:
+        return ""
+    try:
+        return safeverify.theorem_signature(Path(path).read_text()) or ""
+    except Exception:
+        return ""
+
+
+def _parse_result_kind(text: str) -> str:
+    value = (text or "").strip().upper()
+    if "DISPROVED" in value:
+        return "disproved"
+    if "PROVED" in value:
+        return "proved"
+    if "NEEDS_REVIEW" in value or "NEEDS REVIEW" in value:
+        return "needs_review"
+    return "needs_review"
+
+
+def _classify_final_result(
+    *,
+    model: str,
+    messages: list,
+    final_text: str,
+    theorem_signature: str,
+    config: LeaConfig,
+) -> tuple[str, str | None, Usage, float]:
+    """Classify a checked artifact relative to the user's request.
+
+    This is intentionally conservative: parse failures, provider errors, or any
+    non-conforming answer become needs_review, not proof success.
+    """
+    request = _latest_user_request(messages)
+    classifier_messages = [{
+        "role": "user",
+        "content": (
+            "User request:\n"
+            f"{request or '(unavailable)'}\n\n"
+            "Verified Lean theorem signature:\n"
+            f"{theorem_signature or '(unavailable)'}\n\n"
+            "Final assistant message:\n"
+            f"{final_text or '(unavailable)'}"
+        ),
+    }]
+    text = ""
+    usage = Usage()
+    cost = 0.0
+    try:
+        for event in stream(
+            model,
+            _RESULT_CLASSIFIER_PROMPT,
+            classifier_messages,
+            [],
+            config.model_kwargs,
+            streaming=config.stream,
+        ):
+            if isinstance(event, TextDelta):
+                text += event.text
+            elif isinstance(event, Done):
+                usage.input_tokens += event.usage.input_tokens
+                usage.output_tokens += event.usage.output_tokens
+                cost += event.cost
+    except Exception as exc:
+        return "needs_review", f"Result classification failed: {type(exc).__name__}: {exc}", usage, cost
+    kind = _parse_result_kind(text)
+    detail = text.strip() or None
+    return kind, detail, usage, cost
 
 
 def _meaning_events(tool_name: str, args: dict, result: str) -> list:
@@ -566,9 +684,23 @@ def _run_events_inner(
                 messages.append({"role": "user", "content": f"{_FINAL_GATE_FAILURE_MESSAGE}\n\n{diagnostic}"})
                 continue
 
+            final_text = text or "(no response)"
+            result_kind, result_detail, result_usage, result_cost = _classify_final_result(
+                model=model,
+                messages=messages,
+                final_text=final_text,
+                theorem_signature=_theorem_signature(proof_state.latest_proof_path),
+                config=config,
+            )
+            total_usage.input_tokens += result_usage.input_tokens
+            total_usage.output_tokens += result_usage.output_tokens
+            total_cost += result_cost
+            if result_usage.input_tokens or result_usage.output_tokens or result_cost:
+                yield UsageUpdated(result_usage.input_tokens, result_usage.output_tokens, result_cost)
             final_transcript = transcript(turn)
-            yield Finished("completed", text or "(no response)", turn, session_id, model,
-                           total_usage, total_cost, final_transcript)
+            yield Finished("completed", final_text, turn, session_id, model,
+                           total_usage, total_cost, final_transcript,
+                           result_kind=result_kind, result_detail=result_detail)
             return
 
         tool_results = []

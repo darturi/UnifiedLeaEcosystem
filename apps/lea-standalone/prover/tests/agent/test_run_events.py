@@ -34,6 +34,10 @@ def install_fakes():
     proof_path = str(Path(calls["tmpdir"].name) / "Basic.lean")
 
     def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta("PROVED")
+            yield Done(Usage(2, 1), 0.0001)
+            return
         calls["n"] += 1
         calls["systems"].append(system)
         calls["messages"].append(messages)
@@ -59,6 +63,10 @@ def install_silent_tool_fake():
     proof_path = str(Path(calls["tmpdir"].name) / "Silent.lean")
 
     def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta("PROVED")
+            yield Done(Usage(2, 1), 0.0001)
+            return
         calls["n"] += 1
         calls["systems"].append(system)
         if not tools:
@@ -97,6 +105,10 @@ def install_final_gate_fake(*, check_outputs, final_texts=None):
     final_texts = final_texts or ["All done.", "Fixed now."]
 
     def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta("PROVED")
+            yield Done(Usage(2, 1), 0.0001)
+            return
         calls["n"] += 1
         calls["messages"].append(messages)
         if calls["n"] == 1:
@@ -125,6 +137,10 @@ def install_final_gate_repair_fake():
     proof_path = str(Path(calls["tmpdir"].name) / "Repair.lean")
 
     def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta("PROVED")
+            yield Done(Usage(2, 1), 0.0001)
+            return
         calls["n"] += 1
         calls["messages"].append(messages)
         if calls["n"] == 1:
@@ -167,6 +183,10 @@ def install_no_artifact_repair_fake():
     proof_path = str(Path(calls["tmpdir"].name) / "Recovered.lean")
 
     def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta("PROVED")
+            yield Done(Usage(2, 1), 0.0001)
+            return
         calls["n"] += 1
         calls["messages"].append(messages)
         if calls["n"] == 1:
@@ -202,6 +222,10 @@ def install_explicit_check_fake(*, edit_after_check=False):
     proof_path = str(Path(calls["tmpdir"].name) / "Explicit.lean")
 
     def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta("PROVED")
+            yield Done(Usage(2, 1), 0.0001)
+            return
         calls["n"] += 1
         calls["messages"].append(messages)
         if calls["n"] == 1:
@@ -244,7 +268,7 @@ def test_run_events_sequence():
         # each ToolResulted is immediately followed by its meaning-level event (A2):
         # write_file -> FileChanged, lean_check -> CheckResult.
         "ToolResulted", "FileChanged", "ToolResulted", "CheckResult",
-        "TurnStarted", "AssistantTextDelta", "UsageUpdated", "Finished",
+        "TurnStarted", "AssistantTextDelta", "UsageUpdated", "UsageUpdated", "Finished",
     ]
     check("event order", types == expected_types)
 
@@ -259,8 +283,9 @@ def test_run_events_sequence():
     check("Finished.reason completed", fin.reason == "completed")
     check("Finished.text", fin.text == "All done.")
     check("Finished.turns", fin.turns == 2)
-    check("Finished cumulative usage", fin.usage == Usage(120, 50))
-    check("Finished cumulative cost", abs(fin.cost - 0.004) < 1e-9)
+    check("Finished cumulative usage", fin.usage == Usage(122, 51))
+    check("Finished cumulative cost", abs(fin.cost - 0.0041) < 1e-9)
+    check("Finished result kind proved", fin.result_kind == "proved")
     check("transcript turns", fin.transcript["turns"] == 2)
     check("transcript has messages", len(fin.transcript["messages"]) >= 3)
 
@@ -330,7 +355,7 @@ def test_narrate_tool_steps_forces_text_before_silent_tool_call():
             "text": "I will explain the proof move before using the tool.",
         },
     )
-    check("forced narration usage included", fin.usage == Usage(125, 57))
+    check("forced narration usage included", fin.usage == Usage(127, 58))
 
 
 def test_final_gate_failed_check_resumes_loop():
@@ -400,6 +425,50 @@ def test_edit_after_successful_check_rechecks_final_gate():
     fin = events[-1]
     check("edit after check completes", isinstance(fin, Finished) and fin.reason == "completed")
     check("edit after check rechecked", calls["checks"] == [proof_path, proof_path])
+
+
+def install_result_classifier_fake(classifier_text):
+    calls = {"n": 0, "tmpdir": tempfile.TemporaryDirectory()}
+    proof_path = str(Path(calls["tmpdir"].name) / "Result.lean")
+
+    def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if "classify the mathematical outcome" in system:
+            yield TextDelta(classifier_text)
+            yield Done(Usage(2, 1), 0.0001)
+            return
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield ToolCall("write_file", {"path": proof_path, "content": "theorem result : True := by trivial\n"})
+            yield _ToolMeta("write")
+            yield ToolCall("lean_check", {"path": proof_path})
+            yield _ToolMeta("check")
+            yield Done(Usage(10, 5), 0.001)
+            return
+        yield TextDelta("Final message.")
+        yield Done(Usage(3, 2), 0.0002)
+
+    agent.stream = fake_stream
+    agent._tools.lean_check = lambda path: "OK — no errors, no warnings."
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
+    return calls
+
+
+def test_final_result_classifier_marks_proved():
+    install_result_classifier_fake("PROVED")
+    fin = list(agent.run_events(cfg(), msgs("prove it")))[-1]
+    check("result classifier proved", fin.result_kind == "proved")
+
+
+def test_final_result_classifier_marks_disproved():
+    install_result_classifier_fake("DISPROVED")
+    fin = list(agent.run_events(cfg(), msgs("find a counterexample")))[-1]
+    check("result classifier disproved", fin.result_kind == "disproved")
+
+
+def test_final_result_classifier_defaults_ambiguous_to_needs_review():
+    install_result_classifier_fake("I am not sure")
+    fin = list(agent.run_events(cfg(), msgs("prove it")))[-1]
+    check("result classifier ambiguous", fin.result_kind == "needs_review")
 
 
 def cfg_interactive():
@@ -559,6 +628,9 @@ def main():
     test_final_gate_success_allows_completion()
     test_successful_explicit_check_skips_duplicate_final_gate()
     test_edit_after_successful_check_rechecks_final_gate()
+    test_final_result_classifier_marks_proved()
+    test_final_result_classifier_marks_disproved()
+    test_final_result_classifier_defaults_ambiguous_to_needs_review()
     test_interactive_sorry_skeleton_is_not_proved()
     test_interactive_assistant_turn_routes_to_chat_and_keeps_tools()
     test_text_only_history_serializes_for_provider()

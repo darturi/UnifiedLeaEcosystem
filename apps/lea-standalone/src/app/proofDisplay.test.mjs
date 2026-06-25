@@ -55,12 +55,21 @@ test('failed checks remain failed even when code contains sorry', () => {
   );
 });
 
-test('run success with a sorry-bearing latest step is displayed as stubbed', () => {
+test('run proved with a sorry-bearing latest step is displayed as stubbed', () => {
   const steps = [
     step({ id: 'c1', code: 'theorem t : True := by\n  trivial\n' }),
     step({ id: 'c2', code: 'theorem t : True := by\n  sorry\n' }),
   ];
+  assert.equal(deriveRunCompletionStatus('proved', steps), 'stubbed');
   assert.equal(deriveRunCompletionStatus('success', steps), 'stubbed');
+});
+
+test('run disproved is displayed as disproof, not proof', () => {
+  assert.equal(deriveRunCompletionStatus('disproved', [step()]), 'disproved');
+});
+
+test('ambiguous checked artifacts are displayed as needing review', () => {
+  assert.equal(deriveRunCompletionStatus('needs_review', [step()]), 'needs_review');
 });
 
 test('Lean comments mentioning sorry do not make the code a stub', () => {
