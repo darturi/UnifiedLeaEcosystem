@@ -76,6 +76,17 @@ test("definition targets use definition copy and do not show Stub", async () => 
   assert.equal(harness.hasButtonText("Stub"), false);
 });
 
+test("definition success renders a defined badge", async () => {
+  const harness = createContentHarness(
+    { status: "formalized", resultKind: "defined" },
+    { targetKind: "definition", targetLabel: "DemoDefinition", targetText: "A definition." }
+  );
+  await harness.loadStatusForVisibleTheorem();
+
+  assert.equal(harness.hasButtonText("defined"), true);
+  assert.equal(harness.hasButtonText("formalized"), false);
+});
+
 function createContentHarness(statusInfo, theoremPatch = {}) {
   const document = new FakeDocument();
   const timers = [];

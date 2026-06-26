@@ -4,7 +4,7 @@
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
-  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "disproved", "in_progress", "sorry_stub"]);
+  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
@@ -198,7 +198,7 @@
         status.textContent = spec.pendingText;
         try {
           const result = await spec.run(target);
-          status.textContent = `${formatStatus(result.status)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
+          status.textContent = `${formatStatus(result.status, result)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
           renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[targetKey(target)]?.leanStatement || "");
           await refreshStatusesNow();
         } catch (error) {
@@ -489,7 +489,7 @@
 
     if (chip) {
       chip.className = `ol-lean-status-chip ol-lean-status-chip-${currentStatus}`;
-      chip.textContent = formatStatus(currentStatus);
+      chip.textContent = formatStatus(currentStatus, statusInfo);
       if (hasStubbedTheoremUses(statusInfo)) {
         chip.appendChild(createStubbedTheoremUsesMark());
       }
@@ -786,7 +786,7 @@
       const badge = document.createElement("button");
       badge.className = `ol-lean-status ol-lean-status-${status}`;
       badge.type = "button";
-      badge.appendChild(document.createTextNode(formatStatus(status)));
+      badge.appendChild(document.createTextNode(formatStatus(status, statusInfo)));
       if (hasStubbedTheoremUses(statusInfo)) {
         badge.appendChild(createStubbedTheoremUsesMark());
       }
@@ -801,7 +801,7 @@
         badge.appendChild(progress);
       }
       const stubbedUsesLabel = hasStubbedTheoremUses(statusInfo) ? " warning: proof uses sorry-stubbed support" : "";
-      const statusLabel = `${formatStatus(status)}${turnProgress.label ? ` ${turnProgress.label}` : ""}${stubbedUsesLabel}`;
+      const statusLabel = `${formatStatus(status, statusInfo)}${turnProgress.label ? ` ${turnProgress.label}` : ""}${stubbedUsesLabel}`;
       badge.title = statusInfo.message || `Lean status for ${target.targetLabel}: ${statusLabel}`;
       badge.setAttribute("aria-label", `Open Lea popover for ${target.targetLabel}. Status: ${statusLabel}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
@@ -815,7 +815,10 @@
     }
   }
 
-  function formatStatus(status) {
+  function formatStatus(status, statusInfo = null) {
+    if ((status === "formalized" || status === "defined") && statusInfo?.resultKind === "defined") {
+      return "defined";
+    }
     switch (status) {
       case "unformalized":
         return "unformalized";
@@ -823,6 +826,8 @@
         return "in progress";
       case "formalized":
         return "formalized";
+      case "defined":
+        return "defined";
       case "disproved":
         return "Counterexample found";
       case "sorry_stub":
@@ -922,6 +927,7 @@
       case "in_progress":
         return "Formalizing...";
       case "formalized":
+      case "defined":
       case "disproved":
       case "unknown":
         return "Check status";

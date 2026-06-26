@@ -108,6 +108,7 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
     # run persisted: proved + usage + a per-turn breakdown row
     run = store.get_run(ctx.run_id)
     assert run["status"] == "proved"
+    assert run["result_kind"] == "proved"
     assert run["input_tokens"] == 10 and run["output_tokens"] == 5
     assert abs(run["cost_usd"] - 0.01) < 1e-9
     assert [r["label"] for r in detail["usage_breakdown"]] == ["Turn 1"]
@@ -118,6 +119,47 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
     assert types.count("code_step") == 2  # write, then verdict back-fill
     assert "message" in types
     assert types[-1] == "done"
+
+
+def test_definition_artifact_persists_defined_result_kind(tmp_path, monkeypatch):
+    ctx, queue = _context(tmp_path, monkeypatch, task="Define a subadditive predicate")
+
+    def script(proof_path):
+        Path(proof_path).write_text(
+            "import Mathlib\n\n"
+            "def Subadditive (a : Nat -> Int) : Prop := True\n"
+        )
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": proof_path})
+        yield FileChanged(proof_path)
+        yield ToolCalled("lean_check", {"path": proof_path})
+        yield CheckResult(proof_path, "ok", None)
+        yield Finished(
+            "completed",
+            "Defined Subadditive.",
+            1,
+            ctx.session_id,
+            "gemini/test",
+            Usage(input_tokens=10, output_tokens=5),
+            0.01,
+            {},
+            result_kind="needs_review",
+            result_detail="NEEDS_REVIEW",
+        )
+
+    monkeypatch.setattr(bridge, "run_events", _fake_run_events(script))
+
+    bridge.run_lea(ctx)
+
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "proved"
+    assert run["result_kind"] == "defined"
+    assert run["result_detail"] is None
+
+    done = _drain(queue)[-1]
+    assert done["type"] == "done"
+    assert done["payload"]["status"] == "proved"
+    assert done["payload"]["result_kind"] == "defined"
 
 
 def test_disproof_result_persists_and_streams_distinct_outcome(tmp_path, monkeypatch):

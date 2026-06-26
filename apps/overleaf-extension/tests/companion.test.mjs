@@ -1487,7 +1487,7 @@ test("formalize definition uses a declaration-oriented prompt and typed job key"
     assert.equal(job.jobKey, "project-1:definition:Subadditive");
     assert.equal(job.targetKind, "definition");
     assert.equal(job.targetLabel, "Subadditive");
-    assert.equal(job.resultKind, "formalized");
+    assert.equal(job.resultKind, "defined");
     assert.match(calls[0].body.task, /This target is a definition, not a theorem/);
     assert.match(calls[0].body.task, /Do not create a fake theorem/);
     assert.match(calls[0].body.task, /Represent this as a predicate/);
@@ -1497,7 +1497,7 @@ test("formalize definition uses a declaration-oriented prompt and typed job key"
       targets: [{ targetKind: "definition", targetLabel: "Subadditive", targetText: "A definition." }]
     }, state);
     assert.equal(statuses.body.statuses["definition:Subadditive"].status, "formalized");
-    assert.equal(statuses.body.statuses["definition:Subadditive"].resultKind, "formalized");
+    assert.equal(statuses.body.statuses["definition:Subadditive"].resultKind, "defined");
   } finally {
     restorePath();
   }

@@ -67,6 +67,8 @@ interface ProofSessionState {
   setRunStatus: (runStatus?: RunStatus) => void;
   runStatusById: Record<string, string>;
   setRunStatusById: (update: Updater<Record<string, string>>) => void;
+  runResultKindById: Record<string, string | null | undefined>;
+  setRunResultKindById: (update: Updater<Record<string, string | null | undefined>>) => void;
 
   // Theorem-approval gate: the approval history (each gains a decision once
   // resolved; M13) + a busy flag while a decision is in flight.
@@ -104,6 +106,8 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   setRunStatus: (runStatus) => set({ runStatus }),
   runStatusById: {},
   setRunStatusById: (update) => set((s) => ({ runStatusById: apply(update, s.runStatusById) })),
+  runResultKindById: {},
+  setRunResultKindById: (update) => set((s) => ({ runResultKindById: apply(update, s.runResultKindById) })),
 
   approvals: [],
   setApprovals: (update) => set((s) => ({ approvals: apply(update, s.approvals) })),

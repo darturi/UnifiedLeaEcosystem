@@ -1620,7 +1620,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     : [];
   job.finalStatus = outcome.finalStatus;
   job.resultKind = target.targetKind === "definition" && outcome.jobStatus === "formalized"
-    ? "formalized"
+    ? "defined"
     : outcome.resultKind || null;
   job.resultDetail = outcome.resultDetail || null;
   job.apiRunId = exit.apiRunId || job.apiRunId || null;
@@ -2201,7 +2201,7 @@ function buildJobResponse({ job, status, target }) {
     leanStatement: job.leanStatement || "",
     logTail: "",
     message: job.error || job.resultDetail || (status === "disproved" ? "Lea found a verified counterexample or disproof. The original theorem was not proven." : ""),
-    resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "formalized" ? (target.targetKind === "definition" ? "formalized" : "proved") : null),
+    resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "formalized" ? (target.targetKind === "definition" ? "defined" : "proved") : null),
     resultDetail: job.resultDetail || null,
     leaSessionId,
     leaSessionUrl: leaSessionId ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId) : null,
@@ -2601,7 +2601,7 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   return {
     status: "formalized",
     ...responseBase,
-    resultKind: target.targetKind === "definition" ? "formalized" : "proved",
+    resultKind: target.targetKind === "definition" ? "defined" : "proved",
     leanStatement: extractLeanStatement(content, entry.name)
   };
 }
@@ -2644,7 +2644,7 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
   return {
     status: "formalized",
     ...responseBase,
-    resultKind: target.targetKind === "definition" ? "formalized" : "proved",
+    resultKind: target.targetKind === "definition" ? "defined" : "proved",
     leanStatement: extractLeanStatement(content, declarationName)
   };
 }
