@@ -244,7 +244,11 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     chrome: {
       runtime: {
         id: "test-extension",
-        getURL: (file) => `chrome-extension://test/${file}`,
+        // Real .mjs web-accessible resources resolve to their on-disk path so the
+        // pane's lazy `import(chrome.runtime.getURL(...))` works under the harness.
+        getURL: (file) => file.endsWith(".mjs")
+          ? path.join(repoRoot, "apps/overleaf-extension/extension", file)
+          : `chrome-extension://test/${file}`,
         sendMessage(_message, callback) {
           callback?.({ ok: true });
         },
@@ -264,7 +268,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   context.self = window;
   context.location = window.location;
 
-  vm.runInNewContext(contentScript, context, { filename: contentScriptPath });
+  vm.runInNewContext(contentScript, context, {
+    filename: contentScriptPath,
+    // content.js loads web-accessible-resource modules via
+    // `import(chrome.runtime.getURL(...))`; getURL returns an absolute path for .mjs
+    // resources and the default loader imports them, so the pane's lazy module load
+    // works under the test harness without --experimental-vm-modules.
+    importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER
+  });
   timers.splice(0, timers.length);
 
   return {
@@ -370,7 +381,12 @@ class FakeElement {
     this.classList = {
       contains: (className) => this.className.split(/\s+/).includes(className)
     };
+    this.scrollTop = 0;
   }
+
+  focus() {}
+
+  blur() {}
 
   get className() {
     return this._className;

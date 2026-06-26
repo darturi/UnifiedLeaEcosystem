@@ -1,16 +1,17 @@
-import { createHash } from "node:crypto";
+import { hashTargetText, normalizeTargetText } from "./theoremParser.mjs";
+import { stripLeaTargetText } from "../extension/targetParserCore.mjs";
 
 const THEOREM_KINDS = new Set(["theorem", "lemma", "proposition", "corollary"]);
 const DEFINITION_KINDS = new Set(["definition"]);
 const SUPPORTED_KINDS = new Set([...THEOREM_KINDS, ...DEFINITION_KINDS]);
 
-export function normalizeLeanPaneText(text) {
-  return String(text || "").replace(/\s+/g, " ").trim();
-}
-
-export function hashLeanPaneSource(text) {
-  return createHash("sha256").update(normalizeLeanPaneText(text)).digest("hex");
-}
+// The pane hashes the exact same canonical text the formalize path hashes
+// (`hashTargetText` over `stripLeaTargetText`), so an item's `sourceHash` and a
+// finished job's `targetTextHash` are directly comparable for staleness. These
+// aliases keep the original export names while delegating to the single source of
+// truth in theoremParser/targetParserCore (PLAN-overleaf-lean-pane-improvements item 1).
+export const normalizeLeanPaneText = normalizeTargetText;
+export const hashLeanPaneSource = hashTargetText;
 
 export function buildLeanPaneManifest({
   overleafProjectId = "unknown",
@@ -37,11 +38,15 @@ export function buildLeanPaneManifest({
     const file = normalizedFiles.find((candidate) => candidate.path === sourceFile);
     if (!file) continue;
     for (const item of parseLeanPaneItemsFromFile(file, items.length)) {
+      const documentOrder = items.length;
       items.push({
-        id: `${item.kind}:${item.label}`,
+        // documentOrder keeps the id unique even when two environments share the
+        // same kind+label (a duplicate_label case), so expansion state and DOM
+        // dataset ids never collide in the pane.
+        id: `${item.kind}:${item.label}:${documentOrder}`,
         overleafProjectId,
         ...item,
-        documentOrder: items.length
+        documentOrder
       });
       const seen = labels.get(item.label) || [];
       seen.push(item.sourceFile);
@@ -79,7 +84,7 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
     if (!leanName) continue;
     const sourceStart = offsetToLineColumn(content, environment.from);
     const sourceEnd = offsetToLineColumn(content, environment.to);
-    const naturalLanguageLatex = cleanNaturalLanguageLatex(extracted.rawLatex);
+    const naturalLanguageLatex = stripLeaTargetText(extracted.rawLatex);
     items.push({
       label: leanName,
       kind: environment.name,
@@ -91,7 +96,7 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
       sourceEndLine: sourceEnd.line,
       sourceStartOffset: environment.from,
       sourceEndOffset: environment.to,
-      sourceHash: hashLeanPaneSource(naturalLanguageLatex),
+      sourceHash: hashTargetText(naturalLanguageLatex),
       naturalLanguageLatex,
       naturalLanguageRendered: renderLightLatex(naturalLanguageLatex),
       leanKind: DEFINITION_KINDS.has(environment.name) ? "def" : "theorem",
@@ -251,13 +256,6 @@ function extractEnvironmentContent(source, environment) {
     latexLabel: labelMatch ? labelMatch[1].trim() : "",
     title: environment.title
   };
-}
-
-function cleanNaturalLanguageLatex(source) {
-  return String(source || "")
-    .replace(/^[ \t]*%\s*lea:.*(?:\r?\n|$)/gmi, "")
-    .replace(/\\label\s*\{[^}]*\}/g, "")
-    .trim();
 }
 
 function renderLightLatex(source) {

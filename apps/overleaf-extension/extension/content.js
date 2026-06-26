@@ -7,6 +7,7 @@
   const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
+  const LEAN_PANE_POLL_DELAY_MS = 4000;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -38,8 +39,9 @@
   let leanPaneBody = null;
   let leanPaneStatus = null;
   let leanPaneRefreshTimer = null;
+  let leanPanePollTimer = null;
+  let leanPaneView = null;
   let leanPaneExpandedItemIds = new Set();
-  let leanPaneDirty = true;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
   let costCapNotice = null;
@@ -70,7 +72,6 @@
       renderStatusBadges();
       if (activeTexChanged) {
         texMirrorDirty = true;
-        leanPaneDirty = true;
         scheduleTexMirrorSync();
         if (leanPane) scheduleLeanPaneRefresh();
       }
@@ -84,7 +85,12 @@
   renderLeanPaneButton();
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closePopover();
+    if (event.key !== "Escape") return;
+    if (activePopover) {
+      closePopover();
+      return;
+    }
+    if (leanPane) closeLeanPane();
   });
 
   document.addEventListener("click", (event) => {
@@ -147,6 +153,7 @@
     leanPane.className = "ol-lean-project-pane";
     leanPane.setAttribute("role", "complementary");
     leanPane.setAttribute("aria-label", "Lean project pane");
+    leanPane.tabIndex = -1;
 
     const header = document.createElement("div");
     header.className = "ol-lean-project-pane-header";
@@ -191,12 +198,15 @@
     leanPane.appendChild(leanPaneStatus);
     leanPane.appendChild(leanPaneBody);
     document.body.appendChild(leanPane);
+    leanPane.focus({ preventScroll: true });
     refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
   }
 
   function closeLeanPane() {
     clearTimeout(leanPaneRefreshTimer);
     leanPaneRefreshTimer = null;
+    clearTimeout(leanPanePollTimer);
+    leanPanePollTimer = null;
     if (!leanPane) return;
     leanPane.remove();
     leanPane = null;
@@ -204,19 +214,36 @@
     leanPaneStatus = null;
   }
 
+  // Load the pure pane helpers once. The pane is only built on user click (well
+  // after startup), so a lazy import here always resolves before any render runs.
+  async function ensureLeanPaneView() {
+    if (leanPaneView) return leanPaneView;
+    leanPaneView = await import(chrome.runtime.getURL("leanPaneView.mjs"));
+    return leanPaneView;
+  }
+
+  // Edits to the open document re-render the pane from the cached file set with the
+  // live buffer overlaid — a cheap, no-blink background refresh (no project download).
   function scheduleLeanPaneRefresh() {
     clearTimeout(leanPaneRefreshTimer);
     leanPaneRefreshTimer = setTimeout(() => {
-      refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+      refreshLeanPaneNow({ background: true }).catch(renderLeanPaneError);
     }, LEAN_PANE_REFRESH_DELAY_MS);
   }
 
-  async function refreshLeanPaneNow({ forceFetch = false } = {}) {
+  // `forceFetch` re-downloads the project archive; `background` skips the blanking
+  // "Loading…" state and preserves scroll, for edit-driven and poll refreshes.
+  async function refreshLeanPaneNow({ forceFetch = false, background = false } = {}) {
     if (!leanPane || !leanPaneBody || !leanPaneStatus) return;
     clearTimeout(leanPaneRefreshTimer);
     leanPaneRefreshTimer = null;
-    leanPaneStatus.textContent = "Loading project inventory...";
-    leanPaneBody.replaceChildren();
+    clearTimeout(leanPanePollTimer);
+    leanPanePollTimer = null;
+    await ensureLeanPaneView();
+    if (!background) {
+      leanPaneStatus.textContent = "Loading project inventory...";
+      leanPaneBody.replaceChildren();
+    }
 
     const projectId = extractOverleafProjectId();
     const files = await getLeanPaneProjectFiles({ projectId, forceFetch });
@@ -236,6 +263,16 @@
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
     renderLeanPaneManifest(payload);
+    scheduleLeanPanePollIfNeeded(payload);
+  }
+
+  // Keep refreshing while any item is still being formalized; stop once it settles.
+  function scheduleLeanPanePollIfNeeded(manifest) {
+    if (!leanPane || !leanPaneView?.hasInProgressItems(manifest?.items)) return;
+    clearTimeout(leanPanePollTimer);
+    leanPanePollTimer = setTimeout(() => {
+      refreshLeanPaneNow({ background: true }).catch(renderLeanPaneError);
+    }, LEAN_PANE_POLL_DELAY_MS);
   }
 
   async function getLeanPaneProjectFiles({ projectId, forceFetch }) {
@@ -244,31 +281,27 @@
         ? [{ path: latestActiveTexPath, content: latestActiveTex }]
         : [];
     }
-    const needFetch = forceFetch || leanPaneDirty || !lastLeanPaneFiles || lastLeanPaneProjectId !== projectId;
+    const needFetch = leanPaneView.shouldRefetchLeanPaneFiles({
+      forceFetch,
+      lastFiles: lastLeanPaneFiles,
+      lastProjectId: lastLeanPaneProjectId,
+      projectId
+    });
     let files;
     if (needFetch) {
       files = await collectProjectTexFiles(projectId);
     } else {
       files = lastLeanPaneFiles.map((file) => ({ ...file }));
-      overlayActiveTex(files);
+      leanPaneView.overlayActiveTex(files, latestActiveTexPath, latestActiveTex);
     }
     lastLeanPaneFiles = files.map((file) => ({ ...file }));
     lastLeanPaneProjectId = projectId;
-    leanPaneDirty = false;
     return files;
-  }
-
-  function overlayActiveTex(files) {
-    if (!latestActiveTexPath || typeof latestActiveTex !== "string") return;
-    const wanted = String(latestActiveTexPath).replace(/^\/+/, "");
-    const existing = files.find((file) => file.path === wanted);
-    if (existing) {
-      existing.content = latestActiveTex;
-    }
   }
 
   function renderLeanPaneManifest(manifest) {
     if (!leanPaneBody || !leanPaneStatus) return;
+    const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
     leanPaneBody.replaceChildren();
     leanPaneStatus.textContent = items.length
@@ -289,6 +322,8 @@
     for (const item of items) {
       leanPaneBody.appendChild(renderLeanPaneItem(item));
     }
+
+    leanPaneBody.scrollTop = prevScrollTop;
   }
 
   function renderLeanPaneItem(item) {
@@ -312,13 +347,13 @@
 
     const text = document.createElement("span");
     text.className = "ol-lean-project-item-title";
-    text.textContent = `${capitalize(item.kind)}: ${item.title || item.leanDeclarationName || item.label}`;
+    text.textContent = `${leanPaneView.capitalize(item.kind)}: ${item.title || item.leanDeclarationName || item.label}`;
     const meta = document.createElement("span");
     meta.className = "ol-lean-project-item-meta";
     meta.textContent = item.label;
     const chip = document.createElement("span");
     chip.className = `ol-lean-project-status ol-lean-project-status-${item.status || "unknown"}`;
-    chip.textContent = formatPaneStatus(item.status || "unknown");
+    chip.textContent = leanPaneView.formatPaneStatus(item.status || "unknown");
     header.appendChild(text);
     header.appendChild(meta);
     header.appendChild(chip);
@@ -1150,30 +1185,6 @@
       default:
         return "checking";
     }
-  }
-
-  function formatPaneStatus(status) {
-    switch (status) {
-      case "missing-stub":
-        return "missing stub";
-      case "stub-generated":
-        return "stub generated";
-      case "valid":
-        return "valid";
-      case "invalid":
-        return "invalid";
-      case "stale":
-        return "stale";
-      case "error":
-        return "error";
-      default:
-        return "unknown";
-    }
-  }
-
-  function capitalize(value) {
-    const text = String(value || "");
-    return text ? `${text.slice(0, 1).toUpperCase()}${text.slice(1)}` : "";
   }
 
   function inProgressMessage(statusInfo, target = null) {

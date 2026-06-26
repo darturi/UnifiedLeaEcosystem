@@ -53,6 +53,10 @@ const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
 const DEFAULT_LEA_MAX_TURNS = 20;
 const DEFAULT_LEA_JOB_TIMEOUT_SECONDS = 900;
 const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
+// Cap on concurrent Lean-pane item enrichments. Each enrichment does a handful of
+// filesystem reads plus an optional adapter session fetch; running them in a bounded
+// pool keeps a large project's manifest fast without flooding the FS/adapter.
+const LEAN_PANE_ENRICH_CONCURRENCY = 8;
 const PROVIDER_KEY_VALIDATION_TIMEOUT_MS = 5000;
 const MAX_SPEND_MESSAGE = "Max spend limit reached. Lea run was cancelled.";
 const MAX_SPEND_BLOCK_MESSAGE = "Max spend limit has been reached.";
@@ -427,14 +431,15 @@ export async function handleLeanPaneManifest(payload, state) {
     };
   }
 
-  const items = [];
-  for (const item of manifest.items) {
-    items.push(await enrichLeanPaneItem({
+  const items = await mapWithConcurrency(
+    manifest.items,
+    LEAN_PANE_ENRICH_CONCURRENCY,
+    (item) => enrichLeanPaneItem({
       item,
       state,
       overleafProjectId: payload.overleafProjectId || "unknown"
-    }));
-  }
+    })
+  );
 
   return {
     statusCode: 200,
@@ -443,6 +448,24 @@ export async function handleLeanPaneManifest(payload, state) {
       items
     }
   };
+}
+
+// Order-preserving bounded-concurrency map. `fn` is expected to resolve (Lean-pane
+// enrichment catches its own errors), so a worker rejection is surfaced rather than
+// swallowed.
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 export async function handleUpdateLeaSettings(payload, state) {
@@ -2437,6 +2460,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   }
 
   const paneStatus = mapLeanPaneStatus(statusInfo);
+  const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
   const stale = Boolean(
     latestJob?.targetTextHash &&
     latestJob.targetTextHash !== item.sourceHash &&
@@ -2464,6 +2488,9 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   return {
     ...item,
     status: stale ? "stale" : paneStatus,
+    // Drives the pane's live polling: it keeps refreshing while any item is still
+    // being formalized, then stops once everything settles.
+    inProgress: inProgress && !stale,
     generatedFromSourceHash: latestJob?.targetTextHash || undefined,
     lastGeneratedAt: latestJob?.finishedAt || latestJob?.startedAt || undefined,
     leanDeclarationName,

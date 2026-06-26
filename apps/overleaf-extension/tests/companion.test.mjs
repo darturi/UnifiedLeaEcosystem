@@ -464,6 +464,39 @@ test("lean pane manifest degrades when Lea lookup is unavailable", async () => {
   assert.equal(res.body.diagnostics.at(-1).code, "lea_unconfigured");
 });
 
+test("lean pane manifest flags in-progress items for live polling", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+
+  await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    targetText: "Every open cover has a finite subcover."
+  }, state);
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "unknown");
+  assert.equal(res.body.items[0].inProgress, true);
+});
+
 test("settings clear max spend and reject negative caps", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({
