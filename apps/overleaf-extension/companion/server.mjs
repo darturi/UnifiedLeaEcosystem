@@ -2459,12 +2459,12 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     };
   }
 
-  const paneStatus = mapLeanPaneStatus(statusInfo);
+  const paneStatus = mapLeanPaneStatus(statusInfo, item);
   const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
   const stale = Boolean(
     latestJob?.targetTextHash &&
     latestJob.targetTextHash !== item.sourceHash &&
-    ["stub-generated", "valid", "invalid"].includes(paneStatus)
+    ["stub-generated", "valid", "defined", "disproved", "invalid"].includes(paneStatus)
   );
   const artifact = await readLeanPaneArtifact({
     leaRepoPath: state.settings.leaRepoPath,
@@ -2503,14 +2503,21 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   };
 }
 
-function mapLeanPaneStatus(statusInfo) {
+// Collapse the prover's run statuses onto the pane's artifact-lifecycle vocabulary.
+// Two distinctions matter for product consistency:
+//   - a disproof is a *successful* counterexample, never `invalid` (it is not a
+//     failed run) — see FEATURE-counterexample-workflows.md;
+//   - a formalized definition is `defined`, distinct from a `valid` (proved)
+//     theorem — see FEATURE-overleaf-definition-tags.md.
+function mapLeanPaneStatus(statusInfo, item) {
   const status = String(statusInfo?.status || "").toLowerCase();
   const effective = String(statusInfo?.effectiveStatus || "").toLowerCase();
   if (status === "unformalized" || status === "unavailable") return "missing-stub";
   if (status === "sorry_stub" || effective === "sorry_stub") return "stub-generated";
-  if (status === "formalized") return "valid";
-  if (status === "failed" || status === "disproved") return "invalid";
-  if (status === "in_progress") return "unknown";
+  if (status === "formalized") return item?.leanKind === "def" ? "defined" : "valid";
+  if (status === "disproved") return "disproved";
+  if (status === "failed") return "invalid";
+  if (status === "in_progress") return "in-progress";
   return "unknown";
 }
 

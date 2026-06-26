@@ -10,6 +10,11 @@ const PANE_STATUS_LABELS = {
   "missing-stub": "missing stub",
   "stub-generated": "stub generated",
   valid: "valid",
+  defined: "defined",
+  // A verified disproof is surfaced as a counterexample: a successful result, but
+  // not a proof of the stated theorem (FEATURE-counterexample-workflows.md).
+  disproved: "counterexample",
+  "in-progress": "in progress",
   invalid: "invalid",
   stale: "stale",
   error: "error",

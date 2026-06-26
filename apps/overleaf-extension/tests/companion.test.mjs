@@ -339,11 +339,46 @@ test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => 
   }, state);
 
   assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.body.items.map((item) => item.status), ["stub-generated", "valid"]);
+  // The definition formalizes to `defined`, distinct from a proved theorem's `valid`.
+  assert.deepEqual(res.body.items.map((item) => item.status), ["stub-generated", "defined"]);
   assert.match(res.body.items[0].leanStub, /theorem compactness_criterion/);
   assert.match(res.body.items[0].leanArtifactContent, /sorry/);
   assert.match(res.body.items[1].leanArtifactContent, /def locally_finite_family/);
   assert.equal(res.body.items[1].leanKind, "def");
+});
+
+test("lean pane manifest surfaces a disproof as a counterexample, not a failure", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.disproved = {
+    jobId: "disproved",
+    jobKey: "project-1:theorem:false_claim",
+    status: "disproved",
+    targetKind: "theorem",
+    targetLabel: "false_claim",
+    declarationName: "false_claim",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:false}",
+        "% lea: formalize label=false_claim",
+        "Every group is abelian.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "disproved");
 });
 
 test("lean pane manifest marks generated artifacts stale when source hash changes", async () => {
@@ -493,7 +528,7 @@ test("lean pane manifest flags in-progress items for live polling", async () => 
   }, state);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.items[0].status, "unknown");
+  assert.equal(res.body.items[0].status, "in-progress");
   assert.equal(res.body.items[0].inProgress, true);
 });
 

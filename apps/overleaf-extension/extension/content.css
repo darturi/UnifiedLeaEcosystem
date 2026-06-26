@@ -329,9 +329,17 @@
   white-space: nowrap;
 }
 
-.ol-lean-project-status-valid {
+.ol-lean-project-status-valid,
+.ol-lean-project-status-defined {
   color: var(--ol-green);
   background: var(--ol-green-soft);
+}
+
+/* A verified disproof / counterexample is a successful result, but not a proof of
+   the stated theorem — accent (not green) marks "succeeded, but not what you asked". */
+.ol-lean-project-status-disproved {
+  color: var(--ol-accent-ink);
+  background: var(--ol-accent-soft);
 }
 
 .ol-lean-project-status-stub-generated,
@@ -339,6 +347,11 @@
 .ol-lean-project-status-missing-stub {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
+}
+
+.ol-lean-project-status-in-progress {
+  color: var(--ol-muted);
+  background: var(--ol-line-2);
 }
 
 .ol-lean-project-status-invalid,

@@ -12,6 +12,9 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("missing-stub"), "missing stub");
   assert.equal(formatPaneStatus("stub-generated"), "stub generated");
   assert.equal(formatPaneStatus("valid"), "valid");
+  assert.equal(formatPaneStatus("defined"), "defined");
+  assert.equal(formatPaneStatus("disproved"), "counterexample");
+  assert.equal(formatPaneStatus("in-progress"), "in progress");
   assert.equal(formatPaneStatus("stale"), "stale");
   assert.equal(formatPaneStatus("nonsense"), "unknown");
   assert.equal(formatPaneStatus(undefined), "unknown");

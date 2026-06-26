@@ -17,6 +17,21 @@ extension UI in `extension/content.js` + `content.css`. See
 `docs/FEATURE-overleaf-lean-pane.md` for the V1 spec (read-only; source
 navigation and formalization actions are explicitly deferred to later versions).
 
+## Status (updated 2026-06-26)
+
+- **Done:** items 1–9. All seven implementation adjustments (1–7) and the two
+  status-taxonomy spec adjustments (8 disproved≠failed, 9 defined≠proved) are
+  implemented with tests; the overleaf-extension suite is green.
+- **Item 9 resolution:** the pane keeps its artifact-lifecycle vocabulary and adds
+  distinct `defined`, `disproved` (chip label "counterexample"), and `in-progress`
+  states (rather than adopting the full product run-status vocabulary).
+- **Decided, no code change:** item 10 — do **not** show unmarked environments
+  (the pane stays a marked-target inventory; already the implemented behavior, with
+  a test) and item 13 — **abandon** full Overleaf-tab integration and keep the
+  extension-owned floating pane as the accepted V1 surface. Both recorded in
+  `FEATURE-overleaf-lean-pane.md`.
+- **Open:** items 11 (source navigation) and 12 (formalize from pane).
+
 ---
 
 ## Implementation adjustments
@@ -149,6 +164,11 @@ project-overview ambition.
 **Decision:** confirm whether the pane is a marked-target inventory or a true
 project overview, before building more on top of the current assumption.
 
+**Resolved (2026-06-26):** the pane is a marked-target inventory — unmarked
+environments are **not** shown. This is the already-implemented behavior, so no code
+change is needed; clarified in `FEATURE-overleaf-lean-pane.md` (the spec previously
+read ambiguously as "all labeled environments").
+
 ### 11. Source navigation — **Medium** — *specced V2*
 
 Clicking an item should jump to its block in the Overleaf editor. The manifest
@@ -173,6 +193,10 @@ against a fragile, unstable DOM with no public API.
 **Decision:** invest in tab-style integration, or formally accept the floating pane
 as the intended V1 surface and record that in the spec.
 
+**Resolved (2026-06-26):** accept the floating pane as the intended V1 surface; no
+full Overleaf-tab integration will be pursued. Recorded in
+`FEATURE-overleaf-lean-pane.md`. No code change needed.
+
 ---
 
 ## Suggested sequencing
@@ -183,5 +207,6 @@ as the intended V1 surface and record that in the spec.
    alignment).
 3. **V2 roadmap:** item 11 (source navigation) → item 12 (formalize from pane),
    with item 4 (live refresh) folded in.
-4. **Decide and record:** items 10 and 13 are product/scope calls best resolved
-   before the dependent work above expands.
+4. **Decided and recorded (2026-06-26):** item 10 (marked-target inventory only)
+   and item 13 (keep the floating pane; no Overleaf-tab integration) — both
+   no-code-change decisions captured in `FEATURE-overleaf-lean-pane.md`.
