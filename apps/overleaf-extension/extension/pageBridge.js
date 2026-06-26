@@ -2,6 +2,8 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
 
 (function () {
   let activeView = null;
+  const NAVIGATE_POLL_INTERVAL_MS = 120;
+  const NAVIGATE_POLL_ATTEMPTS = 25; // ~3s for a freshly-opened doc to load
 
   window.addEventListener("UNSTABLE_editor:extensions", (event) => {
     const detail = event.detail || {};
@@ -77,9 +79,184 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
-    if (event.data?.type !== "OL_LEAN_REQUEST_TARGETS") return;
-    if (activeView) publishTargets(activeView);
+    if (event.data?.type === "OL_LEAN_REQUEST_TARGETS") {
+      if (activeView) publishTargets(activeView);
+      return;
+    }
+    if (event.data?.type === "OL_LEAN_NAVIGATE") {
+      navigateToSource(event.data);
+      return;
+    }
   });
+
+  // Item 11: jump the editor to a source block. Navigation is anchored on the item's
+  // marker text (robust to edits and path-format quirks) and falls back to byte
+  // offsets. When the active document's path can't be matched to the item's file, the
+  // current view is still attempted — Overleaf's internal path API is best-effort.
+  function navigateToSource(message) {
+    const activePath = getActiveDocPath();
+    const inActiveFile = !activePath || sameDocPath(activePath, message?.sourceFile);
+
+    if (inActiveFile) {
+      const ok = selectTargetInActiveView(message, { allowOffsets: true });
+      postNavigateResult(ok, ok ? "" : "not_found", message?.sourceFile);
+      return;
+    }
+
+    // A different, known file: open it through Overleaf's IDE API (which also scrolls
+    // to the line natively), then wait for that doc to become active and select the
+    // block precisely.
+    if (openDocByPath(message?.sourceFile, message)) {
+      waitForActiveDoc(message?.sourceFile, message, NAVIGATE_POLL_ATTEMPTS);
+      return;
+    }
+
+    // Couldn't switch files (private API changed/unavailable): only navigate in the
+    // current view if the item's anchor text is actually present, so we never select
+    // an unrelated range from a different file, and tell the UI it failed.
+    const ok = selectTargetInActiveView(message, { allowOffsets: false });
+    postNavigateResult(ok, ok ? "" : "open_failed", message?.sourceFile);
+  }
+
+  // After opening a different file, the new CodeMirror document loads asynchronously.
+  // Poll (bounded) until the target doc is active (or its anchor text is visible),
+  // then select; report failure if it never arrives.
+  function waitForActiveDoc(targetPath, message, attempts) {
+    const activePath = getActiveDocPath();
+    const source = activeView ? activeView.state.doc.toString() : "";
+    const ready = (activePath && sameDocPath(activePath, targetPath)) ||
+      findAnchorIndex(source, message) >= 0;
+
+    if (ready) {
+      const ok = selectTargetInActiveView(message, { allowOffsets: true });
+      postNavigateResult(ok, ok ? "" : "not_found", targetPath);
+      return;
+    }
+    if (attempts <= 0) {
+      postNavigateResult(false, "open_timeout", targetPath);
+      return;
+    }
+    window.setTimeout(() => waitForActiveDoc(targetPath, message, attempts - 1), NAVIGATE_POLL_INTERVAL_MS);
+  }
+
+  function postNavigateResult(ok, reason, sourceFile) {
+    window.postMessage({
+      type: "OL_LEAN_NAVIGATE_RESULT",
+      ok: Boolean(ok),
+      reason: reason || "",
+      sourceFile: sourceFile || ""
+    }, "*");
+  }
+
+  function selectTargetInActiveView(message, { allowOffsets }) {
+    const view = activeView;
+    if (!view) return false;
+    const source = view.state.doc.toString();
+
+    let from = findAnchorIndex(source, message);
+    let to = from;
+    if (from < 0) {
+      if (!allowOffsets) return false;
+      const offsetFrom = Number(message?.from);
+      if (!Number.isFinite(offsetFrom)) return false;
+      from = offsetFrom;
+      const offsetTo = Number(message?.to);
+      to = Number.isFinite(offsetTo) ? offsetTo : offsetFrom;
+    }
+
+    const docLength = view.state.doc.length;
+    const anchor = Math.max(0, Math.min(from, docLength));
+    const head = Math.max(anchor, Math.min(to, docLength));
+    view.dispatch({ selection: { anchor, head }, scrollIntoView: true });
+    if (typeof view.focus === "function") view.focus();
+    return true;
+  }
+
+  // Locate the item's block by its marker text. Prefers the Lea marker
+  // (`% lea: … label=<name>`), then the LaTeX `\label{…}`. Returns -1 if neither is
+  // found (e.g. the item lives in a different file than the one open).
+  function findAnchorIndex(source, message) {
+    const text = String(source || "");
+    const leanLabel = String(message?.leanLabel || "").trim();
+    if (leanLabel) {
+      const markerRe = new RegExp(
+        `%[ \\t]*lea:[^\\n]*\\blabel[ \\t]*=[ \\t]*\\{?${escapeRegExp(leanLabel)}\\b`,
+        "i"
+      );
+      const match = markerRe.exec(text);
+      if (match) return match.index;
+    }
+    const latexLabel = String(message?.latexLabel || "").trim();
+    if (latexLabel) {
+      const index = text.indexOf(`\\label{${latexLabel}}`);
+      if (index >= 0) return index;
+    }
+    return -1;
+  }
+
+  function escapeRegExp(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function sameDocPath(a, b) {
+    const left = normalizeDocPath(a);
+    return left !== "" && left === normalizeDocPath(b);
+  }
+
+  function normalizeDocPath(value) {
+    return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
+  }
+
+  // Open a project file by path through Overleaf's IDE API. Tries the known method
+  // shapes defensively (the private API has shifted across Overleaf versions) and
+  // passes `gotoLine` so Overleaf scrolls to the block natively even before the
+  // anchor-select runs. Returns true if a real open call was made.
+  function openDocByPath(targetPath, message) {
+    try {
+      const ide = window._ide;
+      const ft = ide && ide.fileTreeManager;
+      const em = ide && ide.editorManager;
+      if (!ft || !em) return false;
+      const wanted = normalizeDocPath(targetPath);
+      if (!wanted) return false;
+
+      const entity = resolveEntityByPath(ft, wanted);
+      if (!entity) return false;
+
+      const line = Number(message?.line);
+      const options = Number.isFinite(line) && line > 0 ? { gotoLine: line } : {};
+
+      if (typeof em.openDoc === "function") {
+        em.openDoc(entity, options);
+        return true;
+      }
+      const id = entity._id || entity.id;
+      if (id && typeof em.openDocId === "function") {
+        em.openDocId(id, options);
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  // Resolve a file-tree entity from a path, tolerating the different return shapes
+  // Overleaf's findEntityByPath has used (entity directly, or { entity, ... }) and
+  // an optional leading slash.
+  function resolveEntityByPath(ft, wanted) {
+    if (typeof ft.findEntityByPath !== "function") return null;
+    for (const candidate of [wanted, `/${wanted}`]) {
+      try {
+        const found = ft.findEntityByPath(candidate);
+        const entity = found && (found.entity || found);
+        if (entity && (entity._id || entity.id || entity.name || entity.type)) return entity;
+      } catch {
+        // try the next candidate form
+      }
+    }
+    return null;
+  }
 
   window.setInterval(() => {
     if (activeView) publishTargets(activeView);

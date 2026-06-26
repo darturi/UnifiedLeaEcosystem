@@ -60,6 +60,13 @@
       showDiagnosticPopover(event.data.clientX, event.data.clientY, event.data.diagnostic || event.data.target);
       return;
     }
+    if (event.data?.type === "OL_LEAN_NAVIGATE_RESULT") {
+      if (!event.data.ok && leanPaneStatus) {
+        const file = event.data.sourceFile || "the source file";
+        leanPaneStatus.textContent = `Couldn't open ${file} automatically. Open it in Overleaf, then click "Go to source" again.`;
+      }
+      return;
+    }
     if (event.data?.type === "OL_LEAN_TARGETS_VISIBLE") {
       const nextActiveTex = typeof event.data.activeTex === "string" ? event.data.activeTex : "";
       const nextProjectId = extractOverleafProjectId();
@@ -396,6 +403,10 @@
 
     const actions = document.createElement("div");
     actions.className = "ol-lean-project-detail-actions";
+    actions.appendChild(renderGoToSourceButton(item));
+    if (leanPaneView.canFormalizePaneItem(item)) {
+      actions.appendChild(renderFormalizeButton(item));
+    }
     if (item.leanStub) {
       actions.appendChild(renderCopyButton("Copy stub", item.leanStub));
     }
@@ -416,6 +427,56 @@
       detail.appendChild(empty);
     }
     return detail;
+  }
+
+  // Item 11: jump the Overleaf editor to this item's source block. The actual
+  // scroll/select happens in pageBridge (page world) which owns the CodeMirror view.
+  function renderGoToSourceButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button";
+    button.textContent = "Go to source";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      window.postMessage({
+        type: "OL_LEAN_NAVIGATE",
+        sourceFile: item.sourceFile || "",
+        from: item.sourceStartOffset,
+        to: item.sourceEndOffset,
+        line: item.sourceStartLine,
+        // Text anchors let pageBridge locate the block even when byte offsets have
+        // drifted (edits) or the file path can't be matched exactly.
+        leanLabel: item.label || item.leanDeclarationName || "",
+        latexLabel: item.latexLabel || ""
+      }, "*");
+    });
+    return button;
+  }
+
+  // Item 12: start a formalization run for this item, reusing the same /formalize
+  // path the in-document badge uses, then refresh so the pane reflects in-progress
+  // (polling, from item 4, takes over until it settles).
+  function renderFormalizeButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button ol-lean-formalize-button";
+    button.textContent = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      button.disabled = true;
+      button.textContent = "Starting…";
+      try {
+        await formalize(leanPaneView.paneItemToFormalizeTarget(item));
+        await refreshLeanPaneNow({ background: true });
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "Retry formalize";
+        if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+      }
+    });
+    return button;
   }
 
   function renderCopyButton(label, text) {

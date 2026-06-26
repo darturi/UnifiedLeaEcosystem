@@ -58,3 +58,27 @@ export function overlayActiveTex(files, activePath, activeContent) {
 export function hasInProgressItems(items) {
   return Array.isArray(items) && items.some((item) => item && item.inProgress);
 }
+
+// Pane statuses where starting (or restarting) a formalization run is meaningful.
+// Terminal-good states (valid / defined / disproved) and a running job are excluded.
+const FORMALIZABLE_PANE_STATUSES = new Set([
+  "missing-stub", "stub-generated", "stale", "invalid", "unknown", "error"
+]);
+
+// Whether the pane should offer a Formalize action for an item: it must be a valid
+// marker target, not already running, and in an actionable state.
+export function canFormalizePaneItem(item) {
+  if (!item || !item.formalizable || item.inProgress) return false;
+  return FORMALIZABLE_PANE_STATUSES.has(item.status);
+}
+
+// Shape a manifest item into the target payload the existing /formalize flow expects.
+export function paneItemToFormalizeTarget(item) {
+  return {
+    targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+    targetLabel: item?.leanDeclarationName || item?.label || "",
+    targetText: item?.naturalLanguageLatex || "",
+    targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
+    targetContext: item?.targetContext || ""
+  };
+}

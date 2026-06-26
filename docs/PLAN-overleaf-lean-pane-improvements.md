@@ -19,18 +19,25 @@ navigation and formalization actions are explicitly deferred to later versions).
 
 ## Status (updated 2026-06-26)
 
-- **Done:** items 1–9. All seven implementation adjustments (1–7) and the two
-  status-taxonomy spec adjustments (8 disproved≠failed, 9 defined≠proved) are
+- **Done:** items 1–12. The seven implementation adjustments (1–7), the two
+  status-taxonomy spec adjustments (8 disproved≠failed, 9 defined≠proved), and the
+  two V2 roadmap features (11 source navigation, 12 formalize from pane) are
   implemented with tests; the overleaf-extension suite is green.
 - **Item 9 resolution:** the pane keeps its artifact-lifecycle vocabulary and adds
   distinct `defined`, `disproved` (chip label "counterexample"), and `in-progress`
   states (rather than adopting the full product run-status vocabulary).
+- **Item 11:** "Go to source" posts `OL_LEAN_NAVIGATE`; pageBridge selects/scrolls
+  the CodeMirror range (same-file is precise; a different file is opened
+  best-effort via Overleaf's IDE API, then selected).
+- **Item 12:** the manifest now carries marker metadata (`formalizable`,
+  `targetUses`, `targetContext`); a "Formalize"/"Re-formalize" action on actionable
+  items reuses the existing `/formalize` flow, then live polling (item 4) takes over.
 - **Decided, no code change:** item 10 — do **not** show unmarked environments
   (the pane stays a marked-target inventory; already the implemented behavior, with
   a test) and item 13 — **abandon** full Overleaf-tab integration and keep the
   extension-owned floating pane as the accepted V1 surface. Both recorded in
   `FEATURE-overleaf-lean-pane.md`.
-- **Open:** items 11 (source navigation) and 12 (formalize from pane).
+- **All plan items (1–13) are now resolved.**
 
 ---
 
@@ -176,12 +183,42 @@ already carries `sourceStartOffset` / `sourceStartLine` / `sourceEndLine`, so th
 remaining work is mostly in `pageBridge.js`: scroll/select the CodeMirror range. The
 V1 spec explicitly lists source navigation for "later versions."
 
+**Implemented (2026-06-26):** a "Go to source" button posts `OL_LEAN_NAVIGATE`;
+`pageBridge.js` selects + `scrollIntoView`s the block in the active CodeMirror view.
+Navigation is **anchored on the marker text** (the `% lea: … label=<name>` comment,
+then `\label{…}`) so it survives byte-offset drift and path-format quirks, falling
+back to offsets. An unknown/unmatched active-doc path is treated as "navigate in the
+current view".
+
+**Cross-file navigation:** a known *different* file is opened through Overleaf's IDE
+API — `fileTreeManager.findEntityByPath` (tolerant of both return shapes and a
+leading slash) then `editorManager.openDoc(entity, { gotoLine })`, which scrolls
+natively — after which the bridge **polls until that doc is actually active** (~3s
+budget) and then anchor-selects. If the file can't be resolved/opened, it reports
+`OL_LEAN_NAVIGATE_RESULT { ok:false }` and the pane tells the user to open the file
+manually (it never mis-selects an unrelated range from the wrong file). Covered by
+`pageBridge.test.mjs` (same-file anchor/offset/clamp, cross-file open+select,
+cross-file failure) and `contentActions.test.mjs` (message posted).
+
+> Caveat: cross-file open depends on Overleaf's private `fileTreeManager` /
+> `editorManager` API, which varies by Overleaf version and can't be verified against
+> the live app from the test suite. The code tries the known method shapes
+> defensively and degrades to a clear "open it manually" message rather than failing
+> silently.
+
 ### 12. Formalize-from-pane actions — **Medium/High** — *specced V2*
 
 Let users trigger an autonomous formalization run for a missing or stale item
 directly from the pane. Higher effort because it crosses the
 pane → companion (:31245) → adapter (:8001) boundary and needs run-state feedback in
 the pane (which ties into item 4, live refresh).
+
+**Implemented (2026-06-26):** the manifest now carries `formalizable` /
+`targetUses` / `targetContext` (recovered by re-running the formalize-path parser),
+so a "Formalize"/"Re-formalize" action on actionable items reuses the existing
+`/formalize` flow and then refreshes; live polling (item 4) reflects progress until
+the run settles. Malformed markers are not offered as targets. Covered by
+`leanPaneView.test.mjs`, `leanPaneManifest.test.mjs`, and `contentActions.test.mjs`.
 
 ### 13. True PDF-sibling tab vs. accept the floating aside — **High**
 

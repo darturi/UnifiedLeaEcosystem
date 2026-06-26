@@ -173,9 +173,101 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
 });
 
+test("Lean pane 'Go to source' posts a navigate message with the item's offsets", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          sourceStartOffset: 3,
+          sourceEndOffset: 42,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          leanDeclarationName: "main_theorem",
+          formalizable: true
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Go to source");
+
+  const navigate = harness.postedMessages.find((message) => message.type === "OL_LEAN_NAVIGATE");
+  assert.ok(navigate, "expected an OL_LEAN_NAVIGATE message");
+  assert.equal(navigate.sourceFile, "main.tex");
+  assert.equal(navigate.from, 3);
+  assert.equal(navigate.to, 42);
+});
+
+test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          sourceStartOffset: 0,
+          sourceEndOffset: 42,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          leanDeclarationName: "main_theorem",
+          formalizable: true,
+          targetUses: ["helper_lemma"],
+          targetContext: "Use the helper."
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  const call = harness.fetchCalls.find((entry) => entry.url.includes("/formalize"));
+  assert.ok(call, "expected a POST to /formalize");
+  assert.equal(call.options.method, "POST");
+  const body = JSON.parse(call.options.body);
+  assert.equal(body.targetLabel, "main_theorem");
+  assert.equal(body.targetKind, "theorem");
+  assert.deepEqual(body.targetUses, ["helper_lemma"]);
+  assert.equal(body.targetContext, "Use the helper.");
+});
+
 function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const document = new FakeDocument();
   const timers = [];
+  const fetchCalls = [];
+  const postedMessages = [];
   let nextTimerId = 1;
 
   const window = {
@@ -189,6 +281,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       this._listeners.set(type, listeners);
     },
     postMessage(data) {
+      postedMessages.push(data);
       for (const listener of this._listeners.get("message") || []) {
         listener({ source: window, data });
       }
@@ -224,16 +317,22 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       }
     },
     document,
-    fetch: async (url) => ({
-      ok: true,
-      status: 200,
-      async json() {
-        if (String(url).includes("/lean-pane/manifest")) {
-          return options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
+    fetch: async (url, fetchOptions) => {
+      fetchCalls.push({ url: String(url), options: fetchOptions });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          if (String(url).includes("/lean-pane/manifest")) {
+            return options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
+          }
+          if (String(url).includes("/formalize")) {
+            return { jobId: "job-1", status: "in_progress" };
+          }
+          return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
         }
-        return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
-      }
-    }),
+      };
+    },
     globalThis: null,
     setTimeout(callback) {
       const id = nextTimerId++;
@@ -319,6 +418,15 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(button, "expected Lean pane item header");
       button.click();
     },
+    clickButtonText(text) {
+      const button = document.body
+        .querySelectorAll("button")
+        .find((candidate) => candidate.textContent === text);
+      assert.ok(button, `expected a button labeled "${text}"`);
+      button.click();
+    },
+    fetchCalls,
+    postedMessages,
     bodyText() {
       return document.body.textContent;
     }

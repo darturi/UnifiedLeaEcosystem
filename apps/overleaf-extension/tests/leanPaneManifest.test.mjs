@@ -117,6 +117,48 @@ test("source hashes match the formalize target parser for the same block", () =>
   }
 });
 
+test("carries marker metadata so pane items can be formalized", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:c}",
+        "% lea: formalize label=compactness uses={finite_subcover} context={Start from the cover.}",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}",
+        // A bare \\label with no Lea marker is not a formalize target (and is omitted).
+        "\\begin{lemma}\\label{lem:plain}Plain.\\end{lemma}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 1);
+  const [item] = manifest.items;
+  assert.equal(item.formalizable, true);
+  assert.deepEqual(item.targetUses, ["finite_subcover"]);
+  assert.equal(item.targetContext, "Start from the cover.");
+});
+
+test("marks items with a malformed marker as not formalizable", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        // `define` marker inside a theorem environment is an environment_mismatch:
+        // the pane still lists the item, but it is not a runnable formalize target.
+        "\\begin{theorem}\\label{thm:x}",
+        "% lea: define label=mismatch",
+        "A statement.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].formalizable, false);
+  assert.deepEqual(manifest.items[0].targetUses, []);
+});
+
 test("makes ids unique for duplicate kind+label items", () => {
   const manifest = buildLeanPaneManifest({
     files: [{

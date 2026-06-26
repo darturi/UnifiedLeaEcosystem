@@ -1,5 +1,5 @@
 import { hashTargetText, normalizeTargetText } from "./theoremParser.mjs";
-import { stripLeaTargetText } from "../extension/targetParserCore.mjs";
+import { parseTargets, stripLeaTargetText } from "../extension/targetParserCore.mjs";
 
 const THEOREM_KINDS = new Set(["theorem", "lemma", "proposition", "corollary"]);
 const DEFINITION_KINDS = new Set(["definition"]);
@@ -37,8 +37,13 @@ export function buildLeanPaneManifest({
   for (const sourceFile of orderedPaths) {
     const file = normalizedFiles.find((candidate) => candidate.path === sourceFile);
     if (!file) continue;
+    // Reuse the formalize-path parser to recover full marker metadata (uses/context)
+    // and confirm the marker is a valid formalize target. Keyed by environment
+    // offset, which both parsers compute identically for the same source.
+    const targetByOffset = new Map(parseTargets(file.content).map((target) => [target.from, target]));
     for (const item of parseLeanPaneItemsFromFile(file, items.length)) {
       const documentOrder = items.length;
+      const matchedTarget = targetByOffset.get(item.sourceStartOffset);
       items.push({
         // documentOrder keeps the id unique even when two environments share the
         // same kind+label (a duplicate_label case), so expansion state and DOM
@@ -46,6 +51,10 @@ export function buildLeanPaneManifest({
         id: `${item.kind}:${item.label}:${documentOrder}`,
         overleafProjectId,
         ...item,
+        // formalize-from-pane (item 12): only a valid marker is a runnable target.
+        formalizable: Boolean(matchedTarget),
+        targetUses: matchedTarget?.targetUses || [],
+        targetContext: matchedTarget?.targetContext || "",
         documentOrder
       });
       const seen = labels.get(item.label) || [];

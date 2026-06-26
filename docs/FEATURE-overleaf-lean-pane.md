@@ -17,8 +17,11 @@ extension-owned floating panel, and that is the accepted V1 surface, not a stopg
 It should still read as a project preview rather than a cramped inline widget, but
 no further Overleaf-tab integration is planned.
 
-Version 1 is read-only. Later versions should add source navigation and
-formalization actions.
+Version 1 began read-only. As of 2026-06-26 the pane also supports **source
+navigation** ("Go to source" jumps the editor to an item's block) and
+**formalize-from-pane** (start a run for an actionable item, reusing the existing
+`/formalize` flow with live status polling). See
+`PLAN-overleaf-lean-pane-improvements.md` items 11–12.
 
 ## Goal
 

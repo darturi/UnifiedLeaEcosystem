@@ -94,6 +94,362 @@ test("page bridge positions target badges from badgeFrom", async () => {
   }
 });
 
+test("page bridge selects and scrolls to a source range on OL_LEAN_NAVIGATE", async () => {
+  const source = [
+    "\\begin{theorem}\\label{thm:main}",
+    "% lea: formalize label=main_theorem",
+    "A theorem.",
+    "\\end{theorem}"
+  ].join("\n");
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+  let focused = false;
+
+  globalThis.window = {
+    CodeMirror: null,
+    _ide: {
+      editorManager: { getCurrentDocId: () => "doc-1" },
+      fileTreeManager: {
+        findEntityById: () => ({ _id: "doc-1", path: "main.tex" }),
+        getEntityPath: (entity) => entity.path
+      }
+    },
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage() {},
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?navigate=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() { focused = true; }
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    assert.equal(typeof onMessage, "function");
+    onMessage({
+      source: globalThis.window,
+      data: { type: "OL_LEAN_NAVIGATE", sourceFile: "/main.tex", from: 5, to: 20 }
+    });
+
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].selection, { anchor: 5, head: 20 });
+    assert.equal(dispatched[0].scrollIntoView, true);
+    assert.equal(focused, true);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test("page bridge anchors navigation on the marker label even without an active path", async () => {
+  const source = [
+    "\\begin{theorem}\\label{thm:main}",
+    "% lea: formalize label=main_theorem",
+    "A theorem.",
+    "\\end{theorem}"
+  ].join("\n");
+  const markerIndex = source.indexOf("% lea");
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+
+  globalThis.window = {
+    CodeMirror: null,
+    // No _ide: getActiveDocPath() returns "" — navigation must still work via anchor.
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage() {},
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?anchor=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() {}
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    onMessage({
+      source: globalThis.window,
+      data: {
+        type: "OL_LEAN_NAVIGATE",
+        sourceFile: "main.tex",
+        from: 0,
+        to: 0,
+        leanLabel: "main_theorem",
+        latexLabel: "thm:main"
+      }
+    });
+
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].selection, { anchor: markerIndex, head: markerIndex });
+    assert.equal(dispatched[0].scrollIntoView, true);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test("page bridge opens a different file and selects the block on cross-file navigation", async () => {
+  const source = [
+    "\\begin{theorem}\\label{thm:main}",
+    "% lea: formalize label=main_theorem",
+    "A theorem.",
+    "\\end{theorem}"
+  ].join("\n");
+  const markerIndex = source.indexOf("% lea");
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+  const openCalls = [];
+  const posted = [];
+
+  // Active doc starts as other.tex; opening main.tex (mock) flips the active doc.
+  let currentDocId = "doc-other";
+  const entitiesById = {
+    "doc-other": { _id: "doc-other", path: "other.tex" },
+    "doc-main": { _id: "doc-main", path: "main.tex" }
+  };
+
+  globalThis.window = {
+    CodeMirror: null,
+    _ide: {
+      editorManager: {
+        getCurrentDocId: () => currentDocId,
+        openDoc(entity, options) {
+          openCalls.push({ entity, options });
+          currentDocId = entity._id;
+        }
+      },
+      fileTreeManager: {
+        findEntityById: (id) => entitiesById[id] || null,
+        findEntityByPath: (p) => {
+          const key = String(p).replace(/^\/+/, "");
+          return key === "main.tex" ? entitiesById["doc-main"]
+            : key === "other.tex" ? entitiesById["doc-other"]
+            : null;
+        },
+        getEntityPath: (entity) => entity.path
+      }
+    },
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage(message) { posted.push(message); },
+    setTimeout() { return 0; },
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?xfile=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() {}
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    onMessage({
+      source: globalThis.window,
+      data: {
+        type: "OL_LEAN_NAVIGATE",
+        sourceFile: "main.tex",
+        line: 2,
+        from: 0,
+        to: 0,
+        leanLabel: "main_theorem",
+        latexLabel: "thm:main"
+      }
+    });
+
+    // Opened the right file natively (with gotoLine), then selected the block.
+    assert.equal(openCalls.length, 1);
+    assert.equal(openCalls[0].entity.path, "main.tex");
+    assert.equal(openCalls[0].options.gotoLine, 2);
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].selection, { anchor: markerIndex, head: markerIndex });
+    const result = posted.find((message) => message.type === "OL_LEAN_NAVIGATE_RESULT");
+    assert.ok(result && result.ok === true);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test("page bridge reports failure when a different file cannot be opened", async () => {
+  const source = "\\begin{theorem}\\label{thm:main}\n% lea: formalize label=main_theorem\nX\n\\end{theorem}";
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+  const posted = [];
+
+  globalThis.window = {
+    CodeMirror: null,
+    _ide: {
+      editorManager: { getCurrentDocId: () => "doc-other", openDoc() {} },
+      fileTreeManager: {
+        findEntityById: () => ({ _id: "doc-other", path: "other.tex" }),
+        findEntityByPath: () => null, // target file not resolvable
+        getEntityPath: (entity) => entity.path
+      }
+    },
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage(message) { posted.push(message); },
+    setTimeout() { return 0; },
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?xfilefail=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() {}
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    // Different active file, target not openable, and the anchor IS present in the
+    // current view (last-resort) — but it is a different file, so we must NOT select.
+    onMessage({
+      source: globalThis.window,
+      data: { type: "OL_LEAN_NAVIGATE", sourceFile: "missing.tex", line: 2, leanLabel: "unrelated_label" }
+    });
+
+    assert.equal(dispatched.length, 0);
+    const result = posted.find((message) => message.type === "OL_LEAN_NAVIGATE_RESULT");
+    assert.ok(result && result.ok === false);
+    assert.equal(result.sourceFile, "missing.tex");
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test("page bridge clamps an out-of-range navigation target to the document", async () => {
+  const source = "short";
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+
+  globalThis.window = {
+    CodeMirror: null,
+    _ide: {
+      editorManager: { getCurrentDocId: () => "doc-1" },
+      fileTreeManager: {
+        findEntityById: () => ({ _id: "doc-1", path: "main.tex" }),
+        getEntityPath: (entity) => entity.path
+      }
+    },
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage() {},
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?clamp=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() {}
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    onMessage({
+      source: globalThis.window,
+      data: { type: "OL_LEAN_NAVIGATE", sourceFile: "main.tex", from: 999, to: 2000 }
+    });
+
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].selection, { anchor: source.length, head: source.length });
+  } finally {
+    delete globalThis.window;
+  }
+});
+
 test("page bridge does not publish targets when CodeMirror has no coordinates", async () => {
   const source = [
     "\\begin{theorem}",
