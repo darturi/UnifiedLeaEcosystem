@@ -384,6 +384,65 @@ test("lean pane manifest marks generated artifacts stale when source hash change
   assert.equal(res.body.items[0].generatedFromSourceHash, "old-source-hash");
 });
 
+test("lean pane manifest uses adapter session code for formalized jobs without recorded proof paths", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch(calls, {
+      sessionId: "sess-formalized",
+      sessionDetail: {
+        project_namespace: "Lea.Project",
+        runs: [{ id: "api-run-1", input_tokens: 0, output_tokens: 0, cost_usd: 0 }],
+        code_steps: [{
+          id: "step-1",
+          seq: 1,
+          path: "Compactness.lean",
+          code: "@[simp]\ntheorem compactness_criterion : True := by\n  trivial\n",
+          check_status: "ok"
+        }]
+      }
+    })
+  });
+  state.jobs.formalized = {
+    jobId: "formalized",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaUiBaseUrl: "http://localhost:5173",
+    leaSessionId: "sess-formalized",
+    apiRunId: "api-run-1",
+    projectSlug: "project-1",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "valid");
+  assert.match(res.body.items[0].leanStub, /theorem compactness_criterion : True/);
+  assert.match(res.body.items[0].leanArtifactContent, /trivial/);
+  assert.match(res.body.items[0].leanArtifactPath, /Compactness\.lean/);
+  assert.ok(calls.some((call) => String(call.url).includes("/api/sessions/sess-formalized")));
+});
+
 test("lean pane manifest degrades when Lea lookup is unavailable", async () => {
   const state = await makeState();
 

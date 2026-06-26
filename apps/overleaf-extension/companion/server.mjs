@@ -2447,9 +2447,17 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     statusInfo
   });
   const leanDeclarationName = statusInfo?.declarationName || item.leanDeclarationName;
+  const sessionArtifact = artifact.content
+    ? { relativePath: "", content: "" }
+    : await readLeanPaneArtifactFromSession({
+        state,
+        job: latestJob,
+        declarationName: leanDeclarationName
+      });
+  const effectiveArtifact = artifact.content ? artifact : sessionArtifact;
   const leanStub = statusInfo?.leanStatement || (
-    artifact.content && leanDeclarationName
-      ? extractLeanStatement(artifact.content, leanDeclarationName)
+    effectiveArtifact.content && leanDeclarationName
+      ? extractLeanStatement(effectiveArtifact.content, leanDeclarationName)
       : ""
   );
 
@@ -2460,8 +2468,8 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     lastGeneratedAt: latestJob?.finishedAt || latestJob?.startedAt || undefined,
     leanDeclarationName,
     leanStub: leanStub || undefined,
-    leanArtifactPath: artifact.relativePath || statusInfo?.recordedProofPath || statusInfo?.relativePath || undefined,
-    leanArtifactContent: artifact.content || undefined,
+    leanArtifactPath: effectiveArtifact.relativePath || artifact.relativePath || statusInfo?.recordedProofPath || statusInfo?.relativePath || undefined,
+    leanArtifactContent: effectiveArtifact.content || undefined,
     message: stale
       ? "The LaTeX source changed after this Lean artifact was generated."
       : statusInfo?.message || undefined
@@ -2479,12 +2487,48 @@ function mapLeanPaneStatus(statusInfo) {
   return "unknown";
 }
 
+async function readLeanPaneArtifactFromSession({ state, job, declarationName }) {
+  const sessionId = job?.leaSessionId || job?.recorderSessionId || "";
+  if (!sessionId || !declarationName) {
+    return { relativePath: "", content: "" };
+  }
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(job.leaApiBaseUrl || state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return { relativePath: "", content: "" };
+  }
+  const detail = await fetchApiSessionDetail({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    sessionId
+  });
+  if (!detail.ok || !detail.body || typeof detail.body !== "object") {
+    return { relativePath: "", content: "" };
+  }
+  const leanSteps = (Array.isArray(detail.body.code_steps) ? detail.body.code_steps : [])
+    .filter((step) => step && String(step.path || "").endsWith(".lean") && String(step.code || "").trim())
+    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+  const candidates = leanSteps.filter((step) => containsDeclaration(String(step.code || ""), declarationName));
+  const step = candidates[candidates.length - 1] || (leanSteps.length === 1 ? leanSteps[0] : null);
+  if (!step) {
+    return { relativePath: "", content: "" };
+  }
+  const namespace = detail.body.project_namespace || job.projectNamespace || projectNamespaceFromSlug(job.projectSlug);
+  return {
+    relativePath: proofPathFromProjectStep({ namespace, stepPath: step.path }),
+    content: String(step.code || "")
+  };
+}
+
 async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
-  const relativePath = statusInfo?.recordedProofPath || "";
+  const relativePath = statusInfo?.recordedProofPath ||
+    (String(statusInfo?.relativePath || "").endsWith(".lean") ? statusInfo.relativePath : "");
   let absolutePath = relativePath
     ? buildLeaProofPath({ leaRepoPath, proofPath: relativePath })
     : "";
-  if (!absolutePath && statusInfo?.absolutePath) {
+  if (!absolutePath && String(statusInfo?.absolutePath || "").endsWith(".lean")) {
     const resolvedRepo = path.resolve(leaRepoPath);
     const resolvedCandidate = path.resolve(statusInfo.absolutePath);
     if (resolvedCandidate === resolvedRepo || resolvedCandidate.startsWith(`${resolvedRepo}${path.sep}`)) {
@@ -3129,14 +3173,14 @@ function unescapeHtmlAttribute(value) {
 
 function containsDeclaration(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b`
+    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b`
   );
   return declarationPattern.test(content);
 }
 
 function extractLeanStatement(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
+    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
   );
   const match = content.match(declarationPattern);
   if (!match) return "";
