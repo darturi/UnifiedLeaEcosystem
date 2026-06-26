@@ -28,6 +28,7 @@ import {
   inferLeanDeclarationName,
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
+import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   fetchAdapterSettings,
@@ -397,6 +398,53 @@ export async function handleMirrorTex(payload, state) {
   return { statusCode: 200, body: { ok: true, summary: result.body } };
 }
 
+export async function handleLeanPaneManifest(payload, state) {
+  const manifest = buildLeanPaneManifest({
+    overleafProjectId: payload.overleafProjectId || "unknown",
+    files: Array.isArray(payload.files) ? payload.files : [],
+    activePath: payload.activePath || ""
+  });
+
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: false });
+  if (!leaValidation.ok) {
+    return {
+      statusCode: 200,
+      body: {
+        ...manifest,
+        diagnostics: [
+          ...manifest.diagnostics,
+          {
+            code: leaValidation.error || "lea_lookup_unavailable",
+            message: leaValidation.message || "Lean artifact lookup is unavailable."
+          }
+        ],
+        items: manifest.items.map((item) => ({
+          ...item,
+          status: "unknown",
+          message: leaValidation.message || "Lean artifact lookup is unavailable."
+        }))
+      }
+    };
+  }
+
+  const items = [];
+  for (const item of manifest.items) {
+    items.push(await enrichLeanPaneItem({
+      item,
+      state,
+      overleafProjectId: payload.overleafProjectId || "unknown"
+    }));
+  }
+
+  return {
+    statusCode: 200,
+    body: {
+      ...manifest,
+      items
+    }
+  };
+}
+
 export async function handleUpdateLeaSettings(payload, state) {
   const leaRepoPath = String(payload.leaRepoPath || "").trim();
   const validation = await validateLeaRepo(leaRepoPath);
@@ -692,6 +740,12 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "POST" && url.pathname === "/mirror-tex") {
     const result = await handleMirrorTex(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/manifest") {
+    const result = await handleLeanPaneManifest(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -2344,6 +2398,110 @@ async function getTargetStatus({
     theoremLabel: targetLabel,
     jobs
   });
+}
+
+async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
+  const targetKind = item.leanKind === "def" ? "definition" : "theorem";
+  const targetLabel = String(item.leanDeclarationName || "").trim();
+  if (!isValidLeanIdentifier(targetLabel)) {
+    return {
+      ...item,
+      status: "missing-stub",
+      message: "No Lean declaration name is available for artifact lookup."
+    };
+  }
+
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    targetKind,
+    targetLabel
+  });
+  const latestJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
+
+  let statusInfo;
+  try {
+    statusInfo = await getTargetStatus({
+      leaRepoPath: state.settings.leaRepoPath,
+      overleafProjectId,
+      targetKind,
+      targetLabel,
+      jobs: state.jobs || {}
+    });
+  } catch (error) {
+    return {
+      ...item,
+      status: "error",
+      message: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  const paneStatus = mapLeanPaneStatus(statusInfo);
+  const stale = Boolean(
+    latestJob?.targetTextHash &&
+    latestJob.targetTextHash !== item.sourceHash &&
+    ["stub-generated", "valid", "invalid"].includes(paneStatus)
+  );
+  const artifact = await readLeanPaneArtifact({
+    leaRepoPath: state.settings.leaRepoPath,
+    statusInfo
+  });
+  const leanDeclarationName = statusInfo?.declarationName || item.leanDeclarationName;
+  const leanStub = statusInfo?.leanStatement || (
+    artifact.content && leanDeclarationName
+      ? extractLeanStatement(artifact.content, leanDeclarationName)
+      : ""
+  );
+
+  return {
+    ...item,
+    status: stale ? "stale" : paneStatus,
+    generatedFromSourceHash: latestJob?.targetTextHash || undefined,
+    lastGeneratedAt: latestJob?.finishedAt || latestJob?.startedAt || undefined,
+    leanDeclarationName,
+    leanStub: leanStub || undefined,
+    leanArtifactPath: artifact.relativePath || statusInfo?.recordedProofPath || statusInfo?.relativePath || undefined,
+    leanArtifactContent: artifact.content || undefined,
+    message: stale
+      ? "The LaTeX source changed after this Lean artifact was generated."
+      : statusInfo?.message || undefined
+  };
+}
+
+function mapLeanPaneStatus(statusInfo) {
+  const status = String(statusInfo?.status || "").toLowerCase();
+  const effective = String(statusInfo?.effectiveStatus || "").toLowerCase();
+  if (status === "unformalized" || status === "unavailable") return "missing-stub";
+  if (status === "sorry_stub" || effective === "sorry_stub") return "stub-generated";
+  if (status === "formalized") return "valid";
+  if (status === "failed" || status === "disproved") return "invalid";
+  if (status === "in_progress") return "unknown";
+  return "unknown";
+}
+
+async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
+  const relativePath = statusInfo?.recordedProofPath || "";
+  let absolutePath = relativePath
+    ? buildLeaProofPath({ leaRepoPath, proofPath: relativePath })
+    : "";
+  if (!absolutePath && statusInfo?.absolutePath) {
+    const resolvedRepo = path.resolve(leaRepoPath);
+    const resolvedCandidate = path.resolve(statusInfo.absolutePath);
+    if (resolvedCandidate === resolvedRepo || resolvedCandidate.startsWith(`${resolvedRepo}${path.sep}`)) {
+      absolutePath = resolvedCandidate;
+    }
+  }
+  if (!absolutePath || !existsSync(absolutePath)) {
+    return { relativePath, content: "" };
+  }
+  try {
+    return {
+      relativePath: relativePath || relativeToLeaRepo({ leaRepoPath, absolutePath }),
+      content: await fs.readFile(absolutePath, "utf8")
+    };
+  } catch {
+    return { relativePath, content: "" };
+  }
 }
 
 async function resolveTargetUseStatus({

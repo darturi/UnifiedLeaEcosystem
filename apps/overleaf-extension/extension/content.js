@@ -6,6 +6,7 @@
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
   const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
+  const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -32,6 +33,15 @@
   let latestStatuses = {};
   let badgeLayer = null;
   let settingsButton = null;
+  let leanPaneButton = null;
+  let leanPane = null;
+  let leanPaneBody = null;
+  let leanPaneStatus = null;
+  let leanPaneRefreshTimer = null;
+  let leanPaneExpandedItemIds = new Set();
+  let leanPaneDirty = true;
+  let lastLeanPaneFiles = null;
+  let lastLeanPaneProjectId = "";
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -60,7 +70,9 @@
       renderStatusBadges();
       if (activeTexChanged) {
         texMirrorDirty = true;
+        leanPaneDirty = true;
         scheduleTexMirrorSync();
+        if (leanPane) scheduleLeanPaneRefresh();
       }
       scheduleStatusRefresh();
     }
@@ -69,6 +81,7 @@
   injectPageBridge();
   requestTargetsSoon();
   renderSettingsButton();
+  renderLeanPaneButton();
 
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") closePopover();
@@ -102,6 +115,300 @@
       showSettingsPopover();
     });
     (document.body || document.documentElement).appendChild(settingsButton);
+  }
+
+  function renderLeanPaneButton() {
+    if (leanPaneButton) return;
+    leanPaneButton = document.createElement("button");
+    leanPaneButton.type = "button";
+    leanPaneButton.className = "ol-lean-pane-trigger";
+    leanPaneButton.setAttribute("aria-label", "Open Lean project pane");
+    leanPaneButton.title = "Lean project pane";
+    const mark = document.createElement("span");
+    mark.className = "ol-lean-trigger-mark";
+    mark.textContent = "Π";
+    leanPaneButton.appendChild(mark);
+    leanPaneButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (leanPane) {
+        closeLeanPane();
+      } else {
+        showLeanPane();
+      }
+    });
+    (document.body || document.documentElement).appendChild(leanPaneButton);
+  }
+
+  function showLeanPane() {
+    closePopover();
+    if (leanPane) return;
+    leanPane = document.createElement("aside");
+    leanPane.className = "ol-lean-project-pane";
+    leanPane.setAttribute("role", "complementary");
+    leanPane.setAttribute("aria-label", "Lean project pane");
+
+    const header = document.createElement("div");
+    header.className = "ol-lean-project-pane-header";
+    const titleWrap = document.createElement("div");
+    const kicker = document.createElement("p");
+    kicker.className = "ol-lean-project-pane-kicker";
+    kicker.textContent = "Project preview";
+    const title = document.createElement("h2");
+    title.textContent = "Lean pane";
+    titleWrap.appendChild(kicker);
+    titleWrap.appendChild(title);
+
+    const controls = document.createElement("div");
+    controls.className = "ol-lean-project-pane-controls";
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "ol-lean-icon-button";
+    refresh.title = "Refresh Lean pane";
+    refresh.setAttribute("aria-label", "Refresh Lean pane");
+    refresh.textContent = "↻";
+    refresh.addEventListener("click", () => {
+      refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+    });
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "ol-lean-icon-button";
+    close.title = "Close Lean pane";
+    close.setAttribute("aria-label", "Close Lean pane");
+    close.textContent = "x";
+    close.addEventListener("click", closeLeanPane);
+    controls.appendChild(refresh);
+    controls.appendChild(close);
+    header.appendChild(titleWrap);
+    header.appendChild(controls);
+
+    leanPaneStatus = document.createElement("p");
+    leanPaneStatus.className = "ol-lean-project-pane-status";
+    leanPaneBody = document.createElement("div");
+    leanPaneBody.className = "ol-lean-project-pane-body";
+
+    leanPane.appendChild(header);
+    leanPane.appendChild(leanPaneStatus);
+    leanPane.appendChild(leanPaneBody);
+    document.body.appendChild(leanPane);
+    refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+  }
+
+  function closeLeanPane() {
+    clearTimeout(leanPaneRefreshTimer);
+    leanPaneRefreshTimer = null;
+    if (!leanPane) return;
+    leanPane.remove();
+    leanPane = null;
+    leanPaneBody = null;
+    leanPaneStatus = null;
+  }
+
+  function scheduleLeanPaneRefresh() {
+    clearTimeout(leanPaneRefreshTimer);
+    leanPaneRefreshTimer = setTimeout(() => {
+      refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+    }, LEAN_PANE_REFRESH_DELAY_MS);
+  }
+
+  async function refreshLeanPaneNow({ forceFetch = false } = {}) {
+    if (!leanPane || !leanPaneBody || !leanPaneStatus) return;
+    clearTimeout(leanPaneRefreshTimer);
+    leanPaneRefreshTimer = null;
+    leanPaneStatus.textContent = "Loading project inventory...";
+    leanPaneBody.replaceChildren();
+
+    const projectId = extractOverleafProjectId();
+    const files = await getLeanPaneProjectFiles({ projectId, forceFetch });
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const response = await fetch(`${baseUrl}/lean-pane/manifest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        overleafProjectId: projectId,
+        activePath: latestActiveTexPath || "",
+        files
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    }
+    renderLeanPaneManifest(payload);
+  }
+
+  async function getLeanPaneProjectFiles({ projectId, forceFetch }) {
+    if (!projectId || projectId === "unknown") {
+      return latestActiveTexPath && typeof latestActiveTex === "string"
+        ? [{ path: latestActiveTexPath, content: latestActiveTex }]
+        : [];
+    }
+    const needFetch = forceFetch || leanPaneDirty || !lastLeanPaneFiles || lastLeanPaneProjectId !== projectId;
+    let files;
+    if (needFetch) {
+      files = await collectProjectTexFiles(projectId);
+    } else {
+      files = lastLeanPaneFiles.map((file) => ({ ...file }));
+      overlayActiveTex(files);
+    }
+    lastLeanPaneFiles = files.map((file) => ({ ...file }));
+    lastLeanPaneProjectId = projectId;
+    leanPaneDirty = false;
+    return files;
+  }
+
+  function overlayActiveTex(files) {
+    if (!latestActiveTexPath || typeof latestActiveTex !== "string") return;
+    const wanted = String(latestActiveTexPath).replace(/^\/+/, "");
+    const existing = files.find((file) => file.path === wanted);
+    if (existing) {
+      existing.content = latestActiveTex;
+    }
+  }
+
+  function renderLeanPaneManifest(manifest) {
+    if (!leanPaneBody || !leanPaneStatus) return;
+    const items = Array.isArray(manifest?.items) ? manifest.items : [];
+    leanPaneBody.replaceChildren();
+    leanPaneStatus.textContent = items.length
+      ? `${items.length} labeled item${items.length === 1 ? "" : "s"} from ${manifest.rootFile || "project sources"}.`
+      : "No labeled theorem, lemma, proposition, corollary, or definition environments found.";
+
+    if (Array.isArray(manifest?.diagnostics) && manifest.diagnostics.length > 0) {
+      const diagnostics = document.createElement("div");
+      diagnostics.className = "ol-lean-project-pane-diagnostics";
+      for (const diagnostic of manifest.diagnostics.slice(0, 4)) {
+        const line = document.createElement("p");
+        line.textContent = diagnostic.message || diagnostic.code || "Lean pane diagnostic";
+        diagnostics.appendChild(line);
+      }
+      leanPaneBody.appendChild(diagnostics);
+    }
+
+    for (const item of items) {
+      leanPaneBody.appendChild(renderLeanPaneItem(item));
+    }
+  }
+
+  function renderLeanPaneItem(item) {
+    const expanded = leanPaneExpandedItemIds.has(item.id);
+    const card = document.createElement("section");
+    card.className = `ol-lean-project-item ol-lean-project-item-${item.status || "unknown"}`;
+    card.dataset.itemId = item.id || "";
+
+    const header = document.createElement("button");
+    header.type = "button";
+    header.className = "ol-lean-project-item-header";
+    header.setAttribute("aria-expanded", String(expanded));
+    header.addEventListener("click", () => {
+      if (leanPaneExpandedItemIds.has(item.id)) {
+        leanPaneExpandedItemIds.delete(item.id);
+      } else {
+        leanPaneExpandedItemIds.add(item.id);
+      }
+      card.replaceWith(renderLeanPaneItem(item));
+    });
+
+    const text = document.createElement("span");
+    text.className = "ol-lean-project-item-title";
+    text.textContent = `${capitalize(item.kind)}: ${item.title || item.leanDeclarationName || item.label}`;
+    const meta = document.createElement("span");
+    meta.className = "ol-lean-project-item-meta";
+    meta.textContent = item.label;
+    const chip = document.createElement("span");
+    chip.className = `ol-lean-project-status ol-lean-project-status-${item.status || "unknown"}`;
+    chip.textContent = formatPaneStatus(item.status || "unknown");
+    header.appendChild(text);
+    header.appendChild(meta);
+    header.appendChild(chip);
+    card.appendChild(header);
+
+    const natural = document.createElement("p");
+    natural.className = "ol-lean-project-natural";
+    natural.textContent = item.naturalLanguageRendered || item.naturalLanguageLatex || "";
+    card.appendChild(natural);
+
+    if (item.leanStub) {
+      const stub = document.createElement("pre");
+      stub.className = "ol-lean-project-code";
+      stub.textContent = item.leanStub;
+      card.appendChild(stub);
+    } else {
+      const missing = document.createElement("p");
+      missing.className = "ol-lean-project-missing";
+      missing.textContent = "No Lean stub has been generated yet.";
+      card.appendChild(missing);
+    }
+
+    if (expanded) {
+      card.appendChild(renderLeanPaneItemDetail(item));
+    }
+    return card;
+  }
+
+  function renderLeanPaneItemDetail(item) {
+    const detail = document.createElement("div");
+    detail.className = "ol-lean-project-detail";
+    const meta = document.createElement("p");
+    meta.textContent = [
+      item.sourceFile,
+      item.sourceStartLine ? `lines ${item.sourceStartLine}-${item.sourceEndLine || item.sourceStartLine}` : "",
+      item.leanDeclarationName ? `Lean: ${item.leanDeclarationName}` : "",
+      item.leanArtifactPath ? `Artifact: ${item.leanArtifactPath}` : ""
+    ].filter(Boolean).join(" · ");
+    detail.appendChild(meta);
+
+    const actions = document.createElement("div");
+    actions.className = "ol-lean-project-detail-actions";
+    if (item.leanStub) {
+      actions.appendChild(renderCopyButton("Copy stub", item.leanStub));
+    }
+    if (item.leanArtifactContent) {
+      actions.appendChild(renderCopyButton("Copy artifact", item.leanArtifactContent));
+    }
+    if (actions.children.length > 0) detail.appendChild(actions);
+
+    if (item.leanArtifactContent) {
+      const artifact = document.createElement("pre");
+      artifact.className = "ol-lean-project-artifact";
+      artifact.textContent = item.leanArtifactContent;
+      detail.appendChild(artifact);
+    } else {
+      const empty = document.createElement("p");
+      empty.className = "ol-lean-project-missing";
+      empty.textContent = "No generated Lean artifact is available for this item.";
+      detail.appendChild(empty);
+    }
+    return detail;
+  }
+
+  function renderCopyButton(label, text) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button";
+    button.textContent = label;
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(text);
+        button.textContent = "Copied";
+      } catch {
+        button.textContent = "Copy failed";
+      }
+    });
+    return button;
+  }
+
+  function renderLeanPaneError(error) {
+    if (!leanPaneBody || !leanPaneStatus) return;
+    leanPaneStatus.textContent = "Could not load Lean pane.";
+    leanPaneBody.replaceChildren();
+    const message = document.createElement("p");
+    message.className = "ol-lean-project-pane-error";
+    message.textContent = normalizeErrorMessage(error);
+    leanPaneBody.appendChild(message);
   }
 
   function showTargetPopover(clientX, clientY, target) {
@@ -843,6 +1150,30 @@
       default:
         return "checking";
     }
+  }
+
+  function formatPaneStatus(status) {
+    switch (status) {
+      case "missing-stub":
+        return "missing stub";
+      case "stub-generated":
+        return "stub generated";
+      case "valid":
+        return "valid";
+      case "invalid":
+        return "invalid";
+      case "stale":
+        return "stale";
+      case "error":
+        return "error";
+      default:
+        return "unknown";
+    }
+  }
+
+  function capitalize(value) {
+    const text = String(value || "");
+    return text ? `${text.slice(0, 1).toUpperCase()}${text.slice(1)}` : "";
   }
 
   function inProgressMessage(statusInfo, target = null) {

@@ -97,7 +97,83 @@ test("definition success renders a defined badge", async () => {
   assert.equal(harness.hasButtonText("formalized"), false);
 });
 
-function createContentHarness(statusInfo, theoremPatch = {}) {
+test("Lean pane trigger opens a project pane and renders manifest items", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:thm:main",
+          kind: "theorem",
+          label: "thm:main",
+          title: "Main theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 3,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.match(harness.bodyText(), /Lean pane/);
+  assert.match(harness.bodyText(), /Main theorem/);
+  assert.match(harness.bodyText(), /missing stub/);
+});
+
+test("Lean pane expanded detail shows copy actions only for generated content", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:thm:main",
+          kind: "theorem",
+          label: "thm:main",
+          status: "valid",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 3,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          leanDeclarationName: "main_theorem",
+          leanStub: "theorem main_theorem : True",
+          leanArtifactPath: "workspace/proofs/Main.lean",
+          leanArtifactContent: "theorem main_theorem : True := by\n  trivial\n"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  harness.clickFirstPaneItem();
+
+  assert.equal(harness.hasButtonText("Copy stub"), true);
+  assert.equal(harness.hasButtonText("Copy artifact"), true);
+  assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
+});
+
+function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const document = new FakeDocument();
   const timers = [];
   let nextTimerId = 1;
@@ -105,7 +181,7 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
   const window = {
     innerWidth: 1024,
     innerHeight: 768,
-    location: { pathname: "/project/project-1" },
+    location: { pathname: options.locationPath || "/project/project-1" },
     _listeners: new Map(),
     addEventListener(type, listener) {
       const listeners = this._listeners.get(type) || [];
@@ -148,11 +224,14 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
       }
     },
     document,
-    fetch: async () => ({
+    fetch: async (url) => ({
       ok: true,
       status: 200,
       async json() {
-          return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
+        if (String(url).includes("/lean-pane/manifest")) {
+          return options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
+        }
+        return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
       }
     }),
     globalThis: null,
@@ -219,6 +298,16 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
         .querySelectorAll("button")
         .some((button) => button.textContent === text);
     },
+    clickPaneTrigger() {
+      const button = document.body.querySelector(".ol-lean-pane-trigger");
+      assert.ok(button, "expected Lean pane trigger");
+      button.click();
+    },
+    clickFirstPaneItem() {
+      const button = document.body.querySelector(".ol-lean-project-item-header");
+      assert.ok(button, "expected Lean pane item header");
+      button.click();
+    },
     bodyText() {
       return document.body.textContent;
     }
@@ -227,6 +316,10 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
 
 async function flushPromises() {
   for (let i = 0; i < 8; i += 1) {
+    await Promise.resolve();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  for (let i = 0; i < 4; i += 1) {
     await Promise.resolve();
   }
 }
@@ -270,6 +363,7 @@ class FakeElement {
     this.dataset = {};
     this.style = {};
     this.attributes = {};
+    this._listeners = new Map();
     this.hidden = false;
     this._textContent = "";
     this._className = "";
@@ -352,7 +446,33 @@ class FakeElement {
     this.parentNode = null;
   }
 
-  addEventListener() {}
+  addEventListener(type, listener) {
+    const listeners = this._listeners.get(type) || [];
+    listeners.push(listener);
+    this._listeners.set(type, listeners);
+  }
+
+  click() {
+    for (const listener of this._listeners.get("click") || []) {
+      listener({
+        preventDefault() {},
+        stopPropagation() {},
+        clientX: 0,
+        clientY: 0,
+        target: this
+      });
+    }
+  }
+
+  replaceWith(next) {
+    if (!this.parentNode) return;
+    const siblings = this.parentNode.children;
+    const index = siblings.indexOf(this);
+    if (index === -1) return;
+    next.parentNode = this.parentNode;
+    siblings[index] = next;
+    this.parentNode = null;
+  }
 
   setAttribute(name, value) {
     this.attributes[name] = String(value);

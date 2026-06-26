@@ -11,6 +11,7 @@ import {
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
+  handleLeanPaneManifest,
   handleMirrorTex,
   handleStub,
   handleUpdateLeaSettings,
@@ -265,6 +266,143 @@ test("mirror-tex rejects a missing project id and respects the disable toggle", 
   );
   assert.equal(disabled.statusCode, 400);
   assert.equal(disabled.body.error, "tex_mirror_disabled");
+});
+
+test("lean pane manifest returns missing-stub items without artifacts", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    activePath: "main.tex",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\documentclass{article}",
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items.length, 1);
+  assert.equal(res.body.items[0].label, "compactness_criterion");
+  assert.equal(res.body.items[0].latexLabel, "thm:compactness");
+  assert.equal(res.body.items[0].status, "missing-stub");
+  assert.equal(res.body.items[0].leanDeclarationName, "compactness_criterion");
+});
+
+test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  await writeLeaProjectProof(
+    leaRepo,
+    path.join("workspace", "proofs", "Lea", "Project", "compactness.lean"),
+    "theorem compactness_criterion : True := by\n  sorry\n"
+  );
+  await writeLeaProjectProof(
+    leaRepo,
+    path.join("workspace", "proofs", "Lea", "Project", "locally_finite.lean"),
+    "def locally_finite_family : Prop := True\n"
+  );
+  await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
+    {
+      theoremName: "compactness_criterion",
+      proofPath: path.join("workspace", "proofs", "Lea", "Project", "compactness.lean")
+    },
+    {
+      theoremName: "locally_finite_family",
+      proofPath: path.join("workspace", "proofs", "Lea", "Project", "locally_finite.lean")
+    }
+  ]);
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    activePath: "main.tex",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\documentclass{article}",
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}",
+        "\\begin{definition}\\label{def:locally-finite}",
+        "% lea: define label=locally_finite_family",
+        "A family is locally finite if every point has a neighborhood meeting finitely many members.",
+        "\\end{definition}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.items.map((item) => item.status), ["stub-generated", "valid"]);
+  assert.match(res.body.items[0].leanStub, /theorem compactness_criterion/);
+  assert.match(res.body.items[0].leanArtifactContent, /sorry/);
+  assert.match(res.body.items[1].leanArtifactContent, /def locally_finite_family/);
+  assert.equal(res.body.items[1].leanKind, "def");
+});
+
+test("lean pane manifest marks generated artifacts stale when source hash changes", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project", "compactness.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  trivial\n");
+  state.jobs.stale = {
+    jobId: "stale",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    recordedProofPath: proofPath,
+    targetTextHash: "old-source-hash",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "The source has changed.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "stale");
+  assert.equal(res.body.items[0].generatedFromSourceHash, "old-source-hash");
+});
+
+test("lean pane manifest degrades when Lea lookup is unavailable", async () => {
+  const state = await makeState();
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:main}",
+        "% lea: formalize label=main_theorem",
+        "A.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "unknown");
+  assert.equal(res.body.diagnostics.at(-1).code, "lea_unconfigured");
 });
 
 test("settings clear max spend and reject negative caps", async () => {
