@@ -114,7 +114,8 @@
   border-color: var(--ol-accent);
 }
 
-.ol-lean-status-formalized {
+.ol-lean-status-formalized,
+.ol-lean-status-defined {
   color: var(--ol-green);
   background: var(--ol-green-soft);
   border-color: var(--ol-green);
@@ -426,7 +427,8 @@
   background: var(--ol-accent-soft);
 }
 
-.ol-lean-status-chip-formalized {
+.ol-lean-status-chip-formalized,
+.ol-lean-status-chip-defined {
   color: var(--ol-green);
   background: var(--ol-green-soft);
 }

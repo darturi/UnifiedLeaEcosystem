@@ -48,6 +48,7 @@ from lea.interface import (
     run_events,
 )
 
+from .artifacts import classify_lean_artifact
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
 from . import projects, store, uploads
@@ -190,11 +191,22 @@ _FINISH_STATUS = {
 
 _COMPLETED_RESULTS = {"proved", "disproved", "needs_review"}
 
-
 def _finished_status(ev: Finished) -> str:
     if ev.reason == "completed":
         return ev.result_kind if ev.result_kind in _COMPLETED_RESULTS else "proved"
     return _FINISH_STATUS.get(ev.reason, "failed")
+
+
+def _completed_artifact_result(ev: Finished, artifact_kind: str) -> tuple[str, str | None]:
+    """Return persisted run status + result kind for a completed Lea artifact."""
+    if ev.reason != "completed":
+        return _finished_status(ev), None
+    if ev.result_kind == "disproved":
+        return "disproved", "disproved"
+    if artifact_kind == "definition":
+        return "proved", "defined"
+    result_kind = ev.result_kind if ev.result_kind in _COMPLETED_RESULTS else "proved"
+    return result_kind, result_kind
 
 
 def _final_text_for_result(ev: Finished) -> str:
@@ -358,6 +370,7 @@ def run_lea(context: RunnerContext) -> None:
     # proof write (D33): the latter is a canvas snapshot via FileChanged; the former
     # is committed quietly and refreshes the project graph, never the canvas.
     last_write_path: str | None = None
+    checked_artifact_kind = "unknown"
     usage = _UsageByTurn()
     last_persisted: str | None = None
     final_status = "failed"
@@ -457,8 +470,11 @@ def run_lea(context: RunnerContext) -> None:
                 if step_id:
                     updated = store.set_code_step_check(step_id, ev.status, ev.detail)
                     if updated:
+                        code = gs.snapshot(repo_key, updated["commit_sha"], rel)
+                        if ev.status == "ok":
+                            checked_artifact_kind = classify_lean_artifact(code)
                         emit(events, "code_step", {
-                            **updated, "code": gs.snapshot(repo_key, updated["commit_sha"], rel),
+                            **updated, "code": code,
                         })
                 emit(events, "status", {
                     "status": "lean_check", "message": f"lean_check: {ev.status}",
@@ -495,15 +511,14 @@ def run_lea(context: RunnerContext) -> None:
                 flush_narration()
                 final_text = _final_text_for_result(ev)
                 persist_assistant(final_text)
-                final_status = _finished_status(ev)
-                result_kind = ev.result_kind if ev.result_kind in _COMPLETED_RESULTS else None
+                final_status, result_kind = _completed_artifact_result(ev, checked_artifact_kind)
                 final_result_kind = result_kind
-                final_result_detail = ev.result_detail
+                final_result_detail = None if result_kind == "defined" else ev.result_detail
                 store.update_run(
                     run_id, final_status, final_text=final_text,
                     input_tokens=ev.usage.input_tokens, output_tokens=ev.usage.output_tokens,
                     cost_usd=ev.cost,
-                    result_kind=result_kind, result_detail=ev.result_detail,
+                    result_kind=result_kind, result_detail=final_result_detail,
                 )
                 store.replace_run_usage_breakdown(run_id, usage.rows())
                 # Persist the faithful conversation for the next activation to replay

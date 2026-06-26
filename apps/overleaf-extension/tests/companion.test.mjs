@@ -617,12 +617,12 @@ test("completed formalization status keeps Lea UI session link", async () => {
   });
   state.jobs.completed_link = {
     jobId: "completed_link",
-    jobKey: "project-1:linked_done_test",
+    jobKey: "project-1:theorem:linked_done_test",
     status: "success",
     overleafProjectId: "project-1",
     projectId: "project-1",
     projectSlug: "project-1",
-    theoremLabel: "linked_done_test",
+    targetLabel: "linked_done_test",
     declarationName: "linked_done_test",
     recorderSessionId: "sess-done",
     recorderRunId: "run-done",
@@ -633,13 +633,13 @@ test("completed formalization status keeps Lea UI session link", async () => {
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "linked_done_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "linked_done_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.linked_done_test.status, "formalized");
-  assert.equal(statuses.body.statuses.linked_done_test.leaSessionId, "sess-done");
-  assert.equal(statuses.body.statuses.linked_done_test.leaSessionUrl, "http://localhost:5173/?session=sess-done");
+  assert.equal(statuses.body.statuses["theorem:linked_done_test"].status, "formalized");
+  assert.equal(statuses.body.statuses["theorem:linked_done_test"].leaSessionId, "sess-done");
+  assert.equal(statuses.body.statuses["theorem:linked_done_test"].leaSessionUrl, "http://localhost:5173/?session=sess-done");
 });
 
 test("in-progress status links Lea UI session from leaSessionId (no recorder)", async () => {
@@ -650,12 +650,12 @@ test("in-progress status links Lea UI session from leaSessionId (no recorder)", 
   });
   state.jobs.active_link = {
     jobId: "active_link",
-    jobKey: "project-1:in_progress_test",
+    jobKey: "project-1:theorem:in_progress_test",
     status: "in_progress",
     overleafProjectId: "project-1",
     projectId: "project-1",
     projectSlug: "project-1",
-    theoremLabel: "in_progress_test",
+    targetLabel: "in_progress_test",
     declarationName: "in_progress_test",
     // Adapter session id from run start; recorder CLI never ran.
     leaSessionId: "sess-running",
@@ -666,13 +666,13 @@ test("in-progress status links Lea UI session from leaSessionId (no recorder)", 
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "in_progress_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "in_progress_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.in_progress_test.status, "in_progress");
-  assert.equal(statuses.body.statuses.in_progress_test.leaSessionId, "sess-running");
-  assert.equal(statuses.body.statuses.in_progress_test.leaSessionUrl, "http://localhost:5173/?session=sess-running");
+  assert.equal(statuses.body.statuses["theorem:in_progress_test"].status, "in_progress");
+  assert.equal(statuses.body.statuses["theorem:in_progress_test"].leaSessionId, "sess-running");
+  assert.equal(statuses.body.statuses["theorem:in_progress_test"].leaSessionUrl, "http://localhost:5173/?session=sess-running");
 });
 
 test("statuses report saved sorry stubs", async () => {
@@ -691,12 +691,12 @@ test("statuses report saved sorry stubs", async () => {
 
   const result = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "saved_stub_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "saved_stub_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(result.statusCode, 200);
-  assert.equal(result.body.statuses.saved_stub_test.status, "sorry_stub");
-  assert.equal(result.body.statuses.saved_stub_test.leanStatement, "theorem saved_stub_test : True");
+  assert.equal(result.body.statuses["theorem:saved_stub_test"].status, "sorry_stub");
+  assert.equal(result.body.statuses["theorem:saved_stub_test"].leanStatement, "theorem saved_stub_test : True");
 });
 
 test("statuses report active Lea jobs as in progress", async () => {
@@ -709,17 +709,18 @@ test("statuses report active Lea jobs as in progress", async () => {
 
   await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "active_status_test",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "active_status_test",
+    targetText: "A theorem."
   }, state);
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "active_status_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "active_status_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.active_status_test.status, "in_progress");
+  assert.equal(statuses.body.statuses["theorem:active_status_test"].status, "in_progress");
 });
 
 test("statuses include turn progress for active Lea jobs", async () => {
@@ -736,14 +737,15 @@ test("statuses include turn progress for active Lea jobs", async () => {
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "active_progress_test",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "active_progress_test",
+    targetText: "A theorem."
   }, state);
 
   await waitFor(() => state.jobs[result.body.jobId]?.leaCurrentTurn === 6);
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "active_progress_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "active_progress_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
@@ -765,19 +767,20 @@ test("active Lea job omits turn progress when current turn is unknown or invalid
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "unknown_turn_test",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "unknown_turn_test",
+    targetText: "A theorem."
   }, state);
 
   await waitFor(() => state.jobs[result.body.jobId]?.status === "in_progress");
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "unknown_turn_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "unknown_turn_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.unknown_turn_test.status, "in_progress");
-  assert.equal(statuses.body.statuses.unknown_turn_test.turnProgress, undefined);
+  assert.equal(statuses.body.statuses["theorem:unknown_turn_test"].status, "in_progress");
+  assert.equal(statuses.body.statuses["theorem:unknown_turn_test"].turnProgress, undefined);
 });
 
 test("statuses report formalized proofs recorded in Lea project markdown", async () => {
@@ -797,9 +800,9 @@ test("statuses report formalized proofs recorded in Lea project markdown", async
 
   const configured = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "project_markdown_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "project_markdown_test", targetText: "A theorem." }]
   }, state);
-  const status = configured.body.statuses.project_markdown_test;
+  const status = configured.body.statuses["theorem:project_markdown_test"];
   assert.equal(configured.statusCode, 200);
   assert.equal(status.status, "formalized");
   assert.equal(status.leanStatement, "lemma project_markdown_test : True");
@@ -839,8 +842,9 @@ test("formalize maps an Overleaf label to the Lean artifact Lea records", async 
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "epsilon_one",
-      theoremText: [
+      targetKind: "theorem",
+    targetLabel: "epsilon_one",
+      targetText: [
         "Formalize this theorem as part of project epsilon.",
         "Theorem name: even_square_of_even",
         "Lean signature:",
@@ -853,20 +857,20 @@ test("formalize maps an Overleaf label to the Lean artifact Lea records", async 
     assert.match(calls[0].body.task, /use that name/);
     assert.match(calls[0].body.task, /no sorry\/admit in theorem even_square_of_even/);
     const job = state.jobs[result.body.jobId];
-    assert.equal(job.theoremLabel, "epsilon_one");
+    assert.equal(job.targetLabel, "epsilon_one");
     assert.equal(job.declarationName, "even_square_of_even");
     assert.equal(job.recordedProofPath, proofPath);
     assert.equal(job.moduleName, "Lea.Project1.even_square_of_even");
 
     const statuses = await handleGetStatuses({
       overleafProjectId: "project-1",
-      theorems: [{ theoremLabel: "epsilon_one", theoremText: "A theorem." }]
+      targets: [{ targetKind: "theorem", targetLabel: "epsilon_one", targetText: "A theorem." }]
     }, state);
 
-    const status = statuses.body.statuses.epsilon_one;
+    const status = statuses.body.statuses["theorem:epsilon_one"];
     assert.equal(statuses.statusCode, 200);
     assert.equal(status.status, "formalized");
-    assert.equal(status.theoremLabel, "epsilon_one");
+    assert.equal(status.targetLabel, "epsilon_one");
     assert.equal(status.declarationName, "even_square_of_even");
     assert.equal(status.recordedProofPath, proofPath);
     assert.equal(status.leanStatement, "theorem even_square_of_even : True");
@@ -908,7 +912,7 @@ test("formalize includes resolved theorem uses in the Lea prompt", async () => {
     });
     state.jobs["epsilon-one-job"] = {
       jobId: "epsilon-one-job",
-      jobKey: "project-1:epsilon_one",
+      jobKey: "project-1:theorem:epsilon_one",
       status: "formalized",
       declarationName: "even_square_of_even",
       recordedProofPath: dependencyProofPath,
@@ -919,13 +923,14 @@ test("formalize includes resolved theorem uses in the Lea prompt", async () => {
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "epsilon_two",
-      theoremText: [
+      targetKind: "theorem",
+    targetLabel: "epsilon_two",
+      targetText: [
         "Theorem name: even_square_of_double_plus_double",
         "Lean signature:",
         "theorem even_square_of_double_plus_double : True := by"
       ].join("\n"),
-      theoremUses: ["epsilon_one"]
+      targetUses: ["epsilon_one"]
     }, state);
 
     await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
@@ -934,8 +939,7 @@ test("formalize includes resolved theorem uses in the Lea prompt", async () => {
       calls[0].body.task,
       new RegExp(`To formalize the theorem make use of the even_square_of_even theorem at ${escapeRegExp(path.join(leaRepo, dependencyProofPath))}\\.`)
     );
-    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
-      theoremLabel: "epsilon_one",
+    assert.deepEqual(state.jobs[result.body.jobId].targetUses, [{ targetKind: "theorem", targetLabel: "epsilon_one",
       declarationName: "even_square_of_even",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
@@ -973,7 +977,7 @@ test("formalize includes multiple resolved theorem uses in source order", async 
     });
     state.jobs["first-support-job"] = {
       jobId: "first-support-job",
-      jobKey: "project-1:first_label",
+      jobKey: "project-1:theorem:first_label",
       status: "formalized",
       declarationName: "first_support",
       recordedProofPath: firstProofPath,
@@ -982,7 +986,7 @@ test("formalize includes multiple resolved theorem uses in source order", async 
     };
     state.jobs["second-support-job"] = {
       jobId: "second-support-job",
-      jobKey: "project-1:second_label",
+      jobKey: "project-1:theorem:second_label",
       status: "formalized",
       declarationName: "second_support",
       recordedProofPath: secondProofPath,
@@ -992,10 +996,11 @@ test("formalize includes multiple resolved theorem uses in source order", async 
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "multi_use_target",
-      theoremText: "theorem multi_use_target : True := by",
-      theoremUses: ["first_label", "second_label"],
-      theoremContext: "Reuse the support lemmas in the listed order."
+      targetKind: "theorem",
+    targetLabel: "multi_use_target",
+      targetText: "theorem multi_use_target : True := by",
+      targetUses: ["first_label", "second_label"],
+      targetContext: "Reuse the support lemmas in the listed order."
     }, state);
 
     await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
@@ -1048,9 +1053,10 @@ test("formalize allows theorem uses backed by sorry stubs", async () => {
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "uses_stub_support",
-      theoremText: "theorem uses_stub_support : True := by",
-      theoremUses: ["stub_support"]
+      targetKind: "theorem",
+    targetLabel: "uses_stub_support",
+      targetText: "theorem uses_stub_support : True := by",
+      targetUses: ["stub_support"]
     }, state);
 
     assert.equal(result.statusCode, 200);
@@ -1059,16 +1065,14 @@ test("formalize allows theorem uses backed by sorry stubs", async () => {
       calls[0].body.task,
       new RegExp(`To formalize the theorem make use of the stub_support theorem at ${escapeRegExp(path.join(leaRepo, dependencyProofPath))}\\.`)
     );
-    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
-      theoremLabel: "stub_support",
+    assert.deepEqual(state.jobs[result.body.jobId].targetUses, [{ targetKind: "theorem", targetLabel: "stub_support",
       declarationName: "stub_support",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
       moduleName: "Lea.Project1.stub_support",
       status: "sorry_stub"
     }]);
-    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, [{
-      theoremLabel: "stub_support",
+    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, [{ targetKind: "theorem", targetLabel: "stub_support",
       declarationName: "stub_support",
       moduleName: "Lea.Project1.stub_support",
       relativePath: dependencyProofPath,
@@ -1076,26 +1080,25 @@ test("formalize allows theorem uses backed by sorry stubs", async () => {
     }]);
     const statuses = await handleGetStatuses({
       overleafProjectId: "project-1",
-      theorems: [{ theoremLabel: "uses_stub_support", theoremText: "A theorem." }]
+      targets: [{ targetKind: "theorem", targetLabel: "uses_stub_support", targetText: "A theorem." }]
     }, state);
-    assert.equal(statuses.body.statuses.uses_stub_support.status, "formalized");
-    assert.deepEqual(statuses.body.statuses.uses_stub_support.stubbedTheoremUses, [{
-      theoremLabel: "stub_support",
+    assert.equal(statuses.body.statuses["theorem:uses_stub_support"].status, "formalized");
+    assert.deepEqual(statuses.body.statuses["theorem:uses_stub_support"].stubbedTheoremUses, [{ targetKind: "theorem", targetLabel: "stub_support",
       declarationName: "stub_support",
       moduleName: "Lea.Project1.stub_support",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath)
     }]);
-    assert.equal(statuses.body.statuses.uses_stub_support.hasStubbedTheoremUses, true);
+    assert.equal(statuses.body.statuses["theorem:uses_stub_support"].hasStubbedTheoremUses, true);
 
     await writeLeaProjectProof(leaRepo, dependencyProofPath, "theorem stub_support : True := by\n  trivial\n");
     const refreshedStatuses = await handleGetStatuses({
       overleafProjectId: "project-1",
-      theorems: [{ theoremLabel: "uses_stub_support", theoremText: "A theorem." }]
+      targets: [{ targetKind: "theorem", targetLabel: "uses_stub_support", targetText: "A theorem." }]
     }, state);
-    assert.equal(refreshedStatuses.body.statuses.uses_stub_support.status, "formalized");
-    assert.equal(refreshedStatuses.body.statuses.uses_stub_support.stubbedTheoremUses, undefined);
-    assert.equal(refreshedStatuses.body.statuses.uses_stub_support.hasStubbedTheoremUses, undefined);
+    assert.equal(refreshedStatuses.body.statuses["theorem:uses_stub_support"].status, "formalized");
+    assert.equal(refreshedStatuses.body.statuses["theorem:uses_stub_support"].stubbedTheoremUses, undefined);
+    assert.equal(refreshedStatuses.body.statuses["theorem:uses_stub_support"].hasStubbedTheoremUses, undefined);
   } finally {
     restorePath();
   }
@@ -1138,9 +1141,10 @@ test("formalized theorem has no stubbed-use warning when stub support is not imp
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "does_not_import_stub_support",
-      theoremText: "theorem does_not_import_stub_support : True := by",
-      theoremUses: ["unused_stub_support"]
+      targetKind: "theorem",
+    targetLabel: "does_not_import_stub_support",
+      targetText: "theorem does_not_import_stub_support : True := by",
+      targetUses: ["unused_stub_support"]
     }, state);
 
     assert.equal(result.statusCode, 200);
@@ -1148,11 +1152,11 @@ test("formalized theorem has no stubbed-use warning when stub support is not imp
     assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, []);
     const statuses = await handleGetStatuses({
       overleafProjectId: "project-1",
-      theorems: [{ theoremLabel: "does_not_import_stub_support", theoremText: "A theorem." }]
+      targets: [{ targetKind: "theorem", targetLabel: "does_not_import_stub_support", targetText: "A theorem." }]
     }, state);
-    assert.equal(statuses.body.statuses.does_not_import_stub_support.status, "formalized");
-    assert.equal(statuses.body.statuses.does_not_import_stub_support.stubbedTheoremUses, undefined);
-    assert.equal(statuses.body.statuses.does_not_import_stub_support.hasStubbedTheoremUses, undefined);
+    assert.equal(statuses.body.statuses["theorem:does_not_import_stub_support"].status, "formalized");
+    assert.equal(statuses.body.statuses["theorem:does_not_import_stub_support"].stubbedTheoremUses, undefined);
+    assert.equal(statuses.body.statuses["theorem:does_not_import_stub_support"].hasStubbedTheoremUses, undefined);
   } finally {
     restorePath();
   }
@@ -1195,16 +1199,16 @@ test("formalized theorem has no stubbed-use warning when imported support is for
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "imports_formalized_support",
-      theoremText: "theorem imports_formalized_support : True := by",
-      theoremUses: ["formalized_support"]
+      targetKind: "theorem",
+    targetLabel: "imports_formalized_support",
+      targetText: "theorem imports_formalized_support : True := by",
+      targetUses: ["formalized_support"]
     }, state);
 
     assert.equal(result.statusCode, 200);
     await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
     assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, []);
-    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
-      theoremLabel: "formalized_support",
+    assert.deepEqual(state.jobs[result.body.jobId].targetUses, [{ targetKind: "theorem", targetLabel: "formalized_support",
       declarationName: "formalized_support",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
@@ -1252,10 +1256,10 @@ test("formalize allows theorem uses backed by failed sorry stubs", async () => {
     });
     state.jobs.failed_stub_job = {
       jobId: "failed_stub_job",
-      jobKey: "project-1:failed_stub_support",
+      jobKey: "project-1:theorem:failed_stub_support",
       status: "failed",
       finalStatus: "sorry_stub",
-      theoremLabel: "failed_stub_support",
+      targetLabel: "failed_stub_support",
       declarationName: "failed_stub_support",
       recordedProofPath: dependencyProofPath,
       moduleName: "Lea.Project1.failed_stub_support",
@@ -1270,19 +1274,20 @@ test("formalize allows theorem uses backed by failed sorry stubs", async () => {
 
     const statuses = await handleGetStatuses({
       overleafProjectId: "project-1",
-      theorems: [{ theoremLabel: "failed_stub_support", theoremText: "A theorem." }]
+      targets: [{ targetKind: "theorem", targetLabel: "failed_stub_support", targetText: "A theorem." }]
     }, state);
 
     assert.equal(statuses.statusCode, 200);
-    assert.equal(statuses.body.statuses.failed_stub_support.status, "failed");
-    assert.equal(statuses.body.statuses.failed_stub_support.effectiveStatus, "sorry_stub");
-    assert.equal(statuses.body.statuses.failed_stub_support.leanStatement, "theorem failed_stub_support : True");
+    assert.equal(statuses.body.statuses["theorem:failed_stub_support"].status, "failed");
+    assert.equal(statuses.body.statuses["theorem:failed_stub_support"].effectiveStatus, "sorry_stub");
+    assert.equal(statuses.body.statuses["theorem:failed_stub_support"].leanStatement, "theorem failed_stub_support : True");
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "uses_failed_stub_support",
-      theoremText: "theorem uses_failed_stub_support : True := by",
-      theoremUses: ["failed_stub_support"]
+      targetKind: "theorem",
+    targetLabel: "uses_failed_stub_support",
+      targetText: "theorem uses_failed_stub_support : True := by",
+      targetUses: ["failed_stub_support"]
     }, state);
 
     assert.equal(result.statusCode, 200);
@@ -1291,16 +1296,14 @@ test("formalize allows theorem uses backed by failed sorry stubs", async () => {
       calls[0].body.task,
       new RegExp(`To formalize the theorem make use of the failed_stub_support theorem at ${escapeRegExp(path.join(leaRepo, dependencyProofPath))}\\.`)
     );
-    assert.deepEqual(state.jobs[result.body.jobId].theoremUses, [{
-      theoremLabel: "failed_stub_support",
+    assert.deepEqual(state.jobs[result.body.jobId].targetUses, [{ targetKind: "theorem", targetLabel: "failed_stub_support",
       declarationName: "failed_stub_support",
       relativePath: dependencyProofPath,
       absolutePath: path.join(leaRepo, dependencyProofPath),
       moduleName: "Lea.Project1.failed_stub_support",
       status: "sorry_stub"
     }]);
-    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, [{
-      theoremLabel: "failed_stub_support",
+    assert.deepEqual(state.jobs[result.body.jobId].stubbedTheoremUses, [{ targetKind: "theorem", targetLabel: "failed_stub_support",
       declarationName: "failed_stub_support",
       moduleName: "Lea.Project1.failed_stub_support",
       relativePath: dependencyProofPath,
@@ -1322,9 +1325,10 @@ test("formalize blocks unresolved theorem uses", async () => {
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "needs_support",
-    theoremText: "A theorem.",
-    theoremUses: ["missing_support"]
+    targetKind: "theorem",
+    targetLabel: "needs_support",
+    targetText: "A theorem.",
+    targetUses: ["missing_support"]
   }, state);
 
   assert.equal(result.statusCode, 400);
@@ -1342,9 +1346,10 @@ test("formalize rejects invalid theorem uses labels", async () => {
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "needs_support",
-    theoremText: "A theorem.",
-    theoremUses: ["invalid-label"]
+    targetKind: "theorem",
+    targetLabel: "needs_support",
+    targetText: "A theorem.",
+    targetUses: ["invalid-label"]
   }, state);
 
   assert.equal(result.statusCode, 400);
@@ -1378,8 +1383,9 @@ test("formalize maps unnamed theorem output that uses the Overleaf label", async
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "label_named_result",
-      theoremText: "A theorem without a Lean name."
+      targetKind: "theorem",
+    targetLabel: "label_named_result",
+      targetText: "A theorem without a Lean name."
     }, state);
 
     await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
@@ -1424,8 +1430,9 @@ test("formalize persists completed Lea usage and cost", async () => {
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "usage_capture_test",
-      theoremText: "A theorem."
+      targetKind: "theorem",
+    targetLabel: "usage_capture_test",
+      targetText: "A theorem."
     }, state);
 
     await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
@@ -1438,6 +1445,105 @@ test("formalize persists completed Lea usage and cost", async () => {
   } finally {
     restorePath();
   }
+});
+
+test("formalize definition uses a declaration-oriented prompt and typed job key", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "Subadditive.lean");
+  const restorePath = await installFakeLake();
+  try {
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(
+            leaRepo,
+            proofPath,
+            "def Subadditive (a : Nat -> Int) : Prop := True\n"
+          );
+          await writeLeaProjectMarkdown(leaRepo, "project-1", {
+            theoremName: "Subadditive",
+            proofPath,
+            moduleName: "Lea.Project1.Subadditive"
+          });
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      targetKind: "definition",
+      targetLabel: "Subadditive",
+      targetText: "A sequence is subadditive when a_{m+n} <= a_m + a_n.",
+      targetContext: "Represent this as a predicate on functions Nat -> Int."
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    const job = state.jobs[result.body.jobId];
+    assert.equal(result.statusCode, 200);
+    assert.equal(job.jobKey, "project-1:definition:Subadditive");
+    assert.equal(job.targetKind, "definition");
+    assert.equal(job.targetLabel, "Subadditive");
+    assert.equal(job.resultKind, "defined");
+    assert.match(calls[0].body.task, /This target is a definition, not a theorem/);
+    assert.match(calls[0].body.task, /Do not create a fake theorem/);
+    assert.match(calls[0].body.task, /Represent this as a predicate/);
+
+    const statuses = await handleGetStatuses({
+      overleafProjectId: "project-1",
+      targets: [{ targetKind: "definition", targetLabel: "Subadditive", targetText: "A definition." }]
+    }, state);
+    assert.equal(statuses.body.statuses["definition:Subadditive"].status, "formalized");
+    assert.equal(statuses.body.statuses["definition:Subadditive"].resultKind, "defined");
+  } finally {
+    restorePath();
+  }
+});
+
+test("same-label theorem and definition targets do not collide", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.same_theorem = {
+    jobId: "same_theorem",
+    jobKey: "project-1:theorem:SameName",
+    status: "in_progress",
+    mode: "formalization",
+    targetKind: "theorem",
+    targetLabel: "SameName",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    declarationName: "SameName",
+    projectMarkdownPath: buildLeaProjectMarkdownPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }),
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+  state.jobs.same_definition = {
+    ...state.jobs.same_theorem,
+    jobId: "same_definition",
+    jobKey: "project-1:definition:SameName",
+    targetKind: "definition",
+    status: "failed",
+    finalStatus: "unformalized",
+    error: "definition failed",
+    startedAt: "2026-01-01T00:00:01.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [
+      { targetKind: "theorem", targetLabel: "SameName", targetText: "A theorem." },
+      { targetKind: "definition", targetLabel: "SameName", targetText: "A definition." }
+    ]
+  }, state);
+
+  assert.equal(statuses.body.statuses["theorem:SameName"].status, "in_progress");
+  assert.equal(statuses.body.statuses["definition:SameName"].status, "failed");
+  assert.equal(statuses.body.statuses["definition:SameName"].message, "definition failed");
 });
 
 test("usage falls back to in-memory job totals when the adapter is unavailable", async () => {
@@ -1607,9 +1713,9 @@ test("formalize cleans previous failed Lea artifacts before retrying", async () 
     });
     state.jobs.previous_failed = {
       jobId: "previous_failed",
-      jobKey: "project-1:retry_label",
+      jobKey: "project-1:theorem:retry_label",
       status: "failed",
-      theoremLabel: "retry_label",
+      targetLabel: "retry_label",
       declarationName: "retry_label",
       declarationNameHint: "retry_target",
       relativePath: path.join("workspace", "projects", "project-1.md"),
@@ -1622,8 +1728,9 @@ test("formalize cleans previous failed Lea artifacts before retrying", async () 
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "retry_label",
-      theoremText: [
+      targetKind: "theorem",
+    targetLabel: "retry_label",
+      targetText: [
         "Theorem name: retry_target",
         "Lean signature:",
         "theorem retry_target : True := by"
@@ -1666,8 +1773,9 @@ test("formalize fails when Lea records multiple new artifacts without a hint", a
 
     const result = await handleFormalize({
       overleafProjectId: "project-1",
-      theoremLabel: "ambiguous_result",
-      theoremText: "A theorem without a Lean name."
+      targetKind: "theorem",
+    targetLabel: "ambiguous_result",
+      targetText: "A theorem without a Lean name."
     }, state);
 
     await waitFor(() => state.jobs[result.body.jobId]?.status === "failed");
@@ -1691,10 +1799,10 @@ test("statuses are unformalized when project markdown has no theorem entry", asy
 
   const result = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "missing_entry_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "missing_entry_test", targetText: "A theorem." }]
   }, state);
 
-  const status = result.body.statuses.missing_entry_test;
+  const status = result.body.statuses["theorem:missing_entry_test"];
   assert.equal(result.statusCode, 200);
   assert.equal(status.status, "unformalized");
   assert.equal(status.projectSlug, "project-1");
@@ -1712,10 +1820,10 @@ test("statuses are unformalized when project markdown points to a missing proof 
 
   const result = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "missing_proof_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "missing_proof_test", targetText: "A theorem." }]
   }, state);
 
-  const status = result.body.statuses.missing_proof_test;
+  const status = result.body.statuses["theorem:missing_proof_test"];
   assert.equal(result.statusCode, 200);
   assert.equal(status.status, "unformalized");
   assert.equal(status.recordedProofPath, proofPath);
@@ -1738,11 +1846,11 @@ test("statuses are sorry_stub when project proof still contains sorry", async ()
 
   const result = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "project_sorry_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "project_sorry_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(result.statusCode, 200);
-  assert.equal(result.body.statuses.project_sorry_test.status, "sorry_stub");
+  assert.equal(result.body.statuses["theorem:project_sorry_test"].status, "sorry_stub");
 });
 
 test("statuses report formalized direct proof files without project markdown", async () => {
@@ -1757,10 +1865,10 @@ test("statuses report formalized direct proof files without project markdown", a
 
   const result = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "direct_proof_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "direct_proof_test", targetText: "A theorem." }]
   }, state);
 
-  const status = result.body.statuses.direct_proof_test;
+  const status = result.body.statuses["theorem:direct_proof_test"];
   assert.equal(result.statusCode, 200);
   assert.equal(status.status, "formalized");
   assert.equal(status.relativePath, proofPath);
@@ -1779,9 +1887,9 @@ test("completed direct proof files override stale failed jobs", async () => {
   );
   state.jobs.failed_job = {
     jobId: "failed_job",
-    jobKey: "project-1:failed_but_written_test",
+    jobKey: "project-1:theorem:failed_but_written_test",
     status: "failed",
-    theoremLabel: "failed_but_written_test",
+    targetLabel: "failed_but_written_test",
     relativePath: path.join("workspace", "projects", "project-1.md"),
     absolutePath: path.join(leaRepo, "workspace", "projects", "project-1.md"),
     logPath: path.join(path.dirname(state.jobsPath), "failed-but-written.log"),
@@ -1793,11 +1901,11 @@ test("completed direct proof files override stale failed jobs", async () => {
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "failed_but_written_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "failed_but_written_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.failed_but_written_test.status, "formalized");
+  assert.equal(statuses.body.statuses["theorem:failed_but_written_test"].status, "formalized");
 });
 
 test("formalize rejects missing OpenAI key", async () => {
@@ -1809,8 +1917,9 @@ test("formalize rejects missing OpenAI key", async () => {
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "missing_key_test",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "missing_key_test",
+    targetText: "A theorem."
   }, state);
 
   assert.equal(result.statusCode, 400);
@@ -1828,9 +1937,9 @@ test("failed jobs take precedence over completed project markdown entries", asyn
   });
   state.jobs.failed_job = {
     jobId: "failed_job",
-    jobKey: "project-1:failed_precedence_test",
+    jobKey: "project-1:theorem:failed_precedence_test",
     status: "failed",
-    theoremLabel: "failed_precedence_test",
+    targetLabel: "failed_precedence_test",
     relativePath: path.join("workspace", "projects", "project-1.md"),
     absolutePath: path.join(leaRepo, "workspace", "projects", "project-1.md"),
     logPath: path.join(path.dirname(state.jobsPath), "failed-precedence.log"),
@@ -1842,13 +1951,13 @@ test("failed jobs take precedence over completed project markdown entries", asyn
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "failed_precedence_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "failed_precedence_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.failed_precedence_test.status, "failed");
-  assert.equal(statuses.body.statuses.failed_precedence_test.effectiveStatus, "unformalized");
-  assert.match(statuses.body.statuses.failed_precedence_test.logTail, /failed proof/);
+  assert.equal(statuses.body.statuses["theorem:failed_precedence_test"].status, "failed");
+  assert.equal(statuses.body.statuses["theorem:failed_precedence_test"].effectiveStatus, "unformalized");
+  assert.match(statuses.body.statuses["theorem:failed_precedence_test"].logTail, /failed proof/);
 });
 
 test("formalize fails a Lea job that exceeds the job timeout", async () => {
@@ -1862,8 +1971,9 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "timeout_test",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "timeout_test",
+    targetText: "A theorem."
   }, state);
 
   assert.equal(result.statusCode, 200);
@@ -1877,12 +1987,12 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "timeout_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "timeout_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.timeout_test.status, "failed");
-  assert.match(statuses.body.statuses.timeout_test.logTail, /timed out/);
+  assert.equal(statuses.body.statuses["theorem:timeout_test"].status, "failed");
+  assert.match(statuses.body.statuses["theorem:timeout_test"].logTail, /timed out/);
 });
 
 test("startup recovery fails interrupted in-progress jobs", async () => {
@@ -1891,9 +2001,9 @@ test("startup recovery fails interrupted in-progress jobs", async () => {
   const logPath = path.join(path.dirname(state.jobsPath), "interrupted.log");
   state.jobs.interrupted_job = {
     jobId: "interrupted_job",
-    jobKey: "project-1:interrupted_status_test",
+    jobKey: "project-1:theorem:interrupted_status_test",
     status: "in_progress",
-    theoremLabel: "interrupted_status_test",
+    targetLabel: "interrupted_status_test",
     relativePath: path.join("workspace", "projects", "project-1.md"),
     absolutePath: path.join(leaRepo, "workspace", "projects", "project-1.md"),
     logPath,
@@ -1911,11 +2021,11 @@ test("startup recovery fails interrupted in-progress jobs", async () => {
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "interrupted_status_test", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "interrupted_status_test", targetText: "A theorem." }]
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.interrupted_status_test.status, "failed");
+  assert.equal(statuses.body.statuses["theorem:interrupted_status_test"].status, "failed");
 });
 
 async function makeLeaRepo() {
@@ -2266,8 +2376,9 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "t_api",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "t_api",
+    targetText: "A theorem."
   }, state);
 
   assert.equal(result.statusCode, 200);
@@ -2306,8 +2417,9 @@ test("stub on the /api backend records a checked sorry stub with a Lea session l
 
   const result = await handleStub({
     overleafProjectId: "project-1",
-    theoremLabel: "generated_stub",
-    theoremText: "A generated stub theorem."
+    targetKind: "theorem",
+    targetLabel: "generated_stub",
+    targetText: "A generated stub theorem."
   }, state);
 
   assert.equal(result.statusCode, 200);
@@ -2320,10 +2432,10 @@ test("stub on the /api backend records a checked sorry stub with a Lea session l
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "generated_stub", theoremText: "A generated stub theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "generated_stub", targetText: "A generated stub theorem." }]
   }, state);
-  assert.equal(statuses.body.statuses.generated_stub.status, "sorry_stub");
-  assert.equal(statuses.body.statuses.generated_stub.leanStatement, "theorem generated_stub : True");
+  assert.equal(statuses.body.statuses["theorem:generated_stub"].status, "sorry_stub");
+  assert.equal(statuses.body.statuses["theorem:generated_stub"].leanStatement, "theorem generated_stub : True");
 });
 
 test("formalize after a saved stub reuses the stub session and proof file", async () => {
@@ -2349,13 +2461,13 @@ test("formalize after a saved stub reuses the stub session and proof file", asyn
   });
   state.jobs.stub_job = {
     jobId: "stub_job",
-    jobKey: "project-1:reuse_stub",
+    jobKey: "project-1:theorem:reuse_stub",
     status: "sorry_stub",
     finalStatus: "sorry_stub",
     overleafProjectId: "project-1",
     projectId: "project-1",
     projectSlug: "project-1",
-    theoremLabel: "reuse_stub",
+    targetLabel: "reuse_stub",
     declarationName: "reuse_stub",
     recordedProofPath: proofPath,
     moduleName: "Lea.Project1.ReuseStub",
@@ -2370,8 +2482,9 @@ test("formalize after a saved stub reuses the stub session and proof file", asyn
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "reuse_stub",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "reuse_stub",
+    targetText: "A theorem."
   }, state);
 
   assert.equal(result.statusCode, 200);
@@ -2386,7 +2499,7 @@ test("resolveProofOutcome trusts an adapter-verified run even with no local proo
   // The adapter defers project-markdown recording, so the companion often
   // cannot locate the proof on disk (localStatus === unformalized). A successful
   // run (exit.ok) must still resolve to `formalized` — this is the core fix.
-  const job = { theoremLabel: "t1", leaWorkspacePath: "/tmp/does-not-matter" };
+  const job = { targetKind: "theorem", targetLabel: "t1", leaWorkspacePath: "/tmp/does-not-matter" };
   const outcome = await resolveProofOutcome({
     job,
     localStatus: { status: "unformalized" },
@@ -2402,7 +2515,7 @@ test("resolveProofOutcome trusts an adapter-verified run even with no local proo
 
 test("resolveProofOutcome maps adapter disproof to disproved status", async () => {
   const outcome = await resolveProofOutcome({
-    job: { theoremLabel: "false_claim", leaWorkspacePath: "/tmp/does-not-matter" },
+    job: { targetKind: "theorem", targetLabel: "false_claim", leaWorkspacePath: "/tmp/does-not-matter" },
     localStatus: { status: "unformalized" },
     exit: {
       ok: true,
@@ -2420,7 +2533,7 @@ test("resolveProofOutcome maps adapter disproof to disproved status", async () =
 });
 
 test("resolveProofOutcome keeps a verified run formalized when local evidence is also formalized", async () => {
-  const job = { theoremLabel: "t2", leaWorkspacePath: "/tmp/x" };
+  const job = { targetKind: "theorem", targetLabel: "t2", leaWorkspacePath: "/tmp/x" };
   const localStatus = { status: "formalized", leanStatement: "theorem t2 : True" };
   const outcome = await resolveProofOutcome({ job, localStatus, exit: { ok: true } });
 
@@ -2432,7 +2545,7 @@ test("resolveProofOutcome keeps a verified run formalized when local evidence is
 });
 
 test("resolveProofOutcome records a leftover sorry as a failed run with sorry_stub effective status", async () => {
-  const job = { theoremLabel: "t3", leaWorkspacePath: "/tmp/x" };
+  const job = { targetKind: "theorem", targetLabel: "t3", leaWorkspacePath: "/tmp/x" };
   const localStatus = { status: "sorry_stub", absolutePath: "/tmp/x/t3.lean" };
   const outcome = await resolveProofOutcome({ job, localStatus, exit: { ok: true } });
 
@@ -2443,7 +2556,7 @@ test("resolveProofOutcome records a leftover sorry as a failed run with sorry_st
 });
 
 test("resolveProofOutcome marks a failed run as failed and surfaces the run error", async () => {
-  const job = { theoremLabel: "t4", leaWorkspacePath: "/tmp/x" };
+  const job = { targetKind: "theorem", targetLabel: "t4", leaWorkspacePath: "/tmp/x" };
   const outcome = await resolveProofOutcome({
     job,
     localStatus: { status: "unformalized" },
@@ -2470,8 +2583,9 @@ test("formalize on the /api backend tags the theorem formalized when the run suc
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "t_api_success",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "t_api_success",
+    targetText: "A theorem."
   }, state);
 
   await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
@@ -2481,10 +2595,10 @@ test("formalize on the /api backend tags the theorem formalized when the run suc
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "t_api_success", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "t_api_success", targetText: "A theorem." }]
   }, state);
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses.t_api_success.status, "formalized");
+  assert.equal(statuses.body.statuses["theorem:t_api_success"].status, "formalized");
 });
 
 test("formalize on the /api backend tags the theorem failed when the run does not succeed", async () => {
@@ -2498,8 +2612,9 @@ test("formalize on the /api backend tags the theorem failed when the run does no
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
-    theoremLabel: "t_api_failure",
-    theoremText: "A theorem."
+    targetKind: "theorem",
+    targetLabel: "t_api_failure",
+    targetText: "A theorem."
   }, state);
 
   await waitFor(() => state.jobs[result.body.jobId]?.status === "failed");
@@ -2508,7 +2623,7 @@ test("formalize on the /api backend tags the theorem failed when the run does no
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
-    theorems: [{ theoremLabel: "t_api_failure", theoremText: "A theorem." }]
+    targets: [{ targetKind: "theorem", targetLabel: "t_api_failure", targetText: "A theorem." }]
   }, state);
-  assert.equal(statuses.body.statuses.t_api_failure.status, "failed");
+  assert.equal(statuses.body.statuses["theorem:t_api_failure"].status, "failed");
 });

@@ -64,6 +64,10 @@ test('run proved with a sorry-bearing latest step is displayed as stubbed', () =
   assert.equal(deriveRunCompletionStatus('success', steps), 'stubbed');
 });
 
+test('run proved with defined result kind is displayed as definition creation', () => {
+  assert.equal(deriveRunCompletionStatus('proved', [step({ code: 'def d : Nat := 0\n' })], 'defined'), 'defined');
+});
+
 test('run disproved is displayed as disproof, not proof', () => {
   assert.equal(deriveRunCompletionStatus('disproved', [step()]), 'disproved');
 });

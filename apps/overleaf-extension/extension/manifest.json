@@ -23,7 +23,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["pageBridge.js", "zipTex.mjs"],
+      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs"],
       "matches": ["https://www.overleaf.com/*"]
     }
   ],

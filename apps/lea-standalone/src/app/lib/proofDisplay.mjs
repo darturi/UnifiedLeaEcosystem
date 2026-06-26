@@ -31,10 +31,16 @@ export function latestCodeStep(steps = []) {
   return steps.length ? steps[steps.length - 1] : null;
 }
 
-export function deriveRunCompletionStatus(runStatus, steps = []) {
+/**
+ * @param {string | null | undefined} runStatus
+ * @param {Array<any>} steps
+ * @param {string | null | undefined} resultKind
+ */
+export function deriveRunCompletionStatus(runStatus, steps = [], resultKind = null) {
   if (runStatus === 'disproved' || runStatus === 'needs_review') return runStatus;
   if (runStatus !== 'proved' && runStatus !== 'success') return runStatus || 'pending';
   const latest = latestCodeStep(steps);
   const proofStatus = deriveCodeStepProofStatus(latest);
+  if (resultKind === 'defined' && proofStatus === 'proved') return 'defined';
   return proofStatus === 'proved' || proofStatus === 'stubbed' ? proofStatus : 'answered';
 }

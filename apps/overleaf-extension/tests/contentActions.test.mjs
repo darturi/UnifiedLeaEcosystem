@@ -25,8 +25,8 @@ for (const [name, statusInfo, shouldShow] of CASES) {
     await harness.loadStatusForVisibleTheorem();
 
     harness.window.postMessage({
-      type: "OL_LEAN_THEOREM_CLICK",
-      theorem: harness.theorem,
+      type: "OL_LEAN_TARGET_CLICK",
+      target: harness.target,
       clientX: 16,
       clientY: 20
     }, "*");
@@ -58,22 +58,43 @@ test("diagnostic markers render a non-runnable fix badge and popover", async () 
   assert.equal(harness.hasButtonText("Formalize"), false);
 });
 
-test("legacy theorem syntax shows a deprecation warning while remaining runnable", async () => {
+test("targets without coordinates do not render floating status badges", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
-    { syntax: "legacy", deprecated: true }
+    { coords: null }
+  );
+  await harness.loadStatusForVisibleTheorem();
+
+  assert.equal(harness.hasButtonText("unformalized"), false);
+});
+
+test("definition targets use definition copy and do not show Stub", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    { targetKind: "definition", targetLabel: "DemoDefinition", targetText: "A definition." }
   );
   await harness.loadStatusForVisibleTheorem();
 
   harness.window.postMessage({
-    type: "OL_LEAN_THEOREM_CLICK",
-    theorem: harness.theorem,
+    type: "OL_LEAN_TARGET_CLICK",
+    target: harness.target,
     clientX: 16,
     clientY: 20
   }, "*");
 
-  assert.match(harness.bodyText(), /legacy \\theorem\[\.\.\.\] syntax still works temporarily/);
-  assert.equal(harness.hasButtonText("Formalize"), true);
+  assert.equal(harness.hasButtonText("Formalize definition"), true);
+  assert.equal(harness.hasButtonText("Stub"), false);
+});
+
+test("definition success renders a defined badge", async () => {
+  const harness = createContentHarness(
+    { status: "formalized", resultKind: "defined" },
+    { targetKind: "definition", targetLabel: "DemoDefinition", targetText: "A definition." }
+  );
+  await harness.loadStatusForVisibleTheorem();
+
+  assert.equal(harness.hasButtonText("defined"), true);
+  assert.equal(harness.hasButtonText("formalized"), false);
 });
 
 function createContentHarness(statusInfo, theoremPatch = {}) {
@@ -102,9 +123,12 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
   };
   document.defaultView = window;
 
-  const theorem = {
-    label: "demo_theorem",
-    text: "A theorem.",
+  const target = {
+    targetKind: "theorem",
+    targetLabel: "demo_theorem",
+    targetText: "A theorem.",
+    targetUses: [],
+    targetContext: "",
     coords: { left: 12, top: 18 },
     ...theoremPatch
   };
@@ -128,7 +152,7 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
       ok: true,
       status: 200,
       async json() {
-        return { statuses: { [theorem.label]: statusInfo } };
+          return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
       }
     }),
     globalThis: null,
@@ -165,17 +189,17 @@ function createContentHarness(statusInfo, theoremPatch = {}) {
   timers.splice(0, timers.length);
 
   return {
-    theorem,
+    target,
     window,
     async loadStatusForVisibleTheorem() {
       await this.loadVisibleTheorems();
     },
     async loadVisibleTheorems({ diagnostics = [] } = {}) {
       window.postMessage({
-        type: "OL_LEAN_THEOREMS_VISIBLE",
-        theorems: [theorem],
+        type: "OL_LEAN_TARGETS_VISIBLE",
+        targets: [target],
         diagnostics,
-        activeTex: "\\theorem[label=demo_theorem]{A theorem.}",
+        activeTex: "\\begin{theorem}\n% lea: formalize label=demo_theorem\nA theorem.\n\\end{theorem}",
         activePath: "main.tex"
       }, "*");
       assert.ok(timers.length > 0, "expected status refresh to be scheduled");

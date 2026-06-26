@@ -76,6 +76,7 @@ export function ChatThread({
   // R1c-2b: run lifecycle + approvals from the store.
   const runStatus = useProofSession((s) => s.runStatus);
   const runStatusById = useProofSession((s) => s.runStatusById);
+  const runResultKindById = useProofSession((s) => s.runResultKindById);
   const isRunning = useProofSession((s) => s.isRunning);
   const currentRunId = useProofSession((s) => s.currentRunId);
   const approvals = useProofSession((s) => s.approvals);
@@ -187,12 +188,23 @@ export function ChatThread({
     },
     [runStatusById],
   );
+  const latestRunResultKind = useMemo(
+    () => {
+      const values = Object.values(runResultKindById);
+      return values.length ? values[values.length - 1] : undefined;
+    },
+    [runResultKindById],
+  );
   const headChip = isRunning
     ? { cls: 'run', text: '● proving' }
     : latestProofStatus === 'stubbed'
     ? { cls: 'run', text: '○ stubbed' }
     : latestRunOutcome === 'disproved' && latestProofStatus === 'proved'
     ? { cls: 'warn', text: '⊘ disproved' }
+    : (latestRunOutcome === 'proved' || latestRunOutcome === 'success') &&
+        latestRunResultKind === 'defined' &&
+        latestProofStatus === 'proved'
+    ? { cls: 'ok', text: '✓ defined' }
     : (latestRunOutcome === 'proved' || latestRunOutcome === 'success') && latestProofStatus === 'proved'
     ? { cls: 'ok', text: '✓ proved' }
     : runStatus === 'needs_review' || latestRunOutcome === 'needs_review'
@@ -337,11 +349,13 @@ export function ChatThread({
             );
             const codeStepList = codeNodes.map((n) => n.step);
             const steps = codeStepList.length;
-            const completion = deriveRunCompletionStatus(status, codeStepList);
+            const resultKind = group.runId ? runResultKindById[group.runId] : undefined;
+            const completion = deriveRunCompletionStatus(status, codeStepList, resultKind);
             return (
               <Fragment key={group.runId ?? `g${gi}`}>
                 {group.nodes.map(renderNode)}
                 {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
+                {finished && completion === 'defined' && <DefinedCard steps={steps} session={session} />}
                 {finished && completion === 'disproved' && <DisprovedCard steps={steps} session={session} />}
                 {finished && completion === 'needs_review' && <NeedsReviewCard />}
                 {finished && completion === 'stubbed' && <StubCard steps={steps} session={session} />}
@@ -443,6 +457,22 @@ function ProvedCard({ steps, session }: { steps: number; session?: SessionSummar
   return (
     <div className="final">
       <div className="fhead">✓ Proved — 0 errors, 0 sorry</div>
+      {session && (
+        <div className="meta">
+          <span>{steps} steps</span>
+          {session.total_tokens ? <span>{formatTokens(session.total_tokens)} tokens</span> : null}
+          {session.cost_usd ? <span>${session.cost_usd.toFixed(3)}</span> : null}
+          {session.duration_seconds ? <span>{session.duration_seconds}s</span> : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DefinedCard({ steps, session }: { steps: number; session?: SessionSummary }) {
+  return (
+    <div className="final">
+      <div className="fhead">✓ Definition created — 0 errors</div>
       {session && (
         <div className="meta">
           <span>{steps} steps</span>

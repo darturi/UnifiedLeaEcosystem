@@ -54,6 +54,7 @@ export function useProofStream() {
       setApprovals,
       setApprovalBusy,
       setRunStatusById,
+      setRunResultKindById,
       setEditedPath,
       setSafeVerify,
     } = useProofSession.getState();
@@ -87,9 +88,17 @@ export function useProofStream() {
     );
     setApprovalBusy(false);
     const statuses: Record<string, string> = {};
-    for (const r of detail.runs || []) statuses[r.id] = r.status;
-    if (active) statuses[active.id] = active.status;
+    const resultKinds: Record<string, string | null | undefined> = {};
+    for (const r of detail.runs || []) {
+      statuses[r.id] = r.status;
+      resultKinds[r.id] = r.result_kind;
+    }
+    if (active) {
+      statuses[active.id] = active.status;
+      resultKinds[active.id] = active.result_kind;
+    }
     setRunStatusById(statuses);
+    setRunResultKindById(resultKinds);
     setEditedPath(undefined);
     setSafeVerify(detail.safe_verify || null);
     if (active && (active.status === 'running' || active.status === 'pending')) {
@@ -103,8 +112,18 @@ export function useProofStream() {
     // just-finished status straight from it and re-apply it after applyDetail
     // (which would otherwise clear it, since the run is no longer active).
     const finished = useProofSession.getState().runStatus;
+    const currentRunId = useProofSession.getState().currentRunId;
+    const finishedResultKind = currentRunId
+      ? useProofSession.getState().runResultKindById[currentRunId]
+      : undefined;
     applyDetail(detail);
     if (finished) useProofSession.getState().setRunStatus(finished);
+    if (currentRunId && finishedResultKind) {
+      useProofSession.getState().setRunResultKindById((prev) => ({
+        ...prev,
+        [currentRunId]: finishedResultKind,
+      }));
+    }
   };
 
   const attachStream = (runId: string, sessionId: string) => {
@@ -123,6 +142,7 @@ export function useProofStream() {
       setIsRunning,
       setRunStatus,
       setRunStatusById,
+      setRunResultKindById,
       setCurrentRunId,
       setError,
     } = useProofSession.getState();
@@ -230,14 +250,18 @@ export function useProofStream() {
       source.close();
       eventSourceRef.current = null;
       let status: RunStatus = 'proved';
+      let resultKind: string | null | undefined;
       try {
-        status = (JSON.parse((event as MessageEvent).data || '{}').status as RunStatus) || 'proved';
+        const payload = JSON.parse((event as MessageEvent).data || '{}');
+        status = (payload.status as RunStatus) || 'proved';
+        resultKind = payload.result_kind;
       } catch {
         /* keep default */
       }
       setIsRunning(false);
       setRunStatus(status);
       setRunStatusById((prev) => ({ ...prev, [runId]: status }));
+      setRunResultKindById((prev) => ({ ...prev, [runId]: resultKind }));
       setCurrentRunId(undefined);
       setApprovals((prev) => prev.filter((a) => a.decision));
       setApprovalBusy(false);

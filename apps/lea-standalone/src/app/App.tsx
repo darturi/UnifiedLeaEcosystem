@@ -70,6 +70,7 @@ export default function App() {
   const runStatus = useProofSession((s) => s.runStatus);
   const setRunStatus = useProofSession((s) => s.setRunStatus);
   const setRunStatusById = useProofSession((s) => s.setRunStatusById);
+  const setRunResultKindById = useProofSession((s) => s.setRunResultKindById);
   const approvals = useProofSession((s) => s.approvals);
   const setApprovals = useProofSession((s) => s.setApprovals);
   const approvalBusy = useProofSession((s) => s.approvalBusy);
@@ -212,6 +213,7 @@ export default function App() {
       setCurrentRunId(run.run_id);
       setRunStatus('running');
       setRunStatusById((prev) => ({ ...prev, [run.run_id]: 'running' }));
+      setRunResultKindById((prev) => ({ ...prev, [run.run_id]: null }));
       setIsRunning(true);
       setMessages([run.message]);
       window.localStorage.setItem(SELECTED_SESSION_KEY, run.session_id);
@@ -260,6 +262,7 @@ export default function App() {
     setCurrentRunId(undefined);
     setRunStatus(undefined);
     setRunStatusById({});
+    setRunResultKindById({});
     setApprovals([]);
     setApprovalBusy(false);
     setError(undefined);
@@ -281,6 +284,7 @@ export default function App() {
       setCurrentRunId(run.run_id);
       setRunStatus('running');
       setRunStatusById((prev) => ({ ...prev, [run.run_id]: 'running' }));
+      setRunResultKindById((prev) => ({ ...prev, [run.run_id]: null }));
       setIsRunning(true);
       setMessages((current) => [...current, run.message]);
       setDraft('');
