@@ -93,3 +93,82 @@ test("page bridge positions target badges from badgeFrom", async () => {
     delete globalThis.window;
   }
 });
+
+test("page bridge does not publish targets when CodeMirror has no coordinates", async () => {
+  const source = [
+    "\\begin{theorem}",
+    "% lea: formalize label=offscreen_theorem",
+    "An offscreen theorem.",
+    "\\end{theorem}"
+  ].join("\n");
+  const messages = [];
+  const listeners = new Map();
+  const extensions = [];
+
+  globalThis.window = {
+    CodeMirror: null,
+    innerHeight: 768,
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage(message) {
+      messages.push(message);
+    },
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?noCoords=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    assert.equal(typeof installBridge, "function");
+
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: {
+            fromClass(PluginClass, spec) {
+              return { PluginClass, spec };
+            }
+          },
+          Decoration: {
+            mark() {
+              return {
+                range(from, to) {
+                  return { from, to };
+                }
+              };
+            },
+            set(ranges) {
+              return ranges;
+            }
+          }
+        }
+      }
+    });
+
+    const view = {
+      state: {
+        doc: {
+          toString() {
+            return source;
+          }
+        }
+      },
+      coordsAtPos() {
+        return null;
+      }
+    };
+
+    new extensions[0].PluginClass(view);
+
+    const visibleMessage = messages.find((message) => message.type === "OL_LEAN_TARGETS_VISIBLE");
+    assert.ok(visibleMessage);
+    assert.deepEqual(visibleMessage.targets, []);
+    assert.deepEqual(visibleMessage.diagnostics, []);
+  } finally {
+    delete globalThis.window;
+  }
+});

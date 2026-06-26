@@ -108,8 +108,8 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
       type: "OL_LEAN_TARGETS_VISIBLE",
       activeTex: source,
       activePath: getActiveDocPath(),
-      targets: documentResult.targets.map((target) => withCoords(view, target)),
-      diagnostics: documentResult.diagnostics.map((diagnostic) => withCoords(view, diagnostic))
+      targets: documentResult.targets.map((target) => withCoords(view, target)).filter(hasCoords),
+      diagnostics: documentResult.diagnostics.map((diagnostic) => withCoords(view, diagnostic)).filter(hasCoords)
     }, "*");
   }
 
@@ -141,6 +141,10 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
     };
   }
 
+  function hasCoords(target) {
+    return Boolean(target.coords);
+  }
+
   function getTargetCoords(view, target) {
     const positions = [
       target.badgeFrom,
@@ -154,16 +158,33 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
       if (coords) break;
     }
     if (!coords) {
-      return {
-        left: 24,
-        top: 24,
-        bottom: 42
-      };
+      return null;
+    }
+    if (!isUsableCoords(view, coords)) {
+      return null;
     }
     return {
       left: Math.max(coords.right, coords.left),
       top: coords.top,
       bottom: coords.bottom
     };
+  }
+
+  function isUsableCoords(view, coords) {
+    if (![coords.left, coords.right, coords.top, coords.bottom].every(Number.isFinite)) {
+      return false;
+    }
+
+    const viewportHeight = Number.isFinite(window.innerHeight) ? window.innerHeight : null;
+    if (viewportHeight !== null && (coords.bottom < 0 || coords.top > viewportHeight)) {
+      return false;
+    }
+
+    const editorRect = view.scrollDOM?.getBoundingClientRect?.() || view.dom?.getBoundingClientRect?.();
+    if (editorRect && (coords.bottom < editorRect.top || coords.top > editorRect.bottom)) {
+      return false;
+    }
+
+    return true;
   }
 })();

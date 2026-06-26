@@ -58,6 +58,16 @@ test("diagnostic markers render a non-runnable fix badge and popover", async () 
   assert.equal(harness.hasButtonText("Formalize"), false);
 });
 
+test("targets without coordinates do not render floating status badges", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    { coords: null }
+  );
+  await harness.loadStatusForVisibleTheorem();
+
+  assert.equal(harness.hasButtonText("unformalized"), false);
+});
+
 test("definition targets use definition copy and do not show Stub", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },

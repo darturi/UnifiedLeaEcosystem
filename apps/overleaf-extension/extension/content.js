@@ -763,7 +763,8 @@
 
     badgeLayer.replaceChildren();
     for (const diagnostic of latestDiagnostics) {
-      const coords = diagnostic.coords || { left: 24, top: 24 };
+      const coords = diagnostic.coords;
+      if (!coords) continue;
       const badge = document.createElement("button");
       badge.className = "ol-lean-status ol-lean-status-failed";
       badge.type = "button";
@@ -780,7 +781,8 @@
       badgeLayer.appendChild(badge);
     }
     for (const target of latestTargets) {
-      const coords = target.coords || { left: 24, top: 24 };
+      const coords = target.coords;
+      if (!coords) continue;
       const statusInfo = latestStatuses[targetKey(target)] || { status: "unknown" };
       const status = statusInfo.status || "unknown";
       const badge = document.createElement("button");
