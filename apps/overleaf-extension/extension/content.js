@@ -17,7 +17,7 @@
   let activePopover = null;
   let statusRefreshTimer = null;
   let usageRefreshTimer = null;
-  let latestTheorems = [];
+  let latestTargets = [];
   let latestDiagnostics = [];
   let latestActiveTex = "";
   let latestActiveTexPath = "";
@@ -39,20 +39,20 @@
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
-    if (event.data?.type === "OL_LEAN_THEOREM_CLICK") {
-      rememberTheorem(event.data.theorem);
-      showTheoremPopover(event.data.clientX, event.data.clientY, event.data.theorem);
+    if (event.data?.type === "OL_LEAN_TARGET_CLICK") {
+      rememberTarget(event.data.target);
+      showTargetPopover(event.data.clientX, event.data.clientY, event.data.target);
       return;
     }
     if (event.data?.type === "OL_LEAN_DIAGNOSTIC_CLICK") {
-      showDiagnosticPopover(event.data.clientX, event.data.clientY, event.data.diagnostic || event.data.theorem);
+      showDiagnosticPopover(event.data.clientX, event.data.clientY, event.data.diagnostic || event.data.target);
       return;
     }
-    if (event.data?.type === "OL_LEAN_THEOREMS_VISIBLE") {
+    if (event.data?.type === "OL_LEAN_TARGETS_VISIBLE") {
       const nextActiveTex = typeof event.data.activeTex === "string" ? event.data.activeTex : "";
       const nextProjectId = extractOverleafProjectId();
       const activeTexChanged = nextActiveTex !== latestActiveTex || nextProjectId !== latestActiveTexProjectId;
-      latestTheorems = event.data.theorems || [];
+      latestTargets = event.data.targets || [];
       latestDiagnostics = event.data.diagnostics || [];
       latestActiveTex = nextActiveTex;
       latestActiveTexPath = typeof event.data.activePath === "string" ? event.data.activePath : latestActiveTexPath;
@@ -67,7 +67,7 @@
   });
 
   injectPageBridge();
-  requestTheoremsSoon();
+  requestTargetsSoon();
   renderSettingsButton();
 
   document.addEventListener("keydown", (event) => {
@@ -82,7 +82,7 @@
 
   window.addEventListener("resize", renderStatusBadges);
   window.addEventListener("scroll", () => {
-    requestTheorems();
+    requestTargets();
     renderStatusBadges();
   }, true);
 
@@ -104,9 +104,9 @@
     (document.body || document.documentElement).appendChild(settingsButton);
   }
 
-  function showTheoremPopover(clientX, clientY, theorem) {
-    if (theorem?.syntax === "diagnostic") {
-      showDiagnosticPopover(clientX, clientY, theorem);
+  function showTargetPopover(clientX, clientY, target) {
+    if (target?.syntax === "diagnostic") {
+      showDiagnosticPopover(clientX, clientY, target);
       return;
     }
     closePopover();
@@ -122,20 +122,21 @@
       <p class="ol-lean-popover-status"></p>
     `;
 
-    popover.dataset.theoremLabel = theorem.label;
-    popover.querySelector("strong").textContent = theorem.label;
+    const key = targetKey(target);
+    popover.dataset.targetKey = key;
+    popover.querySelector("strong").textContent = target.targetLabel;
     const actions = popover.querySelector("[data-role='theorem-actions']");
     const status = popover.querySelector(".ol-lean-popover-status");
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
     const stubbedWarning = popover.querySelector(".ol-lean-popover-warning");
-    const statusInfo = latestStatuses[theorem.label] || {};
+    const statusInfo = latestStatuses[key] || {};
     const currentStatus = statusInfo.status || "unknown";
     const actionStatus = getActionStatus(statusInfo);
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
-    renderTheoremWarning(stubbedWarning, theorem, statusInfo);
-    renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus, statusInfo);
+    renderTargetWarning(stubbedWarning, target, statusInfo);
+    renderTargetActions(actions, target, currentStatus, status, leanStatement, actionStatus, statusInfo);
     if (currentStatus === "in_progress") {
-      status.textContent = inProgressMessage(latestStatuses[theorem.label]);
+      status.textContent = inProgressMessage(latestStatuses[key], target);
     } else if (isExtensionContextInvalidated()) {
       status.textContent = "Extension was reloaded. Refresh this Overleaf tab.";
     }
@@ -177,10 +178,10 @@
     activePopover = popover;
   }
 
-  function renderTheoremActions(actions, theorem, currentStatus, status, leanStatement, actionStatus = currentStatus, statusInfo = {}) {
+  function renderTargetActions(actions, target, currentStatus, status, leanStatement, actionStatus = currentStatus, statusInfo = {}) {
     actions.replaceChildren();
     const disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
-    const actionSpecs = actionSpecsForStatus(actionStatus);
+    const actionSpecs = actionSpecsForStatus(actionStatus, target);
     for (const spec of actionSpecs) {
       const button = document.createElement("button");
       button.type = "button";
@@ -196,17 +197,17 @@
         }
         status.textContent = spec.pendingText;
         try {
-          const result = await spec.run(theorem);
+          const result = await spec.run(target);
           status.textContent = `${formatStatus(result.status)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
-          renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[theorem.label]?.leanStatement || "");
+          renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[targetKey(target)]?.leanStatement || "");
           await refreshStatusesNow();
         } catch (error) {
           status.textContent = error instanceof Error ? error.message : String(error);
           if (isMaxSpendError(error)) {
             showCostCapNotice(null, { force: true, noticeKey: `error:${Date.now()}` });
           }
-          const latestStatus = latestStatuses[theorem.label] || { status: currentStatus };
-          renderTheoremActions(actions, theorem, latestStatus.status || currentStatus, status, leanStatement, getActionStatus(latestStatus));
+          const latestStatus = latestStatuses[targetKey(target)] || { status: currentStatus };
+          renderTargetActions(actions, target, latestStatus.status || currentStatus, status, leanStatement, getActionStatus(latestStatus));
         }
       });
       actions.appendChild(button);
@@ -245,24 +246,26 @@
     actions.appendChild(closeButton);
   }
 
-  function actionSpecsForStatus(status) {
+  function actionSpecsForStatus(status, target) {
+    const definition = isDefinitionTarget(target);
     if (status === "unformalized") {
-      return [
-        {
-          role: "theorem-action",
-          label: "Formalize",
-          primary: true,
-          pendingText: "Starting Lea...",
-          run: formalize
-        },
-        {
+      const specs = [{
+        role: "target-action",
+        label: definition ? "Formalize definition" : "Formalize",
+        primary: true,
+        pendingText: "Starting Lea...",
+        run: formalize
+      }];
+      if (!definition) {
+        specs.push({
           role: "theorem-stub-action",
           label: "Stub",
           primary: false,
           pendingText: "Creating Lean stub...",
           run: stubTheorem
-        }
-      ];
+        });
+      }
+      return specs;
     }
     if (status === "sorry_stub") {
       return [{
@@ -284,7 +287,7 @@
     }
     return [{
       role: "theorem-action",
-      label: buttonTextForStatus(status),
+      label: buttonTextForStatus(status, target),
       primary: true,
       pendingText: "Starting Lea...",
       run: formalize
@@ -472,9 +475,10 @@
     popover.style.top = `${Math.max(12, window.innerHeight - rect.height - bottom)}px`;
   }
 
-  function updatePopoverStatus(popover, theorem) {
-    if (!popover || popover.dataset.theoremLabel !== theorem.label) return;
-    const statusInfo = latestStatuses[theorem.label] || { status: "unknown" };
+  function updatePopoverStatus(popover, target) {
+    const key = targetKey(target);
+    if (!popover || popover.dataset.targetKey !== key) return;
+    const statusInfo = latestStatuses[key] || { status: "unknown" };
     const currentStatus = statusInfo.status || "unknown";
     const actionStatus = getActionStatus(statusInfo);
     const chip = popover.querySelector(".ol-lean-status-chip");
@@ -491,7 +495,7 @@
       }
     }
     if (actions) {
-      renderTheoremActions(actions, theorem, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement, actionStatus, statusInfo);
+      renderTargetActions(actions, target, currentStatus, popover.querySelector(".ol-lean-popover-status"), leanStatement, actionStatus, statusInfo);
     }
 
     if (detail) {
@@ -502,16 +506,16 @@
       } else if (statusInfo.relativePath) {
         detail.textContent = statusInfo.relativePath;
       } else if (currentStatus === "in_progress") {
-        detail.textContent = inProgressMessage(statusInfo);
+        detail.textContent = inProgressMessage(statusInfo, target);
       } else {
-        detail.textContent = "Ready to send this theorem to Lea.";
+        detail.textContent = `Ready to send this ${targetNoun(target)} to Lea.`;
       }
     }
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
-    renderTheoremWarning(stubbedWarning, theorem, statusInfo);
+    renderTargetWarning(stubbedWarning, target, statusInfo);
   }
 
-  async function formalize(theorem) {
+  async function formalize(target) {
     // Flush any pending .tex mirror so the run's context is current (a no-op when
     // nothing changed since the last background sync).
     await syncTexMirrorNow({ force: true }).catch(() => {});
@@ -522,11 +526,12 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         overleafProjectId: extractOverleafProjectId(),
-        theoremLabel: theorem.label,
-        theoremText: theorem.text,
-        theoremUses: theorem.uses || [],
-        theoremContext: theorem.context || "",
-        sourceHash: await sha256(normalizeTheoremText(theorem.text))
+        targetKind: target.targetKind,
+        targetLabel: target.targetLabel,
+        targetText: target.targetText,
+        targetUses: target.targetUses || [],
+        targetContext: target.targetContext || "",
+        sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
 
@@ -537,7 +542,7 @@
     return payload;
   }
 
-  async function stubTheorem(theorem) {
+  async function stubTheorem(target) {
     // Stubbing also needs the current .tex mirror because statement translation may
     // depend on local notation/definitions in the surrounding document.
     await syncTexMirrorNow({ force: true }).catch(() => {});
@@ -548,11 +553,12 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         overleafProjectId: extractOverleafProjectId(),
-        theoremLabel: theorem.label,
-        theoremText: theorem.text,
-        theoremUses: theorem.uses || [],
-        theoremContext: theorem.context || "",
-        sourceHash: await sha256(normalizeTheoremText(theorem.text))
+        targetKind: target.targetKind,
+        targetLabel: target.targetLabel,
+        targetText: target.targetText,
+        targetUses: target.targetUses || [],
+        targetContext: target.targetContext || "",
+        sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
 
@@ -563,9 +569,9 @@
     return payload;
   }
 
-  async function refreshSingleStatus(theorem) {
+  async function refreshSingleStatus(target) {
     await refreshStatusesNow();
-    return latestStatuses[theorem.label] || {
+    return latestStatuses[targetKey(target)] || {
       status: "unavailable",
       relativePath: ""
     };
@@ -581,7 +587,7 @@
   }
 
   async function refreshStatusesNow() {
-    if (latestTheorems.length === 0) {
+    if (latestTargets.length === 0) {
       postStatuses({});
       return;
     }
@@ -593,9 +599,10 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         overleafProjectId: extractOverleafProjectId(),
-        theorems: latestTheorems.map((theorem) => ({
-          theoremLabel: theorem.label,
-          theoremText: theorem.text
+        targets: latestTargets.map((target) => ({
+          targetKind: target.targetKind,
+          targetLabel: target.targetLabel,
+          targetText: target.targetText
         }))
       })
     });
@@ -605,9 +612,9 @@
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
     postStatuses(withFallbackStatuses(payload.statuses || {}));
-    if (activePopover?.dataset.theoremLabel) {
-      const theorem = latestTheorems.find((item) => item.label === activePopover.dataset.theoremLabel);
-      if (theorem) updatePopoverStatus(activePopover, theorem);
+    if (activePopover?.dataset.targetKey) {
+      const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
+      if (target) updatePopoverStatus(activePopover, target);
     }
     if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
       scheduleStatusRefresh();
@@ -715,8 +722,8 @@
   function postStatusError(error) {
     const message = normalizeErrorMessage(error);
     const statuses = {};
-    for (const theorem of latestTheorems) {
-      statuses[theorem.label] = {
+    for (const target of latestTargets) {
+      statuses[targetKey(target)] = {
         status: "offline",
         message
       };
@@ -735,11 +742,12 @@
 
   function withFallbackStatuses(statuses) {
     const completeStatuses = { ...statuses };
-    for (const theorem of latestTheorems) {
-      if (!completeStatuses[theorem.label]) {
-        completeStatuses[theorem.label] = {
+    for (const target of latestTargets) {
+      const key = targetKey(target);
+      if (!completeStatuses[key]) {
+        completeStatuses[key] = {
           status: "unavailable",
-          message: "The companion did not return a status for this theorem."
+          message: `The companion did not return a status for this ${targetNoun(target)}.`
         };
       }
     }
@@ -771,9 +779,9 @@
       });
       badgeLayer.appendChild(badge);
     }
-    for (const theorem of latestTheorems) {
-      const coords = theorem.coords || { left: 24, top: 24 };
-      const statusInfo = latestStatuses[theorem.label] || { status: "unknown" };
+    for (const target of latestTargets) {
+      const coords = target.coords || { left: 24, top: 24 };
+      const statusInfo = latestStatuses[targetKey(target)] || { status: "unknown" };
       const status = statusInfo.status || "unknown";
       const badge = document.createElement("button");
       badge.className = `ol-lean-status ol-lean-status-${status}`;
@@ -794,14 +802,14 @@
       }
       const stubbedUsesLabel = hasStubbedTheoremUses(statusInfo) ? " warning: proof uses sorry-stubbed support" : "";
       const statusLabel = `${formatStatus(status)}${turnProgress.label ? ` ${turnProgress.label}` : ""}${stubbedUsesLabel}`;
-      badge.title = statusInfo.message || `Lean status for ${theorem.label}: ${statusLabel}`;
-      badge.setAttribute("aria-label", `Open Lea popover for ${theorem.label}. Status: ${statusLabel}.`);
+      badge.title = statusInfo.message || `Lean status for ${target.targetLabel}: ${statusLabel}`;
+      badge.setAttribute("aria-label", `Open Lea popover for ${target.targetLabel}. Status: ${statusLabel}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
       badge.style.top = `${coords.top}px`;
       badge.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        showTheoremPopover(event.clientX, event.clientY, theorem);
+        showTargetPopover(event.clientX, event.clientY, target);
       });
       badgeLayer.appendChild(badge);
     }
@@ -830,11 +838,12 @@
     }
   }
 
-  function inProgressMessage(statusInfo) {
+  function inProgressMessage(statusInfo, target = null) {
     const turnProgressText = formatTurnProgress(statusInfo);
+    const noun = targetNoun(target);
     return turnProgressText
-      ? `Lea proof is in progress: ${turnProgressText}.`
-      : "Lea proof is in progress. Waiting for the first turn update.";
+      ? `Lea ${noun} formalization is in progress: ${turnProgressText}.`
+      : `Lea ${noun} formalization is in progress. Waiting for the first turn update.`;
   }
 
   function getTurnProgressDisplay(statusInfo) {
@@ -871,7 +880,7 @@
       element.textContent = "";
       return;
     }
-    const names = uses.map((use) => use.declarationName || use.theoremLabel).filter(Boolean).join(", ");
+    const names = uses.map((use) => use.declarationName || use.targetLabel).filter(Boolean).join(", ");
     const plural = uses.length !== 1;
     element.hidden = false;
     element.textContent = plural
@@ -879,16 +888,11 @@
       : `Proof uses supporting theorem ${names}, which has been sorry stubbed but not fully formalized.`;
   }
 
-  function renderTheoremWarning(element, theorem, statusInfo) {
+  function renderTargetWarning(element, target, statusInfo) {
     if (!element) return;
     const uses = getStubbedTheoremUses(statusInfo);
     if (uses.length > 0) {
       renderStubbedTheoremUsesWarning(element, statusInfo);
-      return;
-    }
-    if (theorem?.deprecated) {
-      element.hidden = false;
-      element.textContent = "This legacy \\theorem[...] syntax still works temporarily, but new Overleaf documents should use % lea: comment markers.";
       return;
     }
     element.hidden = true;
@@ -912,7 +916,8 @@
     return mark;
   }
 
-  function buttonTextForStatus(status) {
+  function buttonTextForStatus(status, target = null) {
+    const definition = isDefinitionTarget(target);
     switch (status) {
       case "in_progress":
         return "Formalizing...";
@@ -923,7 +928,7 @@
       case "sorry_stub":
       case "unformalized":
       default:
-        return "Run Lea";
+        return definition ? "Regenerate definition" : "Run Lea";
     }
   }
 
@@ -1369,10 +1374,10 @@
 
   function maxSpendNoticeKeyFromStatuses(statuses) {
     const parts = [];
-    for (const [theoremLabel, statusInfo] of Object.entries(statuses || {})) {
+    for (const [statusKey, statusInfo] of Object.entries(statuses || {})) {
       if (!isMaxSpendStatus(statusInfo)) continue;
       parts.push([
-        theoremLabel,
+        statusKey,
         statusInfo.jobId || "",
         statusInfo.finishedAt || "",
         statusInfo.message || ""
@@ -1427,14 +1432,27 @@
     return message;
   }
 
-  function rememberTheorem(theorem) {
-    if (!theorem?.label) return;
-    const existingIndex = latestTheorems.findIndex((item) => item.label === theorem.label);
+  function rememberTarget(target) {
+    if (!target?.targetLabel) return;
+    const key = targetKey(target);
+    const existingIndex = latestTargets.findIndex((item) => targetKey(item) === key);
     if (existingIndex === -1) {
-      latestTheorems = [...latestTheorems, theorem];
+      latestTargets = [...latestTargets, target];
       return;
     }
-    latestTheorems = latestTheorems.map((item, index) => (index === existingIndex ? theorem : item));
+    latestTargets = latestTargets.map((item, index) => (index === existingIndex ? target : item));
+  }
+
+  function targetKey(target) {
+    return `${target?.targetKind || "theorem"}:${target?.targetLabel || ""}`;
+  }
+
+  function isDefinitionTarget(target) {
+    return target?.targetKind === "definition";
+  }
+
+  function targetNoun(target) {
+    return isDefinitionTarget(target) ? "definition" : "theorem";
   }
 
   function extractOverleafProjectId() {
@@ -1442,7 +1460,7 @@
     return match ? match[1] : "unknown";
   }
 
-  function normalizeTheoremText(text) {
+  function normalizeTargetText(text) {
     return String(text).replace(/\s+/g, " ").trim();
   }
 
@@ -1454,6 +1472,7 @@
 
   function injectPageBridge() {
     const script = document.createElement("script");
+    script.type = "module";
     script.src = chrome.runtime.getURL("pageBridge.js");
     script.onload = () => script.remove();
     const target = document.documentElement || document.head || document.body;
@@ -1466,13 +1485,13 @@
     }, { once: true });
   }
 
-  function requestTheoremsSoon() {
-    requestTheorems();
-    setTimeout(requestTheorems, 300);
-    setTimeout(requestTheorems, 1000);
+  function requestTargetsSoon() {
+    requestTargets();
+    setTimeout(requestTargets, 300);
+    setTimeout(requestTargets, 1000);
   }
 
-  function requestTheorems() {
-    window.postMessage({ type: "OL_LEAN_REQUEST_THEOREMS" }, "*");
+  function requestTargets() {
+    window.postMessage({ type: "OL_LEAN_REQUEST_TARGETS" }, "*");
   }
 })();

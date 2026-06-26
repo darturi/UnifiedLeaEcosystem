@@ -24,7 +24,7 @@ import {
   slugProjectId
 } from "../shared/leanStub.mjs";
 import {
-  hashTheoremText,
+  hashTargetText,
   inferLeanDeclarationName,
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
@@ -148,20 +148,22 @@ export async function handleGetStatuses(payload, state) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
 
-  const theorems = Array.isArray(payload.theorems) ? payload.theorems : [];
+  const targets = Array.isArray(payload.targets) ? payload.targets : [];
   const statuses = {};
 
-  for (const theorem of theorems) {
-    const theoremLabel = String(theorem.theoremLabel || "");
-    const theoremText = String(theorem.theoremText || "");
-    if (!isValidLeanIdentifier(theoremLabel) || !theoremText.trim()) {
+  for (const rawTarget of targets) {
+    const targetKind = normalizeTargetKind(rawTarget?.targetKind);
+    const targetLabel = String(rawTarget?.targetLabel || "");
+    const targetText = String(rawTarget?.targetText || "");
+    if (!targetKind || !isValidLeanIdentifier(targetLabel) || !targetText.trim()) {
       continue;
     }
 
-    statuses[theoremLabel] = await getTheoremStatus({
+    statuses[targetKey({ targetKind, targetLabel })] = await getTargetStatus({
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId: payload.overleafProjectId || "unknown",
-      theoremLabel,
+      targetKind,
+      targetLabel,
       jobs: state.jobs || {}
     });
   }
@@ -170,15 +172,15 @@ export async function handleGetStatuses(payload, state) {
 }
 
 export async function handleFormalize(payload, state) {
-  const validation = validateLeaPayload(payload);
+  const validation = validateTargetPayload(payload);
   if (!validation.ok) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext } = validation;
-  const expectedHash = hashTheoremText(theoremText);
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext } = validation;
+  const expectedHash = hashTargetText(targetText);
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
-    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
+    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match targetText.");
   }
 
   // Pull the latest shared settings (max-spend cap, key status) from the adapter
@@ -197,7 +199,8 @@ export async function handleFormalize(payload, state) {
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
-    theoremLabel
+    targetKind,
+    targetLabel
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -210,7 +213,7 @@ export async function handleFormalize(payload, state) {
   const usesResolution = await resolveTheoremUses({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
-    theoremUses,
+    targetUses,
     jobs: state.jobs || {}
   });
   if (!usesResolution.ok) {
@@ -221,29 +224,31 @@ export async function handleFormalize(payload, state) {
   // `.lea/files/overleaf/` by the extension's background sync (flushed before this
   // request), so the adapter's composed context already surfaces them to Lea. No
   // per-run LaTeX prep happens here anymore.
-  const reusableStub = await findReusableStubForFormalization({
-    leaRepoPath: state.settings.leaRepoPath,
-    target,
-    jobs: state.jobs || {}
-  });
+  const reusableStub = target.targetKind === "theorem"
+    ? await findReusableStubForFormalization({
+        leaRepoPath: state.settings.leaRepoPath,
+        target,
+        jobs: state.jobs || {}
+      })
+    : null;
   const cleanup = reusableStub
     ? { removedProofPaths: [], removedProjectEntries: [] }
     : await cleanupPreviousRunArtifacts({
         leaRepoPath: state.settings.leaRepoPath,
         target,
-        theoremText,
+        targetText,
         jobs: state.jobs || {}
       });
-  const job = await createLeaJob({ state, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses });
+  const job = await createLeaJob({ state, target, targetText, targetContext, resolvedUses: usesResolution.resolvedUses });
   if (reusableStub) {
     job.leaSessionId = reusableStub.leaSessionId || null;
     job.recordedProofPath = reusableStub.recordedProofPath;
-    job.declarationName = reusableStub.declarationName || target.theoremLabel;
+    job.declarationName = reusableStub.declarationName || target.targetLabel;
     job.moduleName = reusableStub.moduleName || null;
     job.stubToComplete = {
       recordedProofPath: reusableStub.recordedProofPath,
       absolutePath: reusableStub.absolutePath,
-      declarationName: reusableStub.declarationName || target.theoremLabel,
+      declarationName: reusableStub.declarationName || target.targetLabel,
       leanStatement: reusableStub.leanStatement || ""
     };
   }
@@ -251,7 +256,7 @@ export async function handleFormalize(payload, state) {
   state.jobs[job.jobId] = job;
   await writeJson(state.jobsPath, state.jobs);
 
-  runLeaJob({ state, job, target, theoremText, theoremContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
+  runLeaJob({ state, job, target, targetText, targetContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
     job.status = "failed";
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
@@ -266,15 +271,18 @@ export async function handleFormalize(payload, state) {
 }
 
 export async function handleStub(payload, state) {
-  const validation = validateLeaPayload(payload);
+  const validation = validateTargetPayload(payload);
   if (!validation.ok) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext } = validation;
-  const expectedHash = hashTheoremText(theoremText);
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext } = validation;
+  if (targetKind !== "theorem") {
+    return errorResponse(400, "unsupported_stub_target", "Stub generation is only supported for theorem targets.");
+  }
+  const expectedHash = hashTargetText(targetText);
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
-    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match theoremText.");
+    return errorResponse(400, "source_hash_mismatch", "sourceHash does not match targetText.");
   }
 
   await syncSharedSettingsFromAdapter(state);
@@ -290,7 +298,8 @@ export async function handleStub(payload, state) {
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
-    theoremLabel
+    targetKind,
+    targetLabel
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -303,7 +312,7 @@ export async function handleStub(payload, state) {
   const usesResolution = await resolveTheoremUses({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
-    theoremUses,
+    targetUses,
     jobs: state.jobs || {}
   });
   if (!usesResolution.ok) {
@@ -313,8 +322,8 @@ export async function handleStub(payload, state) {
   const job = await createLeaJob({
     state,
     target,
-    theoremText,
-    theoremContext,
+    targetText,
+    targetContext,
     resolvedUses: usesResolution.resolvedUses,
     mode: "stub"
   });
@@ -326,8 +335,8 @@ export async function handleStub(payload, state) {
       state,
       job,
       target,
-      theoremText,
-      theoremContext,
+      targetText,
+      targetContext,
       resolvedUses: usesResolution.resolvedUses
     });
   } catch (error) {
@@ -1062,28 +1071,32 @@ function sanitizeSettingsForStorage(settings) {
   return sanitizeRuntimeSettings(settings);
 }
 
-function validateLeaPayload(payload) {
+function validateTargetPayload(payload) {
   const overleafProjectId = String(payload.overleafProjectId || "");
-  const theoremLabel = String(payload.theoremLabel || "");
-  const theoremText = String(payload.theoremText || "");
-  const theoremContext = String(payload.theoremContext || "").trim();
-  const theoremUses = Array.isArray(payload.theoremUses)
-    ? payload.theoremUses.map((value) => String(value || "").trim()).filter(Boolean)
+  const targetKind = normalizeTargetKind(payload.targetKind);
+  const targetLabel = String(payload.targetLabel || "");
+  const targetText = String(payload.targetText || "");
+  const targetContext = String(payload.targetContext || "").trim();
+  const targetUses = Array.isArray(payload.targetUses)
+    ? payload.targetUses.map((value) => String(value || "").trim()).filter(Boolean)
     : [];
   if (!overleafProjectId.trim()) {
     return { ok: false, error: "missing_project_id", message: "overleafProjectId is required." };
   }
-  if (!isValidLeanIdentifier(theoremLabel)) {
-    return { ok: false, error: "invalid_label", message: "Theorem label must be a valid Lean identifier." };
+  if (!targetKind) {
+    return { ok: false, error: "invalid_target_kind", message: "targetKind must be theorem or definition." };
   }
-  const invalidUse = theoremUses.find((value) => !isValidLeanIdentifier(value));
+  if (!isValidLeanIdentifier(targetLabel)) {
+    return { ok: false, error: "invalid_label", message: "Target label must be a valid Lean identifier." };
+  }
+  const invalidUse = targetUses.find((value) => !isValidLeanIdentifier(value));
   if (invalidUse) {
-    return { ok: false, error: "invalid_uses", message: `Theorem dependency label must be a valid Lean identifier: ${invalidUse}.` };
+    return { ok: false, error: "invalid_uses", message: `Target dependency label must be a valid Lean identifier: ${invalidUse}.` };
   }
-  if (!theoremText.trim()) {
-    return { ok: false, error: "missing_theorem_text", message: "Theorem text is required." };
+  if (!targetText.trim()) {
+    return { ok: false, error: "missing_target_text", message: "Target text is required." };
   }
-  return { ok: true, overleafProjectId, theoremLabel, theoremText, theoremUses, theoremContext };
+  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext };
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -1110,19 +1123,30 @@ export function buildOverleafDocumentUrl(overleafProjectId) {
   return `https://www.overleaf.com/project/${encodeURIComponent(id)}`;
 }
 
-function buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel }) {
+function normalizeTargetKind(value) {
+  const kind = String(value || "").trim();
+  return kind === "theorem" || kind === "definition" ? kind : "";
+}
+
+function targetKey({ targetKind, targetLabel }) {
+  return `${targetKind}:${targetLabel}`;
+}
+
+function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel }) {
   const projectSlug = slugProjectId(overleafProjectId);
   const projectMarkdownPath = buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId });
   return {
     overleafProjectId,
     projectId: overleafProjectId,
     projectSlug,
-    theoremLabel,
-    declarationName: theoremLabel,
+    targetKind,
+    targetLabel,
+    theoremLabel: targetLabel,
+    declarationName: targetLabel,
     projectMarkdownPath,
     relativePath: relativeToLeaRepo({ leaRepoPath, absolutePath: projectMarkdownPath }),
     absolutePath: projectMarkdownPath,
-    jobKey: `${projectSlug}:${theoremLabel}`
+    jobKey: `${projectSlug}:${targetKey({ targetKind, targetLabel })}`
   };
 }
 
@@ -1184,15 +1208,15 @@ function findLatestFinishedJob(jobs, jobKey) {
     .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
 }
 
-async function resolveTheoremUses({ leaRepoPath, overleafProjectId, theoremUses, jobs }) {
+async function resolveTheoremUses({ leaRepoPath, overleafProjectId, targetUses, jobs }) {
   const resolvedUses = [];
   const unresolvedUses = [];
 
-  for (const theoremLabel of theoremUses) {
-    const status = await getTheoremStatus({
+  for (const theoremLabel of targetUses) {
+    const status = await resolveTargetUseStatus({
       leaRepoPath,
       overleafProjectId,
-      theoremLabel,
+      targetLabel: theoremLabel,
       jobs
     });
 
@@ -1203,7 +1227,8 @@ async function resolveTheoremUses({ leaRepoPath, overleafProjectId, theoremUses,
     }
 
     resolvedUses.push({
-      theoremLabel,
+      targetKind: status.targetKind || "theorem",
+      targetLabel: theoremLabel,
       declarationName: equivalentStatus.declarationName,
       relativePath: equivalentStatus.recordedProofPath || equivalentStatus.relativePath || "",
       absolutePath: equivalentStatus.absolutePath,
@@ -1255,11 +1280,11 @@ function validateLeaRuntime(state, { requireApiKey }) {
   return { ok: true };
 }
 
-async function createLeaJob({ state, target, theoremText, theoremContext = "", resolvedUses = [], mode = "formalization" }) {
+async function createLeaJob({ state, target, targetText, targetContext = "", resolvedUses = [], mode = "formalization" }) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const jobId = `${target.theoremLabel}-${timestamp}`;
+  const jobId = `${target.targetKind}-${target.targetLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
-  const declarationNameHint = inferLeanDeclarationName(theoremText);
+  const declarationNameHint = inferLeanDeclarationName(targetText);
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
@@ -1270,16 +1295,17 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
     jobKey: target.jobKey,
     status: "in_progress",
     mode,
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
     projectMarkdownPath: target.projectMarkdownPath,
-    theoremLabel: target.theoremLabel,
-    declarationName: target.theoremLabel,
+    declarationName: target.targetLabel,
     declarationNameHint: declarationNameHint || null,
-    theoremUses: resolvedUses,
-    theoremContext,
-    theoremTextHash: hashTheoremText(theoremText),
+    targetUses: resolvedUses,
+    targetContext,
+    targetTextHash: hashTargetText(targetText),
     relativePath: target.relativePath,
     absolutePath: target.absolutePath,
     logPath,
@@ -1301,18 +1327,18 @@ async function createLeaJob({ state, target, theoremText, theoremContext = "", r
   };
 }
 
-async function cleanupPreviousRunArtifacts({ leaRepoPath, target, theoremText, jobs }) {
+async function cleanupPreviousRunArtifacts({ leaRepoPath, target, targetText, jobs }) {
   const previousJob = findLatestFinishedJob(jobs, target.jobKey);
   if (!previousJob) {
     return { removedProofPaths: [], removedProjectEntries: [] };
   }
 
-  const declarationHint = inferLeanDeclarationName(theoremText);
+  const declarationHint = inferLeanDeclarationName(targetText);
   const candidateNames = new Set([
     previousJob.declarationName,
     previousJob.declarationNameHint,
     declarationHint,
-    target.theoremLabel
+    target.targetLabel
   ].filter(Boolean));
   const candidateProofPaths = new Set([
     previousJob.recordedProofPath
@@ -1469,7 +1495,7 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
       effectiveStatus: local,
       leanCheck: null,
       error: exit.ok
-        ? `Lea reported a verified outcome but ${job.theoremLabel} still uses sorry/admit.`
+        ? `Lea reported a verified outcome but ${job.targetLabel || job.declarationName} still uses sorry/admit.`
         : (exit.error || null)
     };
   }
@@ -1525,7 +1551,7 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
 // decided, so the badge, the job record, and the polling resolver can never
 // disagree about whether a theorem was formalized.
 async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses }) {
-  const uses = Array.isArray(resolvedUses) ? resolvedUses : (job.theoremUses || []);
+  const uses = Array.isArray(resolvedUses) ? resolvedUses : (job.targetUses || []);
 
   const artifact = exit.ok
     ? await identifyLeaArtifact({
@@ -1552,7 +1578,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     : artifact?.error
       ? {
         status: "unformalized",
-        theoremLabel: target.theoremLabel,
+        theoremLabel: target.targetLabel,
         declarationName: target.declarationName,
         relativePath: target.relativePath,
         absolutePath: target.absolutePath,
@@ -1563,7 +1589,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
       : await getTheoremStatus({
         leaRepoPath: state.settings.leaRepoPath,
         overleafProjectId: target.overleafProjectId,
-        theoremLabel: target.theoremLabel,
+        theoremLabel: target.targetLabel,
         jobs: {}
       });
   const localStatus = (
@@ -1593,7 +1619,9 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     })
     : [];
   job.finalStatus = outcome.finalStatus;
-  job.resultKind = outcome.resultKind || null;
+  job.resultKind = target.targetKind === "definition" && outcome.jobStatus === "formalized"
+    ? "formalized"
+    : outcome.resultKind || null;
   job.resultDetail = outcome.resultDetail || null;
   job.apiRunId = exit.apiRunId || job.apiRunId || null;
   job.exitCode = ["formalized", "disproved"].includes(outcome.jobStatus) ? 0 : 1;
@@ -1615,13 +1643,14 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
   await writeJson(state.jobsPath, state.jobs);
 }
 
-async function runLeaJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
+async function runLeaJob({ state, job, target, targetText, targetContext = "", resolvedUses = [] }) {
   const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
+    targetKind: target.targetKind,
     projectSlug: target.projectSlug,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    theoremContext,
+    targetLabel: target.targetLabel,
+    targetText,
+    targetContext,
     declarationNameHint: job.declarationNameHint || "",
     resolvedUses,
     stubToComplete: job.stubToComplete || null
@@ -1632,13 +1661,13 @@ async function runLeaJob({ state, job, target, theoremText, theoremContext = "",
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 }
 
-async function runLeaStubJob({ state, job, target, theoremText, theoremContext = "", resolvedUses = [] }) {
+async function runLeaStubJob({ state, job, target, targetText, targetContext = "", resolvedUses = [] }) {
   const observedCodeSteps = new Map();
   const prompt = buildLeaStubPrompt({
     projectSlug: target.projectSlug,
-    theoremLabel: target.theoremLabel,
-    theoremText,
-    theoremContext,
+    theoremLabel: target.targetLabel,
+    theoremText: targetText,
+    theoremContext: targetContext,
     resolvedUses
   });
   const exit = await runLeaProofJobForJob({
@@ -1747,7 +1776,29 @@ function validateStubArtifact({ state, job, target, exit, sessionDetail, observe
   };
 }
 
-function buildLeaPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+  if (targetKind === "definition") {
+    return buildLeaDefinitionPrompt({
+      projectSlug,
+      targetLabel,
+      targetText,
+      targetContext,
+      declarationNameHint,
+      resolvedUses
+    });
+  }
+  return buildLeaTheoremPrompt({
+    projectSlug,
+    theoremLabel: targetLabel,
+    theoremText: targetText,
+    theoremContext: targetContext,
+    declarationNameHint,
+    resolvedUses,
+    stubToComplete
+  });
+}
+
+function buildLeaTheoremPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -1783,6 +1834,41 @@ The final file must compile with no sorry/admit in theorem ${proofTarget}.
 Use the Lea project context to choose the project namespace and proof path.
 Do not edit the project markdown during proof search; Lea will record the final result after the proof succeeds.
 Do not create placeholder files outside Lea's workspace. If you cannot complete the proof, leave the best partial Lean file in the Lea project proof directory.`;
+}
+
+function buildLeaDefinitionPrompt({ projectSlug, targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [] }) {
+  const naming = declarationNameHint
+    ? `The definition text appears to specify Lean declaration name ${declarationNameHint}; use that name for the primary declaration.`
+    : `Use the declaration name ${targetLabel} for the primary declaration unless the text explicitly specifies a better Lean name.`;
+  const usesGuidance = resolvedUses.length === 0
+    ? ""
+    : `\nAvailable already-recorded support declarations:\n${resolvedUses.map((use) => (
+      `- ${use.declarationName} at ${use.absolutePath}`
+    )).join("\n")}\n`;
+  const formalizationGuidance = targetContext.trim()
+    ? `\nFormalization guidance:\n${targetContext.trim()}\n`
+    : "";
+
+  return `Formalize the Overleaf definition labeled ${targetLabel} in project ${projectSlug}.
+This target is a definition, not a theorem.
+
+Create the appropriate Lean declaration or small group of declarations for the mathematical concept described below. Do not create a fake theorem just to satisfy a proof workflow.
+If the prose naturally maps to a predicate, prefer a named def.
+If it introduces bundled data and properties, consider structure or class.
+If it introduces a shorthand, consider abbrev or notation.
+${naming}
+${usesGuidance}
+
+Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a declaration for approval. If a detail is ambiguous, pick the most natural interpretation and proceed without waiting.
+
+The final Lean file must compile with no sorry/admit.
+Use the Lea project context to choose the project namespace and proof path.
+Do not edit the project markdown during formalization; Lea will record the final result after the declaration compiles.
+Do not create placeholder files outside Lea's workspace.
+
+Overleaf definition text:
+${targetText}
+${formalizationGuidance}`;
 }
 
 function buildLeaStubPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", resolvedUses = [] }) {
@@ -2094,12 +2180,14 @@ async function readLogTail(logPath, maxChars = 4000) {
 }
 
 function buildJobResponse({ job, status, target }) {
-  const declarationName = job.declarationName || target.declarationName || target.theoremLabel;
+  const declarationName = job.declarationName || target.declarationName || target.targetLabel;
   const leaSessionId = job.leaSessionId || job.recorderSessionId || null;
   const response = {
     status,
     jobId: job.jobId,
-    theoremLabel: target.theoremLabel,
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
+    targetKey: targetKey(target),
     declarationName,
     relativePath: job.recordedProofPath || target.relativePath,
     absolutePath: job.recordedProofPath
@@ -2113,7 +2201,7 @@ function buildJobResponse({ job, status, target }) {
     leanStatement: job.leanStatement || "",
     logTail: "",
     message: job.error || job.resultDetail || (status === "disproved" ? "Lea found a verified counterexample or disproof. The original theorem was not proven." : ""),
-    resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "formalized" ? "proved" : null),
+    resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "formalized" ? (target.targetKind === "definition" ? "formalized" : "proved") : null),
     resultDetail: job.resultDetail || null,
     leaSessionId,
     leaSessionUrl: leaSessionId ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId) : null,
@@ -2162,7 +2250,8 @@ async function findImportedStubbedTheoremUses({ proofPath, resolvedUses = [] }) 
   return stubbedUses
     .filter((use) => imports.has(use.moduleName))
     .map((use) => ({
-      theoremLabel: use.theoremLabel,
+      targetKind: use.targetKind || "theorem",
+      targetLabel: use.targetLabel,
       declarationName: use.declarationName,
       moduleName: use.moduleName,
       relativePath: use.relativePath || "",
@@ -2179,10 +2268,11 @@ async function findImportedCurrentlyStubbedTheoremUses({
 }) {
   const candidateUses = resolvedUses
     .map((use) => ({
-      theoremLabel: String(use?.theoremLabel || "").trim(),
+      targetKind: normalizeTargetKind(use?.targetKind) || "theorem",
+      targetLabel: String(use?.targetLabel || "").trim(),
       moduleName: use?.moduleName || null
     }))
-    .filter((use) => use.theoremLabel && use.moduleName);
+    .filter((use) => use.targetLabel && use.moduleName);
   if (!proofPath || candidateUses.length === 0) {
     return [];
   }
@@ -2205,7 +2295,8 @@ async function findImportedCurrentlyStubbedTheoremUses({
     const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
       leaRepoPath,
       overleafProjectId,
-      theoremLabel: use.theoremLabel,
+      targetKind: use.targetKind,
+      theoremLabel: use.targetLabel,
       jobs
     }));
     if (status?.status !== "sorry_stub") {
@@ -2213,7 +2304,8 @@ async function findImportedCurrentlyStubbedTheoremUses({
     }
 
     stubbedUses.push({
-      theoremLabel: use.theoremLabel,
+      targetKind: use.targetKind,
+      targetLabel: use.targetLabel,
       declarationName: status.declarationName,
       moduleName: status.moduleName || use.moduleName,
       relativePath: status.recordedProofPath || status.relativePath || "",
@@ -2238,13 +2330,45 @@ function parseLeanImports(content) {
   return imports;
 }
 
+async function getTargetStatus({
+  leaRepoPath,
+  overleafProjectId = "unknown",
+  targetKind,
+  targetLabel,
+  jobs = {}
+}) {
+  return getTheoremStatus({
+    leaRepoPath,
+    overleafProjectId,
+    targetKind,
+    theoremLabel: targetLabel,
+    jobs
+  });
+}
+
+async function resolveTargetUseStatus({
+  leaRepoPath,
+  overleafProjectId = "unknown",
+  targetLabel,
+  jobs = {}
+}) {
+  for (const targetKind of ["theorem", "definition"]) {
+    const status = await getTargetStatus({ leaRepoPath, overleafProjectId, targetKind, targetLabel, jobs });
+    if (["formalized", "sorry_stub"].includes(getEquivalentTheoremStatus(status).status)) {
+      return status;
+    }
+  }
+  return getTargetStatus({ leaRepoPath, overleafProjectId, targetKind: "theorem", targetLabel, jobs });
+}
+
 async function getTheoremStatus({
   leaRepoPath,
   overleafProjectId = "unknown",
+  targetKind = "theorem",
   theoremLabel,
   jobs = {}
 }) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel });
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
   const { projectStatus, directProofStatus, mappedStatus } = await getCurrentTheoremProofStatuses({
     leaRepoPath,
     target,
@@ -2336,7 +2460,9 @@ async function getTheoremStatus({
 
   return {
     status: "unformalized",
-    theoremLabel,
+    targetKind,
+    targetLabel: theoremLabel,
+    targetKey: targetKey({ targetKind, targetLabel: theoremLabel }),
     declarationName: theoremLabel,
     relativePath: target.relativePath,
     absolutePath: target.absolutePath,
@@ -2366,10 +2492,11 @@ async function getCurrentTheoremProofStatuses({
 async function getCurrentTheoremProofStatus({
   leaRepoPath,
   overleafProjectId = "unknown",
+  targetKind = "theorem",
   theoremLabel,
   jobs = {}
 }) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, theoremLabel });
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
   const { mappedStatus, projectStatus, directProofStatus } = await getCurrentTheoremProofStatuses({
     leaRepoPath,
     target,
@@ -2377,7 +2504,9 @@ async function getCurrentTheoremProofStatus({
   });
   return mappedStatus || projectStatus || directProofStatus || {
     status: "unformalized",
-    theoremLabel,
+    targetKind,
+    targetLabel: theoremLabel,
+    targetKey: targetKey({ targetKind, targetLabel: theoremLabel }),
     declarationName: theoremLabel,
     relativePath: target.relativePath,
     absolutePath: target.absolutePath,
@@ -2439,7 +2568,9 @@ async function getLeaProjectTheoremStatus({ leaRepoPath, target }) {
 async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: entry.proofPath });
   const responseBase = {
-    theoremLabel: target.theoremLabel,
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
+    targetKey: targetKey(target),
     declarationName: entry.name,
     relativePath: entry.proofPath,
     absolutePath: absolutePath || "",
@@ -2470,6 +2601,7 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   return {
     status: "formalized",
     ...responseBase,
+    resultKind: target.targetKind === "definition" ? "formalized" : "proved",
     leanStatement: extractLeanStatement(content, entry.name)
   };
 }
@@ -2488,7 +2620,9 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
   }
 
   const responseBase = {
-    theoremLabel: target.theoremLabel,
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
+    targetKey: targetKey(target),
     declarationName,
     relativePath: proofPath,
     absolutePath,
@@ -2510,6 +2644,7 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
   return {
     status: "formalized",
     ...responseBase,
+    resultKind: target.targetKind === "definition" ? "formalized" : "proved",
     leanStatement: extractLeanStatement(content, declarationName)
   };
 }
@@ -2551,8 +2686,8 @@ async function getLatestMappedJobStatus({
       leaRepoPath,
       overleafProjectId: target.projectId,
       proofPath: status.absolutePath,
-      resolvedUses: Array.isArray(mappedJob.theoremUses) && mappedJob.theoremUses.length > 0
-        ? mappedJob.theoremUses
+      resolvedUses: Array.isArray(mappedJob.targetUses) && mappedJob.targetUses.length > 0
+        ? mappedJob.targetUses
         : mappedJob.stubbedTheoremUses || [],
       jobs
     })
@@ -2836,14 +2971,14 @@ function unescapeHtmlAttribute(value) {
 
 function containsDeclaration(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma)\\s+${escapeRegExp(theoremLabel)}\\b`
+    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b`
   );
   return declarationPattern.test(content);
 }
 
 function extractLeanStatement(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma)\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?:=`
+    `(^|\\n)\\s*(?:private\\s+|protected\\s+)?(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
   );
   const match = content.match(declarationPattern);
   if (!match) return "";
