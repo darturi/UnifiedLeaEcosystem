@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ROOT, LEGACY_KEY_ENV, configured_provider_keys, load_config
+from .config import (
+    ROOT, LEGACY_KEY_ENV, configured_provider_keys, load_config,
+    permission_tier as config_permission_tier, PERMISSION_TIERS,
+    github_token as config_github_token,
+)
 from . import models_catalog
 from . import store
 
@@ -25,6 +29,18 @@ PROVIDER_LABELS = {
     "openai": "OpenAI",
     "anthropic": "Anthropic",
     "google": "Google",
+}
+# Display metadata for the approval tiers the live system actually supports
+# (the gate vs. autonomous axis). Keyed by config.PERMISSION_TIERS.
+PERMISSION_TIER_DETAILS = {
+    "stepwise": {
+        "label": "Approve each step",
+        "description": "Ask before each agent action (bash / write / edit) during formalization.",
+    },
+    "none": {
+        "label": "Fully autonomous",
+        "description": "The agent runs without approval prompts.",
+    },
 }
 # Curated shortlist of current models. Not exhaustive — the Settings model field
 # is a searchable combobox that also accepts any custom model ID (provider is
@@ -43,6 +59,10 @@ KEY_VALIDATORS = {
     "anthropic": re.compile(r"^sk-ant-.+"),
     "google": re.compile(r"^AIza[A-Za-z0-9_-]{20,}$"),
 }
+# GitHub PAT shapes (D34): classic `ghp_…`/scoped `gho_`/`ghu_`/`ghs_`/`ghr_`,
+# fine-grained `github_pat_…`, or a legacy 40-hex token. Lenient on length so valid
+# tokens aren't rejected; this is a format sniff, not authentication (the push proves the token).
+GITHUB_TOKEN_RE = re.compile(r"^(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|[0-9a-fA-F]{40})$")
 
 # The three "first-class" providers — their env vars route to legacy flat TOML
 # keys and get live key verification. Everything else (Mistral, HuggingFace, …)
@@ -99,6 +119,12 @@ def settings_payload(path: Path | None = None) -> dict[str, Any]:
         "current_spend_usd": float(stats["global"]["cost_usd"]),
         "api_keys": _api_keys_payload(configured_provider_keys(path)),
         "model_options": MODEL_OPTIONS,
+        "permission_tier": config_permission_tier(path),
+        "permission_tiers": [
+            {"value": tier, **PERMISSION_TIER_DETAILS[tier]} for tier in PERMISSION_TIERS
+        ],
+        # Presence-only, like the provider keys — the raw token never reaches the client.
+        "github_token": _masked_key(config_github_token(path)),
     }
 
 
@@ -179,6 +205,31 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
             if max_turns_int < 1:
                 raise ValueError("max_turns must be at least 1")
             updates["max_turns"] = max_turns_int
+
+    if "permission_tier" in values and values["permission_tier"] is not None:
+        tier = str(values["permission_tier"])
+        if tier not in PERMISSION_TIERS:
+            raise ValueError(
+                f"permission_tier must be one of {', '.join(PERMISSION_TIERS)}"
+            )
+        updates["permission_tier"] = tier
+
+    # GitHub token (D34): same {value, clear} shape as a provider key, redacted on read.
+    github_update = values.get("github_token")
+    if isinstance(github_update, dict):
+        if github_update.get("clear"):
+            updates["github_token"] = None
+        else:
+            gh_value = github_update.get("value")
+            if gh_value is not None:
+                gh_value = str(gh_value).strip()
+                if gh_value:
+                    if not GITHUB_TOKEN_RE.fullmatch(gh_value):
+                        raise SettingsValidationError(
+                            "That doesn't look like a GitHub token (expected ghp_…, github_pat_…, or a 40-char hex).",
+                            "github_token",
+                        )
+                    updates["github_token"] = gh_value
 
     if "max_spend_usd" in values:
         max_spend_usd = values["max_spend_usd"]

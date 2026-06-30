@@ -5,21 +5,27 @@ import {
   File as FileIcon,
   Folder,
   FolderOpen,
+  Github,
   Pencil,
+  UploadCloud,
 } from 'lucide-react';
 import {
+  getProject,
   getProjectFile,
   getProjectTree,
+  getSettings,
   projectExportUrl,
+  pushProject,
   putProjectFile,
+  setProjectRemote,
   type TreeEntry,
 } from '../lib/api';
 
-// The Filesystem tab (F8 / D34) — "see everything, edit, download." The project is
-// already a git repo, so this exposes it: a tree of the repo (left), a viewer/editor
-// for the selected file (right; write+commit, with a `.lean` check verdict), and an
-// Export button that downloads the whole project as a zip. GitHub push is a later
-// pass (6b) — this is the local view/edit/export half.
+// The Filesystem tab (F8 / D34) — "see everything, edit, download, share." The project
+// is already a git repo, so this exposes it: a tree of the repo (left), a viewer/editor
+// for the selected file (right; write+commit, with a `.lean` check verdict), an Export
+// button (zip), and a Share bar (6b) — set a GitHub remote + explicit Push using the
+// token from Settings (the token is injected into the push URL only, never persisted).
 
 type CheckVerdict = { status: 'ok' | 'error'; detail?: string | null } | null;
 
@@ -47,6 +53,61 @@ export function FilesystemTab({
   const seededRef = useRef<string | null>(null);
 
   const [selected, setSelected] = useState<string | null>(null);
+
+  // Share-to-GitHub (6b/D34): the project's saved remote + whether a token is set.
+  const [showShare, setShowShare] = useState(false);
+  const [remoteUrl, setRemoteUrl] = useState('');
+  const [savedRemote, setSavedRemote] = useState('');
+  const [tokenConfigured, setTokenConfigured] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [shareMsg, setShareMsg] = useState<string | null>(null);
+  const [shareErr, setShareErr] = useState<string | null>(null);
+
+  // Load the project's saved remote + whether a GitHub token is configured (drives
+  // the Push button's enabled state + the "add a token" hint).
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([getProject(projectId), getSettings().catch(() => null)])
+      .then(([project, settings]) => {
+        if (cancelled) return;
+        setSavedRemote(project.remote_url ?? '');
+        setRemoteUrl(project.remote_url ?? '');
+        setTokenConfigured(Boolean(settings?.github_token?.configured));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  const saveRemote = async () => {
+    setShareErr(null);
+    setShareMsg(null);
+    try {
+      const res = await setProjectRemote(projectId, remoteUrl.trim());
+      setSavedRemote(res.remote_url);
+      setRemoteUrl(res.remote_url);
+      setShareMsg('Remote saved.');
+    } catch (err) {
+      setShareErr(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const push = async () => {
+    if (!savedRemote) return;
+    if (!window.confirm(`Push this project to ${savedRemote}?\n\nThis pushes your local commits to the repo's main branch.`)) return;
+    setSharing(true);
+    setShareErr(null);
+    setShareMsg(null);
+    try {
+      const res = await pushProject(projectId);
+      setShareMsg(`Pushed to ${res.remote_url}.`);
+    } catch (err) {
+      setShareErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSharing(false);
+    }
+  };
 
   // Load + live-refresh the tree. Auto-expand every dir once per project (the repo is
   // small), then preserve the user's toggles across later refreshes.
@@ -95,11 +156,58 @@ export function FilesystemTab({
   return (
     <div className="fs">
       <div className="fs-bar">
-        <span className="fs-bar-hint">The project repo — browse, edit any file, download the lot.</span>
+        <span className="fs-bar-hint">The project repo — browse, edit any file, download, share.</span>
+        <button
+          className={`fs-share-toggle${showShare ? ' is-open' : ''}`}
+          onClick={() => setShowShare((s) => !s)}
+          title="Share this project to GitHub"
+        >
+          <Github size={13} /> Share
+        </button>
         <a className="fs-export" href={projectExportUrl(projectId)} download title="Download the whole project as a zip">
           <Download size={13} /> Export
         </a>
       </div>
+
+      {showShare && (
+        <div className="fs-share">
+          <div className="fs-share-row">
+            <input
+              className="fs-share-input"
+              value={remoteUrl}
+              placeholder="https://github.com/you/repo"
+              onChange={(e) => setRemoteUrl(e.target.value)}
+              spellCheck={false}
+            />
+            <button
+              className="fs-share-save"
+              onClick={saveRemote}
+              disabled={!remoteUrl.trim() || remoteUrl.trim() === savedRemote}
+            >
+              Save remote
+            </button>
+            <button
+              className="fs-share-push"
+              onClick={push}
+              disabled={!savedRemote || !tokenConfigured || sharing}
+              title={
+                !tokenConfigured
+                  ? 'Add a GitHub token in Settings to push'
+                  : !savedRemote
+                  ? 'Save a remote first'
+                  : 'Push to GitHub'
+              }
+            >
+              <UploadCloud size={13} /> {sharing ? 'Pushing…' : 'Push to GitHub'}
+            </button>
+          </div>
+          {!tokenConfigured && (
+            <div className="fs-share-hint">Add a GitHub token in Settings to enable Push.</div>
+          )}
+          {shareMsg && <div className="fs-share-ok">{shareMsg}</div>}
+          {shareErr && <div className="fs-share-err">{shareErr}</div>}
+        </div>
+      )}
 
       <div className="fs-body">
         <div className="fs-tree">

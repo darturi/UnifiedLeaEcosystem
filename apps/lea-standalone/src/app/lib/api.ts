@@ -300,6 +300,31 @@ export function projectExportUrl(projectId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/export`;
 }
 
+// ── Git sharing: set remote + push to GitHub (6b/U3, D34) ─────────────────────
+// The remote URL is stored per-project; the token is global (Settings, redacted).
+export async function setProjectRemote(
+  projectId: string,
+  remoteUrl: string,
+): Promise<{ id: string; remote_url: string }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/git/remote`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ remote_url: remoteUrl }),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to set the GitHub remote.'));
+  return response.json();
+}
+
+export async function pushProject(
+  projectId: string,
+): Promise<{ pushed: boolean; remote_url: string; detail: string }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/git/push`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Push to GitHub failed.'));
+  return response.json();
+}
+
 // ── Global search (Slice 7, D41) ──────────────────────────────────────────────
 // Sessions matching the query by their own title or their project's title, each
 // tagged with its project. The only way to reach a project session (sidebar-hidden).
@@ -368,21 +393,44 @@ export async function verifySession(
 // Settings / Stats / Models  (F6 rewires the pages; the endpoints already exist)
 // ────────────────────────────────────────────────────────────────────────────
 
+// The two approval modes the live system supports: "stepwise" gates the mutating
+// tools (interactive default), "none" runs fully autonomous (no gate). Mirrors the
+// backend config.PERMISSION_TIERS.
+export type PermissionTier = 'stepwise' | 'none';
+
+export interface PermissionTierOption {
+  value: PermissionTier;
+  label: string;
+  description: string;
+}
+
+// A masked provider-key status (presence-only; the raw key never reaches the client).
+export interface ApiKeyStatus {
+  configured: boolean;
+  last4?: string | null;
+  label: string;
+}
+
 export interface AppSettings {
   model?: string;
+  permission_tier?: PermissionTier;
+  permission_tiers?: PermissionTierOption[];
   max_turns?: number | null;
   max_spend_usd?: number | null;
   current_spend_usd?: number;
-  api_keys?: Record<string, { configured: boolean; last4?: string | null; label: string }>;
+  api_keys?: Record<string, ApiKeyStatus>;
+  github_token?: { configured: boolean; last4?: string | null };
   model_options?: { value: string; label: string; family?: string }[];
   [key: string]: unknown;
 }
 
 export interface SettingsUpdate {
   model?: string;
+  permission_tier?: PermissionTier;
   max_turns?: number | null;
   max_spend_usd?: number | null;
   api_keys?: Record<string, { value?: string; clear?: boolean }>;
+  github_token?: { value?: string; clear?: boolean };
 }
 
 export interface ModelCatalogEntry { value: string; label: string; provider: string }

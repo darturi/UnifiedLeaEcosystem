@@ -328,3 +328,97 @@ def test_put_doc_feeds_composed_context(tmp_path, monkeypatch):
     msg = project_service.compose_context_message(store.get_project(project["id"]), repo)
     assert "Prove √2 is irrational." in msg["content"]
     assert "explicit witnesses preferred" in msg["content"]
+
+
+# ── Git sharing: set remote + push (6b/U3, D34) ────────────────────────────────
+
+def test_set_project_remote_valid_and_invalid(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    pid = projects_route.create_project(ProjectCreate(title="Share Me"))["id"]
+    from app.routes.projects import RemoteUpdate
+
+    res = projects_route.set_project_remote(pid, RemoteUpdate(remote_url="https://github.com/me/share-me.git/"))
+    assert res["remote_url"] == "https://github.com/me/share-me.git"  # trailing slash stripped
+    assert store.get_project(pid)["remote_url"] == "https://github.com/me/share-me.git"
+
+    with pytest.raises(HTTPException) as ei:
+        projects_route.set_project_remote(pid, RemoteUpdate(remote_url="ftp://example.com/x"))
+    assert ei.value.status_code == 400
+
+
+def test_push_guards_no_remote_then_no_token(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    from app.routes.projects import RemoteUpdate
+    pid = projects_route.create_project(ProjectCreate(title="NoShare"))["id"]
+
+    with pytest.raises(HTTPException) as e1:
+        projects_route.push_project(pid)
+    assert e1.value.status_code == 400 and "remote" in e1.value.detail.lower()
+
+    projects_route.set_project_remote(pid, RemoteUpdate(remote_url="https://github.com/me/noshare"))
+    monkeypatch.setattr(projects_route, "github_token", lambda: None)
+    with pytest.raises(HTTPException) as e2:
+        projects_route.push_project(pid)
+    assert e2.value.status_code == 400 and "token" in e2.value.detail.lower()
+
+
+def test_push_to_local_bare_repo_functionally(tmp_path, monkeypatch):
+    """Push really lands commits on the remote (token=None, a local bare repo as the
+    remote). Proves push_to_github targets HEAD:refs/heads/main."""
+    import subprocess
+    from app.gitstore import GitStore
+
+    proofs = _setup(tmp_path, monkeypatch)
+    pid = projects_route.create_project(ProjectCreate(title="Pushy"))["id"]
+    repo = projects_route.project_service.project_repo_dir(store.get_project(pid), proofs)
+    (repo / "hello.txt").write_text("hi")
+    GitStore(proofs).commit_all(repo, "add hello")
+
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    GitStore(proofs).push_to_github(repo, str(bare), token=None, branch="main")
+
+    log = subprocess.run(
+        ["git", "--git-dir", str(bare), "log", "--oneline", "main"],
+        capture_output=True, text=True,
+    )
+    assert "add hello" in log.stdout
+
+
+def test_push_failure_detail_suggests_lea_only_on_divergence():
+    from app.routes.projects import _push_failure_detail
+    diverged = _push_failure_detail("! [rejected] main -> main (non-fast-forward)\nUpdates were rejected")
+    assert "reconcile" in diverged.lower() and "lea" in diverged.lower()
+    auth = _push_failure_detail("fatal: Authentication failed for 'https://github.com/me/repo'")
+    assert "reconcile" not in auth.lower()
+
+
+def test_push_to_diverged_remote_points_at_lea(tmp_path, monkeypatch):
+    """A real non-fast-forward push surfaces the 'ask Lea to reconcile' hint."""
+    import subprocess
+    from app.gitstore import GitStore
+
+    proofs = _setup(tmp_path, monkeypatch)
+    pid = projects_route.create_project(ProjectCreate(title="Diverged"))["id"]
+    repo = projects_route.project_service.project_repo_dir(store.get_project(pid), proofs)
+    (repo / "local.txt").write_text("local")
+    GitStore(proofs).commit_all(repo, "local commit")
+
+    bare = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    subprocess.run(["git", "init", "-q", str(seed)], check=True)
+    for k, v in (("user.email", "x@y.z"), ("user.name", "x")):
+        subprocess.run(["git", "-C", str(seed), "config", k, v], check=True)
+    (seed / "remote.txt").write_text("remote")
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "remote commit"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", str(bare), "HEAD:refs/heads/main"], check=True)
+
+    store.update_project(pid, remote_url=str(bare))
+    monkeypatch.setattr(projects_route, "github_token", lambda: "ghp_dummy")
+
+    with pytest.raises(HTTPException) as ei:
+        projects_route.push_project(pid)
+    assert ei.value.status_code == 502
+    assert "reconcile" in ei.value.detail.lower() and "lea" in ei.value.detail.lower()
