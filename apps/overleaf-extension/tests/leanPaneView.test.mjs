@@ -3,10 +3,13 @@ import test from "node:test";
 import {
   canFormalizePaneItem,
   capitalize,
+  formatLiteMath,
   formatPaneStatus,
   hasInProgressItems,
+  highlightLeanLine,
   overlayActiveTex,
   paneItemToFormalizeTarget,
+  parsePaneLatex,
   shouldRefetchLeanPaneFiles
 } from "../extension/leanPaneView.mjs";
 
@@ -97,4 +100,57 @@ test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item",
   assert.equal(theorem.targetKind, "theorem");
   assert.deepEqual(theorem.targetUses, []);
   assert.equal(theorem.targetContext, "");
+});
+
+test("parsePaneLatex splits inline and display math delimiters", () => {
+  assert.deepEqual(parsePaneLatex("Let $x \\in \\mathbb{R}$ and \\[x^2 \\ge 0\\]."), [
+    { type: "text", text: "Let " },
+    { type: "math", text: "x \\in \\mathbb{R}", display: false },
+    { type: "text", text: " and " },
+    { type: "math", text: "x^2 \\ge 0", display: true },
+    { type: "text", text: "." }
+  ]);
+
+  assert.deepEqual(parsePaneLatex("Use $$a_n\\to 0$$ now."), [
+    { type: "text", text: "Use " },
+    { type: "math", text: "a_n\\to 0", display: true },
+    { type: "text", text: " now." }
+  ]);
+});
+
+test("parsePaneLatex leaves unmatched delimiters as readable text", () => {
+  assert.deepEqual(parsePaneLatex("Cost is \\$5 and $unfinished."), [
+    { type: "text", text: "Cost is \\$5 and $unfinished." }
+  ]);
+});
+
+test("formatLiteMath prettifies common theorem math without dependencies", () => {
+  assert.deepEqual(formatLiteMath("\\forall x \\in \\mathbb{R}, x^2 \\ge 0"), [
+    { type: "text", text: "∀ x ∈ ℝ, x" },
+    { type: "sup", text: "2" },
+    { type: "text", text: " ≥ 0" }
+  ]);
+
+  assert.deepEqual(formatLiteMath("a_{n+1} \\to \\alpha"), [
+    { type: "text", text: "a" },
+    { type: "sub", text: "n+1" },
+    { type: "text", text: " → α" }
+  ]);
+});
+
+test("formatLiteMath keeps unknown commands visible as fallback text", () => {
+  assert.deepEqual(formatLiteMath("\\Spec R \\subseteq X"), [
+    { type: "text", text: "Spec R ⊆ X" }
+  ]);
+});
+
+test("highlightLeanLine marks Lean keywords, comments, strings, numbers, and types", () => {
+  const spans = highlightLeanLine('theorem foo : Nat := 2 -- "note"');
+  assert.equal(spans.find((span) => span.text === "theorem")?.cls, "kw");
+  assert.equal(spans.find((span) => span.text === "Nat")?.cls, "ty");
+  assert.equal(spans.find((span) => span.text === "2")?.cls, "num");
+  assert.equal(spans.find((span) => span.text.startsWith("--"))?.cls, "com");
+
+  const stringSpans = highlightLeanLine('open "Mathlib"');
+  assert.equal(stringSpans.find((span) => span.text === '"Mathlib"')?.cls, "str");
 });

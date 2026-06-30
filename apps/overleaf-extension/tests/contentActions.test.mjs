@@ -173,6 +173,54 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
 });
 
+test("Lean pane renders lightweight math and highlighted Lean code", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          title: "Main theorem",
+          status: "valid",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageRendered: "For every x in R, x^2 >= 0.",
+          naturalLanguageLatex: "For every $x \\in \\mathbb{R}$, $x^2 \\ge 0$.",
+          leanKind: "theorem",
+          leanDeclarationName: "main_theorem",
+          leanStub: "theorem main_theorem : Nat := 2",
+          leanArtifactPath: "workspace/proofs/Main.lean",
+          leanArtifactContent: "theorem main_theorem : Nat := by\n  -- proof\n  exact 2\n"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.ok(harness.countSelector(".ol-lean-project-math") >= 2);
+  assert.equal(harness.countSelector(".ol-lean-project-math-sup"), 1);
+  assert.ok(harness.countSelector(".ol-lean-project-lean-kw") >= 1);
+  assert.ok(harness.countSelector(".ol-lean-project-lean-ty") >= 1);
+  assert.ok(harness.countSelector(".ol-lean-project-lean-num") >= 1);
+  assert.match(harness.bodyText(), /For every x ∈ ℝ, x2 ≥ 0\./);
+
+  harness.clickFirstPaneItem();
+
+  assert.equal(harness.hasButtonText("Copy stub"), true);
+  assert.equal(harness.hasButtonText("Copy artifact"), true);
+  assert.ok(harness.countSelector(".ol-lean-project-lean-com") >= 1);
+});
+
 test("Lean pane 'Go to source' posts a navigate message with the item's offsets", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -429,6 +477,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     postedMessages,
     bodyText() {
       return document.body.textContent;
+    },
+    countSelector(selector) {
+      return document.body.querySelectorAll(selector).length;
     }
   };
 }

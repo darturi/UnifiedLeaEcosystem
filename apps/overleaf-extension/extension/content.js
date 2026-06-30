@@ -354,7 +354,7 @@
 
     const text = document.createElement("span");
     text.className = "ol-lean-project-item-title";
-    text.textContent = `${leanPaneView.capitalize(item.kind)}: ${item.title || item.leanDeclarationName || item.label}`;
+    renderLeanPaneTitle(text, item);
     const meta = document.createElement("span");
     meta.className = "ol-lean-project-item-meta";
     meta.textContent = item.label;
@@ -368,13 +368,13 @@
 
     const natural = document.createElement("p");
     natural.className = "ol-lean-project-natural";
-    natural.textContent = item.naturalLanguageRendered || item.naturalLanguageLatex || "";
+    renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
 
     if (item.leanStub) {
       const stub = document.createElement("pre");
       stub.className = "ol-lean-project-code";
-      stub.textContent = item.leanStub;
+      renderLeanPaneCode(stub, item.leanStub);
       card.appendChild(stub);
     } else {
       const missing = document.createElement("p");
@@ -418,7 +418,7 @@
     if (item.leanArtifactContent) {
       const artifact = document.createElement("pre");
       artifact.className = "ol-lean-project-artifact";
-      artifact.textContent = item.leanArtifactContent;
+      renderLeanPaneCode(artifact, item.leanArtifactContent);
       detail.appendChild(artifact);
     } else {
       const empty = document.createElement("p");
@@ -427,6 +427,73 @@
       detail.appendChild(empty);
     }
     return detail;
+  }
+
+  function renderLeanPaneTitle(element, item) {
+    element.replaceChildren();
+    element.appendChild(document.createTextNode(`${leanPaneView.capitalize(item.kind)}: `));
+    const title = item.title || item.leanDeclarationName || item.label || "";
+    if (item.title) {
+      renderLeanPaneLatex(element, title, { append: true });
+    } else {
+      element.appendChild(document.createTextNode(title));
+    }
+  }
+
+  function renderLeanPaneLatex(element, source, { append = false } = {}) {
+    if (!append) element.replaceChildren();
+    const segments = leanPaneView.parsePaneLatex(source || "");
+    if (segments.length === 0) {
+      element.appendChild(document.createTextNode(source || ""));
+      return;
+    }
+
+    for (const segment of segments) {
+      if (segment.type !== "math") {
+        element.appendChild(document.createTextNode(segment.text));
+        continue;
+      }
+      const math = document.createElement("span");
+      math.className = segment.display
+        ? "ol-lean-project-math ol-lean-project-math-display"
+        : "ol-lean-project-math";
+      const parts = leanPaneView.formatLiteMath(segment.text);
+      if (parts.length === 0) {
+        math.textContent = segment.text;
+      } else {
+        for (const part of parts) {
+          if (part.type === "sup" || part.type === "sub") {
+            const script = document.createElement("span");
+            script.className = `ol-lean-project-math-script ol-lean-project-math-${part.type}`;
+            script.textContent = part.text;
+            math.appendChild(script);
+          } else {
+            math.appendChild(document.createTextNode(part.text));
+          }
+        }
+      }
+      element.appendChild(math);
+    }
+  }
+
+  function renderLeanPaneCode(element, code) {
+    element.replaceChildren();
+    const lines = String(code || "").split("\n");
+    lines.forEach((line, lineIndex) => {
+      const row = document.createElement("span");
+      row.className = "ol-lean-project-code-line";
+      for (const token of leanPaneView.highlightLeanLine(line)) {
+        const span = document.createElement("span");
+        if (token.cls) span.className = `ol-lean-project-lean-${token.cls}`;
+        span.textContent = token.text;
+        row.appendChild(span);
+      }
+      if (line === "") row.appendChild(document.createTextNode(" "));
+      element.appendChild(row);
+      if (lineIndex < lines.length - 1) {
+        element.appendChild(document.createTextNode("\n"));
+      }
+    });
   }
 
   // Item 11: jump the Overleaf editor to this item's source block. The actual

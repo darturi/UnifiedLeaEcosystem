@@ -23,6 +23,12 @@
   --ol-red-ink: #9a3f35;
   --ol-amber: #b8842a;
   --ol-amber-soft: #f6ecd8;
+  --ol-code-bg: #fbfaf7;
+  --ol-code-kw: #9a3e8f;
+  --ol-code-str: #4f8a5b;
+  --ol-code-num: #b8842a;
+  --ol-code-com: #a9a79f;
+  --ol-code-type: #c96442;
   --ol-radius: 12px;
   --ol-radius-sm: 8px;
   --ol-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -369,6 +375,40 @@
 
 .ol-lean-project-natural {
   color: var(--ol-ink-2);
+  white-space: pre-wrap;
+}
+
+.ol-lean-project-math {
+  display: inline;
+  margin: 0 1px;
+  color: var(--ol-ink);
+  font-family: var(--ol-serif);
+  font-size: 1.04em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.ol-lean-project-math-display {
+  display: block;
+  margin: 8px 0;
+  overflow-x: auto;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.ol-lean-project-math-script {
+  display: inline-block;
+  margin-left: 1px;
+  font-size: 0.72em;
+  line-height: 0;
+}
+
+.ol-lean-project-math-sup {
+  vertical-align: super;
+}
+
+.ol-lean-project-math-sub {
+  vertical-align: sub;
 }
 
 .ol-lean-project-missing,
@@ -384,10 +424,35 @@
   overflow: auto;
   border: 1px solid var(--ol-line);
   border-radius: 7px;
-  background: var(--ol-panel-2);
+  background: var(--ol-code-bg);
   color: var(--ol-ink-2);
   font: 11px/1.45 var(--ol-mono);
   white-space: pre-wrap;
+}
+
+.ol-lean-project-code-line {
+  white-space: pre-wrap;
+}
+
+.ol-lean-project-lean-kw {
+  color: var(--ol-code-kw);
+}
+
+.ol-lean-project-lean-ty {
+  color: var(--ol-code-type);
+}
+
+.ol-lean-project-lean-str {
+  color: var(--ol-code-str);
+}
+
+.ol-lean-project-lean-num {
+  color: var(--ol-code-num);
+}
+
+.ol-lean-project-lean-com {
+  color: var(--ol-code-com);
+  font-style: italic;
 }
 
 .ol-lean-project-artifact {
