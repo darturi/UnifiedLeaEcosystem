@@ -42,6 +42,8 @@
   let leanPanePollTimer = null;
   let leanPaneView = null;
   let leanPaneExpandedItemIds = new Set();
+  let leanPaneHighlightTimer = null;
+  let lastLeanPaneManifest = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
   let costCapNotice = null;
@@ -153,8 +155,8 @@
     (document.body || document.documentElement).appendChild(leanPaneButton);
   }
 
-  function showLeanPane() {
-    closePopover();
+  function showLeanPane({ deferRefresh = false, preservePopover = false } = {}) {
+    if (!preservePopover) closePopover();
     if (leanPane) return;
     leanPane = document.createElement("aside");
     leanPane.className = "ol-lean-project-pane";
@@ -206,7 +208,9 @@
     leanPane.appendChild(leanPaneBody);
     document.body.appendChild(leanPane);
     leanPane.focus({ preventScroll: true });
-    refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+    if (!deferRefresh) {
+      refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+    }
   }
 
   function closeLeanPane() {
@@ -214,6 +218,8 @@
     leanPaneRefreshTimer = null;
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = null;
+    clearTimeout(leanPaneHighlightTimer);
+    leanPaneHighlightTimer = null;
     if (!leanPane) return;
     leanPane.remove();
     leanPane = null;
@@ -310,6 +316,7 @@
     if (!leanPaneBody || !leanPaneStatus) return;
     const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
+    lastLeanPaneManifest = manifest || null;
     leanPaneBody.replaceChildren();
     leanPaneStatus.textContent = items.length
       ? `${items.length} labeled item${items.length === 1 ? "" : "s"} from ${manifest.rootFile || "project sources"}.`
@@ -709,11 +716,89 @@
       actions.appendChild(sessionButton);
     }
 
+    const paneButton = document.createElement("button");
+    paneButton.type = "button";
+    paneButton.textContent = "Show in Lean pane";
+    paneButton.dataset.role = "show-in-lean-pane";
+    paneButton.disabled = isExtensionContextInvalidated();
+    paneButton.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      status.textContent = "Opening Lean pane...";
+      try {
+        const item = await showTargetInLeanPane(target);
+        status.textContent = `Opened ${item.label || target.targetLabel} in the Lean pane.`;
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error);
+      }
+    });
+    actions.appendChild(paneButton);
+
     const closeButton = document.createElement("button");
     closeButton.type = "button";
     closeButton.textContent = "Close";
     closeButton.addEventListener("click", closePopover);
     actions.appendChild(closeButton);
+  }
+
+  async function showTargetInLeanPane(target) {
+    if (!leanPane) {
+      showLeanPane({ deferRefresh: true, preservePopover: true });
+    }
+    await refreshLeanPaneNow({
+      forceFetch: !lastLeanPaneManifest,
+      background: Boolean(lastLeanPaneManifest)
+    });
+    const item = findLeanPaneItemForTarget(lastLeanPaneManifest?.items || [], target);
+    if (!item) {
+      throw new Error(`Could not find ${target.targetLabel || "this item"} in the Lean pane.`);
+    }
+    leanPaneExpandedItemIds.add(item.id);
+    renderLeanPaneManifest(lastLeanPaneManifest);
+    highlightLeanPaneItem(item.id);
+    return item;
+  }
+
+  function findLeanPaneItemForTarget(items, target) {
+    const targetLabel = String(target?.targetLabel || "").trim();
+    const latexLabel = String(target?.latexLabel || "").trim();
+    const targetFrom = Number(target?.from);
+    const targetTo = Number(target?.to);
+    const activePath = normalizeDocPath(latestActiveTexPath);
+    let best = null;
+
+    for (const item of Array.isArray(items) ? items : []) {
+      let score = 0;
+      if (targetLabel && item?.label === targetLabel) score += 100;
+      if (targetLabel && item?.leanDeclarationName === targetLabel) score += 100;
+      if (latexLabel && item?.latexLabel === latexLabel) score += 80;
+      if (
+        Number.isFinite(targetFrom) &&
+        Number.isFinite(targetTo) &&
+        item?.sourceStartOffset === targetFrom &&
+        item?.sourceEndOffset === targetTo
+      ) {
+        score += 60;
+      }
+      if (activePath && normalizeDocPath(item?.sourceFile) === activePath) score += 5;
+      if (score >= 60 && (!best || score > best.score)) {
+        best = { item, score };
+      }
+    }
+    return best?.item || null;
+  }
+
+  function highlightLeanPaneItem(itemId) {
+    if (!leanPaneBody) return;
+    const element = [...leanPaneBody.querySelectorAll(".ol-lean-project-item")]
+      .find((candidate) => candidate.dataset.itemId === itemId);
+    if (!element) return;
+    element.classList.add("ol-lean-project-item-focus");
+    element.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    clearTimeout(leanPaneHighlightTimer);
+    leanPaneHighlightTimer = setTimeout(() => {
+      element.classList.remove("ol-lean-project-item-focus");
+    }, 1800);
   }
 
   function actionSpecsForStatus(status, target) {
@@ -1936,6 +2021,10 @@
   function extractOverleafProjectId() {
     const match = location.pathname.match(/\/project\/([^/]+)/);
     return match ? match[1] : "unknown";
+  }
+
+  function normalizeDocPath(value) {
+    return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
   }
 
   function normalizeTargetText(text) {

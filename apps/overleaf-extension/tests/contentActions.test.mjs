@@ -263,6 +263,128 @@ test("Lean pane 'Go to source' posts a navigate message with the item's offsets"
   assert.equal(navigate.to, 42);
 });
 
+test("source popover 'Show in Lean pane' opens, expands, and highlights the matching item", async () => {
+  const harness = createContentHarness(
+    { status: "formalized" },
+    { targetLabel: "main_theorem" },
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "valid",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          sourceStartOffset: 0,
+          sourceEndOffset: 42,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          leanDeclarationName: "main_theorem",
+          leanArtifactContent: "theorem main_theorem : True := by\n  trivial\n"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.openTargetPopover();
+  assert.equal(harness.hasButtonText("Show in Lean pane"), true);
+
+  harness.clickButtonText("Show in Lean pane");
+  await flushPromises();
+
+  assert.match(harness.bodyText(), /Lean pane/);
+  assert.match(harness.bodyText(), /No generated Lean artifact|theorem main_theorem/);
+  assert.equal(harness.countSelector(".ol-lean-project-detail"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-item-focus"), 1);
+  assert.equal(harness.firstFocusedPaneItemScrolled(), true);
+  assert.match(harness.bodyText(), /Opened main_theorem in the Lean pane\./);
+});
+
+test("source popover 'Show in Lean pane' matches by Lean declaration name", async () => {
+  const harness = createContentHarness(
+    { status: "formalized" },
+    { targetLabel: "main_theorem" },
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:display-label:0",
+          kind: "theorem",
+          label: "display-label",
+          status: "valid",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          sourceStartOffset: 3,
+          sourceEndOffset: 42,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          leanDeclarationName: "main_theorem"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.openTargetPopover();
+  harness.clickButtonText("Show in Lean pane");
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-project-detail"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-item-focus"), 1);
+  assert.match(harness.bodyText(), /Opened display-label in the Lean pane\./);
+});
+
+test("source popover reports when 'Show in Lean pane' cannot find a matching item", async () => {
+  const harness = createContentHarness(
+    { status: "formalized" },
+    { targetLabel: "main_theorem" },
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:other_theorem:0",
+          kind: "theorem",
+          label: "other_theorem",
+          status: "valid",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          sourceStartOffset: 99,
+          sourceEndOffset: 120,
+          naturalLanguageRendered: "Other theorem.",
+          naturalLanguageLatex: "Other theorem.",
+          leanKind: "theorem",
+          leanDeclarationName: "other_theorem"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.openTargetPopover();
+  harness.clickButtonText("Show in Lean pane");
+  await flushPromises();
+
+  assert.match(harness.bodyText(), /Could not find main_theorem in the Lean pane\./);
+  assert.equal(harness.countSelector(".ol-lean-project-item-focus"), 0);
+});
+
 test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -456,6 +578,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         .querySelectorAll("button")
         .some((button) => button.textContent === text);
     },
+    openTargetPopover() {
+      window.postMessage({
+        type: "OL_LEAN_TARGET_CLICK",
+        target,
+        clientX: 16,
+        clientY: 20
+      }, "*");
+    },
     clickPaneTrigger() {
       const button = document.body.querySelector(".ol-lean-pane-trigger");
       assert.ok(button, "expected Lean pane trigger");
@@ -480,6 +610,10 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
+    },
+    firstFocusedPaneItemScrolled() {
+      const item = document.body.querySelector(".ol-lean-project-item-focus");
+      return Boolean(item?.scrollIntoViewOptions);
     }
   };
 }
@@ -538,14 +672,31 @@ class FakeElement {
     this._textContent = "";
     this._className = "";
     this.classList = {
-      contains: (className) => this.className.split(/\s+/).includes(className)
+      contains: (className) => this.className.split(/\s+/).includes(className),
+      add: (...classNames) => {
+        const next = new Set(this.className.split(/\s+/).filter(Boolean));
+        for (const className of classNames) next.add(className);
+        this.className = [...next].join(" ");
+      },
+      remove: (...classNames) => {
+        const remove = new Set(classNames);
+        this.className = this.className
+          .split(/\s+/)
+          .filter((className) => className && !remove.has(className))
+          .join(" ");
+      }
     };
     this.scrollTop = 0;
+    this.scrollIntoViewOptions = null;
   }
 
   focus() {}
 
   blur() {}
+
+  scrollIntoView(options) {
+    this.scrollIntoViewOptions = options || true;
+  }
 
   get className() {
     return this._className;

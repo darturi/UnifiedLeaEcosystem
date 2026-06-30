@@ -293,6 +293,13 @@
   border: 1px solid var(--ol-line);
   border-radius: var(--ol-radius-sm);
   background: var(--ol-panel);
+  transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
+}
+
+.ol-lean-project-item-focus {
+  border-color: var(--ol-accent);
+  background: var(--ol-accent-soft);
+  box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.12);
 }
 
 .ol-lean-project-item-header {
