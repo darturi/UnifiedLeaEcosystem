@@ -32,6 +32,15 @@ export default defineConfig({
   },
 
   server: {
+    // `katex` (and other deps) are hoisted to the monorepo-root node_modules, so
+    // katex.min.css resolves its font files from outside the app's project root.
+    // This app has its own lockfile, so Vite's workspace-root detection stops here
+    // and excludes the hoisted assets; allow the monorepo root explicitly (it also
+    // contains this app's dir) so those fonts serve in dev. The `..` parent is the
+    // `apps/` dir and `../..` is the monorepo root.
+    fs: {
+      allow: [path.resolve(__dirname, '../..')],
+    },
     proxy: {
       '/api': 'http://localhost:8001',
     },

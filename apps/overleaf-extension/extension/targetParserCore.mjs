@@ -282,11 +282,18 @@ function parseLeaCommentLine(line) {
 function extractEnvironmentText(source, environment) {
   const body = source.slice(environment.bodyFrom, environment.bodyTo);
   const labelMatch = source.slice(environment.from, environment.bodyTo).match(/\\label\s*\{([^}]*)\}/);
-  const targetText = body
+  return { targetText: stripLeaTargetText(body), latexLabel: labelMatch ? labelMatch[1].trim() : "" };
+}
+
+// Canonical natural-language text of a marked environment body: the same text the
+// staleness hash is computed over. Shared with the Lean-pane manifest so both
+// surfaces hash byte-identical input and can never drift (see
+// shared/leanPaneManifest.mjs and PLAN-overleaf-lean-pane-improvements.md item 1).
+export function stripLeaTargetText(body) {
+  return String(body || "")
     .replace(/^[ \t]*%\s*lea:.*(?:\r?\n|$)/gmi, "")
     .replace(/\\label\s*\{[^}]*\}/g, "")
     .trim();
-  return { targetText, latexLabel: labelMatch ? labelMatch[1].trim() : "" };
 }
 
 function buildDiagnostic({ code, message, from, to }) {

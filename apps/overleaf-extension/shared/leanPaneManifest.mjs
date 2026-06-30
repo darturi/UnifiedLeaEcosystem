@@ -1,0 +1,249 @@
+import { hashTargetText, normalizeTargetText } from "./theoremParser.mjs";
+import { parseTargets, stripLeaTargetText } from "../extension/targetParserCore.mjs";
+
+const THEOREM_KINDS = new Set(["theorem", "lemma", "proposition", "corollary"]);
+const DEFINITION_KINDS = new Set(["definition"]);
+const SUPPORTED_KINDS = new Set([...THEOREM_KINDS, ...DEFINITION_KINDS]);
+
+// The pane hashes the exact same canonical text the formalize path hashes
+// (`hashTargetText` over `stripLeaTargetText`), so an item's `sourceHash` and a
+// finished job's `targetTextHash` are directly comparable for staleness. These
+// aliases keep the original export names while delegating to the single source of
+// truth in theoremParser/targetParserCore (PLAN-overleaf-lean-pane-improvements item 1).
+export const normalizeLeanPaneText = normalizeTargetText;
+export const hashLeanPaneSource = hashTargetText;
+
+export function buildLeanPaneManifest({
+  overleafProjectId = "unknown",
+  files = []
+} = {}) {
+  const normalizedFiles = normalizeFiles(files);
+  const diagnostics = [];
+  const orderedPaths = normalizedFiles.map((file) => file.path).sort((a, b) => a.localeCompare(b));
+
+  const items = [];
+  const labels = new Map();
+  for (const sourceFile of orderedPaths) {
+    const file = normalizedFiles.find((candidate) => candidate.path === sourceFile);
+    if (!file) continue;
+    // Reuse the formalize-path parser to recover full marker metadata (uses/context)
+    // and confirm the marker is a valid formalize target. Keyed by environment
+    // offset, which both parsers compute identically for the same source.
+    const targetByOffset = new Map(parseTargets(file.content).map((target) => [target.from, target]));
+    for (const item of parseLeanPaneItemsFromFile(file, items.length)) {
+      const documentOrder = items.length;
+      const matchedTarget = targetByOffset.get(item.sourceStartOffset);
+      items.push({
+        // documentOrder keeps the id unique even when two environments share the
+        // same kind+label (a duplicate_label case), so expansion state and DOM
+        // dataset ids never collide in the pane.
+        id: `${item.kind}:${item.label}:${documentOrder}`,
+        overleafProjectId,
+        ...item,
+        // formalize-from-pane (item 12): only a valid marker is a runnable target.
+        formalizable: Boolean(matchedTarget),
+        targetUses: matchedTarget?.targetUses || [],
+        targetContext: matchedTarget?.targetContext || "",
+        documentOrder
+      });
+      const seen = labels.get(item.label) || [];
+      seen.push(item.sourceFile);
+      labels.set(item.label, seen);
+    }
+  }
+
+  for (const [label, sourceFiles] of labels.entries()) {
+    if (sourceFiles.length <= 1) continue;
+    diagnostics.push({
+      code: "duplicate_label",
+      label,
+      message: `Label ${label} appears in multiple Lean-pane items.`,
+      sourceFiles
+    });
+  }
+
+  return {
+    ok: true,
+    generatedAt: new Date().toISOString(),
+    rootFile: "",
+    items,
+    diagnostics
+  };
+}
+
+export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
+  const content = String(file?.content ?? "");
+  const sourceFile = normalizePath(file?.path || "");
+  const environments = findSupportedEnvironments(content);
+  const items = [];
+  for (const environment of environments) {
+    const extracted = extractEnvironmentContent(content, environment);
+    const leanName = extractLeaMarkerLabel(extracted.rawLatex);
+    if (!leanName) continue;
+    const sourceStart = offsetToLineColumn(content, environment.from);
+    const sourceEnd = offsetToLineColumn(content, environment.to);
+    const naturalLanguageLatex = stripLeaTargetText(extracted.rawLatex);
+    items.push({
+      label: leanName,
+      kind: environment.name,
+      title: extracted.title || undefined,
+      latexLabel: extracted.latexLabel || undefined,
+      documentOrder: initialOrder + items.length,
+      sourceFile,
+      sourceStartLine: sourceStart.line,
+      sourceEndLine: sourceEnd.line,
+      sourceStartOffset: environment.from,
+      sourceEndOffset: environment.to,
+      sourceHash: hashTargetText(naturalLanguageLatex),
+      naturalLanguageLatex,
+      naturalLanguageRendered: renderLightLatex(naturalLanguageLatex),
+      leanKind: DEFINITION_KINDS.has(environment.name) ? "def" : "theorem",
+      leanDeclarationName: leanName || undefined,
+      status: "missing-stub"
+    });
+  }
+  return items;
+}
+
+function normalizeFiles(files) {
+  const byPath = new Map();
+  for (const file of Array.isArray(files) ? files : []) {
+    const filePath = normalizePath(file?.path || "");
+    if (!filePath || !filePath.toLowerCase().endsWith(".tex")) continue;
+    byPath.set(filePath, { path: filePath, content: String(file?.content ?? "") });
+  }
+  return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function findSupportedEnvironments(source) {
+  const environments = [];
+  const stack = [];
+  const names = [...SUPPORTED_KINDS].join("|");
+  const pattern = new RegExp(`\\\\(begin|end)\\s*\\{\\s*(${names})\\s*\\}`, "g");
+  let match;
+
+  while ((match = pattern.exec(source))) {
+    const [, command, name] = match;
+    if (command === "begin") {
+      const openerEnd = findEnvironmentOpenerEnd(source, pattern.lastIndex);
+      stack.push({
+        name,
+        from: match.index,
+        bodyFrom: openerEnd.bodyFrom,
+        title: openerEnd.title
+      });
+      continue;
+    }
+
+    for (let index = stack.length - 1; index >= 0; index -= 1) {
+      if (stack[index].name !== name) continue;
+      const [open] = stack.splice(index, 1);
+      environments.push({
+        ...open,
+        bodyTo: match.index,
+        to: pattern.lastIndex
+      });
+      break;
+    }
+  }
+
+  return environments.sort((a, b) => a.from - b.from);
+}
+
+function findEnvironmentOpenerEnd(source, cursor) {
+  let index = cursor;
+  let bodyFrom = cursor;
+  let title = "";
+  while (index < source.length) {
+    index = skipInlineWhitespace(source, index);
+    if (isLineBreak(source[index])) break;
+    const group = parseBalancedSuffix(source, index);
+    if (!group.ok) break;
+    const groupText = source.slice(index + 1, group.end - 1).trim();
+    if (!title) {
+      title = groupText;
+    }
+    index = group.end;
+    bodyFrom = index;
+  }
+  return { bodyFrom, title: renderLightLatex(title) };
+}
+
+function extractEnvironmentContent(source, environment) {
+  const rawLatex = source.slice(environment.bodyFrom, environment.bodyTo).trim();
+  const heading = source.slice(environment.from, environment.bodyTo);
+  const labelMatch = heading.match(/\\label\s*\{([^}]*)\}/);
+  return {
+    rawLatex,
+    latexLabel: labelMatch ? labelMatch[1].trim() : "",
+    title: environment.title
+  };
+}
+
+function renderLightLatex(source) {
+  return String(source || "")
+    .replace(/^[ \t]*%.*(?:\r?\n|$)/gm, "")
+    .replace(/\\label\s*\{[^}]*\}/g, "")
+    .replace(/\\(?:emph|textbf|textit|mathrm|operatorname)\s*\{([^{}]*)\}/g, "$1")
+    .replace(/\\(?:ref|eqref|cite|autoref)\s*\{([^{}]*)\}/g, "$1")
+    .replace(/\\(?:left|right)\b/g, "")
+    .replace(/\\[,;:!]/g, " ")
+    .replace(/~+/g, " ")
+    .replace(/[ \t]*\r?\n[ \t]*/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function extractLeaMarkerLabel(source) {
+  const labelMatch = String(source || "").match(/^[ \t]*%\s*lea:\s*(?:formalize|define)?[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/im);
+  const value = (labelMatch?.[1] || labelMatch?.[2] || "").trim();
+  return isValidLeanIdentifier(value) ? value : "";
+}
+
+function isValidLeanIdentifier(value) {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(String(value || ""));
+}
+
+function offsetToLineColumn(source, offset) {
+  const prefix = String(source || "").slice(0, Math.max(0, offset));
+  const lines = prefix.split(/\r?\n/);
+  return {
+    line: lines.length,
+    column: lines[lines.length - 1].length + 1
+  };
+}
+
+function normalizePath(value) {
+  return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").trim();
+}
+
+function parseBalancedSuffix(source, cursor) {
+  const opener = source[cursor];
+  const closer = opener === "{" ? "}" : opener === "[" ? "]" : "";
+  if (!closer) return { ok: false };
+
+  let depth = 1;
+  for (let index = cursor + 1; index < source.length; index += 1) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (isLineBreak(char)) return { ok: false };
+    if (char === opener && previous !== "\\") {
+      depth += 1;
+    } else if (char === closer && previous !== "\\") {
+      depth -= 1;
+      if (depth === 0) return { ok: true, end: index + 1 };
+    }
+  }
+  return { ok: false };
+}
+
+function skipInlineWhitespace(source, cursor) {
+  while (cursor < source.length && /[ \t]/.test(source[cursor])) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function isLineBreak(char) {
+  return char === "\n" || char === "\r";
+}

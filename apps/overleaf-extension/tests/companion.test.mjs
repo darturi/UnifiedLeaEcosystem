@@ -8,9 +8,14 @@ import {
   buildOverleafDocumentUrl,
   buildSettingsResponse,
   ensureStartupLeaRuntime,
+  handleChatInterrupt,
+  handleChatMessage,
+  handleChatPoll,
+  handleChatSession,
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
+  handleLeanPaneManifest,
   handleMirrorTex,
   handleStub,
   handleUpdateLeaSettings,
@@ -265,6 +270,270 @@ test("mirror-tex rejects a missing project id and respects the disable toggle", 
   );
   assert.equal(disabled.statusCode, 400);
   assert.equal(disabled.body.error, "tex_mirror_disabled");
+});
+
+test("lean pane manifest returns missing-stub items without artifacts", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    activePath: "main.tex",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\documentclass{article}",
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items.length, 1);
+  assert.equal(res.body.items[0].label, "compactness_criterion");
+  assert.equal(res.body.items[0].latexLabel, "thm:compactness");
+  assert.equal(res.body.items[0].status, "missing-stub");
+  assert.equal(res.body.items[0].leanDeclarationName, "compactness_criterion");
+});
+
+test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  await writeLeaProjectProof(
+    leaRepo,
+    path.join("workspace", "proofs", "Lea", "Project", "compactness.lean"),
+    "theorem compactness_criterion : True := by\n  sorry\n"
+  );
+  await writeLeaProjectProof(
+    leaRepo,
+    path.join("workspace", "proofs", "Lea", "Project", "locally_finite.lean"),
+    "def locally_finite_family : Prop := True\n"
+  );
+  await writeLeaProjectMarkdownEntries(leaRepo, "project-1", [
+    {
+      theoremName: "compactness_criterion",
+      proofPath: path.join("workspace", "proofs", "Lea", "Project", "compactness.lean")
+    },
+    {
+      theoremName: "locally_finite_family",
+      proofPath: path.join("workspace", "proofs", "Lea", "Project", "locally_finite.lean")
+    }
+  ]);
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    activePath: "main.tex",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\documentclass{article}",
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}",
+        "\\begin{definition}\\label{def:locally-finite}",
+        "% lea: define label=locally_finite_family",
+        "A family is locally finite if every point has a neighborhood meeting finitely many members.",
+        "\\end{definition}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  // The definition formalizes to `defined`, distinct from a proved theorem's `valid`.
+  assert.deepEqual(res.body.items.map((item) => item.status), ["stub-generated", "defined"]);
+  assert.match(res.body.items[0].leanStub, /theorem compactness_criterion/);
+  assert.match(res.body.items[0].leanArtifactContent, /sorry/);
+  assert.match(res.body.items[1].leanArtifactContent, /def locally_finite_family/);
+  assert.equal(res.body.items[1].leanKind, "def");
+});
+
+test("lean pane manifest surfaces a disproof as a counterexample, not a failure", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.disproved = {
+    jobId: "disproved",
+    jobKey: "project-1:theorem:false_claim",
+    status: "disproved",
+    targetKind: "theorem",
+    targetLabel: "false_claim",
+    declarationName: "false_claim",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:false}",
+        "% lea: formalize label=false_claim",
+        "Every group is abelian.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "disproved");
+});
+
+test("lean pane manifest marks generated artifacts stale when source hash changes", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project", "compactness.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  trivial\n");
+  state.jobs.stale = {
+    jobId: "stale",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    recordedProofPath: proofPath,
+    targetTextHash: "old-source-hash",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "The source has changed.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "stale");
+  assert.equal(res.body.items[0].generatedFromSourceHash, "old-source-hash");
+});
+
+test("lean pane manifest uses adapter session code for formalized jobs without recorded proof paths", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch(calls, {
+      sessionId: "sess-formalized",
+      sessionDetail: {
+        project_namespace: "Lea.Project",
+        runs: [{ id: "api-run-1", input_tokens: 0, output_tokens: 0, cost_usd: 0 }],
+        code_steps: [{
+          id: "step-1",
+          seq: 1,
+          path: "Compactness.lean",
+          code: "@[simp]\ntheorem compactness_criterion : True := by\n  trivial\n",
+          check_status: "ok"
+        }]
+      }
+    })
+  });
+  state.jobs.formalized = {
+    jobId: "formalized",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaUiBaseUrl: "http://localhost:5173",
+    leaSessionId: "sess-formalized",
+    apiRunId: "api-run-1",
+    projectSlug: "project-1",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "valid");
+  assert.match(res.body.items[0].leanStub, /theorem compactness_criterion : True/);
+  assert.match(res.body.items[0].leanArtifactContent, /trivial/);
+  assert.match(res.body.items[0].leanArtifactPath, /Compactness\.lean/);
+  assert.ok(calls.some((call) => String(call.url).includes("/api/sessions/sess-formalized")));
+});
+
+test("lean pane manifest degrades when Lea lookup is unavailable", async () => {
+  const state = await makeState();
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:main}",
+        "% lea: formalize label=main_theorem",
+        "A.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "unknown");
+  assert.equal(res.body.diagnostics.at(-1).code, "lea_unconfigured");
+});
+
+test("lean pane manifest flags in-progress items for live polling", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+
+  await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    targetText: "Every open cover has a finite subcover."
+  }, state);
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:compactness}",
+        "% lea: formalize label=compactness_criterion",
+        "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "in-progress");
+  assert.equal(res.body.items[0].inProgress, true);
 });
 
 test("settings clear max spend and reject negative caps", async () => {
@@ -2626,4 +2895,249 @@ test("formalize on the /api backend tags the theorem failed when the run does no
     targets: [{ targetKind: "theorem", targetLabel: "t_api_failure", targetText: "A theorem." }]
   }, state);
   assert.equal(statuses.body.statuses["theorem:t_api_failure"].status, "failed");
+});
+
+// --- Lean-pane chat mirror -------------------------------------------------
+
+const CHAT_TARGET = {
+  overleafProjectId: "project-1",
+  targetKind: "theorem",
+  targetLabel: "compactness_criterion",
+  latexLabel: "thm:compactness",
+  sourceFile: "main.tex",
+  sourceStartLine: 2,
+  sourceEndLine: 5,
+  sourceHash: "hash-current",
+  naturalLanguageLatex: "Every open cover has a finite subcover.",
+  leanDeclarationName: "compactness_criterion",
+  status: "invalid"
+};
+
+function makeChatSessionDetail(overrides = {}) {
+  return {
+    status: overrides.status || "answered",
+    messages: overrides.messages || [
+      { id: "m2", role: "assistant", content: "It failed on the second goal.", kind: "assistant", seq: 2, created_at: "2026-01-01T00:00:02.000Z" },
+      { id: "m1", role: "user", content: "Why did this fail?", kind: "user", seq: 1, created_at: "2026-01-01T00:00:01.000Z" },
+      { id: "m3", role: "assistant", content: "calling write_file", kind: "tool_call", seq: 3, created_at: "2026-01-01T00:00:03.000Z" }
+    ],
+    runs: overrides.runs || [{ id: "api-run-1", status: "done", created_at: "2026-01-01T00:00:00.000Z" }],
+    active_run: overrides.active_run ?? null
+  };
+}
+
+function finishedChatJob(overrides = {}) {
+  return {
+    jobId: overrides.jobId || "chat-job",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: overrides.status || "failed",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    leaSessionId: overrides.leaSessionId || "sess-chat-1",
+    leaUiBaseUrl: "http://localhost:5173",
+    targetTextHash: overrides.targetTextHash ?? "hash-current",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+}
+
+test("chat session load returns no-session when no job or association exists", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const res = await handleChatSession({ target: CHAT_TARGET }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.status, "no-session");
+  assert.equal(res.body.leaSessionId, null);
+  assert.deepEqual(res.body.messages, []);
+});
+
+test("chat session load mirrors adapter messages, filtering tool narration and ordering by seq", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch(calls, { sessionDetail: makeChatSessionDetail() })
+  });
+  state.jobs.chat = finishedChatJob();
+
+  const res = await handleChatSession({ target: CHAT_TARGET }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.leaSessionId, "sess-chat-1");
+  assert.equal(res.body.leaSessionUrl, "http://localhost:5173/?session=sess-chat-1");
+  // tool_call message dropped; user/assistant kept in seq order
+  assert.deepEqual(res.body.messages.map((m) => m.role), ["user", "assistant"]);
+  assert.equal(res.body.messages[0].content, "Why did this fail?");
+  assert.ok(calls.some((c) => String(c.url).includes("/api/sessions/sess-chat-1")));
+});
+
+test("chat session load surfaces adapter-unavailable while keeping the session link", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: async () => ({ ok: false, status: 502, async text() { return ""; } })
+  });
+  state.jobs.chat = finishedChatJob();
+
+  const res = await handleChatSession({ target: CHAT_TARGET }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error, "adapter_unavailable");
+  assert.equal(res.body.leaSessionUrl, "http://localhost:5173/?session=sess-chat-1");
+});
+
+test("chat message starts a first-message session with the full context preamble", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Why did this fail?" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.leaSessionId, "sess-api-1");
+  assert.equal(res.body.runId, "api-run-1");
+  assert.equal(res.body.userMessage.content, "Why did this fail?");
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.equal(runCall.body.session_id, undefined);
+  assert.match(runCall.body.message, /You are helping with this Overleaf item\./);
+  assert.match(runCall.body.message, /Natural-language statement:/);
+  assert.match(runCall.body.message, /User request:\nWhy did this fail\?/);
+  // association recorded for a target that had no prior job
+  assert.equal(state.chatSessions["project-1:theorem:compactness_criterion"].leaSessionId, "sess-api-1");
+});
+
+test("chat message continues an existing session with a minimal prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+  state.jobs.chat = finishedChatJob({ leaSessionId: "sess-existing", targetTextHash: "hash-current" });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Please continue." }, state);
+
+  assert.equal(res.statusCode, 200);
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.equal(runCall.body.session_id, "sess-existing");
+  assert.equal(runCall.body.message, "Please continue.");
+  assert.doesNotMatch(runCall.body.message, /You are helping/);
+});
+
+test("chat message prepends a stale note when the source hash drifted", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+  state.jobs.chat = finishedChatJob({ leaSessionId: "sess-existing", targetTextHash: "hash-old" });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Is this still right?" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.stale, true);
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.match(runCall.body.message, /^Note: the Overleaf source changed after the known Lean artifact was generated\.\n\nIs this still right\?$/);
+});
+
+test("chat message is blocked while a formalization run is active", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  state.jobs.active = {
+    jobId: "active",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "in_progress",
+    targetLabel: "compactness_criterion",
+    leaSessionId: "sess-running",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Hi" }, state);
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.error, "run_in_progress");
+});
+
+test("chat message is blocked when the spend cap is reached", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0.01,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  state.jobs.usage = makeUsageJob({ jobId: "usage", projectId: "project-1", inputTokens: 10, outputTokens: 5, costUsd: 0.5 });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Hi" }, state);
+
+  assert.equal(res.statusCode, 402);
+  assert.equal(res.body.error, "max_spend_reached");
+});
+
+test("chat poll reshapes adapter session detail and reports the active run", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch([], {
+      sessionDetail: makeChatSessionDetail({ status: "running", active_run: { id: "api-run-1", status: "running" } })
+    })
+  });
+
+  const res = await handleChatPoll({ sessionId: "sess-chat-1" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.status, "running");
+  assert.equal(res.body.activeRun.id, "api-run-1");
+  assert.deepEqual(res.body.messages.map((m) => m.role), ["user", "assistant"]);
+});
+
+test("chat interrupt forwards the run id to the adapter", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch(calls)
+  });
+
+  const res = await handleChatInterrupt({ runId: "api-run-1" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.ok(calls.some((c) => String(c.url).includes("/api/runs/api-run-1/interrupt")));
+});
+
+test("chat message persists the association to disk when a path is configured", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+  state.chatSessionsPath = path.join(path.dirname(state.jobsPath), "chatSessions.json");
+
+  await handleChatMessage({ target: CHAT_TARGET, message: "Start here." }, state);
+
+  const saved = JSON.parse(await fs.readFile(state.chatSessionsPath, "utf8"));
+  assert.equal(saved["project-1:theorem:compactness_criterion"].leaSessionId, "sess-api-1");
+  assert.equal(saved["project-1:theorem:compactness_criterion"].sourceHash, "hash-current");
 });

@@ -9,13 +9,19 @@ whole project, together with the Lean stubs and generated Lean artifacts
 associated with those items.
 
 The target product experience is that a user can choose a Lean view in the same
-general way they can choose to view the PDF. If Overleaf does not expose enough
-UI surface for a true PDF-preview sibling tab, an extension-owned equivalent is
-acceptable, but the feature should still feel like a project preview mode rather
-than a small inline widget.
+general way they can choose to view the PDF.
 
-Version 1 is read-only. Later versions should add source navigation and
-formalization actions.
+**Decision (2026-06-26):** a true PDF-preview sibling tab inside Overleaf's own UI
+is **not** pursued — Overleaf exposes no stable surface for it. The pane ships as an
+extension-owned floating panel, and that is the accepted V1 surface, not a stopgap.
+It should still read as a project preview rather than a cramped inline widget, but
+no further Overleaf-tab integration is planned.
+
+Version 1 began read-only. As of 2026-06-26 the pane also supports **source
+navigation** ("Go to source" jumps the editor to an item's block) and
+**formalize-from-pane** (start a run for an actionable item, reusing the existing
+`/formalize` flow with live status polling). See
+`PLAN-overleaf-lean-pane-improvements.md` items 11–12.
 
 ## Goal
 
@@ -76,9 +82,9 @@ The extension should expose a Lean pane for the current Overleaf project. The
 pane should be available as a second document preview option alongside, or
 equivalent to, the PDF preview.
 
-The pane should list all included labeled mathematical environments across the
-whole project. Items should appear in the order their natural-language statements
-would appear in the rendered document.
+The pane should list all Lea-marked mathematical environments across the whole
+project (see "Included Items" for the marker rule). Items should appear in the
+order their natural-language statements would appear in the rendered document.
 
 Each item should show:
 
@@ -95,7 +101,7 @@ theorem-specific generated Lean artifact associated with that item.
 
 ## Included Items
 
-Version 1 should include labeled instances of:
+Version 1 should include **Lea-marked** instances of:
 
 ```text
 theorem
@@ -105,7 +111,11 @@ corollary
 definition
 ```
 
-Unlabeled environments should be omitted from the pane.
+**Decision (2026-06-26):** an environment appears in the pane only when it carries a
+Lea marker comment (`% lea: formalize …` / `% lea: define …`). An ordinary
+theorem/definition environment that is merely `\label`-ed but has no Lea marker is
+**omitted** — the pane is a marked-target inventory, not a catalogue of every
+labeled environment in the document.
 
 Definitions should be treated distinctly from proof-bearing statements. A
 definition should be associated with a Lean `def`, not with a theorem-shaped
@@ -343,8 +353,9 @@ underlying project data.
 
 1. A user can open a Lean pane or equivalent Lean project view from Overleaf.
 2. The view scans the whole Overleaf project, not just the active source file.
-3. Only labeled theorem and definition-like environments appear.
-4. Labeled items with no generated Lean still appear with `missing-stub` status.
+3. Only Lea-marked theorem and definition-like environments appear (a bare
+   `\label` without a `% lea:` marker is omitted).
+4. Marked items with no generated Lean still appear with `missing-stub` status.
 5. Items are ordered in rendered document order as closely as possible.
 6. Natural-language content is shown in a lightly rendered form.
 7. Available Lean stubs are shown inline.

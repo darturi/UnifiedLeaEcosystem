@@ -23,6 +23,12 @@
   --ol-red-ink: #9a3f35;
   --ol-amber: #b8842a;
   --ol-amber-soft: #f6ecd8;
+  --ol-code-bg: #fbfaf7;
+  --ol-code-kw: #9a3e8f;
+  --ol-code-str: #4f8a5b;
+  --ol-code-num: #b8842a;
+  --ol-code-com: #a9a79f;
+  --ol-code-type: #c96442;
   --ol-radius: 12px;
   --ol-radius-sm: 8px;
   --ol-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -94,6 +100,8 @@
 
 .ol-lean-status:focus-visible,
 .ol-lean-settings-trigger:focus-visible,
+.ol-lean-pane-trigger:focus-visible,
+.ol-lean-project-tree-row:focus-visible,
 .ol-lean-theorem-popover button:focus-visible,
 .ol-lean-popover button:focus-visible,
 .ol-lean-popover select:focus-visible,
@@ -165,6 +173,28 @@
   cursor: pointer;
 }
 
+.ol-lean-pane-trigger {
+  position: fixed;
+  right: 20px;
+  bottom: 66px;
+  z-index: 2147483646;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--ol-line);
+  border-radius: 999px;
+  background: var(--ol-panel);
+  box-shadow: 0 8px 24px rgba(31, 30, 29, 0.16), 0 1px 4px rgba(31, 30, 29, 0.08);
+  cursor: pointer;
+}
+
+.ol-lean-pane-trigger:hover {
+  border-color: var(--ol-accent);
+  background: var(--ol-panel-2);
+}
+
 .ol-lean-settings-trigger:hover {
   border-color: var(--ol-accent);
   background: var(--ol-panel-2);
@@ -179,6 +209,345 @@
   color: #ffffff;
   background: var(--ol-accent);
   font: 700 14px/1 var(--ol-serif);
+}
+
+.ol-lean-project-pane {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2147483646;
+  display: flex;
+  flex-direction: column;
+  width: min(520px, calc(100vw - 24px));
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  border-left: 1px solid var(--ol-line);
+  box-shadow: -16px 0 40px rgba(31, 30, 29, 0.18);
+  font: 13px/1.45 var(--ol-sans);
+}
+
+.ol-lean-project-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px 12px;
+  border-bottom: 1px solid var(--ol-line);
+}
+
+.ol-lean-project-pane-kicker {
+  margin: 0 0 4px;
+  color: var(--ol-muted);
+  font: 700 10px/1 var(--ol-mono);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ol-lean-project-pane h2 {
+  margin: 0;
+  color: var(--ol-ink);
+  font: 700 20px/1.2 var(--ol-sans);
+}
+
+.ol-lean-project-pane-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.ol-lean-project-pane-status {
+  margin: 0;
+  padding: 10px 18px;
+  color: var(--ol-muted);
+  border-bottom: 1px solid var(--ol-line-2);
+}
+
+.ol-lean-project-pane-body {
+  flex: 1;
+  min-height: 0;
+  padding: 14px 18px 24px;
+  overflow: auto;
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-project-pane-diagnostics,
+.ol-lean-project-pane-error {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  color: var(--ol-red-ink);
+  background: var(--ol-red-soft);
+  border: 1px solid var(--ol-red);
+  border-radius: var(--ol-radius-sm);
+}
+
+.ol-lean-project-pane-diagnostics p {
+  margin: 0;
+}
+
+.ol-lean-project-pane-diagnostics p + p {
+  margin-top: 6px;
+}
+
+.ol-lean-project-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ol-lean-project-tree-node {
+  min-width: 0;
+}
+
+.ol-lean-project-tree-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px 6px calc(8px + (var(--ol-tree-depth, 0) * 16px));
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--ol-ink);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ol-lean-project-tree-row:hover {
+  border-color: var(--ol-line);
+  background: var(--ol-panel);
+}
+
+.ol-lean-project-tree-row-file {
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.ol-lean-project-tree-disclosure {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--ol-muted);
+  font: 700 13px/1 var(--ol-sans);
+}
+
+.ol-lean-project-tree-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 700;
+}
+
+.ol-lean-project-tree-count {
+  color: var(--ol-muted);
+  font: 11px/1 var(--ol-mono);
+  white-space: nowrap;
+}
+
+.ol-lean-project-tree-status {
+  grid-row: auto;
+  grid-column: auto;
+}
+
+.ol-lean-project-tree-items {
+  margin: 6px 0 10px;
+  padding-left: 26px;
+}
+
+.ol-lean-project-tree-items .ol-lean-project-item {
+  margin-bottom: 8px;
+}
+
+.ol-lean-project-item {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel);
+  transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
+}
+
+.ol-lean-project-item-focus {
+  border-color: var(--ol-accent);
+  background: var(--ol-accent-soft);
+  box-shadow: 0 0 0 3px rgba(47, 111, 237, 0.12);
+}
+
+.ol-lean-project-item-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ol-lean-project-item-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ol-ink);
+  font-weight: 700;
+}
+
+.ol-lean-project-item-meta {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ol-muted);
+  font: 11px/1.3 var(--ol-mono);
+}
+
+.ol-lean-project-status {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  align-self: start;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: var(--ol-line-2);
+  color: var(--ol-muted);
+  font: 700 10px/1 var(--ol-sans);
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.ol-lean-project-status-valid,
+.ol-lean-project-status-defined {
+  color: var(--ol-green);
+  background: var(--ol-green-soft);
+}
+
+/* A verified disproof / counterexample is a successful result, but not a proof of
+   the stated theorem — accent (not green) marks "succeeded, but not what you asked". */
+.ol-lean-project-status-disproved {
+  color: var(--ol-accent-ink);
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-project-status-stub-generated,
+.ol-lean-project-status-stale,
+.ol-lean-project-status-missing-stub {
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+}
+
+.ol-lean-project-status-in-progress {
+  color: var(--ol-muted);
+  background: var(--ol-line-2);
+}
+
+.ol-lean-project-status-invalid,
+.ol-lean-project-status-error {
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+}
+
+.ol-lean-project-natural,
+.ol-lean-project-missing,
+.ol-lean-project-detail p {
+  margin: 10px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.ol-lean-project-natural {
+  color: var(--ol-ink-2);
+  white-space: pre-wrap;
+}
+
+.ol-lean-project-math {
+  display: inline;
+  margin: 0 1px;
+  color: var(--ol-ink);
+  font-family: var(--ol-serif);
+  font-size: 1.04em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.ol-lean-project-math-display {
+  display: block;
+  margin: 8px 0;
+  overflow-x: auto;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.ol-lean-project-math-script {
+  display: inline-block;
+  margin-left: 1px;
+  font-size: 0.72em;
+  line-height: 0;
+}
+
+.ol-lean-project-math-sup {
+  vertical-align: super;
+}
+
+.ol-lean-project-math-sub {
+  vertical-align: sub;
+}
+
+.ol-lean-project-missing,
+.ol-lean-project-detail p {
+  color: var(--ol-muted);
+}
+
+.ol-lean-project-code,
+.ol-lean-project-artifact {
+  max-height: 180px;
+  margin: 10px 0 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-code-bg);
+  color: var(--ol-ink-2);
+  font: 11px/1.45 var(--ol-mono);
+  white-space: pre-wrap;
+}
+
+.ol-lean-project-code-line {
+  white-space: pre-wrap;
+}
+
+.ol-lean-project-lean-kw {
+  color: var(--ol-code-kw);
+}
+
+.ol-lean-project-lean-ty {
+  color: var(--ol-code-type);
+}
+
+.ol-lean-project-lean-str {
+  color: var(--ol-code-str);
+}
+
+.ol-lean-project-lean-num {
+  color: var(--ol-code-num);
+}
+
+.ol-lean-project-lean-com {
+  color: var(--ol-code-com);
+  font-style: italic;
+}
+
+.ol-lean-project-artifact {
+  max-height: 320px;
+}
+
+.ol-lean-project-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ol-line-2);
+}
+
+.ol-lean-project-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .ol-lean-theorem-popover {
@@ -526,6 +895,19 @@
   background: var(--ol-panel-2);
 }
 
+/* The Formalize action is the pane's one state-changing button — give it the accent
+   so it reads as primary among the otherwise-passive copy/navigate actions. */
+.ol-lean-formalize-button {
+  border-color: var(--ol-accent);
+  color: var(--ol-accent-ink);
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-formalize-button:hover:not(:disabled) {
+  background: var(--ol-accent-soft);
+  border-color: var(--ol-accent-ink);
+}
+
 .ol-lean-primary-button:disabled,
 .ol-lean-secondary-button:disabled,
 .ol-lean-save-button:disabled {
@@ -737,4 +1119,136 @@
   border-color: var(--ol-accent);
   color: #ffffff;
   background: var(--ol-accent);
+}
+
+/* --- Lean-pane chat mirror -------------------------------------------------
+   A compact drawer over the Lean pane that mirrors the item's full Lea UI chat
+   session. Positioned absolutely within the (fixed) pane container. */
+.ol-lean-chat-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--ol-panel);
+  color: var(--ol-ink);
+}
+
+.ol-lean-chat-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ol-line);
+}
+
+.ol-lean-chat-title {
+  flex: 1;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ol-lean-chat-close {
+  border: 0;
+  background: transparent;
+  color: var(--ol-ink-2);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px;
+}
+
+.ol-lean-chat-source {
+  margin: 0;
+  padding: 6px 12px;
+  color: var(--ol-ink-2);
+  font: 12px/1.4 var(--ol-mono, ui-monospace, monospace);
+}
+
+.ol-lean-chat-transcript {
+  flex: 1;
+  /* Without min-height:0 a flex item defaults to min-height:auto and grows to
+     fit its content instead of scrolling, so the transcript would never overflow
+     internally and autoscroll (scrollTop = scrollHeight) would be a no-op. */
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+.ol-lean-chat-bubble {
+  max-width: 85%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ol-lean-chat-bubble code {
+  font-family: var(--ol-mono, ui-monospace, monospace);
+  font-size: 0.92em;
+}
+
+.ol-lean-chat-bubble-user {
+  align-self: flex-end;
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-chat-bubble-assistant {
+  align-self: flex-start;
+  background: var(--ol-panel-2);
+  border: 1px solid var(--ol-line);
+}
+
+.ol-lean-chat-notice {
+  margin: 0;
+  color: var(--ol-ink-2);
+  font-style: italic;
+}
+
+.ol-lean-chat-error {
+  margin: 0;
+  padding: 6px 12px;
+  color: #b3261e;
+}
+
+.ol-lean-chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--ol-line);
+}
+
+.ol-lean-chat-input {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  padding: 8px;
+  font: inherit;
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  box-sizing: border-box;
+}
+
+.ol-lean-chat-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ol-lean-chat-open {
+  margin-left: auto;
+  color: var(--ol-accent-ink);
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.ol-lean-chat-open:hover {
+  text-decoration: underline;
 }
