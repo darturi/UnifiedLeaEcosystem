@@ -129,8 +129,135 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   await flushPromises();
 
   assert.match(harness.bodyText(), /Lean pane/);
+  harness.clickPaneTreeRowText("main.tex");
   assert.match(harness.bodyText(), /Main theorem/);
   assert.match(harness.bodyText(), /missing stub/);
+});
+
+test("Lean pane renders every source file equally with file rows collapsed by default", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [
+          {
+            id: "theorem:main:0",
+            kind: "theorem",
+            label: "main",
+            title: "Main theorem",
+            status: "valid",
+            sourceFile: "main.tex",
+            documentOrder: 0,
+            naturalLanguageLatex: "Main theorem.",
+            leanKind: "theorem"
+          },
+          {
+            id: "definition:defs:1",
+            kind: "definition",
+            label: "defs",
+            title: "Section definition",
+            status: "missing-stub",
+            sourceFile: "sections/defs.tex",
+            documentOrder: 1,
+            naturalLanguageLatex: "A definition.",
+            leanKind: "def"
+          },
+          {
+            id: "lemma:supp:2",
+            kind: "lemma",
+            label: "supp",
+            title: "Supplemental lemma",
+            status: "valid",
+            sourceFile: "supp.tex",
+            documentOrder: 2,
+            naturalLanguageLatex: "A supplemental result.",
+            leanKind: "theorem"
+          }
+        ],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.match(harness.bodyText(), /3 labeled items across 3 \.tex files\./);
+  assert.deepEqual(harness.paneTreeRowTexts().map((text) => text.replace(/\s+/g, " ")), [
+    "▸main.tex1 itemvalid",
+    "▸sections/1 itemmissing stub",
+    "▸supp.tex1 itemvalid"
+  ]);
+  assert.doesNotMatch(harness.bodyText(), /Main theorem/);
+  assert.doesNotMatch(harness.bodyText(), /Section definition/);
+  assert.doesNotMatch(harness.bodyText(), /Supplemental lemma/);
+
+  harness.clickPaneTreeRowText("main.tex");
+  assert.match(harness.bodyText(), /Main theorem/);
+  harness.clickPaneTreeRowText("sections/");
+  harness.clickPaneTreeRowText("defs.tex");
+  assert.match(harness.bodyText(), /Section definition/);
+  harness.clickPaneTreeRowText("supp.tex");
+  assert.match(harness.bodyText(), /Supplemental lemma/);
+});
+
+test("Lean pane polling refresh preserves expanded folder and file rows", async () => {
+  let manifestCalls = 0;
+  const manifest = () => {
+    const sectionStatus = manifestCalls === 0 ? "in-progress" : "invalid";
+    manifestCalls += 1;
+    return {
+      ok: true,
+      rootFile: "main.tex",
+      items: [
+        {
+          id: "theorem:main:0",
+          kind: "theorem",
+          label: "main",
+          title: "Main theorem",
+          status: "valid",
+          sourceFile: "main.tex",
+          documentOrder: 0,
+          naturalLanguageLatex: "Main theorem.",
+          leanKind: "theorem"
+        },
+        {
+          id: "lemma:section:1",
+          kind: "lemma",
+          label: "section",
+          title: "Section lemma",
+          status: sectionStatus,
+          inProgress: sectionStatus === "in-progress",
+          sourceFile: "sections/defs.tex",
+          documentOrder: 1,
+          naturalLanguageLatex: "A lemma.",
+          leanKind: "theorem"
+        }
+      ],
+      diagnostics: []
+    };
+  };
+  const harness = createContentHarness({ status: "unformalized" }, {}, {
+    locationPath: "/project/unknown",
+    manifest
+  });
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("sections/");
+  harness.clickPaneTreeRowText("defs.tex");
+  assert.match(harness.bodyText(), /Section lemma/);
+  assert.match(harness.bodyText(), /in progress/);
+
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /Section lemma/);
+  assert.match(harness.bodyText(), /invalid/);
+  assert.equal(harness.countSelector(".ol-lean-project-item-header"), 1);
 });
 
 test("Lean pane expanded detail shows copy actions only for generated content", async () => {
@@ -166,6 +293,7 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   harness.clickPaneTrigger();
   await flushPromises();
 
+  harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
 
   assert.equal(harness.hasButtonText("Copy stub"), true);
@@ -207,6 +335,7 @@ test("Lean pane renders lightweight math and highlighted Lean code", async () =>
   harness.clickPaneTrigger();
   await flushPromises();
 
+  harness.clickPaneTreeRowText("main.tex");
   assert.ok(harness.countSelector(".ol-lean-project-math") >= 2);
   assert.equal(harness.countSelector(".ol-lean-project-math-sup"), 1);
   assert.ok(harness.countSelector(".ol-lean-project-lean-kw") >= 1);
@@ -253,6 +382,7 @@ test("Lean pane 'Go to source' posts a navigate message with the item's offsets"
   await harness.loadVisibleTheorems();
   harness.clickPaneTrigger();
   await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
   harness.clickButtonText("Go to source");
 
@@ -277,7 +407,7 @@ test("source popover 'Show in Lean pane' opens, expands, and highlights the matc
           kind: "theorem",
           label: "main_theorem",
           status: "valid",
-          sourceFile: "main.tex",
+          sourceFile: "sections/defs.tex",
           sourceStartLine: 1,
           sourceEndLine: 4,
           sourceStartOffset: 0,
@@ -304,6 +434,8 @@ test("source popover 'Show in Lean pane' opens, expands, and highlights the matc
   assert.match(harness.bodyText(), /No generated Lean artifact|theorem main_theorem/);
   assert.equal(harness.countSelector(".ol-lean-project-detail"), 1);
   assert.equal(harness.countSelector(".ol-lean-project-item-focus"), 1);
+  assert.ok(harness.paneTreeRowTexts().some((text) => text.includes("sections/")));
+  assert.ok(harness.paneTreeRowTexts().some((text) => text.includes("defs.tex")));
   assert.equal(harness.firstFocusedPaneItemScrolled(), true);
   assert.match(harness.bodyText(), /Opened main_theorem in the Lean pane\./);
 });
@@ -419,6 +551,7 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   await harness.loadVisibleTheorems();
   harness.clickPaneTrigger();
   await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
   harness.clickButtonText("Formalize");
   await flushPromises();
@@ -494,7 +627,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         status: 200,
         async json() {
           if (String(url).includes("/lean-pane/manifest")) {
-            return options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
+            return typeof options.manifest === "function"
+              ? options.manifest(fetchCalls)
+              : options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
           }
           if (String(url).includes("/formalize")) {
             return { jobId: "job-1", status: "in_progress" };
@@ -596,12 +731,32 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(button, "expected Lean pane item header");
       button.click();
     },
+    clickFirstPaneTreeRow(kind = "") {
+      const selector = kind ? `.ol-lean-project-tree-row-${kind}` : ".ol-lean-project-tree-row";
+      const button = document.body.querySelector(selector);
+      assert.ok(button, `expected Lean pane tree row ${kind || ""}`.trim());
+      button.click();
+    },
+    clickPaneTreeRowText(text) {
+      const button = document.body
+        .querySelectorAll(".ol-lean-project-tree-row")
+        .find((candidate) => candidate.textContent.includes(text));
+      assert.ok(button, `expected a tree row containing "${text}"`);
+      button.click();
+    },
     clickButtonText(text) {
       const button = document.body
         .querySelectorAll("button")
         .find((candidate) => candidate.textContent === text);
       assert.ok(button, `expected a button labeled "${text}"`);
       button.click();
+    },
+    async runScheduledTimers() {
+      const scheduledTimers = timers.splice(0, timers.length);
+      for (const timer of scheduledTimers) {
+        timer.callback();
+      }
+      await flushPromises();
     },
     fetchCalls,
     postedMessages,
@@ -610,6 +765,11 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
+    },
+    paneTreeRowTexts() {
+      return document.body
+        .querySelectorAll(".ol-lean-project-tree-row")
+        .map((row) => row.textContent);
     },
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");
@@ -665,7 +825,11 @@ class FakeElement {
     this.children = [];
     this.parentNode = null;
     this.dataset = {};
-    this.style = {};
+    this.style = {
+      setProperty: (name, value) => {
+        this.style[name] = String(value);
+      }
+    };
     this.attributes = {};
     this._listeners = new Map();
     this.hidden = false;

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  aggregatePaneStatus,
+  buildLeanPaneTree,
   canFormalizePaneItem,
   capitalize,
   formatLiteMath,
@@ -10,7 +12,8 @@ import {
   overlayActiveTex,
   paneItemToFormalizeTarget,
   parsePaneLatex,
-  shouldRefetchLeanPaneFiles
+  shouldRefetchLeanPaneFiles,
+  treeAncestorIdsForFile
 } from "../extension/leanPaneView.mjs";
 
 test("formatPaneStatus maps known statuses and falls back to unknown", () => {
@@ -21,6 +24,7 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("disproved"), "counterexample");
   assert.equal(formatPaneStatus("in-progress"), "in progress");
   assert.equal(formatPaneStatus("stale"), "stale");
+  assert.equal(formatPaneStatus("mixed"), "mixed");
   assert.equal(formatPaneStatus("nonsense"), "unknown");
   assert.equal(formatPaneStatus(undefined), "unknown");
 });
@@ -100,6 +104,48 @@ test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item",
   assert.equal(theorem.targetKind, "theorem");
   assert.deepEqual(theorem.targetUses, []);
   assert.equal(theorem.targetContext, "");
+});
+
+test("buildLeanPaneTree groups files into a compact source tree", () => {
+  const tree = buildLeanPaneTree([
+    { id: "defs", sourceFile: "sections/defs.tex", documentOrder: 2, status: "missing-stub" },
+    { id: "main", sourceFile: "main.tex", documentOrder: 0, status: "valid" },
+    { id: "intro", sourceFile: "sections/intro.tex", documentOrder: 1, status: "stale" }
+  ]);
+
+  assert.deepEqual(tree.children.map((node) => node.name), ["main.tex", "sections"]);
+  assert.equal(tree.children[0].type, "file");
+  assert.equal(tree.children[0].itemCount, 1);
+  assert.equal(tree.children[1].type, "folder");
+  assert.deepEqual(tree.children[1].children.map((node) => node.path), ["sections/intro.tex", "sections/defs.tex"]);
+  assert.deepEqual(tree.files.map((node) => node.path), ["main.tex", "sections/intro.tex", "sections/defs.tex"]);
+});
+
+test("buildLeanPaneTree omits files with no manifest items and preserves item order", () => {
+  const tree = buildLeanPaneTree([
+    { id: "b", sourceFile: "main.tex", documentOrder: 2, status: "valid" },
+    { id: "a", sourceFile: "main.tex", documentOrder: 1, status: "valid" }
+  ]);
+
+  assert.equal(tree.files.length, 1);
+  assert.deepEqual(tree.files[0].items.map((item) => item.id), ["a", "b"]);
+});
+
+test("aggregatePaneStatus applies file status precedence", () => {
+  assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "in-progress" }]), "in-progress");
+  assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "error" }, { status: "invalid" }]), "error");
+  assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "invalid" }]), "invalid");
+  assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "stale" }]), "stale");
+  assert.equal(aggregatePaneStatus([{ status: "stub-generated" }, { status: "missing-stub" }]), "missing-stub");
+  assert.equal(aggregatePaneStatus([{ status: "stub-generated" }]), "stub-generated");
+  assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "valid" }]), "valid");
+  assert.equal(aggregatePaneStatus([{ status: "defined" }, { status: "defined" }]), "defined");
+  assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "defined" }, { status: "disproved" }]), "mixed");
+});
+
+test("treeAncestorIdsForFile returns expandable folder and file ids", () => {
+  assert.deepEqual(treeAncestorIdsForFile("sections/defs.tex"), ["folder:sections", "file:sections/defs.tex"]);
+  assert.deepEqual(treeAncestorIdsForFile("/main.tex"), ["file:main.tex"]);
 });
 
 test("parsePaneLatex splits inline and display math delimiters", () => {

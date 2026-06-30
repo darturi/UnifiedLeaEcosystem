@@ -41,6 +41,8 @@
   let leanPaneRefreshTimer = null;
   let leanPanePollTimer = null;
   let leanPaneView = null;
+  let leanPaneExpandedTreeNodeIds = new Set();
+  let leanPaneTreeDefaultsKey = "";
   let leanPaneExpandedItemIds = new Set();
   let leanPaneHighlightTimer = null;
   let lastLeanPaneManifest = null;
@@ -225,6 +227,8 @@
     leanPane = null;
     leanPaneBody = null;
     leanPaneStatus = null;
+    leanPaneExpandedTreeNodeIds = new Set();
+    leanPaneTreeDefaultsKey = "";
   }
 
   // Load the pure pane helpers once. The pane is only built on user click (well
@@ -316,10 +320,13 @@
     if (!leanPaneBody || !leanPaneStatus) return;
     const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
+    const tree = leanPaneView.buildLeanPaneTree(items);
+    const fileCount = tree.files.length;
     lastLeanPaneManifest = manifest || null;
+    prepareLeanPaneTreeExpansion(manifest, tree);
     leanPaneBody.replaceChildren();
     leanPaneStatus.textContent = items.length
-      ? `${items.length} labeled item${items.length === 1 ? "" : "s"} from ${manifest.rootFile || "project sources"}.`
+      ? `${items.length} labeled item${items.length === 1 ? "" : "s"} across ${fileCount} .tex file${fileCount === 1 ? "" : "s"}.`
       : "No labeled theorem, lemma, proposition, corollary, or definition environments found.";
 
     if (Array.isArray(manifest?.diagnostics) && manifest.diagnostics.length > 0) {
@@ -333,11 +340,108 @@
       leanPaneBody.appendChild(diagnostics);
     }
 
-    for (const item of items) {
-      leanPaneBody.appendChild(renderLeanPaneItem(item));
+    if (items.length > 0) {
+      const treeElement = document.createElement("div");
+      treeElement.className = "ol-lean-project-tree";
+      for (const node of tree.children) {
+        treeElement.appendChild(renderLeanPaneTreeNode(node, 0, manifest));
+      }
+      leanPaneBody.appendChild(treeElement);
     }
 
     leanPaneBody.scrollTop = prevScrollTop;
+  }
+
+  function prepareLeanPaneTreeExpansion(manifest, tree) {
+    const key = [
+      itemsProjectId(manifest?.items || [])
+    ].join(":");
+    if (key !== leanPaneTreeDefaultsKey) {
+      leanPaneExpandedTreeNodeIds = new Set();
+      leanPaneTreeDefaultsKey = key;
+    }
+
+    const liveIds = new Set();
+    collectLeanPaneTreeNodeIds(tree.children, liveIds);
+    for (const id of [...leanPaneExpandedTreeNodeIds]) {
+      if (!liveIds.has(id)) leanPaneExpandedTreeNodeIds.delete(id);
+    }
+  }
+
+  function itemsProjectId(items) {
+    const item = Array.isArray(items) ? items.find((candidate) => candidate?.overleafProjectId) : null;
+    return item?.overleafProjectId || extractOverleafProjectId() || "unknown";
+  }
+
+  function collectLeanPaneTreeNodeIds(nodes, ids) {
+    for (const node of nodes || []) {
+      ids.add(node.id);
+      if (node.type === "folder") collectLeanPaneTreeNodeIds(node.children, ids);
+    }
+  }
+
+  function renderLeanPaneTreeNode(node, depth, manifest) {
+    const expanded = leanPaneExpandedTreeNodeIds.has(node.id);
+    const section = document.createElement("section");
+    section.className = `ol-lean-project-tree-node ol-lean-project-tree-node-${node.type}`;
+    section.dataset.treeNodeId = node.id;
+
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = `ol-lean-project-tree-row ol-lean-project-tree-row-${node.type}`;
+    row.style.setProperty("--ol-tree-depth", String(depth));
+    row.setAttribute("aria-expanded", String(expanded));
+    row.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${node.type === "folder" ? "folder" : "file"} ${node.path || node.name}`);
+    row.addEventListener("click", () => {
+      toggleLeanPaneTreeNode(node.id);
+      section.replaceWith(renderLeanPaneTreeNode(node, depth, manifest));
+    });
+
+    const disclosure = document.createElement("span");
+    disclosure.className = "ol-lean-project-tree-disclosure";
+    disclosure.textContent = expanded ? "▾" : "▸";
+    row.appendChild(disclosure);
+
+    const name = document.createElement("span");
+    name.className = "ol-lean-project-tree-name";
+    name.textContent = node.type === "folder" ? `${node.name}/` : node.name;
+    row.appendChild(name);
+
+    const count = document.createElement("span");
+    count.className = "ol-lean-project-tree-count";
+    count.textContent = `${node.itemCount} item${node.itemCount === 1 ? "" : "s"}`;
+    row.appendChild(count);
+
+    const chip = document.createElement("span");
+    chip.className = `ol-lean-project-status ol-lean-project-tree-status ol-lean-project-status-${node.status || "unknown"}`;
+    chip.textContent = leanPaneView.formatPaneStatus(node.status || "unknown");
+    row.appendChild(chip);
+    section.appendChild(row);
+
+    if (expanded) {
+      const children = document.createElement("div");
+      children.className = "ol-lean-project-tree-children";
+      if (node.type === "folder") {
+        for (const child of node.children) {
+          children.appendChild(renderLeanPaneTreeNode(child, depth + 1, manifest));
+        }
+      } else {
+        children.className = "ol-lean-project-tree-items";
+        for (const item of node.items) {
+          children.appendChild(renderLeanPaneItem(item));
+        }
+      }
+      section.appendChild(children);
+    }
+    return section;
+  }
+
+  function toggleLeanPaneTreeNode(id) {
+    if (leanPaneExpandedTreeNodeIds.has(id)) {
+      leanPaneExpandedTreeNodeIds.delete(id);
+    } else {
+      leanPaneExpandedTreeNodeIds.add(id);
+    }
   }
 
   function renderLeanPaneItem(item) {
@@ -513,6 +617,11 @@
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
+      if (leanPaneStatus) {
+        leanPaneStatus.textContent = item.sourceFile
+          ? `Opening ${item.sourceFile}...`
+          : "Opening source...";
+      }
       window.postMessage({
         type: "OL_LEAN_NAVIGATE",
         sourceFile: item.sourceFile || "",
@@ -752,6 +861,9 @@
     const item = findLeanPaneItemForTarget(lastLeanPaneManifest?.items || [], target);
     if (!item) {
       throw new Error(`Could not find ${target.targetLabel || "this item"} in the Lean pane.`);
+    }
+    for (const id of leanPaneView.treeAncestorIdsForFile(item.sourceFile || "")) {
+      leanPaneExpandedTreeNodeIds.add(id);
     }
     leanPaneExpandedItemIds.add(item.id);
     renderLeanPaneManifest(lastLeanPaneManifest);

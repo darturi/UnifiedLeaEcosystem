@@ -6,7 +6,7 @@ import {
 } from "../shared/leanPaneManifest.mjs";
 import { parseTargets } from "../shared/theoremParser.mjs";
 
-test("builds document-order inventory through input and include", () => {
+test("builds inventory from every marked tex file without requiring input/include", () => {
   const manifest = buildLeanPaneManifest({
     overleafProjectId: "project-1",
     activePath: "main.tex",
@@ -32,17 +32,23 @@ test("builds document-order inventory through input and include", () => {
         ].join("\n")
       },
       {
-        path: "unused.tex",
-        content: "\\begin{lemma}\\label{lem:unused}Unused.\\end{lemma}"
+        path: "supp.tex",
+        content: [
+          "\\begin{lemma}\\label{lem:supp}",
+          "% lea: formalize label=supplemental_lemma",
+          "A supplemental result.",
+          "\\end{lemma}"
+        ].join("\n")
       }
     ]
   });
 
-  assert.equal(manifest.rootFile, "main.tex");
-  assert.equal(manifest.items.length, 2);
-  assert.deepEqual(manifest.items.map((item) => item.label), ["compactness_criterion", "locally_finite_family"]);
-  assert.deepEqual(manifest.items.map((item) => item.latexLabel), ["thm:compactness", "def:locally-finite"]);
-  assert.deepEqual(manifest.items.map((item) => item.documentOrder), [0, 1]);
+  assert.equal(manifest.rootFile, "");
+  assert.equal(manifest.items.length, 3);
+  assert.deepEqual(manifest.items.map((item) => item.label), ["compactness_criterion", "locally_finite_family", "supplemental_lemma"]);
+  assert.deepEqual(manifest.items.map((item) => item.sourceFile), ["main.tex", "sections/defs.tex", "supp.tex"]);
+  assert.deepEqual(manifest.items.map((item) => item.latexLabel), ["thm:compactness", "def:locally-finite", "lem:supp"]);
+  assert.deepEqual(manifest.items.map((item) => item.documentOrder), [0, 1, 2]);
   assert.equal(manifest.items[0].leanDeclarationName, "compactness_criterion");
   assert.equal(manifest.items[1].leanKind, "def");
 });

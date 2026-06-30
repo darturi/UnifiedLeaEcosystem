@@ -18,6 +18,7 @@ const PANE_STATUS_LABELS = {
   invalid: "invalid",
   stale: "stale",
   error: "error",
+  mixed: "mixed",
   unknown: "unknown"
 };
 
@@ -63,6 +64,8 @@ const DOUBLE_STRUCK = {
   Q: "ℚ", R: "ℝ", S: "𝕊", T: "𝕋", U: "𝕌", V: "𝕍", W: "𝕎", X: "𝕏",
   Y: "𝕐", Z: "ℤ"
 };
+
+const SUCCESS_PANE_STATUSES = new Set(["valid", "defined", "disproved"]);
 
 export function formatPaneStatus(status) {
   return PANE_STATUS_LABELS[status] || "unknown";
@@ -149,6 +152,102 @@ export function highlightLeanLine(line) {
   return spans;
 }
 
+export function buildLeanPaneTree(items) {
+  const root = { type: "root", children: [], childMap: new Map(), order: Number.POSITIVE_INFINITY };
+  const files = new Map();
+  const sortedItems = [...(Array.isArray(items) ? items : [])]
+    .filter((item) => normalizePanePath(item?.sourceFile))
+    .sort((a, b) => paneItemOrder(a) - paneItemOrder(b));
+
+  for (const item of sortedItems) {
+    const sourceFile = normalizePanePath(item.sourceFile);
+    const parts = sourceFile.split("/").filter(Boolean);
+    if (parts.length === 0) continue;
+
+    let parent = root;
+    let currentPath = "";
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      currentPath = currentPath ? `${currentPath}/${parts[index]}` : parts[index];
+      const id = paneTreeFolderId(currentPath);
+      let folder = parent.childMap.get(id);
+      if (!folder) {
+        folder = {
+          type: "folder",
+          id,
+          name: parts[index],
+          path: currentPath,
+          children: [],
+          childMap: new Map(),
+          itemCount: 0,
+          status: "unknown",
+          order: paneItemOrder(item)
+        };
+        parent.childMap.set(id, folder);
+        parent.children.push(folder);
+      }
+      folder.order = Math.min(folder.order, paneItemOrder(item));
+      parent = folder;
+    }
+
+    const fileName = parts[parts.length - 1];
+    const fileId = paneTreeFileId(sourceFile);
+    let file = parent.childMap.get(fileId);
+    if (!file) {
+      file = {
+        type: "file",
+        id: fileId,
+        name: fileName,
+        path: sourceFile,
+        items: [],
+        itemCount: 0,
+        status: "unknown",
+        order: paneItemOrder(item)
+      };
+      parent.childMap.set(fileId, file);
+      parent.children.push(file);
+      files.set(sourceFile, file);
+    }
+    file.items.push(item);
+    file.itemCount = file.items.length;
+    file.order = Math.min(file.order, paneItemOrder(item));
+  }
+
+  finalizePaneTreeNodes(root.children);
+  return { children: root.children, files: [...files.values()] };
+}
+
+export function aggregatePaneStatus(items) {
+  const statuses = (Array.isArray(items) ? items : [])
+    .map((item) => String(item?.status || "unknown"))
+    .filter(Boolean);
+  if (statuses.length === 0) return "unknown";
+  if (statuses.includes("in-progress")) return "in-progress";
+  if (statuses.includes("error")) return "error";
+  if (statuses.includes("invalid")) return "invalid";
+  if (statuses.includes("stale")) return "stale";
+  if (statuses.includes("missing-stub")) return "missing-stub";
+  if (statuses.includes("stub-generated")) return "stub-generated";
+  if (statuses.every((status) => SUCCESS_PANE_STATUSES.has(status))) {
+    const unique = new Set(statuses);
+    return unique.size === 1 ? statuses[0] : "mixed";
+  }
+  const unique = new Set(statuses);
+  return unique.size === 1 ? statuses[0] : "mixed";
+}
+
+export function treeAncestorIdsForFile(sourceFile) {
+  const parts = normalizePanePath(sourceFile).split("/").filter(Boolean);
+  if (parts.length === 0) return [];
+  const ids = [];
+  let currentPath = "";
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    currentPath = currentPath ? `${currentPath}/${parts[index]}` : parts[index];
+    ids.push(paneTreeFolderId(currentPath));
+  }
+  ids.push(paneTreeFileId(parts.join("/")));
+  return ids;
+}
+
 // Decide whether the pane must re-download the whole project archive, or can reuse
 // the cached file set and just overlay the live active-editor buffer. A full fetch
 // is only needed on an explicit request (manual refresh / first open) or when the
@@ -200,6 +299,45 @@ export function paneItemToFormalizeTarget(item) {
     targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
     targetContext: item?.targetContext || ""
   };
+}
+
+function finalizePaneTreeNodes(nodes) {
+  nodes.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+  for (const node of nodes) {
+    if (node.type === "folder") {
+      finalizePaneTreeNodes(node.children);
+      const descendantItems = node.children.flatMap((child) => child.type === "file" ? child.items : collectPaneTreeItems(child));
+      node.itemCount = descendantItems.length;
+      node.status = aggregatePaneStatus(descendantItems);
+      delete node.childMap;
+    } else if (node.type === "file") {
+      node.items.sort((a, b) => paneItemOrder(a) - paneItemOrder(b));
+      node.itemCount = node.items.length;
+      node.status = aggregatePaneStatus(node.items);
+    }
+  }
+}
+
+function collectPaneTreeItems(node) {
+  if (node.type === "file") return node.items;
+  return node.children.flatMap((child) => collectPaneTreeItems(child));
+}
+
+function paneItemOrder(item) {
+  const order = Number(item?.documentOrder);
+  return Number.isFinite(order) ? order : Number.POSITIVE_INFINITY;
+}
+
+function paneTreeFolderId(path) {
+  return `folder:${normalizePanePath(path)}`;
+}
+
+function paneTreeFileId(path) {
+  return `file:${normalizePanePath(path)}`;
+}
+
+function normalizePanePath(value) {
+  return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").trim();
 }
 
 function findNextMathDelimiter(text, cursor) {

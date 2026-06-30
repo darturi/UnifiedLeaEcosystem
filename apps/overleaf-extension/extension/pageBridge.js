@@ -89,17 +89,22 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
     }
   });
 
-  // Item 11: jump the editor to a source block. Navigation is anchored on the item's
-  // marker text (robust to edits and path-format quirks) and falls back to byte
-  // offsets. When the active document's path can't be matched to the item's file, the
-  // current view is still attempted — Overleaf's internal path API is best-effort.
+  // Item 11: jump the editor to a source block. Same-file navigation may fall back
+  // to byte offsets, but cross-file navigation only trusts marker/label anchors
+  // until Overleaf confirms the target file is active.
   function navigateToSource(message) {
     const activePath = getActiveDocPath();
-    const inActiveFile = !activePath || sameDocPath(activePath, message?.sourceFile);
+    const sourceFile = normalizeDocPath(message?.sourceFile);
+    const inActiveFile = sourceFile ? sameDocPath(activePath, sourceFile) : true;
 
     if (inActiveFile) {
       const ok = selectTargetInActiveView(message, { allowOffsets: true });
       postNavigateResult(ok, ok ? "" : "not_found", message?.sourceFile);
+      return;
+    }
+
+    if (!activePath && selectTargetInActiveView(message, { allowOffsets: false })) {
+      postNavigateResult(true, "", message?.sourceFile);
       return;
     }
 
@@ -225,17 +230,22 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
 
       const line = Number(message?.line);
       const options = Number.isFinite(line) && line > 0 ? { gotoLine: line } : {};
-
-      if (typeof em.openDoc === "function") {
-        em.openDoc(entity, options);
-        return true;
-      }
       const id = entity._id || entity.id;
-      if (id && typeof em.openDocId === "function") {
-        em.openDocId(id, options);
-        return true;
-      }
+      let called = false;
+      if (id && typeof em.openDocId === "function") called = tryOpenDoc(() => em.openDocId(id, options)) || called;
+      if (id && typeof em.openDoc === "function") called = tryOpenDoc(() => em.openDoc(id, options)) || called;
+      if (typeof em.openDoc === "function") called = tryOpenDoc(() => em.openDoc(entity, options)) || called;
+      if (typeof em.openEntity === "function") called = tryOpenDoc(() => em.openEntity(entity, options)) || called;
+      return called;
+    } catch {
       return false;
+    }
+  }
+
+  function tryOpenDoc(open) {
+    try {
+      open();
+      return true;
     } catch {
       return false;
     }
@@ -245,17 +255,100 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
   // Overleaf's findEntityByPath has used (entity directly, or { entity, ... }) and
   // an optional leading slash.
   function resolveEntityByPath(ft, wanted) {
-    if (typeof ft.findEntityByPath !== "function") return null;
-    for (const candidate of [wanted, `/${wanted}`]) {
-      try {
-        const found = ft.findEntityByPath(candidate);
-        const entity = found && (found.entity || found);
-        if (entity && (entity._id || entity.id || entity.name || entity.type)) return entity;
-      } catch {
-        // try the next candidate form
+    if (typeof ft.findEntityByPath === "function") {
+      for (const candidate of [wanted, `/${wanted}`]) {
+        try {
+          const found = ft.findEntityByPath(candidate);
+          const entity = found && (found.entity || found);
+          if (isDocEntity(entity)) return entity;
+        } catch {
+          // try the next candidate form
+        }
+      }
+    }
+    return findEntityInTree(ft, wanted);
+  }
+
+  function isDocEntity(entity) {
+    return Boolean(entity && (entity._id || entity.id || entity.name || entity.path || entity.pathname || entity.fileRef));
+  }
+
+  function findEntityInTree(ft, wanted) {
+    const roots = [
+      ft.root,
+      ft.rootFolder,
+      ft.fileTree,
+      ft.tree,
+      ft.docs,
+      ft.entities,
+      typeof ft.getRootFolder === "function" ? safeCall(() => ft.getRootFolder()) : null,
+      typeof ft.getFileTree === "function" ? safeCall(() => ft.getFileTree()) : null,
+      typeof ft.getAllEntities === "function" ? safeCall(() => ft.getAllEntities()) : null
+    ].filter(Boolean);
+    const seen = new Set();
+    for (const root of roots) {
+      const found = walkEntityTree(root, wanted, "", seen);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function walkEntityTree(node, wanted, parentPath, seen) {
+    if (!node || typeof node !== "object") return null;
+    if (seen.has(node)) return null;
+    seen.add(node);
+
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = walkEntityTree(child, wanted, parentPath, seen);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    const entity = node.entity || node;
+    const entityPath = normalizeEntityPath(entity, parentPath);
+    if (entityPath && sameDocPath(entityPath, wanted) && isDocEntity(entity)) {
+      return entity;
+    }
+
+    const childParentPath = entityPath || parentPath;
+    const children = [
+      entity.children,
+      entity.folders,
+      entity.docs,
+      entity.fileRefs,
+      entity.entries,
+      entity.entities
+    ].filter(Boolean);
+    for (const childSet of children) {
+      const found = walkEntityTree(childSet, wanted, childParentPath, seen);
+      if (found) return found;
+    }
+    if (!isDocEntity(entity)) {
+      for (const value of Object.values(entity)) {
+        const found = walkEntityTree(value, wanted, parentPath, seen);
+        if (found) return found;
       }
     }
     return null;
+  }
+
+  function normalizeEntityPath(entity, parentPath) {
+    const direct = entity.path || entity.pathname || entity.filePath || entity.fullPath;
+    if (direct) return normalizeDocPath(direct);
+    const name = entity.name || entity._name || entity.filename;
+    if (!name) return "";
+    const joined = parentPath ? `${normalizeDocPath(parentPath)}/${name}` : name;
+    return normalizeDocPath(joined);
+  }
+
+  function safeCall(fn) {
+    try {
+      return fn();
+    } catch {
+      return null;
+    }
   }
 
   window.setInterval(() => {

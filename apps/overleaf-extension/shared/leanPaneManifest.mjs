@@ -15,22 +15,11 @@ export const hashLeanPaneSource = hashTargetText;
 
 export function buildLeanPaneManifest({
   overleafProjectId = "unknown",
-  files = [],
-  activePath = ""
+  files = []
 } = {}) {
   const normalizedFiles = normalizeFiles(files);
-  const rootFile = selectRootFile(normalizedFiles, activePath);
   const diagnostics = [];
-  if (!rootFile && normalizedFiles.length > 0) {
-    diagnostics.push({
-      code: "missing_root",
-      message: "Could not determine a root .tex file for the Lean pane."
-    });
-  }
-
-  const orderedPaths = rootFile
-    ? expandDocumentOrder(normalizedFiles, rootFile, diagnostics)
-    : normalizedFiles.map((file) => file.path).sort((a, b) => a.localeCompare(b));
+  const orderedPaths = normalizedFiles.map((file) => file.path).sort((a, b) => a.localeCompare(b));
 
   const items = [];
   const labels = new Map();
@@ -76,7 +65,7 @@ export function buildLeanPaneManifest({
   return {
     ok: true,
     generatedAt: new Date().toISOString(),
-    rootFile,
+    rootFile: "",
     items,
     diagnostics
   };
@@ -124,82 +113,6 @@ function normalizeFiles(files) {
     byPath.set(filePath, { path: filePath, content: String(file?.content ?? "") });
   }
   return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
-}
-
-function selectRootFile(files, activePath) {
-  if (files.length === 0) return "";
-  const byPath = new Map(files.map((file) => [file.path, file]));
-  const active = normalizePath(activePath || "");
-  if (active && byPath.has(active) && looksLikeRootDocument(byPath.get(active).content)) {
-    return active;
-  }
-  if (byPath.has("main.tex")) {
-    return "main.tex";
-  }
-  const declared = files.find((file) => looksLikeRootDocument(file.content));
-  return declared?.path || files[0].path;
-}
-
-function looksLikeRootDocument(content) {
-  return /\\documentclass(?:\s*\[[^\]]*\])?\s*\{[^}]+\}/.test(String(content || ""));
-}
-
-function expandDocumentOrder(files, rootFile, diagnostics) {
-  const byPath = new Map(files.map((file) => [file.path, file]));
-  const visited = new Set();
-  const ordered = [];
-
-  function visit(filePath, fromFile = "") {
-    const normalized = normalizePath(filePath);
-    if (!normalized || visited.has(normalized)) return;
-    const file = byPath.get(normalized);
-    if (!file) {
-      diagnostics.push({
-        code: "missing_include",
-        message: `Could not find included .tex file ${normalized}.`,
-        sourceFile: fromFile || rootFile
-      });
-      return;
-    }
-    visited.add(normalized);
-    ordered.push(normalized);
-    for (const includePath of findTexIncludes(file.content, normalized)) {
-      visit(includePath, normalized);
-    }
-  }
-
-  visit(rootFile);
-  return ordered;
-}
-
-function findTexIncludes(content, currentPath) {
-  const includes = [];
-  const stripped = stripLatexComments(String(content || ""));
-  const pattern = /\\(?:input|include)\s*\{([^}]+)\}/g;
-  for (const match of stripped.matchAll(pattern)) {
-    const value = String(match[1] || "").trim();
-    if (!value) continue;
-    includes.push(resolveTexPath(currentPath, value));
-  }
-  return includes;
-}
-
-function resolveTexPath(currentPath, includePath) {
-  const baseParts = normalizePath(currentPath).split("/");
-  baseParts.pop();
-  const includeParts = normalizePath(includePath).split("/").filter(Boolean);
-  const parts = [...baseParts, ...includeParts];
-  const resolved = [];
-  for (const part of parts) {
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      resolved.pop();
-    } else {
-      resolved.push(part);
-    }
-  }
-  const joined = resolved.join("/");
-  return joined.toLowerCase().endsWith(".tex") ? joined : `${joined}.tex`;
 }
 
 function findSupportedEnvironments(source) {
@@ -298,27 +211,6 @@ function offsetToLineColumn(source, offset) {
     line: lines.length,
     column: lines[lines.length - 1].length + 1
   };
-}
-
-function stripLatexComments(source) {
-  return String(source || "")
-    .split(/\r?\n/)
-    .map((line) => {
-      let escaped = false;
-      for (let index = 0; index < line.length; index += 1) {
-        const char = line[index];
-        if (char === "\\" && !escaped) {
-          escaped = true;
-          continue;
-        }
-        if (char === "%" && !escaped) {
-          return line.slice(0, index);
-        }
-        escaped = false;
-      }
-      return line;
-    })
-    .join("\n");
 }
 
 function normalizePath(value) {

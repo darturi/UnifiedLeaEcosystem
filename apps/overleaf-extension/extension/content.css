@@ -101,6 +101,7 @@
 .ol-lean-status:focus-visible,
 .ol-lean-settings-trigger:focus-visible,
 .ol-lean-pane-trigger:focus-visible,
+.ol-lean-project-tree-row:focus-visible,
 .ol-lean-theorem-popover button:focus-visible,
 .ol-lean-popover button:focus-visible,
 .ol-lean-popover select:focus-visible,
@@ -285,6 +286,76 @@
 
 .ol-lean-project-pane-diagnostics p + p {
   margin-top: 6px;
+}
+
+.ol-lean-project-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ol-lean-project-tree-node {
+  min-width: 0;
+}
+
+.ol-lean-project-tree-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 8px 6px calc(8px + (var(--ol-tree-depth, 0) * 16px));
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--ol-ink);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ol-lean-project-tree-row:hover {
+  border-color: var(--ol-line);
+  background: var(--ol-panel);
+}
+
+.ol-lean-project-tree-row-file {
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.ol-lean-project-tree-disclosure {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--ol-muted);
+  font: 700 13px/1 var(--ol-sans);
+}
+
+.ol-lean-project-tree-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 700;
+}
+
+.ol-lean-project-tree-count {
+  color: var(--ol-muted);
+  font: 11px/1 var(--ol-mono);
+  white-space: nowrap;
+}
+
+.ol-lean-project-tree-status {
+  grid-row: auto;
+  grid-column: auto;
+}
+
+.ol-lean-project-tree-items {
+  margin: 6px 0 10px;
+  padding-left: 26px;
+}
+
+.ol-lean-project-tree-items .ol-lean-project-item {
+  margin-bottom: 8px;
 }
 
 .ol-lean-project-item {

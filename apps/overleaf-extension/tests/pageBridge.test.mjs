@@ -227,6 +227,75 @@ test("page bridge anchors navigation on the marker label even without an active 
   }
 });
 
+test("page bridge does not apply cross-file offsets when active path is unknown", async () => {
+  const source = [
+    "\\begin{theorem}\\label{thm:main}",
+    "% lea: formalize label=main_theorem",
+    "A theorem.",
+    "\\end{theorem}"
+  ].join("\n");
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+  const posted = [];
+
+  globalThis.window = {
+    CodeMirror: null,
+    // No _ide path information: a supp.tex request must not highlight main.tex by offset.
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage(message) { posted.push(message); },
+    setTimeout() { return 0; },
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?unknownPathNoOffset=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() {}
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    onMessage({
+      source: globalThis.window,
+      data: {
+        type: "OL_LEAN_NAVIGATE",
+        sourceFile: "supp.tex",
+        from: 0,
+        to: 42,
+        leanLabel: "supplemental_lemma",
+        latexLabel: "lem:supp"
+      }
+    });
+
+    assert.equal(dispatched.length, 0);
+    const result = posted.find((message) => message.type === "OL_LEAN_NAVIGATE_RESULT");
+    assert.ok(result && result.ok === false);
+    assert.equal(result.reason, "open_failed");
+    assert.equal(result.sourceFile, "supp.tex");
+  } finally {
+    delete globalThis.window;
+  }
+});
+
 test("page bridge opens a different file and selects the block on cross-file navigation", async () => {
   const source = [
     "\\begin{theorem}\\label{thm:main}",
@@ -315,9 +384,110 @@ test("page bridge opens a different file and selects the block on cross-file nav
     });
 
     // Opened the right file natively (with gotoLine), then selected the block.
-    assert.equal(openCalls.length, 1);
-    assert.equal(openCalls[0].entity.path, "main.tex");
-    assert.equal(openCalls[0].options.gotoLine, 2);
+    assert.ok(openCalls.some((call) => call.entity?.path === "main.tex"));
+    assert.equal(openCalls.at(-1).options.gotoLine, 2);
+    assert.equal(dispatched.length, 1);
+    assert.deepEqual(dispatched[0].selection, { anchor: markerIndex, head: markerIndex });
+    const result = posted.find((message) => message.type === "OL_LEAN_NAVIGATE_RESULT");
+    assert.ok(result && result.ok === true);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+test("page bridge resolves nested file-tree entities and opens by doc id", async () => {
+  const source = [
+    "\\begin{lemma}\\label{lem:supp}",
+    "% lea: formalize label=supplemental_lemma",
+    "A supplemental result.",
+    "\\end{lemma}"
+  ].join("\n");
+  const markerIndex = source.indexOf("% lea");
+  const listeners = new Map();
+  const extensions = [];
+  const dispatched = [];
+  const openCalls = [];
+  const posted = [];
+  let currentDocId = "doc-main";
+
+  const fileTree = {
+    name: "",
+    folders: [{
+      name: "sections",
+      docs: [{ _id: "doc-supp", name: "supp.tex" }]
+    }],
+    docs: [{ _id: "doc-main", name: "main.tex" }]
+  };
+  const entitiesById = {
+    "doc-main": { _id: "doc-main", path: "main.tex" },
+    "doc-supp": { _id: "doc-supp", path: "sections/supp.tex" }
+  };
+
+  globalThis.window = {
+    CodeMirror: null,
+    _ide: {
+      editorManager: {
+        getCurrentDocId: () => currentDocId,
+        openDocId(id, options) {
+          openCalls.push({ id, options });
+          currentDocId = id;
+        }
+      },
+      fileTreeManager: {
+        root: fileTree,
+        findEntityById: (id) => entitiesById[id] || null,
+        getEntityPath: (entity) => entity.path
+      }
+    },
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage(message) { posted.push(message); },
+    setTimeout(callback) {
+      callback();
+      return 0;
+    },
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?nestedOpen=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: { fromClass(PluginClass, spec) { return { PluginClass, spec }; } },
+          Decoration: { mark() { return { range(from, to) { return { from, to }; } }; }, set(ranges) { return ranges; } }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { length: source.length, toString() { return source; } } },
+      coordsAtPos() { return null; },
+      dispatch(transaction) { dispatched.push(transaction); },
+      focus() {}
+    };
+    new extensions[0].PluginClass(view);
+
+    const [onMessage] = listeners.get("message") || [];
+    onMessage({
+      source: globalThis.window,
+      data: {
+        type: "OL_LEAN_NAVIGATE",
+        sourceFile: "sections/supp.tex",
+        line: 2,
+        from: 0,
+        to: 0,
+        leanLabel: "supplemental_lemma",
+        latexLabel: "lem:supp"
+      }
+    });
+
+    assert.deepEqual(openCalls, [{ id: "doc-supp", options: { gotoLine: 2 } }]);
     assert.equal(dispatched.length, 1);
     assert.deepEqual(dispatched[0].selection, { anchor: markerIndex, head: markerIndex });
     const result = posted.find((message) => message.type === "OL_LEAN_NAVIGATE_RESULT");
