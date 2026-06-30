@@ -83,6 +83,36 @@ def init_db() -> None:
                 created_at text not null
             );
 
+            -- A skill is a DB row, NOT a git file (D45) — the deliberate exception
+            -- to "git owns content" (D7/D8): skills are small user-authored prose
+            -- (markdown `body` in a column), not diffed proof bytes, so they live
+            -- here. `slug` is the stable identifier AND the materialized filename
+            -- stem (the prover reads `## Skill: <slug>`), so it's unique. `is_global`
+            -- = 1 → the skill applies to every project; 0 → only the projects in the
+            -- `skill_projects` join (D47; loose sessions get neither). `source_url`/
+            -- `source_ref` record GitHub provenance for a later re-sync (D56).
+            create table if not exists skills (
+                id text primary key,
+                name text not null,
+                slug text not null unique,
+                body text not null,
+                is_global integer not null default 0,
+                source_url text,
+                source_ref text,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            -- Per-project assignment for non-global skills (D47). Only meaningful
+            -- when the skill's `is_global` = 0; a row means "this skill applies to
+            -- this project". Deleting a skill cascades these rows (explicit, in
+            -- store.py — SQLite FKs aren't enforced here).
+            create table if not exists skill_projects (
+                skill_id text not null references skills(id),
+                project_id text not null references projects(id),
+                primary key (skill_id, project_id)
+            );
+
             create table if not exists runs (
                 id text primary key,
                 session_id text not null references sessions(id),
