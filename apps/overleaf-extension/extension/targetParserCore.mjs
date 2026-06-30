@@ -77,13 +77,19 @@ function parseMarkedTargets(source) {
 
   const groupsByEnvironment = new Map();
   for (const group of [...commentGroups, ...tagDetection.groups]) {
-    const lookupEnvironments = group.syntax === "tag" ? getGenericEnvironments() : commentEnvironments;
-    const environment = findSmallestEnclosingEnvironment(lookupEnvironments, group.from, group.to);
+    // A tag with a body argument (the standalone form) already carries its
+    // own ready-made environment-shaped object and needs no lookup at all.
+    let environment = group.standaloneEnvironment;
+    if (!environment) {
+      const lookupEnvironments = group.syntax === "tag" ? getGenericEnvironments() : commentEnvironments;
+      environment = findSmallestEnclosingEnvironment(lookupEnvironments, group.from, group.to);
+    }
     if (!environment) {
       diagnostics.push(buildDiagnostic({
         code: "missing_environment",
         message: group.syntax === "tag"
-          ? "A Lea tag must be inside a LaTeX environment, e.g. \\begin{theorem}...\\end{theorem}."
+          ? "A Lea tag must either be inside a LaTeX environment (e.g. \\begin{theorem}...\\end{theorem}) "
+            + "or supply the statement as a second argument, e.g. \\leatheorem{label=foo}{Statement text.}."
           : "Lea marker must be inside a supported theorem or definition environment.",
         from: group.from,
         to: group.to
@@ -250,20 +256,107 @@ function findLeaTagGroups(source) {
       metadata.kind = impliedKind;
     }
 
-    groups.push({
+    // Optional second (body) argument -- the standalone form:
+    // \leatheorem{label=foo}{Statement text...}. lea-tags.sty defines this
+    // as an xparse `g` argument, which typesets it and needs no enclosing
+    // environment. Mirrors real TeX argument-scanning exactly: it skips
+    // *all* whitespace (including newlines/blank lines, not just inline
+    // whitespace) looking for the next "{", verified against actual
+    // pdflatex output. That means a single-argument tag immediately
+    // followed by an unrelated standalone {...} group, with nothing but
+    // whitespace between them, really does get absorbed -- both in real
+    // compilation and here. See docs/FEATURE-overleaf-inline-lea-tags.md
+    // ("Standalone form") for the caveat this implies for authors.
+    const bodyArgumentStart = skipWhitespace(body, argument.end);
+    let bodyArgument = null;
+    if (body[bodyArgumentStart] === "{") {
+      const parsedBody = parseBalancedSuffixMultiline(body, bodyArgumentStart);
+      if (!parsedBody.ok) {
+        diagnostics.push(buildDiagnostic({
+          code: "malformed_tag",
+          message: `\\${commandName}{...}{...} body argument is missing its closing brace.`,
+          from: offset + commandStart,
+          to: offset + bodyArgumentStart
+        }));
+        continue;
+      }
+      bodyArgument = parsedBody;
+    }
+
+    const group = {
       from: offset + commandStart,
-      to: offset + argument.end,
+      to: offset + (bodyArgument ? bodyArgument.end : argument.end),
       syntax: "tag",
       command: commandName,
       hasFormalize: impliedKind !== "definition",
       hasDefine: impliedKind === "definition",
       hasTargetMarker: true,
       metadata
-    });
-    pattern.lastIndex = argument.end;
+    };
+
+    if (bodyArgument) {
+      // A ready-to-use environment-shaped object: the rest of the pipeline
+      // (extractEnvironmentText, badge placement, the Lean pane) only ever
+      // reads name/from/to/badgeFrom/bodyFrom/bodyTo off an "environment",
+      // and doesn't care whether those came from \begin{X}...\end{X} or a
+      // tag's own body argument.
+      group.standaloneEnvironment = {
+        name: commandName,
+        from: offset + commandStart,
+        to: offset + bodyArgument.end,
+        badgeFrom: offset + commandStart,
+        bodyFrom: offset + bodyArgumentStart + 1,
+        bodyTo: offset + bodyArgument.end - 1
+      };
+    }
+
+    groups.push(group);
+    pattern.lastIndex = bodyArgument ? bodyArgument.end : argument.end;
   }
 
   return { groups, diagnostics };
+}
+
+// Like skipInlineWhitespace, but crosses newlines/blank lines -- used only to
+// check for a tag's optional body argument, matching real TeX argument
+// scanning (which skips arbitrary whitespace between macro arguments, not
+// just whitespace on the same line). Every *other* same-line convention in
+// this parser (the metadata argument itself, \label) deliberately keeps
+// using skipInlineWhitespace; this one helper is the sole, deliberate
+// exception, because it needs to match what Overleaf will actually compile.
+function skipWhitespace(source, cursor) {
+  while (cursor < source.length && /\s/.test(source[cursor])) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+// Like parseBalancedSuffix, but tolerates newlines inside the matched span.
+// Used only for a tag's body argument, which is routinely a multi-line or
+// multi-paragraph statement; the metadata argument stays single-line via
+// parseBalancedSuffix, unchanged.
+function parseBalancedSuffixMultiline(source, cursor) {
+  const opener = source[cursor];
+  const closer = opener === "{" ? "}" : opener === "[" ? "]" : "";
+  if (!closer) {
+    return { ok: false };
+  }
+
+  let depth = 1;
+  for (let index = cursor + 1; index < source.length; index += 1) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (char === opener && previous !== "\\") {
+      depth += 1;
+    } else if (char === closer && previous !== "\\") {
+      depth -= 1;
+      if (depth === 0) {
+        return { ok: true, end: index + 1 };
+      }
+    }
+  }
+
+  return { ok: false };
 }
 
 function hasLeaTagPackageLoaded(source) {

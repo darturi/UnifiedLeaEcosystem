@@ -140,8 +140,30 @@ Named tag commands: `\leatheorem`, `\lealemma`, `\leaproposition`,
 There's also a generic form for explicit kind control:
 
 ```tex
+\begin{conjecture}
 \lea{kind=definition, label=even_nat, context={Use Nat parity, not Int parity.}}
+A natural number $n$ is even if there exists $k$ with $n = 2k$.
+\end{conjecture}
 ```
+
+### Standalone tags: no enclosing block at all
+
+Give a tag a second argument and it needs no enclosing environment -- the
+argument both renders as the statement and is what's sent to Lea:
+
+```tex
+\leatheorem{label=pythagorean, uses={right_triangle}}
+{In a right triangle, the square of the hypotenuse equals the sum of the
+squares of the other two sides.}
+```
+
+The two arguments don't need to be on the same line -- whitespace (including
+blank lines) between them is fine, matching ordinary TeX argument scanning.
+One caveat that follows directly from that: a tag with **no** intended body,
+placed with nothing but whitespace before an unrelated `{...}` group, will
+have that group absorbed as its body. If you don't want a second argument,
+keep something other than blank lines between the tag and the next braced
+group (the normal case of actual prose in between is never a problem).
 
 If you load `lea-tags.sty` but the extension finds a tag command with nothing
 defining it (a missing or misspelled `\usepackage`), it reports a

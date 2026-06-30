@@ -7,10 +7,11 @@ longer needs to sit inside an allowlisted environment name.
 
 ## Status (updated 2026-06-30)
 
-**Done: Phases 0-6.** All sections below are implemented and tested (193
-tests passing in `apps/overleaf-extension`, up from the pre-feature baseline
-of 176). The `leatheorem` shorthand environment mentioned in the feature spec
-was deferred (not built) -- everything else shipped as planned.
+**Done: Phases 0-6, plus the standalone-form follow-up below.** All sections
+in this plan are implemented and tested (202 tests passing in
+`apps/overleaf-extension`, up from the pre-feature baseline of 176). The
+`leatheorem` shorthand environment mentioned in the feature spec was
+deferred (not built) -- everything else shipped as planned.
 
 Two correctness issues surfaced during implementation that weren't anticipated
 in this plan and are worth recording, since both would have made tag
@@ -43,6 +44,53 @@ Both are exactly the kind of thing Section 4 (Edge cases) and Section 6 (Open
 risks) below were trying to anticipate in the abstract ("math-mode boundary",
 "diagnostic noise") -- the concrete instances turned out to be different from
 what was guessed, which is the usual shape of this kind of risk.
+
+**Follow-up (same day): the standalone (body-argument) form.** A direct
+question after the above shipped -- "does a tag still need an enclosing
+block, and could it not?" -- led to a same-day addition: `lea-tags.sty`'s six
+commands moved from an `m`-only xparse signature to `m g` (`g` = xparse's
+"optional group" type), with the optional second argument both typeset
+(`\IfValueT{#2}{#2}`) and sent to Lea as the statement, e.g.
+`\leatheorem{label=foo}{Statement text.}`. With a body argument, nothing
+needs to enclose the tag.
+
+This addition was verified against real `pdflatex` compilation before any JS
+was written (the sandbox has `pdflatex`/`lualatex`/`xelatex` installed),
+which caught the actual TeX whitespace-skipping semantics directly rather
+than guessing: argument scanning skips *all* whitespace (including blank
+lines) between the metadata and body arguments, so the parser's own
+whitespace-skip for detecting the body argument was written to match that
+exactly (a new `skipWhitespace`, distinct from the existing
+`skipInlineWhitespace` used everywhere else in this parser, which
+deliberately stays same-line). One real, documented consequence: a
+single-argument tag immediately followed by an unrelated standalone `{...}`
+group, with nothing but whitespace between them, has that group absorbed as
+its body -- in real Overleaf compilation and in this parser identically.
+Confirmed with a compiled fixture, then encoded as a test
+(`leaTags.test.mjs`).
+
+Implementation notes:
+- The body argument itself uses a new newline-tolerant brace matcher
+  (`parseBalancedSuffixMultiline`); the metadata argument's matcher stays
+  single-line, unchanged.
+- A tag with a body argument builds its own synthetic environment-shaped
+  object (`name` = the tag command, `bodyFrom`/`bodyTo` = inside the body's
+  braces) and skips the environment-lookup step in `parseMarkedTargets`
+  entirely -- everything downstream (`extractEnvironmentText`, badge
+  placement, the Lean pane) already only reads that shape, not where it came
+  from, so no other code needed to change.
+- `leanPaneManifest.mjs`'s `parseLeanPaneItemsFromFile` needed a second pass
+  (standalone targets never appear in the environment walk) -- and, caught
+  by a test before merge, needed candidates from *both* passes sorted by
+  source offset before assigning `documentOrder`/pushing, since pushing from
+  two separate loops put every standalone item after every environment item
+  regardless of actual position in the file. A genuinely separate bug from
+  the two above, same category: an ordering assumption that was true within
+  one pass and silently false across two.
+- A malformed standalone tag does not currently surface in the Lean pane at
+  all (no loose-detection fallback was built for the no-environment case,
+  to avoid a third near-duplicate of the metadata-extraction logic) --
+  recorded as a known, accepted gap, not a target for this pass.
 
 **Decisions locked (from the feature spec).**
 - Additive, not a replacement. `% lea:` stays the zero-setup default.

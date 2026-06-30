@@ -258,6 +258,45 @@ test("a malformed tag still surfaces as a non-formalizable pane item", () => {
   assert.equal(manifest.items[0].formalizable, false);
 });
 
+test("inventories a standalone (body-argument) tag with no enclosing environment", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\usepackage{lea-tags}",
+        "\\begin{document}",
+        "\\leatheorem{label=pythagorean, uses={right_triangle}}",
+        "{In a right triangle, the square of the hypotenuse equals the sum of the",
+        "squares of the other two sides.}",
+        "",
+        "\\begin{claim}\\label{clm:foo}",
+        "\\leatheorem{label=foo_claim}",
+        "Environment-based statement.",
+        "\\end{claim}",
+        "\\end{document}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 2);
+  // Source order, not "environment items first": the standalone tag appears
+  // earlier in the file than the claim environment, so it must come first.
+  const [standalone, claim] = manifest.items;
+  assert.equal(standalone.label, "pythagorean");
+  assert.equal(standalone.kind, "leatheorem");
+  assert.equal(standalone.leanKind, "theorem");
+  assert.equal(standalone.formalizable, true);
+  assert.deepEqual(standalone.targetUses, ["right_triangle"]);
+  assert.equal(
+    standalone.naturalLanguageLatex,
+    "In a right triangle, the square of the hypotenuse equals the sum of the\nsquares of the other two sides."
+  );
+  assert.equal(standalone.documentOrder, 0);
+
+  assert.equal(claim.label, "foo_claim");
+  assert.equal(claim.documentOrder, 1);
+});
+
 test("reports duplicate labels without dropping items", () => {
   const manifest = buildLeanPaneManifest({
     files: [

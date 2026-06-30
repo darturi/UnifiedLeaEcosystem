@@ -99,31 +99,79 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
   // here, but should still surface as a (non-formalizable) pane item -- see
   // extractLeaMarkerLabel below -- so this is consulted only for the
   // validated kind, not for whether to list the item at all.
-  const targetsByOffset = new Map(parseTargets(content).map((target) => [target.from, target]));
-  const items = [];
+  const targets = parseTargets(content);
+  const targetsByOffset = new Map(targets.map((target) => [target.from, target]));
+  const coveredOffsets = new Set();
+  // Collect candidates from both sources before sorting -- pushing straight
+  // from two separate loops would order all environment-based items before
+  // all standalone-tag items regardless of where they actually sit in the
+  // file, which is wrong: documentOrder/id below are assigned by push order,
+  // and the pane should read top-to-bottom in source order.
+  const candidates = [];
+
   for (const environment of environments) {
     const extracted = extractEnvironmentContent(content, environment);
     const leanName = extractLeaMarkerLabel(extracted.rawLatex);
     if (!leanName) continue;
-    const target = targetsByOffset.get(environment.from);
-    const sourceStart = offsetToLineColumn(content, environment.from);
-    const sourceEnd = offsetToLineColumn(content, environment.to);
-    const naturalLanguageLatex = stripLeaTargetText(extracted.rawLatex);
+    coveredOffsets.add(environment.from);
+    candidates.push({
+      kind: environment.name,
+      target: targetsByOffset.get(environment.from),
+      leanName,
+      from: environment.from,
+      to: environment.to,
+      rawLatex: extracted.rawLatex,
+      title: extracted.title,
+      latexLabel: extracted.latexLabel
+    });
+  }
+
+  // Standalone tags (\leatheorem{label=foo}{Statement...}, see
+  // docs/FEATURE-overleaf-inline-lea-tags.md) need no enclosing environment,
+  // so they never appear in `environments` above -- the target itself
+  // already carries the body span (from a synthetic environment built in
+  // targetParserCore.mjs), so pull any not already covered straight from the
+  // strict target list. Unlike the loop above, there's no loose/malformed
+  // case to handle here: a target only exists in `targets` if it already
+  // passed full validation, so every standalone candidate here is
+  // formalizable by construction. A malformed standalone tag (e.g. an
+  // invalid label=) currently does not surface in the pane at all -- see
+  // docs/PLAN-overleaf-inline-lea-tags.md for why this is an accepted, known
+  // gap rather than an oversight.
+  for (const target of targets) {
+    if (target.syntax !== "tag" || coveredOffsets.has(target.from)) continue;
+    candidates.push({
+      kind: target.latexEnvironment,
+      target,
+      leanName: target.targetLabel,
+      from: target.from,
+      to: target.to,
+      rawLatex: content.slice(target.bodyFrom, target.bodyTo).trim(),
+      title: undefined,
+      latexLabel: target.latexLabel
+    });
+  }
+
+  const items = [];
+  for (const { kind, target, leanName, from, to, rawLatex, title, latexLabel } of candidates.sort((a, b) => a.from - b.from)) {
+    const naturalLanguageLatex = stripLeaTargetText(rawLatex);
+    const sourceStart = offsetToLineColumn(content, from);
+    const sourceEnd = offsetToLineColumn(content, to);
     items.push({
       label: leanName,
-      kind: environment.name,
-      title: extracted.title || undefined,
-      latexLabel: extracted.latexLabel || undefined,
+      kind,
+      title: title || undefined,
+      latexLabel: latexLabel || undefined,
       documentOrder: initialOrder + items.length,
       sourceFile,
       sourceStartLine: sourceStart.line,
       sourceEndLine: sourceEnd.line,
-      sourceStartOffset: environment.from,
-      sourceEndOffset: environment.to,
+      sourceStartOffset: from,
+      sourceEndOffset: to,
       sourceHash: hashTargetText(naturalLanguageLatex),
       naturalLanguageLatex,
       naturalLanguageRendered: renderLightLatex(naturalLanguageLatex),
-      leanKind: leanKindFor(target, environment),
+      leanKind: leanKindFor(target, kind),
       leanDeclarationName: leanName || undefined,
       status: "missing-stub"
     });
@@ -131,14 +179,14 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
   return items;
 }
 
-function leanKindFor(target, environment) {
+function leanKindFor(target, kind) {
   if (target) return target.targetKind === "definition" ? "def" : "theorem";
   // No validated target (missing/invalid/mismatched marker): fall back to a
-  // best-effort guess from the environment name, same as the original
-  // comment-only behavior, for the allowlisted names it can classify. Custom
-  // environments with no resolvable target default to "theorem" -- display
-  // only, since the item is already marked not formalizable.
-  return DEFINITION_KINDS.has(environment.name) ? "def" : "theorem";
+  // best-effort guess from the environment/command name, same as the
+  // original comment-only behavior, for the allowlisted names it can
+  // classify. Anything else defaults to "theorem" -- display only, since the
+  // item is already marked not formalizable whenever target is absent.
+  return DEFINITION_KINDS.has(kind) ? "def" : "theorem";
 }
 
 function normalizeFiles(files) {

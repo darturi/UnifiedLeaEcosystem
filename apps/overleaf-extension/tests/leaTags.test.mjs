@@ -212,3 +212,95 @@ test("strips tag calls (including nested braces in context=) from target text", 
 test("ignores unmarked custom environments (tags are still opt-in)", () => {
   assert.deepEqual(parseTargets(wrapDocument("\\begin{claim}\nUnmarked.\n\\end{claim}")), []);
 });
+
+// --- Standalone form: \leatheorem{...}{Statement...} needs no enclosing
+// environment at all. See docs/FEATURE-overleaf-inline-lea-tags.md
+// ("Standalone form") -- this is the direct answer to "does the tag have to
+// be inside a block?": with a body argument, no.
+
+test("a standalone tag (body as second argument) needs no enclosing environment", () => {
+  const source = wrapDocument(
+    "\\leatheorem{label=pythagorean, uses={right_triangle}}{If $n$ is even, then $n^2$ is even.}"
+  );
+  const result = parseTargetDocument(source);
+  assert.equal(result.diagnostics.length, 0);
+  assert.equal(result.targets.length, 1);
+  const [target] = result.targets;
+  assert.equal(target.targetLabel, "pythagorean");
+  assert.deepEqual(target.targetUses, ["right_triangle"]);
+  assert.equal(target.targetText, "If $n$ is even, then $n^2$ is even.");
+  assert.equal(target.latexEnvironment, "leatheorem");
+  assert.equal(target.syntax, "tag");
+});
+
+test("a standalone tag's body argument can span multiple lines and paragraphs", () => {
+  const source = wrapDocument([
+    "\\leatheorem{label=multi_line}",
+    "{In a right triangle, the square of the hypotenuse equals the sum of the",
+    "squares of the other two sides.}"
+  ].join("\n"));
+  const [target] = parseTargets(source);
+  assert.equal(
+    target.targetText,
+    "In a right triangle, the square of the hypotenuse equals the sum of the\nsquares of the other two sides."
+  );
+});
+
+test("the generic \\lea{...}{...} standalone form respects kind=", () => {
+  const source = wrapDocument(
+    "\\lea{kind=definition, label=even_nat}{A natural number is even if there exists k with n = 2k.}"
+  );
+  const [target] = parseTargets(source);
+  assert.equal(target.targetKind, "definition");
+  assert.equal(target.latexEnvironment, "lea");
+});
+
+test("a standalone tag with an unterminated body argument is a malformed_tag diagnostic", () => {
+  const result = parseTargetDocument(wrapDocument("\\leatheorem{label=foo}{unterminated body"));
+  assert.equal(result.targets.length, 0);
+  assert.equal(result.diagnostics.some((d) => d.code === "malformed_tag"), true);
+});
+
+test("a standalone tag strips a nested \\label{...} from its own body", () => {
+  const source = wrapDocument("\\leatheorem{label=foo}{\\label{thm:foo} Actual statement.}");
+  const [target] = parseTargets(source);
+  assert.equal(target.targetText, "Actual statement.");
+  assert.equal(target.latexLabel, "thm:foo");
+});
+
+test("a tag with no body argument still requires an enclosing environment, with a message mentioning both options", () => {
+  const result = parseTargetDocument(wrapDocument("\\leatheorem{label=bare}\nFloating text."));
+  assert.equal(result.targets.length, 0);
+  assert.equal(result.diagnostics[0].code, "missing_environment");
+  assert.match(result.diagnostics[0].message, /LaTeX environment/);
+  assert.match(result.diagnostics[0].message, /second argument/);
+});
+
+test("standalone-tag detection matches real TeX argument scanning, verified against pdflatex separately: " +
+  "whitespace (including a blank line) between metadata and an unrelated brace group is absorbed as the body", () => {
+  // This mirrors the exact fixture compiled with pdflatex during development
+  // (see docs/PLAN-overleaf-inline-lea-tags.md) -- documenting the behavior
+  // here as a test, not just prose, so a future change can't silently drift
+  // from what Overleaf will actually compile.
+  const source = wrapDocument([
+    "\\leatheorem{label=foo}",
+    "",
+    "{\\bf This stray group has nothing but whitespace before it.}"
+  ].join("\n"));
+  const [target] = parseTargets(source);
+  assert.equal(target.targetText, "\\bf This stray group has nothing but whitespace before it.");
+});
+
+test("text between a tag and a later brace group prevents accidental absorption", () => {
+  const source = wrapDocument([
+    "\\leatheorem{label=foo}",
+    "Some ordinary prose follows on the next line, not a body argument.",
+    "{\\bf This bold group should not be swallowed as foo's body.}"
+  ].join("\n"));
+  const result = parseTargetDocument(source);
+  // No body argument was found (prose intervened), and there's no enclosing
+  // environment either, so this is a missing_environment diagnostic -- an
+  // honest failure, not a silent misattribution of the bold group's text.
+  assert.equal(result.targets.length, 0);
+  assert.equal(result.diagnostics[0].code, "missing_environment");
+});

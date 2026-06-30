@@ -206,12 +206,12 @@ function clearProviderKeyInputs() {
 // extension/assets/lea-tags.sty (kept in sync by hand -- six short lines).
 const LEA_TAGS_PREAMBLE_SNIPPET = [
   "\\RequirePackage{xparse}",
-  "\\NewDocumentCommand{\\lea}{m}{}",
-  "\\NewDocumentCommand{\\leatheorem}{m}{}",
-  "\\NewDocumentCommand{\\lealemma}{m}{}",
-  "\\NewDocumentCommand{\\leaproposition}{m}{}",
-  "\\NewDocumentCommand{\\leacorollary}{m}{}",
-  "\\NewDocumentCommand{\\leadefinition}{m}{}"
+  "\\NewDocumentCommand{\\lea}{m g}{\\IfValueT{#2}{#2}}",
+  "\\NewDocumentCommand{\\leatheorem}{m g}{\\IfValueT{#2}{#2}}",
+  "\\NewDocumentCommand{\\lealemma}{m g}{\\IfValueT{#2}{#2}}",
+  "\\NewDocumentCommand{\\leaproposition}{m g}{\\IfValueT{#2}{#2}}",
+  "\\NewDocumentCommand{\\leacorollary}{m g}{\\IfValueT{#2}{#2}}",
+  "\\NewDocumentCommand{\\leadefinition}{m g}{\\IfValueT{#2}{#2}}"
 ].join("\n");
 
 const leaTagsCopySnippetButton = document.querySelector("#lea-tags-copy-snippet");

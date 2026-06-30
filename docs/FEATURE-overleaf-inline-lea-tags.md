@@ -120,28 +120,39 @@ comment marker, not a replacement:
 
 ### Package
 
-A single file, `lea-tags.sty`, defining commands that typeset nothing:
+A single file, `lea-tags.sty`, defining commands that take a required
+metadata argument and an *optional* second (body) argument:
 
 ```tex
 \NeedsTeXFormat{LaTeX2e}
-\ProvidesPackage{lea-tags}[2026/07/01 v0.1 Lea inline formalization tags]
+\ProvidesPackage{lea-tags}[2026/07/01 v0.2 Lea inline formalization tags]
 \RequirePackage{xparse}
 
 % Generic form: caller states kind= explicitly.
-\NewDocumentCommand{\lea}{m}{}
+\NewDocumentCommand{\lea}{m g}{\IfValueT{#2}{#2}}
 
 % Named convenience wrappers, equivalent to \lea{kind=...,<args>}.
-\NewDocumentCommand{\leatheorem}{m}{}
-\NewDocumentCommand{\lealemma}{m}{}
-\NewDocumentCommand{\leaproposition}{m}{}
-\NewDocumentCommand{\leacorollary}{m}{}
-\NewDocumentCommand{\leadefinition}{m}{}
+\NewDocumentCommand{\leatheorem}{m g}{\IfValueT{#2}{#2}}
+\NewDocumentCommand{\lealemma}{m g}{\IfValueT{#2}{#2}}
+\NewDocumentCommand{\leaproposition}{m g}{\IfValueT{#2}{#2}}
+\NewDocumentCommand{\leacorollary}{m g}{\IfValueT{#2}{#2}}
+\NewDocumentCommand{\leadefinition}{m g}{\IfValueT{#2}{#2}}
 ```
 
-Every command takes one braced argument and expands to nothing. LaTeX still
-parses the argument as a balanced group, which is what gives us compile-time
-brace validation; the contents are never typeset and never interpreted by
-LaTeX beyond brace matching.
+`m` is the required metadata argument; LaTeX still parses it as a balanced
+group, which is what gives us compile-time brace validation, but its
+contents are never typeset (only ever passed to `parseMetadata`). `g` is
+xparse's "optional group" type: present only if a `{` immediately follows
+(after skipping whitespace); if present, it's typeset verbatim via
+`\IfValueT{#2}{#2}` and is also the statement text sent to Lea. If absent,
+the command is the original no-op form from v0.1 -- see "Tagging an existing
+environment" above.
+
+Verified by compiling a test document with `pdflatex`: both forms render
+correctly, and a tag with no body argument followed (only whitespace, no
+other content) by a later, unrelated `{...}` group does get absorbed as that
+tag's body -- exactly matching plain TeX argument-scanning semantics. See
+"Standalone form" below for what this means for authors.
 
 ### Tagging an existing (possibly custom) environment
 
@@ -169,6 +180,46 @@ Goldbach-style statement...
 
 `kind` accepts the same values the comment marker already accepts:
 `theorem` and `definition`.
+
+### Standalone form: no enclosing environment at all
+
+A tag with a second (body) argument needs nothing to enclose it -- the
+body's own braces give the parser an unambiguous boundary, the same role
+`\begin{X}...\end{X}` plays for the other two forms:
+
+```tex
+\leatheorem{label=pythagorean, uses={right_triangle}}
+{In a right triangle, the square of the hypotenuse equals the sum of the
+squares of the other two sides.}
+```
+
+This addresses the original motivating question directly: an enclosing
+block was only ever needed because a single-argument tag carries no body
+text of its own. With a body argument, there's nothing left to enclose.
+
+The metadata and body arguments don't need to be on the same line (TeX's
+own argument scanning skips whitespace, including newlines, between
+arguments, and the parser mirrors that exactly rather than approximating
+it) -- but anything other than whitespace between them (prose, a comment,
+another command) means there's no body argument, and the tag falls back to
+needing an enclosing environment, with a clearer `missing_environment`
+message pointing at this option.
+
+**Caveat, verified against real `pdflatex` output, not just reasoned about:**
+because TeX's argument scanning (and this parser, deliberately matching it)
+skips arbitrary whitespace looking for the next `{`, a single-argument tag
+immediately followed by an unrelated standalone `{...}` group -- with
+nothing but blank lines between them -- *will* be absorbed as that tag's
+body, both in real Overleaf compilation and in this parser's detection.
+Avoid leaving a tag with no intended body directly before an unrelated
+braced group with nothing in between.
+
+A malformed standalone tag (e.g. an invalid `label=`) is correctly rejected
+by `targetParserCore.mjs` like any other diagnostic, but does **not**
+currently surface in the Lean pane inventory the way a malformed
+environment-based marker does (which still shows up, just marked
+not-formalizable) -- see `docs/PLAN-overleaf-inline-lea-tags.md` for why,
+and treat this as a known gap rather than a Lean-pane bug if you hit it.
 
 ### Shorthand environment (not yet implemented)
 
@@ -217,24 +268,40 @@ reuses verbatim.
 3. New `findGenericEnvironments(source)`: the same nesting-stack approach as
    `findSupportedEnvironments`, but matching **any** `\begin{X}...\end{X}`
    pair rather than only the allowlisted names. Used only to locate the
-   smallest enclosing environment for a *tag*-based marker. The
-   comment-marker path keeps using the allowlisted `findSupportedEnvironments`
-   unchanged, so no existing document's behavior changes.
-4. Tag markers found with no enclosing environment at all produce a
-   `missing_environment` diagnostic, same code the comment path already uses
-   for the analogous case.
-5. `extractEnvironmentText` / `stripLeaTargetText` are reused for body
-   extraction; `stripLeaTargetText` gets one addition — strip
-   `\lea{...}` / `\leatheorem{...}` / etc. calls (matched with the same
-   balanced-brace logic) from the extracted body, the same way it already
-   strips `% lea: ...` lines and `\label{...}`.
-6. Targets produced this way set `syntax: "tag"` instead of `"comment"`. The
+   smallest enclosing environment for a *tag*-based marker that has no body
+   argument of its own. The comment-marker path keeps using the allowlisted
+   `findSupportedEnvironments` unchanged, so no existing document's behavior
+   changes.
+4. After the metadata argument, check (skipping whitespace, including
+   newlines) for a second `{...}` argument, matched with a *newline-tolerant*
+   balanced-brace scan (the metadata argument's own matcher stays
+   single-line, matching every other same-line convention in this parser).
+   If present, this is the standalone form: a synthetic environment-shaped
+   object is built directly from the body argument's span (`name` = the tag
+   command name, `bodyFrom`/`bodyTo` = inside the body's braces) and fed into
+   the same per-group pipeline everything else uses, skipping the
+   environment-lookup step entirely. If absent, behavior is unchanged from
+   v0.1 (needs an enclosing environment).
+5. Tag markers with neither a body argument nor an enclosing environment
+   produce a `missing_environment` diagnostic, same code the comment path
+   already uses for the analogous case, reworded to mention the standalone
+   form as an alternative.
+6. `extractEnvironmentText` / `stripLeaTargetText` are reused unchanged for
+   body extraction in all three forms (environment-enclosed, generic, and
+   standalone) — the synthetic environment object has the same shape real
+   ones do, so no extraction code needed to know which form produced it.
+   `stripLeaTargetText` strips `\lea{...}` / `\leatheorem{...}` / etc. calls
+   (matched with the same balanced-brace logic) from the extracted body, the
+   same way it already strips `% lea: ...` lines and `\label{...}`.
+7. Targets produced this way set `syntax: "tag"` instead of `"comment"`. The
    field already exists in the target shape and is plumbed through; nothing
    downstream needs to change to carry it.
-7. A marker count or kind mismatch between a comment marker and a tag command
+8. A marker count or kind mismatch between a comment marker and a tag command
    inside the same environment reuses the existing `duplicate_marker` /
    `environment_mismatch` diagnostics, generalized to be syntax-agnostic —
-   one target per environment, regardless of which syntax declared it.
+   one target per environment, regardless of which syntax declared it. A
+   standalone tag is keyed by its own position, so it can never collide with
+   another marker (nothing else can share its span).
 
 ### New diagnostic: package not loaded
 
@@ -325,8 +392,15 @@ explicitly rather than decided here:
 9. All existing comment-marker and legacy-command tests continue to pass
    unmodified.
 10. New tests cover: custom-environment detection, the generic `\lea{kind=...}`
-    form, each named wrapper, the `leatheorem` shorthand environment, the
-    missing-package diagnostic, and cross-syntax duplicate detection.
+    form, each named wrapper, the missing-package diagnostic, and
+    cross-syntax duplicate detection.
+11. A tag with a body argument (the standalone form) needs no enclosing
+    environment and produces a target whose `latexEnvironment` is the tag
+    command name.
+12. The standalone form's body argument may span multiple lines/paragraphs;
+    the metadata argument stays single-line.
+13. A standalone tag's body, once stripped, excludes any nested
+    `\label{...}` the same way environment-enclosed targets do.
 
 ## Future Extensions
 
@@ -351,3 +425,9 @@ tag-awareness in `leanPaneManifest.mjs`, and `targetSyntax` telemetry on the
 companion job record. See that plan's Status section for the two correctness
 issues found during implementation (and fixed) that aren't otherwise obvious
 from this spec.
+
+The standalone (body-argument) form documented above -- removing the
+enclosing-environment requirement entirely -- was added in a follow-up pass
+the same day, once it was clear from the original Q&A that "must be inside a
+block" was a real limitation worth removing, not just an inherent property
+of the tag approach. See the PLAN doc's Status section for that pass's notes.
