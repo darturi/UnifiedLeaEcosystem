@@ -1,16 +1,25 @@
-# Feature: Overleaf Theorem Chat
+# Feature: Overleaf Lean Pane Chat Mirror
+
+> **Status (v1 implemented 2026-06-30).** Ships behind the Lean pane's per-item
+> `Chat` action. Scope locked to **text bubbles + `Open in Lea`** and **minimal
+> continuation prompts** (full context preamble only on the session-creating
+> message). Companion endpoints `/lean-pane/chat/{session,message,interrupt}` +
+> `GET /lean-pane/chat/session/:sessionId` wrap the existing adapter run/session
+> APIs; the companion is the single SSE driver and the extension polls; no adapter
+> changes. Implementation plan: `docs/PLAN-overleaf-lean-pane-chat-mirror.md`.
 
 ## Summary
 
-Add a compact Lea chat surface inside the Overleaf extension, scoped to a single
-marked theorem, lemma, proposition, corollary, or definition in the Lean pane.
-The user should be able to ask quick follow-up questions, request fixes, and
-continue a formalization thread without leaving Overleaf.
+Add access to the existing Lea chat from the Overleaf Lean pane. For each marked
+theorem, lemma, proposition, corollary, or definition, the Lean pane should let
+the user open a compact mirrored view of that item's corresponding full Lea UI
+chat session.
 
-This is not a separate chat system. It is a small Overleaf-native view of the
-same adapter-backed session that the full Lea UI already uses. The full UI
-remains the complete experience; the Overleaf chat is the fast in-context
-experience.
+This is not a separate chat system. It is a Lean-pane entry point into the same
+adapter-backed session that the full Lea UI already uses. The full UI remains
+the canonical chat; the Overleaf surface mirrors that conversation in context so
+the user can ask quick follow-up questions, request fixes, and continue a
+formalization thread without leaving Overleaf.
 
 ## Goal
 
@@ -23,9 +32,9 @@ Let a user stay in Overleaf for short theorem-specific interactions with Lea:
 - See the latest assistant response and run status without opening the full UI.
 - Open the corresponding full Lea session when the interaction needs more room.
 
-The chat should be directly associated with one mathematical item from the Lean
-pane. It should feel like a small version of the corresponding chat in the full
-standalone UI.
+Chat access should be directly associated with one mathematical item in the Lean
+pane. The transcript shown in Overleaf should be understood as a mirror of the
+corresponding chat in the full standalone UI.
 
 ## Non-Goals
 
@@ -34,6 +43,8 @@ standalone UI.
 - Do not support project-wide free-floating chats in version 1.
 - Do not support editing arbitrary Lean files from the Overleaf chat composer in
   version 1.
+- Do not persist a second Overleaf-owned transcript that can diverge from the
+  full UI.
 - Do not introduce a new persistence model for proof content. Proof bytes still
   belong to git; chat/run metadata still belongs to the adapter SQLite store.
 
@@ -44,28 +55,31 @@ pane items. The companion stores job metadata and links those jobs to adapter
 sessions through `leaSessionId`. The Lean pane can already expose a link to the
 full Lea UI session when one exists.
 
-The missing behavior is that the user cannot continue or inspect that chat
-directly from Overleaf. To ask a follow-up, the user must open the standalone UI,
-find or follow the associated session, and use the full chat interface there.
+The missing behavior is that the Lean pane only links out to that chat. To ask a
+follow-up, the user must open the standalone UI, find or follow the associated
+session, and use the full chat interface there. The extension has no in-pane
+mirror of the same conversation.
 
 ## Proposed Behavior
 
 Each Lean pane item should expose a `Chat` action. Opening it shows a compact
-drawer or inline panel scoped to that item.
+drawer or inline panel from the Lean pane that mirrors the item's full Lea UI
+chat session.
 
 The panel should show:
 
 - Item identity: kind, Lean declaration name, LaTeX label, source file.
 - Current item status: missing stub, in progress, valid, invalid, stale, error,
   disproved, defined, or unknown.
-- The associated Lea session messages, if a session already exists.
+- The associated Lea session messages, mirrored from the adapter session.
 - A composer for a short follow-up message.
 - Live progress while Lea is responding.
-- A persistent `Open in Lea` action for the full session.
+- A persistent `Open in Lea` action for the canonical full session.
 
-If no associated Lea session exists yet, the panel should show an empty-state
-thread and create the session on first user message. The first message must carry
-enough theorem context for Lea to know which item it is discussing.
+If no associated Lea session exists yet, the Lean pane mirror should show an
+empty-state thread and create the canonical session on first user message. The
+first message must carry enough theorem context for Lea to know which item it is
+discussing.
 
 ## User Stories
 
@@ -74,11 +88,26 @@ enough theorem context for Lea to know which item it is discussing.
 2. As a user, I can see the messages from the formalization run that created or
    attempted the proof for that theorem.
 3. As a user, I can ask "why did this fail?" on an invalid theorem and receive a
-   response in the Overleaf panel.
+   response in the Lean-pane mirror.
 4. As a user, I can ask Lea to continue from a generated stub and have that run
    append to the same theorem-associated session.
-5. As a user, I can open the full Lea UI for the same session when I want the
-   code canvas, approvals, settings, or a larger transcript.
+5. As a user, I can open the full Lea UI for the same mirrored session when I
+   want the code canvas, approvals, settings, or a larger transcript.
+
+## Access Model
+
+The Lean pane is the access surface for theorem chat in Overleaf. Chat controls
+should appear in the context of a pane item, not as a global extension popover,
+floating document-level chat, or independent project chat.
+
+Opening chat from a pane item selects that item's adapter session and renders a
+mirrored transcript. Closing the panel should not close, archive, or otherwise
+mutate the canonical full UI session. Reopening the same pane item should reload
+the same session from the adapter.
+
+The `Open in Lea` action is an escape hatch from the mirror to the canonical full
+UI. It should navigate to the same `leaSessionId` currently shown in the
+Lean-pane mirror.
 
 ## Identity Model
 
@@ -157,7 +186,7 @@ changed after the known Lean artifact was generated.
 
 ## Companion API
 
-Add companion endpoints for the extension-owned mini-chat:
+Add companion endpoints for the Lean-pane chat mirror:
 
 ```http
 POST /lean-pane/chat/session
@@ -228,19 +257,19 @@ GET /lean-pane/chat/runs/:runId/events
 ```
 
 The extension should never open two active drivers for the same adapter run. If
-the companion starts and drives a run, the mini-chat should observe through the
-companion rather than independently driving adapter SSE.
+the companion starts and drives a run, the Lean-pane mirror should observe
+through the companion rather than independently driving adapter SSE.
 
 ## Implementation Phases
 
-Version 1 should be the smallest useful theorem chat:
+Version 1 should be the smallest useful Lean-pane mirror of theorem chat:
 
 1. Resolve target-to-session associations from existing jobs and optional
    companion chat metadata.
 2. Add companion chat endpoints that wrap existing adapter session/run APIs.
-3. Add the Lean pane `Chat` action and compact chat panel.
+3. Add the Lean pane `Chat` action and mirrored chat panel.
 4. Support sending one follow-up message, polling until completion, stopping the
-   run, and opening the full Lea session.
+   run, and opening the canonical full Lea session.
 5. Refresh the Lean pane manifest after chat completion.
 
 Later versions can add companion SSE, approval handling, unread indicators,
@@ -248,22 +277,22 @@ better code-step rendering, and richer transcript filtering.
 
 ## UI Specification
 
-The chat entry point appears on each actionable Lean pane item:
+The chat mirror entry point appears on each actionable Lean pane item:
 
 - Primary label: `Chat`
 - Secondary affordance: chat/message icon if the pane has icon-only controls
 - Badge: unread/new response count is optional for later
 
-The chat panel should include:
+The mirrored chat panel should include:
 
 - Header with declaration name and status chip.
 - Short source line: `main.tex:42-51`.
-- Transcript area with compact user/assistant bubbles.
+- Transcript area with compact user/assistant bubbles from the adapter session.
 - Lightweight rendering for Markdown and inline code.
 - Collapsed code-step cards for generated Lean artifacts.
 - Composer with placeholder `Ask Lea about this item...`.
 - Send and Stop buttons.
-- `Open in Lea` link.
+- `Open in Lea` link to the canonical full UI session.
 
 The panel should support these states:
 
@@ -276,18 +305,18 @@ The panel should support these states:
 
 ## Behavior Details
 
-- The chat is scoped to one item at a time. Opening chat on another item switches
-  context.
+- Chat access is scoped through one Lean pane item at a time. Opening chat on
+  another item switches the mirrored session context.
 - Sending a message should flush the latest Overleaf `.tex` mirror first, using
   the existing mirror flow, so Lea sees current source.
 - If the item source hash differs from the latest associated job hash, the chat
   should mark the item stale and include that fact in the prompt.
-- The chat should preserve the exact adapter session transcript. It may hide
+- The mirror should preserve the exact adapter session transcript. It may hide
   verbose tool narration by default, but it must not rewrite persisted messages.
 - If a run produces a new proof artifact, the Lean pane manifest should refresh
   and the item's status should update.
-- If the run hits max spend, missing key, timeout, or adapter conflict, the chat
-  should show the same failure class as the rest of the extension.
+- If the run hits max spend, missing key, timeout, or adapter conflict, the
+  mirrored panel should show the same failure class as the rest of the extension.
 
 ## Tool Approval
 
@@ -295,9 +324,9 @@ Version 1 should avoid introducing tool approval UI inside Overleaf. Chat runs
 started from the extension should therefore use the same autonomous behavior as
 formalization runs.
 
-Future work may support approvals in the mini-chat. If added, approvals should
-mirror the full UI's allow/deny/always-for-session contract and call the adapter
-approval endpoint through the companion.
+Future work may support approvals in the Lean-pane mirror. If added, approvals
+should mirror the full UI's allow/deny/always-for-session contract and call the
+adapter approval endpoint through the companion.
 
 ## Data and Persistence
 
@@ -331,11 +360,13 @@ prefer the job/session data rather than duplicating it.
 ## Acceptance Criteria
 
 - A Lean pane item with an existing formalization session shows a `Chat` action.
-- Opening chat loads the existing adapter messages for that item.
+- Opening chat through the Lean pane loads the existing adapter messages for
+  that item.
 - Sending a message appends a new adapter run to the same session.
 - A Lean pane item with no prior session can start a new theorem-scoped chat.
-- The full Lea UI link opens the exact same session shown in the mini-chat.
-- The chat shows running, stopped, failed, and completed states.
+- The full Lea UI link opens the exact same session shown in the Lean-pane
+  mirror.
+- The mirrored panel shows running, stopped, failed, and completed states.
 - A completed chat run refreshes the pane manifest and item status.
 - Tests cover target-to-session resolution, first-message session creation,
   existing-session continuation, stale-source prompt context, and adapter failure.
@@ -353,7 +384,7 @@ Companion tests:
 Extension tests:
 
 - Render `Chat` actions for pane items.
-- Open the chat panel and request session detail.
+- Open the mirrored chat panel and request session detail.
 - Disable composer while a run is active.
 - Show `Open in Lea` when a session URL exists.
 - Refresh the Lean pane after a chat run completes.
@@ -367,7 +398,7 @@ is added. The preferred implementation uses existing adapter run/session APIs.
   full UI timeline?
 - Should a no-session first message create a regular adapter session immediately,
   or should there be a companion-only draft until the first run starts?
-- Should the mini-chat expose generated code steps inline in version 1, or only
-  show text messages plus `Open in Lea`?
+- Should the Lean-pane mirror expose generated code steps inline in version 1,
+  or only show text messages plus `Open in Lea`?
 - How much of the standalone `ChatThread` behavior should be ported versus
   simplified for extension constraints?

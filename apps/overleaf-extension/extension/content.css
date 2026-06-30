@@ -1120,3 +1120,135 @@
   color: #ffffff;
   background: var(--ol-accent);
 }
+
+/* --- Lean-pane chat mirror -------------------------------------------------
+   A compact drawer over the Lean pane that mirrors the item's full Lea UI chat
+   session. Positioned absolutely within the (fixed) pane container. */
+.ol-lean-chat-panel {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--ol-panel);
+  color: var(--ol-ink);
+}
+
+.ol-lean-chat-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--ol-line);
+}
+
+.ol-lean-chat-title {
+  flex: 1;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ol-lean-chat-close {
+  border: 0;
+  background: transparent;
+  color: var(--ol-ink-2);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px;
+}
+
+.ol-lean-chat-source {
+  margin: 0;
+  padding: 6px 12px;
+  color: var(--ol-ink-2);
+  font: 12px/1.4 var(--ol-mono, ui-monospace, monospace);
+}
+
+.ol-lean-chat-transcript {
+  flex: 1;
+  /* Without min-height:0 a flex item defaults to min-height:auto and grows to
+     fit its content instead of scrolling, so the transcript would never overflow
+     internally and autoscroll (scrollTop = scrollHeight) would be a no-op. */
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+.ol-lean-chat-bubble {
+  max-width: 85%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ol-lean-chat-bubble code {
+  font-family: var(--ol-mono, ui-monospace, monospace);
+  font-size: 0.92em;
+}
+
+.ol-lean-chat-bubble-user {
+  align-self: flex-end;
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-chat-bubble-assistant {
+  align-self: flex-start;
+  background: var(--ol-panel-2);
+  border: 1px solid var(--ol-line);
+}
+
+.ol-lean-chat-notice {
+  margin: 0;
+  color: var(--ol-ink-2);
+  font-style: italic;
+}
+
+.ol-lean-chat-error {
+  margin: 0;
+  padding: 6px 12px;
+  color: #b3261e;
+}
+
+.ol-lean-chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--ol-line);
+}
+
+.ol-lean-chat-input {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  padding: 8px;
+  font: inherit;
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  box-sizing: border-box;
+}
+
+.ol-lean-chat-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ol-lean-chat-open {
+  margin-left: auto;
+  color: var(--ol-accent-ink);
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.ol-lean-chat-open:hover {
+  text-decoration: underline;
+}

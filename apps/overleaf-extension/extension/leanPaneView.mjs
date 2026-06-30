@@ -301,6 +301,69 @@ export function paneItemToFormalizeTarget(item) {
   };
 }
 
+// --- Lean-pane chat mirror -------------------------------------------------
+
+// Whether the pane should offer a Chat action for an item. The mirror needs a
+// stable target identity (a Lean declaration name, falling back to the marker
+// label) to resolve or create the associated Lea session.
+export function canChatPaneItem(item) {
+  return Boolean(item && (item.leanDeclarationName || item.label));
+}
+
+// Shape a manifest item into the LeanPaneChatTarget payload the companion's
+// /lean-pane/chat/* endpoints expect.
+export function paneItemToChatTarget(item, overleafProjectId) {
+  return {
+    overleafProjectId: String(overleafProjectId || ""),
+    targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+    targetLabel: item?.leanDeclarationName || item?.label || "",
+    latexLabel: item?.latexLabel || "",
+    sourceFile: item?.sourceFile || "",
+    sourceStartLine: item?.sourceStartLine,
+    sourceEndLine: item?.sourceEndLine,
+    sourceHash: item?.sourceHash || "",
+    naturalLanguageLatex: item?.naturalLanguageLatex || "",
+    leanDeclarationName: item?.leanDeclarationName || "",
+    recordedProofPath: item?.leanArtifactPath || "",
+    status: item?.status || ""
+  };
+}
+
+// Resolve the chat panel's visual state from the current fetch/run flags and the
+// latest companion response. Drives which controls are enabled and what the
+// panel renders (spec: "UI Specification" / states).
+export function nextChatState({ loading = false, sending = false, response = null, error = null } = {}) {
+  if (error) return "error";
+  if (response && response.ok === false) {
+    return response.error === "adapter_unavailable" ? "adapter-unavailable" : "error";
+  }
+  if (loading) return "loading-session";
+  if (sending) return "running";
+  if (response && response.activeRun) return "running";
+  if (response && response.status === "no-session") return "no-session";
+  if (response && response.ok) return "ready";
+  return "loading-session";
+}
+
+// The composer accepts input only when the session is loaded and idle. A new
+// session (no-session) accepts the first message; an in-flight run does not.
+export function chatComposerEnabled(state) {
+  return state === "ready" || state === "no-session";
+}
+
+// True while a run is in flight — the panel shows Stop instead of Send and keeps
+// polling the companion until the run settles.
+export function chatRunActive(state) {
+  return state === "running";
+}
+
+// CSS modifier class for a transcript bubble by author role.
+export function chatBubbleClass(role) {
+  return String(role).toLowerCase() === "user"
+    ? "ol-lean-chat-bubble-user"
+    : "ol-lean-chat-bubble-assistant";
+}
+
 function finalizePaneTreeNodes(nodes) {
   nodes.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   for (const node of nodes) {

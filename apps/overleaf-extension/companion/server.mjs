@@ -29,6 +29,7 @@ import {
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
 import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
+import { buildChatPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   fetchAdapterSettings,
@@ -47,6 +48,10 @@ const APP_DIR = path.join(PROJECT_ROOT, ".overleaf-lean-stub");
 const ENV_PATH = ROOT_ENV_PATH;
 const SETTINGS_PATH = path.join(APP_DIR, "settings.json");
 const JOBS_PATH = path.join(APP_DIR, "jobs.json");
+// Target -> Lea session association for the Lean-pane chat mirror. Only used to
+// recover a chat that exists before any formalization job; when a job already
+// records the session we prefer that (D: adapter owns sessions/runs/messages).
+const CHAT_SESSIONS_PATH = path.join(APP_DIR, "chatSessions.json");
 const JOB_LOG_DIR = path.join(APP_DIR, "jobs");
 const DEFAULT_LEA_API_BASE_URL = "http://127.0.0.1:8001";
 const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
@@ -99,16 +104,19 @@ const ADAPTER_SHARED_SCALARS = {
 export async function createServer({
   settingsPath = SETTINGS_PATH,
   jobsPath = JOBS_PATH,
+  chatSessionsPath = CHAT_SESSIONS_PATH,
   fetchImpl = fetch,
   env = process.env
 } = {}) {
   const state = {
     settingsPath,
     jobsPath,
+    chatSessionsPath,
     fetchImpl,
     env,
     settings: applyEnvDefaults(await readJson(settingsPath, {}), env),
-    jobs: await readJson(jobsPath, {})
+    jobs: await readJson(jobsPath, {}),
+    chatSessions: await readJson(chatSessionsPath, {})
   };
   await ensureStartupLeaRuntime(state);
   await recoverInterruptedJobs(state);
@@ -468,6 +476,321 @@ async function mapWithConcurrency(items, limit, fn) {
   return results;
 }
 
+// --- Lean-pane chat mirror ------------------------------------------------
+// A compact Overleaf view of the *same* adapter-backed session the full Lea UI
+// uses. The companion is the single SSE driver of the run; the extension only
+// polls these endpoints. See docs/FEATURE-overleaf-lean-pane-chat-mirror.md.
+
+function normalizeChatTarget(rawTarget, state) {
+  const overleafProjectId = String(rawTarget?.overleafProjectId || "");
+  const targetKind = normalizeTargetKind(rawTarget?.targetKind);
+  const targetLabel = String(rawTarget?.targetLabel || "");
+  if (!overleafProjectId.trim()) {
+    return { ok: false, error: "missing_project_id", message: "overleafProjectId is required." };
+  }
+  if (!targetKind) {
+    return { ok: false, error: "invalid_target_kind", message: "targetKind must be theorem or definition." };
+  }
+  if (!isValidLeanIdentifier(targetLabel)) {
+    return { ok: false, error: "invalid_label", message: "Target label must be a valid Lean identifier." };
+  }
+  const target = {
+    overleafProjectId,
+    targetKind,
+    targetLabel,
+    projectSlug: slugProjectId(overleafProjectId),
+    // Identical to the job store's jobKey, so a chat resolves to the same session
+    // any formalization run recorded for this target.
+    targetKey: chatTargetKey({ overleafProjectId, targetKind, targetLabel }),
+    latexLabel: String(rawTarget?.latexLabel || "").trim(),
+    sourceFile: String(rawTarget?.sourceFile || "").trim(),
+    sourceStartLine: toPositiveInteger(rawTarget?.sourceStartLine),
+    sourceEndLine: toPositiveInteger(rawTarget?.sourceEndLine),
+    sourceHash: String(rawTarget?.sourceHash || "").trim(),
+    naturalLanguageLatex: String(rawTarget?.naturalLanguageLatex || ""),
+    leanDeclarationName: String(rawTarget?.leanDeclarationName || "").trim(),
+    recordedProofPath: String(rawTarget?.recordedProofPath || "").trim(),
+    status: String(rawTarget?.status || "").trim()
+  };
+  return { ok: true, target };
+}
+
+function chatBaseUrls(state) {
+  return {
+    baseUrl: normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL),
+    uiBaseUrl: normalizeLeaUiBaseUrl(state.settings?.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL)
+  };
+}
+
+// Resolve a target to its Lea session. Newest-wins, preferring job-recorded
+// sessions over the companion association map (the spec: prefer job/session data
+// when it exists). `latestJobHash` drives stale detection; `activeJob` blocks a
+// concurrent send.
+function resolveChatSession({ state, target }) {
+  const jobs = state.jobs || {};
+  const jobKey = target.targetKey;
+  const activeJob = findActiveJob(jobs, jobKey) || null;
+  const linkedJob = findLatestJobWithLeaSession(jobs, jobKey);
+  const finishedJob = findLatestFinishedJob(jobs, jobKey);
+  const assoc = (state.chatSessions || {})[jobKey] || null;
+  const leaSessionId =
+    (activeJob && (activeJob.leaSessionId || activeJob.recorderSessionId)) ||
+    (linkedJob && (linkedJob.leaSessionId || linkedJob.recorderSessionId)) ||
+    (assoc && assoc.leaSessionId) ||
+    null;
+  const latestJobHash = (finishedJob && finishedJob.targetTextHash) || (assoc && assoc.sourceHash) || null;
+  return { leaSessionId, latestJobHash, activeJob };
+}
+
+async function persistChatSessions(state) {
+  if (!state.chatSessionsPath) return;
+  await writeJson(state.chatSessionsPath, state.chatSessions || {});
+}
+
+export async function handleChatSession(payload, state) {
+  const validation = normalizeChatTarget(payload?.target, state);
+  if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+  const target = validation.target;
+
+  let uiBaseUrl;
+  try {
+    uiBaseUrl = chatBaseUrls(state).uiBaseUrl;
+  } catch {
+    uiBaseUrl = null;
+  }
+
+  const { leaSessionId, activeJob } = resolveChatSession({ state, target });
+  if (!leaSessionId) {
+    return {
+      statusCode: 200,
+      body: {
+        ok: true,
+        targetKey: target.targetKey,
+        leaSessionId: null,
+        leaSessionUrl: null,
+        status: "no-session",
+        messages: [],
+        runs: [],
+        activeRun: null
+      }
+    };
+  }
+
+  const leaSessionUrl = uiBaseUrl ? buildLeaSessionUrl(uiBaseUrl, leaSessionId) : null;
+  let baseUrl;
+  try {
+    baseUrl = chatBaseUrls(state).baseUrl;
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+
+  const detail = await fetchApiSessionDetail({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    sessionId: leaSessionId
+  });
+  if (!detail.ok || !detail.body || typeof detail.body !== "object") {
+    return {
+      statusCode: 200,
+      body: {
+        ok: false,
+        error: "adapter_unavailable",
+        message: detail.error || "Could not reach the Lea adapter.",
+        targetKey: target.targetKey,
+        leaSessionId,
+        leaSessionUrl
+      }
+    };
+  }
+
+  const body = toChatSessionResponse(detail.body, { targetKey: target.targetKey, leaSessionId, leaSessionUrl });
+  // A live formalization run may not yet be reflected in the adapter detail snapshot.
+  if (activeJob && !body.activeRun) body.status = "in-progress";
+  return { statusCode: 200, body };
+}
+
+export async function handleChatPoll(payload, state) {
+  const sessionId = String(payload?.sessionId || "").trim();
+  if (!sessionId) return errorResponse(400, "missing_session_id", "sessionId is required.");
+
+  let baseUrl;
+  let uiBaseUrl;
+  try {
+    ({ baseUrl, uiBaseUrl } = chatBaseUrls(state));
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+
+  const leaSessionUrl = buildLeaSessionUrl(uiBaseUrl, sessionId);
+  const detail = await fetchApiSessionDetail({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    sessionId
+  });
+  if (!detail.ok || !detail.body || typeof detail.body !== "object") {
+    return {
+      statusCode: 200,
+      body: {
+        ok: false,
+        error: "adapter_unavailable",
+        message: detail.error || "Could not reach the Lea adapter.",
+        leaSessionId: sessionId,
+        leaSessionUrl
+      }
+    };
+  }
+
+  return {
+    statusCode: 200,
+    body: toChatSessionResponse(detail.body, { targetKey: null, leaSessionId: sessionId, leaSessionUrl })
+  };
+}
+
+export async function handleChatMessage(payload, state) {
+  const validation = normalizeChatTarget(payload?.target, state);
+  if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+  const target = validation.target;
+  const message = String(payload?.message || "").trim();
+  if (!message) return errorResponse(400, "missing_message", "A chat message is required.");
+
+  // Pull the latest shared cap/key status, then run the same preflight as a
+  // formalization run so the panel reuses the existing failure classes.
+  await syncSharedSettingsFromAdapter(state);
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
+  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+
+  const { leaSessionId, latestJobHash, activeJob } = resolveChatSession({ state, target });
+  if (activeJob) {
+    return errorResponse(409, "run_in_progress", "A Lea run for this item is already in progress.");
+  }
+
+  const stale = Boolean(latestJobHash && target.sourceHash && latestJobHash !== target.sourceHash);
+  const prompt = buildChatPrompt(target, { stale, firstMessage: !leaSessionId, userText: message });
+
+  let started;
+  try {
+    started = await startChatRun({ state, target, leaSessionId, prompt });
+  } catch (error) {
+    return errorResponse(502, "chat_run_failed", error instanceof Error ? error.message : String(error));
+  }
+  if (!started.ok || !started.sessionId) {
+    return errorResponse(502, "chat_run_failed", started.error || "Lea adapter did not start the chat run.");
+  }
+
+  const now = new Date().toISOString();
+  state.chatSessions ||= {};
+  const existing = state.chatSessions[target.targetKey] || null;
+  state.chatSessions[target.targetKey] = {
+    leaSessionId: started.sessionId,
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    sourceHash: target.sourceHash || existing?.sourceHash || null
+  };
+  await persistChatSessions(state);
+
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      targetKey: target.targetKey,
+      leaSessionId: started.sessionId,
+      leaSessionUrl: started.leaSessionUrl,
+      runId: started.runId,
+      stale,
+      userMessage: { id: null, role: "user", content: message, kind: "user", createdAt: now }
+    }
+  };
+}
+
+export async function handleChatInterrupt(payload, state) {
+  const runId = String(payload?.runId || "").trim();
+  const sessionId = String(payload?.sessionId || "").trim();
+
+  let baseUrl;
+  try {
+    baseUrl = chatBaseUrls(state).baseUrl;
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+
+  let targetRunId = runId;
+  if (!targetRunId && sessionId) {
+    const detail = await fetchApiSessionDetail({
+      fetchImpl: state.fetchImpl || fetch,
+      baseUrl,
+      apiKey: state.env?.LEA_API_KEY,
+      sessionId
+    });
+    targetRunId = detail.ok && detail.body?.active_run?.id ? detail.body.active_run.id : "";
+  }
+  if (!targetRunId) return errorResponse(400, "missing_run", "No active run to interrupt.");
+
+  const result = await interruptApiRun({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    runId: targetRunId
+  });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, "interrupt_failed", result.error || "Could not interrupt the Lea run.");
+  }
+  return { statusCode: 200, body: { ok: true, runId: targetRunId } };
+}
+
+// Start (and background-drive) a chat run, resolving as soon as the adapter
+// returns a run id — NOT when the run finishes. The companion keeps driving the
+// SSE stream to completion in the background while the extension polls; this
+// keeps the POST /lean-pane/chat/message response fast and guarantees a single
+// driver for the run.
+function startChatRun({ state, target, leaSessionId, prompt }) {
+  const { baseUrl, uiBaseUrl } = chatBaseUrls(state);
+  let settle;
+  let settled = false;
+  const started = new Promise((resolve) => { settle = resolve; });
+  const finish = (value) => {
+    if (settled) return;
+    settled = true;
+    settle(value);
+  };
+
+  const run = runApiProofJob({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    message: prompt,
+    sessionId: leaSessionId || null,
+    maxTurns: state.settings?.leaMaxTurns,
+    timeoutMs: (state.settings?.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS) * 1000,
+    autoApprove: true,
+    autonomous: true,
+    projectSlug: target.projectSlug || null,
+    projectTitle: target.projectSlug || null,
+    origin: "overleaf",
+    originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
+    onRunStarted: async (runId, sessionId) => {
+      const resolvedSessionId = sessionId || leaSessionId || null;
+      finish({
+        ok: true,
+        runId,
+        sessionId: resolvedSessionId,
+        leaSessionUrl: resolvedSessionId ? buildLeaSessionUrl(uiBaseUrl, resolvedSessionId) : null
+      });
+    }
+  });
+
+  // If start failed (no run id, so onRunStarted never fired) settle from the run
+  // outcome; otherwise this is a no-op because onRunStarted already settled.
+  run.then(
+    (exit) => finish({ ok: false, error: exit?.error || "Lea adapter did not start the chat run." }),
+    (error) => finish({ ok: false, error: error instanceof Error ? error.message : String(error) })
+  );
+
+  return started;
+}
+
 export async function handleUpdateLeaSettings(payload, state) {
   const leaRepoPath = String(payload.leaRepoPath || "").trim();
   const validation = await validateLeaRepo(leaRepoPath);
@@ -769,6 +1092,31 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "POST" && url.pathname === "/lean-pane/manifest") {
     const result = await handleLeanPaneManifest(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/chat/session") {
+    const result = await handleChatSession(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/chat/message") {
+    const result = await handleChatMessage(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/chat/interrupt") {
+    const result = await handleChatInterrupt(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname.startsWith("/lean-pane/chat/session/")) {
+    const sessionId = decodeURIComponent(url.pathname.slice("/lean-pane/chat/session/".length));
+    const result = await handleChatPoll({ sessionId }, state);
     sendJson(response, result.statusCode, result.body);
     return;
   }

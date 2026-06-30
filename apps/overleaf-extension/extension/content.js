@@ -48,6 +48,21 @@
   let lastLeanPaneManifest = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
+  // Lean-pane chat mirror: a compact view of the same adapter session the full
+  // Lea UI uses. One panel at a time; `leanPaneChatToken` invalidates stale
+  // fetch/poll callbacks when the user switches items or closes the panel.
+  let leanPaneChatPanel = null;
+  let leanPaneChatItem = null;
+  let leanPaneChatTarget = null;
+  let leanPaneChatResponse = null;
+  let leanPaneChatSessionId = "";
+  let leanPaneChatRunId = "";
+  let leanPaneChatLoading = false;
+  let leanPaneChatSending = false;
+  let leanPaneChatError = null;
+  let leanPaneChatOptimistic = [];
+  let leanPaneChatPollTimer = null;
+  let leanPaneChatToken = 0;
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -222,6 +237,7 @@
     leanPanePollTimer = null;
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
+    closeLeanPaneChat();
     if (!leanPane) return;
     leanPane.remove();
     leanPane = null;
@@ -515,6 +531,9 @@
     const actions = document.createElement("div");
     actions.className = "ol-lean-project-detail-actions";
     actions.appendChild(renderGoToSourceButton(item));
+    if (leanPaneView.canChatPaneItem(item)) {
+      actions.appendChild(renderChatButton(item));
+    }
     if (leanPaneView.canFormalizePaneItem(item)) {
       actions.appendChild(renderFormalizeButton(item));
     }
@@ -660,6 +679,376 @@
       }
     });
     return button;
+  }
+
+  // Chat mirror entry point on a pane item. Opens the compact transcript scoped
+  // to this item's Lea session (creating one on first message).
+  function renderChatButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button ol-lean-chat-button";
+    button.textContent = "Chat";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openLeanPaneChat(item);
+    });
+    return button;
+  }
+
+  function isChatResponseActive(payload) {
+    return Boolean(payload && payload.ok !== false && payload.activeRun);
+  }
+
+  function ensureChatPanel() {
+    if (leanPaneChatPanel && leanPaneChatPanel.isConnected) return leanPaneChatPanel;
+    const panel = document.createElement("div");
+    panel.className = "ol-lean-chat-panel";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "Lea chat");
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.stopPropagation();
+        closeLeanPaneChat();
+      }
+    });
+    (leanPane || document.body).appendChild(panel);
+    leanPaneChatPanel = panel;
+    return panel;
+  }
+
+  function closeLeanPaneChat() {
+    leanPaneChatToken += 1;
+    clearTimeout(leanPaneChatPollTimer);
+    leanPaneChatPollTimer = null;
+    if (leanPaneChatPanel) leanPaneChatPanel.remove();
+    leanPaneChatPanel = null;
+    leanPaneChatItem = null;
+    leanPaneChatTarget = null;
+    leanPaneChatResponse = null;
+    leanPaneChatSessionId = "";
+    leanPaneChatRunId = "";
+    leanPaneChatLoading = false;
+    leanPaneChatSending = false;
+    leanPaneChatError = null;
+    leanPaneChatOptimistic = [];
+  }
+
+  async function chatCompanionBaseUrl() {
+    const settings = await getSettings();
+    return String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+  }
+
+  async function openLeanPaneChat(item) {
+    const token = ++leanPaneChatToken;
+    clearTimeout(leanPaneChatPollTimer);
+    leanPaneChatItem = item;
+    leanPaneChatTarget = leanPaneView.paneItemToChatTarget(item, itemsProjectId(lastLeanPaneManifest?.items || []));
+    leanPaneChatResponse = null;
+    leanPaneChatSessionId = "";
+    leanPaneChatRunId = "";
+    leanPaneChatError = null;
+    leanPaneChatOptimistic = [];
+    leanPaneChatLoading = true;
+    leanPaneChatSending = false;
+    ensureChatPanel();
+    renderChatPanel();
+    const input = leanPaneChatPanel?.querySelector(".ol-lean-chat-input");
+    if (input) input.focus();
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/chat/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: leanPaneChatTarget })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (token !== leanPaneChatToken) return;
+      leanPaneChatLoading = false;
+      leanPaneChatResponse = payload;
+      leanPaneChatSessionId = payload.leaSessionId || "";
+      if (isChatResponseActive(payload)) {
+        leanPaneChatSending = true;
+        startChatPolling();
+      }
+      renderChatPanel();
+    } catch (error) {
+      if (token !== leanPaneChatToken) return;
+      leanPaneChatLoading = false;
+      leanPaneChatError = error;
+      renderChatPanel();
+    }
+  }
+
+  async function sendChatMessage() {
+    if (!leanPaneChatTarget) return;
+    const input = leanPaneChatPanel?.querySelector(".ol-lean-chat-input");
+    const text = String(input?.value || "").trim();
+    if (!text) return;
+    const token = leanPaneChatToken;
+    leanPaneChatSending = true;
+    leanPaneChatError = null;
+    leanPaneChatOptimistic.push({ role: "user", content: text, kind: "user" });
+    if (input) input.value = "";
+    renderChatPanel();
+    try {
+      // Flush the latest .tex mirror so Lea sees current source before answering.
+      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/chat/message`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target: leanPaneChatTarget, message: text })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (token !== leanPaneChatToken) return;
+      if (!response.ok || !payload.ok) {
+        leanPaneChatSending = false;
+        leanPaneChatError = new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+        renderChatPanel();
+        return;
+      }
+      leanPaneChatSessionId = payload.leaSessionId || leanPaneChatSessionId;
+      leanPaneChatRunId = payload.runId || "";
+      startChatPolling();
+      renderChatPanel();
+    } catch (error) {
+      if (token !== leanPaneChatToken) return;
+      leanPaneChatSending = false;
+      leanPaneChatError = error;
+      renderChatPanel();
+    }
+  }
+
+  function startChatPolling() {
+    clearTimeout(leanPaneChatPollTimer);
+    leanPaneChatPollTimer = setTimeout(() => {
+      pollChatSession().catch(() => {});
+    }, LEAN_PANE_POLL_DELAY_MS);
+  }
+
+  async function pollChatSession() {
+    if (!leanPaneChatSessionId) return;
+    const token = leanPaneChatToken;
+    const baseUrl = await chatCompanionBaseUrl();
+    const response = await fetch(`${baseUrl}/lean-pane/chat/session/${encodeURIComponent(leanPaneChatSessionId)}`);
+    const payload = await response.json().catch(() => ({}));
+    if (token !== leanPaneChatToken) return;
+    if (payload && payload.ok) {
+      leanPaneChatResponse = payload;
+      leanPaneChatOptimistic = [];
+      if (isChatResponseActive(payload)) {
+        leanPaneChatSending = true;
+        startChatPolling();
+      } else {
+        const wasRunning = leanPaneChatSending;
+        leanPaneChatSending = false;
+        // A finished chat run may have changed the item's artifact/status.
+        if (wasRunning) refreshLeanPaneNow({ background: true }).catch(() => {});
+      }
+    } else {
+      // Adapter unavailable mid-run: surface it and stop polling.
+      leanPaneChatSending = false;
+      leanPaneChatResponse = payload;
+    }
+    renderChatPanel();
+  }
+
+  async function stopChatRun() {
+    const token = leanPaneChatToken;
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      await fetch(`${baseUrl}/lean-pane/chat/interrupt`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runId: leanPaneChatRunId, sessionId: leanPaneChatSessionId })
+      });
+    } catch {
+      // best-effort; the next poll reflects the actual run state
+    }
+    if (token === leanPaneChatToken) pollChatSession().catch(() => {});
+  }
+
+  function chatTranscriptMessages() {
+    const persisted = Array.isArray(leanPaneChatResponse?.messages) ? leanPaneChatResponse.messages : [];
+    return [...persisted, ...leanPaneChatOptimistic];
+  }
+
+  function renderChatPanel() {
+    if (!leanPaneChatPanel) return;
+    const panel = leanPaneChatPanel;
+    const item = leanPaneChatItem || {};
+    const state = leanPaneView.nextChatState({
+      loading: leanPaneChatLoading,
+      sending: leanPaneChatSending,
+      response: leanPaneChatResponse,
+      error: leanPaneChatError
+    });
+    panel.dataset.chatState = state;
+    // Autoscroll only when the user is already pinned to the bottom, so live
+    // answers follow along but reading earlier messages isn't yanked away.
+    const previousTranscript = panel.querySelector(".ol-lean-chat-transcript");
+    const pinToBottom = previousTranscript
+      ? (previousTranscript.scrollHeight - previousTranscript.scrollTop - previousTranscript.clientHeight) < 48
+      : true;
+    panel.replaceChildren();
+
+    // Header: declaration name + pane status chip + close
+    const header = document.createElement("div");
+    header.className = "ol-lean-chat-header";
+    const title = document.createElement("span");
+    title.className = "ol-lean-chat-title";
+    title.textContent = item.leanDeclarationName || item.label || "Lea chat";
+    header.appendChild(title);
+    const chip = document.createElement("span");
+    chip.className = `ol-lean-project-status ol-lean-project-status-${item.status || "unknown"}`;
+    chip.textContent = leanPaneView.formatPaneStatus(item.status || "unknown");
+    header.appendChild(chip);
+    const closeButton = document.createElement("button");
+    closeButton.type = "button";
+    closeButton.className = "ol-lean-chat-close";
+    closeButton.setAttribute("aria-label", "Close chat");
+    closeButton.textContent = "✕";
+    closeButton.addEventListener("click", closeLeanPaneChat);
+    header.appendChild(closeButton);
+    panel.appendChild(header);
+
+    if (item.sourceFile) {
+      const source = document.createElement("p");
+      source.className = "ol-lean-chat-source";
+      source.textContent = item.sourceStartLine
+        ? `${item.sourceFile}:${item.sourceStartLine}-${item.sourceEndLine || item.sourceStartLine}`
+        : item.sourceFile;
+      panel.appendChild(source);
+    }
+
+    // Transcript
+    const transcript = document.createElement("div");
+    transcript.className = "ol-lean-chat-transcript";
+    if (state === "loading-session") {
+      transcript.appendChild(chatNotice("Loading conversation…"));
+    } else if (state === "adapter-unavailable") {
+      transcript.appendChild(chatNotice(leanPaneChatResponse?.message || "The Lea adapter is unavailable."));
+    } else {
+      const messages = chatTranscriptMessages();
+      if (messages.length === 0 && state === "no-session") {
+        transcript.appendChild(chatNotice("No conversation yet. Ask Lea about this item to start one."));
+      } else if (messages.length === 0) {
+        transcript.appendChild(chatNotice("No messages yet."));
+      } else {
+        for (const message of messages) {
+          transcript.appendChild(renderChatBubble(message));
+        }
+      }
+      if (leanPaneChatSending) transcript.appendChild(chatNotice("Lea is working…"));
+    }
+    panel.appendChild(transcript);
+
+    if (leanPaneChatError) {
+      const error = document.createElement("p");
+      error.className = "ol-lean-chat-error";
+      error.textContent = normalizeErrorMessage(leanPaneChatError);
+      panel.appendChild(error);
+    }
+
+    // Composer
+    const composer = document.createElement("div");
+    composer.className = "ol-lean-chat-composer";
+    const input = document.createElement("textarea");
+    input.className = "ol-lean-chat-input";
+    input.rows = 2;
+    input.placeholder = "Ask Lea about this item...";
+    input.disabled = !leanPaneView.chatComposerEnabled(state);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        if (leanPaneView.chatComposerEnabled(state)) sendChatMessage();
+      }
+    });
+    composer.appendChild(input);
+
+    const controls = document.createElement("div");
+    controls.className = "ol-lean-chat-controls";
+    if (leanPaneView.chatRunActive(state)) {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "ol-lean-secondary-button ol-lean-chat-stop";
+      stop.textContent = "Stop";
+      stop.addEventListener("click", stopChatRun);
+      controls.appendChild(stop);
+    } else {
+      const send = document.createElement("button");
+      send.type = "button";
+      send.className = "ol-lean-primary-button ol-lean-chat-send";
+      send.textContent = "Send";
+      send.disabled = !leanPaneView.chatComposerEnabled(state);
+      send.addEventListener("click", () => sendChatMessage());
+      controls.appendChild(send);
+    }
+    const sessionUrl = leanPaneChatResponse?.leaSessionUrl || "";
+    if (sessionUrl) {
+      const open = document.createElement("a");
+      open.className = "ol-lean-chat-open";
+      open.href = sessionUrl;
+      open.target = "_blank";
+      open.rel = "noopener noreferrer";
+      open.textContent = "Open in Lea";
+      controls.appendChild(open);
+    }
+    composer.appendChild(controls);
+    panel.appendChild(composer);
+
+    // Pin to the bottom once the whole panel (composer included) is laid out, so
+    // the transcript's final flex height is settled before we scroll.
+    if (pinToBottom) transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  function chatNotice(text) {
+    const notice = document.createElement("p");
+    notice.className = "ol-lean-chat-notice";
+    notice.textContent = text;
+    return notice;
+  }
+
+  function renderChatBubble(message) {
+    const bubble = document.createElement("div");
+    bubble.className = `ol-lean-chat-bubble ${leanPaneView.chatBubbleClass(message.role)}`;
+    renderChatMarkdown(bubble, message.content || "");
+    return bubble;
+  }
+
+  // Minimal inline rendering: paragraphs, `inline code`, and **bold**. The mirror
+  // shows the persisted transcript verbatim; it never rewrites stored messages.
+  function renderChatMarkdown(container, text) {
+    const lines = String(text || "").split(/\r?\n/);
+    lines.forEach((line, index) => {
+      renderChatInline(container, line);
+      if (index < lines.length - 1) container.appendChild(document.createElement("br"));
+    });
+  }
+
+  function renderChatInline(container, line) {
+    const tokenRe = /(`[^`]+`)|(\*\*[^*]+\*\*)/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = tokenRe.exec(line)) !== null) {
+      if (match.index > lastIndex) {
+        container.appendChild(document.createTextNode(line.slice(lastIndex, match.index)));
+      }
+      if (match[1]) {
+        const code = document.createElement("code");
+        code.textContent = match[1].slice(1, -1);
+        container.appendChild(code);
+      } else if (match[2]) {
+        const strong = document.createElement("strong");
+        strong.textContent = match[2].slice(2, -2);
+        container.appendChild(strong);
+      }
+      lastIndex = tokenRe.lastIndex;
+    }
+    if (lastIndex < line.length) {
+      container.appendChild(document.createTextNode(line.slice(lastIndex)));
+    }
   }
 
   function renderCopyButton(label, text) {

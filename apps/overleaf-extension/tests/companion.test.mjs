@@ -8,6 +8,10 @@ import {
   buildOverleafDocumentUrl,
   buildSettingsResponse,
   ensureStartupLeaRuntime,
+  handleChatInterrupt,
+  handleChatMessage,
+  handleChatPoll,
+  handleChatSession,
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
@@ -2891,4 +2895,249 @@ test("formalize on the /api backend tags the theorem failed when the run does no
     targets: [{ targetKind: "theorem", targetLabel: "t_api_failure", targetText: "A theorem." }]
   }, state);
   assert.equal(statuses.body.statuses["theorem:t_api_failure"].status, "failed");
+});
+
+// --- Lean-pane chat mirror -------------------------------------------------
+
+const CHAT_TARGET = {
+  overleafProjectId: "project-1",
+  targetKind: "theorem",
+  targetLabel: "compactness_criterion",
+  latexLabel: "thm:compactness",
+  sourceFile: "main.tex",
+  sourceStartLine: 2,
+  sourceEndLine: 5,
+  sourceHash: "hash-current",
+  naturalLanguageLatex: "Every open cover has a finite subcover.",
+  leanDeclarationName: "compactness_criterion",
+  status: "invalid"
+};
+
+function makeChatSessionDetail(overrides = {}) {
+  return {
+    status: overrides.status || "answered",
+    messages: overrides.messages || [
+      { id: "m2", role: "assistant", content: "It failed on the second goal.", kind: "assistant", seq: 2, created_at: "2026-01-01T00:00:02.000Z" },
+      { id: "m1", role: "user", content: "Why did this fail?", kind: "user", seq: 1, created_at: "2026-01-01T00:00:01.000Z" },
+      { id: "m3", role: "assistant", content: "calling write_file", kind: "tool_call", seq: 3, created_at: "2026-01-01T00:00:03.000Z" }
+    ],
+    runs: overrides.runs || [{ id: "api-run-1", status: "done", created_at: "2026-01-01T00:00:00.000Z" }],
+    active_run: overrides.active_run ?? null
+  };
+}
+
+function finishedChatJob(overrides = {}) {
+  return {
+    jobId: overrides.jobId || "chat-job",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: overrides.status || "failed",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    leaSessionId: overrides.leaSessionId || "sess-chat-1",
+    leaUiBaseUrl: "http://localhost:5173",
+    targetTextHash: overrides.targetTextHash ?? "hash-current",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+}
+
+test("chat session load returns no-session when no job or association exists", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const res = await handleChatSession({ target: CHAT_TARGET }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.status, "no-session");
+  assert.equal(res.body.leaSessionId, null);
+  assert.deepEqual(res.body.messages, []);
+});
+
+test("chat session load mirrors adapter messages, filtering tool narration and ordering by seq", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch(calls, { sessionDetail: makeChatSessionDetail() })
+  });
+  state.jobs.chat = finishedChatJob();
+
+  const res = await handleChatSession({ target: CHAT_TARGET }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.leaSessionId, "sess-chat-1");
+  assert.equal(res.body.leaSessionUrl, "http://localhost:5173/?session=sess-chat-1");
+  // tool_call message dropped; user/assistant kept in seq order
+  assert.deepEqual(res.body.messages.map((m) => m.role), ["user", "assistant"]);
+  assert.equal(res.body.messages[0].content, "Why did this fail?");
+  assert.ok(calls.some((c) => String(c.url).includes("/api/sessions/sess-chat-1")));
+});
+
+test("chat session load surfaces adapter-unavailable while keeping the session link", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: async () => ({ ok: false, status: 502, async text() { return ""; } })
+  });
+  state.jobs.chat = finishedChatJob();
+
+  const res = await handleChatSession({ target: CHAT_TARGET }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, false);
+  assert.equal(res.body.error, "adapter_unavailable");
+  assert.equal(res.body.leaSessionUrl, "http://localhost:5173/?session=sess-chat-1");
+});
+
+test("chat message starts a first-message session with the full context preamble", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Why did this fail?" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.leaSessionId, "sess-api-1");
+  assert.equal(res.body.runId, "api-run-1");
+  assert.equal(res.body.userMessage.content, "Why did this fail?");
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.equal(runCall.body.session_id, undefined);
+  assert.match(runCall.body.message, /You are helping with this Overleaf item\./);
+  assert.match(runCall.body.message, /Natural-language statement:/);
+  assert.match(runCall.body.message, /User request:\nWhy did this fail\?/);
+  // association recorded for a target that had no prior job
+  assert.equal(state.chatSessions["project-1:theorem:compactness_criterion"].leaSessionId, "sess-api-1");
+});
+
+test("chat message continues an existing session with a minimal prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+  state.jobs.chat = finishedChatJob({ leaSessionId: "sess-existing", targetTextHash: "hash-current" });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Please continue." }, state);
+
+  assert.equal(res.statusCode, 200);
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.equal(runCall.body.session_id, "sess-existing");
+  assert.equal(runCall.body.message, "Please continue.");
+  assert.doesNotMatch(runCall.body.message, /You are helping/);
+});
+
+test("chat message prepends a stale note when the source hash drifted", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+  state.jobs.chat = finishedChatJob({ leaSessionId: "sess-existing", targetTextHash: "hash-old" });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Is this still right?" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.stale, true);
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.match(runCall.body.message, /^Note: the Overleaf source changed after the known Lean artifact was generated\.\n\nIs this still right\?$/);
+});
+
+test("chat message is blocked while a formalization run is active", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  state.jobs.active = {
+    jobId: "active",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "in_progress",
+    targetLabel: "compactness_criterion",
+    leaSessionId: "sess-running",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Hi" }, state);
+
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.error, "run_in_progress");
+});
+
+test("chat message is blocked when the spend cap is reached", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0.01,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  state.jobs.usage = makeUsageJob({ jobId: "usage", projectId: "project-1", inputTokens: 10, outputTokens: 5, costUsd: 0.5 });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Hi" }, state);
+
+  assert.equal(res.statusCode, 402);
+  assert.equal(res.body.error, "max_spend_reached");
+});
+
+test("chat poll reshapes adapter session detail and reports the active run", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch([], {
+      sessionDetail: makeChatSessionDetail({ status: "running", active_run: { id: "api-run-1", status: "running" } })
+    })
+  });
+
+  const res = await handleChatPoll({ sessionId: "sess-chat-1" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.equal(res.body.status, "running");
+  assert.equal(res.body.activeRun.id, "api-run-1");
+  assert.deepEqual(res.body.messages.map((m) => m.role), ["user", "assistant"]);
+});
+
+test("chat interrupt forwards the run id to the adapter", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterApiFetch(calls)
+  });
+
+  const res = await handleChatInterrupt({ runId: "api-run-1" }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ok, true);
+  assert.ok(calls.some((c) => String(c.url).includes("/api/runs/api-run-1/interrupt")));
+});
+
+test("chat message persists the association to disk when a path is configured", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls)
+  });
+  state.chatSessionsPath = path.join(path.dirname(state.jobsPath), "chatSessions.json");
+
+  await handleChatMessage({ target: CHAT_TARGET, message: "Start here." }, state);
+
+  const saved = JSON.parse(await fs.readFile(state.chatSessionsPath, "utf8"));
+  assert.equal(saved["project-1:theorem:compactness_criterion"].leaSessionId, "sess-api-1");
+  assert.equal(saved["project-1:theorem:compactness_criterion"].sourceHash, "hash-current");
 });
