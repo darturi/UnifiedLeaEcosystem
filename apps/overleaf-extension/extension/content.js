@@ -989,10 +989,23 @@
     if (sessionUrl) {
       const open = document.createElement("a");
       open.className = "ol-lean-chat-open";
+      // Keep href + target as a safe fallback (and for context-menu / modifier
+      // clicks), but route a plain click through the background worker so an
+      // already-open Lea tab is focused and navigated instead of duplicated.
       open.href = sessionUrl;
       open.target = "_blank";
       open.rel = "noopener noreferrer";
       open.textContent = "Open in Lea";
+      open.addEventListener("click", (event) => {
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1) return;
+        event.preventDefault();
+        // baseUrl defaults to the session URL's origin, which is what the worker
+        // matches existing Lea tabs against.
+        openLeaSession({ url: sessionUrl, baseUrl: sessionUrl }).catch((error) => {
+          leanPaneChatError = error;
+          renderChatPanel();
+        });
+      });
       controls.appendChild(open);
     }
     composer.appendChild(controls);
