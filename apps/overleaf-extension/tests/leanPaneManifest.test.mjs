@@ -180,6 +180,84 @@ test("makes ids unique for duplicate kind+label items", () => {
   assert.notEqual(manifest.items[0].id, manifest.items[1].id);
 });
 
+test("inventories a tag-marked item in a custom (non-allowlisted) environment", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\usepackage{lea-tags}",
+        "\\begin{document}",
+        "\\begin{claim}\\label{clm:foo}",
+        "\\leatheorem{label=foo_claim, uses={bar}, context={hint}}",
+        "Statement text.",
+        "\\end{claim}",
+        "\\begin{fact}",
+        "\\leadefinition{label=even_nat}",
+        "A definition body.",
+        "\\end{fact}",
+        "\\end{document}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 2);
+  const [claim, fact] = manifest.items;
+  assert.equal(claim.kind, "claim");
+  assert.equal(claim.label, "foo_claim");
+  assert.equal(claim.leanKind, "theorem");
+  assert.equal(claim.formalizable, true);
+  assert.deepEqual(claim.targetUses, ["bar"]);
+  assert.equal(claim.targetContext, "hint");
+
+  assert.equal(fact.kind, "fact");
+  assert.equal(fact.label, "even_nat");
+  assert.equal(fact.leanKind, "def");
+  assert.equal(fact.formalizable, true);
+});
+
+test("tag-marked and comment-marked items in allowlisted environments are equivalent", () => {
+  const manifestFor = (marker) => buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\usepackage{lea-tags}",
+        "\\begin{document}",
+        "\\begin{theorem}\\label{thm:x}",
+        marker,
+        "A statement.",
+        "\\end{theorem}",
+        "\\end{document}"
+      ].join("\n")
+    }]
+  });
+
+  const tagManifest = manifestFor("\\leatheorem{label=x, uses={y}, context={hint}}");
+  const commentManifest = manifestFor("% lea: formalize label=x uses={y} context={hint}");
+
+  for (const key of ["label", "kind", "leanKind", "formalizable", "targetUses", "targetContext", "naturalLanguageLatex"]) {
+    assert.deepEqual(tagManifest.items[0][key], commentManifest.items[0][key], `expected ${key} to match`);
+  }
+});
+
+test("a malformed tag still surfaces as a non-formalizable pane item", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{claim}\\label{clm:x}",
+        // kind=bogus is invalid, but the label is still loosely recoverable.
+        "\\lea{kind=bogus, label=mismatch}",
+        "A statement.",
+        "\\end{claim}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].label, "mismatch");
+  assert.equal(manifest.items[0].formalizable, false);
+});
+
 test("reports duplicate labels without dropping items", () => {
   const manifest = buildLeanPaneManifest({
     files: [

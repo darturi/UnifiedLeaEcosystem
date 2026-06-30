@@ -201,6 +201,35 @@ function clearProviderKeyInputs() {
   }
 }
 
+// Paste-into-preamble alternative to \usepackage{lea-tags}, for users who
+// don't want to add a second project file. Must define the same commands as
+// extension/assets/lea-tags.sty (kept in sync by hand -- six short lines).
+const LEA_TAGS_PREAMBLE_SNIPPET = [
+  "\\RequirePackage{xparse}",
+  "\\NewDocumentCommand{\\lea}{m}{}",
+  "\\NewDocumentCommand{\\leatheorem}{m}{}",
+  "\\NewDocumentCommand{\\lealemma}{m}{}",
+  "\\NewDocumentCommand{\\leaproposition}{m}{}",
+  "\\NewDocumentCommand{\\leacorollary}{m}{}",
+  "\\NewDocumentCommand{\\leadefinition}{m}{}"
+].join("\n");
+
+const leaTagsCopySnippetButton = document.querySelector("#lea-tags-copy-snippet");
+const leaTagsCopyStatusEl = document.querySelector("#lea-tags-copy-status");
+
+if (leaTagsCopySnippetButton) {
+  leaTagsCopySnippetButton.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(LEA_TAGS_PREAMBLE_SNIPPET);
+      if (leaTagsCopyStatusEl) leaTagsCopyStatusEl.textContent = "Snippet copied. Paste it into your project's preamble.";
+    } catch (error) {
+      if (leaTagsCopyStatusEl) {
+        leaTagsCopyStatusEl.textContent = error instanceof Error ? error.message : String(error);
+      }
+    }
+  });
+}
+
 function renderProviderKeyStatus(providerKeys = {}) {
   if (!providerStatusList) return;
   providerStatusList.replaceChildren();

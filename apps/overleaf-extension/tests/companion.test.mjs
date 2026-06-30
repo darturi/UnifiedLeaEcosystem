@@ -503,6 +503,51 @@ test("lean pane manifest degrades when Lea lookup is unavailable", async () => {
   assert.equal(res.body.diagnostics.at(-1).code, "lea_unconfigured");
 });
 
+test("records targetSyntax on the job for telemetry, defaulting to comment", async () => {
+  const leaRepo = await makeLeaRepo();
+
+  const defaultState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  const defaultResult = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "syntax_default_test",
+    targetText: "A theorem."
+    // no syntax field
+  }, defaultState);
+  assert.equal(defaultState.jobs[defaultResult.body.jobId].targetSyntax, "comment");
+
+  const tagState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  const tagResult = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "syntax_tag_test",
+    targetText: "A theorem.",
+    syntax: "tag"
+  }, tagState);
+  assert.equal(tagState.jobs[tagResult.body.jobId].targetSyntax, "tag");
+
+  // Identity (jobKey) and every field that reaches the prompt are unaffected
+  // by syntax -- a tag-sourced and comment-sourced target with the same
+  // targetKind/targetLabel/targetText/targetUses/targetContext produce
+  // identical jobs apart from this one telemetry field and the inputs that
+  // differ by construction (jobId/timestamps/label/jobKey/hash).
+  const defaultJob = { ...defaultState.jobs[defaultResult.body.jobId] };
+  const tagJob = { ...tagState.jobs[tagResult.body.jobId] };
+  for (const key of ["jobId", "jobKey", "targetLabel", "targetSyntax", "targetTextHash", "startedAt", "logPath", "absolutePath", "relativePath", "declarationName"]) {
+    delete defaultJob[key];
+    delete tagJob[key];
+  }
+  assert.deepEqual(defaultJob, tagJob);
+});
+
 test("lean pane manifest flags in-progress items for live polling", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({

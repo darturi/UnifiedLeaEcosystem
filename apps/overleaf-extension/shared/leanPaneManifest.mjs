@@ -1,9 +1,18 @@
 import { hashTargetText, normalizeTargetText } from "./theoremParser.mjs";
-import { parseTargets, stripLeaTargetText } from "../extension/targetParserCore.mjs";
+import {
+  findEnvironments,
+  isLineBreak,
+  parseBalancedSuffix,
+  parseTargets,
+  skipInlineWhitespace,
+  stripLeaTargetText
+} from "../extension/targetParserCore.mjs";
 
-const THEOREM_KINDS = new Set(["theorem", "lemma", "proposition", "corollary"]);
+// Used only as a display-kind fallback (leanKindFor) when an environment has
+// no validated target -- e.g. a malformed or mismatched marker. Custom
+// (non-allowlisted) environments aren't classifiable this way and default to
+// "theorem"; see leanKindFor.
 const DEFINITION_KINDS = new Set(["definition"]);
-const SUPPORTED_KINDS = new Set([...THEOREM_KINDS, ...DEFINITION_KINDS]);
 
 // The pane hashes the exact same canonical text the formalize path hashes
 // (`hashTargetText` over `stripLeaTargetText`), so an item's `sourceHash` and a
@@ -74,12 +83,29 @@ export function buildLeanPaneManifest({
 export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
   const content = String(file?.content ?? "");
   const sourceFile = normalizePath(file?.path || "");
-  const environments = findSupportedEnvironments(content);
+  // Generic (no name allowlist): a custom environment tagged with
+  // \leatheorem{...}/\leadefinition{...}/etc. is inventoried exactly like
+  // theorem/definition. The allowlist was only ever a proxy for "this might
+  // be a Lea target" -- a tag states that directly, so custom environments
+  // (e.g. \begin{claim}) are exactly the case tags exist to support.
+  //
+  // Sort by start offset: findEnvironments pushes an environment when its
+  // \end{} is matched, so a nested pair (rare for theorem-like environments,
+  // but not impossible) would otherwise appear before its enclosing one.
+  const environments = findEnvironments(content, { names: null }).sort((a, b) => a.from - b.from);
+  // The strict, validated parser (same one the formalize path and
+  // buildLeanPaneManifest's own formalizable-matching use), keyed by
+  // environment start offset. A malformed/mismatched marker won't appear
+  // here, but should still surface as a (non-formalizable) pane item -- see
+  // extractLeaMarkerLabel below -- so this is consulted only for the
+  // validated kind, not for whether to list the item at all.
+  const targetsByOffset = new Map(parseTargets(content).map((target) => [target.from, target]));
   const items = [];
   for (const environment of environments) {
     const extracted = extractEnvironmentContent(content, environment);
     const leanName = extractLeaMarkerLabel(extracted.rawLatex);
     if (!leanName) continue;
+    const target = targetsByOffset.get(environment.from);
     const sourceStart = offsetToLineColumn(content, environment.from);
     const sourceEnd = offsetToLineColumn(content, environment.to);
     const naturalLanguageLatex = stripLeaTargetText(extracted.rawLatex);
@@ -97,12 +123,22 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
       sourceHash: hashTargetText(naturalLanguageLatex),
       naturalLanguageLatex,
       naturalLanguageRendered: renderLightLatex(naturalLanguageLatex),
-      leanKind: DEFINITION_KINDS.has(environment.name) ? "def" : "theorem",
+      leanKind: leanKindFor(target, environment),
       leanDeclarationName: leanName || undefined,
       status: "missing-stub"
     });
   }
   return items;
+}
+
+function leanKindFor(target, environment) {
+  if (target) return target.targetKind === "definition" ? "def" : "theorem";
+  // No validated target (missing/invalid/mismatched marker): fall back to a
+  // best-effort guess from the environment name, same as the original
+  // comment-only behavior, for the allowlisted names it can classify. Custom
+  // environments with no resolvable target default to "theorem" -- display
+  // only, since the item is already marked not formalizable.
+  return DEFINITION_KINDS.has(environment.name) ? "def" : "theorem";
 }
 
 function normalizeFiles(files) {
@@ -115,58 +151,18 @@ function normalizeFiles(files) {
   return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function findSupportedEnvironments(source) {
-  const environments = [];
-  const stack = [];
-  const names = [...SUPPORTED_KINDS].join("|");
-  const pattern = new RegExp(`\\\\(begin|end)\\s*\\{\\s*(${names})\\s*\\}`, "g");
-  let match;
-
-  while ((match = pattern.exec(source))) {
-    const [, command, name] = match;
-    if (command === "begin") {
-      const openerEnd = findEnvironmentOpenerEnd(source, pattern.lastIndex);
-      stack.push({
-        name,
-        from: match.index,
-        bodyFrom: openerEnd.bodyFrom,
-        title: openerEnd.title
-      });
-      continue;
-    }
-
-    for (let index = stack.length - 1; index >= 0; index -= 1) {
-      if (stack[index].name !== name) continue;
-      const [open] = stack.splice(index, 1);
-      environments.push({
-        ...open,
-        bodyTo: match.index,
-        to: pattern.lastIndex
-      });
-      break;
-    }
-  }
-
-  return environments.sort((a, b) => a.from - b.from);
-}
-
-function findEnvironmentOpenerEnd(source, cursor) {
-  let index = cursor;
-  let bodyFrom = cursor;
-  let title = "";
-  while (index < source.length) {
-    index = skipInlineWhitespace(source, index);
-    if (isLineBreak(source[index])) break;
-    const group = parseBalancedSuffix(source, index);
-    if (!group.ok) break;
-    const groupText = source.slice(index + 1, group.end - 1).trim();
-    if (!title) {
-      title = groupText;
-    }
-    index = group.end;
-    bodyFrom = index;
-  }
-  return { bodyFrom, title: renderLightLatex(title) };
+// Title-only helper: an environment may open with an optional bracketed or
+// braced title immediately after \begin{name} (e.g.
+// \begin{definition}[Locally finite family]), before any \label{...}. Body
+// extraction itself (bodyFrom/bodyTo) comes from the shared findEnvironments
+// above; this only recovers the display title, which is pane-specific and
+// not needed by the comment/tag marker parsers.
+function extractEnvironmentTitle(source, openerEnd) {
+  const index = skipInlineWhitespace(source, openerEnd);
+  if (isLineBreak(source[index])) return "";
+  const group = parseBalancedSuffix(source, index);
+  if (!group.ok) return "";
+  return renderLightLatex(source.slice(index + 1, group.end - 1).trim());
 }
 
 function extractEnvironmentContent(source, environment) {
@@ -176,7 +172,7 @@ function extractEnvironmentContent(source, environment) {
   return {
     rawLatex,
     latexLabel: labelMatch ? labelMatch[1].trim() : "",
-    title: environment.title
+    title: extractEnvironmentTitle(source, environment.openerEnd)
   };
 }
 
@@ -194,10 +190,20 @@ function renderLightLatex(source) {
     .trim();
 }
 
+// Loose, best-effort label extraction -- not full validation. Deliberately
+// permissive (unlike targetParserCore's strict parser) so that a malformed or
+// mismatched marker still surfaces as a pane item (just not formalizable),
+// rather than silently disappearing from the inventory. Tries the comment
+// marker syntax first, then the tag syntax.
 function extractLeaMarkerLabel(source) {
-  const labelMatch = String(source || "").match(/^[ \t]*%\s*lea:\s*(?:formalize|define)?[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/im);
-  const value = (labelMatch?.[1] || labelMatch?.[2] || "").trim();
-  return isValidLeanIdentifier(value) ? value : "";
+  const text = String(source || "");
+  const commentMatch = text.match(/^[ \t]*%\s*lea:\s*(?:formalize|define)?[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/im);
+  const commentValue = (commentMatch?.[1] || commentMatch?.[2] || "").trim();
+  if (isValidLeanIdentifier(commentValue)) return commentValue;
+
+  const tagMatch = text.match(/\\(?:lea|leatheorem|lealemma|leaproposition|leacorollary|leadefinition)\b[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/);
+  const tagValue = (tagMatch?.[1] || tagMatch?.[2] || "").trim();
+  return isValidLeanIdentifier(tagValue) ? tagValue : "";
 }
 
 function isValidLeanIdentifier(value) {
@@ -217,33 +223,3 @@ function normalizePath(value) {
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").trim();
 }
 
-function parseBalancedSuffix(source, cursor) {
-  const opener = source[cursor];
-  const closer = opener === "{" ? "}" : opener === "[" ? "]" : "";
-  if (!closer) return { ok: false };
-
-  let depth = 1;
-  for (let index = cursor + 1; index < source.length; index += 1) {
-    const char = source[index];
-    const previous = source[index - 1];
-    if (isLineBreak(char)) return { ok: false };
-    if (char === opener && previous !== "\\") {
-      depth += 1;
-    } else if (char === closer && previous !== "\\") {
-      depth -= 1;
-      if (depth === 0) return { ok: true, end: index + 1 };
-    }
-  }
-  return { ok: false };
-}
-
-function skipInlineWhitespace(source, cursor) {
-  while (cursor < source.length && /[ \t]/.test(source[cursor])) {
-    cursor += 1;
-  }
-  return cursor;
-}
-
-function isLineBreak(char) {
-  return char === "\n" || char === "\r";
-}

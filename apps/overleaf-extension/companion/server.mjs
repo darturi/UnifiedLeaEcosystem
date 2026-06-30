@@ -190,7 +190,7 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext } = validation;
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax } = validation;
   const expectedHash = hashTargetText(targetText);
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match targetText.");
@@ -252,7 +252,7 @@ export async function handleFormalize(payload, state) {
         targetText,
         jobs: state.jobs || {}
       });
-  const job = await createLeaJob({ state, target, targetText, targetContext, resolvedUses: usesResolution.resolvedUses });
+  const job = await createLeaJob({ state, target, targetText, targetContext, targetSyntax, resolvedUses: usesResolution.resolvedUses });
   if (reusableStub) {
     job.leaSessionId = reusableStub.leaSessionId || null;
     job.recordedProofPath = reusableStub.recordedProofPath;
@@ -289,7 +289,7 @@ export async function handleStub(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext } = validation;
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax } = validation;
   if (targetKind !== "theorem") {
     return errorResponse(400, "unsupported_stub_target", "Stub generation is only supported for theorem targets.");
   }
@@ -337,6 +337,7 @@ export async function handleStub(payload, state) {
     target,
     targetText,
     targetContext,
+    targetSyntax,
     resolvedUses: usesResolution.resolvedUses,
     mode: "stub"
   });
@@ -1505,6 +1506,12 @@ function validateTargetPayload(payload) {
   const targetUses = Array.isArray(payload.targetUses)
     ? payload.targetUses.map((value) => String(value || "").trim()).filter(Boolean)
     : [];
+  // Informational only -- which marker syntax (comment vs. inline tag,
+  // docs/FEATURE-overleaf-inline-lea-tags.md) produced this target. Recorded
+  // on the job for debugging/telemetry; it never affects the prompt, jobKey,
+  // or any validation/dependency-resolution behavior below. Defaults to
+  // "comment" for any client that predates this field.
+  const targetSyntax = payload.syntax === "tag" ? "tag" : "comment";
   if (!overleafProjectId.trim()) {
     return { ok: false, error: "missing_project_id", message: "overleafProjectId is required." };
   }
@@ -1521,7 +1528,7 @@ function validateTargetPayload(payload) {
   if (!targetText.trim()) {
     return { ok: false, error: "missing_target_text", message: "Target text is required." };
   }
-  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext };
+  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax };
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -1705,7 +1712,7 @@ function validateLeaRuntime(state, { requireApiKey }) {
   return { ok: true };
 }
 
-async function createLeaJob({ state, target, targetText, targetContext = "", resolvedUses = [], mode = "formalization" }) {
+async function createLeaJob({ state, target, targetText, targetContext = "", targetSyntax = "comment", resolvedUses = [], mode = "formalization" }) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jobId = `${target.targetKind}-${target.targetLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
@@ -1722,6 +1729,9 @@ async function createLeaJob({ state, target, targetText, targetContext = "", res
     mode,
     targetKind: target.targetKind,
     targetLabel: target.targetLabel,
+    // Debugging/telemetry only -- see validateTargetPayload. Never read by
+    // buildLeaPrompt, jobKey construction, or dependency resolution.
+    targetSyntax,
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,

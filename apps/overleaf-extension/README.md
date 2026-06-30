@@ -111,6 +111,49 @@ documents, but new documents should use `% lea:` comment markers:
 }
 ```
 
+## Inline Tag Syntax
+
+`% lea:` comments only work inside `theorem`, `lemma`, `proposition`,
+`corollary`, and `definition` environments. If your document defines its own
+theorem-like environment (`claim`, `conjecture`, `fact`, a journal-specific
+name, ...), use an inline Lea tag instead. Tags are invisible LaTeX commands
+from a small package, `lea-tags.sty`, available from the extension's options
+page (download link or a copy-paste preamble snippet -- no `\usepackage` line
+needed if you use the snippet).
+
+```tex
+\usepackage{lea-tags}
+...
+\begin{claim}\label{clm:even-square}
+\leatheorem{label=even_square, uses={even_def}, context={Use the parity definition first.}}
+If $n$ is even, then $n^2$ is even.
+\end{claim}
+```
+
+`claim` is not a recognized environment name, but `\leatheorem{...}` states
+its own kind directly, so the extension still finds and formalizes it. The
+`label=`/`uses=`/`context=` fields work exactly like the comment-marker
+fields above.
+
+Named tag commands: `\leatheorem`, `\lealemma`, `\leaproposition`,
+`\leacorollary` (all theorem-kind), and `\leadefinition` (definition-kind).
+There's also a generic form for explicit kind control:
+
+```tex
+\lea{kind=definition, label=even_nat, context={Use Nat parity, not Int parity.}}
+```
+
+If you load `lea-tags.sty` but the extension finds a tag command with nothing
+defining it (a missing or misspelled `\usepackage`), it reports a
+`tag_package_not_loaded` warning -- check this before compiling, since an
+undefined tag command will otherwise fail the whole Overleaf build.
+
+A comment marker and a tag inside the same environment is an error
+(`duplicate_marker`); use one or the other per target. Both syntaxes are
+permanently supported side by side -- comments stay the simplest path for
+ordinary `theorem`/`lemma`/`definition` blocks, tags exist for everything
+else.
+
 ## Setup
 
 Run setup from the monorepo root:

@@ -1,0 +1,42 @@
+% lea-tags.sty
+%
+% Invisible LaTeX commands that mark a theorem, lemma, proposition,
+% corollary, or definition for the Lea Overleaf extension, without requiring
+% the enclosing environment to have a recognized name (theorem, lemma, ...).
+% Every command here typesets nothing; LaTeX still parses the braced
+% argument as a balanced group, which is what gives you a real compile
+% error if the metadata is malformed (e.g. an unbalanced brace in
+% context={...}), instead of a silently unrecognized marker.
+%
+% See docs/FEATURE-overleaf-inline-lea-tags.md in the lea-ecosystem repo for
+% the full design and the metadata field reference (label, uses, context,
+% kind). In short:
+%
+%   \begin{claim}\label{clm:foo}
+%   \leatheorem{label=foo_claim, uses={bar}, context={Treat foo as a Nat predicate.}}
+%   Statement text...
+%   \end{claim}
+%
+% `claim` does not need to be theorem/lemma/proposition/corollary/definition
+% -- any \begin{...}...\end{...} environment works, because the tag itself
+% states what kind of target it is.
+%
+% If you don't want a second project file, the extension's options page can
+% copy this same set of command definitions (minus the two lines below) as
+% a paste-into-your-preamble snippet instead of \usepackage{lea-tags}.
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{lea-tags}[2026/07/01 v0.1 Lea inline formalization tags]
+\RequirePackage{xparse}
+
+% Generic form: caller states kind= explicitly, e.g.
+%   \lea{kind=theorem, label=foo, uses={bar}, context={...}}
+%   \lea{kind=definition, label=foo, context={...}}
+\NewDocumentCommand{\lea}{m}{}
+
+% Named convenience wrappers, equivalent to \lea{kind=...,<args>}.
+\NewDocumentCommand{\leatheorem}{m}{}
+\NewDocumentCommand{\lealemma}{m}{}
+\NewDocumentCommand{\leaproposition}{m}{}
+\NewDocumentCommand{\leacorollary}{m}{}
+\NewDocumentCommand{\leadefinition}{m}{}
