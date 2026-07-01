@@ -12,7 +12,8 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .. import store
+from .. import ghimport, store
+from ..config import github_token
 
 router = APIRouter()
 
@@ -34,6 +35,12 @@ class SkillAssignment(BaseModel):
     project_ids: list[str] = []
 
 
+class SkillImport(BaseModel):
+    url: str
+    is_global: bool = False
+    project_ids: list[str] = []
+
+
 @router.get("/api/skills")
 def list_skills() -> dict:
     return {"skills": store.list_skills()}
@@ -46,6 +53,30 @@ def create_skill(request: SkillCreate) -> dict:
     right after create so the row comes back fully scoped."""
     try:
         skill = store.create_skill(request.name, request.body)
+        if request.is_global or request.project_ids:
+            skill = store.set_skill_assignment(
+                skill["id"], is_global=request.is_global, project_ids=request.project_ids
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return skill
+
+
+@router.post("/api/skills/import", status_code=201)
+def import_skill(request: SkillImport) -> dict:
+    """Add a skill from a GitHub link (D56): shallow-clone → snapshot the md into
+    `body` → create + scope in one call. Uses the global GitHub token from Settings
+    for private/rate-limited repos (public repos need none). A bad URL / clone
+    failure / missing md is a 400."""
+    try:
+        imported = ghimport.fetch_skill(request.url, github_token())
+    except ghimport.GitHubImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    try:
+        skill = store.create_skill(
+            imported.name, imported.body,
+            source_url=imported.source_url, source_ref=imported.source_ref,
+        )
         if request.is_global or request.project_ids:
             skill = store.set_skill_assignment(
                 skill["id"], is_global=request.is_global, project_ids=request.project_ids

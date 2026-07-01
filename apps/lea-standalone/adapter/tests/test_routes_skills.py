@@ -5,9 +5,9 @@ routes have no config/proofs-root coupling (skills are DB rows, D45)."""
 import pytest
 from fastapi import HTTPException
 
-from app import db, store
+from app import db, ghimport, store
 from app.routes import skills as skills_route
-from app.routes.skills import SkillAssignment, SkillCreate, SkillUpdate
+from app.routes.skills import SkillAssignment, SkillCreate, SkillImport, SkillUpdate
 
 
 def _setup(tmp_path, monkeypatch):
@@ -100,6 +100,45 @@ def test_assignment_missing_is_404(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         skills_route.set_skill_assignment("no-such-id", SkillAssignment(is_global=True))
     assert exc.value.status_code == 404
+
+
+def test_import_creates_and_scopes_a_skill(tmp_path, monkeypatch):
+    # W4/D56: /import fetches from GitHub then creates + scopes in one call. The
+    # fetch is stubbed (the ghimport clone path is covered in test_ghimport.py).
+    _setup(tmp_path, monkeypatch)
+    p = store.create_project("proj-a", title="A")
+    monkeypatch.setattr(
+        skills_route, "github_token", lambda: None
+    )
+    monkeypatch.setattr(
+        skills_route.ghimport, "fetch_skill",
+        lambda url, token: ghimport.ImportedSkill(
+            name="Imported Skill", body="# body",
+            source_url=url, source_ref="main",
+        ),
+    )
+
+    created = skills_route.import_skill(
+        SkillImport(url="https://github.com/you/repo", project_ids=[p["id"]])
+    )
+    assert created["name"] == "Imported Skill"
+    assert created["body"] == "# body"
+    assert created["source_url"] == "https://github.com/you/repo"
+    assert created["source_ref"] == "main"
+    assert created["project_ids"] == [p["id"]]
+
+
+def test_import_bad_url_is_400(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(skills_route, "github_token", lambda: None)
+
+    def boom(url, token):
+        raise ghimport.GitHubImportError("Not a GitHub URL.")
+
+    monkeypatch.setattr(skills_route.ghimport, "fetch_skill", boom)
+    with pytest.raises(HTTPException) as exc:
+        skills_route.import_skill(SkillImport(url="https://gitlab.com/o/r"))
+    assert exc.value.status_code == 400
 
 
 def test_delete_then_missing(tmp_path, monkeypatch):
