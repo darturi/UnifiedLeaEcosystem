@@ -576,6 +576,67 @@ def test_no_divergence_when_agent_state_is_current(tmp_path, monkeypatch):
     assert received[0][-1]["content"] == "keep going"
 
 
+def _skills_recording_fake(received: dict):
+    """A fake run_events that records the `config.skills` paths it was handed and
+    reads each file's content *while the temp dir still exists* (before the run's
+    finally cleans it up), then finishes cleanly."""
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        received["skills"] = list(config.skills)
+        received["bodies"] = {Path(p).name: Path(p).read_text() for p in config.skills}
+        yield TurnStarted(1)
+        yield Finished("assistant", "ok", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    return fake
+
+
+def test_project_run_materializes_resolved_skills_into_cfg(tmp_path, monkeypatch):
+    # W3/D48: a project run picks up the skills that resolve for it (global ∪
+    # assigned) as per-run temp .md files on cfg.skills, and the temp dir is cleaned
+    # up when the run ends.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    proofs_root = tmp_path / "workspace" / "proofs"
+    project = projects.provision_project("Epsilon", proofs_root)
+    glob = store.create_skill("Ring Tactics", "use `ring`")
+    store.set_skill_assignment(glob["id"], is_global=True)
+    scoped = store.create_skill("House Rules", "our conventions")
+    store.set_skill_assignment(scoped["id"], is_global=False, project_ids=[project["id"]])
+
+    session = store.create_session("prove foo", project_id=project["id"])
+    run = store.create_run(session["id"], "gemini/test", None, 3, project_id=project["id"])
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    ctx = bridge.RunnerContext(session["id"], run["id"], "prove foo", config, Queue())
+
+    received: dict = {}
+    monkeypatch.setattr(bridge, "run_events", _skills_recording_fake(received))
+    bridge.run_lea(ctx)
+
+    assert {Path(p).name for p in received["skills"]} == {"ring-tactics.md", "house-rules.md"}
+    assert received["bodies"]["ring-tactics.md"] == "use `ring`"
+    assert received["bodies"]["house-rules.md"] == "our conventions"
+    # The materialized temp dir is removed in the run's finally (no leak).
+    for path in received["skills"]:
+        assert not Path(path).exists()
+    # The original config object is untouched — cfg is rebuilt via replace() (frozen).
+    assert config.skills == []
+
+
+def test_loose_run_resolves_no_skills(tmp_path, monkeypatch):
+    # A loose (project-less) session resolves to no skills by definition (D47), so
+    # cfg.skills stays empty even when global skills exist.
+    ctx, _ = _context(tmp_path, monkeypatch)
+    glob = store.create_skill("Ring Tactics", "use `ring`")
+    store.set_skill_assignment(glob["id"], is_global=True)
+
+    received: dict = {}
+    monkeypatch.setattr(bridge, "run_events", _skills_recording_fake(received))
+    bridge.run_lea(ctx)
+
+    assert received["skills"] == []
+
+
 def test_second_concurrent_run_is_rejected(tmp_path, monkeypatch):
     ctx, queue = _context(tmp_path, monkeypatch)
     # hold the lock as if another run were active
