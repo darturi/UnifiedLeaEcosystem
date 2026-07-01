@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 
-export type View = 'main' | 'stats' | 'settings' | 'project';
+export type View = 'main' | 'stats' | 'settings' | 'project' | 'skills';
 
 /**
  * useLayout — the app's view/render UI state (v2.0.1 R5).

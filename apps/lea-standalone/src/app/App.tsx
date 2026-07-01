@@ -5,6 +5,7 @@ import { Canvas, type CheckOutcome } from './components/Canvas';
 import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
 import { ProjectWindow } from './components/ProjectWindow';
+import { SkillFactory } from './components/SkillFactory';
 import { NewProjectDialog } from './components/NewProjectDialog';
 import { SearchOverlay } from './components/SearchOverlay';
 import { sortCodeSteps } from './lib/timeline.mjs';
@@ -366,6 +367,13 @@ export default function App() {
         />
       </>
     );
+  if (view === 'skills')
+    return (
+      <>
+        {searchOverlay}
+        <SkillFactory onBack={() => setView('main')} />
+      </>
+    );
   if (view === 'stats')
     return (
       <>
@@ -408,6 +416,10 @@ export default function App() {
           }}
           onSelectProject={openProjectWindow}
           onNewProject={() => setNewProjectOpen(true)}
+          onOpenSkills={() => {
+            closeProject();
+            setView('skills');
+          }}
           onOpenSearch={() => setSearchOpen(true)}
           onOpenSettings={() => setView('settings')}
           onOpenStats={() => setView('stats')}

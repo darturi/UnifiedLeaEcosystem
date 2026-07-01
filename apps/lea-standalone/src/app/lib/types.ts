@@ -107,6 +107,24 @@ export interface ProjectFile {
   created_at: string;
 }
 
+// ── Skills (Skill Factory, v2.1.1) ────────────────────────────────────────────
+// A skill is a DB row: a markdown `body` (procedural knowledge) injected into the
+// prover's system prompt for the runs it resolves for. Scope (D47): `is_global`
+// → every project; else the projects in `project_ids`; loose sessions get none.
+// `source_url`/`source_ref` record GitHub provenance for an imported skill.
+export interface Skill {
+  id: string;
+  name: string;
+  slug: string;
+  body: string;
+  is_global: boolean;
+  project_ids: string[];
+  source_url?: string | null;
+  source_ref?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // ── Blueprint & derived graph (v2.1 Slice 5, D28/D29) ─────────────────────────
 // The blueprint is `.lea/blueprint.md` (markdown-canonical); the graph is parsed +
 // derived on read. Status is derived from live Lean state, never stored.

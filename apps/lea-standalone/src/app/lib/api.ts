@@ -16,6 +16,7 @@ import type {
   ProjectDetail,
   ProjectFile,
   ProjectGraph,
+  Skill,
   BlueprintWarning,
   TreeEntry,
   SearchResult,
@@ -323,6 +324,78 @@ export async function pushProject(
   });
   if (!response.ok) throw new Error(await detailMessage(response, 'Push to GitHub failed.'));
   return response.json();
+}
+
+// ── Skills (Skill Factory, v2.1.1) ────────────────────────────────────────────
+// CRUD + scope assignment + GitHub import over /api/skills. A skill's `body` is
+// markdown injected into the prover's system prompt for the project runs it
+// resolves for (global ∪ assigned, D47).
+export async function listSkills(): Promise<Skill[]> {
+  const response = await fetch('/api/skills');
+  if (!response.ok) throw new Error(`Failed to load skills: ${response.statusText}`);
+  const data = await response.json();
+  return Array.isArray(data.skills) ? data.skills : [];
+}
+
+export async function createSkill(input: {
+  name: string;
+  body?: string;
+  is_global?: boolean;
+  project_ids?: string[];
+}): Promise<Skill> {
+  const response = await fetch('/api/skills', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to create the skill.'));
+  return response.json();
+}
+
+// Import a skill from a GitHub link (D56) — the headline "paste a link → Add".
+export async function importSkill(input: {
+  url: string;
+  is_global?: boolean;
+  project_ids?: string[];
+}): Promise<Skill> {
+  const response = await fetch('/api/skills/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to import the skill.'));
+  return response.json();
+}
+
+export async function updateSkill(
+  skillId: string,
+  update: { name?: string; body?: string },
+): Promise<Skill> {
+  const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the skill.'));
+  return response.json();
+}
+
+export async function setSkillAssignment(
+  skillId: string,
+  assignment: { is_global: boolean; project_ids: string[] },
+): Promise<Skill> {
+  const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}/assignment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(assignment),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the skill scope.'));
+  return response.json();
+}
+
+export async function deleteSkill(skillId: string): Promise<void> {
+  const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to delete the skill.'));
 }
 
 // ── Global search (Slice 7, D41) ──────────────────────────────────────────────

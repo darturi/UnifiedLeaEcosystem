@@ -1,4 +1,4 @@
-import { BarChart3, PanelLeftClose, Plus } from 'lucide-react';
+import { BarChart3, PanelLeftClose, Plus, Sparkles } from 'lucide-react';
 import type { SessionSummary } from '../lib/api';
 import { useSessions } from '../stores/sessions';
 import { useProjects } from '../stores/projects';
@@ -13,6 +13,7 @@ export function Sidebar({
   onNewSession,
   onSelectProject,
   onNewProject,
+  onOpenSkills,
   onOpenSearch,
   onOpenSettings,
   onOpenStats,
@@ -24,6 +25,7 @@ export function Sidebar({
   onNewSession: () => void;
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
+  onOpenSkills: () => void;
   onOpenSearch: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
@@ -82,6 +84,14 @@ export function Sidebar({
               </button>
             ))
           )}
+        </div>
+
+        <div className="proj-group">
+          <div className="group-label">Library</div>
+          <button className="row" onClick={onOpenSkills}>
+            <span className="picon"><Sparkles size={13} /></span>
+            <span className="rtitle">Skills</span>
+          </button>
         </div>
 
         {looseSessions.length > 0 && <div className="group-label">Chats</div>}
