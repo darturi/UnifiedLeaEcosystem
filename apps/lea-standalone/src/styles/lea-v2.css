@@ -234,6 +234,34 @@
 .canvas-head .cv-btn:disabled { opacity: .5; cursor: not-allowed; }
 .canvas-head .cv-btn.run { background: var(--accent); color: #fff; border-color: var(--accent); }
 .canvas-head .x { cursor: pointer; color: var(--muted); border: 1px solid var(--line); border-radius: 7px; width: 26px; height: 26px; display: grid; place-items: center; background: var(--panel); }
+
+/* Canvas file selector (#10): pick which file is shown + verified. */
+.cv-file-select { position: relative; min-width: 0; }
+.cv-file-btn { display: inline-flex; align-items: center; gap: 5px; max-width: 260px; font: inherit;
+  font-size: 12.5px; color: var(--ink-2); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 7px; padding: 4px 9px; cursor: pointer; }
+.cv-file-btn:hover { border-color: var(--accent); color: var(--accent); }
+.cv-file-name { font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-file-caret { color: var(--muted); font-size: 10px; flex: none; }
+.cv-file-backdrop { position: fixed; inset: 0; z-index: 30; }
+.cv-file-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 31; min-width: 220px;
+  max-width: 320px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(31,30,29,.16); padding: 5px; max-height: 320px; overflow: auto; }
+.cv-file-row { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: none;
+  border: none; border-radius: 7px; cursor: pointer; font: inherit; font-size: 12.5px; color: var(--ink);
+  padding: 6px 9px; }
+.cv-file-row:hover { background: var(--accent-soft); }
+.cv-file-row.active { background: var(--accent-soft); }
+.cv-file-row.active .cv-file-dot { background: var(--accent); }
+.cv-file-row.scratch { color: var(--muted); }
+.cv-file-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line); flex: none; }
+.cv-file-row-name { font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; flex: 1; }
+.cv-file-tag { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--accent); background: var(--accent-soft); border-radius: 20px; padding: 1px 7px; flex: none; }
+.cv-file-group { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
+  padding: 8px 9px 3px; }
+
 pre.code.editing { padding: 16px; white-space: pre-wrap; caret-color: var(--accent); outline: none; color: var(--ink); }
 .edit-hint { font-size: 11px; color: var(--muted); padding: 6px 16px; background: var(--amber-soft); border-bottom: 1px solid var(--line-2); }
 .stepper { display: flex; align-items: center; gap: 6px; padding: 9px 16px; border-bottom: 1px solid var(--line-2); background: var(--panel-2); }

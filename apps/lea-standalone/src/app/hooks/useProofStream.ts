@@ -11,6 +11,7 @@ import {
 import { useProofSession } from '../stores/proofSession';
 import { useSessions } from '../stores/sessions';
 import { sortCodeSteps } from '../lib/timeline.mjs';
+import { mainFileIndex } from '../lib/canvasFiles.mjs';
 
 /**
  * useProofStream — owns the run EventSource lifecycle (v2.0.1 R2).
@@ -62,7 +63,12 @@ export function useProofStream() {
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
     setStatusEvents(detail.status_events || []);
-    setCodeIndex(Math.max(0, sortCodeSteps(detail.code_steps).length - 1));
+    // Open on the main proof's latest snapshot, not the absolute last step — so a
+    // session that ended on a throwaway `scratch` probe still shows the proof (#10).
+    // (Live runs still auto-follow new steps below.)
+    const sortedForOpen = sortCodeSteps(detail.code_steps);
+    const openIndex = mainFileIndex(sortedForOpen);
+    setCodeIndex(openIndex >= 0 ? openIndex : Math.max(0, sortedForOpen.length - 1));
     lastSeqRef.current = Math.max(
       0,
       ...detail.messages.map((m) => m.seq ?? 0),

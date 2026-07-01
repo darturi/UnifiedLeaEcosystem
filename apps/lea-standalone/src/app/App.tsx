@@ -326,22 +326,25 @@ export default function App() {
 
   // Canvas editing → write the file, then lean_check; reconcile to pick up the
   // new user-authored code step. Returns the verdict for the canvas foot.
-  const handleSaveAndCheck = async (content: string): Promise<CheckOutcome> => {
-    const path = sortedCode[sortedCode.length - 1]?.path;
-    if (!selectedSessionId || !path) return { status: 'error', detail: 'No file to edit.' };
-    await writeSessionFile(selectedSessionId, path, content, 'Manual edit from the canvas.');
-    const result = await leanCheckSession(selectedSessionId, path);
+  // The canvas passes the file it's showing (#10); fall back to the latest step's
+  // file for the single-file case. So Edit/lean_check and SafeVerify act on the
+  // *chosen* file, not always the newest (possibly scratch) one.
+  const handleSaveAndCheck = async (content: string, path?: string): Promise<CheckOutcome> => {
+    const target = path ?? sortedCode[sortedCode.length - 1]?.path;
+    if (!selectedSessionId || !target) return { status: 'error', detail: 'No file to edit.' };
+    await writeSessionFile(selectedSessionId, target, content, 'Manual edit from the canvas.');
+    const result = await leanCheckSession(selectedSessionId, target);
     await reconcile(selectedSessionId);
     await refreshSessions();
-    setEditedPath(path); // after reconcile (which clears it) — surface the nudge
+    setEditedPath(target); // after reconcile (which clears it) — surface the nudge
     setSafeVerify(null); // the edit invalidates any prior SafeVerify verdict
     return result;
   };
 
-  const handleVerify = async (): Promise<CheckOutcome> => {
-    const path = sortedCode[sortedCode.length - 1]?.path;
+  const handleVerify = async (path?: string): Promise<CheckOutcome> => {
+    const target = path ?? sortedCode[sortedCode.length - 1]?.path;
     if (!selectedSessionId) return { status: 'error', detail: 'No session.' };
-    const result = await verifySession(selectedSessionId, path);
+    const result = await verifySession(selectedSessionId, target);
     setSafeVerify({ status: result.status, detail: result.detail });
     return result;
   };
