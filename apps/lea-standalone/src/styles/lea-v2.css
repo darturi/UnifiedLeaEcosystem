@@ -249,7 +249,9 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .ln { display: flex; } .ln .gut { width: 44px; text-align: right; padding-right: 14px; color: #c8c6bd; flex: none; user-select: none; }
 .ln .src { white-space: pre-wrap; word-break: break-word; padding-right: 16px; }
 .ln.add { background: rgba(79,138,91,.10); } .ln.errline { background: rgba(192,86,74,.10); }
-.kw { color: var(--kw); } .fn { color: var(--fn); } .str { color: var(--str); } .num { color: var(--num); } .com { color: var(--com); font-style: italic; } .ty { color: var(--type); }
+/* Lean token colors now come inline from Shiki's theme (#11); the old .kw/.ty/…
+   palette classes were retired with the regex highlighter. (--fn is still used by
+   .tool .tname above.) */
 .canvas-foot { border-top: 1px solid var(--line); padding: 9px 16px; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
 .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600; padding: 2px 9px; border-radius: 20px; }
 .badge.sv, .badge.compile { color: var(--green); background: var(--green-soft); }

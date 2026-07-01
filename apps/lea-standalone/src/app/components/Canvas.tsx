@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { CodeStep, SafeVerifyStatus } from '../lib/api';
 import { diffForStep } from '../lib/codeDiff';
-import { highlightLine } from '../lib/leanHighlight.mjs';
+import { ensureHighlighter, highlightToLines, isHighlighterReady } from '../lib/leanHighlight.mjs';
 import {
   deriveCodeStepProofStatus,
   hasSorryLikeCheckDetail,
@@ -63,6 +63,27 @@ export function Canvas({
     // non-removed rows, with 'added' lines tinted green like the mockup.
     return diffForStep(codeSteps, safeIndex).filter((r: any) => r.kind !== 'removed');
   }, [codeSteps, safeIndex, step]);
+
+  // Lean highlighting via Shiki (#11). The highlighter loads async once per session;
+  // `hlReady` flips true when it's in, triggering a re-highlight. `tokenLines` is the
+  // whole snapshot tokenized (so multi-line /- -/ block comments highlight correctly),
+  // indexed by source line; a row picks its tokens by its new-file line number. Null
+  // (still loading / no code) → the rows fall back to plain text, never blank.
+  const [hlReady, setHlReady] = useState(isHighlighterReady());
+  useEffect(() => {
+    if (hlReady) return;
+    let cancelled = false;
+    ensureHighlighter()
+      .then(() => !cancelled && setHlReady(true))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [hlReady]);
+  const tokenLines = useMemo(
+    () => (hlReady && step?.code ? highlightToLines(step.code) : null),
+    [hlReady, step?.code],
+  );
 
   const beginEdit = () => {
     setDraftCode(step?.code ?? '');
@@ -196,15 +217,7 @@ export function Canvas({
                 <div key={i} className={`ln ${row.kind === 'added' ? 'add' : ''}`}>
                   <span className="gut">{row.newLineNumber ?? ''}</span>
                   <span className="src">
-                    {highlightLine(row.line).map((s: any, j: number) =>
-                      s.cls ? (
-                        <span key={j} className={s.cls}>
-                          {s.text}
-                        </span>
-                      ) : (
-                        <span key={j}>{s.text}</span>
-                      ),
-                    )}
+                    {renderLineTokens(tokenLines, row)}
                     {row.line === '' ? ' ' : ''}
                   </span>
                 </div>
@@ -265,4 +278,27 @@ export function Canvas({
       </div>
     </section>
   );
+}
+
+// Render one diff row's source using its Shiki tokens (colors inline from the
+// theme). Tokens are keyed by the row's new-file line number, so this stays aligned
+// with the gutter. Falls back to the raw line text while the highlighter loads or if
+// a line has no tokens. Shiki fontStyle is a bitmask (Italic=1, Bold=2, Underline=4).
+function renderLineTokens(tokenLines: any[] | null, row: any) {
+  const toks =
+    tokenLines && row.newLineNumber != null ? tokenLines[row.newLineNumber - 1] : null;
+  if (!toks) return row.line;
+  return toks.map((t: any, j: number) => (
+    <span
+      key={j}
+      style={{
+        color: t.color,
+        fontStyle: t.fontStyle & 1 ? 'italic' : undefined,
+        fontWeight: t.fontStyle & 2 ? 600 : undefined,
+        textDecoration: t.fontStyle & 4 ? 'underline' : undefined,
+      }}
+    >
+      {t.content}
+    </span>
+  ));
 }
