@@ -163,6 +163,21 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
     disk hasn't changed, so the new step points at the same commit_sha as the
     latest step; it exists to give the re-check its own timeline entry
     (who/why/when), not new content. See the `PathRequest.author` docstring.
+
+    A `"cascade"` check always runs immediately after a `POST .../rebuild` of
+    some *other* module in the project (the Overleaf lean pane's manual-edit
+    flow, docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade
+    verification"). It deliberately still goes through the normal (warm) path
+    here, NOT `interface_check(..., cold=True)`: a live end-to-end test found
+    the cold subprocess path (`tools.lean_check_cold`, `lake env lean <file>`
+    one-shot) did NOT reliably see a just-rebuilt project-local module's fresh
+    `.olean` either -- a real Lean/Lake quirk still under investigation, not
+    something to build correctness on. Trusting the warm path here instead
+    works, and was confirmed by that same test: `rebuild_session_module`
+    (below) calls `lsp_daemon.mark_stale` on every successful build, which
+    runs strictly before this call in the cascade's own request order, so the
+    daemon has already restarted (discarding whatever it had cached for the
+    rebuilt module) by the time this check reaches it.
     """
     abs_path, rel = _resolve_proof_path(session_id, request.path)
     result = interface_check(abs_path)

@@ -965,6 +965,24 @@ export async function handleLeanPaneEditSave(payload, state) {
   const afterHeader = parseDeclarationHeader(content, targetLabel);
   const classification = classifyEdit({ before: beforeHeader, after: afterHeader, expectedName: targetLabel, ownCheckFailed });
 
+  // The pane's own item identity (`targetLabel`) stays pinned to the LaTeX
+  // marker's label=... forever -- that's correct, it's the doc-side anchor.
+  // But `linkedJob.declarationName` is a *cache* of "what Lean symbol does
+  // this session's file currently define," taken at formalize time, and nothing
+  // refreshed it on a manual rename until now. Everything that reads it
+  // (buildJobResponse, getLatestMappedJobStatus, and -- the concrete bug this
+  // fixes -- readLeanPaneArtifactFromSession's "does the latest step still
+  // contain this name" filter) was still searching for the OLD name after a
+  // rename, so the item's displayed artifact silently fell back to the last
+  // code_step that matched it: a stale, pre-rename snapshot, even though the
+  // real file on disk (and the session's actual latest code_step) already had
+  // the rename. Updating it here keeps every downstream reader looking for the
+  // name that's actually in the file now.
+  if (classification.kind === "renamed" && linkedJob) {
+    linkedJob.declarationName = classification.to;
+    jobsChanged = true;
+  }
+
   const ownResult = {
     path: before.path,
     checkStatus: check.body?.status || null,

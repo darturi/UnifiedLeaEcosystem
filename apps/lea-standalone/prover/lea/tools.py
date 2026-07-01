@@ -143,7 +143,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     return "OK"
 
 
-def lean_check(path: str) -> str:
+def lean_check(path: str, *, use_lsp: bool = True) -> str:
     p = Path(path).resolve()
     if not p.exists():
         return f"Error: {p} does not exist."
@@ -152,7 +152,25 @@ def lean_check(path: str) -> str:
 
     # Fast path: persistent LSP daemon (keeps Mathlib oleans warm). ~420×
     # speedup on in-place edits. See lea/lsp_daemon.py and tests/lsp/.
-    if lake_root and not os.environ.get("LEA_DISABLE_LSP"):
+    #
+    # `use_lsp=False` skips this deliberately (see `lean_check_cold` below):
+    # the daemon caches every module it has ever imported for the life of its
+    # process, so a check through it can silently resolve an `import` against
+    # a stale in-memory copy even after a real `lake build` (`rebuild_module`,
+    # below) refreshed that module's `.olean` on disk from a *different*
+    # process.
+    #
+    # CAUTION: a live end-to-end test (tests/lsp/test_cascade_rename_integration.py)
+    # found that `use_lsp=False` -- i.e. the plain `lake env lean <file>`
+    # subprocess below -- does NOT reliably see a just-rebuilt project-local
+    # module's fresh `.olean` either, unlike restarting the daemon (which does).
+    # This is a real Lean/Lake behavior difference still under investigation,
+    # not something to rely on for correctness yet. The Overleaf lean pane's
+    # cascade re-check of a dependent (routes/sessions.py) does NOT use this --
+    # it relies on `rebuild_module`'s `lsp_daemon.mark_stale` call instead,
+    # confirmed correct by the same test. See
+    # docs/FEATURE-overleaf-lean-pane-manual-edit.md ("Cascade verification").
+    if use_lsp and lake_root and not os.environ.get("LEA_DISABLE_LSP"):
         try:
             from lea.lsp_daemon import check_via_lsp
             return check_via_lsp(str(p), p.read_text(), lake_root)
@@ -179,6 +197,21 @@ def lean_check(path: str) -> str:
         return f"Error: lean timed out after {timeout}s."
     except FileNotFoundError:
         return "Error: `lean` or `lake` not found. Is Lean 4 installed?"
+
+
+def lean_check_cold(path: str) -> str:
+    """`lean_check` with the LSP fast path forced off -- always a real, cold
+    `lake env lean` / `lean` subprocess compile, in principle reading whatever
+    `.olean`s are on disk right now with no in-process import cache to be
+    stale.
+
+    CAUTION: do not reach for this to work around the daemon's staleness
+    (see `lean_check`'s `use_lsp` docstring) -- a live end-to-end test found
+    it does NOT reliably do so for a project-local dependency. Prefer
+    `lsp_daemon.mark_stale` (wired into `rebuild_module`, below) plus the
+    normal warm `lean_check`, which that same test confirmed does work.
+    """
+    return lean_check(path, use_lsp=False)
 
 
 def rebuild_module(path: str) -> str:
@@ -234,6 +267,19 @@ def rebuild_module(path: str) -> str:
         )
         output = (result.stdout + "\n" + result.stderr).strip()
         if result.returncode == 0:
+            # This module's .olean on disk just changed, but a persistent LSP
+            # daemon (lsp_daemon.py) already holding it imported keeps its own
+            # in-memory copy for the life of its process -- this subprocess
+            # rebuild can't reach into that other process to fix it. Flag the
+            # daemon (if one exists for this lake_root) so its *next* check
+            # restarts it first, rather than silently serving the pre-rebuild
+            # environment forever. Best-effort: a project with LEA_DISABLE_LSP
+            # set, or no daemon started yet, has nothing to flag.
+            try:
+                from lea.lsp_daemon import mark_stale
+                mark_stale(lake_root)
+            except Exception:
+                pass
             return output if output else "OK — rebuilt."
         # Lake's own build-failure report (e.g. "✗ [n/total] Building <module>
         # (Ns)" plus a `trace:` block showing the invocation it ran) is NOT the

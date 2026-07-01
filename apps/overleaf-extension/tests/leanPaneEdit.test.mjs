@@ -255,6 +255,67 @@ test("edit save: a signature edit cascades and reports a broken dependent, attri
   assert.equal(state.jobs.a.lastEditCheckStatus, "ok");
   assert.equal(state.jobs.b.lastEditCheckStatus, "error");
   assert.match(state.jobs.b.lastEditCheckDetail, /unknown identifier/);
+
+  // a same-name signature edit (not a rename) must not touch declarationName --
+  // only classification.kind === "renamed" should
+  assert.equal(state.jobs.a.declarationName, undefined);
+});
+
+test("edit save: a rename updates the job's cached declarationName, not just the classification", async () => {
+  // Regression test for a bug found live: the pane's item identity
+  // (targetLabel) correctly stays pinned to the LaTeX marker's label=...
+  // forever, but linkedJob.declarationName is a *cache* of "what Lean symbol
+  // this session's file currently defines," taken once at formalize time.
+  // Nothing refreshed it on a manual rename, so readLeanPaneArtifactFromSession
+  // (which selects the latest code_step whose content still contains
+  // declarationName) kept falling back to the pre-rename step -- the edited
+  // item's own displayed code block silently stayed stale even though the
+  // rename itself, and the cascade break on its dependent, were both detected
+  // and reported correctly. See docs/FEATURE-overleaf-lean-pane-manual-edit.md.
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob({ declarationName: "compactness_criterion" }), b: dependentJob() },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null },
+        "sess-b": (body) => ({ path: body.path, status: "error", detail: "unknown identifier: compactness_criterion" })
+      }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      // same signature shape, different name -- classifyEdit's "renamed" case
+      content: "theorem compactness_thm : True := by\n  sorry\n"
+    },
+    state
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ownResult.classification.kind, "renamed");
+  assert.equal(res.body.ownResult.classification.from, "compactness_criterion");
+  assert.equal(res.body.ownResult.classification.to, "compactness_thm");
+
+  // the actual fix: the job's cached identity now matches the file's real,
+  // current declaration -- not what it was when first formalized
+  assert.equal(state.jobs.a.declarationName, "compactness_thm");
+
+  // unaffected by the fix: the pane's own identity for this item stays pinned
+  // to the LaTeX label, so the cascade impact on the dependent is still
+  // reported by that stable name, not the new Lean symbol
+  assert.deepEqual(res.body.dependentsImpact[0].brokenByUpstream, { targetLabel: "compactness_criterion", renamed: true });
 });
 
 test("edit save: a proof-only edit never triggers a rebuild (no dependents to verify)", async () => {

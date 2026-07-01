@@ -79,7 +79,7 @@ def test_lean_check_backfills_verdict_onto_the_step(tmp_path, monkeypatch):
     session, _ = _seed_session_with_commit(tmp_path)  # seeds a step with check_status="ok"
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_check",
-                        lambda p: CheckResult(p, "error", "p.lean:2:0: error: boom"))
+                        lambda p, cold=False: CheckResult(p, "error", "p.lean:2:0: error: boom"))
 
     result = sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
 
@@ -100,7 +100,7 @@ def test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfillin
     session, sha = _seed_session_with_commit(tmp_path)  # seeds one step, check_status="ok"
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_check",
-                        lambda p: CheckResult(p, "error", "p.lean:3:0: error: unknown identifier"))
+                        lambda p, cold=False: CheckResult(p, "error", "p.lean:3:0: error: unknown identifier"))
 
     result = sessions_route.lean_check_session(
         session["id"],
@@ -119,6 +119,40 @@ def test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfillin
     assert steps[-1]["summary"] == "Re-checked after edit to compactness_criterion"
 
 
+def test_lean_check_with_cascade_author_uses_the_warm_path_not_cold(tmp_path, monkeypatch):
+    """A cascade re-check always runs right after a `/rebuild` of some *other*
+    module in the project. It deliberately does NOT force `interface_check(...,
+    cold=True)` -- a live end-to-end test (tests/lsp/test_cascade_rename_integration.py)
+    found the cold subprocess path doesn't reliably see a just-rebuilt
+    project-local module's fresh `.olean` either. Correctness instead comes
+    from `rebuild_session_module` (tested separately) calling
+    `lsp_daemon.mark_stale`, which runs strictly before this check in the
+    cascade's own request order -- confirmed by that same test. See
+    docs/FEATURE-overleaf-lean-pane-manual-edit.md ('Cascade verification')."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    calls = []
+
+    def _fake_check(p, cold=False):
+        calls.append(cold)
+        return CheckResult(p, "ok", None)
+
+    monkeypatch.setattr(sessions_route, "interface_check", _fake_check)
+
+    sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean", author="cascade"))
+    assert calls == [False]
+
+    calls.clear()
+    sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+    assert calls == [False]
+
+    calls.clear()
+    sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean", author="user"))
+    assert calls == [False]  # every author uses the same (warm) path
+
+
 def test_lean_check_without_author_still_backfills_as_before(tmp_path, monkeypatch):
     """Regression guard: omitting `author` (every existing caller) must be
     byte-for-byte the original back-fill-only behavior."""
@@ -126,7 +160,7 @@ def test_lean_check_without_author_still_backfills_as_before(tmp_path, monkeypat
     db.init_db()
     session, _ = _seed_session_with_commit(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
-    monkeypatch.setattr(sessions_route, "interface_check", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(sessions_route, "interface_check", lambda p, cold=False: CheckResult(p, "ok", None))
 
     result = sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
 
