@@ -254,6 +254,23 @@ export function runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId, 
   });
 }
 
+// Force a real `lake build` of a session's working file's module (D2-adjacent,
+// no run). `runApiSessionLeanCheck`'s LSP fast path never updates the compiled
+// `.olean` another file's `import` resolves against, so before trusting a
+// cascade re-check of a *dependent* file, the edited module needs this to have
+// run once first. See docs/FEATURE-overleaf-lean-pane-manual-edit.md ("Cascade
+// verification") and the matching adapter route's docstring
+// (routes/sessions.py `rebuild_session_module`).
+export function rebuildApiSessionModule({ fetchImpl, baseUrl, apiKey, sessionId, path }) {
+  const body = {};
+  if (path) body.path = path;
+  return fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/rebuild`, {
+    method: "POST",
+    headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+}
+
 function deriveTurnProgress(payload, defaultMaxTurns) {
   if (!payload || typeof payload !== "object") return null;
   const turn = Number(payload.turn);

@@ -148,6 +148,50 @@ def test_verify_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
     assert result["path"] == "Lea/Misc/p.lean"
 
 
+def test_rebuild_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
+    """docs/FEATURE-overleaf-lean-pane-manual-edit.md, 'Cascade verification':
+    unlike lean-check, rebuild forces a real `lake build` (via lea.interface.rebuild
+    -> tools.rebuild_module) so a dependent's later lean-check resolves this
+    module's current .olean, not a stale one. Route-level: just verify wiring."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_rebuild", lambda p: CheckResult(p, "ok", None))
+
+    result = sessions_route.rebuild_session_module(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+
+    assert result == {"path": "Lea/Misc/p.lean", "status": "ok", "detail": None}
+
+
+def test_rebuild_surfaces_a_real_compile_failure(tmp_path, monkeypatch):
+    """A real `lake build` failure must be reported as-is -- callers (the
+    Overleaf cascade) rely on this to distinguish 'safe to trust dependents'
+    from 'nothing downstream can be verified right now'."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_rebuild",
+                        lambda p: CheckResult(p, "error", "p.lean:2:0: error: boom"))
+
+    result = sessions_route.rebuild_session_module(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+
+    assert result["status"] == "error"
+    assert result["detail"] == "p.lean:2:0: error: boom"
+
+
+def test_rebuild_404_when_session_has_no_proof_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("empty")
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.rebuild_session_module(session["id"], PathRequest())
+    assert exc.value.status_code == 404
+
+
 def test_check_404_when_session_has_no_proof_file(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

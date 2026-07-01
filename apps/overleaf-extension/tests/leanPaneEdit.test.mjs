@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { handleLeanPaneEditSave, handleLeanPaneEditStart, handleLeanPaneManifest } from "../companion/server.mjs";
+import { formatDependentOutcome } from "../extension/leanPaneView.mjs";
 
 async function makeLeaRepo() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lea-edit-repo-"));
@@ -41,12 +42,12 @@ function jsonResponse(status, body) {
 // Routes GET/POST /api/sessions/{id}[/file|/lean-check] against per-session
 // fixtures, and records every call for assertions on exactly what the
 // cascade logic did/didn't touch.
-function makeEditFetch(calls, { sessionDetails = {}, writeResponses = {}, checkResponses = {} } = {}) {
+function makeEditFetch(calls, { sessionDetails = {}, writeResponses = {}, checkResponses = {}, rebuildResponses = {} } = {}) {
   return async (url, requestOptions = {}) => {
     const method = requestOptions.method || "GET";
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     calls.push({ url: String(url), method, body });
-    const match = String(url).match(/\/api\/sessions\/([^/]+)(?:\/(file|lean-check))?$/);
+    const match = String(url).match(/\/api\/sessions\/([^/]+)(?:\/(file|lean-check|rebuild))?$/);
     if (!match) return jsonResponse(404, { detail: "unmapped url in test fetch stub" });
     const sessionId = decodeURIComponent(match[1]);
     const kind = match[2] || "detail";
@@ -59,6 +60,14 @@ function makeEditFetch(calls, { sessionDetails = {}, writeResponses = {}, checkR
     }
     if (kind === "lean-check") {
       const response = checkResponses[sessionId];
+      return jsonResponse(200, typeof response === "function" ? response(body) : (response || { path: body?.path, status: "ok", detail: null }));
+    }
+    if (kind === "rebuild") {
+      // Defaults to a successful rebuild so every existing test (none of which
+      // configure rebuildResponses) sees the cascade proceed exactly as before
+      // this step was introduced -- only tests that care about a *failed*
+      // rebuild need to override it.
+      const response = rebuildResponses[sessionId];
       return jsonResponse(200, typeof response === "function" ? response(body) : (response || { path: body?.path, status: "ok", detail: null }));
     }
     return jsonResponse(404, { detail: "unmapped kind" });
@@ -232,12 +241,211 @@ test("edit save: a signature edit cascades and reports a broken dependent, attri
   assert.equal(cascadeCall.body.author, "cascade");
   assert.equal(cascadeCall.body.path, "compactness_corollary.lean");
 
+  // the edited module (sess-a) was rebuilt for real -- once, and before the
+  // dependent's check -- so the dependent's "still valid"/"invalid" verdict
+  // above is against A's *current* signature, not a stale compiled artifact.
+  const rebuildCalls = calls.filter((c) => c.url.endsWith("/sess-a/rebuild"));
+  assert.equal(rebuildCalls.length, 1);
+  assert.equal(rebuildCalls[0].body.path, "compactness_criterion.lean");
+  assert.ok(calls.indexOf(rebuildCalls[0]) < calls.indexOf(cascadeCall));
+
   // both the edited item's own job and the broken dependent's job carry the
   // fresh verdict, so getTheoremStatus's override picks it up for both on the
   // next manifest refresh (not just the edited item)
   assert.equal(state.jobs.a.lastEditCheckStatus, "ok");
   assert.equal(state.jobs.b.lastEditCheckStatus, "error");
   assert.match(state.jobs.b.lastEditCheckDetail, /unknown identifier/);
+});
+
+test("edit save: a proof-only edit never triggers a rebuild (no dependents to verify)", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob(), b: dependentJob() },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  trivial\n"
+    },
+    state
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ownResult.classification.kind, "proof-only");
+  assert.ok(!calls.some((c) => c.url.endsWith("/rebuild")));
+});
+
+test("edit save: fixing a previously-broken file re-verifies dependents even though the fix itself is proof-only", async () => {
+  // Regression test for a real bug: classifyEdit/cascadeRequired only reason
+  // about whether THIS edit could newly break a dependent -- a proof-only fix
+  // is correctly exempt from that (proof irrelevance). But if the file was
+  // previously broken and a dependent got left holding a stale "unconfirmed"
+  // verdict (via the rebuild-failure fail-closed path), fixing the proof back
+  // up must still re-verify that dependent, or its chip is stuck forever.
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: {
+      // Both previously left broken/unconfirmed by an earlier bad edit.
+      a: editedJob({ lastEditCheckStatus: "error", lastEditCheckDetail: "unsolved goals" }),
+      b: dependentJob({ lastEditCheckStatus: "error", lastEditCheckDetail: "Not re-verified: rebuilding compactness_criterion failed, so this dependent's status is unconfirmed." })
+    },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-3" }, note: null } },
+      checkResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null },
+        "sess-b": { path: "compactness_corollary.lean", status: "ok", detail: null }
+      }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      // same header as EDITED_SESSION_DETAIL's -- proof-only fix
+      content: "theorem compactness_criterion : True := by\n  trivial\n"
+    },
+    state
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ownResult.classification.kind, "proof-only");
+
+  // A proof-only classification alone would normally skip the cascade -- but
+  // this file just recovered from a failing state, so it must run anyway.
+  const rebuildCalls = calls.filter((c) => c.url.endsWith("/sess-a/rebuild"));
+  assert.equal(rebuildCalls.length, 1);
+  const cascadeCall = calls.find((c) => c.url.endsWith("/sess-b/lean-check"));
+  assert.ok(cascadeCall);
+
+  assert.equal(res.body.dependentsImpact.length, 1);
+  assert.equal(res.body.dependentsImpact[0].status, "reverified");
+
+  // the dependent's stale "unconfirmed" chip is cleared back to ok, not left
+  // stuck on the old verdict forever
+  assert.equal(state.jobs.b.lastEditCheckStatus, "ok");
+});
+
+test("edit save: a proof-only edit to an already-healthy file still skips the cascade", async () => {
+  // Companion regression guard: the recovery trigger must not turn EVERY
+  // proof-only edit into a cascade -- only ones that actually recover from a
+  // prior failure. Same content shape as the always-skip test above, but
+  // explicit about why: lastEditCheckStatus was never "error" to begin with.
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob(), b: dependentJob() }, // no lastEditCheckStatus at all
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  trivial\n"
+    },
+    state
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.ownResult.classification.kind, "proof-only");
+  assert.deepEqual(res.body.dependentsImpact, []);
+  assert.ok(!calls.some((c) => c.url.includes("/sess-b/")));
+});
+
+test("edit save: a rebuild failure marks dependents unknown instead of trusting a stale recheck", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob(), b: dependentJob() },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } },
+      // The fast own-check can pass (e.g. via sorry-recovery) even when a real
+      // build of the same module fails outright.
+      rebuildResponses: { "sess-a": { path: "compactness_criterion.lean", status: "error", detail: "compactness_criterion.lean:1:0: error: unexpected token" } }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion (h : True) : True := by\n  sorry\n"
+    },
+    state
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.dependentsImpact.length, 1);
+  const impact = res.body.dependentsImpact[0];
+  assert.equal(impact.targetLabel, "compactness_corollary");
+  assert.equal(impact.status, "unknown");
+  assert.match(impact.checkDetail, /unexpected token/);
+
+  // never trusted a lean-check against the dependent once its own rebuild
+  // failed -- no stale-olean-backed "still valid" gets reported
+  assert.ok(!calls.some((c) => c.url.endsWith("/sess-b/lean-check")));
+
+  // The dependent's own status CHIP (not just this impact message) must also
+  // stop reading "valid" -- fail closed, same as a confirmed break, since
+  // there's no separate "unconfirmed" chip state today. Regression guard: a
+  // wrong chip is a different bug from a wrong message and needs its own check.
+  assert.equal(state.jobs.b.lastEditCheckStatus, "error");
+  assert.match(state.jobs.b.lastEditCheckDetail, /unconfirmed/);
+
+  // End-to-end regression guard for the real bug: the data shape alone isn't
+  // enough -- confirm what the pane actually RENDERS for this outcome is not
+  // the same text as a genuine successful recheck. formatDependentOutcome had
+  // no branch for status "unknown" and silently fell through to "re-checked,
+  // still valid", which is exactly what was observed live even though the
+  // rebuild correctly failed and the cascade correctly skipped the check.
+  const rendered = formatDependentOutcome(impact);
+  assert.doesNotMatch(rendered, /still valid/);
+  assert.match(rendered, /could not be verified/);
 });
 
 test("edit save: a def body edit cascades even with an unchanged signature", async () => {

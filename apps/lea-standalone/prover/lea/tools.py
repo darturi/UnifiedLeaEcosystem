@@ -181,6 +181,80 @@ def lean_check(path: str) -> str:
         return "Error: `lean` or `lake` not found. Is Lean 4 installed?"
 
 
+def rebuild_module(path: str) -> str:
+    """Force a real `lake build` of the Lean module at `path`, so its compiled
+    `.olean` on disk reflects the file's *current* source.
+
+    `lean_check`'s LSP fast path (above) never does this -- that's exactly what
+    makes a same-file recheck ~420x faster than a cold compile, but it also means
+    any *other* file that `import`s this module keeps resolving against whatever
+    `.olean` was last built, no matter how many times the importing file itself
+    is rechecked, until something does a real build. This is that something:
+    called once per edited module, before cascade-verifying its dependents
+    (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade verification").
+
+    Unlike `lean_check`, this always shells out -- there is no fast path for
+    "make the compiled artifact on disk match the source," only a real one.
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        return f"Error: {p} does not exist."
+
+    lake_root = _find_lake_root(str(p))
+    if not lake_root:
+        return f"Error: no lakefile.lean/lakefile.toml found above {p}."
+
+    # Mirrors the adapter's own `config.lea_root / "workspace" / "proofs"`
+    # convention (routes/sessions.py `_resolve_proof_path`) and the companion's
+    # `moduleNameFromProjectStep` (leanDependencyGraph.mjs): the Lean module name
+    # is the file's path relative to the library's source root, dot-joined, no
+    # extension. This project's `lean_lib Lea where srcDir := "proofs"`
+    # (workspace/lakefile.lean) is exactly that source root.
+    src_root = Path(lake_root) / "proofs"
+    try:
+        module_rel = p.relative_to(src_root.resolve())
+    except ValueError:
+        return f"Error: {p} is not under the Lean source root {src_root}."
+    module_name = ".".join(module_rel.with_suffix("").parts)
+
+    timeout = int(os.environ.get("LEAN_CHECK_TIMEOUT", "900"))
+    try:
+        result = subprocess.run(
+            ["lake", "build", module_name],
+            # Explicit UTF-8: Lean's own output is full of non-ASCII (✖, ⊢,
+            # Mathlib's unicode notation). `text=True` alone decodes with the
+            # ambient locale's default encoding, which is not guaranteed to be
+            # UTF-8 for a background-launched process -- a decoding failure
+            # there would raise uncaught (not TimeoutExpired/FileNotFoundError)
+            # and surface as an opaque 500 instead of a real verdict.
+            # errors="replace" so a genuinely malformed byte can't crash the
+            # rebuild outright either.
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, cwd=lake_root,
+        )
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode == 0:
+            return output if output else "OK — rebuilt."
+        # Lake's own build-failure report (e.g. "✗ [n/total] Building <module>
+        # (Ns)" plus a `trace:` block showing the invocation it ran) is NOT the
+        # same format `lean`'s direct CLI/LSP diagnostics use -- the
+        # `file.lean:L:C: error: ...` line `_lean_check_has_error`/
+        # `_first_error_line` (lea/interface.py `rebuild`) scan for may be
+        # buried deep in Lake's own log, or, for some failure modes, absent
+        # from the captured output entirely even though the build genuinely
+        # failed. A non-zero exit code from `lake build` is authoritative on
+        # its own -- don't make error detection depend on Lake's own log
+        # happening to contain the literal word "error". Prefix unambiguously
+        # so the downstream text-based classifiers can never miss a real
+        # build failure regardless of how Lake chose to phrase it.
+        label = output or f"lake build exited with code {result.returncode} (no output)."
+        return f"error: lake build failed for {module_name} (exit {result.returncode}):\n{label}"
+    except subprocess.TimeoutExpired:
+        return f"Error: lake build timed out after {timeout}s."
+    except FileNotFoundError:
+        return "Error: `lake` not found. Is Lean 4 installed?"
+
+
 # --- output classifiers -----------------------------------------------------
 # Pure helpers that read lean_check / tool output and classify it. Shared single
 # source of truth: the agent's live events (agent._meaning_events,

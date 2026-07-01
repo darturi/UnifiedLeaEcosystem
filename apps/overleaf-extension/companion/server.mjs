@@ -48,6 +48,7 @@ import {
   putAdapterSettings,
   runApiProofJob,
   runApiSessionLeanCheck,
+  rebuildApiSessionModule,
   writeApiSessionFile
 } from "./leaApiClient.mjs";
 
@@ -949,6 +950,10 @@ export async function handleLeanPaneEditSave(payload, state) {
     return errorResponse(check.status || 502, "edit_check_failed", check.error || "Could not check the edit.");
   }
   const ownCheckFailed = String(check.body?.status || "").toLowerCase() !== "ok";
+  // Snapshot BEFORE recordEditCheckVerdict mutates it -- this is the only
+  // place that knows whether the file was previously known-broken, needed to
+  // detect a recovery below.
+  const wasPreviouslyFailing = linkedJob?.lastEditCheckStatus === "error";
   // Record the real compiler verdict on the linked job so getTheoremStatus's
   // status override (see its doc comment) picks it up on the next manifest
   // refresh -- otherwise the pane's chip keeps reading the target as
@@ -967,8 +972,21 @@ export async function handleLeanPaneEditSave(payload, state) {
     classification
   };
 
+  // classifyEdit/cascadeRequired only reason about whether THIS edit could
+  // newly BREAK a dependent (proof irrelevance -> a proof-only edit never
+  // can, so it's correctly exempted). They say nothing about the opposite
+  // direction: a proof-only edit that fixes a previously-broken file needs to
+  // re-verify dependents too, because an earlier cascade (or the rebuild-
+  // failure fail-closed path above) may have left them holding a stale
+  // "broken"/"unconfirmed" verdict that only a fresh check can clear. Without
+  // this, fixing epsilon_one back to a real proof leaves epsilon_two's chip
+  // stuck on whatever it last said, forever -- the mirror image of the bug
+  // this whole cascade exists to catch. Real recovery (not just "still
+  // failing the same way") requires !ownCheckFailed.
+  const recoveredFromFailure = wasPreviouslyFailing && !ownCheckFailed;
+
   const dependentsImpact = [];
-  if (cascadeRequired(classification)) {
+  if (cascadeRequired(classification) || recoveredFromFailure) {
     let dependents = [];
     try {
       dependents = await dependentsOf({
@@ -978,6 +996,62 @@ export async function handleLeanPaneEditSave(payload, state) {
       });
     } catch {
       dependents = [];
+    }
+
+    // The dependents loop below re-checks each dependent via the fast LSP
+    // `lean-check` path -- which never touches the *edited* module's compiled
+    // `.olean`, so without this, every dependent would resolve `import
+    // <editedModule>` against whatever was built before this save, no matter
+    // how many times it's rechecked (the bug this cascade exists to catch).
+    // Force one real rebuild of the edited module first, so the checks below
+    // are against its current source. Skipped when there's nothing to verify
+    // against (dependents.length === 0) -- no point paying for a rebuild that
+    // nothing downstream would observe.
+    if (dependents.length > 0) {
+      const rebuild = await rebuildApiSessionModule({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path });
+      const rebuildOk = rebuild.ok && String(rebuild.body?.status || "").toLowerCase() === "ok";
+      if (!rebuildOk) {
+        // The edited module doesn't produce a real, current .olean right now
+        // (a genuine compile failure the fast own-check may have missed via
+        // sorry-recovery, an adapter/transport failure, or a timeout) -- every
+        // dependent's check below would be checking against nothing
+        // trustworthy. Report "can't verify" rather than guessing either way.
+        for (const file of dependents) {
+          const summary = summarizeDependentFile(file);
+          const dependentSession = resolveDependentSession({ state, overleafProjectId, targetLabel: summary.targetLabel });
+
+          if (dependentSession.activeJob) {
+            // Don't race a live run on the dependent -- same rule as the
+            // per-dependent loop below.
+            dependentsImpact.push({ ...summary, status: "busy", attributed: true, busy: true, brokenByUpstream: null });
+            continue;
+          }
+
+          // Fail closed: this dependent was never actually re-checked (the
+          // upstream rebuild itself failed), so its status CHIP must not keep
+          // reading whatever it last read -- typically "valid", from before
+          // this edit -- or the pane is right back to the exact bug this
+          // cascade exists to catch, just one layer removed (a wrong message
+          // is fixed by formatDependentOutcome's "unknown" branch above it in
+          // leanPaneView.mjs; the item's own chip is a separate render path,
+          // getTheoremStatus's lastEditCheckStatus override, and needs its
+          // own write). There is no "unconfirmed" chip state today -- treating
+          // it the same as "broken" is the safe default until one exists.
+          const detail = `Not re-verified: rebuilding ${targetLabel} failed, so this dependent's status is unconfirmed.`;
+          if (dependentSession.linkedJob) {
+            jobsChanged = recordEditCheckVerdict(dependentSession.linkedJob, { status: "error", detail }) || jobsChanged;
+          }
+          dependentsImpact.push({
+            ...summary,
+            status: "unknown",
+            attributed: Boolean(dependentSession.leaSessionId),
+            busy: false,
+            checkDetail: rebuild.body?.detail || rebuild.error || detail,
+            brokenByUpstream: null
+          });
+        }
+        dependents = [];
+      }
     }
 
     for (const file of dependents) {

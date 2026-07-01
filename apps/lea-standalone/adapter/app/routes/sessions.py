@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from lea.interface import check as interface_check, verify as interface_verify
+from lea.interface import check as interface_check, rebuild as interface_rebuild, verify as interface_verify
 
 from ..config import load_config
 from .. import projects, store
@@ -181,6 +181,36 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
         return {"path": rel, "status": result.status, "detail": result.detail, "code_step": new_step}
     if step:
         store.set_code_step_check(step["id"], result.status, result.detail)
+    return {"path": rel, "status": result.status, "detail": result.detail}
+
+
+@router.post("/api/sessions/{session_id}/rebuild")
+def rebuild_session_module(session_id: str, request: PathRequest) -> dict:
+    """Force a real `lake build` of a session's working file's module (D2-adjacent
+    standalone capability, no agent run), so any *other* session's file that
+    `import`s it resolves against a fresh `.olean` instead of a stale one.
+
+    Why this exists: `lean-check` above (and `check_via_lsp`/`lea/lsp_daemon.py`
+    it delegates to) is fast precisely because it never touches this file's
+    compiled `.olean` -- fine when a session is only ever checking its own file,
+    but a project-mate session's `lean-check` of a *dependent* file silently
+    resolves its `import` against whatever `.olean` was last built, indefinitely,
+    no matter how many times either file is rechecked. The Overleaf lean pane's
+    manual-edit cascade (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade
+    verification") calls this once per edited module, before re-checking any of
+    its dependents, so a dependent's "still valid" is never a caching artifact.
+    """
+    abs_path, rel = _resolve_proof_path(session_id, request.path)
+    try:
+        result = interface_rebuild(abs_path)
+    except Exception as exc:  # noqa: BLE001 -- an unexpected failure here must
+        # surface as "can't verify" (the companion's cascade already treats a
+        # non-2xx/non-"ok" response this way), never as a raw 500 that leaves
+        # the caller unable to distinguish "the module doesn't compile" from
+        # "the rebuild itself crashed." Whatever this is, it's genuinely a
+        # verdict of "unknown," not silent success.
+        logger.exception("rebuild failed unexpectedly for session=%s path=%s", session_id, abs_path)
+        return {"path": rel, "status": "error", "detail": f"rebuild crashed: {exc}"}
     return {"path": rel, "status": result.status, "detail": result.detail}
 
 

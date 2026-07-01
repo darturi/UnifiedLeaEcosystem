@@ -398,6 +398,19 @@ export function formatDependentsImpact(dependents) {
 // The post-save outcome line for a single cascade-checked dependent --
 // distinguishes a verified break (renamed vs. same-name signature change,
 // feature spec acceptance criterion 8) from busy/unattributed/still-fine.
+//
+// `status: "unknown"` with `attributed: true` is a DIFFERENT outcome from the
+// "still valid" default below, and must come before it: it means the cascade
+// never actually got a trustworthy verdict for this dependent -- either the
+// upstream module's rebuild itself failed (server.mjs's dependents.length>0
+// branch, before any dependent is even reached) or the per-dependent
+// lean-check call itself errored out (adapter unreachable, etc.). Either way
+// this dependent was NOT re-checked against current source, so saying "still
+// valid" here would be exactly the stale-verdict bug this whole cascade
+// exists to prevent -- falling through to the same text as a genuine,
+// successful recheck was a real regression caught live (a rebuild failure
+// correctly skipped the per-dependent check, but still rendered as "re-
+// checked, still valid").
 export function formatDependentOutcome(dependent) {
   if (!dependent) return "";
   const label = dependent.targetLabel || "";
@@ -408,6 +421,10 @@ export function formatDependentOutcome(dependent) {
   if (dependent.brokenByUpstream) return `${label}: broken by this edit.`;
   if (dependent.attributed === false) {
     return `${label}: may be affected, but no recorded session was found to re-check it.`;
+  }
+  if (dependent.status === "unknown") {
+    const reason = dependent.checkDetail ? ` (${dependent.checkDetail})` : "";
+    return `${label}: could not be verified${reason} -- treat as unconfirmed, not as valid.`;
   }
   return `${label}: re-checked, still valid.`;
 }

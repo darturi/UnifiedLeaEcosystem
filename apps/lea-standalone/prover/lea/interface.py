@@ -29,13 +29,14 @@ from .events import (
     UsageUpdated,
     VerifyResult,
 )
-from .tools import lean_check, _lean_check_has_error, _first_error_line
+from .tools import lean_check, rebuild_module, _lean_check_has_error, _first_error_line
 
 __all__ = [
     # the three capabilities (D2)
     "run_events",
     "check",
     "verify",
+    "rebuild",
     # the typed event stream (D17) — one import for every event type
     "AgentEvent",
     "AssistantTextDelta",
@@ -60,6 +61,26 @@ def check(path: str) -> CheckResult:
     never disagree with what a run would report for the same file.
     """
     out = lean_check(path)
+    err = _lean_check_has_error(out)
+    return CheckResult(
+        path,
+        "error" if err else "ok",
+        _first_error_line(out) if err else None,
+    )
+
+
+def rebuild(path: str) -> CheckResult:
+    """Force a real `lake build` of a file's module (`tools.rebuild_module`) and
+    return a verdict in the same shape as `check`.
+
+    No agent run. `check`'s LSP fast path never updates the compiled `.olean`
+    another file's `import` resolves against -- so before trusting a *different*
+    file's re-check of something that imports this one, that other file's check
+    needs this to have run first, once, for the edited module. Used by the
+    Overleaf lean pane's manual-edit cascade
+    (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade verification").
+    """
+    out = rebuild_module(path)
     err = _lean_check_has_error(out)
     return CheckResult(
         path,

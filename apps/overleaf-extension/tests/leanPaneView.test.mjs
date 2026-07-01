@@ -249,6 +249,35 @@ test("formatDependentOutcome distinguishes broken/renamed/busy/unattributed/stil
   assert.equal(formatDependentOutcome(null), "");
 });
 
+// Regression test for a real bug caught live: a dependent that was never
+// actually re-checked (its upstream module's rebuild failed, or the
+// per-dependent check call itself errored) must not render the same text as
+// a genuinely successful recheck -- `status: "unknown"` has to take priority
+// over the "attributed, not busy, not broken -> still valid" default.
+test("formatDependentOutcome distinguishes 'could not verify' from a genuine still-valid recheck", () => {
+  assert.equal(
+    formatDependentOutcome({
+      targetLabel: "epsilon_two",
+      status: "unknown",
+      attributed: true,
+      busy: false,
+      brokenByUpstream: null,
+      checkDetail: "error: lake build failed for Lea.Proj.epsilon_one (exit 1): ..."
+    }),
+    "epsilon_two: could not be verified (error: lake build failed for Lea.Proj.epsilon_one (exit 1): ...) -- treat as unconfirmed, not as valid."
+  );
+  // Same outcome without a detail message still reads as "unconfirmed", not "valid".
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "epsilon_two", status: "unknown", attributed: true, busy: false, brokenByUpstream: null }),
+    "epsilon_two: could not be verified -- treat as unconfirmed, not as valid."
+  );
+  // A genuine successful recheck (status "reverified", not "unknown") is unaffected.
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", status: "reverified", attributed: true, busy: false, brokenByUpstream: null }),
+    "a: re-checked, still valid."
+  );
+});
+
 test("highlightLeanLine marks Lean keywords, comments, strings, numbers, and types", () => {
   const spans = highlightLeanLine('theorem foo : Nat := 2 -- "note"');
   assert.equal(spans.find((span) => span.text === "theorem")?.cls, "kw");
