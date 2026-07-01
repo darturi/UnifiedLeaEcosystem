@@ -301,6 +301,12 @@ export function projectExportUrl(projectId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/export`;
 }
 
+// A direct-download URL for a single session's files as a zip (#14). Loose sessions
+// have no other download path; used by the session header's Download button.
+export function sessionExportUrl(sessionId: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/export`;
+}
+
 // ── Git sharing: set remote + push to GitHub (6b/U3, D34) ─────────────────────
 // The remote URL is stored per-project; the token is global (Settings, redacted).
 export async function setProjectRemote(

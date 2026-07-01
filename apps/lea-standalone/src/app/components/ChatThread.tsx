@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { PanelLeftOpen } from 'lucide-react';
+import { Download, PanelLeftOpen } from 'lucide-react';
+import { sessionExportUrl } from '../lib/api';
 import type {
   ApprovalDecision,
   ApprovalRecord,
@@ -321,15 +322,32 @@ export function ChatThread({
         {headChip && <span className={`chip ${headChip.cls}`}>{headChip.text}</span>}
         <OriginBadge origin={session?.origin} originUrl={session?.origin_url} />
         <span className="head-spacer" />
+        {/* Download this session's files as a zip (#14). Loose sessions only — a
+            project session's files download from the project's Filesystem tab. Shown
+            once the session has written at least one file (else export would 404). */}
+        {session && !session.project_id && codeSteps.length > 0 && (
+          <a
+            className="head-download"
+            href={sessionExportUrl(session.id)}
+            download
+            title="Download this session's files as a zip"
+          >
+            <Download size={13} /> Download
+          </a>
+        )}
         <ModelPicker
           value={model || ''}
           onChange={onModelChange}
           catalog={modelCatalog}
           featured={modelFeatured}
         />
-        <button className="canvas-toggle" onClick={onToggleCanvas}>
-          ◧ {canvasCollapsed ? 'Show canvas' : 'Canvas'}
-        </button>
+        {/* Only a "Show canvas" affordance when the canvas is hidden — when it's
+            open the Canvas's own × closes it, so a second toggle here is redundant. */}
+        {canvasCollapsed && (
+          <button className="canvas-toggle" onClick={onToggleCanvas}>
+            ◧ Show canvas
+          </button>
+        )}
       </div>
 
       <div className="thread" ref={scrollRef} onScroll={onScroll}>

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronLeft } from 'lucide-react';
+import { ChevronLeft, Download } from 'lucide-react';
 import type { ProjectDetail, SessionStatus } from '../lib/api';
 import { MarkdownDoc } from './MarkdownDoc';
 import { FilesCard } from './FilesCard';
@@ -121,6 +121,13 @@ export function ProjectWindow({
                 ))}
               </ul>
             )}
+
+            {/* Discoverability (#14): the project's files/download live under the
+                Filesystem tab, not here — point there with a one-click jump. */}
+            <div className="pw-download-hint">
+              <Download size={13} /> Browse or download this project’s files under the{' '}
+              <button className="pw-link" onClick={() => setTab('filesystem')}>Filesystem</button> tab.
+            </div>
           </div>
 
           <aside className="pw-rail">
