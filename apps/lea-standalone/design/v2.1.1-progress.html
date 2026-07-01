@@ -221,10 +221,10 @@
         <span class="tag be">backend</span><span class="dec">SafeVerify</span><span class="badge b-unplanned">Unplanned</span></div>
       <div class="scope">Kevin's ask #1: surface SafeVerify logs (and other UI-generated logs, later) to the agent so it can read and act on them. <b>Builds on</b> the merged SafeVerify work (PR #7: sibling-import LEAN_PATH fix + Proved-vs-audited graph) but is a new surface. <b>Plan first:</b> where logs are captured, how they reach the agent (a tool? injected context?), scope/size limits.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id issue">#10</span><span class="title">SafeVerify — canvas main-file restore + run verify on a chosen file</span>
-        <span class="tag fe">frontend</span><span class="dec">SafeVerify</span><span class="badge b-unplanned">Unplanned</span></div>
-      <div class="scope">Kevin's ask #2: Lea's scratch files land as the most-recent Canvas entry; there's no way to put the <b>main</b> file back in the Canvas, and SafeVerify only runs on the latest-turn file. <b>Note:</b> the backend <code>/api/sessions/{id}/verify</code> already accepts a <code>path</code> — so this is mostly a <b>canvas/UI</b> fix (pick which file is "main" + run verify on it). <b>Plan first:</b> canvas file-selector UX + wiring the path through.</div>
+        <span class="tag fe">frontend</span><span class="dec">SafeVerify</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>✓ DONE</b> (commit <code>be25489</code>). A <b>file selector</b> (dropdown) in the canvas header — main files first, dimmed <b>scratch</b> group, the main proof tagged; picking one jumps the stepper to that file's latest snapshot. The Edit / Run SafeVerify / verdict gate moved from "newest step overall" → "newest snapshot of the <b>shown</b> file" (<code>isFileCurrent</code>), so they stay live on the main proof even when a scratch write came after. SafeVerify + lean_check now act on the shown file's <code>path</code> (threaded through <code>onVerify</code>/<code>onSaveAndCheck</code>; the backend already took a <code>path</code> — no server change). Sessions open on the main proof's latest snapshot, not a leftover scratch (<code>useProofStream</code>); live runs still auto-follow. New <code>canvasFiles.mjs</code> helpers + 5 tests; frontend suite <b>42 pass</b>; tsc + build clean.</div>
     </div>
     <div class="todo is-done">
       <div class="top"><span class="id issue">#11</span><span class="title">Proper Lean syntax highlighter in the Canvas</span>
