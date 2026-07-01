@@ -13,15 +13,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from lea.interface import check as interface_check, verify as interface_verify
 
 from ..config import load_config
-from .. import projects, store
+from .. import filesystem as fs_service, projects, store
 
 router = APIRouter()
 logger = logging.getLogger("lea-interface.sessions")
@@ -162,6 +163,41 @@ def verify_session(session_id: str, request: PathRequest) -> dict:
     # Persist the verdict so it survives reload (surfaced as session_detail.safe_verify).
     store.set_session_safe_verify(session_id, result.status, result.detail)
     return {"path": rel, "status": result.status, "detail": result.detail}
+
+
+@router.get("/api/sessions/{session_id}/export")
+def export_session(session_id: str) -> Response:
+    """Stream a zip of a session's files (#14). A loose session has its own repo
+    (``proofs/<session-id>``) with no other download path — this fills that gap,
+    reusing the project export's zip plumbing (source + ``.lea`` assets; ``.git``/
+    ``.lake`` excluded). A project session resolves to its shared project repo (the
+    project's own Export is the primary path; this stays consistent). 404 if the
+    session is unknown or has written no files yet."""
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    config = load_config()
+    if config.lea_root is None:
+        raise HTTPException(status_code=422, detail="lea_root is not configured")
+    proofs_root = config.lea_root / "workspace" / "proofs"
+    project = store.get_project(session["project_id"]) if session.get("project_id") else None
+    repo = projects.repo_for_session(session, proofs_root, project)
+    if not repo.exists():
+        raise HTTPException(status_code=404, detail="This session has no files to download yet.")
+    data = fs_service.export_zip(repo)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{_session_zip_name(session)}"'},
+    )
+
+
+def _session_zip_name(session: dict) -> str:
+    """A friendly zip filename from the session title, e.g. 'Prove √2 irrational' →
+    'prove-2-irrational.zip'. Falls back to the session id when the title is empty
+    or slugifies to nothing."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (session.get("title") or "").lower()).strip("-")[:60]
+    return f"{slug or 'session-' + str(session['id'])[:8]}.zip"
 
 
 def _resolve_proof_path(session_id: str, path: str | None) -> tuple[str, str]:

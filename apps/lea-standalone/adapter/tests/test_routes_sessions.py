@@ -169,6 +169,58 @@ def test_session_list_events_emits_initial_sessions_changed(tmp_path, monkeypatc
     assert "event: sessions_changed" in first
 
 
+def test_export_session_returns_a_zip_of_its_files(tmp_path, monkeypatch):
+    # #14: a loose session's files download as a zip (its own proofs/<id> repo).
+    import io
+    import zipfile
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)  # writes Lea/Misc/p.lean
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    response = sessions_route.export_session(session["id"])
+
+    assert response.media_type == "application/zip"
+    assert response.headers["Content-Disposition"] == 'attachment; filename="s.zip"'  # slug of "S"
+    names = zipfile.ZipFile(io.BytesIO(response.body)).namelist()
+    assert any(n.endswith("Lea/Misc/p.lean") for n in names)
+    assert not any("/.git/" in n for n in names)  # .git excluded by export_zip
+
+
+def test_export_session_404_when_missing_or_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    # unknown session
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.export_session("no-such-session")
+    assert exc.value.status_code == 404
+
+    # a session that has never written a file → no repo on disk → 404 (not a 500)
+    empty = store.create_session("nothing here")
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.export_session(empty["id"])
+    assert exc.value.status_code == 404
+
+
+def test_export_session_filename_falls_back_to_id(tmp_path, monkeypatch):
+    # A title that slugifies to nothing falls back to a session-<id8> filename.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    gs = GitStore(tmp_path / "workspace" / "proofs")
+    session = store.create_session("!!!")  # slug → "" → fallback
+    repo = gs.init_session(session["id"])
+    (repo / "note.txt").write_text("hi")
+    gs.commit_write(session["id"], turn=None, author="user", tool="edit")
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    response = sessions_route.export_session(session["id"])
+    expected = f'attachment; filename="session-{session["id"][:8]}.zip"'
+    assert response.headers["Content-Disposition"] == expected
+
+
 def test_write_file_rejects_path_escape(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

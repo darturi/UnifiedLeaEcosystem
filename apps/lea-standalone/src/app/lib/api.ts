@@ -16,6 +16,7 @@ import type {
   ProjectDetail,
   ProjectFile,
   ProjectGraph,
+  Skill,
   BlueprintWarning,
   TreeEntry,
   SearchResult,
@@ -300,6 +301,109 @@ export function projectExportUrl(projectId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/export`;
 }
 
+// A direct-download URL for a single session's files as a zip (#14). Loose sessions
+// have no other download path; used by the session header's Download button.
+export function sessionExportUrl(sessionId: string): string {
+  return `/api/sessions/${encodeURIComponent(sessionId)}/export`;
+}
+
+// ── Git sharing: set remote + push to GitHub (6b/U3, D34) ─────────────────────
+// The remote URL is stored per-project; the token is global (Settings, redacted).
+export async function setProjectRemote(
+  projectId: string,
+  remoteUrl: string,
+): Promise<{ id: string; remote_url: string }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/git/remote`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ remote_url: remoteUrl }),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to set the GitHub remote.'));
+  return response.json();
+}
+
+export async function pushProject(
+  projectId: string,
+): Promise<{ pushed: boolean; remote_url: string; detail: string }> {
+  const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/git/push`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Push to GitHub failed.'));
+  return response.json();
+}
+
+// ── Skills (Skill Factory, v2.1.1) ────────────────────────────────────────────
+// CRUD + scope assignment + GitHub import over /api/skills. A skill's `body` is
+// markdown injected into the prover's system prompt for the project runs it
+// resolves for (global ∪ assigned, D47).
+export async function listSkills(): Promise<Skill[]> {
+  const response = await fetch('/api/skills');
+  if (!response.ok) throw new Error(`Failed to load skills: ${response.statusText}`);
+  const data = await response.json();
+  return Array.isArray(data.skills) ? data.skills : [];
+}
+
+export async function createSkill(input: {
+  name: string;
+  body?: string;
+  is_global?: boolean;
+  project_ids?: string[];
+}): Promise<Skill> {
+  const response = await fetch('/api/skills', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to create the skill.'));
+  return response.json();
+}
+
+// Import a skill from a GitHub link (D56) — the headline "paste a link → Add".
+export async function importSkill(input: {
+  url: string;
+  is_global?: boolean;
+  project_ids?: string[];
+}): Promise<Skill> {
+  const response = await fetch('/api/skills/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to import the skill.'));
+  return response.json();
+}
+
+export async function updateSkill(
+  skillId: string,
+  update: { name?: string; body?: string },
+): Promise<Skill> {
+  const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the skill.'));
+  return response.json();
+}
+
+export async function setSkillAssignment(
+  skillId: string,
+  assignment: { is_global: boolean; project_ids: string[] },
+): Promise<Skill> {
+  const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}/assignment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(assignment),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the skill scope.'));
+  return response.json();
+}
+
+export async function deleteSkill(skillId: string): Promise<void> {
+  const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to delete the skill.'));
+}
+
 // ── Global search (Slice 7, D41) ──────────────────────────────────────────────
 // Sessions matching the query by their own title or their project's title, each
 // tagged with its project. The only way to reach a project session (sidebar-hidden).
@@ -368,21 +472,44 @@ export async function verifySession(
 // Settings / Stats / Models  (F6 rewires the pages; the endpoints already exist)
 // ────────────────────────────────────────────────────────────────────────────
 
+// The two approval modes the live system supports: "stepwise" gates the mutating
+// tools (interactive default), "none" runs fully autonomous (no gate). Mirrors the
+// backend config.PERMISSION_TIERS.
+export type PermissionTier = 'stepwise' | 'none';
+
+export interface PermissionTierOption {
+  value: PermissionTier;
+  label: string;
+  description: string;
+}
+
+// A masked provider-key status (presence-only; the raw key never reaches the client).
+export interface ApiKeyStatus {
+  configured: boolean;
+  last4?: string | null;
+  label: string;
+}
+
 export interface AppSettings {
   model?: string;
+  permission_tier?: PermissionTier;
+  permission_tiers?: PermissionTierOption[];
   max_turns?: number | null;
   max_spend_usd?: number | null;
   current_spend_usd?: number;
-  api_keys?: Record<string, { configured: boolean; last4?: string | null; label: string }>;
+  api_keys?: Record<string, ApiKeyStatus>;
+  github_token?: { configured: boolean; last4?: string | null };
   model_options?: { value: string; label: string; family?: string }[];
   [key: string]: unknown;
 }
 
 export interface SettingsUpdate {
   model?: string;
+  permission_tier?: PermissionTier;
   max_turns?: number | null;
   max_spend_usd?: number | null;
   api_keys?: Record<string, { value?: string; clear?: boolean }>;
+  github_token?: { value?: string; clear?: boolean };
 }
 
 export interface ModelCatalogEntry { value: string; label: string; provider: string }

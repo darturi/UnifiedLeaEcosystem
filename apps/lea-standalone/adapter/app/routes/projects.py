@@ -9,6 +9,7 @@ graph), so detail here is just meta + the project's sessions.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
@@ -17,7 +18,8 @@ from pydantic import BaseModel
 
 from lea.interface import check as interface_check
 
-from ..config import load_config
+from ..config import load_config, github_token
+from ..gitstore import GitStore, GitStoreError
 from .. import blueprint as blueprint_doc
 from .. import filesystem as fs_service
 from .. import graph as graph_service
@@ -59,6 +61,29 @@ class MirrorFile(BaseModel):
 class MirrorRequest(BaseModel):
     files: list[MirrorFile]
     source: str = "overleaf"
+
+
+class RemoteUpdate(BaseModel):
+    remote_url: str
+
+
+# An https GitHub-style repo URL: host / owner / repo (repo may carry a `.git`).
+_GITHUB_REMOTE_RE = re.compile(r"^https://[\w.\-]+/[\w.\-]+/[\w.\-]+$")
+
+# Git's wording for "the remote has commits you don't" (a rejected, non-fast-forward push).
+_DIVERGED_MARKERS = ("non-fast-forward", "fetch first", "updates were rejected", "[rejected]")
+
+
+def _push_failure_detail(message: str) -> str:
+    """Human-facing push error. When the failure is a *divergence* (the remote moved
+    ahead of the project), point the user at Lea to reconcile — not a dead end (D34)."""
+    detail = f"Push failed: {message}"
+    if any(marker in message.lower() for marker in _DIVERGED_MARKERS):
+        detail += (
+            "\n\nThe GitHub repo has commits this project doesn't — the histories have diverged. "
+            "You can ask Lea to reconcile them (it can run git from a session), then push again."
+        )
+    return detail
 
 
 def _proofs_root() -> Path:
@@ -245,6 +270,48 @@ def export_project(project_id: str) -> Response:
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ── Git sharing: set remote + push to GitHub (6b/U3, D34) ─────────────────────────
+# A project is already a git repo, so sharing is: store a per-project remote URL and
+# push to it with the global `github_token` (Settings). Pushing is outward-facing →
+# always an explicit user action; the token is injected into the push URL only (never
+# persisted to .git/config) and scrubbed from any output.
+
+
+@router.put("/api/projects/{project_id}/git/remote")
+def set_project_remote(project_id: str, request: RemoteUpdate) -> dict:
+    """Set the project's GitHub remote URL (D34). Stored on the project row; the
+    token stays global in Settings. Returns the (token-free) remote."""
+    _require_project(project_id)
+    url = request.remote_url.strip().rstrip("/")
+    if not _GITHUB_REMOTE_RE.fullmatch(url):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter an https GitHub repo URL, e.g. https://github.com/you/repo",
+        )
+    updated = store.update_project(project_id, remote_url=url)
+    return {"id": updated["id"], "remote_url": updated["remote_url"]}
+
+
+@router.post("/api/projects/{project_id}/git/push")
+def push_project(project_id: str) -> dict:
+    """Push the project repo to its configured GitHub remote using the global token
+    (D34). Explicit user action only. 400 if no remote or no token is configured;
+    502 (scrubbed) if git rejects the push (auth / non-fast-forward / unreachable)."""
+    project = _require_project(project_id)
+    remote_url = project.get("remote_url")
+    if not remote_url:
+        raise HTTPException(status_code=400, detail="No GitHub remote set for this project.")
+    token = github_token()
+    if not token:
+        raise HTTPException(status_code=400, detail="No GitHub token configured. Add one in Settings.")
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    try:
+        summary = GitStore(_proofs_root()).push_to_github(repo, remote_url, token)
+    except GitStoreError as exc:
+        raise HTTPException(status_code=502, detail=_push_failure_detail(str(exc))) from None
+    return {"pushed": True, "remote_url": remote_url, "detail": summary or "Pushed."}
 
 
 # ── Files: upload / list / download / delete (S1/S2, D27) ────────────────────────

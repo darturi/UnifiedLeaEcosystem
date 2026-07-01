@@ -21,9 +21,12 @@ class ApiKeyUpdateRequest(BaseModel):
 
 class SettingsRequest(BaseModel):
     model: str | None = None
+    permission_tier: str | None = None
     max_turns: int | None = None
     max_spend_usd: float | None = None
     api_keys: dict[str, ApiKeyUpdateRequest] | None = None
+    # Same {value, clear} shape as a provider key; redacted on read (D34).
+    github_token: ApiKeyUpdateRequest | None = None
 
 
 @router.get("/api/settings")

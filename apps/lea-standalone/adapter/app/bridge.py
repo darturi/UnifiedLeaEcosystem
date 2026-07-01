@@ -51,7 +51,7 @@ from lea.interface import (
 from .artifacts import classify_lean_artifact
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import projects, store, uploads
+from . import projects, skills_catalog, store, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
@@ -334,6 +334,11 @@ def run_lea(context: RunnerContext) -> None:
     # may have created+set it already if Stop was hit before we got here (D18).
     stop_event = _stop_events.setdefault(run_id, Event())
 
+    # Per-run temp dir holding materialized skill .md files (W3/D48); None until
+    # resolved below. Declared before any setup that could throw so the `finally`
+    # can always clean it up.
+    skills_tempdir: str | None = None
+
     lea_root = cfg.lea_root or (Path(__file__).resolve().parents[2] / "prover")
     proofs_root = Path(lea_root) / "workspace" / "proofs"
     # Resolve the session's repo (D24): a project session writes the shared
@@ -356,6 +361,14 @@ def run_lea(context: RunnerContext) -> None:
         uploads.ensure_overleaf_gitignore(project, proofs_root)
     # Project namespace for the prompt (D32): None → the default Lea.Misc block.
     namespace = project["namespace"] if project else None
+    # Skill resolution (W3/D48): a project run picks up the skills that resolve for
+    # it (global ∪ assigned, D47), materialized to per-run temp .md files fed to the
+    # prover via cfg.skills. Loose sessions resolve to none (project is None), so
+    # cfg.skills stays empty — no behavior change on the loose path.
+    if project:
+        skill_paths, skills_tempdir = skills_catalog.materialize_project_skills(project["id"])
+        if skill_paths:
+            cfg = replace(cfg, skills=skill_paths)
 
     narration: list[str] = []
     current_turn = 0
@@ -535,6 +548,7 @@ def run_lea(context: RunnerContext) -> None:
             logger.exception("Failed to mark run %s failed", run_id)
         final_status = "failed"
     finally:
+        skills_catalog.cleanup(skills_tempdir)
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
         if current_active_run_id() == run_id:

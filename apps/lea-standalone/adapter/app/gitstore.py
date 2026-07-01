@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
 
 # Identity for commits the adapter makes on the agent's behalf. Set repo-locally
 # at init so the store never depends on the host's global git config (there is
@@ -39,6 +40,28 @@ class GitStoreError(RuntimeError):
 def commit_message(subject: str) -> str:
     """A commit subject plus the Lea co-author trailer (blank line between)."""
     return f"{subject}\n\n{CO_AUTHOR_TRAILER}"
+
+
+def _inject_token(remote_url: str, token: str) -> str:
+    """Embed the token into an https remote URL for a single push (D34).
+
+    `https://github.com/owner/repo(.git)` → `https://x-access-token:<token>@github.com/owner/repo`.
+    Only https/http URLs are rewritten; ssh/other schemes are returned unchanged
+    (the token can't help there). The result is used as a one-shot push target and
+    is never written to `.git/config`, so the token never lands on disk."""
+    parsed = urlparse(remote_url)
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        return remote_url
+    netloc = f"x-access-token:{token}@{parsed.hostname}"
+    if parsed.port:
+        netloc += f":{parsed.port}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def _scrub(text: str, token: str | None) -> str:
+    """Remove the token from any git output before it's surfaced/logged — git echoes
+    the (tokenized) URL in errors, which would otherwise leak the credential."""
+    return text.replace(token, "***") if token else text
 
 
 class GitStore:
@@ -110,6 +133,22 @@ class GitStore:
     def head(self, session_id: str) -> str:
         """The session repo's current HEAD sha (the latest committed state)."""
         return self._git(self.session_repo(session_id), "rev-parse", "HEAD").strip()
+
+    def push_to_github(self, repo: Path, remote_url: str, token: str | None, *, branch: str = "main") -> str:
+        """Push ``repo``'s current HEAD to ``remote_url``'s ``branch`` (D34).
+
+        The token (when given) is injected into the push URL for *this invocation
+        only* — passed as the push target, never via ``git remote set-url`` — so it
+        is never persisted to ``.git/config``. The token is scrubbed from both the
+        success summary and any error before they leave this method, since git echoes
+        the URL (with the token) in its messages. Raises ``GitStoreError`` (scrubbed)
+        on a failed push (auth, non-fast-forward, unreachable, …)."""
+        push_url = _inject_token(remote_url, token) if token else remote_url
+        try:
+            out = self._git(repo, "push", push_url, f"HEAD:refs/heads/{branch}")
+        except GitStoreError as exc:
+            raise GitStoreError(_scrub(str(exc), token)) from None
+        return _scrub(out, token).strip()
 
     def init_session(self, session_id: str) -> Path:
         """Create (or no-op if present) the session's git repo and return its path.

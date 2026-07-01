@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..config import load_config
+from ..config import load_config, permission_tier
 from .. import bridge
 from ..bridge import RunnerContext, run_lea, request_stop
 from .. import projects
@@ -100,8 +100,13 @@ def create_run(request: RunRequest) -> dict:
             origin_url=request.origin_url,
         )
 
+    # The run is autonomous (no gate + non-interactive prompt, D19) when the caller
+    # forces it (the Overleaf path) OR the configured approval tier is "none". A UI
+    # run with the default "stepwise" tier stays gated. Stored on the run, so the
+    # events endpoint replays the same mode.
+    autonomous = request.autonomous or (permission_tier() == "none")
     run = store.create_run(session["id"], config.model, None, config.max_turns,
-                           project_id=project_id, autonomous=request.autonomous)
+                           project_id=project_id, autonomous=autonomous)
     user_message = store.add_message(session["id"], "user", message, run["id"])
     project = store.get_project(project_id) if project_id else None
     return {

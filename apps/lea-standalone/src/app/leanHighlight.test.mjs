@@ -1,36 +1,47 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { highlightLine } from './lib/leanHighlight.mjs';
+import {
+  ensureHighlighter,
+  highlightToLines,
+  isHighlighterReady,
+} from './lib/leanHighlight.mjs';
 
-const text = (spans) => spans.map((s) => s.text).join('');
-const clsOf = (spans, word) => spans.find((s) => s.text === word)?.cls;
+// The highlighter now wraps Shiki (the real Lean 4 TextMate grammar) via the pure-JS
+// engine, so it runs in node with no WASM. These pin the contract the canvas relies
+// on: tokens are per-line, reconstruct the source exactly, and carry theme colors.
 
-test('round-trips the original line exactly', () => {
-  const line = 'theorem sqrt_two_irrational : Irrational (Real.sqrt 2) := by';
-  assert.equal(text(highlightLine(line)), line);
+test('is not ready until initialized, then loads', async () => {
+  assert.equal(isHighlighterReady(), false);
+  assert.equal(highlightToLines('theorem t : True'), null); // null before load → plain fallback
+  await ensureHighlighter();
+  assert.equal(isHighlighterReady(), true);
 });
 
-test('classifies keywords, types, numbers, comments', () => {
-  const spans = highlightLine('theorem foo : Nat := 2 -- note');
-  assert.equal(clsOf(spans, 'theorem'), 'kw');
-  assert.equal(clsOf(spans, 'Nat'), 'ty');
-  assert.equal(clsOf(spans, '2'), 'num');
-  assert.equal(spans.find((s) => s.text.startsWith('--'))?.cls, 'com');
-  assert.equal(clsOf(spans, 'foo'), ''); // lowercase identifier is plain
+test('tokens are per-line and reconstruct the source exactly', async () => {
+  await ensureHighlighter();
+  const code = 'theorem foo : Nat := 2 -- note\n/- a block\n   comment -/\n  simp [add_comm]';
+  const lines = highlightToLines(code);
+  assert.ok(Array.isArray(lines));
+  assert.equal(lines.length, code.split('\n').length);
+  const rebuilt = lines.map((toks) => toks.map((t) => t.content).join('')).join('\n');
+  assert.equal(rebuilt, code); // exact round-trip → aligns with the canvas line rows
 });
 
-test('a full-line comment is one comment span', () => {
-  const spans = highlightLine('-- formalized statement (approved)');
-  assert.equal(spans.length, 1);
-  assert.equal(spans[0].cls, 'com');
+test('assigns theme colors to tokens', async () => {
+  await ensureHighlighter();
+  const [line] = highlightToLines('theorem foo : Nat');
+  const kw = line.find((t) => t.content === 'theorem');
+  assert.ok(kw, 'the keyword token exists');
+  assert.match(kw.color || '', /^#/, 'tokens carry a hex color from the theme');
 });
 
-test('strings are highlighted as str', () => {
-  const spans = highlightLine('open "Mathlib"');
-  assert.equal(clsOf(spans, '"Mathlib"'), 'str');
-  assert.equal(clsOf(spans, 'open'), 'kw');
-});
-
-test('empty line yields no spans', () => {
-  assert.deepEqual(highlightLine(''), []);
+test('multi-line block comments are recognized (grammar is stateful)', async () => {
+  await ensureHighlighter();
+  // The inside of a /- … -/ that spans lines should color like the opener — proof
+  // the grammar carries comment state across lines (the old regex could not).
+  const lines = highlightToLines('/- open\n   still comment -/\nreal');
+  const opener = lines[0].find((t) => t.content.includes('open'));
+  const inside = lines[1].find((t) => t.content.includes('still'));
+  assert.ok(opener && inside);
+  assert.equal(opener.color, inside.color); // same (comment) color across the line break
 });

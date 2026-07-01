@@ -12,6 +12,9 @@ from .db import ROOT, connect, row_to_dict, utc_now
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+# A skill slug is the stable id AND the materialized filename stem the prover reads
+# as `## Skill: <slug>` (D45) — lower-kebab, letter/digit-initial, ≤80 chars.
+SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
 
 
 def create_session(
@@ -443,6 +446,9 @@ def delete_project_cascade(project_id: str) -> bool:
                 conn.execute(f"delete from {table} where session_id in ({marks})", session_ids)
             conn.execute(f"delete from sessions where id in ({marks})", session_ids)
         conn.execute("delete from project_files where project_id = ?", (project_id,))
+        # Drop any skill assignments pointing at this project (D47) — the skills
+        # themselves survive (they may be global or assigned elsewhere).
+        conn.execute("delete from skill_projects where project_id = ?", (project_id,))
         conn.execute("delete from projects where id = ?", (project_id,))
     return True
 
@@ -469,6 +475,239 @@ def validate_project_slug(slug: str) -> str:
     if not PROJECT_SLUG_RE.fullmatch(value):
         raise ValueError("Project slug must be 1-80 characters using letters, numbers, '_' or '-'.")
     return value
+
+
+# --- Skills (Skill Factory, v2.1.1 W1) ------------------------------------------
+# A skill is a DB row (markdown `body` in a column), not a git file (D45). The
+# scope model (D47): `is_global` → every project; else the `skill_projects` join;
+# loose (project-less) sessions resolve to none. These queries are the store half
+# of Slice 8 — CRUD + assignment + the project-resolution read; the routes (W2),
+# run-time materialization (W3), and GitHub import (W4) build on top.
+
+
+def slugify_skill(value: str) -> str:
+    """Derive a skill slug from a name: lower-kebab, alphanumeric, ≤80 chars (D45).
+    Runs of non-alphanumerics collapse to a single '-'; a leading non-letter/digit
+    is dropped (slugs must be letter/digit-initial). Empty input → 'skill'."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    text = text[:80].rstrip("-")
+    return text or "skill"
+
+
+def validate_skill_slug(slug: str) -> str:
+    value = str(slug or "").strip()
+    if not SKILL_SLUG_RE.fullmatch(value):
+        raise ValueError(
+            "Skill slug must be 1-80 characters of lowercase letters, numbers or '-', "
+            "starting with a letter or number."
+        )
+    return value
+
+
+def _unique_skill_slug(conn, base: str, exclude_id: str | None = None) -> str:
+    """A slug not already taken by another skill, appending -2, -3, … on collision.
+    `exclude_id` lets an update keep its own slug. Bounded retry so the unique
+    constraint is the real backstop, not this loop."""
+    base = validate_skill_slug(base)
+    candidate = base
+    suffix = 2
+    while True:
+        row = conn.execute(
+            "select id from skills where slug = ?", (candidate,)
+        ).fetchone()
+        if row is None or row["id"] == exclude_id:
+            return candidate
+        candidate = validate_skill_slug(f"{base[:74]}-{suffix}")
+        suffix += 1
+
+
+def _skill_row(conn, skill_id: str) -> dict | None:
+    row = conn.execute("select * from skills where id = ?", (skill_id,)).fetchone()
+    if not row:
+        return None
+    data = _normalize_skill(row_to_dict(row))
+    data["project_ids"] = [
+        r["project_id"]
+        for r in conn.execute(
+            "select project_id from skill_projects where skill_id = ? order by project_id",
+            (skill_id,),
+        ).fetchall()
+    ]
+    return data
+
+
+def create_skill(
+    name: str,
+    body: str,
+    is_global: bool = False,
+    source_url: str | None = None,
+    source_ref: str | None = None,
+    slug: str | None = None,
+) -> dict:
+    """Insert a skill row (D45). `slug` defaults to a unique slugify(name); when
+    given explicitly it is validated and uniquified. The created row carries its
+    (empty) `project_ids` so callers get the full assignment shape back."""
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Skill name is required.")
+    base_slug = validate_skill_slug(slug) if slug else slugify_skill(clean_name)
+    now = utc_now()
+    skill_id = str(uuid4())
+    with connect() as conn:
+        final_slug = _unique_skill_slug(conn, base_slug)
+        conn.execute(
+            """
+            insert into skills
+                (id, name, slug, body, is_global, source_url, source_ref, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                skill_id,
+                clean_name,
+                final_slug,
+                str(body or ""),
+                1 if is_global else 0,
+                source_url,
+                source_ref,
+                now,
+                now,
+            ),
+        )
+        return _skill_row(conn, skill_id)
+
+
+def get_skill(skill_id: str) -> dict | None:
+    with connect() as conn:
+        return _skill_row(conn, skill_id)
+
+
+def get_skill_by_slug(slug: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("select id from skills where slug = ?", (slug,)).fetchone()
+        return _skill_row(conn, row["id"]) if row else None
+
+
+def list_skills() -> list[dict]:
+    """All skills, newest first, each with its `project_ids` assignment list. The
+    factory catalog (F11) renders global/▣-projects badges from this."""
+    with connect() as conn:
+        ids = [
+            row["id"]
+            for row in conn.execute(
+                "select id from skills order by updated_at desc, name asc"
+            ).fetchall()
+        ]
+        return [_skill_row(conn, skill_id) for skill_id in ids]
+
+
+def update_skill(
+    skill_id: str,
+    name: str | None = None,
+    body: str | None = None,
+    source_url: str | None = None,
+    source_ref: str | None = None,
+) -> dict | None:
+    """Update a skill's editable fields (name/body/provenance). The slug is the
+    stable identifier (D45) and is NOT changed here. Pass a field as None to leave
+    it untouched. Returns the updated row, or None if the id is unknown."""
+    now = utc_now()
+    with connect() as conn:
+        current = conn.execute("select * from skills where id = ?", (skill_id,)).fetchone()
+        if not current:
+            return None
+        cur = row_to_dict(current)
+        new_name = cur["name"] if name is None else (str(name).strip() or cur["name"])
+        conn.execute(
+            """
+            update skills
+            set name = ?, body = ?, source_url = ?, source_ref = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                new_name,
+                cur["body"] if body is None else str(body),
+                cur["source_url"] if source_url is None else source_url,
+                cur["source_ref"] if source_ref is None else source_ref,
+                now,
+                skill_id,
+            ),
+        )
+        return _skill_row(conn, skill_id)
+
+
+def set_skill_assignment(
+    skill_id: str,
+    is_global: bool,
+    project_ids: list[str] | None = None,
+) -> dict | None:
+    """Set a skill's scope (D47): `is_global` plus the explicit per-project join.
+    Replaces the join wholesale with `project_ids` (deduped, unknown ids rejected).
+    When `is_global` is True the join is still stored but unused at resolution time
+    — kept so toggling global off restores the prior per-project set is the caller's
+    job; here global simply wins. Returns the updated row, or None if unknown."""
+    ids = list(dict.fromkeys(project_ids or []))
+    now = utc_now()
+    with connect() as conn:
+        if not conn.execute("select 1 from skills where id = ?", (skill_id,)).fetchone():
+            return None
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            known = {
+                r["id"]
+                for r in conn.execute(
+                    f"select id from projects where id in ({marks})", ids
+                ).fetchall()
+            }
+            missing = [pid for pid in ids if pid not in known]
+            if missing:
+                raise ValueError(f"Unknown project id(s): {', '.join(missing)}")
+        conn.execute("delete from skill_projects where skill_id = ?", (skill_id,))
+        for project_id in ids:
+            conn.execute(
+                "insert into skill_projects (skill_id, project_id) values (?, ?)",
+                (skill_id, project_id),
+            )
+        conn.execute(
+            "update skills set is_global = ?, updated_at = ? where id = ?",
+            (1 if is_global else 0, now, skill_id),
+        )
+        return _skill_row(conn, skill_id)
+
+
+def delete_skill(skill_id: str) -> bool:
+    """Delete a skill and cascade its `skill_projects` rows. Returns False if absent."""
+    with connect() as conn:
+        if not conn.execute("select 1 from skills where id = ?", (skill_id,)).fetchone():
+            return False
+        conn.execute("delete from skill_projects where skill_id = ?", (skill_id,))
+        conn.execute("delete from skills where id = ?", (skill_id,))
+    return True
+
+
+def skills_for_project(project_id: str) -> list[dict]:
+    """The skills that resolve for a project: global ∪ assigned (D47), newest first.
+    This is the run-time resolution read W3 materializes to `cfg.skills`. A loose
+    (project-less) session never calls this — it resolves to [] by definition."""
+    with connect() as conn:
+        ids = [
+            row["id"]
+            for row in conn.execute(
+                """
+                select id from skills
+                where is_global = 1
+                   or id in (select skill_id from skill_projects where project_id = ?)
+                order by updated_at desc, name asc
+                """,
+                (project_id,),
+            ).fetchall()
+        ]
+        return [_skill_row(conn, skill_id) for skill_id in ids]
+
+
+def _normalize_skill(row: dict) -> dict:
+    row["is_global"] = bool(row.get("is_global"))
+    return row
 
 
 def update_run(

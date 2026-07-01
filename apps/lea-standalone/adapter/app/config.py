@@ -24,7 +24,10 @@ from pathlib import Path
 
 from lea.config import LeaConfig  # the one config dataclass (re-exported below)
 
-__all__ = ["LeaConfig", "load_config", "configured_provider_keys", "ROOT", "LEGACY_KEY_ENV"]
+__all__ = [
+    "LeaConfig", "load_config", "configured_provider_keys", "ROOT", "LEGACY_KEY_ENV",
+    "permission_tier", "PERMISSION_TIERS", "DEFAULT_PERMISSION_TIER", "github_token",
+]
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -65,6 +68,40 @@ def configured_provider_keys(path: Path | None = None) -> dict[str, str]:
     config_path = path or ROOT / "config" / "lea.local.toml"
     data: dict = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
     return _provider_keys(data)
+
+
+# --- approval / permission tier (adapter-only; controls the run's gate) --------
+# The live system has one real approval axis: a per-tool gate (interactive) vs.
+# none (autonomous). `permission_tier` is the persisted default for *UI* runs:
+#   "stepwise" -> gate the mutating tools (bash/write_file/edit_file) — the default
+#   "none"     -> fully autonomous (no gate + the non-interactive prompt)
+# Overleaf runs force autonomous regardless (D19). This is an adapter concept, so
+# it lives here (a config-file getter), not on the prover's LeaConfig.
+PERMISSION_TIERS = ("stepwise", "none")
+DEFAULT_PERMISSION_TIER = "stepwise"
+
+
+def permission_tier(path: Path | None = None) -> str:
+    """The configured default approval tier for UI runs (read-only).
+
+    Falls back to the default for a missing/unknown value, so a hand-edited or
+    stale config can never select a tier the run code doesn't understand.
+    """
+    config_path = path or ROOT / "config" / "lea.local.toml"
+    data: dict = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+    tier = data.get("permission_tier", DEFAULT_PERMISSION_TIER)
+    return tier if tier in PERMISSION_TIERS else DEFAULT_PERMISSION_TIER
+
+
+def github_token(path: Path | None = None) -> str | None:
+    """The GitHub token for `git push` (D34), or None. Read-only; never exported to
+    the environment or returned to the client (Settings reports presence only). The
+    git layer injects it into the push URL for a single invocation — it is never
+    written to `.git/config`."""
+    config_path = path or ROOT / "config" / "lea.local.toml"
+    data: dict = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+    token = data.get("github_token")
+    return str(token) if token else None
 
 
 def load_config(path: Path | None = None) -> LeaConfig:

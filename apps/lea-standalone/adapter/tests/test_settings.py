@@ -238,3 +238,55 @@ def test_update_settings_rejects_provider_rejected_api_key(tmp_path, monkeypatch
         assert exc.field == "api_keys.openai"
     else:
         raise AssertionError("Expected SettingsValidationError")
+
+
+# ── GitHub token (D34) — redacted like a provider key ──────────────────────────
+
+def _gh(n):
+    return "ghp_" + ("a" * 36) if n == 1 else "ghp_" + ("b" * 36)
+
+
+def test_settings_payload_masks_github_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text(f'model = "gpt-4o"\nopenai_api_key = "sk-x"\ngithub_token = "{_gh(1)}"\n')
+
+    payload = settings_service.settings_payload(config_path)
+    assert payload["github_token"] == {"configured": True, "last4": "aaaa"}
+
+
+def test_settings_payload_github_token_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "gpt-4o"\nopenai_api_key = "sk-x"\n')
+    assert settings_service.settings_payload(config_path)["github_token"] == {"configured": False, "last4": None}
+
+
+def test_update_settings_sets_then_clears_github_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "gpt-4o"\nopenai_api_key = "sk-x"\n')
+
+    payload = settings_service.update_settings({"github_token": {"value": _gh(2)}}, config_path)
+    assert payload["github_token"]["configured"] is True
+    assert _gh(2) in config_path.read_text()  # persisted to the TOML
+
+    payload = settings_service.update_settings({"github_token": {"clear": True}}, config_path)
+    assert payload["github_token"] == {"configured": False, "last4": None}
+    assert "github_token" not in config_path.read_text()
+
+
+def test_update_settings_rejects_malformed_github_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "gpt-4o"\nopenai_api_key = "sk-x"\n')
+    try:
+        settings_service.update_settings({"github_token": {"value": "not-a-token"}}, config_path)
+    except settings_service.SettingsValidationError as exc:
+        assert exc.field == "github_token"
+    else:
+        raise AssertionError("Expected SettingsValidationError")

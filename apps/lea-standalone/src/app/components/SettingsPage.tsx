@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Check, Eye, EyeOff, KeyRound, RotateCcw, Save, Settings, X } from 'lucide-react';
+import { Check, Eye, EyeOff, KeyRound, Plus, RotateCcw, Save, Settings, X } from 'lucide-react';
 import {
   AppSettings,
   ApiKeyStatus,
@@ -14,26 +14,10 @@ import {
 } from '../lib/api';
 import { ModelCombobox } from './ModelCombobox';
 import { RadioGroup, RadioGroupItem } from './ui/radio-group';
-import { Slider } from './ui/slider';
 import { Progress } from './ui/progress';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Separator } from './ui/separator';
-
-const PERMISSION_DETAILS: Record<PermissionTier, { title: string; description: string }> = {
-  none: {
-    title: 'Fully autonomous',
-    description: 'The agent can run without approval prompts.',
-  },
-  theorem_translation: {
-    title: 'Approve theorem formalization',
-    description: 'Ask before committing the top-level Lean theorem statement.',
-  },
-  stepwise: {
-    title: 'Approve each agent step',
-    description: 'Ask before each agent action during formalization.',
-  },
-};
 
 // Client-side format hints for the first-class providers; other providers are
 // validated by the backend / provider at runtime.
@@ -57,13 +41,18 @@ interface KeyField {
 export function SettingsPage({ onBack }: { onBack: () => void }) {
   const [settings, setSettings] = useState<AppSettings>();
   const [model, setModel] = useState('');
-  const [permissionTier, setPermissionTier] = useState<PermissionTier>('theorem_translation');
-  const [theoremTranslationRetries, setTheoremTranslationRetries] = useState(3);
-  const [maxTurns, setMaxTurns] = useState(20);
+  const [permissionTier, setPermissionTier] = useState<PermissionTier>('stepwise');
   const [maxSpend, setMaxSpend] = useState('');
   const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
   const [clearedKeys, setClearedKeys] = useState<Record<string, boolean>>({});
   const [visibleKeys, setVisibleKeys] = useState<Record<string, boolean>>({});
+  // User-added providers beyond the first-class three (e.g. OPENROUTER_API_KEY):
+  // editable {name, value} rows, saved as any `*_API_KEY` the backend accepts.
+  const [customKeys, setCustomKeys] = useState<{ env: string; value: string }[]>([]);
+  // GitHub token (D34) — redacted like a provider key; used by project "Push to GitHub".
+  const [githubToken, setGithubToken] = useState('');
+  const [githubVisible, setGithubVisible] = useState(false);
+  const [clearGithub, setClearGithub] = useState(false);
   const [catalog, setCatalog] = useState<ModelCatalogEntry[]>([]);
   const [requirements, setRequirements] = useState<ModelRequirements>();
   const [isLoading, setIsLoading] = useState(true);
@@ -78,13 +67,14 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
     try {
       const loaded = await getSettings();
       setSettings(loaded);
-      setModel(loaded.model);
-      setPermissionTier(loaded.permission_tier);
-      setTheoremTranslationRetries(loaded.theorem_translation_max_retries);
-      setMaxTurns(loaded.max_turns ?? 20);
+      setModel(loaded.model ?? '');
+      setPermissionTier(loaded.permission_tier ?? 'stepwise');
       setMaxSpend(loaded.max_spend_usd == null ? '' : String(loaded.max_spend_usd));
       setApiKeys({});
       setClearedKeys({});
+      setCustomKeys([]);
+      setGithubToken('');
+      setClearGithub(false);
       setFieldErrors({});
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to load settings.');
@@ -166,6 +156,21 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
     setFieldErrors({});
     setSaved(false);
     const localErrors = validateBeforeSave(keyFields, apiKeys, keyMissing, requiredKeys[0], model);
+    // Validate the user-added providers: an env name like OPENROUTER_API_KEY + a
+    // value. Empty rows are ignored; the cleaned list is what we send.
+    const customClean: { env: string; value: string }[] = [];
+    customKeys.forEach((row, i) => {
+      const env = row.env.trim().toUpperCase();
+      const value = row.value.trim();
+      if (!env && !value) return;
+      if (!/^[A-Z][A-Z0-9_]*_API_KEY$/.test(env)) {
+        localErrors[`custom.${i}`] = 'Key name must look like OPENROUTER_API_KEY.';
+      } else if (!value) {
+        localErrors[`custom.${i}`] = 'Enter a value for this provider key.';
+      } else {
+        customClean.push({ env, value });
+      }
+    });
     if (Object.keys(localErrors).length > 0) {
       setFieldErrors(localErrors);
       setError(Object.values(localErrors)[0]);
@@ -182,23 +187,31 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
           apiKeyUpdates[field.env] = { clear: true };
         }
       }
+      for (const { env, value } of customClean) {
+        apiKeyUpdates[env] = { value };
+      }
+      const githubUpdate = githubToken.trim()
+        ? { value: githubToken.trim() }
+        : clearGithub
+        ? { clear: true }
+        : undefined;
       const update: SettingsUpdate = {
         model,
         permission_tier: permissionTier,
-        theorem_translation_max_retries: theoremTranslationRetries,
-        max_turns: maxTurns,
         max_spend_usd: maxSpend.trim() ? Number(maxSpend) : null,
         api_keys: Object.keys(apiKeyUpdates).length ? apiKeyUpdates : undefined,
+        github_token: githubUpdate,
       };
       const savedSettings = await saveSettings(update);
       setSettings(savedSettings);
-      setModel(savedSettings.model);
-      setPermissionTier(savedSettings.permission_tier);
-      setTheoremTranslationRetries(savedSettings.theorem_translation_max_retries);
-      setMaxTurns(savedSettings.max_turns ?? 20);
+      setModel(savedSettings.model ?? '');
+      setPermissionTier(savedSettings.permission_tier ?? 'stepwise');
       setMaxSpend(savedSettings.max_spend_usd == null ? '' : String(savedSettings.max_spend_usd));
       setApiKeys({});
       setClearedKeys({});
+      setCustomKeys([]);
+      setGithubToken('');
+      setClearGithub(false);
       setFieldErrors({});
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1800);
@@ -215,7 +228,7 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
   };
 
   return (
-    <div className="min-h-full bg-background">
+    <div className="lea-app settings-scope min-h-full bg-background text-foreground">
       <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 px-5 py-8">
         <div className="flex items-start justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
@@ -340,6 +353,125 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
                     </div>
                   );
                 })}
+
+                {customKeys.map((row, i) => (
+                  <div key={`custom-${i}`} className="space-y-2 rounded-md border border-dashed border-border p-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <Label className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                        Custom provider
+                      </Label>
+                      <button
+                        type="button"
+                        onClick={() => setCustomKeys((cur) => cur.filter((_, j) => j !== i))}
+                        className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                        aria-label="Remove this provider"
+                        title="Remove this provider"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                    <div className="flex gap-2">
+                      <Input
+                        value={row.env}
+                        placeholder="OPENROUTER_API_KEY"
+                        onChange={(event) =>
+                          setCustomKeys((cur) =>
+                            cur.map((c, j) => (j === i ? { ...c, env: event.target.value.toUpperCase() } : c)),
+                          )
+                        }
+                        aria-label="Provider key name"
+                        className="w-1/2 font-mono"
+                      />
+                      <Input
+                        type="password"
+                        value={row.value}
+                        placeholder="Enter API key"
+                        onChange={(event) =>
+                          setCustomKeys((cur) => cur.map((c, j) => (j === i ? { ...c, value: event.target.value } : c)))
+                        }
+                        aria-label="Provider key value"
+                        className="flex-1 font-mono"
+                      />
+                    </div>
+                    {fieldErrors[`custom.${i}`] && (
+                      <p className="text-xs text-destructive">{fieldErrors[`custom.${i}`]}</p>
+                    )}
+                  </div>
+                ))}
+
+                <button
+                  type="button"
+                  onClick={() => setCustomKeys((cur) => [...cur, { env: '', value: '' }])}
+                  className="flex items-center gap-2 rounded-md border border-dashed border-border px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <Plus className="h-4 w-4" /> Add another provider
+                </button>
+              </div>
+            </Section>
+
+            <Separator />
+
+            <Section
+              title="GitHub"
+              description="A token to push a project to GitHub (from a project's Filesystem tab). Needs repo scope."
+            >
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="github-token">Personal access token</Label>
+                  {settings?.github_token?.configured && !clearGithub && (
+                    <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                      <KeyRound className="h-3.5 w-3.5" />
+                      Saved{settings.github_token.last4 ? ` ...${settings.github_token.last4}` : ''}
+                    </span>
+                  )}
+                </div>
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <Input
+                      id="github-token"
+                      type={githubVisible ? 'text' : 'password'}
+                      value={githubToken}
+                      placeholder={
+                        settings?.github_token?.configured && !clearGithub
+                          ? 'Enter a new token to replace the saved one'
+                          : 'ghp_… or github_pat_…'
+                      }
+                      onChange={(event) => setGithubToken(event.target.value)}
+                      className="pr-10 font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setGithubVisible((v) => !v)}
+                      className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                      aria-label="Toggle GitHub token visibility"
+                      title="Toggle GitHub token visibility"
+                    >
+                      {githubVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                  {settings?.github_token?.configured && (
+                    <button
+                      type="button"
+                      onClick={() => setClearGithub((c) => !c)}
+                      className={[
+                        'flex h-9 w-9 items-center justify-center rounded-md border transition-colors',
+                        clearGithub
+                          ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                          : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
+                      ].join(' ')}
+                      aria-label={clearGithub ? 'Keep GitHub token' : 'Clear GitHub token'}
+                      title={clearGithub ? 'Keep GitHub token' : 'Clear GitHub token'}
+                    >
+                      {clearGithub ? <RotateCcw className="h-4 w-4" /> : <X className="h-4 w-4" />}
+                    </button>
+                  )}
+                </div>
+                {fieldErrors['github_token'] && (
+                  <p className="text-xs text-destructive">{fieldErrors['github_token']}</p>
+                )}
+                {clearGithub && (
+                  <p className="text-xs text-destructive">This saved token will be removed on save.</p>
+                )}
               </div>
             </Section>
 
@@ -351,68 +483,22 @@ export function SettingsPage({ onBack }: { onBack: () => void }) {
                 onValueChange={(value) => setPermissionTier(value as PermissionTier)}
                 className="gap-2"
               >
-                {(settings?.permission_tiers || []).map((tier) => {
-                  const detail = PERMISSION_DETAILS[tier.value];
-                  return (
-                    <Label
-                      key={tier.value}
-                      className={[
-                        'flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors',
-                        permissionTier === tier.value ? 'border-primary bg-accent' : 'border-border hover:bg-accent/70',
-                      ].join(' ')}
-                    >
-                      <RadioGroupItem value={tier.value} className="mt-0.5" />
-                      <span className="min-w-0">
-                        <span className="block text-sm font-medium text-foreground">{detail.title}</span>
-                        <span className="mt-1 block text-sm font-normal text-muted-foreground">{detail.description}</span>
-                      </span>
-                    </Label>
-                  );
-                })}
+                {(settings?.permission_tiers || []).map((tier) => (
+                  <Label
+                    key={tier.value}
+                    className={[
+                      'flex cursor-pointer items-start gap-3 rounded-md border p-3 transition-colors',
+                      permissionTier === tier.value ? 'border-primary bg-accent' : 'border-border hover:bg-accent/70',
+                    ].join(' ')}
+                  >
+                    <RadioGroupItem value={tier.value} className="mt-0.5" />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-foreground">{tier.label}</span>
+                      <span className="mt-1 block text-sm font-normal text-muted-foreground">{tier.description}</span>
+                    </span>
+                  </Label>
+                ))}
               </RadioGroup>
-            </Section>
-
-            <Separator />
-
-            <Section
-              title="Theorem Translation Retries"
-              description="Internal attempts to produce a checked Lean theorem statement."
-            >
-              <Input
-                type="number"
-                min={1}
-                step={1}
-                value={theoremTranslationRetries}
-                disabled={permissionTier !== 'theorem_translation'}
-                onChange={(event) => setTheoremTranslationRetries(toPositiveInteger(event.target.value))}
-                aria-label="Theorem translation retry attempts"
-                className="w-32 disabled:cursor-not-allowed disabled:opacity-50"
-              />
-            </Section>
-
-            <Separator />
-
-            <Section title="Max Turns" description="Maximum turns the agent may take on a proof attempt.">
-              <div className="flex items-center gap-4">
-                <Slider
-                  min={1}
-                  max={100}
-                  step={1}
-                  value={[maxTurns]}
-                  onValueChange={([value]) => setMaxTurns(value)}
-                  className="flex-1"
-                />
-                <Input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={maxTurns}
-                  onChange={(event) =>
-                    setMaxTurns(Math.min(100, Math.max(1, Number(event.target.value) || 1)))
-                  }
-                  className="w-24"
-                />
-              </div>
             </Section>
 
             <Separator />
@@ -493,11 +579,6 @@ function Section({
       <div className="min-w-0">{children}</div>
     </section>
   );
-}
-
-function toPositiveInteger(value: string): number {
-  const parsed = Math.trunc(Number(value));
-  return Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
 }
 
 function validateBeforeSave(
