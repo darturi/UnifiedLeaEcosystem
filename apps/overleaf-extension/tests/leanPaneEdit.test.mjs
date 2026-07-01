@@ -3,11 +3,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { handleLeanPaneEditSave, handleLeanPaneEditStart } from "../companion/server.mjs";
+import { handleLeanPaneEditSave, handleLeanPaneEditStart, handleLeanPaneManifest } from "../companion/server.mjs";
 
 async function makeLeaRepo() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lea-edit-repo-"));
   await fs.mkdir(path.join(dir, "workspace", "proofs"), { recursive: true });
+  // handleLeanPaneManifest validates the repo (validateLeaRepo) before
+  // enrichment; without these it degrades every item to status "unknown"
+  // rather than actually computing a status, which would mask this file's
+  // manifest-level regression test rather than exercise it.
+  await fs.writeFile(path.join(dir, "pyproject.toml"), "[project]\nname = \"lea-prover\"\n", "utf8");
+  await fs.writeFile(path.join(dir, "workspace", "lean-toolchain"), "leanprover/lean4:stable\n", "utf8");
+  await fs.writeFile(path.join(dir, "workspace", "lakefile.lean"), "import Lake\nopen Lake DSL\n", "utf8");
   return dir;
 }
 
@@ -21,6 +28,7 @@ function makeState({ leaRepo, jobs = {}, fetchImpl }) {
   return {
     settings: { leaRepoPath: leaRepo, leaApiBaseUrl: "http://127.0.0.1:8001" },
     jobs,
+    jobsPath: path.join(leaRepo, "jobs.json"),
     env: {},
     fetchImpl
   };
@@ -223,6 +231,13 @@ test("edit save: a signature edit cascades and reports a broken dependent, attri
   assert.ok(cascadeCall);
   assert.equal(cascadeCall.body.author, "cascade");
   assert.equal(cascadeCall.body.path, "compactness_corollary.lean");
+
+  // both the edited item's own job and the broken dependent's job carry the
+  // fresh verdict, so getTheoremStatus's override picks it up for both on the
+  // next manifest refresh (not just the edited item)
+  assert.equal(state.jobs.a.lastEditCheckStatus, "ok");
+  assert.equal(state.jobs.b.lastEditCheckStatus, "error");
+  assert.match(state.jobs.b.lastEditCheckDetail, /unknown identifier/);
 });
 
 test("edit save: a def body edit cascades even with an unchanged signature", async () => {
@@ -347,4 +362,70 @@ test("edit save: a dependent with its own active run is skipped, not raced", asy
   assert.equal(res.body.dependentsImpact.length, 1);
   assert.equal(res.body.dependentsImpact[0].busy, true);
   assert.ok(!calls.some((c) => c.url.endsWith("/sess-b/lean-check")));
+});
+
+// Regression test for the bug report: editing a proof to be broken must flip
+// the pane's own status chip to invalid, not just surface a small-print note
+// alongside a chip that still says valid. Exercises the real path a user
+// hits: handleLeanPaneManifest (which computes the chip's status) before and
+// after handleLeanPaneEditSave.
+test("edit save flips the item's own status chip to invalid on the next manifest refresh (not just a side note)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob() }, // status: "formalized" -- what the pane read as "valid" before the bugfix
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "error", detail: "unknown identifier: foo" }
+      }
+    })
+  });
+
+  const tex = [
+    "\\begin{theorem}\\label{thm:x}",
+    "% lea: formalize label=compactness_criterion",
+    "Every open cover has a finite subcover.",
+    "\\end{theorem}"
+  ].join("\n");
+  const files = [{ path: "main.tex", content: tex }];
+
+  const before = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(before.body.items[0].status, "valid");
+
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  exact foo\n"
+    },
+    state
+  );
+  assert.equal(save.statusCode, 200);
+  assert.equal(save.body.ownResult.checkStatus, "error");
+
+  const after = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(after.body.items[0].status, "invalid");
+  assert.match(after.body.items[0].message, /unknown identifier: foo/);
+
+  // and the override clears itself once a later edit compiles again
+  state.fetchImpl = makeEditFetch(calls, {
+    sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+    writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-3" }, note: null } },
+    checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } }
+  });
+  await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  trivial\n"
+    },
+    state
+  );
+  const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(fixed.body.items[0].status, "valid");
 });

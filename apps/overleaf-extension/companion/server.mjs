@@ -949,6 +949,12 @@ export async function handleLeanPaneEditSave(payload, state) {
     return errorResponse(check.status || 502, "edit_check_failed", check.error || "Could not check the edit.");
   }
   const ownCheckFailed = String(check.body?.status || "").toLowerCase() !== "ok";
+  // Record the real compiler verdict on the linked job so getTheoremStatus's
+  // status override (see its doc comment) picks it up on the next manifest
+  // refresh -- otherwise the pane's chip keeps reading the target as
+  // "formalized" from stale on-disk evidence. See
+  // docs/FEATURE-overleaf-lean-pane-manual-edit.md.
+  let jobsChanged = recordEditCheckVerdict(linkedJob, check.body);
 
   const beforeHeader = parseDeclarationHeader(before.content, targetLabel);
   const afterHeader = parseDeclarationHeader(content, targetLabel);
@@ -1004,6 +1010,10 @@ export async function handleLeanPaneEditSave(payload, state) {
         continue;
       }
       const broken = String(cascadeCheck.body?.status || "").toLowerCase() !== "ok";
+      // Same override as the edited item itself: a cascade re-check is just
+      // as authoritative as an own check, so the dependent's chip must
+      // reflect it too, not only the impact-list note.
+      jobsChanged = recordEditCheckVerdict(dependentSession.linkedJob, cascadeCheck.body) || jobsChanged;
       dependentsImpact.push({
         ...summary,
         status: broken ? "invalid" : "reverified",
@@ -1017,7 +1027,24 @@ export async function handleLeanPaneEditSave(payload, state) {
     }
   }
 
+  if (jobsChanged) {
+    await writeJson(state.jobsPath, state.jobs);
+  }
+
   return { statusCode: 200, body: { ok: true, unchanged: false, ownResult, dependentsImpact } };
+}
+
+// Persist the real lean_check verdict from an edit or a cascade re-check onto
+// its target's linked job -- see getTheoremStatus's status-override doc
+// comment. `status`/`detail` are the adapter's raw lean-check response shape
+// (`{status, detail}`, D6). Returns whether a mutation actually happened, so
+// callers can persist state.jobs only once, after all mutations.
+function recordEditCheckVerdict(job, { status, detail } = {}) {
+  if (!job) return false;
+  job.lastEditCheckStatus = String(status || "").toLowerCase() === "ok" ? "ok" : "error";
+  job.lastEditCheckDetail = detail || null;
+  job.lastEditedAt = new Date().toISOString();
+  return true;
 }
 
 // Start (and background-drive) a chat run, resolving as soon as the adapter
@@ -3219,6 +3246,29 @@ async function getTheoremStatus({
   jobs = {}
 }) {
   const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
+  const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
+  const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
+  const activeJob = findActiveJob(jobs, target.jobKey);
+
+  // A manual edit (or a cascade re-check triggered by editing something this
+  // target imports) may have broken a target that would otherwise still read
+  // as "formalized" below -- mappedStatus/directProofStatus only re-derive
+  // "formalized" from a `sorry`/`admit` regex over the CURRENT file content,
+  // not a real compile. lastEditCheckStatus carries the actual `lean_check`
+  // verdict recorded by handleLeanPaneEditSave (docs/FEATURE-overleaf-lean-pane-manual-edit.md).
+  // Checked first, ahead of every other status source, so a fresh compiler
+  // result always wins over a stale regex re-derivation of an old job's
+  // outcome -- and cleared (lastEditCheckStatus "ok") once an edit compiles
+  // again, so the normal chain resumes deciding status as before.
+  //
+  // Scope note: this only covers getTheoremStatus (the pane's per-item status
+  // source). getCurrentTheoremProofStatus, used by `uses=` dependency
+  // resolution at formalize time, does not yet honor this override -- left
+  // as-is for this fix, which is scoped to the pane status chip.
+  if (!activeJob && linkedJob?.lastEditCheckStatus === "error") {
+    return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
+  }
+
   const { projectStatus, directProofStatus, mappedStatus } = await getCurrentTheoremProofStatuses({
     leaRepoPath,
     target,
@@ -3228,10 +3278,7 @@ async function getTheoremStatus({
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
   const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
   const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
-  const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
-  const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
 
-  const activeJob = findActiveJob(jobs, target.jobKey);
   if (activeJob) {
     if (
       mappedStatus?.status === "formalized" ||
@@ -3363,6 +3410,23 @@ async function getCurrentTheoremProofStatus({
     projectId: target.projectId,
     projectSlug: target.projectSlug,
     projectMarkdownPath: target.projectMarkdownPath
+  };
+}
+
+// The status shape for a target whose latest recorded lean_check verdict
+// (from a manual edit or a cascade re-check, see the lastEditCheckStatus
+// comment in getTheoremStatus) came back non-"ok". Deliberately built the
+// same way buildFailedTheoremStatus is: status "failed" so mapLeanPaneStatus
+// maps it to the pane's existing "invalid" chip with zero new rendering
+// logic, and `message` carries the real compiler diagnostic where the pane
+// already shows a failed item's reason.
+function buildEditBrokenTheoremStatus({ linkedJob, target }) {
+  const base = buildJobResponse({ job: linkedJob, status: "failed", target });
+  return {
+    ...base,
+    effectiveStatus: "unformalized",
+    message: linkedJob.lastEditCheckDetail || "This item no longer compiles after a manual edit.",
+    brokenByEdit: true
   };
 }
 

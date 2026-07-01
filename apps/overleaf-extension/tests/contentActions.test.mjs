@@ -707,7 +707,11 @@ test("Lean pane edit 'Save' posts the edited content and renders the cascade imp
   // edit view closes and the pane re-fetches the manifest (the plan's stated
   // approach: reuse the normal refresh path rather than a bespoke per-item patch)
   assert.equal(harness.editTextarea(), null);
-  assert.match(harness.bodyText(), /Own check: ok \(signature\)\./);
+  // the edited item's OWN outcome is not repeated here -- it now drives that
+  // item's status chip directly (a separate, adapter-level fix); this note
+  // is scoped to what only cross-item impact can tell you
+  assert.doesNotMatch(harness.bodyText(), /Own check:/);
+  assert.match(harness.bodyText(), /1 downstream item affected: 1 broken\./);
   assert.match(harness.bodyText(), /corollary_a: broken by this edit\./);
 });
 

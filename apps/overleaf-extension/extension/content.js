@@ -574,7 +574,8 @@
     }
 
     if (!editing && leanPaneEditLastResult && leanPaneEditLastResult.itemId === item.id) {
-      detail.appendChild(renderLeanPaneEditImpactSummary(leanPaneEditLastResult));
+      const summary = renderLeanPaneEditImpactSummary(leanPaneEditLastResult);
+      if (summary) detail.appendChild(summary);
     }
     return detail;
   }
@@ -724,24 +725,39 @@
 
   // Post-save summary shown under an item right after a successful save (until
   // the item is re-expanded/re-edited or the pane state key changes).
+  // The edited item's OWN outcome is deliberately not repeated here: it now
+  // drives the item's status chip and `message` directly (getTheoremStatus's
+  // lastEditCheckStatus override, docs/FEATURE-overleaf-lean-pane-manual-edit.md),
+  // the same place any other failed item's reason already shows. Repeating it
+  // here in small print was the original, confusing version of this note --
+  // this summary is now scoped to what the chip *can't* show on its own: a
+  // one-time confirmation of what a save actually did across OTHER items.
+  // Returns null when there's nothing worth a separate note for.
   function renderLeanPaneEditImpactSummary(result) {
-    const container = document.createElement("div");
-    container.className = "ol-lean-project-impact-note";
     if (result.unchanged) {
+      const container = document.createElement("div");
+      container.className = "ol-lean-project-impact-note";
       container.textContent = "No changes to save.";
       return container;
     }
-    const lines = [];
-    if (result.ownResult?.checkStatus) {
-      const kind = result.ownResult.classification?.kind;
-      lines.push(`Own check: ${result.ownResult.checkStatus}${kind ? ` (${kind})` : ""}.`);
-    }
-    for (const dependent of result.dependentsImpact || []) {
-      lines.push(leanPaneView.formatDependentOutcome(dependent));
-    }
-    for (const line of lines) {
+    const dependents = result.dependentsImpact || [];
+    if (dependents.length === 0) return null;
+
+    const container = document.createElement("div");
+    container.className = "ol-lean-project-impact-note";
+    const heading = document.createElement("p");
+    const brokenCount = dependents.filter((d) => d.brokenByUpstream).length;
+    const busyCount = dependents.filter((d) => d.busy).length;
+    const okCount = dependents.length - brokenCount - busyCount;
+    const parts = [];
+    if (brokenCount > 0) parts.push(`${brokenCount} broken`);
+    if (busyCount > 0) parts.push(`${busyCount} not yet re-checked`);
+    if (okCount > 0) parts.push(`${okCount} still valid`);
+    heading.textContent = `${dependents.length} downstream item${dependents.length === 1 ? "" : "s"} affected: ${parts.join(", ")}.`;
+    container.appendChild(heading);
+    for (const dependent of dependents) {
       const p = document.createElement("p");
-      p.textContent = line;
+      p.textContent = leanPaneView.formatDependentOutcome(dependent);
       container.appendChild(p);
     }
     return container;
