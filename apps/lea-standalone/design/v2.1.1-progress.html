@@ -226,10 +226,10 @@
         <span class="tag fe">frontend</span><span class="dec">SafeVerify</span><span class="badge b-unplanned">Unplanned</span></div>
       <div class="scope">Kevin's ask #2: Lea's scratch files land as the most-recent Canvas entry; there's no way to put the <b>main</b> file back in the Canvas, and SafeVerify only runs on the latest-turn file. <b>Note:</b> the backend <code>/api/sessions/{id}/verify</code> already accepts a <code>path</code> — so this is mostly a <b>canvas/UI</b> fix (pick which file is "main" + run verify on it). <b>Plan first:</b> canvas file-selector UX + wiring the path through.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id issue">#11</span><span class="title">Proper Lean syntax highlighter in the Canvas</span>
-        <span class="tag fe">frontend</span><span class="dec">highlighter</span><span class="badge b-unplanned">Unplanned</span></div>
-      <div class="scope">"Lean syntax highlighter needs a little attention." No tracker/design item today. <b>Plan first:</b> assess the current Canvas highlighting, pick an approach (a Lean TextMate/Monaco grammar, a Lean-aware tokenizer, or a lightweight regex pass), and scope it to the Canvas component.</div>
+        <span class="tag fe">frontend</span><span class="dec">highlighter</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>✓ DONE</b> (commit <code>cd0446e</code>). Replaced the hand-rolled regex tokenizer with <b>Shiki</b>, which ships the real Lean 4 TextMate grammar — multi-line <code>/- -/</code> block comments, tactics, attributes, unicode, char/hex literals all highlight correctly. Kept the per-line diff gutter by using Shiki's <code>codeToTokens</code> (not <code>codeToHtml</code>), mapped by new-file line number; colors inline from the <code>vitesse-light</code> theme (fits the cream <code>--code-bg</code>). Fine-grained Shiki (core + <b>pure-JS engine, no WASM</b>) <b>dynamically imported</b> so it code-splits and lazy-loads only when the canvas first shows Lean (~26 kB gzip of chunks; ~56 kB gzip trimmed off the main bundle). 4 rewritten tests; tsc clean; production build green.</div>
     </div>
     <div class="todo is-done">
       <div class="top"><span class="id issue">#14</span><span class="title">Download files for a single session + Projects discoverability hint</span>
