@@ -231,10 +231,10 @@
         <span class="tag fe">frontend</span><span class="dec">highlighter</span><span class="badge b-unplanned">Unplanned</span></div>
       <div class="scope">"Lean syntax highlighter needs a little attention." No tracker/design item today. <b>Plan first:</b> assess the current Canvas highlighting, pick an approach (a Lean TextMate/Monaco grammar, a Lean-aware tokenizer, or a lightweight regex pass), and scope it to the Canvas component.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-done">
       <div class="top"><span class="id issue">#14</span><span class="title">Download files for a single session + Projects discoverability hint</span>
-        <span class="tag be">backend</span><span class="dec">download</span><span class="badge b-unplanned">Unplanned</span></div>
-      <div class="scope">Two parts: (1) a <b>single-session</b> file download (project-level export exists — <code>filesystem.export_zip</code> / U2 — but a loose session has none); (2) make it explicit in Projects that the <b>Download</b> option lives under the <b>Filesystem</b> tab. <b>Plan first:</b> session-scoped export endpoint (reuse the zip plumbing) + button placement + the Projects hint.</div>
+        <span class="tag be">backend</span><span class="tag fe">frontend</span><span class="dec">download</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>✓ DONE</b> (commit <code>248ac4b</code>). (1) <code>GET /api/sessions/{id}/export</code> resolves the session's repo (loose → <code>proofs/&lt;id&gt;</code>) and reuses the project zip plumbing (<code>export_zip</code>; <code>.git</code>/<code>.lake</code> excluded), served as an attachment named from the session title (slug, or <code>session-&lt;id8&gt;</code> fallback); 404 when unknown or fileless. A <b>Download</b> button in the session (ChatThread) header — loose sessions with ≥1 file only. (2) Projects Overview gained a one-click hint that jumps to the <b>Filesystem</b> tab where the project Export lives. 3 route tests; adapter suite <b>254 passed</b>, tsc clean. Verified live: real session → 200 zip; bogus → 404.</div>
     </div>
     <div class="todo is-done">
       <div class="top"><span class="id">6b/U3</span><span class="title">GitHub sharing — remote + push + github_token in Settings</span>
