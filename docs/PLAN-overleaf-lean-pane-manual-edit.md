@@ -5,6 +5,46 @@ direct-edit affordance on an expanded Lean pane item, plus cross-target
 downstream-impact detection driven by real `lean_check` re-verification rather
 than heuristics.
 
+## Status (updated 2026-06-30)
+
+**Phases 0-4 implemented, with one verification gap.** All companion/extension
+work (Phases 0, 2, 3, 4) is covered by tests and the full `overleaf-extension`
+suite is green (241 tests, up from a 202 baseline). Phase 1's adapter change
+is written and mirrors the existing `lean_check_session` test conventions
+exactly, but **could not be executed** in the implementation environment: the
+adapter's `.venv` was built on the host machine (macOS/Homebrew paths) and
+isn't usable in this sandbox, and rebuilding a Python 3.13 venv here failed
+(no network access to fetch a standalone interpreter). The Python changes
+passed `py_compile` (syntax-valid) and were written to exactly match
+`test_lean_check_backfills_verdict_onto_the_step`'s existing shape, but the
+new `test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfilling`
+/ `test_lean_check_without_author_still_backfills_as_before` /
+`test_author_cascade_round_trips_with_no_check_constraint` tests should be run
+for real (`cd apps/lea-standalone/adapter && ./.venv/bin/python -m pytest`)
+before this ships.
+
+Deviations from the plan below, discovered during implementation:
+- Phase 2's "how does a cascade re-check get its own code_step" question
+  (flagged as an open risk) was resolved as option (a): `PathRequest` gained
+  optional `author`/`summary` fields; when `author` is set, `lean_check_session`
+  inserts a new `code_step` (reusing the existing commit_sha) instead of
+  back-filling the latest one. Omitting `author` is byte-identical to the
+  original behavior.
+- Phase 3's module ended up self-contained (`leanSignatureDiff.mjs`) rather
+  than merged into `leanDependencyGraph.mjs` — the header-parsing logic was
+  substantial enough to warrant its own file, as the plan allowed.
+- The balanced-brace header scanner (Phase 3's "Open risks" item) was
+  hand-written in `leanSignatureDiff.mjs` rather than importing
+  `targetParserCore.mjs`'s `parseBalancedSuffix` across the extension/companion
+  boundary — resolving that open question in favor of porting a small helper,
+  as the plan's second option allowed.
+- `handleLeanPaneEditSave`'s dependent-session resolution
+  (`resolveDependentSession`) tries both `theorem` and `definition` kinds per
+  dependent, mirroring the existing `resolveTargetUseStatus` pattern — not
+  spelled out explicitly in the plan's Phase 2 sketch but a direct consequence
+  of Section 1's grounding (a dependent's kind isn't known from the reverse
+  index alone).
+
 ## 1. Grounding — what's there today, confirmed by reading the code
 
 This plan leans on five facts established while writing the feature spec.

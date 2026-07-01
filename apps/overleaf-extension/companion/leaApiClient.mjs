@@ -219,6 +219,41 @@ export function fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId })
   });
 }
 
+// D9: write a manual edit to a session's working file as a first-class,
+// run-less step (POST /api/sessions/{id}/file). The adapter commits it
+// `author=user`, records a code_step, and returns `{unchanged:true}` for a
+// no-op save. Used by the Overleaf lean pane's manual-edit surface
+// (docs/FEATURE-overleaf-lean-pane-manual-edit.md) -- the same primitive the
+// standalone canvas already uses, just called from a second client.
+export function writeApiSessionFile({ fetchImpl, baseUrl, apiKey, sessionId, path, content, note }) {
+  const body = { path, content };
+  if (note) body.note = note;
+  return fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/file`, {
+    method: "POST",
+    headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+}
+
+// Standalone LSP-backed `lean_check` on a session's working file (D2), no
+// run required. Without `author`, back-fills the verdict onto the file's
+// existing latest code_step (the original behavior, used for the edited
+// file's own check). With `author` (e.g. `"cascade"`), the adapter instead
+// records a *new* code_step attributed to that author -- used for
+// re-verifying a project dependent that the edit itself didn't touch. See
+// docs/PLAN-overleaf-lean-pane-manual-edit.md Phase 1/2.
+export function runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId, path, author, summary }) {
+  const body = {};
+  if (path) body.path = path;
+  if (author) body.author = author;
+  if (summary) body.summary = summary;
+  return fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/lean-check`, {
+    method: "POST",
+    headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+}
+
 function deriveTurnProgress(payload, defaultMaxTurns) {
   if (!payload || typeof payload !== "object") return null;
   const turn = Number(payload.turn);

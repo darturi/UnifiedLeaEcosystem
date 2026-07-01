@@ -63,6 +63,15 @@
   let leanPaneChatOptimistic = [];
   let leanPaneChatPollTimer = null;
   let leanPaneChatToken = 0;
+  // Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md): at most one
+  // item's edit view is open at a time, tracked by item id the same way
+  // leanPaneExpandedItemIds tracks expansion -- module state survives the
+  // pane's full replaceChildren re-render.
+  let leanPaneEditingItemId = "";
+  let leanPaneEditDraft = "";
+  let leanPaneEditPreSaveDependents = [];
+  let leanPaneEditError = "";
+  let leanPaneEditLastResult = null;
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -528,6 +537,8 @@
     ].filter(Boolean).join(" · ");
     detail.appendChild(meta);
 
+    const editing = leanPaneEditingItemId === item.id;
+
     const actions = document.createElement("div");
     actions.className = "ol-lean-project-detail-actions";
     actions.appendChild(renderGoToSourceButton(item));
@@ -537,6 +548,9 @@
     if (leanPaneView.canFormalizePaneItem(item)) {
       actions.appendChild(renderFormalizeButton(item));
     }
+    if (!editing && leanPaneView.canEditPaneItem(item)) {
+      actions.appendChild(renderEditButton(item));
+    }
     if (item.leanStub) {
       actions.appendChild(renderCopyButton("Copy stub", item.leanStub));
     }
@@ -545,7 +559,9 @@
     }
     if (actions.children.length > 0) detail.appendChild(actions);
 
-    if (item.leanArtifactContent) {
+    if (editing) {
+      detail.appendChild(renderLeanPaneEditControls(item));
+    } else if (item.leanArtifactContent) {
       const artifact = document.createElement("pre");
       artifact.className = "ol-lean-project-artifact";
       renderLeanPaneCode(artifact, item.leanArtifactContent);
@@ -556,7 +572,179 @@
       empty.textContent = "No generated Lean artifact is available for this item.";
       detail.appendChild(empty);
     }
+
+    if (!editing && leanPaneEditLastResult && leanPaneEditLastResult.itemId === item.id) {
+      detail.appendChild(renderLeanPaneEditImpactSummary(leanPaneEditLastResult));
+    }
     return detail;
+  }
+
+  // Manual edit entry point on a pane item (docs/FEATURE-overleaf-lean-pane-manual-edit.md).
+  function renderEditButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button ol-lean-edit-button";
+    button.textContent = "Edit";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openLeanPaneEdit(item);
+    });
+    return button;
+  }
+
+  // Open the inline edit view for an item: shows the current artifact
+  // immediately (no network round trip needed to start typing), then
+  // best-effort refreshes the draft + pre-save dependents preview from
+  // /lean-pane/edit/start. A network failure here still leaves editing usable
+  // -- the preview is a nicety, not a precondition (feature spec: v1 does not
+  // block editing on the impact preview being available).
+  async function openLeanPaneEdit(item) {
+    leanPaneEditingItemId = item.id;
+    leanPaneEditDraft = item.leanArtifactContent || "";
+    leanPaneEditPreSaveDependents = [];
+    leanPaneEditError = "";
+    leanPaneEditLastResult = null;
+    renderLeanPaneManifest(lastLeanPaneManifest);
+    try {
+      const projectId = itemsProjectId(lastLeanPaneManifest?.items || []);
+      const target = leanPaneView.paneItemToEditTarget(item, projectId);
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/edit/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(target)
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok && payload?.ok && leanPaneEditingItemId === item.id) {
+        leanPaneEditDraft = typeof payload.content === "string" ? payload.content : leanPaneEditDraft;
+        leanPaneEditPreSaveDependents = Array.isArray(payload.dependents) ? payload.dependents : [];
+        renderLeanPaneManifest(lastLeanPaneManifest);
+      }
+    } catch {
+      // Best-effort only -- see doc comment above.
+    }
+  }
+
+  function closeLeanPaneEdit() {
+    leanPaneEditingItemId = "";
+    leanPaneEditDraft = "";
+    leanPaneEditPreSaveDependents = [];
+    leanPaneEditError = "";
+    renderLeanPaneManifest(lastLeanPaneManifest);
+  }
+
+  function renderLeanPaneEditControls(item) {
+    const container = document.createElement("div");
+    container.className = "ol-lean-project-edit";
+
+    if (leanPaneEditPreSaveDependents.length > 0) {
+      const note = document.createElement("p");
+      note.className = "ol-lean-project-impact-note";
+      note.textContent = leanPaneView.formatDependentsImpact(leanPaneEditPreSaveDependents);
+      container.appendChild(note);
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.className = "ol-lean-project-edit-textarea";
+    textarea.value = leanPaneEditDraft;
+    textarea.spellcheck = false;
+    textarea.setAttribute("aria-label", `Edit Lean source for ${item.leanDeclarationName || item.label || "this item"}`);
+    container.appendChild(textarea);
+
+    const errorLine = document.createElement("p");
+    errorLine.className = "ol-lean-project-edit-error";
+    errorLine.hidden = !leanPaneEditError;
+    errorLine.textContent = leanPaneEditError || "";
+    container.appendChild(errorLine);
+
+    const actions = document.createElement("div");
+    actions.className = "ol-lean-project-detail-actions";
+
+    const cancelButton = document.createElement("button");
+    cancelButton.type = "button";
+    cancelButton.className = "ol-lean-secondary-button";
+    cancelButton.textContent = "Cancel";
+    cancelButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeLeanPaneEdit();
+    });
+
+    const saveButton = document.createElement("button");
+    saveButton.type = "button";
+    saveButton.className = "ol-lean-secondary-button ol-lean-edit-save-button";
+    saveButton.textContent = "Save";
+    saveButton.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const content = textarea.value;
+      saveButton.disabled = true;
+      cancelButton.disabled = true;
+      textarea.disabled = true;
+      saveButton.textContent = "Saving…";
+      errorLine.hidden = true;
+      try {
+        const projectId = itemsProjectId(lastLeanPaneManifest?.items || []);
+        const target = leanPaneView.paneItemToEditTarget(item, projectId);
+        const baseUrl = await chatCompanionBaseUrl();
+        const response = await fetch(`${baseUrl}/lean-pane/edit/save`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...target, content })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+          throw new Error(payload?.message || `Save failed (HTTP ${response.status}).`);
+        }
+        leanPaneEditingItemId = "";
+        leanPaneEditError = "";
+        leanPaneEditLastResult = { itemId: item.id, ...payload };
+        // No agent run is started by a save (feature spec acceptance criterion
+        // 9); this refresh just picks up the new check verdicts -- the edited
+        // item's own status plus any cascade-checked dependents -- through the
+        // pane's normal manifest path rather than a bespoke cross-item update.
+        await refreshLeanPaneNow({ background: true });
+      } catch (error) {
+        leanPaneEditError = normalizeErrorMessage(error);
+        saveButton.disabled = false;
+        cancelButton.disabled = false;
+        textarea.disabled = false;
+        saveButton.textContent = "Save";
+        errorLine.hidden = false;
+        errorLine.textContent = leanPaneEditError;
+      }
+    });
+
+    actions.appendChild(saveButton);
+    actions.appendChild(cancelButton);
+    container.appendChild(actions);
+    return container;
+  }
+
+  // Post-save summary shown under an item right after a successful save (until
+  // the item is re-expanded/re-edited or the pane state key changes).
+  function renderLeanPaneEditImpactSummary(result) {
+    const container = document.createElement("div");
+    container.className = "ol-lean-project-impact-note";
+    if (result.unchanged) {
+      container.textContent = "No changes to save.";
+      return container;
+    }
+    const lines = [];
+    if (result.ownResult?.checkStatus) {
+      const kind = result.ownResult.classification?.kind;
+      lines.push(`Own check: ${result.ownResult.checkStatus}${kind ? ` (${kind})` : ""}.`);
+    }
+    for (const dependent of result.dependentsImpact || []) {
+      lines.push(leanPaneView.formatDependentOutcome(dependent));
+    }
+    for (const line of lines) {
+      const p = document.createElement("p");
+      p.textContent = line;
+      container.appendChild(p);
+    }
+    return container;
   }
 
   function renderLeanPaneTitle(element, item) {

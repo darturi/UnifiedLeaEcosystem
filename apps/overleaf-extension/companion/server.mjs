@@ -32,13 +32,23 @@ import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
 import { buildChatPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
+  dependentsOf,
+  moduleNameFromProjectStep,
+  parseLeanImports,
+  projectNamespaceFromSlug,
+  proofPathFromProjectStep
+} from "./leanDependencyGraph.mjs";
+import { classifyEdit, cascadeRequired, parseDeclarationHeader } from "./leanSignatureDiff.mjs";
+import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
   interruptApiRun,
   mirrorProjectTexFiles,
   putAdapterSettings,
-  runApiProofJob
+  runApiProofJob,
+  runApiSessionLeanCheck,
+  writeApiSessionFile
 } from "./leaApiClient.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -741,6 +751,275 @@ export async function handleChatInterrupt(payload, state) {
   return { statusCode: 200, body: { ok: true, runId: targetRunId } };
 }
 
+// --- Lean-pane manual edit --------------------------------------------------
+// docs/FEATURE-overleaf-lean-pane-manual-edit.md /
+// docs/PLAN-overleaf-lean-pane-manual-edit.md (Phase 2).
+//
+// Unlike chat (resolveChatSession), editing never creates a session: the
+// pane only offers "Edit" for an item that already has a recorded artifact
+// (content.js: canEditPaneItem), and a recorded artifact implies a
+// formalization job already produced a session. A missing session here is a
+// data-consistency error, not a "start fresh" case -- see the plan's
+// Section 1, point 5.
+function resolveEditSession({ state, overleafProjectId, targetKind, targetLabel }) {
+  const jobs = state.jobs || {};
+  const jobKey = chatTargetKey({ overleafProjectId, targetKind, targetLabel });
+  const activeJob = findActiveJob(jobs, jobKey) || null;
+  const linkedJob = findLatestJobWithLeaSession(jobs, jobKey);
+  const leaSessionId =
+    (activeJob && (activeJob.leaSessionId || activeJob.recorderSessionId)) ||
+    (linkedJob && (linkedJob.leaSessionId || linkedJob.recorderSessionId)) ||
+    null;
+  return { leaSessionId, activeJob, linkedJob, jobKey };
+}
+
+function validateEditPayload(payload) {
+  const overleafProjectId = String(payload?.overleafProjectId || "");
+  const targetKind = normalizeTargetKind(payload?.targetKind);
+  const targetLabel = String(payload?.targetLabel || "");
+  if (!overleafProjectId.trim()) {
+    return { ok: false, error: "missing_project_id", message: "overleafProjectId is required." };
+  }
+  if (!targetKind) {
+    return { ok: false, error: "invalid_target_kind", message: "targetKind must be theorem or definition." };
+  }
+  if (!isValidLeanIdentifier(targetLabel)) {
+    return { ok: false, error: "invalid_label", message: "Target label must be a valid Lean identifier." };
+  }
+  return { ok: true, overleafProjectId, targetKind, targetLabel };
+}
+
+function validateEditSavePayload(payload) {
+  const base = validateEditPayload(payload);
+  if (!base.ok) return base;
+  const content = payload?.content;
+  if (typeof content !== "string" || !content.trim()) {
+    return { ok: false, error: "missing_content", message: "content is required." };
+  }
+  const note = payload?.note ? String(payload.note).trim() : "";
+  return { ...base, content, note };
+}
+
+// Find the working file + declaration name for a target's session, the same
+// way readLeanPaneArtifactFromSession locates a pane item's artifact: among
+// the session's recorded `.lean` code_steps, prefer the newest one whose code
+// actually contains the declaration, falling back to the sole `.lean` step
+// when there's only one. Also resolves the project namespace, needed for the
+// reverse-dependency scan.
+async function loadEditableSessionFile({ state, leaSessionId, overleafProjectId, targetKind, targetLabel, linkedJob }) {
+  const baseUrl = chatBaseUrls(state).baseUrl;
+  const detail = await fetchApiSessionDetail({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    apiKey: state.env?.LEA_API_KEY,
+    sessionId: leaSessionId
+  });
+  if (!detail.ok || !detail.body || typeof detail.body !== "object") {
+    return { ok: false, error: "adapter_unavailable", message: detail.error || "Could not reach the Lea adapter." };
+  }
+  const leanSteps = (Array.isArray(detail.body.code_steps) ? detail.body.code_steps : [])
+    .filter((step) => step && String(step.path || "").endsWith(".lean") && String(step.code || "").trim())
+    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+  const candidates = leanSteps.filter((step) => containsDeclaration(String(step.code || ""), targetLabel));
+  const step = candidates[candidates.length - 1] || (leanSteps.length === 1 ? leanSteps[0] : null);
+  if (!step) {
+    return { ok: false, error: "no_artifact", message: "No recorded Lean artifact was found for this item." };
+  }
+  const namespace = detail.body.project_namespace
+    || linkedJob?.projectNamespace
+    || projectNamespaceFromSlug(linkedJob?.projectSlug || slugProjectId(overleafProjectId));
+  return {
+    ok: true,
+    path: step.path,
+    content: String(step.code || ""),
+    namespace,
+    moduleName: moduleNameFromProjectStep({ namespace, stepPath: step.path })
+  };
+}
+
+// Best-effort display identity for a dependent file discovered by the reverse
+// index: parse its own declaration name (falls back to "first declaration in
+// the file" per parseDeclarationHeader), or the file's base name if even that
+// fails (a file that somehow contains no declaration at all).
+function summarizeDependentFile(file) {
+  const header = parseDeclarationHeader(file.content);
+  return {
+    targetLabel: header?.name || path.basename(file.stepPath, ".lean"),
+    moduleName: file.moduleName,
+    relativePath: file.stepPath
+  };
+}
+
+// Resolve a dependent's own Lea session by trying both target kinds -- the
+// reverse index only knows the dependent's *file*, not whether it's a
+// theorem or a definition, the same ambiguity resolveTargetUseStatus already
+// handles for the forward (`uses=`) direction.
+function resolveDependentSession({ state, overleafProjectId, targetLabel }) {
+  for (const targetKind of ["theorem", "definition"]) {
+    const resolved = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
+    if (resolved.leaSessionId) return { ...resolved, targetKind };
+  }
+  return { leaSessionId: null, activeJob: null, linkedJob: null, targetKind: "theorem" };
+}
+
+export async function handleLeanPaneEditStart(payload, state) {
+  const validation = validateEditPayload(payload);
+  if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+  const { overleafProjectId, targetKind, targetLabel } = validation;
+
+  const { leaSessionId, activeJob, linkedJob } = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
+  if (!leaSessionId) {
+    return errorResponse(404, "no_session", "No Lea session is recorded for this item yet. Formalize it first.");
+  }
+
+  let file;
+  try {
+    file = await loadEditableSessionFile({ state, leaSessionId, overleafProjectId, targetKind, targetLabel, linkedJob });
+  } catch (error) {
+    return errorResponse(502, "edit_start_failed", error instanceof Error ? error.message : String(error));
+  }
+  if (!file.ok) return errorResponse(file.error === "adapter_unavailable" ? 502 : 404, file.error, file.message);
+
+  let dependents = [];
+  try {
+    dependents = await dependentsOf({
+      leaRepoPath: state.settings.leaRepoPath,
+      namespace: file.namespace,
+      moduleName: file.moduleName
+    });
+  } catch {
+    dependents = []; // best-effort pre-save preview; save-time cascade still runs for real
+  }
+
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      leaSessionId,
+      path: file.path,
+      content: file.content,
+      activeRun: Boolean(activeJob),
+      dependents: dependents.map(summarizeDependentFile)
+    }
+  };
+}
+
+export async function handleLeanPaneEditSave(payload, state) {
+  const validation = validateEditSavePayload(payload);
+  if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+  const { overleafProjectId, targetKind, targetLabel, content, note } = validation;
+
+  const { leaSessionId, activeJob, linkedJob } = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
+  if (!leaSessionId) {
+    return errorResponse(404, "no_session", "No Lea session is recorded for this item yet. Formalize it first.");
+  }
+  if (activeJob) {
+    return errorResponse(409, "run_in_progress", "A Lea run for this item is already in progress.");
+  }
+
+  let baseUrl;
+  try {
+    baseUrl = chatBaseUrls(state).baseUrl;
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+  const apiKey = state.env?.LEA_API_KEY;
+  const fetchImpl = state.fetchImpl || fetch;
+
+  let before;
+  try {
+    before = await loadEditableSessionFile({ state, leaSessionId, overleafProjectId, targetKind, targetLabel, linkedJob });
+  } catch (error) {
+    return errorResponse(502, "edit_save_failed", error instanceof Error ? error.message : String(error));
+  }
+  if (!before.ok) return errorResponse(before.error === "adapter_unavailable" ? 502 : 404, before.error, before.message);
+
+  const write = await writeApiSessionFile({
+    fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path, content, note
+  });
+  if (!write.ok) {
+    return errorResponse(write.status || 502, "edit_write_failed", write.error || "Could not save the edit.");
+  }
+  if (write.body?.unchanged) {
+    return { statusCode: 200, body: { ok: true, unchanged: true, dependentsImpact: [] } };
+  }
+
+  const check = await runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path });
+  if (!check.ok) {
+    return errorResponse(check.status || 502, "edit_check_failed", check.error || "Could not check the edit.");
+  }
+  const ownCheckFailed = String(check.body?.status || "").toLowerCase() !== "ok";
+
+  const beforeHeader = parseDeclarationHeader(before.content, targetLabel);
+  const afterHeader = parseDeclarationHeader(content, targetLabel);
+  const classification = classifyEdit({ before: beforeHeader, after: afterHeader, expectedName: targetLabel, ownCheckFailed });
+
+  const ownResult = {
+    path: before.path,
+    checkStatus: check.body?.status || null,
+    checkDetail: check.body?.detail || null,
+    classification
+  };
+
+  const dependentsImpact = [];
+  if (cascadeRequired(classification)) {
+    let dependents = [];
+    try {
+      dependents = await dependentsOf({
+        leaRepoPath: state.settings.leaRepoPath,
+        namespace: before.namespace,
+        moduleName: before.moduleName
+      });
+    } catch {
+      dependents = [];
+    }
+
+    for (const file of dependents) {
+      const summary = summarizeDependentFile(file);
+      const dependentSession = resolveDependentSession({ state, overleafProjectId, targetLabel: summary.targetLabel });
+
+      if (!dependentSession.leaSessionId) {
+        // No recorded session for this file's declaration (e.g. jobs.json was
+        // reset since it was generated) -- can't attribute a cascade
+        // code_step, but still tell the caller this file exists and is at
+        // risk so the pane can prompt a manual re-check.
+        dependentsImpact.push({ ...summary, status: "unknown", attributed: false, busy: false, brokenByUpstream: null });
+        continue;
+      }
+      if (dependentSession.activeJob) {
+        // Don't race a live run on the dependent (PLAN Phase 2 edge case).
+        dependentsImpact.push({ ...summary, status: "busy", attributed: true, busy: true, brokenByUpstream: null });
+        continue;
+      }
+
+      const cascadeCheck = await runApiSessionLeanCheck({
+        fetchImpl, baseUrl, apiKey,
+        sessionId: dependentSession.leaSessionId,
+        path: file.stepPath,
+        author: "cascade",
+        summary: `Re-checked after edit to ${targetLabel}`
+      });
+      if (!cascadeCheck.ok) {
+        dependentsImpact.push({ ...summary, status: "unknown", attributed: true, busy: false, brokenByUpstream: null });
+        continue;
+      }
+      const broken = String(cascadeCheck.body?.status || "").toLowerCase() !== "ok";
+      dependentsImpact.push({
+        ...summary,
+        status: broken ? "invalid" : "reverified",
+        attributed: true,
+        busy: false,
+        checkDetail: cascadeCheck.body?.detail || null,
+        brokenByUpstream: broken
+          ? { targetLabel, renamed: classification.kind === "renamed" }
+          : null
+      });
+    }
+  }
+
+  return { statusCode: 200, body: { ok: true, unchanged: false, ownResult, dependentsImpact } };
+}
+
 // Start (and background-drive) a chat run, resolving as soon as the adapter
 // returns a run id — NOT when the run finishes. The companion keeps driving the
 // SSE stream to completion in the background while the extension polls; this
@@ -1118,6 +1397,18 @@ async function routeRequest(request, response, state) {
   if (request.method === "GET" && url.pathname.startsWith("/lean-pane/chat/session/")) {
     const sessionId = decodeURIComponent(url.pathname.slice("/lean-pane/chat/session/".length));
     const result = await handleChatPoll({ sessionId }, state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/edit/start") {
+    const result = await handleLeanPaneEditStart(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/edit/save") {
+    const result = await handleLeanPaneEditSave(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -1580,27 +1871,6 @@ function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabe
     absolutePath: projectMarkdownPath,
     jobKey: `${projectSlug}:${targetKey({ targetKind, targetLabel })}`
   };
-}
-
-function projectNamespaceFromSlug(slug) {
-  const parts = String(slug || "").trim().split(/[-_\s]+/).filter(Boolean);
-  let camel = parts.map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`).join("");
-  camel = camel.replace(/[^A-Za-z0-9]/g, "");
-  if (!camel || !/^[A-Za-z]/.test(camel)) {
-    camel = `P${camel}`;
-  }
-  return `Lea.${camel}`;
-}
-
-function proofPathFromProjectStep({ namespace, stepPath }) {
-  const cleanPath = String(stepPath || "").replace(/^\/+/, "");
-  return path.join("workspace", "proofs", ...String(namespace || "Lea.Misc").split("."), cleanPath);
-}
-
-function moduleNameFromProjectStep({ namespace, stepPath }) {
-  const withoutExt = String(stepPath || "").replace(/\.lean$/i, "");
-  const moduleSuffix = withoutExt.split(/[\\/]+/).filter(Boolean).join(".");
-  return [namespace || "Lea.Misc", moduleSuffix].filter(Boolean).join(".");
 }
 
 async function findReusableStubForFormalization({ leaRepoPath, target, jobs }) {
@@ -2749,20 +3019,6 @@ async function findImportedCurrentlyStubbedTheoremUses({
   }
 
   return stubbedUses;
-}
-
-function parseLeanImports(content) {
-  const imports = new Set();
-  for (const line of String(content || "").split(/\r?\n/)) {
-    const match = line.match(/^\s*import\s+(.+?)\s*(?:--.*)?$/);
-    if (!match) continue;
-    for (const moduleName of match[1].trim().split(/\s+/)) {
-      if (moduleName) {
-        imports.add(moduleName);
-      }
-    }
-  }
-  return imports;
 }
 
 async function getTargetStatus({

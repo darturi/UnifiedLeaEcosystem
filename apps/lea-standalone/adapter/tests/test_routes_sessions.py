@@ -90,6 +90,51 @@ def test_lean_check_backfills_verdict_onto_the_step(tmp_path, monkeypatch):
     assert store.session_detail(session["id"])["status"] == "error"
 
 
+def test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfilling(tmp_path, monkeypatch):
+    """docs/FEATURE-overleaf-lean-pane-manual-edit.md: a cascade re-check of a
+    dependent file (triggered by an edit elsewhere in the project) gets its own
+    code_step, distinct from the step the original write produced -- the file
+    on disk didn't change, so the new step reuses the existing commit_sha."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, sha = _seed_session_with_commit(tmp_path)  # seeds one step, check_status="ok"
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_check",
+                        lambda p: CheckResult(p, "error", "p.lean:3:0: error: unknown identifier"))
+
+    result = sessions_route.lean_check_session(
+        session["id"],
+        PathRequest(path="Lea/Misc/p.lean", author="cascade", summary="Re-checked after edit to compactness_criterion"),
+    )
+
+    assert result["status"] == "error"
+    assert result["code_step"]["author"] == "cascade"
+    assert result["code_step"]["commit_sha"] == sha  # no new content, same commit
+
+    steps = store.session_detail(session["id"])["code_steps"]
+    assert len(steps) == 2  # the original write's step, plus the new cascade step
+    assert steps[0]["check_status"] == "ok"       # original step is untouched
+    assert steps[-1]["author"] == "cascade"
+    assert steps[-1]["check_status"] == "error"   # the new step carries the fresh verdict
+    assert steps[-1]["summary"] == "Re-checked after edit to compactness_criterion"
+
+
+def test_lean_check_without_author_still_backfills_as_before(tmp_path, monkeypatch):
+    """Regression guard: omitting `author` (every existing caller) must be
+    byte-for-byte the original back-fill-only behavior."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_check", lambda p: CheckResult(p, "ok", None))
+
+    result = sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+
+    assert "code_step" not in result
+    steps = store.session_detail(session["id"])["code_steps"]
+    assert len(steps) == 1
+
+
 def test_verify_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

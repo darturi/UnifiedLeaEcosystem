@@ -566,6 +566,151 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   assert.equal(body.targetContext, "Use the helper.");
 });
 
+// --- Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md) ----------
+
+function editableItem(overrides = {}) {
+  return {
+    id: "theorem:main_theorem:0",
+    kind: "theorem",
+    label: "main_theorem",
+    status: "valid",
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageRendered: "A theorem.",
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    leanDeclarationName: "main_theorem",
+    leanArtifactContent: "theorem main_theorem : True := by\n  sorry\n",
+    ...overrides
+  };
+}
+
+test("Lean pane 'Edit' only appears for items with a recorded artifact", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [editableItem({ id: "theorem:missing:0", label: "missing", leanArtifactContent: undefined, status: "missing-stub" })],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  assert.equal(harness.hasButtonText("Edit"), false);
+});
+
+test("Lean pane 'Edit' opens an inline textarea pre-filled with the artifact and shows the pre-save impact preview", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [editableItem()], diagnostics: [] },
+      editStart: {
+        ok: true,
+        leaSessionId: "sess-1",
+        path: "main_theorem.lean",
+        content: "theorem main_theorem : True := by\n  sorry\n",
+        dependents: [{ targetLabel: "corollary_a", moduleName: "Lea.P.corollary_a", relativePath: "corollary_a.lean" }]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  harness.clickButtonText("Edit");
+  await flushPromises();
+
+  const textarea = harness.editTextarea();
+  assert.ok(textarea, "expected an edit textarea to render");
+  assert.match(textarea.value, /theorem main_theorem : True/);
+  assert.match(harness.bodyText(), /Editing this may affect 1 downstream item: corollary_a\./);
+  assert.equal(harness.hasButtonText("Save"), true);
+  assert.equal(harness.hasButtonText("Cancel"), true);
+  // the read-only artifact view and the Edit button itself are replaced while editing
+  assert.equal(harness.hasButtonText("Edit"), false);
+});
+
+test("Lean pane edit 'Cancel' discards the draft and makes no save request", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [editableItem()], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Edit");
+  await flushPromises();
+
+  harness.clickButtonText("Cancel");
+
+  assert.equal(harness.editTextarea(), null);
+  assert.equal(harness.hasButtonText("Edit"), true);
+  assert.ok(!harness.fetchCalls.some((call) => call.url.includes("/lean-pane/edit/save")));
+});
+
+test("Lean pane edit 'Save' posts the edited content and renders the cascade impact summary", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [editableItem()], diagnostics: [] },
+      editSave: {
+        ok: true,
+        unchanged: false,
+        ownResult: { checkStatus: "ok", classification: { kind: "signature" } },
+        dependentsImpact: [
+          { targetLabel: "corollary_a", status: "invalid", attributed: true, busy: false, brokenByUpstream: { targetLabel: "main_theorem", renamed: false } }
+        ]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Edit");
+  await flushPromises();
+  harness.setEditTextareaValue("theorem main_theorem (h : True) : True := by\n  sorry\n");
+
+  harness.clickButtonText("Save");
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/edit/save"));
+  assert.ok(saveCall, "expected a POST to /lean-pane/edit/save");
+  const body = JSON.parse(saveCall.options.body);
+  assert.equal(body.targetLabel, "main_theorem");
+  assert.equal(body.targetKind, "theorem");
+  assert.match(body.content, /theorem main_theorem \(h : True\)/);
+
+  // edit view closes and the pane re-fetches the manifest (the plan's stated
+  // approach: reuse the normal refresh path rather than a bespoke per-item patch)
+  assert.equal(harness.editTextarea(), null);
+  assert.match(harness.bodyText(), /Own check: ok \(signature\)\./);
+  assert.match(harness.bodyText(), /corollary_a: broken by this edit\./);
+});
+
 function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const document = new FakeDocument();
   const timers = [];
@@ -633,6 +778,27 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
           }
           if (String(url).includes("/formalize")) {
             return { jobId: "job-1", status: "in_progress" };
+          }
+          if (String(url).includes("/lean-pane/edit/start")) {
+            return typeof options.editStart === "function"
+              ? options.editStart(fetchCalls)
+              : (options.editStart || {
+                  ok: true,
+                  leaSessionId: "sess-1",
+                  path: "main_theorem.lean",
+                  content: "theorem main_theorem : True := by\n  sorry\n",
+                  dependents: []
+                });
+          }
+          if (String(url).includes("/lean-pane/edit/save")) {
+            return typeof options.editSave === "function"
+              ? options.editSave(fetchCalls)
+              : (options.editSave || {
+                  ok: true,
+                  unchanged: false,
+                  ownResult: { checkStatus: "ok", classification: { kind: "proof-only" } },
+                  dependentsImpact: []
+                });
           }
           return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
         }
@@ -750,6 +916,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         .find((candidate) => candidate.textContent === text);
       assert.ok(button, `expected a button labeled "${text}"`);
       button.click();
+    },
+    editTextarea() {
+      return document.body.querySelector(".ol-lean-project-edit-textarea");
+    },
+    setEditTextareaValue(value) {
+      const textarea = this.editTextarea();
+      assert.ok(textarea, "expected the edit textarea to be present");
+      textarea.value = value;
     },
     async runScheduledTimers() {
       const scheduledTimers = timers.splice(0, timers.length);

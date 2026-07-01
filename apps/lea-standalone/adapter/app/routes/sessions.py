@@ -30,6 +30,18 @@ logger = logging.getLogger("lea-interface.sessions")
 class PathRequest(BaseModel):
     # which file in the session to act on; defaults to the latest code_step's path
     path: str | None = None
+    # Optional: attribute this check as its own new code_step instead of
+    # back-filling the existing latest one. Used by the Overleaf lean pane's
+    # cascade re-verification (docs/FEATURE-overleaf-lean-pane-manual-edit.md):
+    # when a manual edit to one declaration may have broken another target
+    # that imports it, the companion re-checks the *unchanged* dependent file
+    # and wants that verdict recorded as its own timeline entry -- 'cascade',
+    # a third convention value alongside code_steps.author's existing
+    # 'agent' | 'user' (D9, apps/lea-standalone/design/v2-architecture.md).
+    # Omitted (the default) preserves the original back-fill-only behavior
+    # exactly, so the standalone UI's existing calls are unaffected.
+    author: str | None = None
+    summary: str | None = None
 
 
 class FileWriteRequest(BaseModel):
@@ -144,10 +156,29 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
 def lean_check_session(session_id: str, request: PathRequest) -> dict:
     """Standalone `lean_check` on a session's working file (LSP fast path, no run,
     D2). Back-fills the verdict onto that file's latest code_step so the canvas +
-    derived session status reflect it."""
+    derived session status reflect it.
+
+    When `request.author` is set (e.g. `"cascade"`), the verdict is recorded as
+    a *new* code_step instead of back-filling the latest one -- the file on
+    disk hasn't changed, so the new step points at the same commit_sha as the
+    latest step; it exists to give the re-check its own timeline entry
+    (who/why/when), not new content. See the `PathRequest.author` docstring.
+    """
     abs_path, rel = _resolve_proof_path(session_id, request.path)
     result = interface_check(abs_path)
     step = store.latest_code_step_for_path(session_id, rel)
+    if request.author and step:
+        new_step = store.add_code_step(
+            session_id,
+            None,
+            rel,
+            commit_sha=step["commit_sha"],
+            author=request.author,
+            summary=request.summary,
+            check_status=result.status,
+            check_detail=result.detail,
+        )
+        return {"path": rel, "status": result.status, "detail": result.detail, "code_step": new_step}
     if step:
         store.set_code_step_check(step["id"], result.status, result.detail)
     return {"path": rel, "status": result.status, "detail": result.detail}
