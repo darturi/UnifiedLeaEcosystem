@@ -14,15 +14,16 @@ import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 from lea.interface import check as interface_check, verify as interface_verify
 
 from ..config import load_config
-from .. import filesystem as fs_service, projects, store
+from .. import filesystem as fs_service, lsp_proxy, projects, store
 
 router = APIRouter()
 logger = logging.getLogger("lea-interface.sessions")
@@ -163,6 +164,53 @@ def verify_session(session_id: str, request: PathRequest) -> dict:
     # Persist the verdict so it survives reload (surfaced as session_detail.safe_verify).
     store.set_session_safe_verify(session_id, result.status, result.detail)
     return {"path": rel, "status": result.status, "detail": result.detail}
+
+
+@router.get("/api/sessions/{session_id}/lsp-info")
+def lsp_info(session_id: str) -> dict:
+    """What the live editor (v2.2) needs to open a file: `fileName` is the proof's
+    path **relative to the Lake root** — the URI the browser opens the Monaco model
+    as, so the WS proxy's `file://`-prefix rewrite (D60/D64) lands it on the real
+    file — plus the current on-disk `content` (the read-only Phase-1 buffer)."""
+    abs_path, rel = _resolve_proof_path(session_id, None)
+    try:
+        lake_root, file_name = lsp_proxy.resolve_target(abs_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    try:
+        content = Path(abs_path).read_text()
+    except OSError:
+        content = ""
+    return {"fileName": file_name, "content": content, "path": rel}
+
+
+@router.websocket("/api/sessions/{session_id}/lsp")
+async def lsp_socket(websocket: WebSocket, session_id: str) -> None:
+    """Bridge the browser's Monaco/Lean LSP to a per-connection `lake serve`
+    (v2.2 · D60/D61). Bare JSON per WS frame ⇄ Content-Length-framed stdio, with
+    `file://` URI rewriting between the browser's virtual path and the real file.
+    The process is spawned on connect and killed on disconnect (idle-reap)."""
+    await websocket.accept()
+    try:
+        abs_path, _ = _resolve_proof_path(session_id, None)
+        lake_root, _file_name = lsp_proxy.resolve_target(abs_path)
+    except HTTPException as exc:
+        await websocket.close(code=1011, reason=str(exc.detail)[:120])
+        return
+    except FileNotFoundError as exc:
+        await websocket.close(code=1011, reason=str(exc)[:120])
+        return
+
+    proxy = lsp_proxy.LspProxy(lake_root, str(lake_root))
+    try:
+        await proxy.start()
+    except FileNotFoundError:
+        await websocket.close(code=1011, reason="lake not found on PATH")
+        return
+    try:
+        await proxy.pump(websocket)
+    except WebSocketDisconnect:
+        await proxy.stop()
 
 
 @router.get("/api/sessions/{session_id}/export")
