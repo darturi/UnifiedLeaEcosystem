@@ -463,6 +463,7 @@ export default function App() {
           )}
 
           <Canvas
+            sessionId={selectedSessionId}
             onClose={() => setCanvasCollapsed(true)}
             onSaveAndCheck={handleSaveAndCheck}
             onVerify={handleVerify}
