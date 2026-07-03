@@ -422,3 +422,83 @@ def test_push_to_diverged_remote_points_at_lea(tmp_path, monkeypatch):
         projects_route.push_project(pid)
     assert ei.value.status_code == 502
     assert "reconcile" in ei.value.detail.lower() and "lea" in ei.value.detail.lower()
+
+
+# ── By-slug export/share: the Overleaf companion's path (D34) ──────────────────
+
+
+def test_by_slug_share_status_export_and_remote(tmp_path, monkeypatch):
+    """The companion's whole surface: share status (remote + token presence),
+    zip export, and set-remote — all resolved by slug, mirroring the by-id routes."""
+    import io
+    import zipfile
+    from app.routes.projects import RemoteUpdate
+
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Doc One"))
+    slug = project["slug"]
+
+    # Share status: no remote yet; token presence mirrors Settings.
+    monkeypatch.setattr(projects_route, "github_token", lambda: None)
+    status = projects_route.get_share_status_by_slug(slug)
+    assert status == {"id": project["id"], "slug": slug, "remote_url": None, "token_configured": False}
+
+    monkeypatch.setattr(projects_route, "github_token", lambda: "ghp_dummy")
+    projects_route.set_project_remote_by_slug(slug, RemoteUpdate(remote_url="https://github.com/me/doc-one/"))
+    status = projects_route.get_share_status_by_slug(slug)
+    assert status["remote_url"] == "https://github.com/me/doc-one"  # trailing slash stripped
+    assert status["token_configured"] is True
+    assert status["remote_url"] == store.get_project(project["id"])["remote_url"]
+
+    # Export by slug: same zip as the by-id route.
+    resp = projects_route.export_project_by_slug(slug)
+    assert resp.media_type == "application/zip"
+    assert f'filename="{slug}.zip"' in resp.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(resp.body)) as zf:
+        entries = zf.namelist()
+    assert any(n.endswith("/.lea/blueprint.md") for n in entries)
+    assert not any("/.git/" in n for n in entries)
+
+
+def test_by_slug_push_functionally(tmp_path, monkeypatch):
+    """Push-by-slug lands commits on the remote, same as the by-id route."""
+    import subprocess
+    from app.gitstore import GitStore
+
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Slug Push"))
+    repo = projects_route.project_service.project_repo_dir(store.get_project(project["id"]), proofs)
+    (repo / "hello.txt").write_text("hi")
+    GitStore(proofs).commit_all(repo, "add hello")
+
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+    store.update_project(project["id"], remote_url=str(bare))
+    monkeypatch.setattr(projects_route, "github_token", lambda: "ghp_dummy")
+
+    res = projects_route.push_project_by_slug(project["slug"])
+    assert res["pushed"] is True
+    log = subprocess.run(
+        ["git", "--git-dir", str(bare), "log", "--oneline", "main"],
+        capture_output=True, text=True,
+    )
+    assert "add hello" in log.stdout
+
+
+def test_by_slug_never_creates_a_project(tmp_path, monkeypatch):
+    """Unlike mirror's ensure_project, an unknown or malformed slug is a plain 404
+    on every by-slug route — export must never create a project."""
+    from app.routes.projects import RemoteUpdate
+
+    _setup(tmp_path, monkeypatch)
+    for call in (
+        lambda: projects_route.get_share_status_by_slug("no-such-doc"),
+        lambda: projects_route.export_project_by_slug("no-such-doc"),
+        lambda: projects_route.set_project_remote_by_slug("no-such-doc", RemoteUpdate(remote_url="https://github.com/a/b")),
+        lambda: projects_route.push_project_by_slug("no-such-doc"),
+        lambda: projects_route.export_project_by_slug("Bad Slug!!"),  # malformed ≡ missing
+    ):
+        with pytest.raises(HTTPException) as exc:
+            call()
+        assert exc.value.status_code == 404
+    assert store.list_projects() == []  # nothing was created as a side effect

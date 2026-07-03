@@ -589,3 +589,44 @@ function classifyLeanWord(word) {
   if (/^[A-Z]/.test(word)) return "ty";
   return "";
 }
+
+// --- Export & GitHub sharing (D34) -------------------------------------------
+// Pure state derivation for the pane's Share panel, kept here (like the rest of
+// this module) so the enable/disable/hint logic is unit-testable without a DOM.
+
+/**
+ * Derive the Share panel's control state.
+ * @param {object} s
+ * @param {boolean} s.exists - a Lea project exists for this document
+ * @param {string|null} s.remoteUrl - the saved remote (from the adapter project row)
+ * @param {string|undefined} s.draftRemote - the input's current value (defaults to saved)
+ * @param {boolean} s.tokenConfigured - a GitHub token is set in shared settings
+ * @param {boolean} [s.busy] - a save/push request is in flight
+ * @returns {{canSave: boolean, canPush: boolean, hint: string}}
+ */
+export function deriveShareControls({ exists, remoteUrl, draftRemote, tokenConfigured, busy = false }) {
+  const saved = String(remoteUrl || "").trim();
+  const draft = String(draftRemote ?? saved).trim();
+  if (!exists) {
+    return {
+      canSave: false,
+      canPush: false,
+      hint: "This document has no Lea project yet — formalize a theorem first."
+    };
+  }
+  const canSave = !busy && Boolean(draft) && draft !== saved;
+  const canPush = !busy && Boolean(saved) && Boolean(tokenConfigured);
+  let hint = "";
+  if (!saved) {
+    hint = "Save a GitHub remote (https://github.com/you/repo) to enable Push.";
+  } else if (!tokenConfigured) {
+    hint = "Add a GitHub token in Settings to enable Push.";
+  }
+  return { canSave, canPush, hint };
+}
+
+// Pull `filename="…"` out of a Content-Disposition header for the zip download.
+export function filenameFromContentDisposition(header, fallback = "project.zip") {
+  const match = /filename="([^"]+)"/.exec(String(header || ""));
+  return match ? match[1] : fallback;
+}

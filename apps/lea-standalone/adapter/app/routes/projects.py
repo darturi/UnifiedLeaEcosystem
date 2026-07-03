@@ -257,11 +257,9 @@ def write_project_file(project_id: str, request: FilePut) -> dict:
     return {"path": request.path, "commit_sha": sha, "check": check}
 
 
-@router.get("/api/projects/{project_id}/export")
-def export_project(project_id: str) -> Response:
-    """Stream a zip of the whole project repo (source + .lea assets; .git/.lake
-    excluded) so the project is shareable as a single download (D34)."""
-    project = _require_project(project_id)
+def _export_project_response(project: dict) -> Response:
+    """Zip the project repo (source + .lea assets; .git/.lake excluded) into a
+    download response — shared by the by-id and by-slug export routes (D34)."""
     repo = project_service.project_repo_dir(project, _proofs_root())
     data = fs_service.export_zip(repo)
     filename = f"{project['slug']}.zip"
@@ -272,6 +270,13 @@ def export_project(project_id: str) -> Response:
     )
 
 
+@router.get("/api/projects/{project_id}/export")
+def export_project(project_id: str) -> Response:
+    """Stream a zip of the whole project repo (source + .lea assets; .git/.lake
+    excluded) so the project is shareable as a single download (D34)."""
+    return _export_project_response(_require_project(project_id))
+
+
 # ── Git sharing: set remote + push to GitHub (6b/U3, D34) ─────────────────────────
 # A project is already a git repo, so sharing is: store a per-project remote URL and
 # push to it with the global `github_token` (Settings). Pushing is outward-facing →
@@ -279,27 +284,22 @@ def export_project(project_id: str) -> Response:
 # persisted to .git/config) and scrubbed from any output.
 
 
-@router.put("/api/projects/{project_id}/git/remote")
-def set_project_remote(project_id: str, request: RemoteUpdate) -> dict:
-    """Set the project's GitHub remote URL (D34). Stored on the project row; the
-    token stays global in Settings. Returns the (token-free) remote."""
-    _require_project(project_id)
-    url = request.remote_url.strip().rstrip("/")
+def _set_remote_on(project: dict, remote_url: str) -> dict:
+    """Validate + store a project's GitHub remote URL — shared by the by-id and
+    by-slug routes (D34). The token stays global in Settings."""
+    url = remote_url.strip().rstrip("/")
     if not _GITHUB_REMOTE_RE.fullmatch(url):
         raise HTTPException(
             status_code=400,
             detail="Enter an https GitHub repo URL, e.g. https://github.com/you/repo",
         )
-    updated = store.update_project(project_id, remote_url=url)
+    updated = store.update_project(project["id"], remote_url=url)
     return {"id": updated["id"], "remote_url": updated["remote_url"]}
 
 
-@router.post("/api/projects/{project_id}/git/push")
-def push_project(project_id: str) -> dict:
-    """Push the project repo to its configured GitHub remote using the global token
-    (D34). Explicit user action only. 400 if no remote or no token is configured;
-    502 (scrubbed) if git rejects the push (auth / non-fast-forward / unreachable)."""
-    project = _require_project(project_id)
+def _push_project(project: dict) -> dict:
+    """Push the project repo to its configured remote with the global token —
+    shared by the by-id and by-slug routes (D34)."""
     remote_url = project.get("remote_url")
     if not remote_url:
         raise HTTPException(status_code=400, detail="No GitHub remote set for this project.")
@@ -312,6 +312,67 @@ def push_project(project_id: str) -> dict:
     except GitStoreError as exc:
         raise HTTPException(status_code=502, detail=_push_failure_detail(str(exc))) from None
     return {"pushed": True, "remote_url": remote_url, "detail": summary or "Pushed."}
+
+
+@router.put("/api/projects/{project_id}/git/remote")
+def set_project_remote(project_id: str, request: RemoteUpdate) -> dict:
+    """Set the project's GitHub remote URL (D34). Stored on the project row; the
+    token stays global in Settings. Returns the (token-free) remote."""
+    return _set_remote_on(_require_project(project_id), request.remote_url)
+
+
+@router.post("/api/projects/{project_id}/git/push")
+def push_project(project_id: str) -> dict:
+    """Push the project repo to its configured GitHub remote using the global token
+    (D34). Explicit user action only. 400 if no remote or no token is configured;
+    502 (scrubbed) if git rejects the push (auth / non-fast-forward / unreachable)."""
+    return _push_project(_require_project(project_id))
+
+
+# ── By-slug variants: the Overleaf companion's view of export/share (D34) ─────────
+# The companion identifies a project by the slug it derives from the Overleaf
+# document (`slugProjectId`), the same way `/api/projects/by-slug/{slug}/mirror`
+# does. Unlike mirror, these NEVER create the project (`ensure_project` is the
+# formalize path's job): an unknown slug is a plain 404 — "nothing to export yet".
+
+
+def _require_project_by_slug(slug: str) -> dict:
+    try:
+        project = store.get_project_by_slug(slug)
+    except ValueError:
+        project = None  # malformed slug ≡ no such project
+    if project is None:
+        raise HTTPException(status_code=404, detail="No Lea project exists for this document yet.")
+    return project
+
+
+@router.get("/api/projects/by-slug/{slug}/share")
+def get_share_status_by_slug(slug: str) -> dict:
+    """The share state the Overleaf pane needs in one call: the project's remote
+    (token-free) plus whether the global GitHub token is configured (presence only,
+    like Settings — the raw token never reaches a client)."""
+    project = _require_project_by_slug(slug)
+    return {
+        "id": project["id"],
+        "slug": project["slug"],
+        "remote_url": project.get("remote_url"),
+        "token_configured": bool(github_token()),
+    }
+
+
+@router.get("/api/projects/by-slug/{slug}/export")
+def export_project_by_slug(slug: str) -> Response:
+    return _export_project_response(_require_project_by_slug(slug))
+
+
+@router.put("/api/projects/by-slug/{slug}/git/remote")
+def set_project_remote_by_slug(slug: str, request: RemoteUpdate) -> dict:
+    return _set_remote_on(_require_project_by_slug(slug), request.remote_url)
+
+
+@router.post("/api/projects/by-slug/{slug}/git/push")
+def push_project_by_slug(slug: str) -> dict:
+    return _push_project(_require_project_by_slug(slug))
 
 
 # ── Files: upload / list / download / delete (S1/S2, D27) ────────────────────────

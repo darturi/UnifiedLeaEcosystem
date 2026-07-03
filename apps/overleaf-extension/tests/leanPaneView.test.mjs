@@ -15,6 +15,8 @@ import {
   overlayActiveTex,
   paneItemToEditTarget,
   paneItemToFormalizeTarget,
+  deriveShareControls,
+  filenameFromContentDisposition,
   parsePaneLatex,
   shouldRefetchLeanPaneFiles,
   treeAncestorIdsForFile
@@ -288,4 +290,54 @@ test("highlightLeanLine marks Lean keywords, comments, strings, numbers, and typ
 
   const stringSpans = highlightLeanLine('open "Mathlib"');
   assert.equal(stringSpans.find((span) => span.text === '"Mathlib"')?.cls, "str");
+});
+
+test("deriveShareControls gates Save on a changed draft and Push on remote+token", () => {
+  // No Lea project yet: everything off, with the formalize-first hint.
+  const missing = deriveShareControls({ exists: false, remoteUrl: null, tokenConfigured: true });
+  assert.equal(missing.canSave, false);
+  assert.equal(missing.canPush, false);
+  assert.match(missing.hint, /formalize a theorem first/i);
+
+  // Project, no remote: Save enables once a draft is typed; Push stays off.
+  const untouched = deriveShareControls({ exists: true, remoteUrl: null, tokenConfigured: true });
+  assert.equal(untouched.canSave, false);
+  assert.match(untouched.hint, /Save a GitHub remote/);
+  const drafted = deriveShareControls({
+    exists: true, remoteUrl: null, draftRemote: "https://github.com/me/doc", tokenConfigured: true
+  });
+  assert.equal(drafted.canSave, true);
+  assert.equal(drafted.canPush, false);
+
+  // Saved remote + token: Push on; Save off until the draft diverges from saved.
+  const ready = deriveShareControls({
+    exists: true, remoteUrl: "https://github.com/me/doc", tokenConfigured: true
+  });
+  assert.equal(ready.canSave, false);
+  assert.equal(ready.canPush, true);
+  assert.equal(ready.hint, "");
+
+  // Saved remote, no token: Push off with the settings hint.
+  const tokenless = deriveShareControls({
+    exists: true, remoteUrl: "https://github.com/me/doc", tokenConfigured: false
+  });
+  assert.equal(tokenless.canPush, false);
+  assert.match(tokenless.hint, /GitHub token in Settings/);
+
+  // A request in flight disables both.
+  const busy = deriveShareControls({
+    exists: true, remoteUrl: "https://github.com/me/doc",
+    draftRemote: "https://github.com/me/other", tokenConfigured: true, busy: true
+  });
+  assert.equal(busy.canSave, false);
+  assert.equal(busy.canPush, false);
+});
+
+test("filenameFromContentDisposition extracts the quoted filename or falls back", () => {
+  assert.equal(
+    filenameFromContentDisposition('attachment; filename="doc-1.zip"'),
+    "doc-1.zip"
+  );
+  assert.equal(filenameFromContentDisposition(null, "lean-project.zip"), "lean-project.zip");
+  assert.equal(filenameFromContentDisposition("attachment", "x.zip"), "x.zip");
 });
