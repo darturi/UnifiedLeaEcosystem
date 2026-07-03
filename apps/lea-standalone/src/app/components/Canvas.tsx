@@ -1,12 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { CodeStep, SafeVerifyStatus } from '../lib/api';
+import { LiveEditor } from './LiveEditor';
 import { diffForStep } from '../lib/codeDiff';
 import { ensureHighlighter, highlightToLines, isHighlighterReady } from '../lib/leanHighlight.mjs';
-import {
-  deriveCodeStepProofStatus,
-  hasSorryLikeCheckDetail,
-  hasSorryLikeCode,
-} from '../lib/proofDisplay.mjs';
+import { deriveCodeStepProofStatus } from '../lib/proofDisplay.mjs';
 import { sortCodeSteps } from '../lib/timeline.mjs';
 import { distinctFiles, latestIndexForPath, mainFilePath } from '../lib/canvasFiles.mjs';
 import { useProofSession } from '../stores/proofSession';
@@ -21,14 +18,22 @@ export interface CheckOutcome {
 // latest snapshot. Network calls are delegated to the parent (which owns the
 // session id + state) via onSaveAndCheck / onVerify.
 export function Canvas({
+  sessionId,
   onClose,
   onSaveAndCheck,
   onVerify,
 }: {
+  // Present once the session is persisted; the Live editor needs it for the
+  // per-session LSP WebSocket. Absent on a brand-new, unsaved session.
+  sessionId?: string;
   onClose: () => void;
   onSaveAndCheck: (content: string, path?: string) => Promise<CheckOutcome>;
   onVerify: (path?: string) => Promise<CheckOutcome>;
 }) {
+  // v2.2: History = the Shiki snapshot stepper (unchanged); Live = the lean4monaco
+  // editor with real goals/hover/diagnostics (D66). Live needs a persisted session
+  // and at least one file to open.
+  const [mode, setMode] = useState<'history' | 'live'>('history');
   // R1b/R1c: canvas state (verdict, snapshots, stepper position, run-active flag)
   // comes straight from the store now — no props from App.
   const persistedVerify = useProofSession((s) => s.safeVerify);
@@ -41,6 +46,13 @@ export function Canvas({
   const safeIndex = Math.min(Math.max(index, 0), Math.max(total - 1, 0));
   const step = codeSteps[safeIndex];
 
+  // Live mode needs a saved session + a file to open. If those go away (e.g. the
+  // session resets), fall back to History so we never mount the editor with nothing.
+  const canLive = !!sessionId && total > 0;
+  useEffect(() => {
+    if (!canLive && mode === 'live') setMode('history');
+  }, [canLive, mode]);
+
   // File model (#10): a session can touch several files (a main proof + throwaway
   // `scratch` probes). `shownPath` is the file currently in view; `isFileCurrent` is
   // true when the shown step is the newest snapshot OF THAT FILE — so Edit / Run
@@ -52,21 +64,13 @@ export function Canvas({
   const isFileCurrent = !!step && safeIndex === latestIndexForPath(codeSteps, shownPath);
   const pickFile = (path: string) => onIndexChange(latestIndexForPath(codeSteps, path));
 
-  const [editing, setEditing] = useState(false);
-  const [draftCode, setDraftCode] = useState('');
   const [busy, setBusy] = useState(false);
-  const [foot, setFoot] = useState<{ kind: 'idle' | 'ok' | 'bad'; text: string } | null>(null);
   const [verify, setVerify] = useState<{ status: SafeVerifyStatus; detail?: string | null } | null>(null);
 
-  // Leaving the step or starting a run cancels an in-progress edit.
+  // Reset the transient SafeVerify result when the shown step changes.
   useEffect(() => {
-    setEditing(false);
-    setFoot(null);
     setVerify(null);
   }, [safeIndex, step?.id]);
-  useEffect(() => {
-    if (isRunning) setEditing(false);
-  }, [isRunning]);
 
   const rows = useMemo(() => {
     if (!step) return [];
@@ -96,36 +100,6 @@ export function Canvas({
     [hlReady, step?.code],
   );
 
-  const beginEdit = () => {
-    setDraftCode(step?.code ?? '');
-    setFoot(null);
-    setEditing(true);
-  };
-
-  const runCheck = async () => {
-    setBusy(true);
-    setFoot({ kind: 'idle', text: 'running lean_check…' });
-    try {
-      const result = await onSaveAndCheck(draftCode, shownPath);
-      if (result.status === 'ok') {
-        setEditing(false);
-        const hasStub = hasSorryLikeCode(draftCode) || hasSorryLikeCheckDetail(result.detail);
-        setFoot({
-          kind: hasStub ? 'idle' : 'ok',
-          text: hasStub
-            ? 'lean_check: 0 errors · contains sorry'
-            : 'lean_check: 0 errors · your manual check',
-        });
-      } else {
-        setFoot({ kind: 'bad', text: result.detail || 'lean_check reported errors' });
-      }
-    } catch (err) {
-      setFoot({ kind: 'bad', text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const runVerify = async () => {
     setBusy(true);
     setVerify({ status: 'running' });
@@ -140,9 +114,7 @@ export function Canvas({
   };
 
   const proofStatus = deriveCodeStepProofStatus(step);
-  const verdict = editing
-    ? { cls: 'idle', text: '● editing — unsaved' }
-    : proofStatus === 'proved'
+  const verdict = proofStatus === 'proved'
     ? { cls: 'ok', text: '✓ compiles' }
     : proofStatus === 'stubbed'
     ? { cls: 'stub', text: '○ checked stub' }
@@ -164,43 +136,42 @@ export function Canvas({
           <span className="file">{step ? step.path : 'no file yet'}</span>
         )}
         <span className="head-spacer" />
-        {step && isFileCurrent && !isRunning && (
-          editing ? (
-            <button className="cv-btn" onClick={() => setEditing(false)} disabled={busy}>
-              ✕ Cancel
+        {canLive && (
+          <div className="cv-mode" role="tablist" aria-label="Canvas mode">
+            <button
+              className={`cv-mode-btn ${mode === 'history' ? 'active' : ''}`}
+              onClick={() => setMode('history')}
+              title="Review the agent's proof snapshots step by step"
+            >
+              History
             </button>
-          ) : (
-            <button className="cv-btn" onClick={beginEdit}>
-              ✎ Edit
+            <button
+              className={`cv-mode-btn ${mode === 'live' ? 'active' : ''}`}
+              onClick={() => setMode('live')}
+              title="Edit the proof with live Lean feedback (goals, hover, errors on every keystroke)"
+            >
+              Edit
             </button>
-          )
-        )}
-        {editing && (
-          <button className="cv-btn run" onClick={runCheck} disabled={busy}>
-            ▶ Run lean_check
-          </button>
+          </div>
         )}
         <button className="x" onClick={onClose} title="Hide canvas">
           ✕
         </button>
       </div>
 
-      {editing && (
-        <div className="edit-hint">
-          ✎ You're editing this file directly. Run <code>lean_check</code> to verify — Lea picks up
-          from whatever you leave here.
-        </div>
-      )}
-
+      {mode === 'live' && sessionId ? (
+        <LiveEditor sessionId={sessionId} locked={isRunning} onSave={onSaveAndCheck} onVerify={onVerify} />
+      ) : (
+        <>
       {total > 0 && (
         <div className="stepper">
-          <button className="nav" onClick={() => onIndexChange(safeIndex - 1)} disabled={safeIndex === 0 || editing}>
+          <button className="nav" onClick={() => onIndexChange(safeIndex - 1)} disabled={safeIndex === 0}>
             ‹
           </button>
           <button
             className="nav"
             onClick={() => onIndexChange(safeIndex + 1)}
-            disabled={safeIndex === total - 1 || editing}
+            disabled={safeIndex === total - 1}
           >
             ›
           </button>
@@ -218,43 +189,22 @@ export function Canvas({
         <div className="canvas-empty">Lean code will appear here as Lea edits files.</div>
       ) : (
         <div className="code-wrap">
-          {editing ? (
-            <pre
-              className="code editing"
-              contentEditable
-              suppressContentEditableWarning
-              onInput={(e) => setDraftCode((e.target as HTMLElement).innerText)}
-            >
-              {step.code}
-            </pre>
-          ) : (
-            <pre className="code">
-              {rows.map((row: any, i: number) => (
-                <div key={i} className={`ln ${row.kind === 'added' ? 'add' : ''}`}>
-                  <span className="gut">{row.newLineNumber ?? ''}</span>
-                  <span className="src">
-                    {renderLineTokens(tokenLines, row)}
-                    {row.line === '' ? ' ' : ''}
-                  </span>
-                </div>
-              ))}
-            </pre>
-          )}
+          <pre className="code">
+            {rows.map((row: any, i: number) => (
+              <div key={i} className={`ln ${row.kind === 'added' ? 'add' : ''}`}>
+                <span className="gut">{row.newLineNumber ?? ''}</span>
+                <span className="src">
+                  {renderLineTokens(tokenLines, row)}
+                  {row.line === '' ? ' ' : ''}
+                </span>
+              </div>
+            ))}
+          </pre>
         </div>
       )}
 
       <div className="canvas-foot">
-        {foot ? (
-          foot.kind === 'ok' ? (
-            <span className="badge compile">✓ {foot.text}</span>
-          ) : foot.kind === 'bad' ? (
-            <span className="err-detail">{foot.text}</span>
-          ) : foot.text.includes('contains sorry') ? (
-            <span className="badge stub">✓ {foot.text}</span>
-          ) : (
-            <span>{foot.text}</span>
-          )
-        ) : proofStatus === 'proved' ? (
+        {proofStatus === 'proved' ? (
           <span className="badge compile">✓ lean_check: 0 errors</span>
         ) : proofStatus === 'stubbed' ? (
           <span className="badge stub">✓ lean_check: 0 errors · contains sorry</span>
@@ -283,7 +233,6 @@ export function Canvas({
         ) : (
           step &&
           isFileCurrent &&
-          !editing &&
           !isRunning &&
           proofStatus === 'proved' && (
             <button className="cv-btn" onClick={runVerify} disabled={busy}>
@@ -292,6 +241,8 @@ export function Canvas({
           )
         )}
       </div>
+        </>
+      )}
     </section>
   );
 }

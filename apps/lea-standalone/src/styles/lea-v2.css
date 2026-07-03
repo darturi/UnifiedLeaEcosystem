@@ -204,6 +204,28 @@
 .composer .key-nudge-btn { flex: none; border: none; background: var(--accent); color: #fff; font-weight: 550;
   font-size: 12.5px; padding: 6px 12px; border-radius: 8px; cursor: pointer; }
 .composer .key-nudge-btn:hover { opacity: .92; }
+/* SafeVerify result box, surfaced above the composer from Edit mode (v2.2). */
+.composer .verify-box { max-width: 720px; margin: 0 auto 8px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--panel); overflow: hidden; }
+.composer .verify-box.ok { border-color: #bfe0c6; background: #eef7f0; }
+.composer .verify-box.bad { border-color: #eccdbf; background: var(--accent-soft); }
+.composer .verify-box.goal { border-color: #cdd8ea; background: #eef2f8; }
+.composer .verify-box.goal .verify-box-title { color: var(--blue, #4a6fa5); }
+.composer .verify-box-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px 7px 12px; }
+.composer .verify-box-title { font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
+.composer .verify-box.ok .verify-box-title { color: var(--green, #4f8a5b); }
+.composer .verify-box.bad .verify-box-title { color: var(--accent); }
+.composer .verify-box-spacer { flex: 1; }
+.composer .verify-box-icon { flex: none; width: 22px; height: 22px; display: grid; place-items: center;
+  border: none; background: transparent; color: var(--muted); border-radius: 6px; cursor: pointer; font-size: 12px; }
+.composer .verify-box-icon:hover { background: rgba(0,0,0,.06); color: var(--ink); }
+.composer .verify-box-detail { margin: 0; padding: 8px 12px; max-height: 180px; overflow: auto;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word;
+  color: var(--ink-2); border-top: 1px solid rgba(0,0,0,.06); }
+.composer .verify-box-actions { padding: 8px 12px 10px; }
+.composer .verify-box-fix { border: none; background: var(--accent); color: #fff; font-weight: 550;
+  font-size: 12.5px; padding: 6px 12px; border-radius: 8px; cursor: pointer; }
+.composer .verify-box-fix:hover { opacity: .92; }
 .composer-inner { max-width: 720px; margin: 0 auto; border: 1px solid var(--line); background: var(--panel);
   border-radius: 14px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
 .composer textarea { border: none; resize: none; outline: none; font: inherit; color: var(--ink); width: 100%; min-height: 22px; max-height: 200px; overflow-y: auto; background: transparent; }
@@ -234,6 +256,50 @@
 .canvas-head .cv-btn:disabled { opacity: .5; cursor: not-allowed; }
 .canvas-head .cv-btn.run { background: var(--accent); color: #fff; border-color: var(--accent); }
 .canvas-head .x { cursor: pointer; color: var(--muted); border: 1px solid var(--line); border-radius: 7px; width: 26px; height: 26px; display: grid; place-items: center; background: var(--panel); }
+
+/* Canvas mode toggle (v2.2): History (Shiki snapshots) | Live (lean4monaco). */
+.cv-mode { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.cv-mode-btn { font: inherit; font-size: 12px; padding: 4px 11px; cursor: pointer; border: none;
+  background: var(--panel); color: var(--muted); }
+.cv-mode-btn:hover { color: var(--ink-2); }
+.cv-mode-btn.active { background: var(--accent); color: #fff; }
+.cv-mode-btn + .cv-mode-btn { border-left: 1px solid var(--line); }
+
+/* Live editor (v2.2 · LF2/LF3): a Save/Reload bar, Monaco, then the InfoView. */
+.live-editor { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
+.live-editor-bar { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+  border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.live-editor-bar-spacer { flex: 1; }
+.live-editor-note { font-size: 12px; color: var(--muted); }
+.live-editor-note.err { color: var(--accent); }
+/* Save-state dot: green when in sync, amber while editing, blue while saving. */
+.live-editor-status-dot { width: 8px; height: 8px; border-radius: 99px; flex: none; background: var(--muted); }
+.live-editor-status-dot.clean, .live-editor-status-dot.saved { background: var(--green, #4f8a5b); }
+.live-editor-status-dot.dirty { background: var(--amber, #b8842a); }
+.live-editor-status-dot.saving { background: var(--blue, #4a6fa5); animation: liveSavePulse 1s ease-in-out infinite; }
+.live-editor-status-dot.locked { background: var(--muted); }
+@keyframes liveSavePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+/* SafeVerify result row under the bar (room for the audit detail to wrap). */
+.live-editor-verify { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.live-editor-status { padding: 8px 16px; font-size: 12.5px; color: var(--muted);
+  border-bottom: 1px solid var(--line); background: var(--panel-2); }
+.live-editor-status.err { color: var(--accent); }
+.live-editor-split { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+/* flex-basis is set inline (editorPct); the InfoView takes the remaining height. */
+.live-editor-monaco { flex-grow: 0; flex-shrink: 0; min-height: 48px; overflow: hidden; }
+.live-editor-infoview { flex: 1 1 0; min-height: 48px; overflow: hidden; background: #fff; }
+/* Draggable divider between the editor and the goal panel. */
+.live-editor-resizer { flex: none; height: 6px; cursor: row-resize; background: var(--line);
+  border-top: 1px solid var(--panel); border-bottom: 1px solid var(--panel); }
+.live-editor-resizer:hover { background: var(--accent); }
+.live-editor-split.dragging { cursor: row-resize; user-select: none; }
+/* While dragging, stop the InfoView iframe from swallowing the mousemove. */
+.live-editor-split.dragging .live-editor-infoview iframe { pointer-events: none; }
+/* lean4monaco appends a bare <iframe> for the InfoView and never sizes it — an
+   unstyled iframe is 300×150 by default, which is why the InfoView looked boxed.
+   Make it fill the panel so the goal state spans the full width/height. */
+.live-editor-infoview iframe { width: 100%; height: 100%; border: 0; display: block; }
 
 /* Canvas file selector (#10): pick which file is shown + verified. */
 .cv-file-select { position: relative; min-width: 0; }

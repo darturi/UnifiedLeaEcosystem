@@ -42,7 +42,7 @@ export function ModelCombobox({
   const trimmed = query.trim();
   const results = useMemo<ModelCatalogEntry[]>(() => {
     if (!trimmed) {
-      return featured.map((m) => ({ value: m.value, label: m.label, provider: m.family }));
+      return featured.map((m) => ({ value: m.value, label: m.label, provider: m.family ?? '' }));
     }
     const q = trimmed.toLowerCase();
     return catalog

@@ -58,6 +58,8 @@ export function useProofStream() {
       setRunResultKindById,
       setEditedPath,
       setSafeVerify,
+      setVerifySurface,
+      setGoalSurface,
     } = useProofSession.getState();
     useSessions.getState().setSelectedSessionId(detail.id);
     setMessages(detail.messages);
@@ -107,6 +109,8 @@ export function useProofStream() {
     setRunResultKindById(resultKinds);
     setEditedPath(undefined);
     setSafeVerify(detail.safe_verify || null);
+    setVerifySurface(null);
+    setGoalSurface(null);
     if (active && (active.status === 'running' || active.status === 'pending')) {
       attachStream(active.id, detail.id);
     }
