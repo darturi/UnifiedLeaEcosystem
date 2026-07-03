@@ -42,6 +42,12 @@ interface ProofSessionState {
   safeVerify: SafeVerifyResult | null;
   setSafeVerify: (safeVerify: SafeVerifyResult | null) => void;
 
+  // Edit-mode SafeVerify result surfaced as a collapsible box above the composer,
+  // so the user can dismiss it or push the error into the draft ("fix it"). Set on
+  // an Edit-mode SafeVerify run; cleared on dismiss / send / new session.
+  verifySurface: SafeVerifyResult | null;
+  setVerifySurface: (verifySurface: SafeVerifyResult | null) => void;
+
   // Lean proof snapshots for the session (stored raw; consumers sort via
   // sortCodeSteps) + the canvas stepper position. Written by the run stream /
   // session load; codeIndex follows the latest step or the user's stepper choice.
@@ -87,6 +93,9 @@ export const useProofSession = create<ProofSessionState>((set) => ({
 
   safeVerify: null,
   setSafeVerify: (safeVerify) => set({ safeVerify }),
+
+  verifySurface: null,
+  setVerifySurface: (verifySurface) => set({ verifySurface }),
 
   codeSteps: [],
   setCodeSteps: (codeSteps) => set({ codeSteps }),

@@ -69,6 +69,28 @@ export function ChatThread({
   const onModelChange = useModel((s) => s.changeModel);
   // R1a/R1b/R1c: read shared proof-session state straight from the store (no props).
   const editedPath = useProofSession((s) => s.editedPath);
+  // SafeVerify result surfaced from Edit mode as a box above the composer.
+  const verifySurface = useProofSession((s) => s.verifySurface);
+  const setVerifySurface = useProofSession((s) => s.setVerifySurface);
+  const [verifyCollapsed, setVerifyCollapsed] = useState(false);
+  // A fresh result re-opens the box (expanded).
+  useEffect(() => {
+    setVerifyCollapsed(false);
+  }, [verifySurface]);
+
+  // Push the SafeVerify output into the composer as a fix-it prompt, then focus so
+  // the user can add context or just send. Appends if the draft already has text.
+  const sendVerifyToDraft = () => {
+    if (!verifySurface) return;
+    const head =
+      verifySurface.status === 'ok'
+        ? 'SafeVerify passed, but here is the output:'
+        : `SafeVerify reported "${verifySurface.status}" on this proof:`;
+    const prompt = `${head}\n\n${verifySurface.detail ?? ''}\n\nPlease fix the proof so it passes SafeVerify.`.trim();
+    onDraftChange(draft.trim() ? `${draft.trim()}\n\n${prompt}` : prompt);
+    setVerifySurface(null);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
   const error = useProofSession((s) => s.error);
   const activeCodeIndex = useProofSession((s) => s.codeIndex);
   const messages = useProofSession((s) => s.messages);
@@ -415,6 +437,42 @@ export function ChatThread({
           <div className="edit-badge">
             ✎ You edited <code>{editedPath.split('/').pop()}</code> — describe your change so Lea
             picks up where you left off.
+          </div>
+        )}
+        {verifySurface && (
+          <div className={`verify-box ${verifySurface.status === 'ok' ? 'ok' : 'bad'}`}>
+            <div className="verify-box-head">
+              <span className="verify-box-title">
+                🛡 SafeVerify {verifySurface.status === 'ok' ? '✓ passed' : verifySurface.status}
+              </span>
+              <span className="verify-box-spacer" />
+              {verifySurface.detail && (
+                <button
+                  className="verify-box-icon"
+                  onClick={() => setVerifyCollapsed((c) => !c)}
+                  title={verifyCollapsed ? 'Expand' : 'Collapse'}
+                >
+                  {verifyCollapsed ? '▸' : '▾'}
+                </button>
+              )}
+              <button
+                className="verify-box-icon"
+                onClick={() => setVerifySurface(null)}
+                title="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+            {!verifyCollapsed && verifySurface.detail && (
+              <pre className="verify-box-detail">{verifySurface.detail}</pre>
+            )}
+            {verifySurface.status !== 'ok' && (
+              <div className="verify-box-actions">
+                <button className="verify-box-fix" onClick={sendVerifyToDraft}>
+                  ↑ Send to Lea to fix
+                </button>
+              </div>
+            )}
           </div>
         )}
         <div className="composer-inner">

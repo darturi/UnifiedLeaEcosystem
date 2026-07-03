@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
+import type { SafeVerifyResult } from '../lib/api';
+import { useProofSession } from '../stores/proofSession';
 
 type SaveResult = { status: string; detail?: string | null };
 
@@ -35,6 +37,11 @@ export function LiveEditor({
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
   const infoviewRef = useRef<HTMLDivElement>(null);
+  const splitRef = useRef<HTMLDivElement>(null);
+  // The editor/InfoView split is a draggable vertical divider: `editorPct` is the
+  // editor's share of the height; the InfoView takes the rest.
+  const [editorPct, setEditorPct] = useState(60);
+  const [dragging, setDragging] = useState(false);
   // Live handles + latest props kept in refs so the (once-registered) change
   // listener and the Save/Reload handlers read current values, never stale ones.
   /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -173,17 +180,50 @@ export function LiveEditor({
     if (save.state === 'dirty' || save.state === 'saving') setVerify({ state: 'idle' });
   }, [save.state]);
 
+  // Draggable split: translate cursor Y into the editor's height share, clamped so
+  // neither pane collapses. Listeners live on window so the drag continues off the
+  // 6px handle (and while dragging we disable iframe pointer-events below, so the
+  // InfoView doesn't swallow the mousemove).
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e: MouseEvent) => {
+      const rect = splitRef.current?.getBoundingClientRect();
+      if (!rect || rect.height === 0) return;
+      const pct = ((e.clientY - rect.top) / rect.height) * 100;
+      setEditorPct(Math.min(85, Math.max(15, pct)));
+    };
+    const onUp = () => setDragging(false);
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+    return () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+  }, [dragging]);
+
+  // Monaco doesn't reflow to a resized container on its own — relayout after the
+  // split ratio changes.
+  useEffect(() => {
+    editorApiRef.current?.editor?.layout();
+  }, [editorPct]);
+
   // SafeVerify runs on the *saved* on-disk file (kernel replay + axiom audit), so
   // it's only offered when the buffer is in sync (not mid-edit).
   const inSync = save.state === 'clean' || save.state === 'saved';
+  const setVerifySurface = useProofSession((s) => s.setVerifySurface);
   const handleVerify = async () => {
     if (!onVerify) return;
     setVerify({ state: 'running' });
+    setVerifySurface(null); // clear any prior box while this run is in flight
     try {
       const result = await onVerify(pathRef.current);
       setVerify({ state: 'done', status: result.status, detail: result.detail ?? undefined });
+      // Surface the result as a box above the composer (collapse / send-to-Lea).
+      setVerifySurface({ status: result.status, detail: result.detail ?? null } as SafeVerifyResult);
     } catch (err) {
-      setVerify({ state: 'done', status: 'error', detail: err instanceof Error ? err.message : String(err) });
+      const detail = err instanceof Error ? err.message : String(err);
+      setVerify({ state: 'done', status: 'error', detail });
+      setVerifySurface({ status: 'error', detail } as SafeVerifyResult);
     }
   };
 
@@ -228,7 +268,7 @@ export function LiveEditor({
             disabled={status !== 'ready' || !!locked || !inSync || verify.state === 'running'}
             title={inSync ? 'Kernel-audit the saved proof (SafeVerify)' : 'Save first — SafeVerify checks the saved file'}
           >
-            🛡 SafeVerify
+            {verify.state === 'running' ? '🛡 SafeVerify…' : '🛡 SafeVerify'}
           </button>
         )}
         <button
@@ -240,22 +280,16 @@ export function LiveEditor({
           ↻ Reload
         </button>
       </div>
-      {verify.state !== 'idle' && (
-        <div className="live-editor-verify">
-          {verify.state === 'running' ? (
-            <span className="badge idle">🛡 SafeVerify…</span>
-          ) : verify.status === 'ok' ? (
-            <span className="badge sv">🛡 SafeVerify ✓</span>
-          ) : (
-            <span className="sv-fail">
-              <span className="badge bad">🛡 SafeVerify {verify.status}</span>
-              {verify.detail && <span className="err-detail">{verify.detail}</span>}
-            </span>
-          )}
-        </div>
-      )}
-      <div className="live-editor-split">
-        <div ref={editorRef} className="live-editor-monaco" />
+      <div ref={splitRef} className={`live-editor-split ${dragging ? 'dragging' : ''}`}>
+        <div ref={editorRef} className="live-editor-monaco" style={{ flexBasis: `${editorPct}%` }} />
+        <div
+          className="live-editor-resizer"
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setDragging(true);
+          }}
+          title="Drag to resize the goal panel"
+        />
         <div ref={infoviewRef} className="live-editor-infoview vscode-light" />
       </div>
     </div>
