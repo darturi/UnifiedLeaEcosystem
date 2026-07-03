@@ -91,6 +91,23 @@ export function ChatThread({
     setVerifySurface(null);
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
+
+  // Shared InfoView: the goal state captured from the live editor, surfaced above
+  // the composer so the user can ask Lea about it.
+  const goalSurface = useProofSession((s) => s.goalSurface);
+  const setGoalSurface = useProofSession((s) => s.setGoalSurface);
+  const [goalCollapsed, setGoalCollapsed] = useState(false);
+  useEffect(() => {
+    setGoalCollapsed(false);
+  }, [goalSurface]);
+
+  const sendGoalToDraft = () => {
+    if (!goalSurface) return;
+    const text = `Here's the goal I'm working on (line ${goalSurface.line}):\n\n${goalSurface.rendered}\n\n`;
+    onDraftChange(draft.trim() ? `${draft.trim()}\n\n${text}` : text);
+    setGoalSurface(null);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
   const error = useProofSession((s) => s.error);
   const activeCodeIndex = useProofSession((s) => s.codeIndex);
   const messages = useProofSession((s) => s.messages);
@@ -473,6 +490,30 @@ export function ChatThread({
                 </button>
               </div>
             )}
+          </div>
+        )}
+        {goalSurface && (
+          <div className="verify-box goal">
+            <div className="verify-box-head">
+              <span className="verify-box-title">🧩 Goal at line {goalSurface.line}</span>
+              <span className="verify-box-spacer" />
+              <button
+                className="verify-box-icon"
+                onClick={() => setGoalCollapsed((c) => !c)}
+                title={goalCollapsed ? 'Expand' : 'Collapse'}
+              >
+                {goalCollapsed ? '▸' : '▾'}
+              </button>
+              <button className="verify-box-icon" onClick={() => setGoalSurface(null)} title="Dismiss">
+                ✕
+              </button>
+            </div>
+            {!goalCollapsed && <pre className="verify-box-detail">{goalSurface.rendered}</pre>}
+            <div className="verify-box-actions">
+              <button className="verify-box-fix" onClick={sendGoalToDraft}>
+                ↑ Ask Lea about this goal
+              </button>
+            </div>
           </div>
         )}
         <div className="composer-inner">

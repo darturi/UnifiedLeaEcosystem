@@ -102,6 +102,7 @@ export default function App() {
   // App sets it, Canvas reads it.
   const setSafeVerify = useProofSession((s) => s.setSafeVerify);
   const setVerifySurface = useProofSession((s) => s.setVerifySurface);
+  const setGoalSurface = useProofSession((s) => s.setGoalSurface);
   // Model state (active model, catalog, featured, key-missing) lives in the model
   // store (R4); ChatThread reads it directly. App only kicks off the startup load
   // (in the restore effect) + re-sync on returning from Settings.
@@ -272,6 +273,7 @@ export default function App() {
     setEditedPath(undefined);
     setSafeVerify(null);
     setVerifySurface(null);
+    setGoalSurface(null);
     window.localStorage.removeItem(SELECTED_SESSION_KEY);
   };
 

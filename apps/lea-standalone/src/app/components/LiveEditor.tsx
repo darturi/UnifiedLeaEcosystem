@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SafeVerifyResult } from '../lib/api';
+import { LeanQuery } from '../lib/leanQuery';
 import { useProofSession } from '../stores/proofSession';
 
 type SaveResult = { status: string; detail?: string | null };
@@ -47,6 +48,8 @@ export function LiveEditor({
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const editorApiRef = useRef<any>(null);
   /* eslint-enable @typescript-eslint/no-explicit-any */
+  // Typed Lean-LSP query layer, built once the editor is up (Phase 3).
+  const leanQueryRef = useRef<LeanQuery | null>(null);
   const pathRef = useRef<string>('');
   const onSaveRef = useRef(onSave);
   const lockedRef = useRef(locked);
@@ -138,6 +141,7 @@ export function LiveEditor({
         await leanMonacoEditor.start(editorRef.current!, info.fileName, info.content ?? '');
         if (disposed) return;
         editorApiRef.current = leanMonacoEditor;
+        leanQueryRef.current = new LeanQuery(leanMonaco, leanMonacoEditor.editor);
         leanMonacoEditor.editor?.updateOptions({ readOnly: !!lockedRef.current });
         // Auto-save on edit (unless the change was our own programmatic Reload).
         leanMonacoEditor.editor?.onDidChangeModelContent(() => {
@@ -157,6 +161,7 @@ export function LiveEditor({
       disposed = true;
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
       editorApiRef.current = null;
+      leanQueryRef.current = null;
       try {
         leanMonacoEditor?.dispose();
       } catch {
@@ -211,6 +216,39 @@ export function LiveEditor({
   // it's only offered when the buffer is in sync (not mid-edit).
   const inSync = save.state === 'clean' || save.state === 'saved';
   const setVerifySurface = useProofSession((s) => s.setVerifySurface);
+  const setGoalSurface = useProofSession((s) => s.setGoalSurface);
+  const [goalNote, setGoalNote] = useState<string | null>(null);
+
+  // Shared InfoView (Phase 3): ask the live LSP for the goal state at the cursor —
+  // the exact goals the InfoView shows — and surface it above the composer so the
+  // user can ask Lea about it. Queries the human's own session (current buffer,
+  // even mid-edit), so no save is required.
+  const handleAskGoal = async () => {
+    setGoalNote(null);
+    const q = leanQueryRef.current;
+    const pos = q?.cursor();
+    if (!q || !pos) {
+      setGoalNote('Editor not ready.');
+      return;
+    }
+    if (!q.ready()) {
+      setGoalNote('Lean server still starting — try again in a moment.');
+      return;
+    }
+    try {
+      const result = await q.plainGoal();
+      const goals = result?.goals ?? [];
+      const rendered = (result?.rendered ?? goals.join('\n\n')).trim();
+      if (!result || !rendered || goals.length === 0) {
+        // pos is the LSP 0-based position — the same numbering the InfoView shows.
+        setGoalNote(`No goal at ${pos.line}:${pos.character} — click inside a tactic proof.`);
+        return;
+      }
+      setGoalSurface({ rendered, line: pos.line });
+    } catch (err) {
+      setGoalNote(err instanceof Error ? err.message : String(err));
+    }
+  };
   const handleVerify = async () => {
     if (!onVerify) return;
     setVerify({ state: 'running' });
@@ -261,6 +299,15 @@ export function LiveEditor({
         <span className="live-editor-bar-spacer" />
         {status === 'loading' && <span className="live-editor-note">Starting Lean server…</span>}
         {status === 'error' && <span className="live-editor-note err">unavailable: {error}</span>}
+        {goalNote && <span className="live-editor-note">{goalNote}</span>}
+        <button
+          className="cv-btn"
+          onClick={handleAskGoal}
+          disabled={status !== 'ready'}
+          title="Grab the goal state at the cursor and ask Lea about it"
+        >
+          💬 Ask about goal
+        </button>
         {onVerify && (
           <button
             className="cv-btn"
