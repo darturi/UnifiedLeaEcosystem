@@ -305,6 +305,25 @@ http://localhost:5173/?session=<session_id>
 
 Set `LEA_UI_BASE_URL` if your Vite server is running elsewhere.
 
+## Export And GitHub Sharing
+
+The Lean pane header has two actions that operate on the document's Lea project
+(the same repo the Lea UI's Filesystem tab shows):
+
+- **Export** downloads the whole project as a zip (source + `.lea/` assets;
+  `.git`/`.lake` excluded), streamed from the adapter through the companion's
+  `GET /project-export`.
+- **Share** opens a panel to save a GitHub remote (`https://github.com/you/repo`)
+  and push the project's commits to its `main` branch. Pushing requires a GitHub
+  token, set either in the extension's settings popover ("GitHub sharing") or in
+  the Lea UI's Settings — it's the same token, stored only in the adapter's
+  `config/lea.local.toml` and never persisted by the companion or Chrome.
+
+Both actions resolve the project by the document's slug and never create one: a
+document with no formalized theorems yet has nothing to export. If a push is
+rejected because the GitHub repo has diverged, the error suggests asking Lea to
+reconcile the histories from a session — same recovery path as the Lea UI.
+
 ## Optional LaTeX Context
 
 The extension can mirror the active Overleaf editor buffer into the Lea workspace

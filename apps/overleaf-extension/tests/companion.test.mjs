@@ -15,8 +15,13 @@ import {
   handleFormalize,
   handleGetStatuses,
   handleGetUsage,
+  handleGithubTokenUpdate,
   handleLeanPaneManifest,
   handleMirrorTex,
+  handleProjectExport,
+  handleShareSetRemote,
+  handleShareStatus,
+  handleSharePush,
   handleStub,
   handleUpdateLeaSettings,
   recoverFormalizedStatusFromTargetPath,
@@ -3798,4 +3803,170 @@ test("chat message persists the association to disk when a path is configured", 
   const saved = JSON.parse(await fs.readFile(state.chatSessionsPath, "utf8"));
   assert.equal(saved["project-1:theorem:compactness_criterion"].leaSessionId, "sess-api-1");
   assert.equal(saved["project-1:theorem:compactness_criterion"].sourceHash, "hash-current");
+});
+
+// ── Export & GitHub sharing passthroughs (D34) ─────────────────────────────────
+
+// A fake adapter for the by-slug share/export routes. `routes` maps a URL
+// substring to { status, json } or { status, zip: bytes }; unmatched URLs 200 {}.
+function makeShareFetch(calls, routes = {}) {
+  return async (url, options = {}) => {
+    const u = String(url);
+    calls.push({ url: u, method: options.method || "GET", body: options.body ? JSON.parse(options.body) : null });
+    for (const [needle, spec] of Object.entries(routes)) {
+      if (!u.includes(needle)) continue;
+      if (spec.zip) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (h) => (h.toLowerCase() === "content-disposition" ? 'attachment; filename="doc-1.zip"' : "application/zip") },
+          arrayBuffer: async () => spec.zip.buffer.slice(spec.zip.byteOffset, spec.zip.byteOffset + spec.zip.byteLength)
+        };
+      }
+      return { ok: spec.status < 400, status: spec.status, text: async () => JSON.stringify(spec.json ?? {}) };
+    }
+    return { ok: true, status: 200, text: async () => "{}" };
+  };
+}
+
+test("share status maps the adapter's by-slug payload and treats 404 as 'no project yet'", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(calls, {
+      "/share": { status: 200, json: { id: "p1", slug: "doc-1", remote_url: "https://github.com/me/doc", token_configured: true } }
+    })
+  });
+
+  const res = await handleShareStatus({ overleafProjectId: "Doc 1" }, state);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, exists: true, remoteUrl: "https://github.com/me/doc", tokenConfigured: true });
+  assert.ok(calls.some((c) => c.url.includes(`/api/projects/by-slug/${slugProjectId("Doc 1")}/share`)));
+
+  // 404 (never-formalized document) is a calm "nothing to share yet", not an error.
+  const emptyState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], { "/share": { status: 404, json: { detail: "No Lea project exists for this document yet." } } })
+  });
+  const empty = await handleShareStatus({ overleafProjectId: "Doc 1" }, emptyState);
+  assert.equal(empty.statusCode, 200);
+  assert.deepEqual(empty.body, { ok: true, exists: false, remoteUrl: null, tokenConfigured: false });
+
+  // Missing project id → 400 before any adapter call.
+  const missing = await handleShareStatus({}, emptyState);
+  assert.equal(missing.statusCode, 400);
+  assert.equal(missing.body.error, "missing_project_id");
+});
+
+test("set remote forwards to the by-slug route and surfaces the adapter's detail on rejection", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(calls, {
+      "/git/remote": { status: 200, json: { id: "p1", remote_url: "https://github.com/me/doc" } }
+    })
+  });
+
+  const res = await handleShareSetRemote(
+    { overleafProjectId: "Doc 1", remoteUrl: "https://github.com/me/doc/" }, state
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.remoteUrl, "https://github.com/me/doc");
+  const call = calls.find((c) => c.url.includes("/git/remote"));
+  assert.equal(call.method, "PUT");
+  assert.deepEqual(call.body, { remote_url: "https://github.com/me/doc/" });
+
+  const badState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], { "/git/remote": { status: 400, json: { detail: "Enter an https GitHub repo URL, e.g. https://github.com/you/repo" } } })
+  });
+  const bad = await handleShareSetRemote({ overleafProjectId: "Doc 1", remoteUrl: "ftp://x" }, badState);
+  assert.equal(bad.statusCode, 400);
+  assert.match(bad.body.message, /https GitHub repo URL/);
+});
+
+test("push forwards the adapter's user-facing detail, including the diverged-history hint", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], {
+      "/git/push": { status: 200, json: { pushed: true, remote_url: "https://github.com/me/doc", detail: "Pushed." } }
+    })
+  });
+  const res = await handleSharePush({ overleafProjectId: "Doc 1" }, state);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, remoteUrl: "https://github.com/me/doc", detail: "Pushed." });
+
+  const divergedState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], {
+      "/git/push": { status: 502, json: { detail: "Push failed: rejected\n\nThe GitHub repo has commits this project doesn't — you can ask Lea to reconcile them." } }
+    })
+  });
+  const diverged = await handleSharePush({ overleafProjectId: "Doc 1" }, divergedState);
+  assert.equal(diverged.statusCode, 502);
+  assert.match(diverged.body.message, /reconcile/);
+});
+
+test("project export streams the adapter zip through and softens a 404", async () => {
+  const leaRepo = await makeLeaRepo();
+  const zipBytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3]); // PK\x03\x04…
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(calls, { "/export": { zip: zipBytes } })
+  });
+
+  const res = await handleProjectExport({ overleafProjectId: "Doc 1" }, state);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.zip.filename, "doc-1.zip");
+  assert.deepEqual(Array.from(res.zip.bytes), Array.from(zipBytes));
+  assert.ok(calls.some((c) => c.url.includes(`/api/projects/by-slug/${slugProjectId("Doc 1")}/export`)));
+
+  const emptyState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], { "/export": { status: 404, json: { detail: "No Lea project exists for this document yet." } } })
+  });
+  const empty = await handleProjectExport({ overleafProjectId: "Doc 1" }, emptyState);
+  assert.equal(empty.statusCode, 404);
+  assert.match(empty.body.message, /formalize a theorem first/i);
+});
+
+test("github token update writes through to adapter settings and reports presence only", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(calls, {
+      "/api/settings": { status: 200, json: { github_token: { configured: true, last4: "d3f4" } } }
+    })
+  });
+
+  const res = await handleGithubTokenUpdate({ value: "ghp_abcd1234d3f4" }, state);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, githubTokenConfigured: true });
+  const call = calls.find((c) => c.url.includes("/api/settings"));
+  assert.equal(call.method, "PUT");
+  assert.deepEqual(call.body, { github_token: { value: "ghp_abcd1234d3f4" } });
+  // The synced adapter settings now drive the settings response's presence flag.
+  assert.equal(state.adapterSettings?.github_token?.configured, true);
+
+  const clearCalls = [];
+  const clearState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(clearCalls, {
+      "/api/settings": { status: 200, json: { github_token: { configured: false, last4: null } } }
+    })
+  });
+  const cleared = await handleGithubTokenUpdate({ clear: true }, clearState);
+  assert.equal(cleared.statusCode, 200);
+  assert.equal(cleared.body.githubTokenConfigured, false);
+  assert.deepEqual(clearCalls.find((c) => c.url.includes("/api/settings")).body, { github_token: { clear: true } });
+
+  // Neither a value nor clear → 400, and no adapter call.
+  const noop = await handleGithubTokenUpdate({}, clearState);
+  assert.equal(noop.statusCode, 400);
+  assert.equal(noop.body.error, "missing_token");
 });

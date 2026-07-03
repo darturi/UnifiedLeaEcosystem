@@ -48,6 +48,11 @@
   let lastLeanPaneManifest = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
+  // Share panel (D34): remote + push against the adapter's project repo, via the
+  // companion's /share/github passthroughs. One panel, toggled from the header.
+  let leanPaneSharePanel = null;
+  let leanPaneShareState = null;
+  let leanPaneShareBusy = false;
   // Lean-pane chat mirror: a compact view of the same adapter session the full
   // Lea UI uses. One panel at a time; `leanPaneChatToken` invalidates stale
   // fetch/poll callbacks when the user switches items or closes the panel.
@@ -203,6 +208,22 @@
 
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-pane-controls";
+    const exportButton = document.createElement("button");
+    exportButton.type = "button";
+    exportButton.className = "ol-lean-pane-action";
+    exportButton.title = "Download the Lean project as a zip";
+    exportButton.textContent = "Export";
+    exportButton.addEventListener("click", () => {
+      exportLeanProject(exportButton).catch(renderLeanPaneError);
+    });
+    const shareButton = document.createElement("button");
+    shareButton.type = "button";
+    shareButton.className = "ol-lean-pane-action";
+    shareButton.title = "Share the Lean project to GitHub";
+    shareButton.textContent = "Share";
+    shareButton.addEventListener("click", () => {
+      toggleSharePanel().catch(renderLeanPaneError);
+    });
     const refresh = document.createElement("button");
     refresh.type = "button";
     refresh.className = "ol-lean-icon-button";
@@ -219,6 +240,8 @@
     close.setAttribute("aria-label", "Close Lean pane");
     close.textContent = "x";
     close.addEventListener("click", closeLeanPane);
+    controls.appendChild(exportButton);
+    controls.appendChild(shareButton);
     controls.appendChild(refresh);
     controls.appendChild(close);
     header.appendChild(titleWrap);
@@ -247,6 +270,9 @@
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
     closeLeanPaneChat();
+    leanPaneSharePanel = null;
+    leanPaneShareState = null;
+    leanPaneShareBusy = false;
     if (!leanPane) return;
     leanPane.remove();
     leanPane = null;
@@ -254,6 +280,204 @@
     leanPaneStatus = null;
     leanPaneExpandedTreeNodeIds = new Set();
     leanPaneTreeDefaultsKey = "";
+  }
+
+  // ── Export & GitHub sharing (D34) ──────────────────────────────────────────
+  // Both actions go through the companion (never :8001 directly): the zip is
+  // streamed from GET /project-export, and the share panel drives the
+  // /share/github status/remote/push passthroughs. All git/token mechanics stay
+  // in the adapter.
+
+  async function exportLeanProject(button) {
+    const projectId = extractOverleafProjectId();
+    const baseUrl = await chatCompanionBaseUrl();
+    const view = await ensureLeanPaneView();
+    if (button) button.disabled = true;
+    if (leanPaneStatus) leanPaneStatus.textContent = "Preparing the project zip...";
+    try {
+      const response = await fetch(
+        `${baseUrl}/project-export?overleafProjectId=${encodeURIComponent(projectId)}`
+      );
+      if (!response.ok) {
+        let message = `Export failed (HTTP ${response.status}).`;
+        try {
+          message = (await response.json())?.message || message;
+        } catch { /* keep the fallback */ }
+        if (leanPaneStatus) leanPaneStatus.textContent = message;
+        return;
+      }
+      const blob = await response.blob();
+      const filename = view.filenameFromContentDisposition(
+        response.headers.get("content-disposition"),
+        "lean-project.zip"
+      );
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      if (leanPaneStatus) leanPaneStatus.textContent = `Downloaded ${filename}.`;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function toggleSharePanel() {
+    if (leanPaneSharePanel) {
+      leanPaneSharePanel.remove();
+      leanPaneSharePanel = null;
+      return;
+    }
+    if (!leanPane) return;
+    await ensureLeanPaneView();
+
+    const panel = document.createElement("div");
+    panel.className = "ol-lean-share-panel";
+    panel.innerHTML = `
+      <label class="ol-lean-share-remote">
+        <span>GitHub remote</span>
+        <input type="url" autocomplete="off" spellcheck="false" placeholder="https://github.com/you/repo" data-role="share-remote">
+      </label>
+      <div class="ol-lean-share-actions">
+        <button type="button" class="ol-lean-provider-key-button" data-role="share-save">Save remote</button>
+        <button type="button" class="ol-lean-save-button" data-role="share-push">Push to GitHub</button>
+      </div>
+      <p class="ol-lean-share-hint" data-role="share-hint" hidden></p>
+      <p class="ol-lean-share-status" role="status" data-role="share-status">Loading share status...</p>
+    `;
+    leanPane.insertBefore(panel, leanPaneStatus);
+    leanPaneSharePanel = panel;
+
+    const input = panel.querySelector("[data-role='share-remote']");
+    input.addEventListener("input", () => renderShareControls());
+    panel.querySelector("[data-role='share-save']").addEventListener("click", () => {
+      saveShareRemote().catch((error) => setShareStatus(errorText(error)));
+    });
+    panel.querySelector("[data-role='share-push']").addEventListener("click", () => {
+      pushShareRemote().catch((error) => setShareStatus(errorText(error)));
+    });
+
+    try {
+      await loadShareStatus();
+    } catch (error) {
+      setShareStatus(errorText(error));
+    }
+  }
+
+  async function loadShareStatus() {
+    const projectId = extractOverleafProjectId();
+    const baseUrl = await chatCompanionBaseUrl();
+    const response = await fetch(
+      `${baseUrl}/share/github?overleafProjectId=${encodeURIComponent(projectId)}`
+    );
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body?.message || `Could not load share status (HTTP ${response.status}).`);
+    }
+    leanPaneShareState = {
+      exists: Boolean(body.exists),
+      remoteUrl: body.remoteUrl || null,
+      tokenConfigured: Boolean(body.tokenConfigured)
+    };
+    const input = leanPaneSharePanel?.querySelector("[data-role='share-remote']");
+    if (input) input.value = leanPaneShareState.remoteUrl || "";
+    setShareStatus("");
+    renderShareControls();
+  }
+
+  function renderShareControls() {
+    if (!leanPaneSharePanel) return;
+    const input = leanPaneSharePanel.querySelector("[data-role='share-remote']");
+    const save = leanPaneSharePanel.querySelector("[data-role='share-save']");
+    const push = leanPaneSharePanel.querySelector("[data-role='share-push']");
+    const hint = leanPaneSharePanel.querySelector("[data-role='share-hint']");
+    const controls = leanPaneView.deriveShareControls({
+      exists: Boolean(leanPaneShareState?.exists),
+      remoteUrl: leanPaneShareState?.remoteUrl || null,
+      draftRemote: input?.value,
+      tokenConfigured: Boolean(leanPaneShareState?.tokenConfigured),
+      busy: leanPaneShareBusy
+    });
+    if (input) input.disabled = leanPaneShareBusy || !leanPaneShareState?.exists;
+    if (save) save.disabled = !controls.canSave;
+    if (push) {
+      push.disabled = !controls.canPush;
+      push.textContent = leanPaneShareBusy ? "Working..." : "Push to GitHub";
+    }
+    if (hint) {
+      hint.textContent = controls.hint;
+      hint.hidden = !controls.hint;
+    }
+  }
+
+  function setShareStatus(text) {
+    const status = leanPaneSharePanel?.querySelector("[data-role='share-status']");
+    if (status) status.textContent = text || "";
+  }
+
+  async function saveShareRemote() {
+    const input = leanPaneSharePanel?.querySelector("[data-role='share-remote']");
+    const remoteUrl = String(input?.value || "").trim();
+    if (!remoteUrl) return;
+    const projectId = extractOverleafProjectId();
+    const baseUrl = await chatCompanionBaseUrl();
+    leanPaneShareBusy = true;
+    renderShareControls();
+    setShareStatus("Saving remote...");
+    try {
+      const response = await fetch(`${baseUrl}/share/github/remote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overleafProjectId: projectId, remoteUrl })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setShareStatus(body?.message || `Could not save the remote (HTTP ${response.status}).`);
+        return;
+      }
+      leanPaneShareState = { ...leanPaneShareState, remoteUrl: body.remoteUrl || remoteUrl };
+      if (input) input.value = leanPaneShareState.remoteUrl;
+      setShareStatus("Remote saved.");
+    } finally {
+      leanPaneShareBusy = false;
+      renderShareControls();
+    }
+  }
+
+  async function pushShareRemote() {
+    const remote = leanPaneShareState?.remoteUrl;
+    if (!remote) return;
+    if (!window.confirm(`Push this project to ${remote}?\n\nThis pushes the Lea project's commits to the repo's main branch.`)) {
+      return;
+    }
+    const projectId = extractOverleafProjectId();
+    const baseUrl = await chatCompanionBaseUrl();
+    leanPaneShareBusy = true;
+    renderShareControls();
+    setShareStatus("Pushing to GitHub...");
+    try {
+      const response = await fetch(`${baseUrl}/share/github/push`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overleafProjectId: projectId })
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        setShareStatus(body?.message || `Push failed (HTTP ${response.status}).`);
+        return;
+      }
+      setShareStatus(`Pushed to ${body.remoteUrl || remote}.`);
+    } finally {
+      leanPaneShareBusy = false;
+      renderShareControls();
+    }
+  }
+
+  function errorText(error) {
+    return error instanceof Error ? error.message : String(error);
   }
 
   // Load the pure pane helpers once. The pane is only built on user click (well
@@ -1635,6 +1859,22 @@
             </div>
           `).join("")}
         </section>
+        <section class="ol-lean-provider-panel" data-role="github-token-panel">
+          <div class="ol-lean-provider-title">GitHub sharing</div>
+          <p class="ol-lean-provider-note">The push token is stored by Lea (lea.local.toml) — never in Chrome. It enables Push in the Lean pane's Share panel.</p>
+          <div class="ol-lean-provider-row">
+            <div class="ol-lean-provider-row-head">
+              <span>Push token</span>
+              <strong data-role="github-token-status">Missing</strong>
+            </div>
+            <div class="ol-lean-provider-key-controls">
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-toggle">Add token</button>
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-clear" hidden>Remove</button>
+              <input type="password" autocomplete="off" spellcheck="false" data-role="github-token-input" placeholder="GitHub token (repo scope)" hidden>
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-save" hidden>Save token</button>
+            </div>
+          </div>
+        </section>
         <section class="ol-lean-settings-panel">
           <label>
             <span>Model</span>
@@ -1685,6 +1925,50 @@
         markSettingsDirty();
       });
     }
+
+    // GitHub push token (D34): saved immediately via its own companion endpoint
+    // (write-through to the adapter's lea.local.toml), independent of the main
+    // "Save changes" flow. Presence-only display; the raw token is never read back.
+    const githubToggle = popover.querySelector("[data-role='github-token-toggle']");
+    const githubClear = popover.querySelector("[data-role='github-token-clear']");
+    const githubInput = popover.querySelector("[data-role='github-token-input']");
+    const githubSave = popover.querySelector("[data-role='github-token-save']");
+    githubToggle.addEventListener("click", () => {
+      githubInput.hidden = false;
+      githubSave.hidden = false;
+      githubInput.focus();
+    });
+    githubSave.addEventListener("click", async () => {
+      const value = githubInput.value.trim();
+      if (!value) return;
+      githubSave.disabled = true;
+      status.textContent = "Saving GitHub token...";
+      try {
+        await updateGithubToken({ value });
+        githubInput.value = "";
+        githubInput.hidden = true;
+        githubSave.hidden = true;
+        renderGithubTokenStatus(popover, true);
+        status.textContent = "GitHub token saved.";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error);
+      } finally {
+        githubSave.disabled = false;
+      }
+    });
+    githubClear.addEventListener("click", async () => {
+      githubClear.disabled = true;
+      status.textContent = "Removing GitHub token...";
+      try {
+        await updateGithubToken({ clear: true });
+        renderGithubTokenStatus(popover, false);
+        status.textContent = "GitHub token removed.";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error);
+      } finally {
+        githubClear.disabled = false;
+      }
+    });
     saveButton.addEventListener("click", async () => {
       saveButton.disabled = true;
       status.textContent = "Saving Lea settings...";
@@ -2368,11 +2652,43 @@
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
     maxSpendInput.value = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     texMirrorInput.checked = settings.leaTexMirrorEnabled !== false;
+    renderGithubTokenStatus(popover, Boolean(settings.githubTokenConfigured));
     popover.dataset.savedModel = modelSelect.value;
     popover.dataset.savedMaxTurns = String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS);
     popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     popover.dataset.savedTexMirror = String(texMirrorInput.checked);
     popover.querySelector("[data-role='save-settings']").disabled = true;
+  }
+
+  function renderGithubTokenStatus(popover, configured) {
+    const panel = popover.querySelector("[data-role='github-token-panel']");
+    const chip = popover.querySelector("[data-role='github-token-status']");
+    const toggle = popover.querySelector("[data-role='github-token-toggle']");
+    const clear = popover.querySelector("[data-role='github-token-clear']");
+    if (!chip) return;
+    // Same configured-state styling hook as the provider-key rows.
+    const row = panel?.querySelector(".ol-lean-provider-row");
+    if (row) row.dataset.configured = configured ? "true" : "false";
+    chip.textContent = configured ? "Configured" : "Missing";
+    if (toggle) toggle.textContent = configured ? "Replace token" : "Add token";
+    if (clear) clear.hidden = !configured;
+  }
+
+  // POST /settings/github-token: { value } saves, { clear: true } removes. The
+  // companion writes through to the adapter's settings and never persists the
+  // token itself.
+  async function updateGithubToken(payload) {
+    const baseUrl = await chatCompanionBaseUrl();
+    const response = await fetch(`${baseUrl}/settings/github-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body?.message || `Could not update the GitHub token (HTTP ${response.status}).`);
+    }
+    return body;
   }
 
   function renderModelOptions(select, options, selectedModel, providerKeys = {}) {

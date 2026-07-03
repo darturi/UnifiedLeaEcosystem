@@ -41,15 +41,19 @@ import {
 } from "./leanDependencyGraph.mjs";
 import { classifyEdit, cascadeRequired, parseDeclarationHeader } from "./leanSignatureDiff.mjs";
 import {
+  exportProjectZipBySlug,
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
+  fetchProjectShareStatus,
   interruptApiRun,
   mirrorProjectTexFiles,
+  pushProjectBySlug,
   putAdapterSettings,
   runApiProofJob,
   runApiSessionLeanCheck,
   rebuildApiSessionModule,
+  setProjectRemoteBySlug,
   writeApiSessionFile
 } from "./leaApiClient.mjs";
 
@@ -421,6 +425,131 @@ export async function handleMirrorTex(payload, state) {
     return errorResponse(result.status || 502, "mirror_failed", result.error || "Could not mirror .tex to the Lea adapter.");
   }
   return { statusCode: 200, body: { ok: true, summary: result.body } };
+}
+
+// --- Export & GitHub sharing (D34) ------------------------------------------
+// Thin passthroughs to the adapter's by-slug export/share routes, resolved from
+// the Overleaf project id the same way mirror/formalize are. The companion adds
+// no logic of its own: the adapter owns the git repo, the remote validation, the
+// token (never readable back), and the push mechanics.
+
+// Resolve the shared (overleafProjectId → slug, adapter baseUrl) pair every share
+// handler needs, or an errorResponse.
+function resolveShareTarget(payload, state) {
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  if (!overleafProjectId.trim()) {
+    return { error: errorResponse(400, "missing_project_id", "overleafProjectId is required.") };
+  }
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return { error: errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.") };
+  }
+  return { slug: slugProjectId(overleafProjectId), baseUrl, fetchImpl: state.fetchImpl || fetch };
+}
+
+// The adapter's error `detail` strings are already user-facing (including the
+// diverged-history "ask Lea to reconcile" hint) — forward them verbatim.
+function adapterDetail(result, fallback) {
+  const detail = result.body?.detail;
+  if (typeof detail === "string" && detail) return detail;
+  return result.error || fallback;
+}
+
+export async function handleShareStatus(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const result = await fetchProjectShareStatus(target);
+  if (!result.ok) {
+    if (result.status === 404) {
+      // Not an error for the pane: the document simply has no Lea project yet.
+      return { statusCode: 200, body: { ok: true, exists: false, remoteUrl: null, tokenConfigured: false } };
+    }
+    return errorResponse(result.status || 502, "share_status_failed", adapterDetail(result, "Could not reach the Lea adapter."));
+  }
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      exists: true,
+      remoteUrl: result.body?.remote_url || null,
+      tokenConfigured: Boolean(result.body?.token_configured)
+    }
+  };
+}
+
+export async function handleShareSetRemote(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const remoteUrl = String(payload.remoteUrl || "").trim();
+  if (!remoteUrl) {
+    return errorResponse(400, "missing_remote_url", "remoteUrl is required.");
+  }
+  const result = await setProjectRemoteBySlug({ ...target, remoteUrl });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, "share_remote_failed", adapterDetail(result, "Could not save the remote."));
+  }
+  return { statusCode: 200, body: { ok: true, remoteUrl: result.body?.remote_url || remoteUrl } };
+}
+
+export async function handleSharePush(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const result = await pushProjectBySlug(target);
+  if (!result.ok) {
+    return errorResponse(result.status || 502, "share_push_failed", adapterDetail(result, "Push failed."));
+  }
+  return {
+    statusCode: 200,
+    body: { ok: true, remoteUrl: result.body?.remote_url || null, detail: result.body?.detail || "Pushed." }
+  };
+}
+
+// Zip download. Success returns `{ statusCode: 200, zip: { bytes, filename, contentType } }`
+// (routeRequest streams it); failure returns the usual `{ statusCode, body }`.
+export async function handleProjectExport(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const result = await exportProjectZipBySlug(target);
+  if (!result.ok) {
+    const message = result.status === 404
+      ? "No Lea project exists for this document yet — formalize a theorem first."
+      : adapterDetail(result, "Could not export the project.");
+    return errorResponse(result.status || 502, "export_failed", message);
+  }
+  return { statusCode: 200, zip: { bytes: result.bytes, filename: result.filename, contentType: result.contentType } };
+}
+
+// Save/clear the global GitHub push token, stored solely in the adapter's
+// `lea.local.toml` ({ value } | { clear: true } — the same shape the Lea UI
+// sends). The companion never persists or logs it; the response carries presence
+// only.
+export async function handleGithubTokenUpdate(payload, state) {
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
+  }
+  const clear = payload.clear === true;
+  const value = String(payload.value || "").trim();
+  if (!clear && !value) {
+    return errorResponse(400, "missing_token", "Provide a GitHub token, or clear: true to remove it.");
+  }
+  const result = await putAdapterSettings({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    body: { github_token: clear ? { clear: true } : { value } }
+  });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, "github_token_failed", adapterDetail(result, "Could not update the GitHub token."));
+  }
+  if (result.body && typeof result.body === "object") state.adapterSettings = result.body;
+  return {
+    statusCode: 200,
+    body: { ok: true, githubTokenConfigured: Boolean(result.body?.github_token?.configured) }
+  };
 }
 
 export async function handleLeanPaneManifest(payload, state) {
@@ -1668,6 +1797,50 @@ async function routeRequest(request, response, state) {
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/project-export") {
+    const result = await handleProjectExport({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || ""
+    }, state);
+    if (result.zip) {
+      setCorsHeaders(response);
+      response.writeHead(200, {
+        "Content-Type": result.zip.contentType || "application/zip",
+        "Content-Disposition": `attachment; filename="${result.zip.filename}"`,
+        "Content-Length": result.zip.bytes.byteLength
+      });
+      response.end(Buffer.from(result.zip.bytes));
+      return;
+    }
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/share/github") {
+    const result = await handleShareStatus({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || ""
+    }, state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/share/github/remote") {
+    const result = await handleShareSetRemote(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/share/github/push") {
+    const result = await handleSharePush(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/settings/github-token") {
+    const result = await handleGithubTokenUpdate(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/lean-pane/manifest") {
     const result = await handleLeanPaneManifest(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
@@ -1763,7 +1936,10 @@ export async function buildSettingsResponse(state) {
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
     leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
     leaTexMirrorEnabled: state.settings.leaTexMirrorEnabled !== false,
-    leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
+    leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS,
+    // Presence only (like provider keys): the raw token lives solely in the
+    // adapter's lea.local.toml and is set via POST /settings/github-token (D34).
+    githubTokenConfigured: Boolean(state.adapterSettings?.github_token?.configured)
   };
 }
 

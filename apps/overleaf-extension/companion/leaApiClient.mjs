@@ -146,6 +146,74 @@ export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files }) {
   });
 }
 
+// --- Export & GitHub sharing (D34, by-slug) ---------------------------------
+// The adapter's by-slug routes mirror the Lea UI's by-id export/share surface but
+// are keyed by the same document slug the mirror/run paths use. None of them ever
+// create a project — an unknown slug is a 404 ("nothing to export yet").
+
+export function fetchProjectShareStatus({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/share`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+export function setProjectRemoteBySlug({ fetchImpl, baseUrl, slug, remoteUrl }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/git/remote`, {
+    method: "PUT",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ remote_url: remoteUrl }),
+  });
+}
+
+export function pushProjectBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/git/push`, {
+    method: "POST",
+    headers: buildHeaders(null),
+  });
+}
+
+// Pull `filename="…"` out of a Content-Disposition header (the adapter always
+// quotes it). Exported for tests.
+export function filenameFromContentDisposition(header) {
+  const match = /filename="([^"]+)"/.exec(String(header || ""));
+  return match ? match[1] : null;
+}
+
+// Binary download — the one client call that can't go through fetchJson. Returns
+// `{ ok, status, bytes: Uint8Array, filename, contentType }` on success and the
+// familiar `{ ok:false, status?, error }` shape on failure (the error body is the
+// adapter's JSON `detail` when present).
+export async function exportProjectZipBySlug({ fetchImpl, baseUrl, slug }) {
+  const url = `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/export`;
+  let response;
+  try {
+    response = await fetchImpl(url, { method: "GET", headers: buildHeaders(null) });
+  } catch (error) {
+    return { ok: false, error: `Request to ${url} failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    const text = await response.text().catch(() => "");
+    if (text) {
+      try {
+        detail = JSON.parse(text)?.detail || detail;
+      } catch {
+        /* non-JSON error body — keep the status line */
+      }
+    }
+    return { ok: false, status: response.status, error: detail };
+  }
+  const buf = await response.arrayBuffer();
+  return {
+    ok: true,
+    status: response.status,
+    bytes: new Uint8Array(buf),
+    filename: filenameFromContentDisposition(response.headers?.get?.("content-disposition")) || `${slug}.zip`,
+    contentType: response.headers?.get?.("content-type") || "application/zip",
+  };
+}
+
 export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, origin = null, originUrl = null }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
