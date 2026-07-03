@@ -160,7 +160,7 @@ export function Canvas({
       </div>
 
       {mode === 'live' && sessionId ? (
-        <LiveEditor sessionId={sessionId} locked={isRunning} onSave={onSaveAndCheck} />
+        <LiveEditor sessionId={sessionId} locked={isRunning} onSave={onSaveAndCheck} onVerify={onVerify} />
       ) : (
         <>
       {total > 0 && (

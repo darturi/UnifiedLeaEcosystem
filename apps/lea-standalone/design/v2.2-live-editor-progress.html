@@ -93,8 +93,13 @@
     tested → done; <b>you test on the UI</b>.
   </div>
 
-  <div class="bar"><i style="width:80%"></i></div>
-  <div class="counts"><b>1 / 7 tested · 6 / 7 built</b> · 3 backend + 4 frontend across 2 phases ·
+  <div class="bar"><i style="width:100%"></i></div>
+  <div class="counts"><b>2 / 7 tested · 7 / 7 built · Phases 1–2 complete</b> · 3 backend + 4 frontend ·
+    Follow-ups landed: the <b>modal lock is now enforced server-side</b> (<code>POST /file</code> 409s during an
+    active run) and rapid <b>auto-saves coalesce</b> into one History step (both <b>+3 tests</b>, <b>L3 tested</b>);
+    <b>SafeVerify in Edit mode</b> + unicode abbreviations (<code>\to→→</code>, inherent) round out <b>LF4</b>.
+    Adapter <b>267 passed</b>; frontend <b>42 passed</b>; <code>tsc</code> clean; build green. Only <b>Phase 3</b>
+    (below) remains. · 3 backend + 4 frontend across 2 phases ·
     <b>Phase 1 confirmed live in the browser</b> (real goals/hover/diagnostics through the WS proxy) ·
     <b>Phase 2 merged the modes</b>: per your call, "Live" <b>became "Edit"</b> — one editable Monaco mode where the
     LSP checks every keystroke — and the old contentEditable "✎ Edit → Run lean_check" hack was <b>retired</b>
@@ -200,7 +205,7 @@
 
     <div class="todo">
       <div class="top"><span class="id">L3</span><span class="title">Save flow (buffer→git) + modal lock vs. runs</span>
-        <span class="tag be">backend</span><span class="dec">D62</span><span class="badge b-built">Built</span></div>
+        <span class="tag be">backend</span><span class="dec">D62</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Save persists the Monaco buffer through the <b>existing</b>
         <code>POST /sessions/{id}/file</code> → git commit (<code>author=user</code>, invalidates stale SafeVerify —
         already implemented). <b>Modal lock</b>: a session is human-editing <b>xor</b> has an active agent run —
@@ -219,7 +224,7 @@
     </div>
     <div class="todo">
       <div class="top"><span class="id fe">LF4</span><span class="title">Abbreviations / keybindings / SafeVerify on live buffer</span>
-        <span class="tag fe">frontend</span><span class="dec">D66</span><span class="badge b-queued">Queued</span></div>
+        <span class="tag fe">frontend</span><span class="dec">D66</span><span class="badge b-built">Built</span></div>
       <div class="scope">Confirm unicode abbreviations (<code>\to → →</code>) + LSP keybindings from
         <code>lean4monaco</code>; make the <b>Run lean_check</b> / <b>Run SafeVerify</b> buttons act on the live
         buffer's <b>saved</b> file (they already take a <code>path</code> — no server change). Polish: layout,

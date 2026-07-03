@@ -257,6 +257,9 @@
 .live-editor-status-dot.saving { background: var(--blue, #4a6fa5); animation: liveSavePulse 1s ease-in-out infinite; }
 .live-editor-status-dot.locked { background: var(--muted); }
 @keyframes liveSavePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+/* SafeVerify result row under the bar (room for the audit detail to wrap). */
+.live-editor-verify { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
 .live-editor-status { padding: 8px 16px; font-size: 12.5px; color: var(--muted);
   border-bottom: 1px solid var(--line); background: var(--panel-2); }
 .live-editor-status.err { color: var(--accent); }

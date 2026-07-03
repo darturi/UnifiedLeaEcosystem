@@ -26,10 +26,12 @@ export function LiveEditor({
   sessionId,
   locked,
   onSave,
+  onVerify,
 }: {
   sessionId: string;
   locked?: boolean;
   onSave?: (content: string, path: string) => Promise<SaveResult>;
+  onVerify?: (path: string) => Promise<SaveResult>;
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
   const infoviewRef = useRef<HTMLDivElement>(null);
@@ -54,6 +56,9 @@ export function LiveEditor({
   // saving / saved. `detail` carries the lean_check verdict once saved.
   const [save, setSave] = useState<{ state: 'clean' | 'dirty' | 'saving' | 'saved'; detail: string }>(
     { state: 'clean', detail: '' },
+  );
+  const [verify, setVerify] = useState<{ state: 'idle' | 'running' | 'done'; status?: string; detail?: string }>(
+    { state: 'idle' },
   );
 
   useEffect(() => {
@@ -163,6 +168,25 @@ export function LiveEditor({
     editorApiRef.current?.editor?.updateOptions({ readOnly: !!locked });
   }, [locked]);
 
+  // A fresh edit makes any prior SafeVerify verdict stale — clear it.
+  useEffect(() => {
+    if (save.state === 'dirty' || save.state === 'saving') setVerify({ state: 'idle' });
+  }, [save.state]);
+
+  // SafeVerify runs on the *saved* on-disk file (kernel replay + axiom audit), so
+  // it's only offered when the buffer is in sync (not mid-edit).
+  const inSync = save.state === 'clean' || save.state === 'saved';
+  const handleVerify = async () => {
+    if (!onVerify) return;
+    setVerify({ state: 'running' });
+    try {
+      const result = await onVerify(pathRef.current);
+      setVerify({ state: 'done', status: result.status, detail: result.detail ?? undefined });
+    } catch (err) {
+      setVerify({ state: 'done', status: 'error', detail: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
   // Pull the latest on-disk file (e.g. after the agent edited it) into the buffer.
   // Suppress the resulting change event so it isn't treated as a user edit.
   const handleReload = async () => {
@@ -197,6 +221,16 @@ export function LiveEditor({
         <span className="live-editor-bar-spacer" />
         {status === 'loading' && <span className="live-editor-note">Starting Lean server…</span>}
         {status === 'error' && <span className="live-editor-note err">unavailable: {error}</span>}
+        {onVerify && (
+          <button
+            className="cv-btn"
+            onClick={handleVerify}
+            disabled={status !== 'ready' || !!locked || !inSync || verify.state === 'running'}
+            title={inSync ? 'Kernel-audit the saved proof (SafeVerify)' : 'Save first — SafeVerify checks the saved file'}
+          >
+            🛡 SafeVerify
+          </button>
+        )}
         <button
           className="cv-btn"
           onClick={handleReload}
@@ -206,6 +240,20 @@ export function LiveEditor({
           ↻ Reload
         </button>
       </div>
+      {verify.state !== 'idle' && (
+        <div className="live-editor-verify">
+          {verify.state === 'running' ? (
+            <span className="badge idle">🛡 SafeVerify…</span>
+          ) : verify.status === 'ok' ? (
+            <span className="badge sv">🛡 SafeVerify ✓</span>
+          ) : (
+            <span className="sv-fail">
+              <span className="badge bad">🛡 SafeVerify {verify.status}</span>
+              {verify.detail && <span className="err-detail">{verify.detail}</span>}
+            </span>
+          )}
+        </div>
+      )}
       <div className="live-editor-split">
         <div ref={editorRef} className="live-editor-monaco" />
         <div ref={infoviewRef} className="live-editor-infoview vscode-light" />
