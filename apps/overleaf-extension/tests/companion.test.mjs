@@ -19,6 +19,7 @@ import {
   handleMirrorTex,
   handleStub,
   handleUpdateLeaSettings,
+  recoverFormalizedStatusFromTargetPath,
   recoverInterruptedJobs,
   resolveProofOutcome,
   validateLeaRepo
@@ -385,6 +386,379 @@ test("lean pane manifest surfaces a disproof as a counterexample, not a failure"
   assert.equal(res.body.items[0].status, "disproved");
 });
 
+test("lean pane manifest surfaces needs_review as its own badge, not invalid (regression)", async () => {
+  // Reproduces the real bug: a job finished `needs_review` with no markdown
+  // entry recorded (mirrors production, where markdown recording was skipped
+  // entirely for this resultKind before the fix) and no other local evidence.
+  // Before the fix this fell through to the unconditional failedJob branch and
+  // showed `invalid` -- indistinguishable from actually-broken code. It must
+  // now show its own `needs-review` badge instead.
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.needsReview = {
+    jobId: "needsReview",
+    jobKey: "project-1:theorem:compactness_corollary",
+    status: "needs_review",
+    finalStatus: "needs_review",
+    resultKind: "needs_review",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    declarationName: "compactness_corollary",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:corollary}",
+        "% lea: formalize label=compactness_corollary",
+        "A consequence that should follow from compactness_criterion.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "needs-review");
+});
+
+// The terminal-outcome branches in getTheoremStatus used pairwise recency
+// guards -- and the formalized branch's guards predated needs_review, so an
+// OLDER formalized job kept shadowing a NEWER needs_review re-run: the chip
+// stayed "valid" after a re-run the prover itself flagged. Now one selection
+// picks the newest terminal job; these two tests pin both directions.
+test("lean pane manifest: a newer needs_review re-run beats an older formalized job (regression)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const base = {
+    jobKey: "project-1:theorem:compactness_corollary",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    declarationName: "compactness_corollary",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173"
+  };
+  state.jobs.older = {
+    ...base,
+    jobId: "older",
+    status: "formalized",
+    finalStatus: "formalized",
+    resultKind: "proved",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+  state.jobs.newer = {
+    ...base,
+    jobId: "newer",
+    status: "needs_review",
+    finalStatus: "needs_review",
+    resultKind: "needs_review",
+    startedAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:corollary}",
+        "% lea: formalize label=compactness_corollary",
+        "A consequence.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "needs-review");
+});
+
+test("lean pane manifest: a newer formalized re-run beats an older needs_review job", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const base = {
+    jobKey: "project-1:theorem:compactness_corollary",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    declarationName: "compactness_corollary",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173"
+  };
+  state.jobs.older = {
+    ...base,
+    jobId: "older",
+    status: "needs_review",
+    finalStatus: "needs_review",
+    resultKind: "needs_review",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+  state.jobs.newer = {
+    ...base,
+    jobId: "newer",
+    status: "formalized",
+    finalStatus: "formalized",
+    resultKind: "proved",
+    startedAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:corollary}",
+        "% lea: formalize label=compactness_corollary",
+        "A consequence.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "valid");
+});
+
+// Regression for the live report: manually editing a proved theorem's proof
+// to `sorry` left its pane chip reading "valid". `sorry` COMPILES (warning,
+// not error), so the edit's own lean-check verdict stays "ok" and no override
+// fires -- and the formalized job's cached verdict then shadowed the fresh
+// file evidence (mappedStatus correctly re-derived sorry_stub from the file
+// on disk). Fresh stub evidence must now beat the stale job verdict.
+test("lean pane manifest demotes a formalized item to stub-generated when its file now contains a sorry", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  sorry\n");
+  state.jobs.a = {
+    jobId: "a",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    finalStatus: "formalized",
+    resultKind: "proved",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    recordedProofPath: proofPath,
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "Every open cover has a finite subcover.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+
+  const withSorry = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(withSorry.statusCode, 200);
+  assert.equal(withSorry.body.items[0].status, "stub-generated");
+
+  // ...and once the file is a real proof again, the chip returns to valid.
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  trivial\n");
+  const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(fixed.body.items[0].status, "valid");
+});
+
+// The other half of the same report: the DEPENDENT (whose import is now a
+// sorry stub) showed the amber "!" on its document badge but a plain "valid"
+// chip in the pane -- the doc overlay renders statusInfo.stubbedTheoremUses,
+// while the pane enrichment silently dropped that field. The pane item now
+// carries it too.
+test("lean pane manifest surfaces stubbed-import uses on the dependent's pane item, matching the doc badge", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const criterionPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  const corollaryPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_corollary.lean");
+  await writeLeaProjectProof(leaRepo, criterionPath, "theorem compactness_criterion : True := by\n  sorry\n");
+  await writeLeaProjectProof(
+    leaRepo,
+    corollaryPath,
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  trivial\n"
+  );
+  state.jobs.criterion = {
+    jobId: "criterion",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    recordedProofPath: criterionPath,
+    moduleName: "Lea.Project1.compactness_criterion",
+    targetTextHash: "",
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+  state.jobs.corollary = {
+    jobId: "corollary",
+    jobKey: "project-1:theorem:compactness_corollary",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    declarationName: "compactness_corollary",
+    recordedProofPath: corollaryPath,
+    moduleName: "Lea.Project1.compactness_corollary",
+    targetUses: [{
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      moduleName: "Lea.Project1.compactness_criterion"
+    }],
+    targetTextHash: "",
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "Every open cover has a finite subcover.",
+      "\\end{theorem}",
+      "\\begin{theorem}\\label{thm:corollary}",
+      "% lea: formalize label=compactness_corollary uses=compactness_criterion",
+      "A consequence of compactness.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+
+  const res = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(res.statusCode, 200);
+  const byLabel = Object.fromEntries(res.body.items.map((item) => [item.leanDeclarationName, item]));
+
+  // the stubbed item itself is demoted (previous test's fix)
+  assert.equal(byLabel.compactness_criterion.status, "stub-generated");
+
+  // the dependent still compiles -- "valid" is right -- but it now carries
+  // the same stubbed-uses warning the doc badge renders as the amber "!"
+  assert.equal(byLabel.compactness_corollary.status, "valid");
+  assert.ok(Array.isArray(byLabel.compactness_corollary.stubbedTheoremUses));
+  assert.equal(byLabel.compactness_corollary.stubbedTheoremUses[0].targetLabel, "compactness_criterion");
+});
+
+// Regression + feature for the live report ("nothing happens, not even the
+// amber check on the directly reliant theorem"): the stubbed-uses warning
+// used to be computed ONLY from job-recorded `targetUses` (formalize-time
+// `uses=` links) -- so it silently vanished whenever jobs.json was cleared
+// (start-dev.sh does this by default), and it never reached anything more
+// than one hop from the stub. It is now ALSO derived from the files on disk,
+// transitively: every formalized item whose import chain reaches a file that
+// currently contains sorry/admit carries stubbedTheoremUses naming exactly
+// what remains to be formalized upstream -- with NO job use-records needed.
+test("stubbed-upstream warnings are file-derived and transitive: every downstream item lists what remains", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const criterionPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  const corollaryPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_corollary.lean");
+  const applicationPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_application.lean");
+  await writeLeaProjectProof(leaRepo, criterionPath, "theorem compactness_criterion : True := by\n  sorry\n");
+  await writeLeaProjectProof(
+    leaRepo,
+    corollaryPath,
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  trivial\n"
+  );
+  await writeLeaProjectProof(
+    leaRepo,
+    applicationPath,
+    // two hops from the stub -- imports only the corollary, never the stub itself
+    "import Lea.Project1.compactness_corollary\ntheorem compactness_application : True := by\n  trivial\n"
+  );
+  const baseJob = (label, proofPath) => ({
+    jobId: label,
+    jobKey: `project-1:theorem:${label}`,
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: label,
+    declarationName: label,
+    recordedProofPath: proofPath,
+    moduleName: `Lea.Project1.${label}`,
+    // deliberately NO targetUses / stubbedTheoremUses: the warning must not
+    // depend on formalize-time use-records having survived
+    targetTextHash: "",
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  });
+  state.jobs.criterion = baseJob("compactness_criterion", criterionPath);
+  state.jobs.corollary = baseJob("compactness_corollary", corollaryPath);
+  state.jobs.application = baseJob("compactness_application", applicationPath);
+
+  const marker = (label, line) => [
+    `\\begin{theorem}\\label{thm:${line}}`,
+    `% lea: formalize label=${label}`,
+    "Statement.",
+    "\\end{theorem}"
+  ].join("\n");
+  const files = [{
+    path: "main.tex",
+    content: [
+      marker("compactness_criterion", "criterion"),
+      marker("compactness_corollary", "corollary"),
+      marker("compactness_application", "application")
+    ].join("\n")
+  }];
+
+  const res = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(res.statusCode, 200);
+  const byLabel = Object.fromEntries(res.body.items.map((item) => [item.leanDeclarationName, item]));
+
+  // the stub itself is demoted, and doesn't warn about itself
+  assert.equal(byLabel.compactness_criterion.status, "stub-generated");
+  assert.equal(byLabel.compactness_criterion.stubbedTheoremUses, undefined);
+
+  // direct dependent: valid chip + upstream warning, from files alone
+  assert.equal(byLabel.compactness_corollary.status, "valid");
+  assert.deepEqual(
+    (byLabel.compactness_corollary.stubbedTheoremUses || []).map((use) => use.targetLabel),
+    ["compactness_criterion"]
+  );
+
+  // TRANSITIVE dependent (two hops): also warned, naming the real root cause
+  assert.equal(byLabel.compactness_application.status, "valid");
+  assert.deepEqual(
+    (byLabel.compactness_application.stubbedTheoremUses || []).map((use) => use.targetLabel),
+    ["compactness_criterion"]
+  );
+
+  // the doc-badge path (handleGetStatuses -> getTargetStatus) carries the
+  // same warning, so the overlay's amber "!" agrees with the pane
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{ targetKind: "theorem", targetLabel: "compactness_application", targetText: "Statement." }]
+  }, state);
+  const appStatus = statuses.body.statuses["theorem:compactness_application"];
+  assert.equal(appStatus.status, "formalized");
+  assert.equal(appStatus.hasStubbedTheoremUses, true);
+  assert.deepEqual(appStatus.stubbedTheoremUses.map((use) => use.targetLabel), ["compactness_criterion"]);
+
+  // ...and once the stub is really proven, every warning clears
+  await writeLeaProjectProof(leaRepo, criterionPath, "theorem compactness_criterion : True := by\n  trivial\n");
+  const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  const fixedByLabel = Object.fromEntries(fixed.body.items.map((item) => [item.leanDeclarationName, item]));
+  assert.equal(fixedByLabel.compactness_criterion.status, "valid");
+  assert.equal(fixedByLabel.compactness_corollary.stubbedTheoremUses, undefined);
+  assert.equal(fixedByLabel.compactness_application.stubbedTheoremUses, undefined);
+});
+
 test("lean pane manifest marks generated artifacts stale when source hash changes", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -501,6 +875,51 @@ test("lean pane manifest degrades when Lea lookup is unavailable", async () => {
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.items[0].status, "unknown");
   assert.equal(res.body.diagnostics.at(-1).code, "lea_unconfigured");
+});
+
+test("records targetSyntax on the job for telemetry, defaulting to comment", async () => {
+  const leaRepo = await makeLeaRepo();
+
+  const defaultState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  const defaultResult = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "syntax_default_test",
+    targetText: "A theorem."
+    // no syntax field
+  }, defaultState);
+  assert.equal(defaultState.jobs[defaultResult.body.jobId].targetSyntax, "comment");
+
+  const tagState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch([])
+  });
+  const tagResult = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "syntax_tag_test",
+    targetText: "A theorem.",
+    syntax: "tag"
+  }, tagState);
+  assert.equal(tagState.jobs[tagResult.body.jobId].targetSyntax, "tag");
+
+  // Identity (jobKey) and every field that reaches the prompt are unaffected
+  // by syntax -- a tag-sourced and comment-sourced target with the same
+  // targetKind/targetLabel/targetText/targetUses/targetContext produce
+  // identical jobs apart from this one telemetry field and the inputs that
+  // differ by construction (jobId/timestamps/label/jobKey/hash).
+  const defaultJob = { ...defaultState.jobs[defaultResult.body.jobId] };
+  const tagJob = { ...tagState.jobs[tagResult.body.jobId] };
+  for (const key of ["jobId", "jobKey", "targetLabel", "targetSyntax", "targetTextHash", "startedAt", "logPath", "absolutePath", "relativePath", "declarationName"]) {
+    delete defaultJob[key];
+    delete tagJob[key];
+  }
+  assert.deepEqual(defaultJob, tagJob);
 });
 
 test("lean pane manifest flags in-progress items for live polling", async () => {
@@ -2835,6 +3254,245 @@ test("resolveProofOutcome marks a failed run as failed and surfaces the run erro
   assert.equal(outcome.jobStatus, "failed");
   assert.equal(outcome.finalStatus, "unformalized");
   assert.equal(outcome.error, "Lea run ended with status: failed");
+});
+
+test("resolveProofOutcome promotes a needs_review run to formalized when local evidence independently confirms it", async () => {
+  // Regression for the bug where a run that finished `needs_review` (bridge.py
+  // groups it with proved/disproved as a completed, checked-artifact outcome --
+  // NOT a crash/timeout) was collapsed into the same "failed" bucket as an
+  // actual compile failure, because leaApiClient's SUCCESS_DONE_STATUS
+  // deliberately excludes it so exit.ok is false. The pane showed `invalid` for
+  // code that genuinely compiled.
+  //
+  // Once applyProofOutcomeToJob has independently confirmed the emitted file is
+  // sorry-free and really compiles (recoverFormalizedStatusFromTargetPath, since
+  // the agent itself skipped self-registering it), there is no principled reason
+  // to hold it to a stricter bar than any other proof in this app -- promote it
+  // all the way to `formalized`/valid, the same outcome a clean "proved" run
+  // gets. The agent's own uncertainty is not evidence the artifact is wrong.
+  const job = { targetKind: "theorem", targetLabel: "t5", leaWorkspacePath: "/tmp/x" };
+  // The recovery path attaches its already-run, already-passing compile as
+  // `leanCheck` -- promotion is gated on it (regex-derived "formalized" alone
+  // must never promote; that's only half the "sorry-free + compiles" bar).
+  // Attaching it here also keeps runLeanCheck (a real toolchain spawn) out of
+  // the unit test.
+  const leanCheck = { ok: true, exitCode: 0, stdout: "", stderr: "", message: "" };
+  const localStatus = { status: "formalized", leanStatement: "theorem t5 : True", leanCheck };
+  const outcome = await resolveProofOutcome({
+    job,
+    localStatus,
+    exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
+  });
+
+  assert.equal(outcome.jobStatus, "formalized");
+  assert.equal(outcome.finalStatus, "formalized");
+  assert.equal(outcome.effectiveStatus, localStatus);
+  assert.equal(outcome.resultKind, "proved");
+  assert.equal(outcome.error, null);
+  // reuses the attached check -- it must not pay for a second compile
+  assert.equal(outcome.leanCheck, leanCheck);
+});
+
+test("resolveProofOutcome keeps needs_review when the fresh compile FAILS despite sorry-free file evidence", async () => {
+  // `local.status === "formalized"` is a sorry/admit regex over the file, not
+  // a compile. A needs_review run whose file is sorry-free but doesn't
+  // actually compile must stay needs_review -- promoting on regex evidence
+  // alone was the original sin of this branch's first version.
+  const job = { targetKind: "theorem", targetLabel: "t5b", leaWorkspacePath: "/tmp/x" };
+  const failingCheck = { ok: false, exitCode: 1, stdout: "", stderr: "unknown identifier: foo", message: "" };
+  const outcome = await resolveProofOutcome({
+    job,
+    localStatus: { status: "formalized", leanCheck: failingCheck },
+    exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
+  });
+
+  assert.equal(outcome.jobStatus, "needs_review");
+  assert.equal(outcome.finalStatus, "needs_review");
+  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  // the failing check is kept as the diagnostic explaining WHY
+  assert.equal(outcome.leanCheck, failingCheck);
+});
+
+test("resolveProofOutcome keeps needs_review when no compile evidence is possible at all", async () => {
+  // Sorry-free file evidence but no absolutePath to check and no attached
+  // recovery check: nothing verifies this actually compiles, so it must not
+  // promote. (Unlike the exit.ok path, where the ADAPTER verified the run and
+  // a local check is diagnostics-only, nothing upstream has verified a
+  // needs_review result.)
+  const job = { targetKind: "theorem", targetLabel: "t5c", leaWorkspacePath: "/tmp/x" };
+  const outcome = await resolveProofOutcome({
+    job,
+    localStatus: { status: "formalized", leanStatement: "theorem t5c : True" },
+    exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
+  });
+
+  assert.equal(outcome.jobStatus, "needs_review");
+  assert.equal(outcome.finalStatus, "needs_review");
+  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  assert.equal(outcome.leanCheck, null);
+});
+
+// A fetch stub serving GET /api/sessions/{id} for the recovery tests below --
+// the recovery resolves the run's real output file from its session's
+// code_steps (the production path), not from any hand-crafted target shape.
+function makeSessionDetailFetch(details) {
+  return async (url) => {
+    const match = String(url).match(/\/api\/sessions\/([^/]+)$/);
+    const body = match ? details[decodeURIComponent(match[1])] : null;
+    return {
+      ok: Boolean(body),
+      status: body ? 200 : 404,
+      async text() { return JSON.stringify(body || { detail: "unknown session" }); }
+    };
+  };
+}
+
+function recoveryTarget(leaRepo, targetLabel) {
+  // Deliberately the REAL production shape (buildLeaTarget): relativePath /
+  // absolutePath point at the project MARKDOWN file, not any proof file, and
+  // there is no moduleName. The first version of the recovery read those
+  // fields -- and so sorry-scanned and lean-checked the markdown, returning
+  // null on every real run -- while its tests hand-crafted a proof-file
+  // relativePath that production never produces. These tests must not repeat
+  // that: if the recovery ever reads target.relativePath again, they fail.
+  const projectMarkdownPath = path.join(leaRepo, "workspace", "projects", "project-1.md");
+  return {
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetKind: "theorem",
+    targetLabel,
+    theoremLabel: targetLabel,
+    declarationName: targetLabel,
+    projectMarkdownPath,
+    relativePath: path.join("workspace", "projects", "project-1.md"),
+    absolutePath: projectMarkdownPath,
+    jobKey: `project-1:theorem:${targetLabel}`
+  };
+}
+
+test("recoverFormalizedStatusFromTargetPath recovers a compiling proof via the session's code_steps (production target shape)", async () => {
+  const restorePath = await installFakeLake(); // makes runLeanCheck pass
+  try {
+    const leaRepo = await makeLeaRepo();
+    const relativePath = path.join("workspace", "proofs", "Lea", "Project1", "ok_thm.lean");
+    await writeLeaProjectProof(leaRepo, relativePath, "theorem ok_thm : True := by\n  trivial\n");
+    const job = {
+      leaSessionId: "sess-r1",
+      leaWorkspacePath: path.join(leaRepo, "workspace"),
+      declarationNameHint: "ok_thm"
+    };
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      fetchImpl: makeSessionDetailFetch({
+        "sess-r1": {
+          project_namespace: "Lea.Project1",
+          code_steps: [{ path: "ok_thm.lean", seq: 1, code: "theorem ok_thm : True := by\n  trivial\n" }]
+        }
+      })
+    });
+
+    const recovered = await recoverFormalizedStatusFromTargetPath({
+      state,
+      job,
+      target: recoveryTarget(leaRepo, "ok_thm")
+    });
+
+    assert.ok(recovered, "expected the session-recorded proof to be recovered");
+    assert.equal(recovered.status.status, "formalized");
+    assert.equal(recovered.status.declarationName, "ok_thm");
+    assert.equal(recovered.status.recordedProofPath, relativePath);
+    assert.equal(recovered.leanCheck.ok, true);
+  } finally {
+    restorePath();
+  }
+});
+
+test("recoverFormalizedStatusFromTargetPath returns null when the session's recorded file doesn't exist on disk", async () => {
+  // The session says a step exists, but nothing was ever written at the
+  // mapped repo path -- there's genuinely nothing to promote on; must not
+  // fabricate a pass.
+  const leaRepo = await makeLeaRepo();
+  const job = { leaSessionId: "sess-r2", leaWorkspacePath: path.join(leaRepo, "workspace") };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeSessionDetailFetch({
+      "sess-r2": {
+        project_namespace: "Lea.Project1",
+        code_steps: [{ path: "never_written.lean", seq: 1, code: "theorem never_written : True := by\n  trivial\n" }]
+      }
+    })
+  });
+
+  const recovered = await recoverFormalizedStatusFromTargetPath({
+    state,
+    job,
+    target: recoveryTarget(leaRepo, "never_written")
+  });
+
+  assert.equal(recovered, null);
+});
+
+test("recoverFormalizedStatusFromTargetPath returns null (not a false pass) when the file still has a sorry", async () => {
+  const leaRepo = await makeLeaRepo();
+  const relativePath = path.join("workspace", "proofs", "Lea", "Project1", "still_stub.lean");
+  const code = "theorem still_stub : True := by\n  sorry\n";
+  await writeLeaProjectProof(leaRepo, relativePath, code);
+  const job = { leaSessionId: "sess-r3", leaWorkspacePath: path.join(leaRepo, "workspace") };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeSessionDetailFetch({
+      "sess-r3": {
+        project_namespace: "Lea.Project1",
+        code_steps: [{ path: "still_stub.lean", seq: 1, code }]
+      }
+    })
+  });
+
+  const recovered = await recoverFormalizedStatusFromTargetPath({
+    state,
+    job,
+    target: recoveryTarget(leaRepo, "still_stub")
+  });
+
+  assert.equal(recovered, null);
+});
+
+test("recoverFormalizedStatusFromTargetPath returns null when the run has no session to consult", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+
+  const recovered = await recoverFormalizedStatusFromTargetPath({
+    state,
+    job: { leaWorkspacePath: path.join(leaRepo, "workspace") },
+    target: recoveryTarget(leaRepo, "sessionless")
+  });
+
+  assert.equal(recovered, null);
+});
+
+test("resolveProofOutcome still reports needs_review when no local evidence was found (the real-world case)", async () => {
+  // This is the actual shape production hits, not a hypothetical: the
+  // project-markdown index identifyLeaArtifact diffs against is populated by
+  // the agent's own in-run tool calls, and it appears to skip that call when
+  // it isn't confident enough to self-report "proved" -- so localStatus stays
+  // "unformalized" for essentially every real needs_review run, even when the
+  // emitted file compiles cleanly. A first version of this fix gated the
+  // needs_review -> needs_review promotion on `local.status === "formalized"`
+  // and silently fell back to "failed" here, which is the exact bug
+  // resurfacing under a different name. It must not.
+  const job = { targetKind: "theorem", targetLabel: "t6", leaWorkspacePath: "/tmp/x" };
+  const outcome = await resolveProofOutcome({
+    job,
+    localStatus: { status: "unformalized" },
+    exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", error: "Lea run ended with status: needs_review" }
+  });
+
+  assert.equal(outcome.jobStatus, "needs_review");
+  assert.equal(outcome.finalStatus, "needs_review");
+  assert.equal(outcome.resultKind, "needs_review");
+  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  assert.equal(outcome.error, null);
 });
 
 test("formalize on the /api backend tags the theorem formalized when the run succeeds (regression)", async () => {

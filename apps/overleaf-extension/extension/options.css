@@ -178,3 +178,50 @@ select:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
+
+.lea-tags-section {
+  margin-top: 20px;
+  padding: 16px 20px;
+  background: var(--ol-panel-2);
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
+}
+
+.lea-tags-section h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--ol-ink);
+}
+
+.lea-tags-section p {
+  margin: 0 0 10px;
+  color: var(--ol-ink-2);
+  font-size: 13px;
+}
+
+.lea-tags-section code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--ol-line-2);
+  font-size: 12px;
+}
+
+.lea-tags-section a {
+  color: var(--ol-accent-ink);
+  font-weight: 700;
+}
+
+#lea-tags-copy-snippet {
+  height: 30px;
+  padding: 0 10px;
+  border-color: var(--ol-line);
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#lea-tags-copy-snippet:hover {
+  border-color: var(--ol-accent);
+  background: var(--ol-panel-2);
+}

@@ -2,9 +2,36 @@ const THEOREM_ENVIRONMENTS = new Set(["theorem", "lemma", "proposition", "coroll
 const DEFINITION_ENVIRONMENTS = new Set(["definition"]);
 const SUPPORTED_ENVIRONMENTS = new Set([...THEOREM_ENVIRONMENTS, ...DEFINITION_ENVIRONMENTS]);
 
+// Inline tag commands from lea-tags.sty (docs/FEATURE-overleaf-inline-lea-tags.md).
+// Each maps to the targetKind it implies; `lea` is the generic form, whose kind
+// comes from a kind=... argument instead (mirroring `% lea: formalize kind=...`).
+const TAG_COMMAND_KINDS = {
+  leatheorem: "theorem",
+  lealemma: "theorem",
+  leaproposition: "theorem",
+  leacorollary: "theorem",
+  leadefinition: "definition",
+  lea: null
+};
+
+// Longest-name-first so the alternation's backtracking (forced by \b below) has
+// the least work to do; correctness doesn't depend on this ordering.
+const TAG_COMMAND_NAMES = Object.keys(TAG_COMMAND_KINDS).sort((a, b) => b.length - a.length);
+const TAG_COMMAND_PATTERN_SOURCE = `\\\\(${TAG_COMMAND_NAMES.join("|")})\\b`;
+
+// Environments where a Lea tag is almost certainly a mistake (a stray tag left
+// in a figure/list/math environment rather than a theorem-like statement).
+// Non-blocking: the target is still produced, just flagged. Tags are
+// environment-name-agnostic by design, so this is the one safety net against
+// the obvious accidental cases, not an exhaustive list.
+const SUSPICIOUS_TAG_ENVIRONMENTS = new Set([
+  "figure", "figure*", "table", "table*", "itemize", "enumerate",
+  "equation", "equation*", "align", "align*", "tabular", "tabular*"
+]);
+
 export function parseTargetDocument(source) {
   const text = String(source || "");
-  const markerResult = parseCommentMarkedTargets(text);
+  const markerResult = parseMarkedTargets(text);
   return {
     targets: markerResult.targets.sort((a, b) => a.from - b.from),
     diagnostics: markerResult.diagnostics.sort((a, b) => a.from - b.from)
@@ -19,31 +46,74 @@ export function isValidLeanIdentifier(value) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
-function parseCommentMarkedTargets(source) {
+function parseMarkedTargets(source) {
   const diagnostics = [];
-  const environments = findSupportedEnvironments(source);
-  const groups = findLeaCommentGroups(source).filter((group) => group.hasTargetMarker);
-  const groupsByEnvironment = new Map();
+  const commentEnvironments = findSupportedEnvironments(source);
+  let genericEnvironments = null; // computed lazily; only needed if a tag is present
+  const getGenericEnvironments = () => {
+    if (!genericEnvironments) {
+      genericEnvironments = findEnvironments(source, { names: null });
+    }
+    return genericEnvironments;
+  };
 
-  for (const group of groups) {
-    const environment = findSmallestEnclosingEnvironment(environments, group.from, group.to);
+  // A "% lea: ..." line (or \leatheorem{...} tag) inside a verbatim-like
+  // environment is never a real marker -- LaTeX itself never treats "%" as a
+  // comment character there, and a tag command would print literally rather
+  // than execute. Both scanners below run against the masked source (see
+  // maskOpaqueSpans), so such a line simply can't match at all -- no
+  // diagnostic, no target, exactly as if it weren't there. For any *real*
+  // marker (outside every opaque span), masked text is byte-identical to the
+  // original, so this changes nothing about genuine detection.
+  const maskedSource = maskOpaqueSpans(source);
+  const commentGroups = findLeaCommentGroups(maskedSource)
+    .filter((group) => group.hasTargetMarker)
+    .map((group) => ({ ...group, syntax: "comment" }));
+  const tagDetection = findLeaTagGroups(maskedSource);
+  diagnostics.push(...tagDetection.diagnostics);
+
+  if (tagDetection.groups.length > 0 && !hasLeaTagPackageLoaded(source)) {
+    const firstTag = tagDetection.groups[0];
+    diagnostics.push(buildDiagnostic({
+      code: "tag_package_not_loaded",
+      message: "A Lea tag command (e.g. \\leatheorem{...}) is used, but nothing in the preamble defines it. "
+        + "Add \\usepackage{lea-tags} (or the inline fallback definitions) before \\begin{document}, "
+        + "or this document will fail to compile.",
+      from: firstTag.from,
+      to: firstTag.to
+    }));
+  }
+
+  const groupsByEnvironment = new Map();
+  for (const group of [...commentGroups, ...tagDetection.groups]) {
+    // A tag with a body argument (the standalone form) already carries its
+    // own ready-made environment-shaped object and needs no lookup at all.
+    let environment = group.standaloneEnvironment;
+    if (!environment) {
+      const lookupEnvironments = group.syntax === "tag" ? getGenericEnvironments() : commentEnvironments;
+      environment = findSmallestEnclosingEnvironment(lookupEnvironments, group.from, group.to);
+    }
     if (!environment) {
       diagnostics.push(buildDiagnostic({
         code: "missing_environment",
-        message: "Lea marker must be inside a supported theorem or definition environment.",
+        message: group.syntax === "tag"
+          ? "A Lea tag must either be inside a LaTeX environment (e.g. \\begin{theorem}...\\end{theorem}) "
+            + "or supply the statement as a second argument, e.g. \\leatheorem{label=foo}{Statement text.}."
+          : "Lea marker must be inside a supported theorem or definition environment.",
         from: group.from,
         to: group.to
       }));
       continue;
     }
     const key = environment.from;
-    const existing = groupsByEnvironment.get(key) || { environment, groups: [] };
-    existing.groups.push(group);
+    const existing = groupsByEnvironment.get(key) || { groups: [] };
+    existing.groups.push({ ...group, environment });
     groupsByEnvironment.set(key, existing);
   }
 
   const targets = [];
-  for (const { environment, groups: environmentGroups } of groupsByEnvironment.values()) {
+  for (const { groups: environmentGroups } of groupsByEnvironment.values()) {
+    const environment = environmentGroups[0].environment;
     if (environmentGroups.length > 1) {
       diagnostics.push(buildDiagnostic({
         code: "duplicate_marker",
@@ -65,7 +135,11 @@ function parseCommentMarkedTargets(source) {
       }));
       continue;
     }
-    if (markerKind.targetKind !== environment.targetKind) {
+    // The environment-name/kind allowlist check only applies to comment
+    // markers, which depend on the environment name to infer their kind. A
+    // tag states its own kind explicitly, so a custom (non-allowlisted)
+    // environment is exactly the case tags are meant to support.
+    if (group.syntax === "comment" && markerKind.targetKind !== environment.targetKind) {
       diagnostics.push(buildDiagnostic({
         code: "environment_mismatch",
         message: mismatchMessage(markerKind.targetKind, environment),
@@ -116,6 +190,16 @@ function parseCommentMarkedTargets(source) {
       continue;
     }
 
+    if (group.syntax === "tag" && SUSPICIOUS_TAG_ENVIRONMENTS.has(environment.name)) {
+      diagnostics.push(buildDiagnostic({
+        code: "suspicious_environment",
+        message: `Lea tag is inside a ${environment.name} environment, which is unusual for a theorem or `
+          + "definition statement. Double-check this is the intended block.",
+        from: group.from,
+        to: group.to
+      }));
+    }
+
     targets.push({
       targetKind: markerKind.targetKind,
       targetLabel: metadata.label,
@@ -125,7 +209,7 @@ function parseCommentMarkedTargets(source) {
       latexEnvironment: environment.name,
       latexLabel,
       sourceHash: "",
-      syntax: "comment",
+      syntax: group.syntax,
       from: environment.from,
       to: environment.to,
       badgeFrom: environment.badgeFrom,
@@ -135,6 +219,170 @@ function parseCommentMarkedTargets(source) {
   }
 
   return { targets, diagnostics };
+}
+
+// Tag usage is only meaningful in the document body. Restricting detection to
+// after \begin{document} (when present) avoids false-positive matches against
+// the package's own \NewDocumentCommand{\lea}{m}{} *definition* in the
+// preamble (or a user's pasted inline-fallback snippet), which contains the
+// literal substring "\lea}" but is not a tag invocation.
+function documentBodyOffset(source) {
+  const marker = "\\begin{document}";
+  const index = source.indexOf(marker);
+  return index === -1 ? 0 : index + marker.length;
+}
+
+// Expects `source` to already be masked (see maskOpaqueSpans) by the caller
+// -- a tag command's literal text inside a verbatim-like environment (e.g. a
+// documentation example showing \leatheorem{...} syntax) is never really
+// invoked by LaTeX, and masked text simply can't match the tag pattern
+// there, so no malformed_tag/missing_environment diagnostic is generated for
+// it at all.
+function findLeaTagGroups(source) {
+  const groups = [];
+  const diagnostics = [];
+  const offset = documentBodyOffset(source);
+  const body = source.slice(offset);
+  const pattern = new RegExp(TAG_COMMAND_PATTERN_SOURCE, "g");
+  let match;
+
+  while ((match = pattern.exec(body))) {
+    const commandStart = match.index;
+    const commandName = match[1];
+    const afterCommand = pattern.lastIndex;
+    const argumentStart = skipInlineWhitespace(body, afterCommand);
+    const argument = body[argumentStart] === "{" ? parseBalancedSuffix(body, argumentStart) : { ok: false };
+    if (!argument.ok) {
+      diagnostics.push(buildDiagnostic({
+        code: "malformed_tag",
+        message: `\\${commandName}{...} must be followed by a single balanced { } argument on the same line.`,
+        from: offset + commandStart,
+        to: offset + afterCommand
+      }));
+      continue;
+    }
+
+    const argumentInner = body.slice(argumentStart + 1, argument.end - 1);
+    const metadata = parseMetadata(argumentInner);
+    const impliedKind = TAG_COMMAND_KINDS[commandName];
+    if (impliedKind) {
+      // The command name is authoritative over any kind=... the argument
+      // also happens to contain: \leatheorem{...} is always a theorem.
+      metadata.kind = impliedKind;
+    }
+
+    // Optional second (body) argument -- the standalone form:
+    // \leatheorem{label=foo}{Statement text...}. lea-tags.sty defines this
+    // as an xparse `g` argument, which typesets it and needs no enclosing
+    // environment. Mirrors real TeX argument-scanning exactly: it skips
+    // *all* whitespace (including newlines/blank lines, not just inline
+    // whitespace) looking for the next "{", verified against actual
+    // pdflatex output. That means a single-argument tag immediately
+    // followed by an unrelated standalone {...} group, with nothing but
+    // whitespace between them, really does get absorbed -- both in real
+    // compilation and here. See docs/FEATURE-overleaf-inline-lea-tags.md
+    // ("Standalone form") for the caveat this implies for authors.
+    const bodyArgumentStart = skipWhitespace(body, argument.end);
+    let bodyArgument = null;
+    if (body[bodyArgumentStart] === "{") {
+      const parsedBody = parseBalancedSuffixMultiline(body, bodyArgumentStart);
+      if (!parsedBody.ok) {
+        diagnostics.push(buildDiagnostic({
+          code: "malformed_tag",
+          message: `\\${commandName}{...}{...} body argument is missing its closing brace.`,
+          from: offset + commandStart,
+          to: offset + bodyArgumentStart
+        }));
+        continue;
+      }
+      bodyArgument = parsedBody;
+    }
+
+    const group = {
+      from: offset + commandStart,
+      to: offset + (bodyArgument ? bodyArgument.end : argument.end),
+      syntax: "tag",
+      command: commandName,
+      hasFormalize: impliedKind !== "definition",
+      hasDefine: impliedKind === "definition",
+      hasTargetMarker: true,
+      metadata
+    };
+
+    if (bodyArgument) {
+      // A ready-to-use environment-shaped object: the rest of the pipeline
+      // (extractEnvironmentText, badge placement, the Lean pane) only ever
+      // reads name/from/to/badgeFrom/bodyFrom/bodyTo off an "environment",
+      // and doesn't care whether those came from \begin{X}...\end{X} or a
+      // tag's own body argument.
+      group.standaloneEnvironment = {
+        name: commandName,
+        from: offset + commandStart,
+        to: offset + bodyArgument.end,
+        badgeFrom: offset + commandStart,
+        bodyFrom: offset + bodyArgumentStart + 1,
+        bodyTo: offset + bodyArgument.end - 1
+      };
+    }
+
+    groups.push(group);
+    pattern.lastIndex = bodyArgument ? bodyArgument.end : argument.end;
+  }
+
+  return { groups, diagnostics };
+}
+
+// Like skipInlineWhitespace, but crosses newlines/blank lines -- used only to
+// check for a tag's optional body argument, matching real TeX argument
+// scanning (which skips arbitrary whitespace between macro arguments, not
+// just whitespace on the same line). Every *other* same-line convention in
+// this parser (the metadata argument itself, \label) deliberately keeps
+// using skipInlineWhitespace; this one helper is the sole, deliberate
+// exception, because it needs to match what Overleaf will actually compile.
+function skipWhitespace(source, cursor) {
+  while (cursor < source.length && /\s/.test(source[cursor])) {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+// Like parseBalancedSuffix, but tolerates newlines inside the matched span.
+// Used only for a tag's body argument, which is routinely a multi-line or
+// multi-paragraph statement; the metadata argument stays single-line via
+// parseBalancedSuffix, unchanged.
+function parseBalancedSuffixMultiline(source, cursor) {
+  const opener = source[cursor];
+  const closer = opener === "{" ? "}" : opener === "[" ? "]" : "";
+  if (!closer) {
+    return { ok: false };
+  }
+
+  let depth = 1;
+  for (let index = cursor + 1; index < source.length; index += 1) {
+    const char = source[index];
+    const previous = source[index - 1];
+    if (char === opener && previous !== "\\") {
+      depth += 1;
+    } else if (char === closer && previous !== "\\") {
+      depth -= 1;
+      if (depth === 0) {
+        return { ok: true, end: index + 1 };
+      }
+    }
+  }
+
+  return { ok: false };
+}
+
+function hasLeaTagPackageLoaded(source) {
+  const documentStart = source.indexOf("\\begin{document}");
+  const preamble = documentStart === -1 ? source : source.slice(0, documentStart);
+  return (
+    /\\usepackage(?:\[[^\]]*\])?\{[^}]*\blea-tags\b[^}]*\}/.test(preamble)
+    || /\\input\s*\{\s*lea-tags\s*\}/.test(preamble)
+    || /\\(?:New|Renew|Provide)DocumentCommand\s*\{\s*\\lea\s*\}/.test(preamble)
+    || /\\(?:new|renew|provide)command\*?\s*\{\s*\\lea\s*\}/.test(preamble)
+  );
 }
 
 function inferMarkerTargetKind(group) {
@@ -181,20 +429,130 @@ function mismatchMessage(markerKind, environment) {
 }
 
 function findSupportedEnvironments(source) {
+  return findEnvironments(source, { names: SUPPORTED_ENVIRONMENTS }).map((environment) => ({
+    ...environment,
+    targetKind: DEFINITION_ENVIRONMENTS.has(environment.name) ? "definition" : "theorem"
+  }));
+}
+
+// Environments whose *contents* LaTeX itself never interprets the way this
+// parser otherwise would. Inside \begin{verbatim}/\begin{lstlisting}/
+// \begin{minted}, LaTeX's tokenizer is disabled entirely -- a "%" is literal
+// displayed text, not a comment character, so a "% lea: ..." line in there
+// is not a marker under any real compilation of the document, and a
+// \leatheorem{...} tag would print literally rather than execute. `comment`
+// (the comment package) goes further and strips its body from the document
+// outright. None of these nest in real LaTeX (the first matching \end{name}
+// always closes them), so unlike theorem-like environments they need no
+// stack -- just "find the next \end{name} after each \begin{name}".
+//
+// This matters at two levels, both handled below:
+//   1. The environment's own \begin{X}...\end{X} pair should never itself
+//      become a target -- that's NON_TARGET_ENVIRONMENTS, same mechanism as
+//      excluding \begin{document}.
+//   2. Text *inside* the pair must be masked out of all environment/marker
+//      matching, not just excluded from becoming its own target. Found via a
+//      real false positive: a documentation file showing "% lea: ..." syntax
+//      examples inside a \begin{verbatim} block, itself containing an
+//      illustrative "\begin{theorem}...\end{theorem}\n% lea: ..." snippet.
+//      Excluding only the outer verbatim pair (level 1 alone) still let that
+//      *inner*, purely-illustrative "\begin{theorem}" text be matched as its
+//      own real environment, colliding on label with the actual target the
+//      example was describing. Masking the interior is what stops that.
+const VERBATIM_LIKE_ENVIRONMENTS = new Set([
+  "verbatim", "verbatim*", "Verbatim", "lstlisting", "minted", "comment"
+]);
+
+// Structural environments that are never themselves a theorem/definition
+// target, even though they're syntactically just another \begin{X}...\end{X}
+// pair. Excluded only from *generic* matching (names: null) -- the
+// allowlisted comment-marker path never matches these anyway. Without this,
+// a tag with no real enclosing statement environment would resolve to
+// \begin{document}...\end{document} itself (present in essentially every
+// real Overleaf project) instead of producing a missing_environment
+// diagnostic, silently treating the entire paper as the target's body.
+// verbatim-like names are included too (level 1 above).
+const NON_TARGET_ENVIRONMENTS = new Set(["document", ...VERBATIM_LIKE_ENVIRONMENTS]);
+
+// Finds every [contentFrom, contentTo) span whose text lies strictly between
+// a \begin{name}...\end{name} pair for a verbatim-like name -- i.e. text
+// LaTeX itself would never tokenize as \begin/\end/%.
+function findOpaqueSpans(source) {
+  const spans = [];
+  for (const name of VERBATIM_LIKE_ENVIRONMENTS) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const beginPattern = new RegExp(`\\\\begin\\s*\\{\\s*${escapedName}\\s*\\}`, "g");
+    let beginMatch;
+    while ((beginMatch = beginPattern.exec(source))) {
+      const contentFrom = beginPattern.lastIndex;
+      const endPattern = new RegExp(`\\\\end\\s*\\{\\s*${escapedName}\\s*\\}`, "g");
+      endPattern.lastIndex = contentFrom;
+      const endMatch = endPattern.exec(source);
+      if (!endMatch) break; // unterminated -- nothing real to mask, stop scanning this name
+      spans.push({ contentFrom, contentTo: endMatch.index });
+      beginPattern.lastIndex = endMatch.index + endMatch[0].length;
+    }
+  }
+  return spans;
+}
+
+// Returns a string the exact same length as `source`, with every opaque
+// span's interior replaced by spaces (newlines preserved, so line/column
+// math elsewhere stays correct). Once masked, no "\begin", "\end", "%", or
+// "\lea..." tag can ever be found inside a verbatim-like environment's
+// interior, at *any* nesting depth or by *any* scanner -- not just the
+// environment-pair matcher below. This is deliberately a single, blunt
+// primitive rather than scattered "is this position inside a span?" checks
+// at each call site: an earlier version of this fix only masked the
+// environment-pair matcher, which still let a legitimately real *outer*
+// environment (e.g. \begin{enumerate}, in a real false positive) have its
+// raw captured body text -- taken as a plain substring of the ORIGINAL
+// source by leanPaneManifest.mjs's extractLeaMarkerLabel -- independently
+// re-discover a marker nested inside a verbatim sub-block within it. Every
+// scanner in this module, and leanPaneManifest.mjs's own marker-detection
+// slice, now runs against this masked text instead. Offsets are unaffected
+// (same length), so callers that need the *real* displayed text for a
+// legitimately matched environment still slice the original source.
+export function maskOpaqueSpans(source) {
+  const text = String(source || "");
+  const spans = findOpaqueSpans(text);
+  if (spans.length === 0) return text;
+  const chars = text.split("");
+  for (const { contentFrom, contentTo } of spans) {
+    for (let i = contentFrom; i < contentTo; i += 1) {
+      if (chars[i] !== "\n") chars[i] = " ";
+    }
+  }
+  return chars.join("");
+}
+
+// Generic environment finder, shared by the comment-marker path above (via
+// findSupportedEnvironments, restricted to the theorem/definition allowlist)
+// and by tag-based detection and the Lean pane (shared/leanPaneManifest.mjs),
+// which both need to locate *any* \begin{X}...\end{X} pair, not just an
+// allowlisted name. Returns environment objects with no targetKind — callers
+// that need a theorem/definition classification derive it themselves (from
+// the environment name, for the allowlisted case, or from marker metadata,
+// for the tag/generic case).
+export function findEnvironments(source, { names } = {}) {
   const environments = [];
   const stack = [];
-  const names = [...SUPPORTED_ENVIRONMENTS].join("|");
-  const pattern = new RegExp(`\\\\(begin|end)\\s*\\{\\s*(${names})\\s*\\}`, "g");
+  const pattern = buildEnvironmentPattern(names);
+  // Matched against the masked text (see maskOpaqueSpans) so no \begin/\end
+  // pair can ever be found inside a verbatim-like environment's interior.
+  // Offsets are identical to the original source (masking preserves length).
+  const maskedSource = maskOpaqueSpans(source);
   let match;
 
-  while ((match = pattern.exec(source))) {
+  while ((match = pattern.exec(maskedSource))) {
     const [, command, name] = match;
     if (command === "begin") {
-      const bodyFrom = findEnvironmentBadgeAnchor(source, pattern.lastIndex);
+      const openerEnd = pattern.lastIndex;
+      const bodyFrom = findEnvironmentBadgeAnchor(source, openerEnd);
       stack.push({
         name,
-        targetKind: DEFINITION_ENVIRONMENTS.has(name) ? "definition" : "theorem",
         from: match.index,
+        openerEnd,
         badgeFrom: bodyFrom,
         bodyFrom
       });
@@ -213,7 +571,12 @@ function findSupportedEnvironments(source) {
     }
   }
 
-  return environments;
+  return names ? environments : environments.filter((environment) => !NON_TARGET_ENVIRONMENTS.has(environment.name));
+}
+
+function buildEnvironmentPattern(names) {
+  const namePattern = names ? [...names].join("|") : "[A-Za-z]+\\*?";
+  return new RegExp(`\\\\(begin|end)\\s*\\{\\s*(${namePattern})\\s*\\}`, "g");
 }
 
 function findSmallestEnclosingEnvironment(environments, from, to) {
@@ -290,10 +653,32 @@ function extractEnvironmentText(source, environment) {
 // surfaces hash byte-identical input and can never drift (see
 // shared/leanPaneManifest.mjs and PLAN-overleaf-lean-pane-improvements.md item 1).
 export function stripLeaTargetText(body) {
-  return String(body || "")
+  return stripLeaTagCalls(String(body || ""))
     .replace(/^[ \t]*%\s*lea:.*(?:\r?\n|$)/gmi, "")
     .replace(/\\label\s*\{[^}]*\}/g, "")
     .trim();
+}
+
+// Removes \lea{...}/\leatheorem{...}/etc calls from a body of text. Brace-aware
+// (not a fixed-width regex) because context={...} can itself contain braces.
+function stripLeaTagCalls(body) {
+  const pattern = new RegExp(TAG_COMMAND_PATTERN_SOURCE, "g");
+  let result = "";
+  let cursor = 0;
+  let match;
+
+  while ((match = pattern.exec(body))) {
+    if (match.index < cursor) continue;
+    const afterCommand = pattern.lastIndex;
+    const argumentStart = skipInlineWhitespace(body, afterCommand);
+    const argument = body[argumentStart] === "{" ? parseBalancedSuffix(body, argumentStart) : { ok: false };
+    const spanEnd = argument.ok ? argument.end : afterCommand;
+    result += body.slice(cursor, match.index);
+    cursor = spanEnd;
+    pattern.lastIndex = spanEnd;
+  }
+  result += body.slice(cursor);
+  return result;
 }
 
 function buildDiagnostic({ code, message, from, to }) {
@@ -358,7 +743,7 @@ function parseSameLineLabel(source, cursor) {
   return argument.ok && source[argumentStart] === "{" ? argument : { ok: false };
 }
 
-function parseBalancedSuffix(source, cursor) {
+export function parseBalancedSuffix(source, cursor) {
   const opener = source[cursor];
   const closer = opener === "{" ? "}" : opener === "[" ? "]" : "";
   if (!closer) {
@@ -385,14 +770,14 @@ function parseBalancedSuffix(source, cursor) {
   return { ok: false };
 }
 
-function skipInlineWhitespace(source, cursor) {
+export function skipInlineWhitespace(source, cursor) {
   while (cursor < source.length && /[ \t]/.test(source[cursor])) {
     cursor += 1;
   }
   return cursor;
 }
 
-function isLineBreak(char) {
+export function isLineBreak(char) {
   return char === "\n" || char === "\r";
 }
 

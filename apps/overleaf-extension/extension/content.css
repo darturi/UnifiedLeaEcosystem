@@ -428,7 +428,11 @@
 
 .ol-lean-project-status-stub-generated,
 .ol-lean-project-status-stale,
-.ol-lean-project-status-missing-stub {
+.ol-lean-project-status-missing-stub,
+/* A checked, sorry-free proof the prover itself flagged for human review --
+   same "needs attention" register as a stub/stale item, not the red of an
+   actual compile failure. */
+.ol-lean-project-status-needs-review {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
 }
@@ -548,6 +552,53 @@
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+
+/* Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md). */
+.ol-lean-project-edit {
+  margin-top: 10px;
+}
+
+.ol-lean-project-edit-textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 180px;
+  max-height: 420px;
+  padding: 10px;
+  resize: vertical;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-code-bg);
+  color: var(--ol-ink-2);
+  font: 11px/1.45 var(--ol-mono);
+}
+
+.ol-lean-project-edit-textarea:disabled {
+  opacity: 0.65;
+}
+
+.ol-lean-project-edit-error {
+  margin: 8px 0 0;
+  color: #b3261e;
+}
+
+.ol-lean-project-impact-note {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel-2);
+  color: var(--ol-ink-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ol-lean-project-impact-note p {
+  margin: 0;
+}
+
+.ol-lean-project-impact-note p + p {
+  margin-top: 4px;
 }
 
 .ol-lean-theorem-popover {

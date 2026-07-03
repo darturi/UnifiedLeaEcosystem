@@ -27,3 +27,13 @@ __pycache__/
 .overleaf-lean-stub/
 lea.local.toml
 data/
+
+# LaTeX build artifacts (docs/ testing fixtures are compiled locally;
+# only the .tex sources belong in git)
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+docs/*.log
+docs/*.pdf

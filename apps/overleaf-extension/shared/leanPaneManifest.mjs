@@ -1,9 +1,19 @@
 import { hashTargetText, normalizeTargetText } from "./theoremParser.mjs";
-import { parseTargets, stripLeaTargetText } from "../extension/targetParserCore.mjs";
+import {
+  findEnvironments,
+  isLineBreak,
+  maskOpaqueSpans,
+  parseBalancedSuffix,
+  parseTargets,
+  skipInlineWhitespace,
+  stripLeaTargetText
+} from "../extension/targetParserCore.mjs";
 
-const THEOREM_KINDS = new Set(["theorem", "lemma", "proposition", "corollary"]);
+// Used only as a display-kind fallback (leanKindFor) when an environment has
+// no validated target -- e.g. a malformed or mismatched marker. Custom
+// (non-allowlisted) environments aren't classifiable this way and default to
+// "theorem"; see leanKindFor.
 const DEFINITION_KINDS = new Set(["definition"]);
-const SUPPORTED_KINDS = new Set([...THEOREM_KINDS, ...DEFINITION_KINDS]);
 
 // The pane hashes the exact same canonical text the formalize path hashes
 // (`hashTargetText` over `stripLeaTargetText`), so an item's `sourceHash` and a
@@ -74,35 +84,124 @@ export function buildLeanPaneManifest({
 export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
   const content = String(file?.content ?? "");
   const sourceFile = normalizePath(file?.path || "");
-  const environments = findSupportedEnvironments(content);
-  const items = [];
+  // Generic (no name allowlist): a custom environment tagged with
+  // \leatheorem{...}/\leadefinition{...}/etc. is inventoried exactly like
+  // theorem/definition. The allowlist was only ever a proxy for "this might
+  // be a Lea target" -- a tag states that directly, so custom environments
+  // (e.g. \begin{claim}) are exactly the case tags exist to support.
+  //
+  // Sort by start offset: findEnvironments pushes an environment when its
+  // \end{} is matched, so a nested pair (rare for theorem-like environments,
+  // but not impossible) would otherwise appear before its enclosing one.
+  const environments = findEnvironments(content, { names: null }).sort((a, b) => a.from - b.from);
+  // The strict, validated parser (same one the formalize path and
+  // buildLeanPaneManifest's own formalizable-matching use), keyed by
+  // environment start offset. A malformed/mismatched marker won't appear
+  // here, but should still surface as a (non-formalizable) pane item -- see
+  // extractLeaMarkerLabel below -- so this is consulted only for the
+  // validated kind, not for whether to list the item at all.
+  const targets = parseTargets(content);
+  const targetsByOffset = new Map(targets.map((target) => [target.from, target]));
+  const coveredOffsets = new Set();
+  // Masked once, reused for every environment's marker check below. A real,
+  // legitimately-matched environment (e.g. \begin{enumerate} in a
+  // documentation file) can still *contain* a nested verbatim-like block --
+  // findEnvironments already keeps that nested block from becoming its own
+  // target, but extracted.rawLatex below is a plain substring of the
+  // ORIGINAL content, and would still literally contain whatever marker text
+  // sits inside that nested block. Searching the masked slice instead is
+  // what stops a real false positive: a recipe list containing a "% lea:
+  // ..." example inside a \begin{verbatim} block had the whole enclosing
+  // \begin{enumerate} promoted to its own phantom pane item, using the
+  // example's label. rawLatex itself (used for display) stays on the
+  // original content -- only the marker *search* uses the masked version.
+  const maskedContent = maskOpaqueSpans(content);
+  // Collect candidates from both sources before sorting -- pushing straight
+  // from two separate loops would order all environment-based items before
+  // all standalone-tag items regardless of where they actually sit in the
+  // file, which is wrong: documentOrder/id below are assigned by push order,
+  // and the pane should read top-to-bottom in source order.
+  const candidates = [];
+
   for (const environment of environments) {
     const extracted = extractEnvironmentContent(content, environment);
-    const leanName = extractLeaMarkerLabel(extracted.rawLatex);
+    const maskedRawLatex = maskedContent.slice(environment.bodyFrom, environment.bodyTo);
+    const leanName = extractLeaMarkerLabel(maskedRawLatex);
     if (!leanName) continue;
-    const sourceStart = offsetToLineColumn(content, environment.from);
-    const sourceEnd = offsetToLineColumn(content, environment.to);
-    const naturalLanguageLatex = stripLeaTargetText(extracted.rawLatex);
+    coveredOffsets.add(environment.from);
+    candidates.push({
+      kind: environment.name,
+      target: targetsByOffset.get(environment.from),
+      leanName,
+      from: environment.from,
+      to: environment.to,
+      rawLatex: extracted.rawLatex,
+      title: extracted.title,
+      latexLabel: extracted.latexLabel
+    });
+  }
+
+  // Standalone tags (\leatheorem{label=foo}{Statement...}, see
+  // docs/FEATURE-overleaf-inline-lea-tags.md) need no enclosing environment,
+  // so they never appear in `environments` above -- the target itself
+  // already carries the body span (from a synthetic environment built in
+  // targetParserCore.mjs), so pull any not already covered straight from the
+  // strict target list. Unlike the loop above, there's no loose/malformed
+  // case to handle here: a target only exists in `targets` if it already
+  // passed full validation, so every standalone candidate here is
+  // formalizable by construction. A malformed standalone tag (e.g. an
+  // invalid label=) currently does not surface in the pane at all -- see
+  // docs/PLAN-overleaf-inline-lea-tags.md for why this is an accepted, known
+  // gap rather than an oversight.
+  for (const target of targets) {
+    if (target.syntax !== "tag" || coveredOffsets.has(target.from)) continue;
+    candidates.push({
+      kind: target.latexEnvironment,
+      target,
+      leanName: target.targetLabel,
+      from: target.from,
+      to: target.to,
+      rawLatex: content.slice(target.bodyFrom, target.bodyTo).trim(),
+      title: undefined,
+      latexLabel: target.latexLabel
+    });
+  }
+
+  const items = [];
+  for (const { kind, target, leanName, from, to, rawLatex, title, latexLabel } of candidates.sort((a, b) => a.from - b.from)) {
+    const naturalLanguageLatex = stripLeaTargetText(rawLatex);
+    const sourceStart = offsetToLineColumn(content, from);
+    const sourceEnd = offsetToLineColumn(content, to);
     items.push({
       label: leanName,
-      kind: environment.name,
-      title: extracted.title || undefined,
-      latexLabel: extracted.latexLabel || undefined,
+      kind,
+      title: title || undefined,
+      latexLabel: latexLabel || undefined,
       documentOrder: initialOrder + items.length,
       sourceFile,
       sourceStartLine: sourceStart.line,
       sourceEndLine: sourceEnd.line,
-      sourceStartOffset: environment.from,
-      sourceEndOffset: environment.to,
+      sourceStartOffset: from,
+      sourceEndOffset: to,
       sourceHash: hashTargetText(naturalLanguageLatex),
       naturalLanguageLatex,
       naturalLanguageRendered: renderLightLatex(naturalLanguageLatex),
-      leanKind: DEFINITION_KINDS.has(environment.name) ? "def" : "theorem",
+      leanKind: leanKindFor(target, kind),
       leanDeclarationName: leanName || undefined,
       status: "missing-stub"
     });
   }
   return items;
+}
+
+function leanKindFor(target, kind) {
+  if (target) return target.targetKind === "definition" ? "def" : "theorem";
+  // No validated target (missing/invalid/mismatched marker): fall back to a
+  // best-effort guess from the environment/command name, same as the
+  // original comment-only behavior, for the allowlisted names it can
+  // classify. Anything else defaults to "theorem" -- display only, since the
+  // item is already marked not formalizable whenever target is absent.
+  return DEFINITION_KINDS.has(kind) ? "def" : "theorem";
 }
 
 function normalizeFiles(files) {
@@ -115,58 +214,18 @@ function normalizeFiles(files) {
   return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function findSupportedEnvironments(source) {
-  const environments = [];
-  const stack = [];
-  const names = [...SUPPORTED_KINDS].join("|");
-  const pattern = new RegExp(`\\\\(begin|end)\\s*\\{\\s*(${names})\\s*\\}`, "g");
-  let match;
-
-  while ((match = pattern.exec(source))) {
-    const [, command, name] = match;
-    if (command === "begin") {
-      const openerEnd = findEnvironmentOpenerEnd(source, pattern.lastIndex);
-      stack.push({
-        name,
-        from: match.index,
-        bodyFrom: openerEnd.bodyFrom,
-        title: openerEnd.title
-      });
-      continue;
-    }
-
-    for (let index = stack.length - 1; index >= 0; index -= 1) {
-      if (stack[index].name !== name) continue;
-      const [open] = stack.splice(index, 1);
-      environments.push({
-        ...open,
-        bodyTo: match.index,
-        to: pattern.lastIndex
-      });
-      break;
-    }
-  }
-
-  return environments.sort((a, b) => a.from - b.from);
-}
-
-function findEnvironmentOpenerEnd(source, cursor) {
-  let index = cursor;
-  let bodyFrom = cursor;
-  let title = "";
-  while (index < source.length) {
-    index = skipInlineWhitespace(source, index);
-    if (isLineBreak(source[index])) break;
-    const group = parseBalancedSuffix(source, index);
-    if (!group.ok) break;
-    const groupText = source.slice(index + 1, group.end - 1).trim();
-    if (!title) {
-      title = groupText;
-    }
-    index = group.end;
-    bodyFrom = index;
-  }
-  return { bodyFrom, title: renderLightLatex(title) };
+// Title-only helper: an environment may open with an optional bracketed or
+// braced title immediately after \begin{name} (e.g.
+// \begin{definition}[Locally finite family]), before any \label{...}. Body
+// extraction itself (bodyFrom/bodyTo) comes from the shared findEnvironments
+// above; this only recovers the display title, which is pane-specific and
+// not needed by the comment/tag marker parsers.
+function extractEnvironmentTitle(source, openerEnd) {
+  const index = skipInlineWhitespace(source, openerEnd);
+  if (isLineBreak(source[index])) return "";
+  const group = parseBalancedSuffix(source, index);
+  if (!group.ok) return "";
+  return renderLightLatex(source.slice(index + 1, group.end - 1).trim());
 }
 
 function extractEnvironmentContent(source, environment) {
@@ -176,7 +235,7 @@ function extractEnvironmentContent(source, environment) {
   return {
     rawLatex,
     latexLabel: labelMatch ? labelMatch[1].trim() : "",
-    title: environment.title
+    title: extractEnvironmentTitle(source, environment.openerEnd)
   };
 }
 
@@ -194,10 +253,20 @@ function renderLightLatex(source) {
     .trim();
 }
 
+// Loose, best-effort label extraction -- not full validation. Deliberately
+// permissive (unlike targetParserCore's strict parser) so that a malformed or
+// mismatched marker still surfaces as a pane item (just not formalizable),
+// rather than silently disappearing from the inventory. Tries the comment
+// marker syntax first, then the tag syntax.
 function extractLeaMarkerLabel(source) {
-  const labelMatch = String(source || "").match(/^[ \t]*%\s*lea:\s*(?:formalize|define)?[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/im);
-  const value = (labelMatch?.[1] || labelMatch?.[2] || "").trim();
-  return isValidLeanIdentifier(value) ? value : "";
+  const text = String(source || "");
+  const commentMatch = text.match(/^[ \t]*%\s*lea:\s*(?:formalize|define)?[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/im);
+  const commentValue = (commentMatch?.[1] || commentMatch?.[2] || "").trim();
+  if (isValidLeanIdentifier(commentValue)) return commentValue;
+
+  const tagMatch = text.match(/\\(?:lea|leatheorem|lealemma|leaproposition|leacorollary|leadefinition)\b[\s\S]*?\blabel\s*=\s*(?:\{([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/);
+  const tagValue = (tagMatch?.[1] || tagMatch?.[2] || "").trim();
+  return isValidLeanIdentifier(tagValue) ? tagValue : "";
 }
 
 function isValidLeanIdentifier(value) {
@@ -217,33 +286,3 @@ function normalizePath(value) {
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").trim();
 }
 
-function parseBalancedSuffix(source, cursor) {
-  const opener = source[cursor];
-  const closer = opener === "{" ? "}" : opener === "[" ? "]" : "";
-  if (!closer) return { ok: false };
-
-  let depth = 1;
-  for (let index = cursor + 1; index < source.length; index += 1) {
-    const char = source[index];
-    const previous = source[index - 1];
-    if (isLineBreak(char)) return { ok: false };
-    if (char === opener && previous !== "\\") {
-      depth += 1;
-    } else if (char === closer && previous !== "\\") {
-      depth -= 1;
-      if (depth === 0) return { ok: true, end: index + 1 };
-    }
-  }
-  return { ok: false };
-}
-
-function skipInlineWhitespace(source, cursor) {
-  while (cursor < source.length && /[ \t]/.test(source[cursor])) {
-    cursor += 1;
-  }
-  return cursor;
-}
-
-function isLineBreak(char) {
-  return char === "\n" || char === "\r";
-}

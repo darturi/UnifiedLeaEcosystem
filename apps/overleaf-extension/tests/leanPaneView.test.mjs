@@ -3,13 +3,17 @@ import test from "node:test";
 import {
   aggregatePaneStatus,
   buildLeanPaneTree,
+  canEditPaneItem,
   canFormalizePaneItem,
   capitalize,
+  formatDependentOutcome,
+  formatDependentsImpact,
   formatLiteMath,
   formatPaneStatus,
   hasInProgressItems,
   highlightLeanLine,
   overlayActiveTex,
+  paneItemToEditTarget,
   paneItemToFormalizeTarget,
   parsePaneLatex,
   shouldRefetchLeanPaneFiles,
@@ -22,6 +26,7 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("valid"), "valid");
   assert.equal(formatPaneStatus("defined"), "defined");
   assert.equal(formatPaneStatus("disproved"), "counterexample");
+  assert.equal(formatPaneStatus("needs-review"), "needs review");
   assert.equal(formatPaneStatus("in-progress"), "in progress");
   assert.equal(formatPaneStatus("stale"), "stale");
   assert.equal(formatPaneStatus("mixed"), "mixed");
@@ -188,6 +193,90 @@ test("formatLiteMath keeps unknown commands visible as fallback text", () => {
   assert.deepEqual(formatLiteMath("\\Spec R \\subseteq X"), [
     { type: "text", text: "Spec R ⊆ X" }
   ]);
+});
+
+test("canEditPaneItem requires a recorded artifact", () => {
+  assert.equal(canEditPaneItem({ leanArtifactContent: "theorem foo : True := by trivial" }), true);
+  assert.equal(canEditPaneItem({ leanArtifactContent: "" }), false);
+  assert.equal(canEditPaneItem({}), false);
+  assert.equal(canEditPaneItem(null), false);
+});
+
+test("paneItemToEditTarget shapes a theorem/definition target from a pane item", () => {
+  assert.deepEqual(
+    paneItemToEditTarget({ leanKind: "theorem", leanDeclarationName: "compactness_criterion" }, "project-1"),
+    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "compactness_criterion" }
+  );
+  assert.deepEqual(
+    paneItemToEditTarget({ leanKind: "def", label: "locally_finite_family" }, "project-1"),
+    { overleafProjectId: "project-1", targetKind: "definition", targetLabel: "locally_finite_family" }
+  );
+});
+
+test("formatDependentsImpact summarizes an empty or non-empty dependents list", () => {
+  assert.equal(formatDependentsImpact([]), "");
+  assert.equal(formatDependentsImpact(null), "");
+  assert.equal(
+    formatDependentsImpact([{ targetLabel: "corollary_a" }]),
+    "Editing this may affect 1 downstream item: corollary_a."
+  );
+  assert.equal(
+    formatDependentsImpact([{ targetLabel: "corollary_a" }, { targetLabel: "corollary_b" }]),
+    "Editing this may affect 2 downstream items: corollary_a, corollary_b."
+  );
+});
+
+test("formatDependentOutcome distinguishes broken/renamed/busy/unattributed/still-valid outcomes", () => {
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", busy: true }),
+    "a: not re-checked yet (a Lea run is already in progress for it)."
+  );
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", brokenByUpstream: { renamed: true } }),
+    "a: broken -- the declaration it referred to was renamed."
+  );
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", brokenByUpstream: { renamed: false } }),
+    "a: broken by this edit."
+  );
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", attributed: false }),
+    "a: may be affected, but no recorded session was found to re-check it."
+  );
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", attributed: true, brokenByUpstream: null }),
+    "a: re-checked, still valid."
+  );
+  assert.equal(formatDependentOutcome(null), "");
+});
+
+// Regression test for a real bug caught live: a dependent that was never
+// actually re-checked (its upstream module's rebuild failed, or the
+// per-dependent check call itself errored) must not render the same text as
+// a genuinely successful recheck -- `status: "unknown"` has to take priority
+// over the "attributed, not busy, not broken -> still valid" default.
+test("formatDependentOutcome distinguishes 'could not verify' from a genuine still-valid recheck", () => {
+  assert.equal(
+    formatDependentOutcome({
+      targetLabel: "epsilon_two",
+      status: "unknown",
+      attributed: true,
+      busy: false,
+      brokenByUpstream: null,
+      checkDetail: "error: lake build failed for Lea.Proj.epsilon_one (exit 1): ..."
+    }),
+    "epsilon_two: could not be verified (error: lake build failed for Lea.Proj.epsilon_one (exit 1): ...) -- treat as unconfirmed, not as valid."
+  );
+  // Same outcome without a detail message still reads as "unconfirmed", not "valid".
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "epsilon_two", status: "unknown", attributed: true, busy: false, brokenByUpstream: null }),
+    "epsilon_two: could not be verified -- treat as unconfirmed, not as valid."
+  );
+  // A genuine successful recheck (status "reverified", not "unknown") is unaffected.
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "a", status: "reverified", attributed: true, busy: false, brokenByUpstream: null }),
+    "a: re-checked, still valid."
+  );
 });
 
 test("highlightLeanLine marks Lean keywords, comments, strings, numbers, and types", () => {

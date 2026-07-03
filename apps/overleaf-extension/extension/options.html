@@ -56,6 +56,22 @@
         <button type="submit">Save settings</button>
       </form>
       <p id="status" role="status"></p>
+      <section id="lea-tags-section" class="lea-tags-section">
+        <h2>Inline Lea tags (advanced)</h2>
+        <p>
+          An alternative to <code>% lea:</code> comments: invisible LaTeX commands
+          (<code>\leatheorem{...}</code>, <code>\leadefinition{...}</code>, ...) that work
+          inside any environment, not just <code>theorem</code>/<code>lemma</code>/
+          <code>proposition</code>/<code>corollary</code>/<code>definition</code>. Requires
+          loading <code>lea-tags.sty</code> in your Overleaf project's preamble.
+        </p>
+        <p>
+          <a id="lea-tags-download" href="assets/lea-tags.sty" download="lea-tags.sty">Download lea-tags.sty</a>
+          &middot;
+          <button type="button" id="lea-tags-copy-snippet">Copy preamble snippet</button>
+        </p>
+        <p id="lea-tags-copy-status" role="status" class="field-hint"></p>
+      </section>
     </main>
     <script src="options.js"></script>
   </body>

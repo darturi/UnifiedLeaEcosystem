@@ -79,7 +79,7 @@ def test_lean_check_backfills_verdict_onto_the_step(tmp_path, monkeypatch):
     session, _ = _seed_session_with_commit(tmp_path)  # seeds a step with check_status="ok"
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_check",
-                        lambda p: CheckResult(p, "error", "p.lean:2:0: error: boom"))
+                        lambda p, cold=False: CheckResult(p, "error", "p.lean:2:0: error: boom"))
 
     result = sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
 
@@ -88,6 +88,85 @@ def test_lean_check_backfills_verdict_onto_the_step(tmp_path, monkeypatch):
     step = store.latest_code_step_for_path(session["id"], "Lea/Misc/p.lean")
     assert step["check_status"] == "error"
     assert store.session_detail(session["id"])["status"] == "error"
+
+
+def test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfilling(tmp_path, monkeypatch):
+    """docs/FEATURE-overleaf-lean-pane-manual-edit.md: a cascade re-check of a
+    dependent file (triggered by an edit elsewhere in the project) gets its own
+    code_step, distinct from the step the original write produced -- the file
+    on disk didn't change, so the new step reuses the existing commit_sha."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, sha = _seed_session_with_commit(tmp_path)  # seeds one step, check_status="ok"
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_check",
+                        lambda p, cold=False: CheckResult(p, "error", "p.lean:3:0: error: unknown identifier"))
+
+    result = sessions_route.lean_check_session(
+        session["id"],
+        PathRequest(path="Lea/Misc/p.lean", author="cascade", summary="Re-checked after edit to compactness_criterion"),
+    )
+
+    assert result["status"] == "error"
+    assert result["code_step"]["author"] == "cascade"
+    assert result["code_step"]["commit_sha"] == sha  # no new content, same commit
+
+    steps = store.session_detail(session["id"])["code_steps"]
+    assert len(steps) == 2  # the original write's step, plus the new cascade step
+    assert steps[0]["check_status"] == "ok"       # original step is untouched
+    assert steps[-1]["author"] == "cascade"
+    assert steps[-1]["check_status"] == "error"   # the new step carries the fresh verdict
+    assert steps[-1]["summary"] == "Re-checked after edit to compactness_criterion"
+
+
+def test_lean_check_with_cascade_author_uses_the_warm_path_not_cold(tmp_path, monkeypatch):
+    """A cascade re-check always runs right after a `/rebuild` of some *other*
+    module in the project. It deliberately does NOT force `interface_check(...,
+    cold=True)` -- a live end-to-end test (tests/lsp/test_cascade_rename_integration.py)
+    found the cold subprocess path doesn't reliably see a just-rebuilt
+    project-local module's fresh `.olean` either. Correctness instead comes
+    from `rebuild_session_module` (tested separately) calling
+    `lsp_daemon.mark_stale`, which runs strictly before this check in the
+    cascade's own request order -- confirmed by that same test. See
+    docs/FEATURE-overleaf-lean-pane-manual-edit.md ('Cascade verification')."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    calls = []
+
+    def _fake_check(p, cold=False):
+        calls.append(cold)
+        return CheckResult(p, "ok", None)
+
+    monkeypatch.setattr(sessions_route, "interface_check", _fake_check)
+
+    sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean", author="cascade"))
+    assert calls == [False]
+
+    calls.clear()
+    sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+    assert calls == [False]
+
+    calls.clear()
+    sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean", author="user"))
+    assert calls == [False]  # every author uses the same (warm) path
+
+
+def test_lean_check_without_author_still_backfills_as_before(tmp_path, monkeypatch):
+    """Regression guard: omitting `author` (every existing caller) must be
+    byte-for-byte the original back-fill-only behavior."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_check", lambda p, cold=False: CheckResult(p, "ok", None))
+
+    result = sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+
+    assert "code_step" not in result
+    steps = store.session_detail(session["id"])["code_steps"]
+    assert len(steps) == 1
 
 
 def test_verify_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
@@ -101,6 +180,50 @@ def test_verify_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
 
     assert result["status"] == "ok"
     assert result["path"] == "Lea/Misc/p.lean"
+
+
+def test_rebuild_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
+    """docs/FEATURE-overleaf-lean-pane-manual-edit.md, 'Cascade verification':
+    unlike lean-check, rebuild forces a real `lake build` (via lea.interface.rebuild
+    -> tools.rebuild_module) so a dependent's later lean-check resolves this
+    module's current .olean, not a stale one. Route-level: just verify wiring."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_rebuild", lambda p: CheckResult(p, "ok", None))
+
+    result = sessions_route.rebuild_session_module(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+
+    assert result == {"path": "Lea/Misc/p.lean", "status": "ok", "detail": None}
+
+
+def test_rebuild_surfaces_a_real_compile_failure(tmp_path, monkeypatch):
+    """A real `lake build` failure must be reported as-is -- callers (the
+    Overleaf cascade) rely on this to distinguish 'safe to trust dependents'
+    from 'nothing downstream can be verified right now'."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_rebuild",
+                        lambda p: CheckResult(p, "error", "p.lean:2:0: error: boom"))
+
+    result = sessions_route.rebuild_session_module(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+
+    assert result["status"] == "error"
+    assert result["detail"] == "p.lean:2:0: error: boom"
+
+
+def test_rebuild_404_when_session_has_no_proof_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("empty")
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.rebuild_session_module(session["id"], PathRequest())
+    assert exc.value.status_code == 404
 
 
 def test_check_404_when_session_has_no_proof_file(tmp_path, monkeypatch):

@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from lea.interface import check as interface_check, verify as interface_verify
+from lea.interface import check as interface_check, rebuild as interface_rebuild, verify as interface_verify
 
 from ..config import load_config
 from .. import filesystem as fs_service, projects, store
@@ -31,6 +31,18 @@ logger = logging.getLogger("lea-interface.sessions")
 class PathRequest(BaseModel):
     # which file in the session to act on; defaults to the latest code_step's path
     path: str | None = None
+    # Optional: attribute this check as its own new code_step instead of
+    # back-filling the existing latest one. Used by the Overleaf lean pane's
+    # cascade re-verification (docs/FEATURE-overleaf-lean-pane-manual-edit.md):
+    # when a manual edit to one declaration may have broken another target
+    # that imports it, the companion re-checks the *unchanged* dependent file
+    # and wants that verdict recorded as its own timeline entry -- 'cascade',
+    # a third convention value alongside code_steps.author's existing
+    # 'agent' | 'user' (D9, apps/lea-standalone/design/v2-architecture.md).
+    # Omitted (the default) preserves the original back-fill-only behavior
+    # exactly, so the standalone UI's existing calls are unaffected.
+    author: str | None = None
+    summary: str | None = None
 
 
 class FileWriteRequest(BaseModel):
@@ -145,12 +157,76 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
 def lean_check_session(session_id: str, request: PathRequest) -> dict:
     """Standalone `lean_check` on a session's working file (LSP fast path, no run,
     D2). Back-fills the verdict onto that file's latest code_step so the canvas +
-    derived session status reflect it."""
+    derived session status reflect it.
+
+    When `request.author` is set (e.g. `"cascade"`), the verdict is recorded as
+    a *new* code_step instead of back-filling the latest one -- the file on
+    disk hasn't changed, so the new step points at the same commit_sha as the
+    latest step; it exists to give the re-check its own timeline entry
+    (who/why/when), not new content. See the `PathRequest.author` docstring.
+
+    A `"cascade"` check always runs immediately after a `POST .../rebuild` of
+    some *other* module in the project (the Overleaf lean pane's manual-edit
+    flow, docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade
+    verification"). It deliberately still goes through the normal (warm) path
+    here, NOT `interface_check(..., cold=True)`: a live end-to-end test found
+    the cold subprocess path (`tools.lean_check_cold`, `lake env lean <file>`
+    one-shot) did NOT reliably see a just-rebuilt project-local module's fresh
+    `.olean` either -- a real Lean/Lake quirk still under investigation, not
+    something to build correctness on. Trusting the warm path here instead
+    works, and was confirmed by that same test: `rebuild_session_module`
+    (below) calls `lsp_daemon.mark_stale` on every successful build, which
+    runs strictly before this call in the cascade's own request order, so the
+    daemon has already restarted (discarding whatever it had cached for the
+    rebuilt module) by the time this check reaches it.
+    """
     abs_path, rel = _resolve_proof_path(session_id, request.path)
     result = interface_check(abs_path)
     step = store.latest_code_step_for_path(session_id, rel)
+    if request.author and step:
+        new_step = store.add_code_step(
+            session_id,
+            None,
+            rel,
+            commit_sha=step["commit_sha"],
+            author=request.author,
+            summary=request.summary,
+            check_status=result.status,
+            check_detail=result.detail,
+        )
+        return {"path": rel, "status": result.status, "detail": result.detail, "code_step": new_step}
     if step:
         store.set_code_step_check(step["id"], result.status, result.detail)
+    return {"path": rel, "status": result.status, "detail": result.detail}
+
+
+@router.post("/api/sessions/{session_id}/rebuild")
+def rebuild_session_module(session_id: str, request: PathRequest) -> dict:
+    """Force a real `lake build` of a session's working file's module (D2-adjacent
+    standalone capability, no agent run), so any *other* session's file that
+    `import`s it resolves against a fresh `.olean` instead of a stale one.
+
+    Why this exists: `lean-check` above (and `check_via_lsp`/`lea/lsp_daemon.py`
+    it delegates to) is fast precisely because it never touches this file's
+    compiled `.olean` -- fine when a session is only ever checking its own file,
+    but a project-mate session's `lean-check` of a *dependent* file silently
+    resolves its `import` against whatever `.olean` was last built, indefinitely,
+    no matter how many times either file is rechecked. The Overleaf lean pane's
+    manual-edit cascade (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade
+    verification") calls this once per edited module, before re-checking any of
+    its dependents, so a dependent's "still valid" is never a caching artifact.
+    """
+    abs_path, rel = _resolve_proof_path(session_id, request.path)
+    try:
+        result = interface_rebuild(abs_path)
+    except Exception as exc:  # noqa: BLE001 -- an unexpected failure here must
+        # surface as "can't verify" (the companion's cascade already treats a
+        # non-2xx/non-"ok" response this way), never as a raw 500 that leaves
+        # the caller unable to distinguish "the module doesn't compile" from
+        # "the rebuild itself crashed." Whatever this is, it's genuinely a
+        # verdict of "unknown," not silent success.
+        logger.exception("rebuild failed unexpectedly for session=%s path=%s", session_id, abs_path)
+        return {"path": rel, "status": "error", "detail": f"rebuild crashed: {exc}"}
     return {"path": rel, "status": result.status, "detail": result.detail}
 
 

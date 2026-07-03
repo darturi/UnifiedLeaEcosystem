@@ -174,7 +174,7 @@ def init_db() -> None:
                 run_id text references runs(id),          -- NULL for user edits (D9)
                 seq integer not null,                     -- shared per-session timeline position (C4)
                 turn integer,                             -- agent turn; NULL for user edits
-                author text not null default 'agent',     -- 'agent' | 'user'
+                author text not null default 'agent',     -- 'agent' | 'user' | 'cascade' (free-text convention, no CHECK)
                 path text not null,                       -- file this step shows
                 commit_sha text not null,                 -- pointer into the git repo (the content)
                 summary text,                             -- short label / narration

@@ -180,6 +180,123 @@ test("makes ids unique for duplicate kind+label items", () => {
   assert.notEqual(manifest.items[0].id, manifest.items[1].id);
 });
 
+test("inventories a tag-marked item in a custom (non-allowlisted) environment", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\usepackage{lea-tags}",
+        "\\begin{document}",
+        "\\begin{claim}\\label{clm:foo}",
+        "\\leatheorem{label=foo_claim, uses={bar}, context={hint}}",
+        "Statement text.",
+        "\\end{claim}",
+        "\\begin{fact}",
+        "\\leadefinition{label=even_nat}",
+        "A definition body.",
+        "\\end{fact}",
+        "\\end{document}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 2);
+  const [claim, fact] = manifest.items;
+  assert.equal(claim.kind, "claim");
+  assert.equal(claim.label, "foo_claim");
+  assert.equal(claim.leanKind, "theorem");
+  assert.equal(claim.formalizable, true);
+  assert.deepEqual(claim.targetUses, ["bar"]);
+  assert.equal(claim.targetContext, "hint");
+
+  assert.equal(fact.kind, "fact");
+  assert.equal(fact.label, "even_nat");
+  assert.equal(fact.leanKind, "def");
+  assert.equal(fact.formalizable, true);
+});
+
+test("tag-marked and comment-marked items in allowlisted environments are equivalent", () => {
+  const manifestFor = (marker) => buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\usepackage{lea-tags}",
+        "\\begin{document}",
+        "\\begin{theorem}\\label{thm:x}",
+        marker,
+        "A statement.",
+        "\\end{theorem}",
+        "\\end{document}"
+      ].join("\n")
+    }]
+  });
+
+  const tagManifest = manifestFor("\\leatheorem{label=x, uses={y}, context={hint}}");
+  const commentManifest = manifestFor("% lea: formalize label=x uses={y} context={hint}");
+
+  for (const key of ["label", "kind", "leanKind", "formalizable", "targetUses", "targetContext", "naturalLanguageLatex"]) {
+    assert.deepEqual(tagManifest.items[0][key], commentManifest.items[0][key], `expected ${key} to match`);
+  }
+});
+
+test("a malformed tag still surfaces as a non-formalizable pane item", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{claim}\\label{clm:x}",
+        // kind=bogus is invalid, but the label is still loosely recoverable.
+        "\\lea{kind=bogus, label=mismatch}",
+        "A statement.",
+        "\\end{claim}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].label, "mismatch");
+  assert.equal(manifest.items[0].formalizable, false);
+});
+
+test("inventories a standalone (body-argument) tag with no enclosing environment", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\usepackage{lea-tags}",
+        "\\begin{document}",
+        "\\leatheorem{label=pythagorean, uses={right_triangle}}",
+        "{In a right triangle, the square of the hypotenuse equals the sum of the",
+        "squares of the other two sides.}",
+        "",
+        "\\begin{claim}\\label{clm:foo}",
+        "\\leatheorem{label=foo_claim}",
+        "Environment-based statement.",
+        "\\end{claim}",
+        "\\end{document}"
+      ].join("\n")
+    }]
+  });
+
+  assert.equal(manifest.items.length, 2);
+  // Source order, not "environment items first": the standalone tag appears
+  // earlier in the file than the claim environment, so it must come first.
+  const [standalone, claim] = manifest.items;
+  assert.equal(standalone.label, "pythagorean");
+  assert.equal(standalone.kind, "leatheorem");
+  assert.equal(standalone.leanKind, "theorem");
+  assert.equal(standalone.formalizable, true);
+  assert.deepEqual(standalone.targetUses, ["right_triangle"]);
+  assert.equal(
+    standalone.naturalLanguageLatex,
+    "In a right triangle, the square of the hypotenuse equals the sum of the\nsquares of the other two sides."
+  );
+  assert.equal(standalone.documentOrder, 0);
+
+  assert.equal(claim.label, "foo_claim");
+  assert.equal(claim.documentOrder, 1);
+});
+
 test("reports duplicate labels without dropping items", () => {
   const manifest = buildLeanPaneManifest({
     files: [
@@ -196,4 +313,102 @@ test("reports duplicate labels without dropping items", () => {
   assert.equal(manifest.items.length, 2);
   assert.equal(manifest.diagnostics[0].code, "duplicate_label");
   assert.equal(manifest.diagnostics[0].label, "dup");
+});
+
+// Regression test for a real false positive: a documentation file showing
+// "% lea: ..." syntax examples inside a \begin{verbatim} block had that
+// block picked up as its own phantom target (kind "verbatim"), using the
+// first label found in its illustrative text -- colliding with the real,
+// nested theorem the example was describing. LaTeX itself never treats "%"
+// as a comment character inside verbatim-like environments, so a marker
+// found there can never be real; these environments must be excluded
+// outright, not merely produce an extra (duplicate-labeled) item.
+test("a % lea: line inside a verbatim-like environment is never treated as a marker", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [
+      {
+        path: "main.tex",
+        content: [
+          "\\begin{verbatim}",
+          "\\begin{theorem}\\label{thm:example}",
+          "% lea: formalize label=compactness_criterion",
+          "Example text shown for documentation purposes only.",
+          "\\end{theorem}",
+          "\\end{verbatim}",
+          "",
+          "\\begin{theorem}\\label{thm:real}",
+          "% lea: formalize label=compactness_criterion",
+          "The real statement.",
+          "\\end{theorem}"
+        ].join("\n")
+      }
+    ]
+  });
+
+  // Only the real, non-verbatim theorem becomes an item -- no phantom
+  // "verbatim" item, and therefore no duplicate_label diagnostic either.
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].kind, "theorem");
+  assert.equal(manifest.items[0].label, "compactness_criterion");
+  assert.deepEqual(manifest.diagnostics, []);
+});
+
+test("lstlisting, minted, and comment environments are excluded the same way", () => {
+  for (const env of ["lstlisting", "minted", "comment", "verbatim*", "Verbatim"]) {
+    const manifest = buildLeanPaneManifest({
+      files: [
+        {
+          path: "main.tex",
+          content: [
+            `\\begin{${env}}`,
+            "% lea: formalize label=should_not_appear",
+            `\\end{${env}}`
+          ].join("\n")
+        }
+      ]
+    });
+    assert.equal(manifest.items.length, 0, `expected no items for \\begin{${env}}`);
+  }
+});
+
+// Regression test for a follow-on real false positive, found live after the
+// fix above: excluding verbatim-like environments from *becoming* a target
+// stopped that, but a legitimately real *outer* environment (here
+// \begin{enumerate}, e.g. a numbered recipe step in a documentation file)
+// that merely *contains* a nested verbatim example was still promoted to its
+// own phantom item -- because extractLeaMarkerLabel searched a plain
+// substring of the ORIGINAL content for that environment's body, which still
+// literally contained the nested example's "% lea: ..." line. The fix
+// (searching a masked slice instead) must leave the real theorem inside the
+// enumerate step untouched while making the enumerate itself produce no item
+// at all.
+test("a real outer environment containing a nested verbatim marker example is not itself promoted to an item", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [
+      {
+        path: "main.tex",
+        content: [
+          "\\begin{enumerate}",
+          "  \\item Open the item, click Edit, replace with:",
+          "\\begin{verbatim}",
+          "\\begin{theorem}\\label{thm:example}",
+          "% lea: formalize label=uses_locally_finite_computationally",
+          "\\end{theorem}",
+          "\\end{verbatim}",
+          "  \\item Save.",
+          "\\end{enumerate}",
+          "",
+          "\\begin{theorem}\\label{thm:real}",
+          "% lea: formalize label=compactness_criterion",
+          "The real statement.",
+          "\\end{theorem}"
+        ].join("\n")
+      }
+    ]
+  });
+
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].kind, "theorem");
+  assert.equal(manifest.items[0].label, "compactness_criterion");
+  assert.deepEqual(manifest.diagnostics, []);
 });

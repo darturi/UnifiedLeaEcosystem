@@ -959,6 +959,13 @@ def add_code_step(
     `run_id` is NULL for user edits made outside a run (D9); `turn` is NULL for
     user edits. The verdict (`check_status`/`check_detail`) is recorded here, not
     in the commit message (D6), and may be back-filled once `lean_check` returns.
+
+    `author` is a free-text convention, not an enforced enum: `'agent'` (a
+    model turn), `'user'` (a manual canvas edit, D9), or `'cascade'` (a
+    re-verification of an *unchanged* file, triggered by an edit to something
+    it imports elsewhere in the project — see
+    docs/FEATURE-overleaf-lean-pane-manual-edit.md). A cascade step typically
+    reuses the file's existing `commit_sha` since nothing on disk changed.
     """
     now = utc_now()
     step_id = str(uuid4())

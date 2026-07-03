@@ -15,6 +15,7 @@ from lea.events import CheckResult
 
 _FAILURES: list[str] = []
 _ORIG_LEAN_CHECK = interface.lean_check
+_ORIG_LEAN_CHECK_COLD = interface.lean_check_cold
 
 
 def check(name: str, cond: bool) -> None:
@@ -62,12 +63,43 @@ def test_warning_only_is_ok():
     check("warning-only detail None", r.detail is None)
 
 
+def test_default_uses_the_warm_lean_check_not_the_cold_path():
+    calls = {"warm": 0, "cold": 0}
+    interface.lean_check = lambda path: (calls.__setitem__("warm", calls["warm"] + 1), "OK — no errors, no warnings.")[1]
+    interface.lean_check_cold = lambda path: (calls.__setitem__("cold", calls["cold"] + 1), "OK — no errors, no warnings.")[1]
+    try:
+        interface.check("a.lean")
+    finally:
+        interface.lean_check = _ORIG_LEAN_CHECK
+        interface.lean_check_cold = _ORIG_LEAN_CHECK_COLD
+    check("cold=False (default) calls lean_check", calls == {"warm": 1, "cold": 0})
+
+
+def test_cold_true_uses_lean_check_cold_not_the_warm_path():
+    """docs/FEATURE-overleaf-lean-pane-manual-edit.md ('Cascade verification'):
+    the Overleaf lean pane's cascade re-check of a dependent passes cold=True so
+    it bypasses the persistent LSP daemon, which may still have a just-rebuilt
+    sibling module's pre-rebuild environment cached in memory (lsp_daemon.py)."""
+    calls = {"warm": 0, "cold": 0}
+    interface.lean_check = lambda path: (calls.__setitem__("warm", calls["warm"] + 1), "OK — no errors, no warnings.")[1]
+    interface.lean_check_cold = lambda path: (calls.__setitem__("cold", calls["cold"] + 1), "a.lean:3:1: error: unknown identifier 'epsilon_one'")[1]
+    try:
+        r = interface.check("a.lean", cold=True)
+    finally:
+        interface.lean_check = _ORIG_LEAN_CHECK
+        interface.lean_check_cold = _ORIG_LEAN_CHECK_COLD
+    check("cold=True calls lean_check_cold, not lean_check", calls == {"warm": 0, "cold": 1})
+    check("cold=True verdict still classified correctly", r.status == "error")
+
+
 def main():
     print("interface.check (A5) tests:")
     test_clean()
     test_error()
     test_missing_file_is_error()
     test_warning_only_is_ok()
+    test_default_uses_the_warm_lean_check_not_the_cold_path()
+    test_cold_true_uses_lean_check_cold_not_the_warm_path()
     print()
     if _FAILURES:
         print(f"FAILED ({len(_FAILURES)}): {', '.join(_FAILURES)}")

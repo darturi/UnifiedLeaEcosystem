@@ -94,6 +94,82 @@ test("page bridge positions target badges from badgeFrom", async () => {
   }
 });
 
+test("page bridge publishes a tag-sourced target the same way as a comment-sourced one", async () => {
+  // Regression for docs/FEATURE-overleaf-inline-lea-tags.md: pageBridge.js has
+  // no syntax-specific branching (it imports parseTargetDocument directly and
+  // forwards targets/diagnostics generically), so a tag-marked target in a
+  // custom (non-allowlisted) environment should reach OL_LEAN_TARGETS_VISIBLE
+  // with no code changes here.
+  const source = [
+    "\\usepackage{lea-tags}",
+    "\\begin{document}",
+    "\\begin{claim}\\label{clm:foo}",
+    "\\leatheorem{label=foo_claim}",
+    "Statement text.",
+    "\\end{claim}",
+    "\\end{document}"
+  ].join("\n");
+  const messages = [];
+  const listeners = new Map();
+
+  globalThis.window = {
+    CodeMirror: null,
+    addEventListener(type, listener) {
+      const current = listeners.get(type) || [];
+      current.push(listener);
+      listeners.set(type, current);
+    },
+    postMessage(message) {
+      messages.push(message);
+    },
+    setInterval() {}
+  };
+
+  try {
+    await import(`${pathToFileURL(pageBridgePath).href}?tagTarget=${Date.now()}`);
+    const [installBridge] = listeners.get("UNSTABLE_editor:extensions") || [];
+    assert.equal(typeof installBridge, "function");
+
+    const extensions = [];
+    installBridge({
+      detail: {
+        extensions,
+        CodeMirror: {
+          ViewPlugin: {
+            fromClass(PluginClass, spec) {
+              return { PluginClass, spec };
+            }
+          },
+          Decoration: {
+            mark() {
+              return { range: (from, to) => ({ from, to }) };
+            },
+            set(ranges) {
+              return ranges;
+            }
+          }
+        }
+      }
+    });
+
+    const view = {
+      state: { doc: { toString: () => source } },
+      coordsAtPos: (position) => ({ left: position, right: position + 1, top: 10, bottom: 28 })
+    };
+    new extensions[0].PluginClass(view);
+
+    const visibleMessage = messages.find((message) => message.type === "OL_LEAN_TARGETS_VISIBLE");
+    assert.ok(visibleMessage);
+    assert.equal(visibleMessage.targets.length, 1);
+    assert.equal(visibleMessage.targets[0].syntax, "tag");
+    assert.equal(visibleMessage.targets[0].targetLabel, "foo_claim");
+    assert.equal(visibleMessage.targets[0].latexEnvironment, "claim");
+    assert.equal(visibleMessage.diagnostics.length, 0);
+  } finally {
+    delete globalThis.window;
+  }
+});
+
 test("page bridge selects and scrolls to a source range on OL_LEAN_NAVIGATE", async () => {
   const source = [
     "\\begin{theorem}\\label{thm:main}",
