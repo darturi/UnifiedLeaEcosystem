@@ -58,6 +58,28 @@ def test_run_id_is_nullable_for_user_edits(tmp_path, monkeypatch):
     assert step["author"] == "user"
 
 
+def test_author_cascade_round_trips_with_no_check_constraint(tmp_path, monkeypatch):
+    """`author` is a free-text convention column, not a SQL CHECK enum
+    (db.py: 'agent' | 'user' | 'cascade'). This pins that a third convention
+    value -- the Overleaf lean pane's downstream re-verification steps,
+    docs/FEATURE-overleaf-lean-pane-manual-edit.md -- round-trips exactly like
+    'agent'/'user' with no migration, guarding against a future CHECK being
+    added without updating that convention."""
+    _fresh_db(tmp_path, monkeypatch)
+    session = store.create_session("Cascade re-check")
+    step = store.add_code_step(
+        session["id"], None, "workspace/proofs/Lea/P/dependent.lean",
+        commit_sha="e" * 40, author="cascade",
+        summary="Re-checked after edit to compactness_criterion",
+        check_status="error", check_detail="unknown identifier: compactness_criterion",
+    )
+    assert step["run_id"] is None
+    assert step["author"] == "cascade"
+    assert step["check_status"] == "error"
+    detail = store.session_detail(session["id"])
+    assert detail["code_steps"][0]["author"] == "cascade"
+
+
 def test_add_code_step_round_trips_pointer_and_verdict(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
     session = store.create_session("Round trip")

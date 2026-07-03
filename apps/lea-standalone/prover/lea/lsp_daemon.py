@@ -48,6 +48,12 @@ class LeanDaemon:
         self.next_id = 0
         self.calls = 0
         self.broken = False
+        # Set by mark_stale() when some *other* process (rebuild_module's
+        # `lake build` subprocess) has changed a module this daemon may
+        # already have imported. This daemon has no way to reload just that
+        # one module -- Lean's import cache is process-lifetime, not
+        # per-module-invalidatable via LSP -- so a restart is the only fix.
+        self.stale = False
 
     def start(self) -> bool:
         """Spawn server and run LSP handshake. Returns False on failure."""
@@ -265,7 +271,7 @@ def check_via_lsp(file_path: str, content: str, lake_root: str) -> str:
     """
     with _lock:
         d = _daemons.get(lake_root)
-        if d and (d.broken or d.calls >= _RESTART_AFTER):
+        if d and (d.broken or d.stale or d.calls >= _RESTART_AFTER):
             d.shutdown()
             del _daemons[lake_root]
             d = None
@@ -275,6 +281,33 @@ def check_via_lsp(file_path: str, content: str, lake_root: str) -> str:
                 raise RuntimeError(f"failed to start lean --server in {lake_root}")
             _daemons[lake_root] = d
     return d.check(file_path, content)
+
+
+def mark_stale(lake_root: str) -> None:
+    """Flag the persistent daemon for `lake_root`, if one is running, so its
+    *next* check restarts the underlying `lean --server` process first.
+
+    Call this after any real `lake build` (`tools.rebuild_module`) that
+    changes a module's `.olean` on disk. Lean's server caches every module it
+    has ever imported for the life of its process (see this module's
+    docstring) -- a build in a different process can't reach into that cache
+    and fix just the one module, so a full restart is the only guaranteed-
+    correct remedy. This is deliberately lazy (flag now, restart on next use)
+    rather than an eager synchronous restart: an eager restart would pay the
+    cold Mathlib-reload cost inside whatever request triggered the rebuild,
+    and would tear the shared daemon down out from under any unrelated
+    request that happens to be mid-check. Callers that cannot wait for the
+    next check to trigger this (the Overleaf lean pane's cascade re-check,
+    which runs immediately after its own rebuild) should bypass the daemon
+    entirely instead -- see `tools.lean_check_cold`.
+
+    A no-op if no daemon has been started for `lake_root` yet (nothing to
+    invalidate) or if `lake_root` doesn't match any tracked daemon.
+    """
+    with _lock:
+        d = _daemons.get(lake_root)
+        if d is not None:
+            d.stale = True
 
 
 @atexit.register

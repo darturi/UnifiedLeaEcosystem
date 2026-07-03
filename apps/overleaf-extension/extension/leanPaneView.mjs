@@ -14,6 +14,10 @@ const PANE_STATUS_LABELS = {
   // A verified disproof is surfaced as a counterexample: a successful result, but
   // not a proof of the stated theorem (FEATURE-counterexample-workflows.md).
   disproved: "counterexample",
+  // A checked, sorry-free proof the prover flagged for human review -- not
+  // "invalid" (it compiles), not "valid" (not fully confident either); see
+  // server.mjs's mapLeanPaneStatus / resolveProofOutcome needs_review branch.
+  "needs-review": "needs review",
   "in-progress": "in progress",
   invalid: "invalid",
   stale: "stale",
@@ -362,6 +366,71 @@ export function chatBubbleClass(role) {
   return String(role).toLowerCase() === "user"
     ? "ol-lean-chat-bubble-user"
     : "ol-lean-chat-bubble-assistant";
+}
+
+// --- Lean-pane manual edit --------------------------------------------------
+// docs/FEATURE-overleaf-lean-pane-manual-edit.md.
+
+// Editing is only offered for an item that already has a recorded artifact --
+// a missing-stub item has nothing to edit; "Formalize" is the right action
+// there.
+export function canEditPaneItem(item) {
+  return Boolean(item && item.leanArtifactContent);
+}
+
+// Shape a manifest item into the LeanPaneEditTarget payload the companion's
+// /lean-pane/edit/* endpoints expect. Mirrors paneItemToChatTarget's shape.
+export function paneItemToEditTarget(item, overleafProjectId) {
+  return {
+    overleafProjectId: String(overleafProjectId || ""),
+    targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+    targetLabel: item?.leanDeclarationName || item?.label || ""
+  };
+}
+
+// The pre-save impact preview: "editing this may affect N downstream
+// item(s)". Accepts either /edit/start's `dependents` or /edit/save's
+// `dependentsImpact` -- both carry `targetLabel`.
+export function formatDependentsImpact(dependents) {
+  const list = Array.isArray(dependents) ? dependents : [];
+  if (list.length === 0) return "";
+  const names = list.map((d) => d?.targetLabel).filter(Boolean).join(", ");
+  const count = list.length;
+  return `Editing this may affect ${count} downstream item${count === 1 ? "" : "s"}: ${names}.`;
+}
+
+// The post-save outcome line for a single cascade-checked dependent --
+// distinguishes a verified break (renamed vs. same-name signature change,
+// feature spec acceptance criterion 8) from busy/unattributed/still-fine.
+//
+// `status: "unknown"` with `attributed: true` is a DIFFERENT outcome from the
+// "still valid" default below, and must come before it: it means the cascade
+// never actually got a trustworthy verdict for this dependent -- either the
+// upstream module's rebuild itself failed (server.mjs's dependents.length>0
+// branch, before any dependent is even reached) or the per-dependent
+// lean-check call itself errored out (adapter unreachable, etc.). Either way
+// this dependent was NOT re-checked against current source, so saying "still
+// valid" here would be exactly the stale-verdict bug this whole cascade
+// exists to prevent -- falling through to the same text as a genuine,
+// successful recheck was a real regression caught live (a rebuild failure
+// correctly skipped the per-dependent check, but still rendered as "re-
+// checked, still valid").
+export function formatDependentOutcome(dependent) {
+  if (!dependent) return "";
+  const label = dependent.targetLabel || "";
+  if (dependent.busy) return `${label}: not re-checked yet (a Lea run is already in progress for it).`;
+  if (dependent.brokenByUpstream?.renamed) {
+    return `${label}: broken -- the declaration it referred to was renamed.`;
+  }
+  if (dependent.brokenByUpstream) return `${label}: broken by this edit.`;
+  if (dependent.attributed === false) {
+    return `${label}: may be affected, but no recorded session was found to re-check it.`;
+  }
+  if (dependent.status === "unknown") {
+    const reason = dependent.checkDetail ? ` (${dependent.checkDetail})` : "";
+    return `${label}: could not be verified${reason} -- treat as unconfirmed, not as valid.`;
+  }
+  return `${label}: re-checked, still valid.`;
 }
 
 function finalizePaneTreeNodes(nodes) {

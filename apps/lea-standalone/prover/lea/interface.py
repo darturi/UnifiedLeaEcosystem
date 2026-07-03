@@ -29,13 +29,14 @@ from .events import (
     UsageUpdated,
     VerifyResult,
 )
-from .tools import lean_check, _lean_check_has_error, _first_error_line
+from .tools import lean_check, lean_check_cold, rebuild_module, _lean_check_has_error, _first_error_line
 
 __all__ = [
     # the three capabilities (D2)
     "run_events",
     "check",
     "verify",
+    "rebuild",
     # the typed event stream (D17) — one import for every event type
     "AgentEvent",
     "AssistantTextDelta",
@@ -52,14 +53,48 @@ __all__ = [
 ]
 
 
-def check(path: str) -> CheckResult:
-    """Run `lean_check` on a file (LSP fast path) and return a structured verdict.
+def check(path: str, *, cold: bool = False) -> CheckResult:
+    """Run `lean_check` on a file and return a structured verdict.
 
     No agent run. Uses the same output classifiers as the agent's live CheckResult
     events (tools._lean_check_has_error / _first_error_line), so this verdict can
     never disagree with what a run would report for the same file.
+
+    `cold=True` forces `tools.lean_check_cold`, bypassing the persistent LSP
+    daemon entirely, instead of the normal fast path.
+
+    Caution: a live end-to-end test (tests/lsp/test_cascade_rename_integration.py)
+    found that `cold=True` does NOT reliably see a just-rebuilt project-local
+    module's fresh `.olean` either -- a real Lean/Lake behavior difference
+    between `lake env lean <file>` and `lake env lean --server` that's still
+    under investigation, not something to build correctness on yet. The
+    Overleaf lean pane's cascade re-check of a dependent
+    (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade verification"),
+    which is what this parameter was originally added for, does NOT use it --
+    it relies instead on `tools.rebuild_module`'s `lsp_daemon.mark_stale` call
+    (see that function's docstring), confirmed correct by the same test.
     """
-    out = lean_check(path)
+    out = lean_check_cold(path) if cold else lean_check(path)
+    err = _lean_check_has_error(out)
+    return CheckResult(
+        path,
+        "error" if err else "ok",
+        _first_error_line(out) if err else None,
+    )
+
+
+def rebuild(path: str) -> CheckResult:
+    """Force a real `lake build` of a file's module (`tools.rebuild_module`) and
+    return a verdict in the same shape as `check`.
+
+    No agent run. `check`'s LSP fast path never updates the compiled `.olean`
+    another file's `import` resolves against -- so before trusting a *different*
+    file's re-check of something that imports this one, that other file's check
+    needs this to have run first, once, for the edited module. Used by the
+    Overleaf lean pane's manual-edit cascade
+    (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade verification").
+    """
+    out = rebuild_module(path)
     err = _lean_check_has_error(out)
     return CheckResult(
         path,

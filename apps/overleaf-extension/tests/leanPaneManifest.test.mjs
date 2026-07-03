@@ -314,3 +314,101 @@ test("reports duplicate labels without dropping items", () => {
   assert.equal(manifest.diagnostics[0].code, "duplicate_label");
   assert.equal(manifest.diagnostics[0].label, "dup");
 });
+
+// Regression test for a real false positive: a documentation file showing
+// "% lea: ..." syntax examples inside a \begin{verbatim} block had that
+// block picked up as its own phantom target (kind "verbatim"), using the
+// first label found in its illustrative text -- colliding with the real,
+// nested theorem the example was describing. LaTeX itself never treats "%"
+// as a comment character inside verbatim-like environments, so a marker
+// found there can never be real; these environments must be excluded
+// outright, not merely produce an extra (duplicate-labeled) item.
+test("a % lea: line inside a verbatim-like environment is never treated as a marker", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [
+      {
+        path: "main.tex",
+        content: [
+          "\\begin{verbatim}",
+          "\\begin{theorem}\\label{thm:example}",
+          "% lea: formalize label=compactness_criterion",
+          "Example text shown for documentation purposes only.",
+          "\\end{theorem}",
+          "\\end{verbatim}",
+          "",
+          "\\begin{theorem}\\label{thm:real}",
+          "% lea: formalize label=compactness_criterion",
+          "The real statement.",
+          "\\end{theorem}"
+        ].join("\n")
+      }
+    ]
+  });
+
+  // Only the real, non-verbatim theorem becomes an item -- no phantom
+  // "verbatim" item, and therefore no duplicate_label diagnostic either.
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].kind, "theorem");
+  assert.equal(manifest.items[0].label, "compactness_criterion");
+  assert.deepEqual(manifest.diagnostics, []);
+});
+
+test("lstlisting, minted, and comment environments are excluded the same way", () => {
+  for (const env of ["lstlisting", "minted", "comment", "verbatim*", "Verbatim"]) {
+    const manifest = buildLeanPaneManifest({
+      files: [
+        {
+          path: "main.tex",
+          content: [
+            `\\begin{${env}}`,
+            "% lea: formalize label=should_not_appear",
+            `\\end{${env}}`
+          ].join("\n")
+        }
+      ]
+    });
+    assert.equal(manifest.items.length, 0, `expected no items for \\begin{${env}}`);
+  }
+});
+
+// Regression test for a follow-on real false positive, found live after the
+// fix above: excluding verbatim-like environments from *becoming* a target
+// stopped that, but a legitimately real *outer* environment (here
+// \begin{enumerate}, e.g. a numbered recipe step in a documentation file)
+// that merely *contains* a nested verbatim example was still promoted to its
+// own phantom item -- because extractLeaMarkerLabel searched a plain
+// substring of the ORIGINAL content for that environment's body, which still
+// literally contained the nested example's "% lea: ..." line. The fix
+// (searching a masked slice instead) must leave the real theorem inside the
+// enumerate step untouched while making the enumerate itself produce no item
+// at all.
+test("a real outer environment containing a nested verbatim marker example is not itself promoted to an item", () => {
+  const manifest = buildLeanPaneManifest({
+    files: [
+      {
+        path: "main.tex",
+        content: [
+          "\\begin{enumerate}",
+          "  \\item Open the item, click Edit, replace with:",
+          "\\begin{verbatim}",
+          "\\begin{theorem}\\label{thm:example}",
+          "% lea: formalize label=uses_locally_finite_computationally",
+          "\\end{theorem}",
+          "\\end{verbatim}",
+          "  \\item Save.",
+          "\\end{enumerate}",
+          "",
+          "\\begin{theorem}\\label{thm:real}",
+          "% lea: formalize label=compactness_criterion",
+          "The real statement.",
+          "\\end{theorem}"
+        ].join("\n")
+      }
+    ]
+  });
+
+  assert.equal(manifest.items.length, 1);
+  assert.equal(manifest.items[0].kind, "theorem");
+  assert.equal(manifest.items[0].label, "compactness_criterion");
+  assert.deepEqual(manifest.diagnostics, []);
+});

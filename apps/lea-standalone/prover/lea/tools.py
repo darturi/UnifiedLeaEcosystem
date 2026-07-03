@@ -143,7 +143,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     return "OK"
 
 
-def lean_check(path: str) -> str:
+def lean_check(path: str, *, use_lsp: bool = True) -> str:
     p = Path(path).resolve()
     if not p.exists():
         return f"Error: {p} does not exist."
@@ -152,7 +152,25 @@ def lean_check(path: str) -> str:
 
     # Fast path: persistent LSP daemon (keeps Mathlib oleans warm). ~420×
     # speedup on in-place edits. See lea/lsp_daemon.py and tests/lsp/.
-    if lake_root and not os.environ.get("LEA_DISABLE_LSP"):
+    #
+    # `use_lsp=False` skips this deliberately (see `lean_check_cold` below):
+    # the daemon caches every module it has ever imported for the life of its
+    # process, so a check through it can silently resolve an `import` against
+    # a stale in-memory copy even after a real `lake build` (`rebuild_module`,
+    # below) refreshed that module's `.olean` on disk from a *different*
+    # process.
+    #
+    # CAUTION: a live end-to-end test (tests/lsp/test_cascade_rename_integration.py)
+    # found that `use_lsp=False` -- i.e. the plain `lake env lean <file>`
+    # subprocess below -- does NOT reliably see a just-rebuilt project-local
+    # module's fresh `.olean` either, unlike restarting the daemon (which does).
+    # This is a real Lean/Lake behavior difference still under investigation,
+    # not something to rely on for correctness yet. The Overleaf lean pane's
+    # cascade re-check of a dependent (routes/sessions.py) does NOT use this --
+    # it relies on `rebuild_module`'s `lsp_daemon.mark_stale` call instead,
+    # confirmed correct by the same test. See
+    # docs/FEATURE-overleaf-lean-pane-manual-edit.md ("Cascade verification").
+    if use_lsp and lake_root and not os.environ.get("LEA_DISABLE_LSP"):
         try:
             from lea.lsp_daemon import check_via_lsp
             return check_via_lsp(str(p), p.read_text(), lake_root)
@@ -179,6 +197,108 @@ def lean_check(path: str) -> str:
         return f"Error: lean timed out after {timeout}s."
     except FileNotFoundError:
         return "Error: `lean` or `lake` not found. Is Lean 4 installed?"
+
+
+def lean_check_cold(path: str) -> str:
+    """`lean_check` with the LSP fast path forced off -- always a real, cold
+    `lake env lean` / `lean` subprocess compile, in principle reading whatever
+    `.olean`s are on disk right now with no in-process import cache to be
+    stale.
+
+    CAUTION: do not reach for this to work around the daemon's staleness
+    (see `lean_check`'s `use_lsp` docstring) -- a live end-to-end test found
+    it does NOT reliably do so for a project-local dependency. Prefer
+    `lsp_daemon.mark_stale` (wired into `rebuild_module`, below) plus the
+    normal warm `lean_check`, which that same test confirmed does work.
+    """
+    return lean_check(path, use_lsp=False)
+
+
+def rebuild_module(path: str) -> str:
+    """Force a real `lake build` of the Lean module at `path`, so its compiled
+    `.olean` on disk reflects the file's *current* source.
+
+    `lean_check`'s LSP fast path (above) never does this -- that's exactly what
+    makes a same-file recheck ~420x faster than a cold compile, but it also means
+    any *other* file that `import`s this module keeps resolving against whatever
+    `.olean` was last built, no matter how many times the importing file itself
+    is rechecked, until something does a real build. This is that something:
+    called once per edited module, before cascade-verifying its dependents
+    (docs/FEATURE-overleaf-lean-pane-manual-edit.md, "Cascade verification").
+
+    Unlike `lean_check`, this always shells out -- there is no fast path for
+    "make the compiled artifact on disk match the source," only a real one.
+    """
+    p = Path(path).resolve()
+    if not p.exists():
+        return f"Error: {p} does not exist."
+
+    lake_root = _find_lake_root(str(p))
+    if not lake_root:
+        return f"Error: no lakefile.lean/lakefile.toml found above {p}."
+
+    # Mirrors the adapter's own `config.lea_root / "workspace" / "proofs"`
+    # convention (routes/sessions.py `_resolve_proof_path`) and the companion's
+    # `moduleNameFromProjectStep` (leanDependencyGraph.mjs): the Lean module name
+    # is the file's path relative to the library's source root, dot-joined, no
+    # extension. This project's `lean_lib Lea where srcDir := "proofs"`
+    # (workspace/lakefile.lean) is exactly that source root.
+    src_root = Path(lake_root) / "proofs"
+    try:
+        module_rel = p.relative_to(src_root.resolve())
+    except ValueError:
+        return f"Error: {p} is not under the Lean source root {src_root}."
+    module_name = ".".join(module_rel.with_suffix("").parts)
+
+    timeout = int(os.environ.get("LEAN_CHECK_TIMEOUT", "900"))
+    try:
+        result = subprocess.run(
+            ["lake", "build", module_name],
+            # Explicit UTF-8: Lean's own output is full of non-ASCII (✖, ⊢,
+            # Mathlib's unicode notation). `text=True` alone decodes with the
+            # ambient locale's default encoding, which is not guaranteed to be
+            # UTF-8 for a background-launched process -- a decoding failure
+            # there would raise uncaught (not TimeoutExpired/FileNotFoundError)
+            # and surface as an opaque 500 instead of a real verdict.
+            # errors="replace" so a genuinely malformed byte can't crash the
+            # rebuild outright either.
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, cwd=lake_root,
+        )
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode == 0:
+            # This module's .olean on disk just changed, but a persistent LSP
+            # daemon (lsp_daemon.py) already holding it imported keeps its own
+            # in-memory copy for the life of its process -- this subprocess
+            # rebuild can't reach into that other process to fix it. Flag the
+            # daemon (if one exists for this lake_root) so its *next* check
+            # restarts it first, rather than silently serving the pre-rebuild
+            # environment forever. Best-effort: a project with LEA_DISABLE_LSP
+            # set, or no daemon started yet, has nothing to flag.
+            try:
+                from lea.lsp_daemon import mark_stale
+                mark_stale(lake_root)
+            except Exception:
+                pass
+            return output if output else "OK — rebuilt."
+        # Lake's own build-failure report (e.g. "✗ [n/total] Building <module>
+        # (Ns)" plus a `trace:` block showing the invocation it ran) is NOT the
+        # same format `lean`'s direct CLI/LSP diagnostics use -- the
+        # `file.lean:L:C: error: ...` line `_lean_check_has_error`/
+        # `_first_error_line` (lea/interface.py `rebuild`) scan for may be
+        # buried deep in Lake's own log, or, for some failure modes, absent
+        # from the captured output entirely even though the build genuinely
+        # failed. A non-zero exit code from `lake build` is authoritative on
+        # its own -- don't make error detection depend on Lake's own log
+        # happening to contain the literal word "error". Prefix unambiguously
+        # so the downstream text-based classifiers can never miss a real
+        # build failure regardless of how Lake chose to phrase it.
+        label = output or f"lake build exited with code {result.returncode} (no output)."
+        return f"error: lake build failed for {module_name} (exit {result.returncode}):\n{label}"
+    except subprocess.TimeoutExpired:
+        return f"Error: lake build timed out after {timeout}s."
+    except FileNotFoundError:
+        return "Error: `lake` not found. Is Lean 4 installed?"
 
 
 # --- output classifiers -----------------------------------------------------

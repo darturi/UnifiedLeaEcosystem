@@ -2,6 +2,7 @@ import { hashTargetText, normalizeTargetText } from "./theoremParser.mjs";
 import {
   findEnvironments,
   isLineBreak,
+  maskOpaqueSpans,
   parseBalancedSuffix,
   parseTargets,
   skipInlineWhitespace,
@@ -102,6 +103,19 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
   const targets = parseTargets(content);
   const targetsByOffset = new Map(targets.map((target) => [target.from, target]));
   const coveredOffsets = new Set();
+  // Masked once, reused for every environment's marker check below. A real,
+  // legitimately-matched environment (e.g. \begin{enumerate} in a
+  // documentation file) can still *contain* a nested verbatim-like block --
+  // findEnvironments already keeps that nested block from becoming its own
+  // target, but extracted.rawLatex below is a plain substring of the
+  // ORIGINAL content, and would still literally contain whatever marker text
+  // sits inside that nested block. Searching the masked slice instead is
+  // what stops a real false positive: a recipe list containing a "% lea:
+  // ..." example inside a \begin{verbatim} block had the whole enclosing
+  // \begin{enumerate} promoted to its own phantom pane item, using the
+  // example's label. rawLatex itself (used for display) stays on the
+  // original content -- only the marker *search* uses the masked version.
+  const maskedContent = maskOpaqueSpans(content);
   // Collect candidates from both sources before sorting -- pushing straight
   // from two separate loops would order all environment-based items before
   // all standalone-tag items regardless of where they actually sit in the
@@ -111,7 +125,8 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
 
   for (const environment of environments) {
     const extracted = extractEnvironmentContent(content, environment);
-    const leanName = extractLeaMarkerLabel(extracted.rawLatex);
+    const maskedRawLatex = maskedContent.slice(environment.bodyFrom, environment.bodyTo);
+    const leanName = extractLeaMarkerLabel(maskedRawLatex);
     if (!leanName) continue;
     coveredOffsets.add(environment.from);
     candidates.push({
