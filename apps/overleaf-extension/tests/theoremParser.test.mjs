@@ -143,6 +143,48 @@ test("reports missing, invalid, and duplicate marker labels", () => {
   assert.equal(duplicate.diagnostics[0].code, "duplicate_marker");
 });
 
+// Regression test for a follow-on bug found live: excluding verbatim-like
+// environments from producing their own (or a nested, illustrative) target
+// stopped the false *target* from being created, but a "% lea: ..." line
+// inside one was still independently found by the raw comment-line scan,
+// which then correctly failed to find any real enclosing environment
+// (because the inner example environment is now masked out) and surfaced a
+// confusing missing_environment diagnostic pointing at documentation text --
+// worse than silence, since it looks like a real, broken marker. A marker
+// (comment or tag syntax) inside a verbatim-like environment must produce no
+// diagnostic and no target at all, the same as if it weren't there.
+test("a % lea: marker inside a verbatim-like environment produces no diagnostic and no target", () => {
+  const withExample = parseTargetDocument([
+    "\\begin{verbatim}",
+    "\\begin{theorem}\\label{thm:example}",
+    "% lea: formalize label=compactness_criterion",
+    "Example shown for documentation purposes only.",
+    "\\end{theorem}",
+    "\\end{verbatim}",
+    "",
+    "\\begin{theorem}\\label{thm:real}",
+    "% lea: formalize label=compactness_criterion",
+    "The real statement.",
+    "\\end{theorem}"
+  ].join("\n"));
+
+  assert.equal(withExample.targets.length, 1);
+  assert.equal(withExample.targets[0].targetLabel, "compactness_criterion");
+  assert.deepEqual(withExample.diagnostics, []);
+
+  // Same for a lone marker with no real theorem anywhere in the document --
+  // still silent, not a missing_environment diagnostic.
+  const onlyInVerbatim = parseTargetDocument([
+    "\\begin{verbatim}",
+    "\\begin{theorem}",
+    "% lea: formalize label=only_documented",
+    "\\end{theorem}",
+    "\\end{verbatim}"
+  ].join("\n"));
+  assert.equal(onlyInVerbatim.targets.length, 0);
+  assert.deepEqual(onlyInVerbatim.diagnostics, []);
+});
+
 test("reports target/environment mismatches clearly", () => {
   const defineInTheorem = parseTargetDocument("\\begin{theorem}\n% lea: define label=bad\nA.\n\\end{theorem}");
   assert.equal(defineInTheorem.targets.length, 0);

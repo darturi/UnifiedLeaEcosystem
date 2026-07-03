@@ -428,7 +428,11 @@
 
 .ol-lean-project-status-stub-generated,
 .ol-lean-project-status-stale,
-.ol-lean-project-status-missing-stub {
+.ol-lean-project-status-missing-stub,
+/* A checked, sorry-free proof the prover itself flagged for human review --
+   same "needs attention" register as a stub/stale item, not the red of an
+   actual compile failure. */
+.ol-lean-project-status-needs-review {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
 }

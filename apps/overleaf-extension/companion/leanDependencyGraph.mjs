@@ -170,3 +170,45 @@ export async function dependentsOf({ leaRepoPath, namespace, moduleName }) {
   const reverseIndex = buildReverseImportIndex(files);
   return transitiveDependents(moduleName, reverseIndex);
 }
+
+// The FORWARD mirror of dependentsOf: every project file the given module
+// imports, directly or transitively, whose CURRENT content still contains a
+// sorry/admit -- i.e. everything upstream that remains to be formalized
+// before this proof stands on solid ground. Purely file-derived: it reads
+// imports and content from disk right now, so it needs no `uses=` links or
+// job records to have survived (jobs.json is routinely cleared by
+// start-dev.sh), and it is transitive where the job-recorded `targetUses`
+// scan is direct-only. The BFS deliberately continues THROUGH stubbed files:
+// a stub's own imports may be stubs too, and all of them are "what remains."
+//
+// The root can be given as `moduleName` or located by `absolutePath` (for
+// callers that only know where the proof file lives on disk).
+export async function stubbedUpstreamOf({ leaRepoPath, namespace, moduleName, absolutePath }) {
+  const files = await listProjectProofFiles({ leaRepoPath, namespace });
+  const byModule = new Map(files.map((file) => [file.moduleName, file]));
+  let root = moduleName ? byModule.get(moduleName) : null;
+  if (!root && absolutePath) {
+    const resolved = path.resolve(String(absolutePath));
+    root = files.find((file) => path.resolve(file.absolutePath) === resolved) || null;
+  }
+  if (!root) return [];
+
+  const visited = new Set([root.moduleName]);
+  const queue = [root.moduleName];
+  const stubbed = [];
+  while (queue.length > 0) {
+    const current = byModule.get(queue.shift());
+    if (!current) continue;
+    for (const imported of parseLeanImports(current.content)) {
+      if (visited.has(imported)) continue;
+      visited.add(imported);
+      const file = byModule.get(imported);
+      if (!file) continue; // outside the project namespace (Mathlib etc.)
+      if (/\bsorry\b|\badmit\b/.test(file.content)) {
+        stubbed.push(file);
+      }
+      queue.push(imported);
+    }
+  }
+  return stubbed;
+}

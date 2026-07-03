@@ -14,6 +14,10 @@ const PANE_STATUS_LABELS = {
   // A verified disproof is surfaced as a counterexample: a successful result, but
   // not a proof of the stated theorem (FEATURE-counterexample-workflows.md).
   disproved: "counterexample",
+  // A checked, sorry-free proof the prover flagged for human review -- not
+  // "invalid" (it compiles), not "valid" (not fully confident either); see
+  // server.mjs's mapLeanPaneStatus / resolveProofOutcome needs_review branch.
+  "needs-review": "needs review",
   "in-progress": "in progress",
   invalid: "invalid",
   stale: "stale",

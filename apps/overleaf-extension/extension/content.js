@@ -500,12 +500,25 @@
     header.appendChild(text);
     header.appendChild(meta);
     header.appendChild(chip);
+    // Same amber "!" the document overlay's badge shows for a proof whose
+    // imports are currently sorry-stubbed -- the pane item and the doc badge
+    // describe the same status object and must agree.
+    if (getStubbedTheoremUses(item).length > 0) {
+      header.appendChild(createStubbedTheoremUsesMark());
+    }
     card.appendChild(header);
 
     const natural = document.createElement("p");
     natural.className = "ol-lean-project-natural";
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
+
+    if (getStubbedTheoremUses(item).length > 0) {
+      const stubbedWarning = document.createElement("p");
+      stubbedWarning.className = "ol-lean-project-impact-note";
+      renderStubbedTheoremUsesWarning(stubbedWarning, item);
+      card.appendChild(stubbedWarning);
+    }
 
     if (item.leanStub) {
       const stub = document.createElement("pre");

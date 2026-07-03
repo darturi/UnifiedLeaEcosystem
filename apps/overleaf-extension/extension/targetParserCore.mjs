@@ -57,10 +57,19 @@ function parseMarkedTargets(source) {
     return genericEnvironments;
   };
 
-  const commentGroups = findLeaCommentGroups(source)
+  // A "% lea: ..." line (or \leatheorem{...} tag) inside a verbatim-like
+  // environment is never a real marker -- LaTeX itself never treats "%" as a
+  // comment character there, and a tag command would print literally rather
+  // than execute. Both scanners below run against the masked source (see
+  // maskOpaqueSpans), so such a line simply can't match at all -- no
+  // diagnostic, no target, exactly as if it weren't there. For any *real*
+  // marker (outside every opaque span), masked text is byte-identical to the
+  // original, so this changes nothing about genuine detection.
+  const maskedSource = maskOpaqueSpans(source);
+  const commentGroups = findLeaCommentGroups(maskedSource)
     .filter((group) => group.hasTargetMarker)
     .map((group) => ({ ...group, syntax: "comment" }));
-  const tagDetection = findLeaTagGroups(source);
+  const tagDetection = findLeaTagGroups(maskedSource);
   diagnostics.push(...tagDetection.diagnostics);
 
   if (tagDetection.groups.length > 0 && !hasLeaTagPackageLoaded(source)) {
@@ -223,6 +232,12 @@ function documentBodyOffset(source) {
   return index === -1 ? 0 : index + marker.length;
 }
 
+// Expects `source` to already be masked (see maskOpaqueSpans) by the caller
+// -- a tag command's literal text inside a verbatim-like environment (e.g. a
+// documentation example showing \leatheorem{...} syntax) is never really
+// invoked by LaTeX, and masked text simply can't match the tag pattern
+// there, so no malformed_tag/missing_environment diagnostic is generated for
+// it at all.
 function findLeaTagGroups(source) {
   const groups = [];
   const diagnostics = [];
@@ -420,6 +435,34 @@ function findSupportedEnvironments(source) {
   }));
 }
 
+// Environments whose *contents* LaTeX itself never interprets the way this
+// parser otherwise would. Inside \begin{verbatim}/\begin{lstlisting}/
+// \begin{minted}, LaTeX's tokenizer is disabled entirely -- a "%" is literal
+// displayed text, not a comment character, so a "% lea: ..." line in there
+// is not a marker under any real compilation of the document, and a
+// \leatheorem{...} tag would print literally rather than execute. `comment`
+// (the comment package) goes further and strips its body from the document
+// outright. None of these nest in real LaTeX (the first matching \end{name}
+// always closes them), so unlike theorem-like environments they need no
+// stack -- just "find the next \end{name} after each \begin{name}".
+//
+// This matters at two levels, both handled below:
+//   1. The environment's own \begin{X}...\end{X} pair should never itself
+//      become a target -- that's NON_TARGET_ENVIRONMENTS, same mechanism as
+//      excluding \begin{document}.
+//   2. Text *inside* the pair must be masked out of all environment/marker
+//      matching, not just excluded from becoming its own target. Found via a
+//      real false positive: a documentation file showing "% lea: ..." syntax
+//      examples inside a \begin{verbatim} block, itself containing an
+//      illustrative "\begin{theorem}...\end{theorem}\n% lea: ..." snippet.
+//      Excluding only the outer verbatim pair (level 1 alone) still let that
+//      *inner*, purely-illustrative "\begin{theorem}" text be matched as its
+//      own real environment, colliding on label with the actual target the
+//      example was describing. Masking the interior is what stops that.
+const VERBATIM_LIKE_ENVIRONMENTS = new Set([
+  "verbatim", "verbatim*", "Verbatim", "lstlisting", "minted", "comment"
+]);
+
 // Structural environments that are never themselves a theorem/definition
 // target, even though they're syntactically just another \begin{X}...\end{X}
 // pair. Excluded only from *generic* matching (names: null) -- the
@@ -428,7 +471,60 @@ function findSupportedEnvironments(source) {
 // \begin{document}...\end{document} itself (present in essentially every
 // real Overleaf project) instead of producing a missing_environment
 // diagnostic, silently treating the entire paper as the target's body.
-const NON_TARGET_ENVIRONMENTS = new Set(["document"]);
+// verbatim-like names are included too (level 1 above).
+const NON_TARGET_ENVIRONMENTS = new Set(["document", ...VERBATIM_LIKE_ENVIRONMENTS]);
+
+// Finds every [contentFrom, contentTo) span whose text lies strictly between
+// a \begin{name}...\end{name} pair for a verbatim-like name -- i.e. text
+// LaTeX itself would never tokenize as \begin/\end/%.
+function findOpaqueSpans(source) {
+  const spans = [];
+  for (const name of VERBATIM_LIKE_ENVIRONMENTS) {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const beginPattern = new RegExp(`\\\\begin\\s*\\{\\s*${escapedName}\\s*\\}`, "g");
+    let beginMatch;
+    while ((beginMatch = beginPattern.exec(source))) {
+      const contentFrom = beginPattern.lastIndex;
+      const endPattern = new RegExp(`\\\\end\\s*\\{\\s*${escapedName}\\s*\\}`, "g");
+      endPattern.lastIndex = contentFrom;
+      const endMatch = endPattern.exec(source);
+      if (!endMatch) break; // unterminated -- nothing real to mask, stop scanning this name
+      spans.push({ contentFrom, contentTo: endMatch.index });
+      beginPattern.lastIndex = endMatch.index + endMatch[0].length;
+    }
+  }
+  return spans;
+}
+
+// Returns a string the exact same length as `source`, with every opaque
+// span's interior replaced by spaces (newlines preserved, so line/column
+// math elsewhere stays correct). Once masked, no "\begin", "\end", "%", or
+// "\lea..." tag can ever be found inside a verbatim-like environment's
+// interior, at *any* nesting depth or by *any* scanner -- not just the
+// environment-pair matcher below. This is deliberately a single, blunt
+// primitive rather than scattered "is this position inside a span?" checks
+// at each call site: an earlier version of this fix only masked the
+// environment-pair matcher, which still let a legitimately real *outer*
+// environment (e.g. \begin{enumerate}, in a real false positive) have its
+// raw captured body text -- taken as a plain substring of the ORIGINAL
+// source by leanPaneManifest.mjs's extractLeaMarkerLabel -- independently
+// re-discover a marker nested inside a verbatim sub-block within it. Every
+// scanner in this module, and leanPaneManifest.mjs's own marker-detection
+// slice, now runs against this masked text instead. Offsets are unaffected
+// (same length), so callers that need the *real* displayed text for a
+// legitimately matched environment still slice the original source.
+export function maskOpaqueSpans(source) {
+  const text = String(source || "");
+  const spans = findOpaqueSpans(text);
+  if (spans.length === 0) return text;
+  const chars = text.split("");
+  for (const { contentFrom, contentTo } of spans) {
+    for (let i = contentFrom; i < contentTo; i += 1) {
+      if (chars[i] !== "\n") chars[i] = " ";
+    }
+  }
+  return chars.join("");
+}
 
 // Generic environment finder, shared by the comment-marker path above (via
 // findSupportedEnvironments, restricted to the theorem/definition allowlist)
@@ -442,9 +538,13 @@ export function findEnvironments(source, { names } = {}) {
   const environments = [];
   const stack = [];
   const pattern = buildEnvironmentPattern(names);
+  // Matched against the masked text (see maskOpaqueSpans) so no \begin/\end
+  // pair can ever be found inside a verbatim-like environment's interior.
+  // Offsets are identical to the original source (masking preserves length).
+  const maskedSource = maskOpaqueSpans(source);
   let match;
 
-  while ((match = pattern.exec(source))) {
+  while ((match = pattern.exec(maskedSource))) {
     const [, command, name] = match;
     if (command === "begin") {
       const openerEnd = pattern.lastIndex;

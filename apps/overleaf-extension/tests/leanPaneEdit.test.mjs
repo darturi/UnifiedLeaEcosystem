@@ -208,7 +208,13 @@ test("edit save: a signature edit cascades and reports a broken dependent, attri
       sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
       writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
       checkResponses: {
-        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null },
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null }
+      },
+      // The dependent's verdict comes from a REAL `lake build` of its module
+      // (live testing showed its warm lean-check can spuriously pass against
+      // a stale compiled import) -- so breakage is signaled here, not via
+      // checkResponses.
+      rebuildResponses: {
         "sess-b": (body) => ({ path: body.path, status: "error", detail: "unknown identifier: compactness_criterion" })
       }
     })
@@ -286,7 +292,9 @@ test("edit save: a rename updates the job's cached declarationName, not just the
       sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
       writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
       checkResponses: {
-        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null },
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null }
+      },
+      rebuildResponses: {
         "sess-b": (body) => ({ path: body.path, status: "error", detail: "unknown identifier: compactness_criterion" })
       }
     })
@@ -697,4 +705,312 @@ test("edit save flips the item's own status chip to invalid on the next manifest
   );
   const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
   assert.equal(fixed.body.items[0].status, "valid");
+});
+
+// Regression for the other half of the rename fix: updating
+// linkedJob.declarationName fixed readLeanPaneArtifactFromSession (the pane's
+// DISPLAY of the artifact), but loadEditableSessionFile -- the EDIT path's
+// own step lookup -- still searched by the LaTeX label. After a rename, the
+// newest steps contain only the new name, so the next "Edit" served the last
+// pre-rename snapshot into the editor (and a save would have written that
+// stale content back over the renamed file). Both handlers now search, parse,
+// and classify by the job's current declarationName.
+test("edit start after a rename serves the post-rename content, and a second rename still classifies as a rename", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const sessionDetails = {
+    "sess-a": {
+      project_namespace: NAMESPACE,
+      code_steps: [
+        { path: "compactness_criterion.lean", seq: 1, code: "theorem compactness_criterion : True := by\n  sorry\n" }
+      ]
+    }
+  };
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob({ declarationName: "compactness_criterion" }) },
+    fetchImpl: makeEditFetch(calls, { sessionDetails })
+  });
+
+  // First rename: criterion -> criterion_v2.
+  const firstSave = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion_v2 : True := by\n  sorry\n"
+    },
+    state
+  );
+  assert.equal(firstSave.statusCode, 200);
+  assert.equal(firstSave.body.ownResult.classification.kind, "renamed");
+  assert.equal(state.jobs.a.declarationName, "compactness_criterion_v2");
+
+  // The adapter records the write as a new code_step; the old step (still
+  // containing the OLD name) remains in the session history -- exactly the
+  // shape that used to trap the label-based lookup.
+  sessionDetails["sess-a"].code_steps.push({
+    path: "compactness_criterion.lean",
+    seq: 2,
+    code: "theorem compactness_criterion_v2 : True := by\n  sorry\n"
+  });
+
+  const start = await handleLeanPaneEditStart(
+    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "compactness_criterion" },
+    state
+  );
+  assert.equal(start.statusCode, 200);
+  // the post-rename content, NOT the seq-1 pre-rename snapshot
+  assert.match(start.body.content, /compactness_criterion_v2/);
+
+  // Second rename: v2 -> v3. expectedName must be the CURRENT name (v2) for
+  // classifyEdit to see this as a rename; searching/classifying by the
+  // original label made it come out as "signature" and skipped the
+  // declarationName refresh.
+  const secondSave = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion_v3 : True := by\n  sorry\n"
+    },
+    state
+  );
+  assert.equal(secondSave.statusCode, 200);
+  assert.equal(secondSave.body.ownResult.classification.kind, "renamed");
+  assert.equal(secondSave.body.ownResult.classification.from, "compactness_criterion_v2");
+  assert.equal(secondSave.body.ownResult.classification.to, "compactness_criterion_v3");
+  assert.equal(state.jobs.a.declarationName, "compactness_criterion_v3");
+});
+
+// Regression for cascade attribution after a DEPENDENT was itself renamed:
+// the reverse index hands back the dependent file's parsed declaration name,
+// but jobs stay keyed by the LaTeX label forever. Once the dependent's
+// declarationName diverged from its key (via its own rename), the label-keyed
+// lookup missed and the dependent was reported "unknown/unattributed" -- its
+// chip never received cascade verdicts. resolveDependentSession now falls
+// back to scanning jobs by their current declarationName.
+test("edit save: a cascade still attributes a dependent that was previously renamed", async () => {
+  const leaRepo = await makeLeaRepo();
+  // The dependent's FILE declares the renamed symbol...
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem renamed_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: {
+      a: editedJob({ declarationName: "compactness_criterion" }),
+      // ...while its job stays keyed under the original LaTeX label, with the
+      // rename branch's refreshed declarationName cache.
+      b: dependentJob({ declarationName: "renamed_corollary" })
+    },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null }
+      },
+      rebuildResponses: {
+        "sess-b": (body) => ({ path: body.path, status: "error", detail: "unknown identifier: compactness_criterion" })
+      }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      // signature change (binder added) -- forces the cascade
+      content: "theorem compactness_criterion (n : Nat) : True := by\n  sorry\n"
+    },
+    state
+  );
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.dependentsImpact.length, 1);
+  const impact = res.body.dependentsImpact[0];
+  assert.equal(impact.targetLabel, "renamed_corollary");
+  // before the fix: attributed false, no sess-b call, no chip verdict
+  assert.equal(impact.attributed, true);
+  assert.equal(impact.status, "invalid");
+  assert.ok(calls.some((c) => c.url.endsWith("/sess-b/lean-check")));
+  assert.equal(state.jobs.b.lastEditCheckStatus, "error");
+  assert.match(state.jobs.b.lastEditCheckDetail, /unknown identifier/);
+});
+
+// Regression for the live bug report: rename compactness_criterion ->
+// compactness_thm via manual edit (works), then try to edit the item again
+// to rename it back -- and get blocked with "No Lea session is recorded for
+// this item yet. Formalize it first." Root cause: the extension identifies
+// an item by its CURRENT declaration name (paneItemToEditTarget:
+// leanDeclarationName || label), which after the rename is the NEW name --
+// but jobs stay keyed by the LaTeX label, so resolveEditSession's key lookup
+// missed. It now bridges via the jobs' declarationName cache.
+test("edit start/save still resolve the session when the pane sends the post-rename declaration name", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    // post-rename state: job keyed under the LaTeX label, declarationName
+    // refreshed to the new symbol by the first rename's save
+    jobs: { a: editedJob({ declarationName: "compactness_thm" }) },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: {
+        "sess-a": {
+          project_namespace: NAMESPACE,
+          code_steps: [
+            { path: "compactness_criterion.lean", seq: 1, code: "theorem compactness_criterion : True := by\n  sorry\n" },
+            { path: "compactness_criterion.lean", seq: 2, code: "theorem compactness_thm : True := by\n  sorry\n" }
+          ]
+        }
+      },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-3" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } }
+    })
+  });
+
+  // What the extension sends after the rename: the NEW name as targetLabel.
+  const start = await handleLeanPaneEditStart(
+    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "compactness_thm" },
+    state
+  );
+  // was: 404 no_session ("Formalize it first.")
+  assert.equal(start.statusCode, 200);
+  assert.equal(start.body.leaSessionId, "sess-a");
+  assert.match(start.body.content, /compactness_thm/);
+
+  // ...and renaming it BACK to the original name round-trips.
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_thm",
+      content: "theorem compactness_criterion : True := by\n  sorry\n"
+    },
+    state
+  );
+  assert.equal(save.statusCode, 200);
+  assert.equal(save.body.ownResult.classification.kind, "renamed");
+  assert.equal(save.body.ownResult.classification.from, "compactness_thm");
+  assert.equal(save.body.ownResult.classification.to, "compactness_criterion");
+  assert.equal(state.jobs.a.declarationName, "compactness_criterion");
+
+  // a definition item must not hijack a theorem-keyed job via the fallback
+  const wrongKind = await handleLeanPaneEditStart(
+    { overleafProjectId: "project-1", targetKind: "definition", targetLabel: "compactness_thm" },
+    state
+  );
+  assert.equal(wrongKind.statusCode, 404);
+  assert.equal(wrongKind.body.error, "no_session");
+});
+
+// Recipe 4 end-to-end (live report: "downstream theorems did not change their
+// status"). Two layers to this:
+//   1. The DIRECT dependent must flip: its cascade lean-check fails, the
+//      verdict lands on its job, and the next manifest renders its chip
+//      invalid with the compiler's own message.
+//   2. The TRANSITIVE dependent (import chain reaches the edit only through
+//      the broken middle module) is where a real hole lived: its warm
+//      cascade check resolves imports against compiled .oleans, and only the
+//      EDITED module was rebuilt -- the broken middle module's stale .olean
+//      still exports its old, working self, so the check spuriously passed
+//      and the item kept reading "valid". Compilation is transitive, so
+//      breakage now propagates down the import graph regardless.
+test("recipe 4: a signature edit flips the broken dependent AND propagates to transitive dependents", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  exact compactness_criterion\n"
+  );
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/heine_borel_application.lean",
+    "import Lea.Project1.compactness_corollary\ntheorem heine_borel_application : True := by\n  exact compactness_corollary\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: {
+      a: editedJob({ declarationName: "compactness_criterion" }),
+      b: dependentJob({ declarationName: "compactness_corollary" }),
+      c: dependentJob({
+        jobKey: "project-1:theorem:heine_borel_application",
+        leaSessionId: "sess-c",
+        declarationName: "heine_borel_application"
+      })
+    },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null }
+      },
+      rebuildResponses: {
+        // verdicts now come from real per-dependent `lake build`s
+        "sess-b": (body) => ({ path: body.path, status: "error", detail: "type mismatch: compactness_criterion now expects (h : True)" }),
+        // even if the transitive dependent's own build SPURIOUSLY passes
+        // (e.g. an adapter-side caching artifact), the companion must not
+        // believe it -- import-graph propagation overrules it
+        "sess-c": (body) => ({ path: body.path, status: "ok", detail: null })
+      }
+    })
+  });
+
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      // recipe 4: add a hypothesis -- same name, changed signature
+      content: "theorem compactness_criterion (h : True) : True := by\n  trivial\n"
+    },
+    state
+  );
+
+  assert.equal(save.statusCode, 200);
+  assert.equal(save.body.ownResult.classification.kind, "signature");
+  const impactByLabel = Object.fromEntries(save.body.dependentsImpact.map((d) => [d.targetLabel, d]));
+
+  // direct dependent: genuinely re-checked, genuinely failed
+  assert.equal(impactByLabel.compactness_corollary.status, "invalid");
+  assert.equal(impactByLabel.compactness_corollary.brokenByUpstream.targetLabel, "compactness_criterion");
+  assert.equal(state.jobs.b.lastEditCheckStatus, "error");
+  assert.match(state.jobs.b.lastEditCheckDetail, /type mismatch/);
+
+  // transitive dependent: its spurious "ok" was overruled by propagation
+  assert.equal(impactByLabel.heine_borel_application.status, "invalid");
+  assert.equal(impactByLabel.heine_borel_application.brokenByUpstream.viaModule, "Lea.Project1.compactness_corollary");
+  assert.equal(state.jobs.c.lastEditCheckStatus, "error");
+  assert.match(state.jobs.c.lastEditCheckDetail, /compactness_corollary no longer compiles/);
+
+  // ...and the pane chips agree on the next manifest refresh
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "S.",
+      "\\end{theorem}",
+      "\\begin{theorem}\\label{thm:corollary}",
+      "% lea: formalize label=compactness_corollary uses={compactness_criterion}",
+      "S.",
+      "\\end{theorem}",
+      "\\begin{corollary}\\label{thm:application}",
+      "% lea: formalize label=heine_borel_application uses={compactness_corollary}",
+      "S.",
+      "\\end{corollary}"
+    ].join("\n")
+  }];
+  const manifest = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  const byLabel = Object.fromEntries(manifest.body.items.map((item) => [item.leanDeclarationName, item]));
+  assert.equal(byLabel.compactness_criterion.status, "valid"); // its own edit compiles
+  assert.equal(byLabel.compactness_corollary.status, "invalid");
+  assert.match(byLabel.compactness_corollary.message, /type mismatch/);
+  assert.equal(byLabel.heine_borel_application.status, "invalid");
+  assert.match(byLabel.heine_borel_application.message, /compactness_corollary no longer compiles/);
 });
