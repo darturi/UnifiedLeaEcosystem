@@ -992,6 +992,43 @@ def add_code_step(
     return row_to_dict(inserted)
 
 
+def has_active_run(session_id: str) -> bool:
+    """True if the session has a pending/running agent run — the modal lock (D62):
+    a user write is refused while the agent is mid-run so the two never race on the
+    same file. Same status set the derived session status uses for `active_run_count`."""
+    with connect() as conn:
+        row = conn.execute(
+            "select 1 from runs where session_id = ? and status in ('pending', 'running') limit 1",
+            (session_id,),
+        ).fetchone()
+    return row is not None
+
+
+def upsert_user_code_step(session_id: str, path: str, *, commit_sha: str) -> dict:
+    """Record a user edit, coalescing rapid successive edits into one timeline step.
+
+    Auto-save (v2.2) commits on every debounced keystroke-pause, which would spray
+    the History stepper with one 'your edit' step per save. So if the file's latest
+    step is already an *uncommitted-to-a-run* user edit (author='user', run_id NULL),
+    we repoint that step at the new commit and clear its stale verdict — one step
+    that tracks the newest content — instead of inserting a new row. A step authored
+    by the agent (or a user edit for a different file) still starts a fresh step, so
+    the human/agent boundary in the timeline is preserved. Git keeps every commit;
+    only the curated timeline coalesces (D7/D8)."""
+    latest = latest_code_step_for_path(session_id, path)
+    if latest and latest.get("author") == "user" and latest.get("run_id") is None:
+        with connect() as conn:
+            conn.execute(
+                "update code_steps set commit_sha = ?, check_status = NULL, check_detail = NULL "
+                "where id = ?",
+                (commit_sha, latest["id"]),
+            )
+            row = conn.execute("select * from code_steps where id = ?", (latest["id"],)).fetchone()
+        touch_session(session_id)
+        return row_to_dict(row)
+    return add_code_step(session_id, None, path, commit_sha=commit_sha, author="user")
+
+
 def set_code_step_check(step_id: str, check_status: str, check_detail: str | None = None) -> dict | None:
     """Back-fill a code_step's verdict once `lean_check` returns (D6).
 

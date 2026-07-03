@@ -113,6 +113,12 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     if not request.path:
         raise HTTPException(status_code=400, detail="path is required")
 
+    # Modal lock (D62): the agent and the human never write the same file at once.
+    # The live editor already goes read-only during a run; this is the server-side
+    # backstop so a stray/racing write is refused rather than clobbering agent state.
+    if store.has_active_run(session_id):
+        raise HTTPException(status_code=409, detail="A run is active — editing is locked until it finishes.")
+
     resolved = projects.resolve_git(session_id, config.lea_root / "workspace" / "proofs")
     if resolved is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -131,7 +137,9 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     if sha == before:
         return {"unchanged": True, "code_step": None, "note": None}
 
-    step = store.add_code_step(session_id, None, request.path, commit_sha=sha, author="user")
+    # Coalesce rapid auto-saves into one 'your edit' timeline step (D62) — see
+    # store.upsert_user_code_step. Git still records every commit.
+    step = store.upsert_user_code_step(session_id, request.path, commit_sha=sha)
     # A human edit changes the proof, so any prior SafeVerify verdict is stale.
     store.set_session_safe_verify(session_id, None, None)
     note_message = None

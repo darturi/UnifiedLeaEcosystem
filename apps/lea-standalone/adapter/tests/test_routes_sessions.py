@@ -138,6 +138,62 @@ def test_write_file_creates_user_step_and_edit_note(tmp_path, monkeypatch):
     assert store.session_detail(session["id"])["code_steps"][-1]["author"] == "user"
 
 
+def test_write_file_rejected_during_active_run(tmp_path, monkeypatch):
+    # Modal lock (D62): a user write is refused while an agent run is active, so the
+    # two never race on the same file. `create_run` starts a run 'pending' = active.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("S")
+    store.create_run(session["id"], "m", None, 3)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.write_file_session(
+            session["id"], FileWriteRequest(path="Lea/Misc/P.lean", content="x"))
+    assert exc.value.status_code == 409
+
+
+def test_write_file_coalesces_successive_user_edits(tmp_path, monkeypatch):
+    # Auto-save (v2.2) writes on every debounced pause; successive user edits to the
+    # same file collapse into ONE timeline step (same row, repointed) rather than
+    # spraying History with a step per save.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("S")  # no run -> not locked
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    p = "Lea/Misc/P.lean"
+
+    r1 = sessions_route.write_file_session(
+        session["id"], FileWriteRequest(path=p, content="theorem p : True := by trivial\n"))
+    r2 = sessions_route.write_file_session(
+        session["id"], FileWriteRequest(path=p, content="theorem p : True := by\n  trivial\n"))
+
+    assert r1["code_step"]["id"] == r2["code_step"]["id"]  # same row -> coalesced
+    steps = store.session_detail(session["id"])["code_steps"]
+    assert len(steps) == 1
+    assert steps[-1]["author"] == "user"
+    assert steps[-1]["commit_sha"] == r2["code_step"]["commit_sha"]  # points at latest
+
+
+def test_user_edit_after_agent_step_starts_a_new_step(tmp_path, monkeypatch):
+    # The human/agent boundary is preserved: a user edit that lands on top of an
+    # agent step opens a fresh step (only successive *user* edits coalesce).
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_commit(tmp_path)  # agent step for Lea/Misc/p.lean + a run
+    # end the run so the modal lock doesn't block the user write
+    run = store.session_detail(session["id"])["runs"][0]
+    store.update_run(run["id"], "ok")
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    sessions_route.write_file_session(
+        session["id"], FileWriteRequest(path="Lea/Misc/p.lean", content="import Mathlib\n\ntheorem t : True := by\n  trivial\n"))
+
+    steps = store.session_detail(session["id"])["code_steps"]
+    assert len(steps) == 2
+    assert steps[0]["author"] == "agent" and steps[-1]["author"] == "user"
+
+
 def test_write_file_no_op_save_creates_no_step(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
