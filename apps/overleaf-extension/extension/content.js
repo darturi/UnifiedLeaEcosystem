@@ -77,6 +77,12 @@
   let leanPaneEditPreSaveDependents = [];
   let leanPaneEditError = "";
   let leanPaneEditLastResult = null;
+  // Self-repair (docs/FEATURE-overleaf-self-repair.md): the live batch (if
+  // any) + the last repair dispatch error. Batch state is companion-side;
+  // this holds only the latest /lean-pane/repair/status snapshot.
+  let leanPaneRepairBatch = null;
+  let leanPaneRepairBatchTimer = 0;
+  let leanPaneRepairError = "";
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -589,6 +595,9 @@
       leanPaneBody.appendChild(diagnostics);
     }
 
+    const repairBatchPanel = renderLeanPaneRepairBatchPanel();
+    if (repairBatchPanel) leanPaneBody.appendChild(repairBatchPanel);
+
     if (items.length > 0) {
       const treeElement = document.createElement("div");
       treeElement.className = "ol-lean-project-tree";
@@ -788,6 +797,9 @@
     if (!editing && leanPaneView.canEditPaneItem(item)) {
       actions.appendChild(renderEditButton(item));
     }
+    if (!editing && leanPaneView.canRepairPaneItem(item)) {
+      actions.appendChild(renderRepairButton(item));
+    }
     if (item.leanStub) {
       actions.appendChild(renderCopyButton("Copy stub", item.leanStub));
     }
@@ -795,6 +807,16 @@
       actions.appendChild(renderCopyButton("Copy artifact", item.leanArtifactContent));
     }
     if (actions.children.length > 0) detail.appendChild(actions);
+
+    if (item.breakage) {
+      detail.appendChild(renderLeanPaneBreakage(item));
+    }
+    if (item.repairNeedsReview) {
+      const review = document.createElement("p");
+      review.className = "ol-lean-project-repair-review";
+      review.textContent = "A repair for this item compiles, but its declaration header changed -- review that the statement still matches the source.";
+      detail.appendChild(review);
+    }
 
     if (editing) {
       detail.appendChild(renderLeanPaneEditControls(item));
@@ -811,7 +833,7 @@
     }
 
     if (!editing && leanPaneEditLastResult && leanPaneEditLastResult.itemId === item.id) {
-      const summary = renderLeanPaneEditImpactSummary(leanPaneEditLastResult);
+      const summary = renderLeanPaneEditImpactSummary(leanPaneEditLastResult, item);
       if (summary) detail.appendChild(summary);
     }
     return detail;
@@ -829,6 +851,200 @@
       openLeanPaneEdit(item);
     });
     return button;
+  }
+
+  // --- Self-repair actions (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
+
+  function renderRepairButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button ol-lean-repair-button";
+    button.textContent = "Repair with Lea";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const projectId = itemsProjectId(lastLeanPaneManifest?.items || []);
+      const target = leanPaneView.paneItemToEditTarget(item, projectId);
+      requestRepair({
+        overleafProjectId: projectId,
+        items: [{ targetKind: target.targetKind, targetLabel: target.targetLabel }],
+        breakage: item.breakage
+      });
+    });
+    return button;
+  }
+
+  // The chip-adjacent breakage explanation + repair lifecycle line.
+  function renderLeanPaneBreakage(item) {
+    const container = document.createElement("div");
+    container.className = "ol-lean-project-breakage";
+    const attribution = document.createElement("p");
+    attribution.textContent = leanPaneView.formatBreakageAttribution(item.breakage);
+    container.appendChild(attribution);
+    const repair = item.breakage.repair;
+    if (repair?.state === "running") {
+      const line = document.createElement("p");
+      line.className = "ol-lean-project-breakage-running";
+      line.textContent = "A repair run is in progress for this item...";
+      container.appendChild(line);
+    } else if (repair?.state === "failed") {
+      const line = document.createElement("p");
+      line.className = "ol-lean-project-breakage-failed";
+      line.textContent = `Repair failed: ${repair.failureReason || "the repaired file still does not compile."}`;
+      container.appendChild(line);
+    }
+    if (leanPaneRepairError) {
+      const line = document.createElement("p");
+      line.className = "ol-lean-project-breakage-failed";
+      line.textContent = leanPaneRepairError;
+      container.appendChild(line);
+    }
+    return container;
+  }
+
+  // The configured model's display label, for the repair confirmation ("which
+  // agent will do it"). Best-effort: a missing label falls back to generic
+  // copy inside formatRepairConfirmation.
+  async function bestEffortModelLabel() {
+    try {
+      const stored = await getSettings();
+      const model = String(stored.leaModel || "");
+      const options = Array.isArray(stored.leaModelOptions) ? stored.leaModelOptions : [];
+      const found = options.find((option) => (option.value || option.id) === model);
+      return found?.label || model;
+    } catch {
+      return "";
+    }
+  }
+
+  // One confirmation, then dispatch: a single item goes through
+  // /lean-pane/repair/start; several go through the topologically ordered
+  // batch (/lean-pane/repair/all). Nothing runs without the confirm.
+  async function requestRepair({ overleafProjectId, items, breakage }) {
+    const modelLabel = await bestEffortModelLabel();
+    const text = leanPaneView.formatRepairConfirmation({ items, breakage, modelLabel });
+    if (!window.confirm(text)) return;
+    leanPaneRepairError = "";
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      if (items.length === 1) {
+        const response = await fetch(`${baseUrl}/lean-pane/repair/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overleafProjectId, ...items[0] })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
+      } else {
+        const response = await fetch(`${baseUrl}/lean-pane/repair/all`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overleafProjectId, items })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
+        leanPaneRepairBatch = payload;
+        startRepairBatchPolling();
+      }
+    } catch (error) {
+      leanPaneRepairError = normalizeErrorMessage(error);
+    }
+    renderLeanPaneManifest(lastLeanPaneManifest);
+    scheduleLeanPaneRefresh();
+  }
+
+  function startRepairBatchPolling() {
+    if (leanPaneRepairBatchTimer) clearTimeout(leanPaneRepairBatchTimer);
+    leanPaneRepairBatchTimer = setTimeout(async () => {
+      leanPaneRepairBatchTimer = 0;
+      const batchId = leanPaneRepairBatch?.batchId;
+      if (!batchId) return;
+      try {
+        const baseUrl = await chatCompanionBaseUrl();
+        const response = await fetch(`${baseUrl}/lean-pane/repair/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ batchId })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (response.ok) leanPaneRepairBatch = payload;
+      } catch {
+        // transient; keep the last snapshot and try again
+      }
+      renderLeanPaneManifest(lastLeanPaneManifest);
+      scheduleLeanPaneRefresh();
+      if (leanPaneRepairBatch && !leanPaneRepairBatch.done && !leanPaneRepairBatch.pausedOn) {
+        startRepairBatchPolling();
+      }
+    }, 2000);
+  }
+
+  async function continueRepairBatch() {
+    const batchId = leanPaneRepairBatch?.batchId;
+    if (!batchId) return;
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/repair/all/continue`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batchId })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok) leanPaneRepairBatch = payload;
+      startRepairBatchPolling();
+    } catch (error) {
+      leanPaneRepairError = normalizeErrorMessage(error);
+    }
+    renderLeanPaneManifest(lastLeanPaneManifest);
+  }
+
+  // Live batch progress at the top of the pane: one line per item
+  // (formatRepairOutcome), plus continue/dismiss controls when the batch
+  // paused on a failure or the spend cap.
+  function renderLeanPaneRepairBatchPanel() {
+    const batch = leanPaneRepairBatch;
+    if (!batch || !Array.isArray(batch.items) || batch.items.length === 0) return null;
+    const panel = document.createElement("div");
+    panel.className = "ol-lean-project-repair-batch";
+    const heading = document.createElement("p");
+    const doneCount = batch.items.filter((entry) => ["repaired", "needs_review"].includes(entry.state)).length;
+    heading.textContent = batch.done
+      ? `Repair batch finished: ${doneCount}/${batch.items.length} repaired.`
+      : batch.pausedOn
+        ? batch.pausedOn.reason === "max_spend"
+          ? "Repair batch paused: the max spend limit was reached."
+          : `Repair batch paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
+        : `Repairing ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
+    panel.appendChild(heading);
+    for (const entry of batch.items) {
+      const line = document.createElement("p");
+      line.className = "ol-lean-project-repair-batch-item";
+      line.textContent = leanPaneView.formatRepairOutcome(entry);
+      panel.appendChild(line);
+    }
+    const controls = document.createElement("div");
+    controls.className = "ol-lean-project-detail-actions";
+    if (batch.pausedOn) {
+      const cont = document.createElement("button");
+      cont.type = "button";
+      cont.className = "ol-lean-primary-button";
+      cont.textContent = "Continue remaining";
+      cont.addEventListener("click", () => { continueRepairBatch(); });
+      controls.appendChild(cont);
+    }
+    if (batch.done || batch.pausedOn) {
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "ol-lean-secondary-button";
+      dismiss.textContent = "Dismiss";
+      dismiss.addEventListener("click", () => {
+        leanPaneRepairBatch = null;
+        renderLeanPaneManifest(lastLeanPaneManifest);
+      });
+      controls.appendChild(dismiss);
+    }
+    if (controls.children.length > 0) panel.appendChild(controls);
+    return panel;
   }
 
   // Open the inline edit view for an item: shows the current artifact
@@ -970,7 +1186,7 @@
   // this summary is now scoped to what the chip *can't* show on its own: a
   // one-time confirmation of what a save actually did across OTHER items.
   // Returns null when there's nothing worth a separate note for.
-  function renderLeanPaneEditImpactSummary(result) {
+  function renderLeanPaneEditImpactSummary(result, item = null) {
     if (result.unchanged) {
       const container = document.createElement("div");
       container.className = "ol-lean-project-impact-note";
@@ -996,6 +1212,38 @@
       const p = document.createElement("p");
       p.textContent = leanPaneView.formatDependentOutcome(dependent);
       container.appendChild(p);
+    }
+    // Self-repair: offer one action for the whole broken set (feature spec
+    // Part 2). Suppressed when the edit broke the edited item ITSELF -- its
+    // own repair offer (on the item) is the right entry point until it
+    // compiles again.
+    const broken = dependents.filter((d) => d.brokenByUpstream);
+    const ownBroken = String(result.ownResult?.checkStatus || "").toLowerCase() === "error";
+    if (broken.length > 0 && !ownBroken) {
+      const actions = document.createElement("div");
+      actions.className = "ol-lean-project-detail-actions";
+      const repairAll = document.createElement("button");
+      repairAll.type = "button";
+      repairAll.className = "ol-lean-primary-button ol-lean-repair-all-button";
+      repairAll.textContent = `Repair all (${broken.length})`;
+      repairAll.addEventListener("click", () => {
+        const projectId = itemsProjectId(lastLeanPaneManifest?.items || []);
+        const classification = result.ownResult?.classification || {};
+        requestRepair({
+          overleafProjectId: projectId,
+          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel })),
+          breakage: {
+            upstreamLabel: broken[0].brokenByUpstream?.targetLabel || (item?.leanDeclarationName ?? ""),
+            classificationKind: classification.kind,
+            renamedFrom: classification.from,
+            renamedTo: classification.to,
+            via: "edit",
+            selfBroken: false
+          }
+        });
+      });
+      actions.appendChild(repairAll);
+      container.appendChild(actions);
     }
     return container;
   }
@@ -1382,6 +1630,10 @@
         }
       }
       if (leanPaneChatSending) transcript.appendChild(chatNotice("Lea is working…"));
+      // Self-repair: the last completed run's downstream impact (companion
+      // Phase 1 post-run cascade) -- broken dependents + one repair action.
+      const impactNotice = renderChatRunImpactNotice(leanPaneChatResponse?.lastRunImpact);
+      if (impactNotice) transcript.appendChild(impactNotice);
     }
     panel.appendChild(transcript);
 
@@ -1462,6 +1714,51 @@
     notice.className = "ol-lean-chat-notice";
     notice.textContent = text;
     return notice;
+  }
+
+  // "This change broke N downstream items" after a chat run whose post-run
+  // cascade found breakage, with the same repair affordance the pane offers.
+  function renderChatRunImpactNotice(lastRunImpact) {
+    const dependents = Array.isArray(lastRunImpact?.dependentsImpact) ? lastRunImpact.dependentsImpact : [];
+    if (dependents.length === 0) return null;
+    const broken = dependents.filter((d) => d.brokenByUpstream);
+
+    const container = document.createElement("div");
+    container.className = "ol-lean-chat-impact";
+    const heading = document.createElement("p");
+    heading.textContent = broken.length > 0
+      ? `This change broke ${broken.length} downstream item${broken.length === 1 ? "" : "s"}:`
+      : `This change touched ${dependents.length} downstream item${dependents.length === 1 ? "" : "s"} (re-verified):`;
+    container.appendChild(heading);
+    for (const dependent of dependents) {
+      const line = document.createElement("p");
+      line.className = "ol-lean-chat-impact-item";
+      line.textContent = leanPaneView.formatDependentOutcome(dependent);
+      container.appendChild(line);
+    }
+    if (broken.length > 0) {
+      const repairAll = document.createElement("button");
+      repairAll.type = "button";
+      repairAll.className = "ol-lean-primary-button ol-lean-repair-all-button";
+      repairAll.textContent = `Repair all (${broken.length})`;
+      repairAll.addEventListener("click", () => {
+        const classification = lastRunImpact.classification || {};
+        requestRepair({
+          overleafProjectId: leanPaneChatTarget?.overleafProjectId || itemsProjectId(lastLeanPaneManifest?.items || []),
+          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel })),
+          breakage: {
+            upstreamLabel: lastRunImpact.targetLabel || broken[0].brokenByUpstream?.targetLabel || "",
+            classificationKind: classification.kind,
+            renamedFrom: classification.from,
+            renamedTo: classification.to,
+            via: "chat",
+            selfBroken: false
+          }
+        });
+      });
+      container.appendChild(repairAll);
+    }
+    return container;
   }
 
   function renderChatBubble(message) {

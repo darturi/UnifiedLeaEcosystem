@@ -5,9 +5,13 @@ import {
   buildLeanPaneTree,
   canEditPaneItem,
   canFormalizePaneItem,
+  canRepairPaneItem,
   capitalize,
+  formatBreakageAttribution,
   formatDependentOutcome,
   formatDependentsImpact,
+  formatRepairConfirmation,
+  formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
   hasInProgressItems,
@@ -340,4 +344,64 @@ test("filenameFromContentDisposition extracts the quoted filename or falls back"
   );
   assert.equal(filenameFromContentDisposition(null, "lean-project.zip"), "lean-project.zip");
   assert.equal(filenameFromContentDisposition("attachment", "x.zip"), "x.zip");
+});
+
+// --- Self-repair helpers (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
+
+test("canRepairPaneItem gates on breakage, suppression, in-progress, and a running repair", () => {
+  const breakage = { upstreamLabel: "a", repair: { state: "offered" } };
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage }), true);
+  assert.equal(canRepairPaneItem({ status: "invalid" }), false);
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage: { ...breakage, repairSuppressed: "upstream_broken" } }), false);
+  assert.equal(canRepairPaneItem({ status: "in-progress", breakage }), false);
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage: { ...breakage, repair: { state: "running" } } }), false);
+  // a previously failed repair can be retried
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage: { ...breakage, repair: { state: "failed" } } }), true);
+});
+
+test("formatBreakageAttribution distinguishes self-break, rename, suppression, and generic upstream breaks", () => {
+  assert.equal(
+    formatBreakageAttribution({ selfBroken: true, via: "edit" }),
+    "Broken by a manual edit to this item."
+  );
+  assert.match(
+    formatBreakageAttribution({ classificationKind: "renamed", renamedFrom: "a", renamedTo: "b", via: "chat" }),
+    /`a` was renamed to `b` \(via a chat request\)\. This item still refers to the old name\./
+  );
+  assert.match(
+    formatBreakageAttribution({ upstreamLabel: "a", repairSuppressed: "upstream_broken", via: "formalize" }),
+    /repair a first/i
+  );
+  assert.equal(
+    formatBreakageAttribution({ upstreamLabel: "a", classificationKind: "signature", via: "formalize" }),
+    "Broken by a re-formalization to a."
+  );
+});
+
+test("formatRepairConfirmation names the items, the upstream change, the model, and the run count", () => {
+  const text = formatRepairConfirmation({
+    items: [{ targetLabel: "b" }, { targetLabel: "c" }],
+    breakage: { upstreamLabel: "a", classificationKind: "renamed", renamedFrom: "a", renamedTo: "a2" },
+    modelLabel: "GPT-5"
+  });
+  assert.match(text, /Repair 2 items with Lea: b, c\./);
+  assert.match(text, /`a` was renamed to `a2`/);
+  assert.match(text, /2 agent runs with GPT-5/);
+
+  // no model label -> generic copy, never an empty "with"
+  const fallback = formatRepairConfirmation({ items: [{ targetLabel: "b" }], breakage: null });
+  assert.match(fallback, /1 agent run with the configured Lea model/);
+});
+
+test("formatRepairOutcome covers every batch item state", () => {
+  assert.equal(formatRepairOutcome({ targetLabel: "b", state: "pending" }), "b: waiting.");
+  assert.equal(formatRepairOutcome({ targetLabel: "b", state: "running" }), "b: repairing...");
+  assert.equal(formatRepairOutcome({ targetLabel: "b", state: "repaired" }), "b: repaired and verified.");
+  assert.match(formatRepairOutcome({ targetLabel: "b", state: "needs_review" }), /review required/);
+  assert.match(formatRepairOutcome({ targetLabel: "b", state: "failed", reason: "unprovable" }), /repair failed -- unprovable/);
+  assert.match(
+    formatRepairOutcome({ targetLabel: "c", state: "skipped", reason: "depends_on_failed:b" }),
+    /skipped -- depends on failed repair of b\./
+  );
+  assert.match(formatRepairOutcome({ targetLabel: "c", state: "skipped", reason: "already_fixed" }), /already compiles/);
 });

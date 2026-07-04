@@ -433,6 +433,76 @@ export function formatDependentOutcome(dependent) {
   return `${label}: re-checked, still valid.`;
 }
 
+// --- Self-repair (docs/FEATURE-overleaf-self-repair.md, Phase 5) -------------
+
+// A repair is offered on an item that carries breakage attribution, is not
+// suppressed (upstream itself broken -- the offer belongs there), and is not
+// already running something.
+export function canRepairPaneItem(item) {
+  return Boolean(
+    item &&
+    item.breakage &&
+    !item.breakage.repairSuppressed &&
+    item.status !== "in-progress" &&
+    item.breakage.repair?.state !== "running"
+  );
+}
+
+// The chip-adjacent explanation of WHY an item is broken -- distinguishes the
+// user's own edit, an upstream rename (acceptance criterion 8 of the
+// manual-edit spec), and how the upstream change happened (via).
+export function formatBreakageAttribution(breakage) {
+  if (!breakage) return "";
+  const via = { edit: "a manual edit", chat: "a chat request", formalize: "a re-formalization", repair: "a repair run" }[breakage.via] || "a change";
+  if (breakage.selfBroken) {
+    return `Broken by ${via} to this item.`;
+  }
+  if (breakage.classificationKind === "renamed" && breakage.renamedFrom && breakage.renamedTo) {
+    return `Broken: \`${breakage.renamedFrom}\` was renamed to \`${breakage.renamedTo}\` (via ${via}). This item still refers to the old name.`;
+  }
+  if (breakage.repairSuppressed === "upstream_broken") {
+    return `Broken by ${via} to ${breakage.upstreamLabel} -- repair ${breakage.upstreamLabel} first (its file currently fails to compile).`;
+  }
+  return `Broken by ${via} to ${breakage.upstreamLabel}.`;
+}
+
+// The confirmation body shown before any repair run starts (feature spec
+// Part 2: which items, what upstream change, which agent, how many runs).
+export function formatRepairConfirmation({ items = [], breakage = null, modelLabel = "" } = {}) {
+  const count = items.length;
+  const names = items.map((item) => item?.targetLabel || item?.leanDeclarationName || item?.label).filter(Boolean).join(", ");
+  const lines = [];
+  lines.push(`Repair ${count} item${count === 1 ? "" : "s"} with Lea: ${names}.`);
+  if (breakage && !breakage.selfBroken) {
+    if (breakage.classificationKind === "renamed" && breakage.renamedFrom && breakage.renamedTo) {
+      lines.push(`Upstream change: \`${breakage.renamedFrom}\` was renamed to \`${breakage.renamedTo}\`.`);
+    } else if (breakage.upstreamLabel) {
+      lines.push(`Upstream change: ${breakage.upstreamLabel} changed (${breakage.classificationKind || "modified"}).`);
+    }
+  }
+  lines.push(`This will start ${count} agent run${count === 1 ? "" : "s"}${modelLabel ? ` with ${modelLabel}` : " with the configured Lea model"} and consume model usage.`);
+  return lines.join("\n");
+}
+
+// One line per item for the batch progress / outcome list.
+export function formatRepairOutcome(entry) {
+  if (!entry) return "";
+  const label = entry.targetLabel || "";
+  switch (entry.state) {
+    case "pending": return `${label}: waiting.`;
+    case "running": return `${label}: repairing...`;
+    case "repaired": return `${label}: repaired and verified.`;
+    case "needs_review": return `${label}: repaired, but the statement changed -- review required.`;
+    case "failed": return `${label}: repair failed${entry.reason ? ` -- ${entry.reason}` : "."}`;
+    case "skipped":
+      if (String(entry.reason || "").startsWith("depends_on_failed:")) {
+        return `${label}: skipped -- depends on failed repair of ${String(entry.reason).slice("depends_on_failed:".length)}.`;
+      }
+      return `${label}: skipped${entry.reason === "already_fixed" ? " -- already compiles." : entry.reason ? ` (${entry.reason})` : "."}`;
+    default: return `${label}: ${entry.state || "unknown"}.`;
+  }
+}
+
 function finalizePaneTreeNodes(nodes) {
   nodes.sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   for (const node of nodes) {

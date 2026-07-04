@@ -238,7 +238,11 @@ test("edit save: a signature edit cascades and reports a broken dependent, attri
   assert.equal(impact.targetLabel, "compactness_corollary");
   assert.equal(impact.status, "invalid");
   assert.equal(impact.attributed, true);
-  assert.deepEqual(impact.brokenByUpstream, { targetLabel: "compactness_criterion", renamed: false });
+  // via/editedAt: attribution for the self-repair offer (feature spec Part 2)
+  assert.equal(impact.brokenByUpstream.targetLabel, "compactness_criterion");
+  assert.equal(impact.brokenByUpstream.renamed, false);
+  assert.equal(impact.brokenByUpstream.via, "edit");
+  assert.ok(impact.brokenByUpstream.editedAt);
 
   // the cascade check was recorded against the DEPENDENT's own session, with
   // author=cascade, not against the edited target's session
@@ -323,7 +327,9 @@ test("edit save: a rename updates the job's cached declarationName, not just the
   // unaffected by the fix: the pane's own identity for this item stays pinned
   // to the LaTeX label, so the cascade impact on the dependent is still
   // reported by that stable name, not the new Lean symbol
-  assert.deepEqual(res.body.dependentsImpact[0].brokenByUpstream, { targetLabel: "compactness_criterion", renamed: true });
+  assert.equal(res.body.dependentsImpact[0].brokenByUpstream.targetLabel, "compactness_criterion");
+  assert.equal(res.body.dependentsImpact[0].brokenByUpstream.renamed, true);
+  assert.equal(res.body.dependentsImpact[0].brokenByUpstream.via, "edit");
 });
 
 test("edit save: a proof-only edit never triggers a rebuild (no dependents to verify)", async () => {
@@ -1013,4 +1019,185 @@ test("recipe 4: a signature edit flips the broken dependent AND propagates to tr
   assert.match(byLabel.compactness_corollary.message, /type mismatch/);
   assert.equal(byLabel.heine_borel_application.status, "invalid");
   assert.match(byLabel.heine_borel_application.message, /compactness_corollary no longer compiles/);
+});
+
+// --- Self-repair Phase 2: persisted breakage attribution -------------------
+// docs/FEATURE-overleaf-self-repair.md / docs/PLAN-overleaf-self-repair.md.
+// The repair offer must be re-derivable after a manifest refresh or a
+// companion restart, so the upstream attribution -- not just the failing
+// verdict -- must persist on the dependent's job and flow to the pane item.
+
+test("a breaking signature edit persists breakage attribution on the dependent's job (restart-surviving) and surfaces item.breakage", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob(), b: dependentJob() },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } },
+      rebuildResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null },
+        "sess-b": { path: "compactness_corollary.lean", status: "error", detail: "type mismatch" }
+      }
+    })
+  });
+
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion (h : True) : True := by\n  sorry\n"
+    },
+    state
+  );
+  assert.equal(save.statusCode, 200);
+
+  // Persisted attribution on the dependent's job -- with the headers the
+  // repair prompt needs.
+  const breakage = state.jobs.b.lastEditBreakage;
+  assert.equal(breakage.upstreamLabel, "compactness_criterion");
+  assert.equal(breakage.classificationKind, "signature");
+  assert.equal(breakage.via, "edit");
+  assert.equal(breakage.beforeHeader, "theorem compactness_criterion : True");
+  assert.equal(breakage.afterHeader, "theorem compactness_criterion (h : True) : True");
+  // ...and it reached disk (jobs.json), so it survives a companion restart.
+  const persisted = JSON.parse(await fs.readFile(state.jobsPath, "utf8"));
+  assert.equal(persisted.b.lastEditBreakage.upstreamLabel, "compactness_criterion");
+
+  // The manifest surfaces it as item.breakage: not self-broken, not
+  // suppressed (the upstream item itself still compiles).
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "S.",
+      "\\end{theorem}",
+      "\\begin{theorem}\\label{thm:corollary}",
+      "% lea: formalize label=compactness_corollary uses={compactness_criterion}",
+      "S.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+  const manifest = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  const byLabel = Object.fromEntries(manifest.body.items.map((item) => [item.leanDeclarationName, item]));
+  assert.equal(byLabel.compactness_criterion.breakage, undefined); // upstream compiles; no breakage
+  assert.equal(byLabel.compactness_corollary.status, "invalid");
+  assert.equal(byLabel.compactness_corollary.breakage.upstreamLabel, "compactness_criterion");
+  assert.equal(byLabel.compactness_corollary.breakage.selfBroken, false);
+  assert.equal(byLabel.compactness_corollary.breakage.repairSuppressed, undefined);
+});
+
+test("an edit that breaks the item ITSELF records self-attribution, and dependents' repair offers are suppressed while upstream is broken", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob(), b: dependentJob() },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "error", detail: "unexpected token" } },
+      rebuildResponses: {
+        // own compile is broken, so the pre-cascade rebuild of the edited
+        // module fails too -> fail-closed marks the dependent unconfirmed
+        "sess-a": { path: "compactness_criterion.lean", status: "error", detail: "unexpected token" }
+      }
+    })
+  });
+
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  exact\n"
+    },
+    state
+  );
+  assert.equal(save.statusCode, 200);
+  assert.equal(save.body.ownResult.classification.kind, "own-check-failed");
+
+  // Self-attribution on the edited item's own job.
+  assert.equal(state.jobs.a.lastEditBreakage.upstreamLabel, "compactness_criterion");
+  assert.equal(state.jobs.a.lastEditBreakage.classificationKind, "own-check-failed");
+  // Fail-closed attribution on the dependent too.
+  assert.equal(state.jobs.b.lastEditBreakage.upstreamLabel, "compactness_criterion");
+
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "S.",
+      "\\end{theorem}",
+      "\\begin{theorem}\\label{thm:corollary}",
+      "% lea: formalize label=compactness_corollary uses={compactness_criterion}",
+      "S.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+  const manifest = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  const byLabel = Object.fromEntries(manifest.body.items.map((item) => [item.leanDeclarationName, item]));
+  // The edited item: self-broken, repair offered on IT.
+  assert.equal(byLabel.compactness_criterion.status, "invalid");
+  assert.equal(byLabel.compactness_criterion.breakage.selfBroken, true);
+  assert.equal(byLabel.compactness_criterion.breakage.repairSuppressed, undefined);
+  // The dependent: attributed but suppressed until upstream compiles again.
+  assert.equal(byLabel.compactness_corollary.breakage.selfBroken, false);
+  assert.equal(byLabel.compactness_corollary.breakage.repairSuppressed, "upstream_broken");
+});
+
+test("a recovery edit clears persisted breakage on the item and on re-verified dependents", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const staleBreakage = {
+    upstreamLabel: "compactness_criterion", classificationKind: "signature", via: "edit", editedAt: "old"
+  };
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: {
+      a: editedJob({ lastEditCheckStatus: "error", lastEditBreakage: { ...staleBreakage } }),
+      b: dependentJob({ lastEditCheckStatus: "error", lastEditBreakage: { ...staleBreakage } })
+    },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-3" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } }
+      // rebuilds default to ok: the recovery cascade re-verifies the dependent clean
+    })
+  });
+
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  trivial\n"
+    },
+    state
+  );
+  assert.equal(save.statusCode, 200);
+  // proof-only edit, but recovery forces the cascade; both attributions clear
+  assert.equal(state.jobs.a.lastEditBreakage, undefined);
+  assert.equal(state.jobs.b.lastEditBreakage, undefined);
+  assert.equal(state.jobs.b.lastEditCheckStatus, "ok");
 });

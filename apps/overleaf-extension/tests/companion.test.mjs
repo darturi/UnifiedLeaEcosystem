@@ -3970,3 +3970,223 @@ test("github token update writes through to adapter settings and reports presenc
   assert.equal(noop.statusCode, 400);
   assert.equal(noop.body.error, "missing_token");
 });
+
+// --- Self-repair Phase 1: post-run cascade for agent-driven changes --------
+// docs/FEATURE-overleaf-self-repair.md Part 1: a chat-mirror run or a
+// re-formalize that changes a recorded declaration must trigger the same
+// cascade a manual edit does. Until this, those paths ran no cascade at all.
+
+// Routes the full agent-run flow (POST /api/runs -> SSE events) PLUS the
+// per-session detail/rebuild/lean-check calls the post-run cascade makes.
+function makeCascadeRunFetch(calls, { runSessionId = "sess-api-1", sessionDetails = {}, rebuildResponses = {} } = {}) {
+  return async (url, requestOptions = {}) => {
+    const u = String(url);
+    if (u.endsWith("/api/settings")) return jsonResponse(404, { detail: "not found" });
+    const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
+    calls.push({ url: u, options: requestOptions, body });
+    if (u.endsWith("/api/runs") && requestOptions.method === "POST") {
+      return jsonResponse(200, {
+        run_id: "api-run-1",
+        session_id: runSessionId,
+        status: "running",
+        project_namespace: "Lea.Project1"
+      });
+    }
+    if (u.includes("/api/runs/") && u.endsWith("/events")) {
+      return adapterSseResponse([
+        { type: "status", data: { status: "tool_call", turn: 1 } },
+        { type: "done", data: { status: "success" } }
+      ]);
+    }
+    const match = u.match(/\/api\/sessions\/([^/]+)(?:\/(file|lean-check|rebuild))?$/);
+    if (match) {
+      const sessionId = decodeURIComponent(match[1]);
+      const kind = match[2] || "detail";
+      if (kind === "detail") return jsonResponse(200, sessionDetails[sessionId] || { code_steps: [] });
+      if (kind === "rebuild") {
+        return jsonResponse(200, rebuildResponses[sessionId] || { path: body?.path, status: "ok", detail: null });
+      }
+      if (kind === "lean-check") return jsonResponse(200, { path: body?.path, status: "ok", detail: null });
+    }
+    if (u.endsWith("/interrupt")) return jsonResponse(200, { status: "interrupting" });
+    return jsonResponse(404, { detail: "not found" });
+  };
+}
+
+function cascadeUpstreamJob(overrides = {}) {
+  return {
+    jobId: "job-upstream",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    leaSessionId: "sess-chat-1",
+    projectSlug: "project-1",
+    projectNamespace: "Lea.Project1",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+    ...overrides
+  };
+}
+
+function cascadeDependentJob(overrides = {}) {
+  return {
+    jobId: "job-dependent",
+    jobKey: "project-1:theorem:compactness_corollary",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    declarationName: "compactness_corollary",
+    leaSessionId: "sess-b",
+    projectSlug: "project-1",
+    projectNamespace: "Lea.Project1",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z",
+    ...overrides
+  };
+}
+
+test("a chat run that renames the declaration cascades over dependents, attributes via=chat, and records lastRunImpact", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeLeaProjectProof(
+    leaRepo,
+    "workspace/proofs/Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeCascadeRunFetch(calls, {
+      runSessionId: "sess-chat-1",
+      sessionDetails: {
+        "sess-chat-1": {
+          project_namespace: "Lea.Project1",
+          code_steps: [
+            // seq 1: the pre-run recording (what the snapshot sees); seq 2: the
+            // run's rename, already back-filled with a passing check verdict.
+            { path: "compactness_criterion.lean", seq: 1, code: "theorem compactness_criterion : True := by\n  sorry\n" },
+            { path: "compactness_criterion.lean", seq: 2, code: "theorem compactness_thm : True := by\n  sorry\n", check_status: "ok" }
+          ]
+        }
+      },
+      rebuildResponses: {
+        "sess-chat-1": { status: "ok", detail: null },
+        "sess-b": { status: "error", detail: "unknown constant 'Lea.Project1.compactness_criterion'" }
+      }
+    })
+  });
+  state.jobs.upstream = cascadeUpstreamJob();
+  state.jobs.dependent = cascadeDependentJob();
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Rename this theorem to compactness_thm." }, state);
+  assert.equal(res.statusCode, 200);
+
+  // The run's terminal continuation classifies + cascades in the background.
+  await waitFor(() => Boolean(state.jobs.dependent.lastEditBreakage));
+
+  const breakage = state.jobs.dependent.lastEditBreakage;
+  assert.equal(breakage.via, "chat");
+  assert.equal(breakage.classificationKind, "renamed");
+  assert.equal(breakage.renamedTo, "compactness_thm");
+  assert.equal(breakage.upstreamLabel, "compactness_criterion");
+  assert.equal(state.jobs.dependent.lastEditCheckStatus, "error");
+  // rename bookkeeping on the chat target's own linked job, same as manual edits
+  assert.equal(state.jobs.upstream.declarationName, "compactness_thm");
+
+  // lastRunImpact recorded on the chat-session record and surfaced by the poll APIs
+  await waitFor(() => Boolean(state.chatSessions?.["project-1:theorem:compactness_criterion"]?.lastRunImpact));
+  const impact = state.chatSessions["project-1:theorem:compactness_criterion"].lastRunImpact;
+  assert.equal(impact.classification.kind, "renamed");
+  assert.equal(impact.dependentsImpact.length, 1);
+  assert.equal(impact.dependentsImpact[0].status, "invalid");
+  assert.equal(impact.dependentsImpact[0].brokenByUpstream.via, "chat");
+
+  const session = await handleChatSession({ target: CHAT_TARGET }, state);
+  assert.equal(session.body.lastRunImpact.classification.kind, "renamed");
+  const poll = await handleChatPoll({ sessionId: "sess-chat-1" }, state);
+  assert.equal(poll.body.lastRunImpact.classification.kind, "renamed");
+
+  // ...and a follow-up message supersedes the notice: the rename impact is
+  // cleared before the new run starts. The second run changes nothing further
+  // (declaration already renamed), so at most a no-broken-dependents impact
+  // from its own continuation can replace it -- the rename notice is gone.
+  await handleChatMessage({ target: CHAT_TARGET, message: "Thanks!" }, state);
+  const remaining = state.chatSessions["project-1:theorem:compactness_criterion"].lastRunImpact;
+  assert.ok(!remaining || remaining.classification.kind !== "renamed");
+});
+
+test("a chat run on a never-formalized item (no snapshot) runs no cascade and records no impact", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeCascadeRunFetch(calls, { runSessionId: "sess-new" })
+  });
+
+  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Hello" }, state);
+  assert.equal(res.statusCode, 200);
+  // let the run's continuation settle
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(state.chatSessions["project-1:theorem:compactness_criterion"].lastRunImpact, undefined);
+  // no rebuild was ever attempted
+  assert.ok(!calls.some((c) => c.url.endsWith("/rebuild")));
+});
+
+test("a re-formalize whose outcome changes the signature cascades over dependents with via=formalize", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeLeaProjectProof(
+    leaRepo,
+    "workspace/proofs/Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  sorry\n"
+  );
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeCascadeRunFetch(calls, {
+      runSessionId: "sess-api-1",
+      sessionDetails: {
+        // the previous recording, snapshotted before the run
+        "sess-prev": {
+          project_namespace: "Lea.Project1",
+          code_steps: [
+            { path: "compactness_criterion.lean", seq: 1, code: "theorem compactness_criterion : True := by\n  sorry\n" }
+          ]
+        },
+        // the new run's session: same path, changed signature, checked ok
+        "sess-api-1": {
+          project_namespace: "Lea.Project1",
+          code_steps: [
+            { path: "compactness_criterion.lean", seq: 1, code: "theorem compactness_criterion (h : True) : True := by\n  trivial\n", check_status: "ok" }
+          ]
+        }
+      },
+      rebuildResponses: {
+        "sess-api-1": { status: "ok", detail: null },
+        "sess-b": { status: "error", detail: "type mismatch after upstream signature change" }
+      }
+    })
+  });
+  state.jobs.upstream = cascadeUpstreamJob({ leaSessionId: "sess-prev" });
+  state.jobs.dependent = cascadeDependentJob();
+
+  const res = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    targetText: "Every open cover has a finite subcover."
+  }, state);
+  assert.equal(res.statusCode, 200);
+
+  await waitFor(() => Boolean(state.jobs.dependent.lastEditBreakage));
+  const breakage = state.jobs.dependent.lastEditBreakage;
+  assert.equal(breakage.via, "formalize");
+  assert.equal(breakage.classificationKind, "signature");
+  assert.equal(breakage.upstreamLabel, "compactness_criterion");
+  assert.equal(breakage.beforeHeader, "theorem compactness_criterion : True");
+  assert.equal(breakage.afterHeader, "theorem compactness_criterion (h : True) : True");
+  assert.equal(state.jobs.dependent.lastEditCheckStatus, "error");
+});
