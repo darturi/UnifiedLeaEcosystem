@@ -795,8 +795,14 @@
     if (leanPaneView.canChatPaneItem(item)) {
       actions.appendChild(renderChatButton(item));
     }
+    if (leanPaneView.canViewPaneItemInLeaUi(item)) {
+      actions.appendChild(renderViewInLeaButton(item));
+    }
     if (leanPaneView.canFormalizePaneItem(item)) {
       actions.appendChild(renderFormalizeButton(item));
+    }
+    if (leanPaneView.canStubPaneItem(item)) {
+      actions.appendChild(renderStubButton(item));
     }
     if (!editing && leanPaneView.canEditPaneItem(item)) {
       actions.appendChild(renderEditButton(item));
@@ -1111,12 +1117,36 @@
       container.appendChild(note);
     }
 
+    // Overlay editor: the textarea stays the real input, but its text is
+    // transparent (caret excepted); the visible text is the same regex-highlighted
+    // rendering the read view uses (renderLeanPaneCode), in a backdrop layer kept
+    // in sync on input/scroll. Both layers share identical font/padding/wrapping
+    // so the glyphs line up exactly.
+    const editor = document.createElement("div");
+    editor.className = "ol-lean-project-edit-editor";
+
+    const highlightLayer = document.createElement("pre");
+    highlightLayer.className = "ol-lean-project-edit-highlight";
+    highlightLayer.setAttribute("aria-hidden", "true");
+    editor.appendChild(highlightLayer);
+
     const textarea = document.createElement("textarea");
     textarea.className = "ol-lean-project-edit-textarea";
     textarea.value = leanPaneEditDraft;
     textarea.spellcheck = false;
     textarea.setAttribute("aria-label", `Edit Lean source for ${item.leanDeclarationName || item.label || "this item"}`);
-    container.appendChild(textarea);
+    textarea.addEventListener("input", () => {
+      leanPaneEditDraft = textarea.value;
+      renderLeanPaneCode(highlightLayer, textarea.value);
+      highlightLayer.scrollTop = textarea.scrollTop;
+    });
+    textarea.addEventListener("scroll", () => {
+      highlightLayer.scrollTop = textarea.scrollTop;
+      highlightLayer.scrollLeft = textarea.scrollLeft;
+    });
+    editor.appendChild(textarea);
+    renderLeanPaneCode(highlightLayer, leanPaneEditDraft);
+    container.appendChild(editor);
 
     const errorLine = document.createElement("p");
     errorLine.className = "ol-lean-project-edit-error";
@@ -1399,6 +1429,80 @@
         button.disabled = false;
         button.textContent = "Retry formalize";
         if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+      }
+    });
+    return button;
+  }
+
+  // Sorry-stub a theorem from the pane, reusing the same /stub path the
+  // in-document badge popover uses, then refresh so the pane picks up the
+  // new stub-generated status.
+  function renderStubButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button ol-lean-stub-button";
+    button.textContent = "Stub";
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      button.disabled = true;
+      button.textContent = "Stubbing…";
+      try {
+        await stubTheorem(leanPaneView.paneItemToFormalizeTarget(item));
+        await refreshLeanPaneNow({ background: true });
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = "Retry stub";
+        if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+      }
+    });
+    return button;
+  }
+
+  // Open this item's Lea session in the standalone UI, mirroring the popover's
+  // "View in Lea UI" action. The session is resolved through the companion's
+  // chat-session lookup (read-only: it never creates a session); when no
+  // session has been recorded yet, fall back to the Lea UI itself, matching
+  // the popover's base-link fallback.
+  async function openLeaUiForPaneItem(item) {
+    const baseUrl = await chatCompanionBaseUrl();
+    const target = leanPaneView.paneItemToChatTarget(item, itemsProjectId(lastLeanPaneManifest?.items || []));
+    const response = await fetch(`${baseUrl}/lean-pane/chat/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target })
+    });
+    const payload = await response.json().catch(() => ({}));
+    const sessionUrl = String(payload?.leaSessionUrl || "").trim();
+    if (sessionUrl) {
+      await openLeaSession({ url: sessionUrl, baseUrl: sessionUrl });
+      return { sessionOpened: true };
+    }
+    const settings = await getSettings();
+    const uiBaseUrl = String(settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL).replace(/\/+$/, "");
+    await openLeaSession({ url: uiBaseUrl, baseUrl: uiBaseUrl });
+    return { sessionOpened: false };
+  }
+
+  function renderViewInLeaButton(item) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-secondary-button ol-lean-view-in-lea-button";
+    button.textContent = "View in Lea UI";
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      button.disabled = true;
+      if (leanPaneStatus) leanPaneStatus.textContent = "Opening Lea session...";
+      try {
+        const { sessionOpened } = await openLeaUiForPaneItem(item);
+        if (leanPaneStatus) {
+          leanPaneStatus.textContent = sessionOpened ? "Opened Lea session." : "Opened Lea UI.";
+        }
+      } catch (error) {
+        if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+      } finally {
+        button.disabled = false;
       }
     });
     return button;

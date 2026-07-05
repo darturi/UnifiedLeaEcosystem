@@ -294,6 +294,16 @@ export function canFormalizePaneItem(item) {
   return FORMALIZABLE_PANE_STATUSES.has(item.status);
 }
 
+// Whether the pane should offer a sorry-stub action for an item. Mirrors the
+// in-document popover rule: stubbing only applies to a theorem with no Lean
+// artifact yet — definitions always get a full body, and once a stub or proof
+// exists, Formalize / Re-formalize is the right action.
+export function canStubPaneItem(item) {
+  if (!item || !item.formalizable || item.inProgress) return false;
+  if (item.leanKind === "def") return false;
+  return item.status === "missing-stub";
+}
+
 // Shape a manifest item into the target payload the existing /formalize flow expects.
 export function paneItemToFormalizeTarget(item) {
   return {
@@ -303,6 +313,25 @@ export function paneItemToFormalizeTarget(item) {
     targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
     targetContext: item?.targetContext || ""
   };
+}
+
+// Pane statuses that correspond to a real Lea run or saved proof artifact.
+// Same rule the in-document popover applies before offering "View in Lea UI"
+// (companion statuses formalized / defined / disproved / in_progress /
+// sorry_stub), translated to the pane vocabulary and extended with the
+// pane-only artifact states (stale / invalid / needs-review), which also imply
+// a recorded run. missing-stub / unknown / error stay excluded so stale
+// session metadata can't make unformalized items appear viewable.
+const LEA_UI_VIEWABLE_PANE_STATUSES = new Set([
+  "valid", "defined", "disproved", "needs-review", "in-progress",
+  "stub-generated", "stale", "invalid"
+]);
+
+// Whether the pane should offer a "View in Lea UI" action for an item. Needs a
+// stable target identity (like chat) to resolve the associated Lea session.
+export function canViewPaneItemInLeaUi(item) {
+  if (!item || !(item.leanDeclarationName || item.label)) return false;
+  return LEA_UI_VIEWABLE_PANE_STATUSES.has(item.status);
 }
 
 // --- Lean-pane chat mirror -------------------------------------------------

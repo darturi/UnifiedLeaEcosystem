@@ -632,21 +632,62 @@
   margin-top: 10px;
 }
 
+/* Overlay editor: the textarea is the input surface (transparent text, visible
+   caret); the highlight layer behind it shows the same regex-highlighted tokens
+   as the read view. The two layers must keep identical font/padding/wrapping
+   metrics or the glyphs drift out of alignment. */
+.ol-lean-project-edit-editor {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-code-bg);
+}
+
+.ol-lean-project-edit-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 10px;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--ol-ink-2);
+  font: 11px/1.45 var(--ol-mono);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
 .ol-lean-project-edit-textarea {
+  position: relative;
+  display: block;
   box-sizing: border-box;
   width: 100%;
   min-height: 180px;
   max-height: 420px;
   padding: 10px;
   resize: vertical;
-  border: 1px solid var(--ol-line);
-  border-radius: 7px;
-  background: var(--ol-code-bg);
-  color: var(--ol-ink-2);
+  border: none;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--ol-ink-2);
   font: 11px/1.45 var(--ol-mono);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
-.ol-lean-project-edit-textarea:disabled {
+/* A visible scrollbar would shrink the textarea's wrap width relative to the
+   highlight layer and misalign the two; scrolling still works (wheel/keys). */
+.ol-lean-project-edit-textarea::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* Selection must stay translucent so the highlighted text behind shows through. */
+.ol-lean-project-edit-textarea::selection {
+  background: rgba(96, 144, 232, 0.3);
+}
+
+.ol-lean-project-edit-editor:has(.ol-lean-project-edit-textarea:disabled) {
   opacity: 0.65;
 }
 
@@ -1103,8 +1144,9 @@
   background: var(--ol-panel-2);
 }
 
-/* The Formalize action is the pane's one state-changing button — give it the accent
-   so it reads as primary among the otherwise-passive copy/navigate actions. */
+/* Formalize is the pane's primary state-changing action — give it the accent so it
+   stands out from the passive copy/navigate actions and from the lighter Stub
+   alternative (which keeps plain secondary styling, matching the popover hierarchy). */
 .ol-lean-formalize-button {
   border-color: var(--ol-accent);
   color: var(--ol-accent-ink);

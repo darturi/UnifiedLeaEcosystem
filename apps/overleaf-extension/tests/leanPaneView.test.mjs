@@ -5,6 +5,8 @@ import {
   buildLeanPaneTree,
   canEditPaneItem,
   canFormalizePaneItem,
+  canStubPaneItem,
+  canViewPaneItemInLeaUi,
   canRepairPaneItem,
   capitalize,
   formatBreakageAttribution,
@@ -94,6 +96,39 @@ test("canFormalizePaneItem requires a valid marker, an actionable state, and no 
   // A malformed marker (no valid target) is not formalizable.
   assert.equal(canFormalizePaneItem({ ...base, formalizable: false }), false);
   assert.equal(canFormalizePaneItem(undefined), false);
+});
+
+test("canStubPaneItem offers sorry-stubbing only for an unformalized theorem", () => {
+  const base = { formalizable: true, inProgress: false, status: "missing-stub", leanKind: "theorem" };
+  assert.equal(canStubPaneItem(base), true);
+  // Definitions always get a full body from Formalize; there is no stub form.
+  assert.equal(canStubPaneItem({ ...base, leanKind: "def" }), false);
+  // Once any artifact exists (stub or proof), Formalize is the right action.
+  assert.equal(canStubPaneItem({ ...base, status: "stub-generated" }), false);
+  assert.equal(canStubPaneItem({ ...base, status: "valid" }), false);
+  assert.equal(canStubPaneItem({ ...base, status: "stale" }), false);
+  assert.equal(canStubPaneItem({ ...base, inProgress: true }), false);
+  assert.equal(canStubPaneItem({ ...base, formalizable: false }), false);
+  assert.equal(canStubPaneItem(undefined), false);
+});
+
+test("canViewPaneItemInLeaUi requires a target identity and a real run or artifact", () => {
+  const base = { label: "thm:main", status: "valid" };
+  assert.equal(canViewPaneItemInLeaUi(base), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "defined" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "disproved" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "needs-review" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "in-progress" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stub-generated" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stale" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "invalid" }), true);
+  // Never-formalized or indeterminate items must not appear viewable.
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "missing-stub" }), false);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "unknown" }), false);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "error" }), false);
+  // Without a declaration name or label the session can't be resolved.
+  assert.equal(canViewPaneItemInLeaUi({ status: "valid" }), false);
+  assert.equal(canViewPaneItemInLeaUi(undefined), false);
 });
 
 test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item", () => {
