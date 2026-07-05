@@ -418,19 +418,96 @@ export function formatDependentsImpact(dependents) {
 export function formatDependentOutcome(dependent) {
   if (!dependent) return "";
   const label = dependent.targetLabel || "";
-  if (dependent.busy) return `${label}: not re-checked yet (a Lea run is already in progress for it).`;
-  if (dependent.brokenByUpstream?.renamed) {
-    return `${label}: broken -- the declaration it referred to was renamed.`;
+  const base = (() => {
+    if (dependent.busy) return `${label}: not re-checked yet (a Lea run is already in progress for it).`;
+    if (dependent.brokenByUpstream?.renamed) {
+      return `${label}: broken -- the declaration it referred to was renamed.`;
+    }
+    if (dependent.brokenByUpstream) return `${label}: broken by this edit.`;
+    if (dependent.attributed === false) {
+      return `${label}: may be affected, but no recorded session was found to re-check it.`;
+    }
+    if (dependent.status === "unknown") {
+      const reason = dependent.checkDetail ? ` (${dependent.checkDetail})` : "";
+      return `${label}: could not be verified${reason} -- treat as unconfirmed, not as valid.`;
+    }
+    return `${label}: re-checked, still valid.`;
+  })();
+  // Reconciliation suffixes (PLAN-self-repair-stale-offers Fix 1): the base
+  // line is the HISTORICAL record of what this change did; when live truth
+  // has since moved on, the line says so instead of being rewritten -- and
+  // only on lines that claimed a problem, never on "still valid".
+  const claimedProblem = Boolean(dependent.brokenByUpstream) || dependent.busy || dependent.status === "unknown";
+  if (dependent.sinceFixed && claimedProblem) {
+    return `${base.replace(/\.$/, "")} -- since fixed.`;
   }
-  if (dependent.brokenByUpstream) return `${label}: broken by this edit.`;
-  if (dependent.attributed === false) {
-    return `${label}: may be affected, but no recorded session was found to re-check it.`;
+  if (dependent.nowRepairing && claimedProblem) {
+    return `${base.replace(/\.$/, "")} -- repair in progress.`;
   }
-  if (dependent.status === "unknown") {
-    const reason = dependent.checkDetail ? ` (${dependent.checkDetail})` : "";
-    return `${label}: could not be verified${reason} -- treat as unconfirmed, not as valid.`;
+  // The upgrade direction: the snapshot claimed no break, but live truth says
+  // this dependent is broken NOW (a busy-skipped re-check whose run since
+  // ended broken, or a later change). The busy base line is a current-state
+  // claim that is no longer true, so it is corrected, not merely suffixed.
+  if (dependent.nowBroken && !dependent.brokenByUpstream) {
+    if (dependent.busy) {
+      return `${label}: was busy during this edit's re-check -- now broken.`;
+    }
+    return `${base.replace(/\.$/, "")} -- now broken.`;
   }
-  return `${label}: re-checked, still valid.`;
+  return base;
+}
+
+// Reconcile a save-time dependentsImpact snapshot against the LIVE manifest
+// items (PLAN-self-repair-stale-offers Fix 1). The snapshot is a historical
+// record; anything claiming current state or offering an action must derive
+// from live truth. Each entry gains:
+//   sinceFixed   -- its manifest item positively reads fixed (no breakage,
+//                   not invalid/unknown/in-progress)
+//   nowRepairing -- a repair run is live on it right now
+//   matched      -- a manifest item was found at all; unmatched entries keep
+//                   their snapshot state (fail toward offering: a stale offer
+//                   is a server-validated no-op, a hidden offer for something
+//                   still broken is worse).
+export function reconcileDependentsImpact(dependents, manifestItems) {
+  const list = Array.isArray(dependents) ? dependents : [];
+  const items = Array.isArray(manifestItems) ? manifestItems : [];
+  const byName = new Map();
+  for (const item of items) {
+    for (const key of [item?.leanDeclarationName, item?.label]) {
+      if (key && !byName.has(key)) byName.set(key, item);
+    }
+  }
+  return list.map((dependent) => {
+    const item = dependent?.targetLabel ? byName.get(dependent.targetLabel) : null;
+    if (!item) return { ...dependent, sinceFixed: false, nowRepairing: false, nowBroken: false, matched: false };
+    const nowRepairing = item.status === "in-progress" || item.breakage?.repair?.state === "running";
+    const sinceFixed = !nowRepairing
+      && !item.breakage
+      && !["invalid", "unknown", "in-progress"].includes(String(item.status || ""));
+    // The upgrade direction of the reconciliation: an entry the snapshot
+    // recorded as busy/unknown/ok can be BROKEN by live truth now -- e.g. a
+    // dependent skipped as busy during this edit's cascade whose run since
+    // ended in failure (the second-rename-while-repairing case). Suppressed
+    // breakage stays out of nowBroken: offering it would be a server 409.
+    const nowBroken = !nowRepairing
+      && Boolean(item.breakage)
+      && !item.breakage.repairSuppressed;
+    return { ...dependent, sinceFixed, nowRepairing, nowBroken, matched: true };
+  });
+}
+
+// The subset of a reconciled impact list that warrants a repair offer, per
+// the reconciliation principle in BOTH directions: for a dependent matched to
+// live state, live truth alone decides (a snapshot-busy entry whose run since
+// ended broken joins the offer; a snapshot-broken entry since fixed leaves
+// it). Only an UNMATCHED dependent falls back to its snapshot -- fail toward
+// offering, since a stale dispatch is a server-validated no-op.
+export function stillBrokenDependents(dependents) {
+  return (Array.isArray(dependents) ? dependents : []).filter((d) => {
+    if (d.nowRepairing) return false;
+    if (d.matched) return Boolean(d.nowBroken);
+    return Boolean(d.brokenByUpstream) && !d.sinceFixed;
+  });
 }
 
 // --- Self-repair (docs/FEATURE-overleaf-self-repair.md, Phase 5) -------------

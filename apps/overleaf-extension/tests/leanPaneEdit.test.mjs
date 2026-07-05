@@ -1201,3 +1201,32 @@ test("a recovery edit clears persisted breakage on the item and on re-verified d
   assert.equal(state.jobs.b.lastEditBreakage, undefined);
   assert.equal(state.jobs.b.lastEditCheckStatus, "ok");
 });
+
+test("a manual edit save clears a standing lastRepair outcome (needs_review does not outlive the human's own edit)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: { a: editedJob({ lastRepair: { state: "needs_review", finishedAt: "t" } }) },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } }
+    })
+  });
+
+  const res = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      content: "theorem compactness_criterion : True := by\n  trivial\n"
+    },
+    state
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(state.jobs.a.lastRepair, undefined);
+  // ...and it reached disk with the flag gone
+  const persisted = JSON.parse(await fs.readFile(state.jobsPath, "utf8"));
+  assert.equal(persisted.a.lastRepair, undefined);
+});

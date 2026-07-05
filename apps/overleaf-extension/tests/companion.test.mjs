@@ -4190,3 +4190,68 @@ test("a re-formalize whose outcome changes the signature cascades over dependent
   assert.equal(breakage.afterHeader, "theorem compactness_criterion (h : True) : True");
   assert.equal(state.jobs.dependent.lastEditCheckStatus, "error");
 });
+
+// --- Stale-offer reconciliation, chat side (PLAN-self-repair-stale-offers Fix 2)
+
+test("chat lastRunImpact is annotated with each dependent's LIVE state at serve time, without rewriting the stored record", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeCascadeRunFetch(calls, {
+      sessionDetails: { "sess-chat-1": { project_namespace: "Lea.Project1", code_steps: [], messages: [] } }
+    })
+  });
+  state.jobs.upstream = cascadeUpstreamJob();
+  state.jobs.dependent = cascadeDependentJob({
+    lastEditCheckStatus: "error",
+    lastEditBreakage: { upstreamLabel: "compactness_criterion", classificationKind: "renamed", via: "chat", editedAt: "t" }
+  });
+  // A stored impact record, as a completed chat run's continuation left it.
+  state.chatSessions = {
+    "project-1:theorem:compactness_criterion": {
+      leaSessionId: "sess-chat-1",
+      createdAt: "t",
+      updatedAt: "t",
+      sourceHash: null,
+      lastRunImpact: {
+        classification: { kind: "renamed", from: "compactness_criterion", to: "compactness_thm" },
+        targetLabel: "compactness_criterion",
+        finishedAt: "t",
+        dependentsImpact: [
+          { targetLabel: "compactness_corollary", status: "invalid", attributed: true, busy: false, brokenByUpstream: { targetLabel: "compactness_criterion", renamed: true, via: "chat" } }
+        ]
+      }
+    }
+  };
+
+  // While the dependent's job truth says broken: stillBroken.
+  const whileBroken = await handleChatSession({ target: CHAT_TARGET }, state);
+  assert.equal(whileBroken.body.lastRunImpact.dependentsImpact[0].stillBroken, true);
+  assert.equal(whileBroken.body.lastRunImpact.dependentsImpact[0].nowRepairing, false);
+
+  // The dependent gets fixed through ANY path (repair, manual edit, batch):
+  // the next poll reflects it while the stored record is untouched.
+  state.jobs.dependent.lastEditCheckStatus = "ok";
+  delete state.jobs.dependent.lastEditBreakage;
+
+  const afterFix = await handleChatSession({ target: CHAT_TARGET }, state);
+  assert.equal(afterFix.body.lastRunImpact.dependentsImpact[0].stillBroken, false);
+  // history preserved: the record still says what the run broke at the time
+  assert.equal(afterFix.body.lastRunImpact.dependentsImpact[0].brokenByUpstream.renamed, true);
+  const stored = state.chatSessions["project-1:theorem:compactness_criterion"].lastRunImpact;
+  assert.equal(stored.dependentsImpact[0].stillBroken, undefined);
+
+  // the sessionId-only poll path resolves the project slug from the record key
+  const poll = await handleChatPoll({ sessionId: "sess-chat-1" }, state);
+  assert.equal(poll.body.lastRunImpact.dependentsImpact[0].stillBroken, false);
+
+  // a live run on the dependent reads as nowRepairing, not stillBroken
+  state.jobs.dependent.lastEditCheckStatus = "error";
+  state.jobs.dependent.lastEditBreakage = { upstreamLabel: "compactness_criterion", classificationKind: "renamed", via: "chat", editedAt: "t" };
+  state.jobs.live = { jobId: "live", jobKey: "project-1:theorem:compactness_corollary", status: "in_progress", mode: "repair", leaSessionId: "sess-b" };
+  const whileRepairing = await handleChatSession({ target: CHAT_TARGET }, state);
+  assert.equal(whileRepairing.body.lastRunImpact.dependentsImpact[0].nowRepairing, true);
+  assert.equal(whileRepairing.body.lastRunImpact.dependentsImpact[0].stillBroken, false);
+});

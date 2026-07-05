@@ -82,7 +82,11 @@
   // this holds only the latest /lean-pane/repair/status snapshot.
   let leanPaneRepairBatch = null;
   let leanPaneRepairBatchTimer = 0;
-  let leanPaneRepairError = "";
+  // A repair DISPATCH failure, scoped to what was being dispatched:
+  // { itemKey, message } with itemKey = the single item's target label, or
+  // "batch" (PLAN-self-repair-stale-offers Fix 4 -- a global string rendered
+  // under every broken item was itself a member of the stale-copy class).
+  let leanPaneRepairError = null;
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -893,10 +897,11 @@
       line.textContent = `Repair failed: ${repair.failureReason || "the repaired file still does not compile."}`;
       container.appendChild(line);
     }
-    if (leanPaneRepairError) {
+    const itemKey = item.leanDeclarationName || item.label || "";
+    if (leanPaneRepairError && leanPaneRepairError.itemKey === itemKey) {
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
-      line.textContent = leanPaneRepairError;
+      line.textContent = leanPaneRepairError.message;
       container.appendChild(line);
     }
     return container;
@@ -924,7 +929,8 @@
     const modelLabel = await bestEffortModelLabel();
     const text = leanPaneView.formatRepairConfirmation({ items, breakage, modelLabel });
     if (!window.confirm(text)) return;
-    leanPaneRepairError = "";
+    leanPaneRepairError = null;
+    const errorKey = items.length === 1 ? items[0].targetLabel : "batch";
     try {
       const baseUrl = await chatCompanionBaseUrl();
       if (items.length === 1) {
@@ -947,7 +953,7 @@
         startRepairBatchPolling();
       }
     } catch (error) {
-      leanPaneRepairError = normalizeErrorMessage(error);
+      leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
     }
     renderLeanPaneManifest(lastLeanPaneManifest);
     scheduleLeanPaneRefresh();
@@ -993,7 +999,7 @@
       if (response.ok) leanPaneRepairBatch = payload;
       startRepairBatchPolling();
     } catch (error) {
-      leanPaneRepairError = normalizeErrorMessage(error);
+      leanPaneRepairError = { itemKey: "batch", message: normalizeErrorMessage(error) };
     }
     renderLeanPaneManifest(lastLeanPaneManifest);
   }
@@ -1020,6 +1026,12 @@
       const line = document.createElement("p");
       line.className = "ol-lean-project-repair-batch-item";
       line.textContent = leanPaneView.formatRepairOutcome(entry);
+      panel.appendChild(line);
+    }
+    if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
+      const line = document.createElement("p");
+      line.className = "ol-lean-project-breakage-failed";
+      line.textContent = leanPaneRepairError.message;
       panel.appendChild(line);
     }
     const controls = document.createElement("div");
@@ -1193,31 +1205,53 @@
       container.textContent = "No changes to save.";
       return container;
     }
-    const dependents = result.dependentsImpact || [];
+    // The save response is a HISTORICAL snapshot; the pane re-renders this
+    // summary on every manifest refresh, so reconcile it against the live
+    // per-item truth each time -- a dependent fixed through any other path
+    // (per-item repair, manual edit, chat) drops out of the counts and the
+    // offer on the next refresh (PLAN-self-repair-stale-offers Fix 1).
+    const dependents = leanPaneView.reconcileDependentsImpact(
+      result.dependentsImpact || [],
+      lastLeanPaneManifest?.items || []
+    );
     if (dependents.length === 0) return null;
 
     const container = document.createElement("div");
     container.className = "ol-lean-project-impact-note";
     const heading = document.createElement("p");
-    const brokenCount = dependents.filter((d) => d.brokenByUpstream).length;
-    const busyCount = dependents.filter((d) => d.busy).length;
-    const okCount = dependents.length - brokenCount - busyCount;
-    const parts = [];
-    if (brokenCount > 0) parts.push(`${brokenCount} broken`);
-    if (busyCount > 0) parts.push(`${busyCount} not yet re-checked`);
-    if (okCount > 0) parts.push(`${okCount} still valid`);
-    heading.textContent = `${dependents.length} downstream item${dependents.length === 1 ? "" : "s"} affected: ${parts.join(", ")}.`;
+    const stillBroken = leanPaneView.stillBrokenDependents(dependents);
+    const stillBrokenSet = new Set(stillBroken);
+    const repairingCount = dependents.filter((d) => d.nowRepairing && (d.brokenByUpstream || d.busy || d.status === "unknown")).length;
+    const fixedCount = dependents.filter(
+      (d) => d.sinceFixed && (d.brokenByUpstream || d.busy || d.status === "unknown")
+    ).length;
+    const busyCount = dependents.filter(
+      (d) => d.busy && !d.sinceFixed && !d.nowRepairing && !stillBrokenSet.has(d)
+    ).length;
+    const okCount = dependents.length - stillBroken.length - repairingCount - fixedCount - busyCount;
+    if (stillBroken.length + repairingCount + busyCount === 0 && fixedCount > 0) {
+      heading.textContent = `${dependents.length} downstream item${dependents.length === 1 ? " was" : "s were"} affected by this edit -- all since fixed or re-verified.`;
+    } else {
+      const parts = [];
+      if (stillBroken.length > 0) parts.push(`${stillBroken.length} broken`);
+      if (repairingCount > 0) parts.push(`${repairingCount} repairing`);
+      if (fixedCount > 0) parts.push(`${fixedCount} since fixed`);
+      if (busyCount > 0) parts.push(`${busyCount} not yet re-checked`);
+      if (okCount > 0) parts.push(`${okCount} still valid`);
+      heading.textContent = `${dependents.length} downstream item${dependents.length === 1 ? "" : "s"} affected: ${parts.join(", ")}.`;
+    }
     container.appendChild(heading);
     for (const dependent of dependents) {
       const p = document.createElement("p");
       p.textContent = leanPaneView.formatDependentOutcome(dependent);
       container.appendChild(p);
     }
-    // Self-repair: offer one action for the whole broken set (feature spec
-    // Part 2). Suppressed when the edit broke the edited item ITSELF -- its
-    // own repair offer (on the item) is the right entry point until it
-    // compiles again.
-    const broken = dependents.filter((d) => d.brokenByUpstream);
+    // Self-repair: offer one action for the whole CURRENTLY-broken set
+    // (feature spec Part 2) -- never for snapshot-broken items that live
+    // truth says are fixed or already being repaired. Suppressed when the
+    // edit broke the edited item ITSELF -- its own repair offer (on the
+    // item) is the right entry point until it compiles again.
+    const broken = stillBroken;
     const ownBroken = String(result.ownResult?.checkStatus || "").toLowerCase() === "error";
     if (broken.length > 0 && !ownBroken) {
       const actions = document.createElement("div");
@@ -1718,17 +1752,35 @@
 
   // "This change broke N downstream items" after a chat run whose post-run
   // cascade found breakage, with the same repair affordance the pane offers.
+  // The stored impact is the HISTORICAL record of what the run broke; the
+  // companion annotates each entry with its live state (stillBroken /
+  // nowRepairing, PLAN-self-repair-stale-offers Fix 2), and the counts and
+  // the repair offer here derive from that live state only.
   function renderChatRunImpactNotice(lastRunImpact) {
-    const dependents = Array.isArray(lastRunImpact?.dependentsImpact) ? lastRunImpact.dependentsImpact : [];
-    if (dependents.length === 0) return null;
-    const broken = dependents.filter((d) => d.brokenByUpstream);
+    const raw = Array.isArray(lastRunImpact?.dependentsImpact) ? lastRunImpact.dependentsImpact : [];
+    if (raw.length === 0) return null;
+    // Map the server annotation onto the reconciliation fields
+    // (stillBroken is LIVE truth, so `matched` when present); an unannotated
+    // entry (older record) keeps its snapshot state via the unmatched
+    // fallback in stillBrokenDependents.
+    const dependents = raw.map((d) => ({
+      ...d,
+      matched: d.stillBroken !== undefined,
+      nowBroken: d.stillBroken === true,
+      sinceFixed: Boolean(d.brokenByUpstream) && d.stillBroken === false && !d.nowRepairing,
+      nowRepairing: Boolean(d.nowRepairing)
+    }));
+    const broken = leanPaneView.stillBrokenDependents(dependents);
+    const everBroken = dependents.filter((d) => d.brokenByUpstream);
 
     const container = document.createElement("div");
     container.className = "ol-lean-chat-impact";
     const heading = document.createElement("p");
     heading.textContent = broken.length > 0
       ? `This change broke ${broken.length} downstream item${broken.length === 1 ? "" : "s"}:`
-      : `This change touched ${dependents.length} downstream item${dependents.length === 1 ? "" : "s"} (re-verified):`;
+      : everBroken.length > 0
+        ? `This change broke ${everBroken.length} downstream item${everBroken.length === 1 ? "" : "s"} -- all since fixed or being repaired:`
+        : `This change touched ${dependents.length} downstream item${dependents.length === 1 ? "" : "s"} (re-verified):`;
     container.appendChild(heading);
     for (const dependent of dependents) {
       const line = document.createElement("p");

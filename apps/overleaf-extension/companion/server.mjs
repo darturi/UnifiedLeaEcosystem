@@ -789,9 +789,38 @@ export async function handleChatSession(payload, state) {
   // A live formalization run may not yet be reflected in the adapter detail snapshot.
   if (activeJob && !body.activeRun) body.status = "in-progress";
   // Self-repair Phase 1: the last completed run's downstream impact, so the
-  // mirror can render the breakage notice + repair affordance.
-  body.lastRunImpact = state.chatSessions?.[target.targetKey]?.lastRunImpact || null;
+  // mirror can render the breakage notice + repair affordance -- annotated
+  // with each dependent's LIVE state at serve time (stale-offers Fix 2).
+  body.lastRunImpact = annotateLastRunImpact(
+    state,
+    target.overleafProjectId,
+    state.chatSessions?.[target.targetKey]?.lastRunImpact
+  );
   return { statusCode: 200, body };
+}
+
+// Annotate a stored lastRunImpact (the HISTORICAL record of what a run broke)
+// with each dependent's current state, derived from persisted job truth at
+// serve time -- computed per response, never written back, the same
+// computed-not-stored choice as repairSuppressed
+// (docs/PLAN-self-repair-stale-offers.md Fix 2). The mirror derives its
+// counts and its Repair-all offer from `stillBroken`, so a dependent fixed
+// through ANY path (per-item repair, manual edit, batch) drops out of the
+// offer on the next poll while the record of what the run did is preserved.
+function annotateLastRunImpact(state, overleafProjectId, lastRunImpact) {
+  if (!lastRunImpact) return null;
+  if (!Array.isArray(lastRunImpact.dependentsImpact)) return lastRunImpact;
+  return {
+    ...lastRunImpact,
+    dependentsImpact: lastRunImpact.dependentsImpact.map((entry) => {
+      const resolved = resolveDependentSession({ state, overleafProjectId, targetLabel: entry.targetLabel });
+      const nowRepairing = Boolean(resolved.activeJob);
+      const stillBroken = !nowRepairing
+        && resolved.linkedJob?.lastEditCheckStatus === "error"
+        && Boolean(resolved.linkedJob?.lastEditBreakage);
+      return { ...entry, stillBroken, nowRepairing };
+    })
+  };
 }
 
 export async function handleChatPoll(payload, state) {
@@ -828,9 +857,14 @@ export async function handleChatPoll(payload, state) {
 
   const body = toChatSessionResponse(detail.body, { targetKey: null, leaSessionId: sessionId, leaSessionUrl });
   // Poll requests carry only the session id; recover the target's chat record
-  // to surface the last completed run's downstream impact (self-repair Phase 1).
-  const record = Object.values(state.chatSessions || {}).find((entry) => entry?.leaSessionId === sessionId);
-  body.lastRunImpact = record?.lastRunImpact || null;
+  // to surface the last completed run's downstream impact (self-repair
+  // Phase 1). The record's key is `<projectSlug>:<kind>:<label>`; the slug is
+  // what the annotation's job lookups need (slugProjectId is idempotent, so
+  // feeding it back through resolution is safe).
+  const found = Object.entries(state.chatSessions || {}).find(([, entry]) => entry?.leaSessionId === sessionId);
+  body.lastRunImpact = found
+    ? annotateLastRunImpact(state, String(found[0]).split(":")[0], found[1].lastRunImpact)
+    : null;
   return { statusCode: 200, body };
 }
 
@@ -1275,6 +1309,16 @@ export async function handleLeanPaneEditSave(payload, state) {
   // that's what gates the "Repair with Lea" offer on the edited item.
   let jobsChanged = recordEditCheckVerdict(linkedJob, check.body, ownCheckFailed ? breakageDescriptor(upstream) : null);
 
+  // A manual edit supersedes any standing repair outcome for this item
+  // (stale-offers Fix 3): `lastRepair.state === "needs_review"` asks a human
+  // to look at what an agent changed -- this save IS the human looking, and
+  // it changes the file the flag was about. Manual edits are run-less (no
+  // newer job is created), so without this the flag never cleared.
+  if (linkedJob?.lastRepair) {
+    delete linkedJob.lastRepair;
+    jobsChanged = true;
+  }
+
   // The pane's own item identity (`targetLabel`) stays pinned to the LaTeX
   // marker's label=... forever -- that's correct, it's the doc-side anchor.
   // But `linkedJob.declarationName` is a *cache* of "what Lean symbol does
@@ -1477,7 +1521,7 @@ async function runPostRunCascade({ state, overleafProjectId, targetLabel, snapsh
   if (jobsChanged) {
     await writeJson(state.jobsPath, state.jobs);
   }
-  return { classification, afterHeader, dependentsImpact, finishedAt: new Date().toISOString() };
+  return { classification, afterHeader, checkStatus, dependentsImpact, finishedAt: new Date().toISOString() };
 }
 
 // --- Self-repair Phase 3: the repair run ------------------------------------
@@ -1658,11 +1702,55 @@ async function runLeaRepairJob({ state, job, target, snapshot, breakage, prompt 
     job.status = "repair_failed";
     job.finalStatus = "repair_failed";
     job.exitCode = 1;
-    const failureReason = await readRepairFailureReason({ state, job, exit, rebuild });
+
+    // The upstream may have changed AGAIN while this repair ran (its own
+    // cascade skipped this item as busy -- us). Two consequences handled
+    // here rather than reported misleadingly (the second-rename-while-
+    // repairing case, PLAN-self-repair-stale-offers round 2):
+    //
+    // 1. Attribution: re-recording the DISPATCHED descriptor would persist a
+    //    stale rename mapping ("still refers to the old name" about a name
+    //    the repair just adopted) and mis-prompt the next repair. Refresh it
+    //    against the upstream's CURRENT declaration name (kept fresh by the
+    //    rename bookkeeping on every path).
+    const upstreamNow = resolveDependentSession({
+      state,
+      overleafProjectId: target.overleafProjectId,
+      targetLabel: breakage.upstreamLabel
+    });
+    const currentUpstreamName = upstreamNow.linkedJob?.declarationName || null;
+    const upstreamRenamedAgain = Boolean(currentUpstreamName)
+      && Boolean(breakage.upstreamDeclarationName)
+      && currentUpstreamName !== breakage.upstreamDeclarationName;
+    const effectiveBreakage = upstreamRenamedAgain
+      ? {
+          ...breakage,
+          classificationKind: "renamed",
+          upstreamDeclarationName: currentUpstreamName,
+          // What this item's file references now (the name the repair was
+          // dispatched toward) -> the upstream's current name.
+          renamedFrom: breakage.upstreamDeclarationName,
+          renamedTo: currentUpstreamName,
+          editedAt: new Date().toISOString(),
+          beforeHeader: null,
+          afterHeader: null
+        }
+      : breakage;
+
+    // 2. The reason: when the run's own final check PASSED but the verifying
+    //    rebuild failed, the agent's last message is a success report -- not
+    //    an explanation of this failure. Say what actually happened instead
+    //    of quoting it.
+    const ranCleanButFailedVerify = String(impact?.checkStatus || "").toLowerCase() === "ok";
+    const rebuildDetail = rebuild.body?.detail || rebuild.error || "";
+    const failureReason = ranCleanButFailedVerify
+      ? `The repaired file compiled when the agent finished, but verification against the current project failed -- the upstream item changed again while the repair ran${upstreamRenamedAgain ? ` (it is now \`${currentUpstreamName}\`)` : ""}.${rebuildDetail ? ` ${rebuildDetail}` : ""}`
+      : await readRepairFailureReason({ state, job, exit, rebuild });
+
     recordEditCheckVerdict(
       job,
       { status: "error", detail: rebuild.body?.detail || rebuild.error || job.lastEditCheckDetail },
-      breakage
+      effectiveBreakage
     );
     job.lastRepair = { state: "failed", failureReason, finishedAt: new Date().toISOString() };
     await appendLog(job.logPath, `\n[backend] Repair did not verify: ${failureReason}\n`);

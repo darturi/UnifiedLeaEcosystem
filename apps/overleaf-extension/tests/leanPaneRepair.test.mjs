@@ -530,3 +530,76 @@ test("parseLeanImports feeds the batch graph with exact module names", () => {
   const imports = parseLeanImports("import Lea.Project1.compactness_criterion\nimport Mathlib.Topology.Basic\n");
   assert.ok(imports.has("Lea.Project1.compactness_criterion"));
 });
+
+// --- Round 2: upstream renamed AGAIN while the repair ran -------------------
+// (docs/PLAN-self-repair-stale-offers.md, round-2 addendum)
+
+test("a repair that compiled clean but fails verification after a mid-run upstream rename reports the real reason and refreshes attribution", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const steps = [...DEPENDENT_SESSION_DETAIL.code_steps];
+  const state = await makeState({
+    leaRepo,
+    jobs: {
+      b: brokenDependentJob(),
+      // the upstream item's linked job; its declarationName is the live
+      // "current name" the attribution refresh reads
+      upstream: {
+        jobId: "job-upstream",
+        jobKey: "project-1:theorem:compactness_criterion",
+        status: "formalized",
+        targetKind: "theorem",
+        targetLabel: "compactness_criterion",
+        declarationName: "compactness_thm", // rename 1, what the repair targets
+        leaSessionId: "sess-a",
+        projectSlug: "project-1",
+        projectNamespace: NAMESPACE,
+        startedAt: "2026-01-01T00:00:00.000Z",
+        finishedAt: "2026-01-01T00:01:00.000Z"
+      }
+    },
+    fetchImpl: makeRepairFetch(calls, {
+      sessionDetails: {
+        "sess-b": () => ({
+          project_namespace: NAMESPACE,
+          code_steps: steps.slice(),
+          messages: [
+            // the agent's SUCCESS report -- must NOT become the failure reason
+            { id: "m1", role: "assistant", seq: 9, content: "Acknowledged and repaired. The file compiles with no errors." }
+          ]
+        })
+      },
+      rebuildResponses: {
+        "sess-b": { status: "error", detail: "unknown constant 'Lea.Project1.compactness_thm'" }
+      },
+      onRunStarted: () => {
+        // the repair adopts rename 1 and its own check passes...
+        steps.push({ ...REPAIRED_STEP });
+        // ...but the upstream is renamed AGAIN while the repair runs (rename
+        // bookkeeping keeps declarationName current on every path)
+        state.jobs.upstream.declarationName = "compactness_crt";
+      }
+    })
+  });
+
+  const res = await handleLeanPaneRepairStart(
+    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "compactness_corollary" },
+    state
+  );
+  const repairJobId = res.body.jobId;
+  await waitFor(() => state.jobs[repairJobId]?.finalStatus === "repair_failed");
+  const job = state.jobs[repairJobId];
+
+  // the reason says what actually happened, not the agent's success prose
+  assert.match(job.lastRepair.failureReason, /verification against the current project failed/);
+  assert.match(job.lastRepair.failureReason, /changed again while the repair ran/);
+  assert.match(job.lastRepair.failureReason, /compactness_crt/);
+  assert.doesNotMatch(job.lastRepair.failureReason, /Acknowledged and repaired/);
+
+  // attribution refreshed to the CURRENT upstream identity, so the pane's
+  // copy and the next repair prompt carry the right rename mapping
+  assert.equal(job.lastEditBreakage.classificationKind, "renamed");
+  assert.equal(job.lastEditBreakage.renamedFrom, "compactness_thm");
+  assert.equal(job.lastEditBreakage.renamedTo, "compactness_crt");
+  assert.equal(job.lastEditBreakage.upstreamDeclarationName, "compactness_crt");
+});

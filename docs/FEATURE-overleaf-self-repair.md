@@ -440,6 +440,18 @@ Reconciliations between this spec and the shipped implementation:
   reset since it was recorded) has nowhere to persist attribution, so it gets
   the "may be affected — re-check manually" impact line but **no repair
   offer**, as anticipated in the plan's edge cases.
+- **Snapshots are historical records; affordances derive from live truth**
+  (`PLAN-self-repair-stale-offers.md`, fixed post-ship): the post-save impact
+  summary and the chat mirror's post-run notice are frozen records of what a
+  change did *at the time*. Their per-item lines keep that history, but their
+  counts and "Repair all (N)" offers are reconciled against current truth on
+  every render/poll (`reconcileDependentsImpact` client-side against the live
+  manifest; `annotateLastRunImpact` server-side against job records) — a
+  dependent fixed through any path drops out of the offer, with a "— since
+  fixed" correction on its line. Any future pane surface that copies breakage
+  state must follow the same rule: render the copy as history, derive actions
+  from live state, and when live state can't be confirmed, fail toward
+  keeping the offer (a stale dispatch is a server-validated no-op).
 
 ## Acceptance Criteria
 
