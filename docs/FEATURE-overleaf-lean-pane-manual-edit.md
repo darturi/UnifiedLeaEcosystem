@@ -288,6 +288,14 @@ context gets richer).
 
 ## v2 (Roadmap): Let Lea Fix Downstream Items
 
+> **Superseded.** This roadmap section became a full feature of its own:
+> `FEATURE-overleaf-self-repair.md` (implemented per
+> `PLAN-overleaf-self-repair.md`). It delivers everything sketched below —
+> repair runs with injected upstream-diff + failure context, a batch "fix all
+> N" action, and rename-aware repair prompts — plus post-run cascade
+> detection for chat/re-formalize changes that this spec did not cover. The
+> text below is kept for the original design rationale only.
+
 Once v1's detection is trusted, a natural next step is an action on each
 cascade-broken dependent: "Have Lea fix this." This reuses machinery that
 already exists rather than inventing a repair flow from scratch:

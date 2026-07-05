@@ -5,9 +5,13 @@ import {
   buildLeanPaneTree,
   canEditPaneItem,
   canFormalizePaneItem,
+  canRepairPaneItem,
   capitalize,
+  formatBreakageAttribution,
   formatDependentOutcome,
   formatDependentsImpact,
+  formatRepairConfirmation,
+  formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
   hasInProgressItems,
@@ -18,7 +22,9 @@ import {
   deriveShareControls,
   filenameFromContentDisposition,
   parsePaneLatex,
+  reconcileDependentsImpact,
   shouldRefetchLeanPaneFiles,
+  stillBrokenDependents,
   treeAncestorIdsForFile
 } from "../extension/leanPaneView.mjs";
 
@@ -340,4 +346,187 @@ test("filenameFromContentDisposition extracts the quoted filename or falls back"
   );
   assert.equal(filenameFromContentDisposition(null, "lean-project.zip"), "lean-project.zip");
   assert.equal(filenameFromContentDisposition("attachment", "x.zip"), "x.zip");
+});
+
+// --- Self-repair helpers (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
+
+test("canRepairPaneItem gates on breakage, suppression, in-progress, and a running repair", () => {
+  const breakage = { upstreamLabel: "a", repair: { state: "offered" } };
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage }), true);
+  assert.equal(canRepairPaneItem({ status: "invalid" }), false);
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage: { ...breakage, repairSuppressed: "upstream_broken" } }), false);
+  assert.equal(canRepairPaneItem({ status: "in-progress", breakage }), false);
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage: { ...breakage, repair: { state: "running" } } }), false);
+  // a previously failed repair can be retried
+  assert.equal(canRepairPaneItem({ status: "invalid", breakage: { ...breakage, repair: { state: "failed" } } }), true);
+});
+
+test("formatBreakageAttribution distinguishes self-break, rename, suppression, and generic upstream breaks", () => {
+  assert.equal(
+    formatBreakageAttribution({ selfBroken: true, via: "edit" }),
+    "Broken by a manual edit to this item."
+  );
+  assert.match(
+    formatBreakageAttribution({ classificationKind: "renamed", renamedFrom: "a", renamedTo: "b", via: "chat" }),
+    /`a` was renamed to `b` \(via a chat request\)\. This item still refers to the old name\./
+  );
+  assert.match(
+    formatBreakageAttribution({ upstreamLabel: "a", repairSuppressed: "upstream_broken", via: "formalize" }),
+    /repair a first/i
+  );
+  assert.equal(
+    formatBreakageAttribution({ upstreamLabel: "a", classificationKind: "signature", via: "formalize" }),
+    "Broken by a re-formalization to a."
+  );
+});
+
+test("formatRepairConfirmation names the items, the upstream change, the model, and the run count", () => {
+  const text = formatRepairConfirmation({
+    items: [{ targetLabel: "b" }, { targetLabel: "c" }],
+    breakage: { upstreamLabel: "a", classificationKind: "renamed", renamedFrom: "a", renamedTo: "a2" },
+    modelLabel: "GPT-5"
+  });
+  assert.match(text, /Repair 2 items with Lea: b, c\./);
+  assert.match(text, /`a` was renamed to `a2`/);
+  assert.match(text, /2 agent runs with GPT-5/);
+
+  // no model label -> generic copy, never an empty "with"
+  const fallback = formatRepairConfirmation({ items: [{ targetLabel: "b" }], breakage: null });
+  assert.match(fallback, /1 agent run with the configured Lea model/);
+});
+
+test("formatRepairOutcome covers every batch item state", () => {
+  assert.equal(formatRepairOutcome({ targetLabel: "b", state: "pending" }), "b: waiting.");
+  assert.equal(formatRepairOutcome({ targetLabel: "b", state: "running" }), "b: repairing...");
+  assert.equal(formatRepairOutcome({ targetLabel: "b", state: "repaired" }), "b: repaired and verified.");
+  assert.match(formatRepairOutcome({ targetLabel: "b", state: "needs_review" }), /review required/);
+  assert.match(formatRepairOutcome({ targetLabel: "b", state: "failed", reason: "unprovable" }), /repair failed -- unprovable/);
+  assert.match(
+    formatRepairOutcome({ targetLabel: "c", state: "skipped", reason: "depends_on_failed:b" }),
+    /skipped -- depends on failed repair of b\./
+  );
+  assert.match(formatRepairOutcome({ targetLabel: "c", state: "skipped", reason: "already_fixed" }), /already compiles/);
+});
+
+// --- Stale-offer reconciliation (docs/PLAN-self-repair-stale-offers.md) ----
+
+test("reconcileDependentsImpact: fixed, still-broken, repairing, and unmatched dependents", () => {
+  const dependents = [
+    { targetLabel: "fixed_one", brokenByUpstream: { targetLabel: "a" } },
+    { targetLabel: "still_broken", brokenByUpstream: { targetLabel: "a" } },
+    { targetLabel: "repairing_now", brokenByUpstream: { targetLabel: "a" } },
+    { targetLabel: "not_in_manifest", brokenByUpstream: { targetLabel: "a" } }
+  ];
+  const items = [
+    { leanDeclarationName: "fixed_one", status: "valid" },
+    { leanDeclarationName: "still_broken", status: "invalid", breakage: { upstreamLabel: "a" } },
+    { leanDeclarationName: "repairing_now", status: "invalid", breakage: { upstreamLabel: "a", repair: { state: "running" } } }
+  ];
+  const out = reconcileDependentsImpact(dependents, items);
+  const byLabel = Object.fromEntries(out.map((d) => [d.targetLabel, d]));
+  assert.deepEqual(
+    [byLabel.fixed_one.sinceFixed, byLabel.fixed_one.nowRepairing, byLabel.fixed_one.matched],
+    [true, false, true]
+  );
+  assert.deepEqual(
+    [byLabel.still_broken.sinceFixed, byLabel.still_broken.nowRepairing],
+    [false, false]
+  );
+  assert.deepEqual(
+    [byLabel.repairing_now.sinceFixed, byLabel.repairing_now.nowRepairing],
+    [false, true]
+  );
+  // unmatched: snapshot state kept, offer stays (fail toward offering)
+  assert.deepEqual(
+    [byLabel.not_in_manifest.sinceFixed, byLabel.not_in_manifest.matched],
+    [false, false]
+  );
+});
+
+test("reconcileDependentsImpact: an invalid item with no breakage is NOT counted as fixed, and label matching also works", () => {
+  const out = reconcileDependentsImpact(
+    [{ targetLabel: "broken_other_way", brokenByUpstream: { targetLabel: "a" } }],
+    [{ label: "broken_other_way", status: "invalid" }] // matched by label, still invalid
+  );
+  assert.equal(out[0].matched, true);
+  assert.equal(out[0].sinceFixed, false);
+});
+
+test("stillBrokenDependents keeps only currently-broken entries", () => {
+  const out = stillBrokenDependents([
+    { targetLabel: "a", brokenByUpstream: {}, sinceFixed: false, nowRepairing: false },
+    { targetLabel: "b", brokenByUpstream: {}, sinceFixed: true, nowRepairing: false },
+    { targetLabel: "c", brokenByUpstream: {}, sinceFixed: false, nowRepairing: true },
+    { targetLabel: "d", brokenByUpstream: null, sinceFixed: false, nowRepairing: false }
+  ]);
+  assert.deepEqual(out.map((d) => d.targetLabel), ["a"]);
+});
+
+test("formatDependentOutcome appends since-fixed / repair-in-progress only to lines that claimed a problem", () => {
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "b", brokenByUpstream: { renamed: false }, sinceFixed: true }),
+    "b: broken by this edit -- since fixed."
+  );
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "b", brokenByUpstream: { renamed: false }, nowRepairing: true }),
+    "b: broken by this edit -- repair in progress."
+  );
+  assert.match(
+    formatDependentOutcome({ targetLabel: "b", busy: true, sinceFixed: true }),
+    /not re-checked yet.*-- since fixed\.$/
+  );
+  // history is never rewritten on lines that claimed no problem
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "b", status: "reverified", attributed: true, sinceFixed: true }),
+    "b: re-checked, still valid."
+  );
+});
+
+// --- Round 2: bidirectional reconciliation (the busy-skipped dependent) ----
+
+test("reconcileDependentsImpact upgrades a snapshot-busy entry to nowBroken when live truth says so", () => {
+  const dependents = [
+    { targetLabel: "busy_then_broken", busy: true, brokenByUpstream: null },
+    { targetLabel: "busy_then_fixed", busy: true, brokenByUpstream: null },
+    { targetLabel: "busy_still_running", busy: true, brokenByUpstream: null },
+    { targetLabel: "busy_but_suppressed", busy: true, brokenByUpstream: null }
+  ];
+  const items = [
+    { leanDeclarationName: "busy_then_broken", status: "invalid", breakage: { upstreamLabel: "a", repair: { state: "failed" } } },
+    { leanDeclarationName: "busy_then_fixed", status: "valid" },
+    { leanDeclarationName: "busy_still_running", status: "in-progress", breakage: { upstreamLabel: "a", repair: { state: "running" } } },
+    { leanDeclarationName: "busy_but_suppressed", status: "invalid", breakage: { upstreamLabel: "a", repairSuppressed: "upstream_broken" } }
+  ];
+  const byLabel = Object.fromEntries(reconcileDependentsImpact(dependents, items).map((d) => [d.targetLabel, d]));
+  assert.equal(byLabel.busy_then_broken.nowBroken, true);
+  assert.equal(byLabel.busy_then_fixed.nowBroken, false);
+  assert.equal(byLabel.busy_then_fixed.sinceFixed, true);
+  assert.equal(byLabel.busy_still_running.nowBroken, false);
+  assert.equal(byLabel.busy_still_running.nowRepairing, true);
+  assert.equal(byLabel.busy_but_suppressed.nowBroken, false); // offering it would be a server 409
+});
+
+test("stillBrokenDependents decides from live truth for matched entries, in BOTH directions", () => {
+  const out = stillBrokenDependents([
+    // snapshot busy, live broken -> offered (the reported round-2 case)
+    { targetLabel: "a", busy: true, brokenByUpstream: null, matched: true, nowBroken: true, sinceFixed: false, nowRepairing: false },
+    // snapshot broken, live fixed -> not offered (round 1)
+    { targetLabel: "b", brokenByUpstream: {}, matched: true, nowBroken: false, sinceFixed: true, nowRepairing: false },
+    // snapshot broken, live still broken -> offered
+    { targetLabel: "c", brokenByUpstream: {}, matched: true, nowBroken: true, sinceFixed: false, nowRepairing: false },
+    // unmatched snapshot-broken -> offered (fail toward offering)
+    { targetLabel: "d", brokenByUpstream: {}, matched: false, nowBroken: false, sinceFixed: false, nowRepairing: false }
+  ]);
+  assert.deepEqual(out.map((d) => d.targetLabel), ["a", "c", "d"]);
+});
+
+test("formatDependentOutcome corrects a stale busy line when the item is now broken", () => {
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "b", busy: true, nowBroken: true }),
+    "b: was busy during this edit's re-check -- now broken."
+  );
+  assert.equal(
+    formatDependentOutcome({ targetLabel: "b", status: "reverified", attributed: true, nowBroken: true }),
+    "b: re-checked, still valid -- now broken."
+  );
 });

@@ -29,17 +29,20 @@ import {
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
 import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
-import { buildChatPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
+import { buildChatPrompt, buildRepairPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   dependentsOf,
+  listProjectProofFiles,
   moduleNameFromProjectStep,
   parseLeanImports,
   projectNamespaceFromSlug,
   proofPathFromProjectStep,
-  stubbedUpstreamOf
+  stubbedUpstreamOf,
+  topologicalRepairOrder
 } from "./leanDependencyGraph.mjs";
 import { classifyEdit, cascadeRequired, parseDeclarationHeader } from "./leanSignatureDiff.mjs";
+import { breakageDescriptor, runCascadeVerification } from "./cascadeVerify.mjs";
 import {
   exportProjectZipBySlug,
   fetchAdapterSettings,
@@ -249,6 +252,22 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, usesResolution.error, usesResolution.message);
   }
 
+  // Self-repair Phase 1: when this target already has a recorded artifact
+  // (the re-formalize case), snapshot its declaration state NOW -- before
+  // cleanupPreviousRunArtifacts below may delete the old file -- so the run's
+  // terminal handler can classify what changed and cascade over dependents.
+  let preRunLean = null;
+  const previous = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
+  if (previous.leaSessionId) {
+    try {
+      preRunLean = await snapshotPreRunLeanState({
+        state, leaSessionId: previous.leaSessionId, overleafProjectId, targetKind, targetLabel
+      });
+    } catch {
+      preRunLean = null;
+    }
+  }
+
   // The Overleaf project's .tex sources are mirrored into the project's
   // `.lea/files/overleaf/` by the extension's background sync (flushed before this
   // request), so the adapter's composed context already surfaces them to Lea. No
@@ -269,6 +288,9 @@ export async function handleFormalize(payload, state) {
         jobs: state.jobs || {}
       });
   const job = await createLeaJob({ state, target, targetText, targetContext, targetSyntax, resolvedUses: usesResolution.resolvedUses });
+  // Only the parsed header + module identity ride on the job (persisted with
+  // jobs.json); never the full file content -- see snapshotPreRunLeanState.
+  if (preRunLean) job.preRunLean = preRunLean;
   if (reusableStub) {
     job.leaSessionId = reusableStub.leaSessionId || null;
     job.recordedProofPath = reusableStub.recordedProofPath;
@@ -766,7 +788,39 @@ export async function handleChatSession(payload, state) {
   const body = toChatSessionResponse(detail.body, { targetKey: target.targetKey, leaSessionId, leaSessionUrl });
   // A live formalization run may not yet be reflected in the adapter detail snapshot.
   if (activeJob && !body.activeRun) body.status = "in-progress";
+  // Self-repair Phase 1: the last completed run's downstream impact, so the
+  // mirror can render the breakage notice + repair affordance -- annotated
+  // with each dependent's LIVE state at serve time (stale-offers Fix 2).
+  body.lastRunImpact = annotateLastRunImpact(
+    state,
+    target.overleafProjectId,
+    state.chatSessions?.[target.targetKey]?.lastRunImpact
+  );
   return { statusCode: 200, body };
+}
+
+// Annotate a stored lastRunImpact (the HISTORICAL record of what a run broke)
+// with each dependent's current state, derived from persisted job truth at
+// serve time -- computed per response, never written back, the same
+// computed-not-stored choice as repairSuppressed
+// (docs/PLAN-self-repair-stale-offers.md Fix 2). The mirror derives its
+// counts and its Repair-all offer from `stillBroken`, so a dependent fixed
+// through ANY path (per-item repair, manual edit, batch) drops out of the
+// offer on the next poll while the record of what the run did is preserved.
+function annotateLastRunImpact(state, overleafProjectId, lastRunImpact) {
+  if (!lastRunImpact) return null;
+  if (!Array.isArray(lastRunImpact.dependentsImpact)) return lastRunImpact;
+  return {
+    ...lastRunImpact,
+    dependentsImpact: lastRunImpact.dependentsImpact.map((entry) => {
+      const resolved = resolveDependentSession({ state, overleafProjectId, targetLabel: entry.targetLabel });
+      const nowRepairing = Boolean(resolved.activeJob);
+      const stillBroken = !nowRepairing
+        && resolved.linkedJob?.lastEditCheckStatus === "error"
+        && Boolean(resolved.linkedJob?.lastEditBreakage);
+      return { ...entry, stillBroken, nowRepairing };
+    })
+  };
 }
 
 export async function handleChatPoll(payload, state) {
@@ -801,10 +855,17 @@ export async function handleChatPoll(payload, state) {
     };
   }
 
-  return {
-    statusCode: 200,
-    body: toChatSessionResponse(detail.body, { targetKey: null, leaSessionId: sessionId, leaSessionUrl })
-  };
+  const body = toChatSessionResponse(detail.body, { targetKey: null, leaSessionId: sessionId, leaSessionUrl });
+  // Poll requests carry only the session id; recover the target's chat record
+  // to surface the last completed run's downstream impact (self-repair
+  // Phase 1). The record's key is `<projectSlug>:<kind>:<label>`; the slug is
+  // what the annotation's job lookups need (slugProjectId is idempotent, so
+  // feeding it back through resolution is safe).
+  const found = Object.entries(state.chatSessions || {}).find(([, entry]) => entry?.leaSessionId === sessionId);
+  body.lastRunImpact = found
+    ? annotateLastRunImpact(state, String(found[0]).split(":")[0], found[1].lastRunImpact)
+    : null;
+  return { statusCode: 200, body };
 }
 
 export async function handleChatMessage(payload, state) {
@@ -829,9 +890,33 @@ export async function handleChatMessage(payload, state) {
   const stale = Boolean(latestJobHash && target.sourceHash && latestJobHash !== target.sourceHash);
   const prompt = buildChatPrompt(target, { stale, firstMessage: !leaSessionId, userText: message });
 
+  // Self-repair Phase 1: snapshot the recorded declaration BEFORE the run so
+  // its terminal continuation can classify what the agent changed and cascade
+  // over dependents (a chat request can rename/re-state a declaration just
+  // like a manual edit). Null when nothing is recorded yet -- first message
+  // on a never-formalized item has no "before" and no dependents.
+  let preRunSnapshot = null;
+  try {
+    preRunSnapshot = await snapshotPreRunLeanState({
+      state,
+      leaSessionId,
+      overleafProjectId: target.overleafProjectId,
+      targetKind: target.targetKind,
+      targetLabel: target.targetLabel
+    });
+  } catch {
+    preRunSnapshot = null;
+  }
+  // A new message supersedes the previous run's impact notice. Cleared here,
+  // BEFORE the run starts -- clearing after would race this run's own
+  // continuation (see the record write below, which preserves it).
+  if (state.chatSessions?.[target.targetKey]?.lastRunImpact) {
+    delete state.chatSessions[target.targetKey].lastRunImpact;
+  }
+
   let started;
   try {
-    started = await startChatRun({ state, target, leaSessionId, prompt });
+    started = await startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot });
   } catch (error) {
     return errorResponse(502, "chat_run_failed", error instanceof Error ? error.message : String(error));
   }
@@ -846,7 +931,12 @@ export async function handleChatMessage(payload, state) {
     leaSessionId: started.sessionId,
     createdAt: existing?.createdAt || now,
     updatedAt: now,
-    sourceHash: target.sourceHash || existing?.sourceHash || null
+    sourceHash: target.sourceHash || existing?.sourceHash || null,
+    // Any lastRunImpact still on the record here belongs to THIS run's own
+    // terminal continuation (a fast run can finish before this write; the
+    // PREVIOUS run's impact was cleared before startChatRun). Preserving it
+    // instead of clobbering closes that race.
+    ...(existing?.lastRunImpact ? { lastRunImpact: existing.lastRunImpact } : {})
   };
   await persistChatSessions(state);
 
@@ -1187,16 +1277,47 @@ export async function handleLeanPaneEditSave(payload, state) {
   // place that knows whether the file was previously known-broken, needed to
   // detect a recovery below.
   const wasPreviouslyFailing = linkedJob?.lastEditCheckStatus === "error";
-  // Record the real compiler verdict on the linked job so getTheoremStatus's
-  // status override (see its doc comment) picks it up on the next manifest
-  // refresh -- otherwise the pane's chip keeps reading the target as
-  // "formalized" from stale on-disk evidence. See
-  // docs/FEATURE-overleaf-lean-pane-manual-edit.md.
-  let jobsChanged = recordEditCheckVerdict(linkedJob, check.body);
 
   const beforeHeader = parseDeclarationHeader(before.content, effectiveName);
   const afterHeader = parseDeclarationHeader(content, effectiveName);
   const classification = classifyEdit({ before: beforeHeader, after: afterHeader, expectedName: effectiveName, ownCheckFailed });
+
+  // The attribution descriptor for this change -- threaded through the cascade
+  // onto every broken dependent, and persisted (lastEditBreakage) so the repair
+  // offer survives manifest refreshes and restarts (self-repair Phase 2).
+  const upstream = {
+    overleafProjectId,
+    targetLabel,
+    effectiveName,
+    classification,
+    via: "edit",
+    editedAt: new Date().toISOString(),
+    sessionId: leaSessionId,
+    path: before.path,
+    namespace: before.namespace,
+    moduleName: before.moduleName,
+    beforeHeader,
+    afterHeader
+  };
+
+  // Record the real compiler verdict on the linked job so getTheoremStatus's
+  // status override (see its doc comment) picks it up on the next manifest
+  // refresh -- otherwise the pane's chip keeps reading the target as
+  // "formalized" from stale on-disk evidence. See
+  // docs/FEATURE-overleaf-lean-pane-manual-edit.md. When the edit broke the
+  // item ITSELF, the breakage attribution points at the item's own label --
+  // that's what gates the "Repair with Lea" offer on the edited item.
+  let jobsChanged = recordEditCheckVerdict(linkedJob, check.body, ownCheckFailed ? breakageDescriptor(upstream) : null);
+
+  // A manual edit supersedes any standing repair outcome for this item
+  // (stale-offers Fix 3): `lastRepair.state === "needs_review"` asks a human
+  // to look at what an agent changed -- this save IS the human looking, and
+  // it changes the file the flag was about. Manual edits are run-less (no
+  // newer job is created), so without this the flag never cleared.
+  if (linkedJob?.lastRepair) {
+    delete linkedJob.lastRepair;
+    jobsChanged = true;
+  }
 
   // The pane's own item identity (`targetLabel`) stays pinned to the LaTeX
   // marker's label=... forever -- that's correct, it's the doc-side anchor.
@@ -1236,195 +1357,15 @@ export async function handleLeanPaneEditSave(payload, state) {
   // failing the same way") requires !ownCheckFailed.
   const recoveredFromFailure = wasPreviouslyFailing && !ownCheckFailed;
 
-  const dependentsImpact = [];
+  let dependentsImpact = [];
   if (cascadeRequired(classification) || recoveredFromFailure) {
-    let dependents = [];
-    try {
-      dependents = await dependentsOf({
-        leaRepoPath: state.settings.leaRepoPath,
-        namespace: before.namespace,
-        moduleName: before.moduleName
-      });
-    } catch {
-      dependents = [];
-    }
-
-    // The dependents loop below re-checks each dependent via the fast LSP
-    // `lean-check` path -- which never touches the *edited* module's compiled
-    // `.olean`, so without this, every dependent would resolve `import
-    // <editedModule>` against whatever was built before this save, no matter
-    // how many times it's rechecked (the bug this cascade exists to catch).
-    // Force one real rebuild of the edited module first, so the checks below
-    // are against its current source. Skipped when there's nothing to verify
-    // against (dependents.length === 0) -- no point paying for a rebuild that
-    // nothing downstream would observe.
-    if (dependents.length > 0) {
-      const rebuild = await rebuildApiSessionModule({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path });
-      const rebuildOk = rebuild.ok && String(rebuild.body?.status || "").toLowerCase() === "ok";
-      if (!rebuildOk) {
-        // The edited module doesn't produce a real, current .olean right now
-        // (a genuine compile failure the fast own-check may have missed via
-        // sorry-recovery, an adapter/transport failure, or a timeout) -- every
-        // dependent's check below would be checking against nothing
-        // trustworthy. Report "can't verify" rather than guessing either way.
-        for (const file of dependents) {
-          const summary = summarizeDependentFile(file);
-          const dependentSession = resolveDependentSession({ state, overleafProjectId, targetLabel: summary.targetLabel });
-
-          if (dependentSession.activeJob) {
-            // Don't race a live run on the dependent -- same rule as the
-            // per-dependent loop below.
-            dependentsImpact.push({ ...summary, status: "busy", attributed: true, busy: true, brokenByUpstream: null });
-            continue;
-          }
-
-          // Fail closed: this dependent was never actually re-checked (the
-          // upstream rebuild itself failed), so its status CHIP must not keep
-          // reading whatever it last read -- typically "valid", from before
-          // this edit -- or the pane is right back to the exact bug this
-          // cascade exists to catch, just one layer removed (a wrong message
-          // is fixed by formatDependentOutcome's "unknown" branch above it in
-          // leanPaneView.mjs; the item's own chip is a separate render path,
-          // getTheoremStatus's lastEditCheckStatus override, and needs its
-          // own write). There is no "unconfirmed" chip state today -- treating
-          // it the same as "broken" is the safe default until one exists.
-          const detail = `Not re-verified: rebuilding ${effectiveName} failed, so this dependent's status is unconfirmed.`;
-          if (dependentSession.linkedJob) {
-            jobsChanged = recordEditCheckVerdict(dependentSession.linkedJob, { status: "error", detail }) || jobsChanged;
-          }
-          dependentsImpact.push({
-            ...summary,
-            status: "unknown",
-            attributed: Boolean(dependentSession.leaSessionId),
-            busy: false,
-            checkDetail: rebuild.body?.detail || rebuild.error || detail,
-            brokenByUpstream: null
-          });
-        }
-        dependents = [];
-      }
-    }
-
-    // Kept for the post-loop transitive propagation below: which project
-    // modules each dependent imports, and which session/job each resolved to.
-    const importsByModule = new Map(dependents.map((file) => [file.moduleName, parseLeanImports(file.content)]));
-    const sessionByModule = new Map();
-
-    for (const file of dependents) {
-      const summary = summarizeDependentFile(file);
-      const dependentSession = resolveDependentSession({ state, overleafProjectId, targetLabel: summary.targetLabel });
-      sessionByModule.set(file.moduleName, dependentSession);
-
-      if (!dependentSession.leaSessionId) {
-        // No recorded session for this file's declaration (e.g. jobs.json was
-        // reset since it was generated) -- can't attribute a cascade
-        // code_step, but still tell the caller this file exists and is at
-        // risk so the pane can prompt a manual re-check.
-        dependentsImpact.push({ ...summary, status: "unknown", attributed: false, busy: false, brokenByUpstream: null });
-        continue;
-      }
-      if (dependentSession.activeJob) {
-        // Don't race a live run on the dependent (PLAN Phase 2 edge case).
-        dependentsImpact.push({ ...summary, status: "busy", attributed: true, busy: true, brokenByUpstream: null });
-        continue;
-      }
-
-      // The dependent's VERDICT comes from a real `lake build` of its module
-      // (adapter /rebuild), NOT from the warm LSP lean-check: live testing
-      // showed the warm check can still resolve the edited import against a
-      // stale compiled build even after the edited module's own rebuild +
-      // daemon mark_stale (VS Code, which compiles from source, disagreed --
-      // and was right: the file genuinely no longer compiled). `lake build`
-      // compiles the dependent AND everything on its import path from
-      // current source, exactly like VS Code, so its verdict cannot be a
-      // caching artifact. It also makes the transitive case sound end-to-end:
-      // building a second-hop dependent rebuilds the broken middle module
-      // from source and fails with the real cause.
-      const cascadeBuild = await rebuildApiSessionModule({
-        fetchImpl, baseUrl, apiKey,
-        sessionId: dependentSession.leaSessionId,
-        path: file.stepPath
-      });
-      if (!cascadeBuild.ok) {
-        dependentsImpact.push({ ...summary, status: "unknown", attributed: true, busy: false, brokenByUpstream: null });
-        continue;
-      }
-      const broken = String(cascadeBuild.body?.status || "").toLowerCase() !== "ok";
-
-      // Timeline entry (best-effort): the author:"cascade" lean-check records
-      // the re-verification as its own code_step in the adapter DB (who/why/
-      // when). Its own verdict is deliberately NOT trusted for the chip --
-      // see the rebuild comment above; if it disagrees with the build, the
-      // build is right. A failure here loses only the timeline entry.
-      await runApiSessionLeanCheck({
-        fetchImpl, baseUrl, apiKey,
-        sessionId: dependentSession.leaSessionId,
-        path: file.stepPath,
-        author: "cascade",
-        // The post-edit name: for a rename, the NEW identifier is what the
-        // dependent's import now fails (or succeeds) against.
-        summary: `Re-checked after edit to ${classification.kind === "renamed" ? classification.to : effectiveName}`
-      });
-
-      // Same override as the edited item itself: the cascade verdict is just
-      // as authoritative as an own check, so the dependent's chip must
-      // reflect it too, not only the impact-list note.
-      jobsChanged = recordEditCheckVerdict(dependentSession.linkedJob, cascadeBuild.body) || jobsChanged;
-      dependentsImpact.push({
-        ...summary,
-        status: broken ? "invalid" : "reverified",
-        attributed: true,
-        busy: false,
-        checkDetail: cascadeBuild.body?.detail || null,
-        brokenByUpstream: broken
-          ? { targetLabel, renamed: classification.kind === "renamed" }
-          : null
-      });
-    }
-
-    // Compilation is transitive: if a dependent's own SOURCE no longer
-    // compiles, everything that imports it cannot compile from source either
-    // -- but the warm cascade checks above may still have spuriously passed
-    // for those second-hop dependents, because LSP checks resolve imports
-    // against compiled .oleans and only the EDITED module was rebuilt: the
-    // broken dependent's stale .olean still exports its old, working self.
-    // (Recipe 4's chain hit exactly this: compactness_corollary broke, but
-    // heine_borel_application -- whose import chain reaches the edit only
-    // THROUGH the corollary -- read "re-checked, still valid".) Propagate
-    // breakage down the recorded import graph to a fixpoint instead of
-    // trusting those checks: a "still valid" verdict is only kept when no
-    // module on the dependent's import path is known-broken.
-    const brokenModules = new Set(
-      dependentsImpact
-        .filter((entry) => entry.status === "invalid")
-        .map((entry) => entry.moduleName)
-        .filter(Boolean)
-    );
-    let propagated = brokenModules.size > 0;
-    while (propagated) {
-      propagated = false;
-      for (const entry of dependentsImpact) {
-        if (entry.status !== "reverified") continue;
-        const imports = importsByModule.get(entry.moduleName);
-        if (!imports) continue;
-        const brokenImport = [...imports].find((moduleName) => brokenModules.has(moduleName));
-        if (!brokenImport) continue;
-        entry.status = "invalid";
-        entry.brokenByUpstream = {
-          targetLabel,
-          renamed: classification.kind === "renamed",
-          viaModule: brokenImport
-        };
-        entry.checkDetail = `Import ${brokenImport} no longer compiles after the edit to ${effectiveName}; `
-          + "this item cannot compile from source (its passing re-check was against a stale build of that import).";
-        const dependentSession = sessionByModule.get(entry.moduleName);
-        if (dependentSession?.linkedJob) {
-          jobsChanged = recordEditCheckVerdict(dependentSession.linkedJob, { status: "error", detail: entry.checkDetail }) || jobsChanged;
-        }
-        brokenModules.add(entry.moduleName);
-        propagated = true;
-      }
-    }
+    const cascade = await runCascadeVerification({
+      state,
+      deps: buildCascadeDeps({ fetchImpl, baseUrl, apiKey }),
+      upstream
+    });
+    dependentsImpact = cascade.dependentsImpact;
+    jobsChanged = cascade.jobsChanged || jobsChanged;
   }
 
   if (jobsChanged) {
@@ -1434,16 +1375,707 @@ export async function handleLeanPaneEditSave(payload, state) {
   return { statusCode: 200, body: { ok: true, unchanged: false, ownResult, dependentsImpact } };
 }
 
+// The injected-collaborator bundle runCascadeVerification needs (adapter call
+// context + the session/job helpers that live in this file). Injection rather
+// than imports keeps cascadeVerify.mjs cycle-free and unit-testable with a
+// fake fetchImpl.
+function buildCascadeDeps({ fetchImpl, baseUrl, apiKey }) {
+  return {
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    dependentsOf,
+    rebuildApiSessionModule,
+    runApiSessionLeanCheck,
+    resolveDependentSession,
+    recordEditCheckVerdict,
+    summarizeDependentFile,
+    parseLeanImports
+  };
+}
+
+// --- Self-repair Phase 1: post-run cascade for agent-driven changes --------
+// docs/FEATURE-overleaf-self-repair.md Part 1 / docs/PLAN-overleaf-self-repair.md.
+// A chat-mirror run or a re-formalize can change a recorded declaration just
+// as surely as a manual edit can -- and until this, those paths ran no
+// cascade at all: renaming a theorem via chat left every dependent reading
+// "valid" until it was next touched for an unrelated reason.
+
+// Capture the recorded declaration's state BEFORE a run that may rewrite it.
+// Only the parsed header (small) is meant to be persisted on a job record --
+// it is all classifyEdit needs; full before-content is deliberately not kept
+// (a companion restart mid-run then loses only the optional diff, not the
+// classification). Returns null when there is nothing recorded to snapshot
+// (first formalization, chat on a never-formalized item): with no "before"
+// there is nothing dependents could have elaborated against.
+async function snapshotPreRunLeanState({ state, leaSessionId, overleafProjectId, targetKind, targetLabel }) {
+  if (!leaSessionId) return null;
+  const { linkedJob } = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
+  const effectiveName = linkedJob?.declarationName || targetLabel;
+  let file;
+  try {
+    file = await loadEditableSessionFile({ state, leaSessionId, overleafProjectId, declarationName: effectiveName, linkedJob });
+  } catch {
+    return null;
+  }
+  if (!file.ok) return null;
+  return {
+    effectiveName,
+    beforeHeader: parseDeclarationHeader(file.content, effectiveName),
+    path: file.path,
+    namespace: file.namespace,
+    moduleName: file.moduleName,
+    wasPreviouslyFailing: linkedJob?.lastEditCheckStatus === "error"
+  };
+}
+
+// After a run reaches terminal state: read the file's final recorded state,
+// classify the change against the pre-run snapshot, and when the
+// classification (or a recovery) demands it, run the same cascade a manual
+// edit runs. `ownJob` is the job record that will be found as the target's
+// linked job afterwards -- the new job for a re-formalize, the existing
+// linked job (if any) for a chat run -- so verdict/attribution/rename
+// bookkeeping lands where every status reader already looks.
+//
+// Returns { classification, dependentsImpact, finishedAt } or null when there
+// was nothing to classify (no snapshot, no session, no recorded step).
+async function runPostRunCascade({ state, overleafProjectId, targetLabel, snapshot, via, leaSessionId, ownJob = null }) {
+  if (!snapshot || !leaSessionId) return null;
+  let baseUrl;
+  try {
+    baseUrl = chatBaseUrls(state).baseUrl;
+  } catch {
+    return null;
+  }
+  const apiKey = state.env?.LEA_API_KEY;
+  const fetchImpl = state.fetchImpl || fetch;
+
+  // The run's final recorded state of the SAME file we snapshotted: the
+  // newest code_step at that path. Picking by path (not by declaration name,
+  // like the edit path's step lookup) is deliberate -- an agent-side rename
+  // leaves old steps still carrying the old name, and a name-keyed lookup
+  // would resurrect exactly that stale pre-rename snapshot.
+  const detail = await fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId });
+  if (!detail.ok || !detail.body || typeof detail.body !== "object") return null;
+  const stepsAtPath = (Array.isArray(detail.body.code_steps) ? detail.body.code_steps : [])
+    .filter((step) => step && step.path === snapshot.path && String(step.code || "").trim())
+    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0));
+  const finalStep = stepsAtPath[stepsAtPath.length - 1];
+  if (!finalStep) return null;
+
+  const afterContent = String(finalStep.code || "");
+  const afterHeader = parseDeclarationHeader(afterContent, snapshot.effectiveName);
+  // The run's own verdict, back-filled onto the step by the adapter (D6). A
+  // missing verdict (check never ran / hasn't returned) is NOT a failure --
+  // classify by headers alone and record nothing rather than guessing.
+  const checkStatus = finalStep.check_status ?? null;
+  const ownCheckFailed = String(checkStatus || "").toLowerCase() === "error";
+  const classification = classifyEdit({
+    before: snapshot.beforeHeader,
+    after: afterHeader,
+    expectedName: snapshot.effectiveName,
+    ownCheckFailed
+  });
+
+  const upstream = {
+    overleafProjectId,
+    targetLabel,
+    effectiveName: snapshot.effectiveName,
+    classification,
+    via,
+    editedAt: new Date().toISOString(),
+    sessionId: leaSessionId,
+    path: snapshot.path,
+    namespace: snapshot.namespace,
+    moduleName: snapshot.moduleName,
+    beforeHeader: snapshot.beforeHeader,
+    afterHeader
+  };
+
+  let jobsChanged = false;
+  if (checkStatus != null) {
+    jobsChanged = recordEditCheckVerdict(
+      ownJob,
+      { status: checkStatus, detail: finalStep.check_detail ?? null },
+      ownCheckFailed ? breakageDescriptor(upstream) : null
+    );
+  }
+  // Same rename bookkeeping as the manual path: an agent can rename too, and
+  // every declarationName reader has the same stale-cache bug otherwise.
+  if (classification.kind === "renamed" && ownJob && ownJob.declarationName !== classification.to) {
+    ownJob.declarationName = classification.to;
+    jobsChanged = true;
+  }
+
+  const recoveredFromFailure = snapshot.wasPreviouslyFailing && !ownCheckFailed;
+  let dependentsImpact = [];
+  if (cascadeRequired(classification) || recoveredFromFailure) {
+    const cascade = await runCascadeVerification({
+      state,
+      deps: buildCascadeDeps({ fetchImpl, baseUrl, apiKey }),
+      upstream
+    });
+    dependentsImpact = cascade.dependentsImpact;
+    jobsChanged = cascade.jobsChanged || jobsChanged;
+  }
+  if (jobsChanged) {
+    await writeJson(state.jobsPath, state.jobs);
+  }
+  return { classification, afterHeader, checkStatus, dependentsImpact, finishedAt: new Date().toISOString() };
+}
+
+// --- Self-repair Phase 3: the repair run ------------------------------------
+// docs/FEATURE-overleaf-self-repair.md Parts 3-4. A repair run is an ordinary
+// autonomous run on the broken item's own session; only the prompt
+// (buildRepairPrompt) and the bookkeeping differ. Repair jobs share the
+// target's jobKey so every existing busy check composes -- and use terminal
+// status values ("repaired"/"repair_failed") that findLatestJob's exact-match
+// filters can't confuse with a failed/successful FORMALIZATION (the plan's
+// top-rated risk: a failed repair must not masquerade as a failed formalize).
+
+async function createRepairJob({ state, target, linkedJob, breakage, leaSessionId }) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const jobId = `repair-${target.targetKind}-${target.targetLabel}-${timestamp}`;
+  const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await fs.writeFile(logPath, "", "utf8");
+  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL)) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+
+  return {
+    jobId,
+    jobKey: target.jobKey,
+    status: "in_progress",
+    mode: "repair",
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
+    overleafProjectId: target.overleafProjectId,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath,
+    // Identity/display fields copied from the previous linked job, and the
+    // broken-state fields mirrored, so this job -- which becomes the target's
+    // newest linked job the moment it carries a session id -- reads exactly
+    // like the job it supersedes to every jobKey-keyed consumer (artifact
+    // lookup, staleness, the lastEditCheckStatus chip override).
+    declarationName: linkedJob?.declarationName || target.targetLabel,
+    declarationNameHint: linkedJob?.declarationNameHint || null,
+    targetTextHash: linkedJob?.targetTextHash || null,
+    recordedProofPath: linkedJob?.recordedProofPath || null,
+    moduleName: linkedJob?.moduleName || null,
+    leanStatement: linkedJob?.leanStatement || null,
+    projectNamespace: linkedJob?.projectNamespace || null,
+    lastEditCheckStatus: linkedJob?.lastEditCheckStatus || null,
+    lastEditCheckDetail: linkedJob?.lastEditCheckDetail || null,
+    lastEditBreakage: breakage,
+    repairOf: breakage,
+    relativePath: target.relativePath,
+    absolutePath: target.absolutePath,
+    logPath,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    leaRepoPath: state.settings.leaRepoPath,
+    leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
+    leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaSessionId,
+    leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
+    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
+    leaProvider: modelInfo.family,
+    leaProviderFamily: modelInfo.family,
+    leaModel: modelInfo.value,
+    leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
+    leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
+    leaCurrentTurn: null,
+    leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS
+  };
+}
+
+// Re-validate a repair offer against the persisted truth at dispatch time and
+// resolve everything a repair run needs. The offer shown in the pane may be
+// stale (item fixed manually meanwhile, run started, upstream still broken) --
+// the persisted job state, not the client's belief, decides.
+function resolveRepairContext({ state, overleafProjectId, targetKind, targetLabel }) {
+  let resolvedKind = targetKind;
+  let { leaSessionId, activeJob, linkedJob } = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
+  if (!leaSessionId || !linkedJob) {
+    // Batch callers (dependentsImpact entries) know a dependent's label but
+    // not its kind -- fall back to the kind-agnostic resolution the cascade
+    // itself uses for attribution.
+    const fallback = resolveDependentSession({ state, overleafProjectId, targetLabel });
+    if (fallback.leaSessionId && fallback.linkedJob) {
+      ({ leaSessionId, activeJob, linkedJob } = fallback);
+      resolvedKind = fallback.targetKind || targetKind;
+    }
+  }
+  if (!leaSessionId || !linkedJob) {
+    return { ok: false, error: "no_session", statusCode: 404, message: "No Lea session is recorded for this item; there is nothing to repair against." };
+  }
+  if (activeJob) {
+    return { ok: false, error: "run_in_progress", statusCode: 409, message: "A Lea run for this item is already in progress." };
+  }
+  if (linkedJob.lastEditCheckStatus !== "error" || !linkedJob.lastEditBreakage) {
+    // Includes the fixed-meanwhile case: dispatching a repair for an item
+    // that now compiles is a no-op response, never a wasted run.
+    return { ok: true, alreadyFixed: true };
+  }
+  const breakage = linkedJob.lastEditBreakage;
+  // Repairing a dependent is pointless while its upstream's own file fails to
+  // compile -- same suppression the pane derives (deriveItemBreakage).
+  const selfBroken = breakage.upstreamLabel === targetLabel || breakage.upstreamDeclarationName === linkedJob.declarationName;
+  if (!selfBroken && breakage.upstreamLabel) {
+    const upstream = resolveDependentSession({ state, overleafProjectId, targetLabel: breakage.upstreamLabel });
+    if (upstream.linkedJob?.lastEditCheckStatus === "error") {
+      return {
+        ok: false,
+        error: "repair_suppressed",
+        statusCode: 409,
+        message: `Repair the upstream item (${breakage.upstreamLabel}) first: its file currently fails to compile, so this item cannot build regardless.`
+      };
+    }
+  }
+  return { ok: true, alreadyFixed: false, leaSessionId, linkedJob, breakage, targetKind: resolvedKind };
+}
+
+async function runLeaRepairJob({ state, job, target, snapshot, breakage, prompt }) {
+  const exit = await runLeaProofJobForJob({ state, job, target, prompt });
+  if (job.finalStatus === "max_spend") return;
+
+  const fetchImpl = state.fetchImpl || fetch;
+  const baseUrl = job.leaApiBaseUrl;
+  const apiKey = state.env?.LEA_API_KEY;
+
+  // Classify what the run actually changed + cascade over THIS item's own
+  // dependents (a repair normally changes only a proof body -> no-op, but an
+  // agent that touched the header is caught here, not trusted). Runs before
+  // the authoritative rebuild verdict below so the rebuild's verdict is the
+  // last word on the job.
+  let impact = null;
+  try {
+    impact = await runPostRunCascade({
+      state,
+      overleafProjectId: target.overleafProjectId,
+      targetLabel: target.targetLabel,
+      snapshot,
+      via: "repair",
+      leaSessionId: job.leaSessionId || null,
+      ownJob: job
+    });
+  } catch (error) {
+    await appendLog(job.logPath, `\n[backend] Post-repair cascade failed: ${error instanceof Error ? error.message : error}\n`);
+  }
+
+  // Verify the outcome for real -- run completion is not success. Same
+  // authoritative `lake build` verdict source the cascade uses.
+  const rebuild = job.leaSessionId
+    ? await rebuildApiSessionModule({ fetchImpl, baseUrl, apiKey, sessionId: job.leaSessionId, path: snapshot.path })
+    : { ok: false, error: "Lea adapter did not return a session id." };
+  const repaired = rebuild.ok && String(rebuild.body?.status || "").toLowerCase() === "ok";
+
+  // Statement guard (feature spec acceptance criterion 6): the repair must not
+  // have changed the item's own declaration header -- except for the known
+  // upstream rename substituted through it, the one sanctioned mechanical
+  // statement-adjacent change. A changed header on a compiling repair is not
+  // silently accepted OR hard-failed: it is flagged for human review.
+  const beforeHeaderText = snapshot.beforeHeader?.header || "";
+  const afterHeaderText = impact?.afterHeader?.header || "";
+  const renameAdjustedHeader = breakage.renamedFrom && breakage.renamedTo
+    ? beforeHeaderText.split(breakage.renamedFrom).join(breakage.renamedTo)
+    : beforeHeaderText;
+  const headerChanged = Boolean(beforeHeaderText) && Boolean(afterHeaderText)
+    ? afterHeaderText !== beforeHeaderText && afterHeaderText !== renameAdjustedHeader
+    : Boolean(impact && cascadeRequired(impact.classification) && impact.classification.kind !== "own-check-failed");
+
+  if (repaired) {
+    job.status = "repaired";
+    job.finalStatus = "repaired";
+    job.exitCode = 0;
+    // Authoritative pass: clears lastEditBreakage via the verdict choke point.
+    recordEditCheckVerdict(job, rebuild.body);
+    job.lastRepair = headerChanged
+      ? {
+          state: "needs_review",
+          failureReason: "The repair compiles, but the item's declaration header changed -- review that the statement is still what the source claims.",
+          finishedAt: new Date().toISOString()
+        }
+      : { state: "repaired", finishedAt: new Date().toISOString() };
+    await appendLog(job.logPath, `\n[backend] Repair verified by rebuild${headerChanged ? " (header changed -- needs review)" : ""}.\n`);
+  } else {
+    job.status = "repair_failed";
+    job.finalStatus = "repair_failed";
+    job.exitCode = 1;
+
+    // The upstream may have changed AGAIN while this repair ran (its own
+    // cascade skipped this item as busy -- us). Two consequences handled
+    // here rather than reported misleadingly (the second-rename-while-
+    // repairing case, PLAN-self-repair-stale-offers round 2):
+    //
+    // 1. Attribution: re-recording the DISPATCHED descriptor would persist a
+    //    stale rename mapping ("still refers to the old name" about a name
+    //    the repair just adopted) and mis-prompt the next repair. Refresh it
+    //    against the upstream's CURRENT declaration name (kept fresh by the
+    //    rename bookkeeping on every path).
+    const upstreamNow = resolveDependentSession({
+      state,
+      overleafProjectId: target.overleafProjectId,
+      targetLabel: breakage.upstreamLabel
+    });
+    const currentUpstreamName = upstreamNow.linkedJob?.declarationName || null;
+    const upstreamRenamedAgain = Boolean(currentUpstreamName)
+      && Boolean(breakage.upstreamDeclarationName)
+      && currentUpstreamName !== breakage.upstreamDeclarationName;
+    const effectiveBreakage = upstreamRenamedAgain
+      ? {
+          ...breakage,
+          classificationKind: "renamed",
+          upstreamDeclarationName: currentUpstreamName,
+          // What this item's file references now (the name the repair was
+          // dispatched toward) -> the upstream's current name.
+          renamedFrom: breakage.upstreamDeclarationName,
+          renamedTo: currentUpstreamName,
+          editedAt: new Date().toISOString(),
+          beforeHeader: null,
+          afterHeader: null
+        }
+      : breakage;
+
+    // 2. The reason: when the run's own final check PASSED but the verifying
+    //    rebuild failed, the agent's last message is a success report -- not
+    //    an explanation of this failure. Say what actually happened instead
+    //    of quoting it.
+    const ranCleanButFailedVerify = String(impact?.checkStatus || "").toLowerCase() === "ok";
+    const rebuildDetail = rebuild.body?.detail || rebuild.error || "";
+    const failureReason = ranCleanButFailedVerify
+      ? `The repaired file compiled when the agent finished, but verification against the current project failed -- the upstream item changed again while the repair ran${upstreamRenamedAgain ? ` (it is now \`${currentUpstreamName}\`)` : ""}.${rebuildDetail ? ` ${rebuildDetail}` : ""}`
+      : await readRepairFailureReason({ state, job, exit, rebuild });
+
+    recordEditCheckVerdict(
+      job,
+      { status: "error", detail: rebuild.body?.detail || rebuild.error || job.lastEditCheckDetail },
+      effectiveBreakage
+    );
+    job.lastRepair = { state: "failed", failureReason, finishedAt: new Date().toISOString() };
+    await appendLog(job.logPath, `\n[backend] Repair did not verify: ${failureReason}\n`);
+  }
+  job.timedOut = exit.timedOut;
+  job.apiRunId = exit.apiRunId || job.apiRunId || null;
+  job.finishedAt = new Date().toISOString();
+  await writeJson(state.jobsPath, state.jobs);
+}
+
+// The user-facing explanation of a failed repair: the agent's own final
+// message when available (the stop-condition report -- "unprovable as stated
+// because ..."), falling back to the run/rebuild error.
+async function readRepairFailureReason({ state, job, exit, rebuild }) {
+  const fallback = exit?.error || rebuild?.body?.detail || rebuild?.error || "The repaired file still fails to compile.";
+  if (!job.leaSessionId) return fallback;
+  try {
+    const detail = await fetchApiSessionDetail({
+      fetchImpl: state.fetchImpl || fetch,
+      baseUrl: job.leaApiBaseUrl,
+      apiKey: state.env?.LEA_API_KEY,
+      sessionId: job.leaSessionId
+    });
+    const messages = Array.isArray(detail.body?.messages) ? detail.body.messages : [];
+    const lastAssistant = messages
+      .filter((m) => String(m.role || "").toLowerCase() === "assistant" && String(m.content || "").trim())
+      .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0))
+      .pop();
+    const content = String(lastAssistant?.content || "").trim();
+    return content ? content.slice(0, 2000) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// The single dispatch core the per-item endpoint AND the batch loop share.
+// Assumes the caller already ran the preflight trio. Returns one of:
+//   { status: "started", job, target, runPromise }
+//   { status: "already_fixed" }
+//   { status: "error", error, statusCode, message }
+async function startRepairRun({ state, overleafProjectId, targetKind: requestedKind, targetLabel }) {
+  const context = resolveRepairContext({ state, overleafProjectId, targetKind: requestedKind, targetLabel });
+  if (!context.ok) return { status: "error", error: context.error, statusCode: context.statusCode, message: context.message };
+  if (context.alreadyFixed) return { status: "already_fixed" };
+  const { leaSessionId, linkedJob, breakage } = context;
+  const targetKind = context.targetKind || requestedKind;
+
+  // Pre-repair snapshot: the statement guard's "before", and the module
+  // identity the post-repair cascade verifies against.
+  let snapshot = null;
+  try {
+    snapshot = await snapshotPreRunLeanState({ state, leaSessionId, overleafProjectId, targetKind, targetLabel });
+  } catch {
+    snapshot = null;
+  }
+  if (!snapshot) {
+    return { status: "error", error: "repair_start_failed", statusCode: 502, message: "Could not read the item's recorded Lean file to repair against." };
+  }
+
+  const target = buildLeaTarget({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId, targetKind, targetLabel });
+  const prompt = buildRepairPrompt(
+    {
+      projectSlug: target.projectSlug,
+      targetKind,
+      targetLabel,
+      leanDeclarationName: linkedJob.declarationName || targetLabel,
+      recordedProofPath: linkedJob.recordedProofPath || undefined,
+      status: "invalid"
+    },
+    { breakage, diagnostic: linkedJob.lastEditCheckDetail || "" }
+  );
+
+  const job = await createRepairJob({ state, target, linkedJob, breakage, leaSessionId });
+  state.jobs[job.jobId] = job;
+  await writeJson(state.jobsPath, state.jobs);
+
+  const runPromise = runLeaRepairJob({ state, job, target, snapshot, breakage, prompt }).catch(async (error) => {
+    job.status = "repair_failed";
+    job.finalStatus = "repair_failed";
+    job.error = error instanceof Error ? error.message : String(error);
+    job.lastRepair = { state: "failed", failureReason: job.error, finishedAt: new Date().toISOString() };
+    job.finishedAt = new Date().toISOString();
+    await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
+    await writeJson(state.jobsPath, state.jobs);
+  });
+
+  return { status: "started", job, target, runPromise };
+}
+
+// Dispatch one repair run for a broken item. Returns the same job-tracking
+// response shape /formalize returns, so the pane's existing polling drives
+// progress unmodified.
+export async function handleLeanPaneRepairStart(payload, state) {
+  const validation = validateEditPayload(payload);
+  if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+  const { overleafProjectId, targetKind, targetLabel } = validation;
+
+  // Same preflight trio as every run-starting handler.
+  await syncSharedSettingsFromAdapter(state);
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
+  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+
+  const started = await startRepairRun({ state, overleafProjectId, targetKind, targetLabel });
+  if (started.status === "error") return errorResponse(started.statusCode, started.error, started.message);
+  if (started.status === "already_fixed") {
+    return { statusCode: 200, body: { ok: true, alreadyFixed: true } };
+  }
+  return {
+    statusCode: 200,
+    body: buildJobResponse({ job: started.job, status: "in_progress", target: started.target })
+  };
+}
+
+// --- Self-repair Phase 4: batch repair --------------------------------------
+// Sequential, topologically ordered dispatch over a repair set. The batch
+// record is orchestration only (in-memory): per-item truth -- verdicts,
+// breakage, repair outcomes -- lives on jobs/jobs.json, so a companion
+// restart mid-batch loses the loop but nothing an offer can't re-derive.
+
+let repairBatchCounter = 0;
+
+function repairBatchSnapshot(batch) {
+  return {
+    ok: true,
+    batchId: batch.batchId,
+    done: batch.done,
+    running: batch.running,
+    pausedOn: batch.pausedOn,
+    items: batch.items.map(({ targetKind, targetLabel, state: itemState, reason, runJobId }) => ({
+      targetKind, targetLabel, state: itemState, reason: reason || null, runJobId: runJobId || null
+    }))
+  };
+}
+
+export async function handleLeanPaneRepairAll(payload, state) {
+  const overleafProjectId = String(payload?.overleafProjectId || "");
+  if (!overleafProjectId.trim()) {
+    return errorResponse(400, "missing_project_id", "overleafProjectId is required.");
+  }
+  const rawItems = Array.isArray(payload?.items) ? payload.items : [];
+  if (rawItems.length === 0) {
+    return errorResponse(400, "missing_items", "items is required and must be non-empty.");
+  }
+  const items = [];
+  for (const raw of rawItems) {
+    const validation = validateEditPayload({ ...raw, overleafProjectId });
+    if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+    items.push({ targetKind: validation.targetKind, targetLabel: validation.targetLabel });
+  }
+
+  await syncSharedSettingsFromAdapter(state);
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
+  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+
+  // Project import graph, for topological ordering and depends-on-failed
+  // skipping. Full-project (not batch-only): a dependency path between two
+  // batch items may pass through a module that isn't being repaired.
+  const namespace = projectNamespaceFromSlug(slugProjectId(overleafProjectId));
+  let files = [];
+  try {
+    files = await listProjectProofFiles({ leaRepoPath: state.settings.leaRepoPath, namespace });
+  } catch {
+    files = [];
+  }
+  const importsByModule = new Map(files.map((file) => [file.moduleName, parseLeanImports(file.content)]));
+  const moduleByLabel = new Map(files.map((file) => [summarizeDependentFile(file).targetLabel, file.moduleName]));
+
+  const entries = items.map((item) => {
+    const { linkedJob } = resolveEditSession({ state, overleafProjectId, targetKind: item.targetKind, targetLabel: item.targetLabel });
+    const moduleName = linkedJob?.moduleName
+      || moduleByLabel.get(linkedJob?.declarationName || item.targetLabel)
+      || null;
+    return { ...item, moduleName, state: "pending", reason: null, runJobId: null };
+  });
+  const { ordered, cyclic } = topologicalRepairOrder(entries, importsByModule);
+
+  repairBatchCounter += 1;
+  const batch = {
+    batchId: `repair-batch-${Date.now()}-${repairBatchCounter}`,
+    overleafProjectId,
+    createdAt: new Date().toISOString(),
+    items: ordered,
+    importsByModule,
+    cyclic,
+    pausedOn: null,
+    running: false,
+    done: false
+  };
+  state.repairBatches ||= {};
+  state.repairBatches[batch.batchId] = batch;
+
+  runRepairBatch(state, batch).catch((error) => {
+    batch.pausedOn = { targetLabel: null, reason: "batch_error", detail: error instanceof Error ? error.message : String(error) };
+    batch.running = false;
+  });
+
+  return { statusCode: 200, body: repairBatchSnapshot(batch) };
+}
+
+export async function handleLeanPaneRepairAllContinue(payload, state) {
+  const batch = state.repairBatches?.[String(payload?.batchId || "")];
+  if (!batch) return errorResponse(404, "unknown_batch", "No such repair batch (batches do not survive a companion restart).");
+  if (batch.running) return { statusCode: 200, body: repairBatchSnapshot(batch) };
+  if (batch.done) return { statusCode: 200, body: repairBatchSnapshot(batch) };
+  batch.pausedOn = null;
+  runRepairBatch(state, batch).catch((error) => {
+    batch.pausedOn = { targetLabel: null, reason: "batch_error", detail: error instanceof Error ? error.message : String(error) };
+    batch.running = false;
+  });
+  return { statusCode: 200, body: repairBatchSnapshot(batch) };
+}
+
+export async function handleLeanPaneRepairStatus(payload, state) {
+  const batch = state.repairBatches?.[String(payload?.batchId || "")];
+  if (!batch) return errorResponse(404, "unknown_batch", "No such repair batch (batches do not survive a companion restart).");
+  return { statusCode: 200, body: repairBatchSnapshot(batch) };
+}
+
+// True when `fromModule` (transitively) imports `toModule` over the recorded
+// project graph.
+function importsReach(fromModule, toModule, importsByModule) {
+  if (!fromModule || !toModule) return false;
+  const queue = [...(importsByModule.get(fromModule) || [])];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === toModule) return true;
+    if (seen.has(current)) continue;
+    seen.add(current);
+    for (const imported of importsByModule.get(current) || []) queue.push(imported);
+  }
+  return false;
+}
+
+async function runRepairBatch(state, batch) {
+  if (batch.running) return;
+  batch.running = true;
+  try {
+    for (const entry of batch.items) {
+      if (batch.pausedOn) break;
+      if (entry.state !== "pending") continue;
+      // A cap reached mid-batch pauses (resumable once raised) rather than
+      // failing the item.
+      if (spendLimitReached(state)) {
+        batch.pausedOn = { targetLabel: entry.targetLabel, reason: "max_spend" };
+        break;
+      }
+
+      const started = await startRepairRun({
+        state,
+        overleafProjectId: batch.overleafProjectId,
+        targetKind: entry.targetKind,
+        targetLabel: entry.targetLabel
+      });
+      if (started.status === "already_fixed") {
+        entry.state = "skipped";
+        entry.reason = "already_fixed";
+        continue;
+      }
+      if (started.status === "error") {
+        entry.state = "skipped";
+        entry.reason = started.error || "start_failed";
+        continue;
+      }
+
+      entry.state = "running";
+      entry.runJobId = started.job.jobId;
+      await started.runPromise;
+
+      const finalJob = state.jobs[started.job.jobId] || started.job;
+      if (finalJob.finalStatus === "repaired") {
+        entry.state = finalJob.lastRepair?.state === "needs_review" ? "needs_review" : "repaired";
+        continue;
+      }
+
+      // Failed repair: items transitively importing this one cannot succeed --
+      // skip them with an explicit reason, then pause for the user's
+      // continue/stop decision on the remaining independent items.
+      entry.state = "failed";
+      entry.reason = finalJob.lastRepair?.failureReason || finalJob.error || "repair_failed";
+      for (const other of batch.items) {
+        if (other.state !== "pending") continue;
+        if (importsReach(other.moduleName, entry.moduleName, batch.importsByModule)) {
+          other.state = "skipped";
+          other.reason = `depends_on_failed:${entry.targetLabel}`;
+        }
+      }
+      if (batch.items.some((other) => other.state === "pending")) {
+        batch.pausedOn = { targetLabel: entry.targetLabel, reason: "repair_failed" };
+      }
+      break;
+    }
+  } finally {
+    batch.running = false;
+    batch.done = batch.items.every((entry) => entry.state !== "pending" && entry.state !== "running") && !batch.pausedOn;
+  }
+}
+
+
 // Persist the real lean_check verdict from an edit or a cascade re-check onto
 // its target's linked job -- see getTheoremStatus's status-override doc
 // comment. `status`/`detail` are the adapter's raw lean-check response shape
 // (`{status, detail}`, D6). Returns whether a mutation actually happened, so
 // callers can persist state.jobs only once, after all mutations.
-function recordEditCheckVerdict(job, { status, detail } = {}) {
+//
+// `breakage` (self-repair Phase 2) is the persisted upstream-change
+// attribution -- cascadeVerify.mjs's breakageDescriptor shape. This is the
+// single choke point for the repair offer's lifecycle: a failing verdict WITH
+// attribution records it (job.lastEditBreakage -> the pane's "Repair with
+// Lea" offer), and ANY passing verdict clears it -- however the item got
+// fixed (repair run, manual edit, chat), a compile pass is the one
+// authoritative "no longer broken" signal.
+function recordEditCheckVerdict(job, { status, detail } = {}, breakage = null) {
   if (!job) return false;
-  job.lastEditCheckStatus = String(status || "").toLowerCase() === "ok" ? "ok" : "error";
+  const ok = String(status || "").toLowerCase() === "ok";
+  job.lastEditCheckStatus = ok ? "ok" : "error";
   job.lastEditCheckDetail = detail || null;
   job.lastEditedAt = new Date().toISOString();
+  if (ok) {
+    delete job.lastEditBreakage;
+  } else if (breakage) {
+    job.lastEditBreakage = breakage;
+  }
   return true;
 }
 
@@ -1452,10 +2084,11 @@ function recordEditCheckVerdict(job, { status, detail } = {}) {
 // SSE stream to completion in the background while the extension polls; this
 // keeps the POST /lean-pane/chat/message response fast and guarantees a single
 // driver for the run.
-function startChatRun({ state, target, leaSessionId, prompt }) {
+function startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot = null }) {
   const { baseUrl, uiBaseUrl } = chatBaseUrls(state);
   let settle;
   let settled = false;
+  let resolvedRunSessionId = leaSessionId || null;
   const started = new Promise((resolve) => { settle = resolve; });
   const finish = (value) => {
     if (settled) return;
@@ -1479,6 +2112,7 @@ function startChatRun({ state, target, leaSessionId, prompt }) {
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
     onRunStarted: async (runId, sessionId) => {
       const resolvedSessionId = sessionId || leaSessionId || null;
+      resolvedRunSessionId = resolvedSessionId;
       finish({
         ok: true,
         runId,
@@ -1490,12 +2124,61 @@ function startChatRun({ state, target, leaSessionId, prompt }) {
 
   // If start failed (no run id, so onRunStarted never fired) settle from the run
   // outcome; otherwise this is a no-op because onRunStarted already settled.
+  // Either way, once the run reaches terminal state, classify what it changed
+  // and cascade over dependents (self-repair Phase 1). This continuation runs
+  // AFTER the HTTP response settled and is awaited by no caller, so it must
+  // never throw -- an unhandled rejection here is a process-level event.
   run.then(
-    (exit) => finish({ ok: false, error: exit?.error || "Lea adapter did not start the chat run." }),
+    async (exit) => {
+      finish({ ok: false, error: exit?.error || "Lea adapter did not start the chat run." });
+      try {
+        await finishChatRunCascade({ state, target, preRunSnapshot, leaSessionId: resolvedRunSessionId });
+      } catch (error) {
+        console.warn(`[companion] post-chat-run cascade failed for ${target.targetKey}: ${error instanceof Error ? error.message : error}`);
+      }
+    },
     (error) => finish({ ok: false, error: error instanceof Error ? error.message : String(error) })
   );
 
   return started;
+}
+
+// The chat half of the Phase 1 detection gap: after a chat run settles,
+// classify + cascade, then record the outcome on the chat-session record so
+// the mirror can render "this change broke N downstream items" (and the
+// repair affordance) on its next poll. Cleared implicitly by the next message
+// send, which rewrites the record.
+async function finishChatRunCascade({ state, target, preRunSnapshot, leaSessionId }) {
+  if (!preRunSnapshot || !leaSessionId) return;
+  const { linkedJob } = resolveEditSession({
+    state,
+    overleafProjectId: target.overleafProjectId,
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel
+  });
+  const impact = await runPostRunCascade({
+    state,
+    overleafProjectId: target.overleafProjectId,
+    targetLabel: target.targetLabel,
+    snapshot: preRunSnapshot,
+    via: "chat",
+    leaSessionId,
+    ownJob: linkedJob || null
+  });
+  if (!impact) return;
+  // The record normally exists (handleChatMessage writes it once the run
+  // starts), but a fast run can finish first -- create it rather than losing
+  // the impact; handleChatMessage's own write preserves lastRunImpact.
+  state.chatSessions ||= {};
+  const now = new Date().toISOString();
+  const record = state.chatSessions[target.targetKey] ||= {
+    leaSessionId,
+    createdAt: now,
+    updatedAt: now,
+    sourceHash: target.sourceHash || null
+  };
+  record.lastRunImpact = { ...impact, targetLabel: target.targetLabel };
+  await persistChatSessions(state);
 }
 
 export async function handleUpdateLeaSettings(payload, state) {
@@ -1880,6 +2563,30 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "POST" && url.pathname === "/lean-pane/edit/save") {
     const result = await handleLeanPaneEditSave(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/repair/start") {
+    const result = await handleLeanPaneRepairStart(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/repair/all") {
+    const result = await handleLeanPaneRepairAll(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/repair/all/continue") {
+    const result = await handleLeanPaneRepairAllContinue(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/lean-pane/repair/status") {
+    const result = await handleLeanPaneRepairStatus(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -3021,6 +3728,26 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
   if (job.finalStatus === "max_spend") return;
 
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
+
+  // Self-repair Phase 1: a re-formalize is an agent-driven change to an
+  // already-recorded declaration -- classify it against the pre-run snapshot
+  // and cascade over dependents, exactly like a manual edit. Fully isolated:
+  // a cascade failure must not fail the (already applied) run outcome.
+  if (job.preRunLean) {
+    try {
+      await runPostRunCascade({
+        state,
+        overleafProjectId: target.overleafProjectId,
+        targetLabel: target.targetLabel,
+        snapshot: job.preRunLean,
+        via: "formalize",
+        leaSessionId: job.leaSessionId || job.recorderSessionId || null,
+        ownJob: job
+      });
+    } catch (error) {
+      await appendLog(job.logPath, `\n[backend] Post-run cascade failed: ${error instanceof Error ? error.message : error}\n`);
+    }
+  }
 }
 
 async function runLeaStubJob({ state, job, target, targetText, targetContext = "", resolvedUses = [] }) {
@@ -3844,8 +4571,48 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
       : undefined,
     message: stale
       ? "The LaTeX source changed after this Lean artifact was generated."
-      : statusInfo?.message || undefined
+      : statusInfo?.message || undefined,
+    // Edit-induced breakage attribution (self-repair Phase 2): who/what broke
+    // this item and whether a repair can be offered right now. Undefined for
+    // items that are not currently edit-broken.
+    breakage: deriveItemBreakage({ state, overleafProjectId, statusInfo, targetLabel }),
+    // A repair that compiles but changed the item's own declaration header is
+    // flagged, not silently accepted (statement guard, self-repair Phase 3).
+    repairNeedsReview: latestJob?.lastRepair?.state === "needs_review" ? true : undefined
   };
+}
+
+// The pane-facing breakage metadata for an item. `repairSuppressed` is
+// COMPUTED at manifest-build time, never stored (it is derivable, and storing
+// it could drift): repairing a dependent is pointless while the upstream
+// item's own file fails to compile -- its import can't build regardless of
+// what the dependent does -- so the offer belongs on the upstream item alone
+// until the recovery cascade clears the way (feature spec, Edge Cases).
+function deriveItemBreakage({ state, overleafProjectId, statusInfo, targetLabel }) {
+  const breakage = statusInfo?.breakage;
+  if (!breakage) return undefined;
+  // The item is the broken UPSTREAM itself (vs. a broken dependent) when the
+  // attribution points at its own identity -- by pane label, or by current
+  // declaration name for the renamed-and-broken case where the two diverge.
+  const selfBroken = breakage.upstreamLabel === targetLabel
+    || breakage.upstreamDeclarationName === targetLabel
+    || breakage.upstreamDeclarationName === statusInfo?.declarationName;
+  let repairSuppressed;
+  if (!selfBroken && breakage.upstreamLabel) {
+    const upstream = resolveDependentSession({ state, overleafProjectId, targetLabel: breakage.upstreamLabel });
+    if (upstream.linkedJob?.lastEditCheckStatus === "error") repairSuppressed = "upstream_broken";
+  }
+  // Repair lifecycle for the offer chip (feature spec's BrokenByUpstream.repair):
+  // running while a mode:"repair" job is live, failed with the agent's
+  // explanation after an unsuccessful attempt, otherwise offered.
+  const { activeJob, linkedJob } = resolveDependentSession({ state, overleafProjectId, targetLabel });
+  let repair = { state: "offered" };
+  if (activeJob?.mode === "repair") {
+    repair = { state: "running", runId: activeJob.jobId };
+  } else if (linkedJob?.lastRepair?.state === "failed") {
+    repair = { state: "failed", runId: linkedJob.jobId, failureReason: linkedJob.lastRepair.failureReason || null };
+  }
+  return { ...breakage, selfBroken, repairSuppressed, repair };
 }
 
 // Collapse the prover's run statuses onto the pane's artifact-lifecycle vocabulary.
@@ -4152,7 +4919,12 @@ function buildEditBrokenTheoremStatus({ linkedJob, target }) {
     ...base,
     effectiveStatus: "unformalized",
     message: linkedJob.lastEditCheckDetail || "This item no longer compiles after a manual edit.",
-    brokenByEdit: true
+    brokenByEdit: true,
+    // Persisted upstream-change attribution (self-repair Phase 2) -- what lets
+    // the pane offer "Repair with Lea" with real context, surviving manifest
+    // refreshes and companion restarts. Older jobs broken before this field
+    // existed have a verdict but no attribution: they render as plain invalid.
+    breakage: linkedJob.lastEditBreakage || null
   };
 }
 

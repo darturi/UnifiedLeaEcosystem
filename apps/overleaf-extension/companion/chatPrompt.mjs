@@ -43,7 +43,18 @@ export function buildChatPrompt(target = {}, { stale = false, firstMessage = tru
     return stale ? `${CHAT_STALE_NOTE}\n\n${request}` : request;
   }
 
-  const lines = ["You are helping with this Overleaf item.", ""];
+  const lines = ["You are helping with this Overleaf item.", "", ...targetPreambleLines(target)];
+  if (stale) lines.push(CHAT_STALE_NOTE);
+  lines.push("User request:");
+  lines.push(request);
+  return lines.join("\n");
+}
+
+// The shared "which item is this" preamble both first-message chat prompts and
+// repair prompts open with: doc-side identity, source location, the item's
+// natural-language statement, and what is already recorded for it.
+function targetPreambleLines(target = {}) {
+  const lines = [];
   if (target.projectSlug) lines.push(`Project: ${target.projectSlug}`);
   lines.push(`Kind: ${target.targetKind || ""}`);
   lines.push(`Label: ${target.targetLabel || ""}`);
@@ -59,9 +70,81 @@ export function buildChatPrompt(target = {}, { stale = false, firstMessage = tru
   if (target.leanDeclarationName) lines.push(`Known Lean declaration: ${target.leanDeclarationName}`);
   if (target.recordedProofPath) lines.push(`Known Lean artifact: ${target.recordedProofPath}`);
   if (target.status) lines.push(`Known status: ${target.status}`);
-  if (stale) lines.push(CHAT_STALE_NOTE);
-  lines.push("User request:");
-  lines.push(request);
+  return lines;
+}
+
+// One-line human description of an upstream change, from the persisted
+// breakage descriptor (cascadeVerify.mjs breakageDescriptor shape).
+function describeUpstreamChange(breakage) {
+  const name = breakage.upstreamDeclarationName || breakage.upstreamLabel || "an upstream declaration";
+  switch (breakage.classificationKind) {
+    case "renamed":
+      return `The upstream declaration \`${breakage.renamedFrom}\` was RENAMED to \`${breakage.renamedTo}\`. `
+        + "It was renamed, not removed -- references to the old name must be updated to the new one.";
+    case "definition-body":
+      return `The upstream definition \`${name}\` changed (a def/abbrev -- its value can be unfolded downstream, `
+        + "so proofs that relied on the old definition may need rework).";
+    case "own-check-failed":
+      return `The upstream declaration \`${name}\` was changed and its file currently fails to compile.`;
+    default:
+      return `The statement (signature) of the upstream declaration \`${name}\` changed.`;
+  }
+}
+
+const VIA_DESCRIPTION = {
+  edit: "a manual edit",
+  chat: "a chat request",
+  formalize: "a re-formalization run",
+  repair: "an earlier repair run"
+};
+
+// Build the run message for a repair run (docs/FEATURE-overleaf-self-repair.md
+// Part 4). The design goal: the agent starts with "what changed" and "what
+// broke" already in hand -- the upstream classification, old/new headers, the
+// rename mapping when applicable, and the item's actual compiler diagnostic --
+// plus an explicit done-definition and stop condition, so it repairs instead
+// of re-deriving (or worse, re-stating).
+//
+// `breakage` is the persisted job.lastEditBreakage descriptor. The self-repair
+// variant (the user's change broke the item ITSELF -- brokenByEdit) is
+// detected by the attribution pointing at the item's own label.
+export function buildRepairPrompt(target = {}, { breakage = {}, diagnostic = "" } = {}) {
+  const selfRepair = Boolean(breakage.upstreamLabel) && breakage.upstreamLabel === target.targetLabel;
+  const via = VIA_DESCRIPTION[breakage.via] || "a change";
+
+  const lines = [
+    "You are repairing a broken Lean formalization for this Overleaf item.",
+    "",
+    ...targetPreambleLines(target),
+    "",
+    "What changed:"
+  ];
+  if (selfRepair) {
+    lines.push(`This item's own recorded Lean file was changed by ${via} and no longer compiles.`);
+  } else {
+    lines.push(describeUpstreamChange(breakage));
+    lines.push(`This item imports/uses that declaration, and the change came from ${via}.`);
+  }
+  if (breakage.beforeHeader && breakage.afterHeader && breakage.beforeHeader !== breakage.afterHeader) {
+    lines.push(`Previous declaration header: ${breakage.beforeHeader}`);
+    lines.push(`Current declaration header: ${breakage.afterHeader}`);
+  }
+  lines.push("");
+  lines.push("What is broken:");
+  lines.push(
+    String(diagnostic || "").trim()
+      ? `This item's recorded Lean file currently fails to compile:\n${String(diagnostic).trim()}`
+      : "This item's recorded Lean file currently fails to compile."
+  );
+  lines.push("");
+  lines.push("Your task:");
+  lines.push("Update this item's recorded Lean file so it compiles again (lean_check passes), under these rules:");
+  if (breakage.classificationKind === "renamed" && !selfRepair) {
+    lines.push(`- Update references and imports from \`${breakage.renamedFrom}\` to \`${breakage.renamedTo}\`. This mechanical rename update is the ONLY statement-adjacent change allowed.`);
+  }
+  lines.push("- Do NOT weaken, strengthen, or otherwise alter this item's own theorem statement to make the proof go through. The statement must stay semantically identical" + (breakage.classificationKind === "renamed" ? " (modulo the renamed identifier)" : "") + ".");
+  lines.push("- Do NOT introduce sorry, admit, or new axioms.");
+  lines.push("- If the upstream change makes this item's statement unprovable as stated, STOP and report that conclusion, explaining exactly why -- do not alter the statement to something provable.");
   return lines.join("\n");
 }
 

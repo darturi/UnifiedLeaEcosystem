@@ -212,3 +212,66 @@ export async function stubbedUpstreamOf({ leaRepoPath, namespace, moduleName, ab
   }
   return stubbed;
 }
+
+// -- Batch-repair ordering (self-repair Phase 4) -------------------------------
+
+// Order a repair set so an item is repaired only after every batch item it
+// transitively imports: repairing `C` before the `B` it imports would have
+// `C` fail on `B`'s still-broken import and waste a full agent run.
+//
+// `items` carry a `moduleName` (null/undefined allowed -- unattributable items
+// sort last, in given order); `importsByModule` is Map<moduleName, imports>
+// over the WHOLE project (transitive paths may pass through non-batch
+// modules). Lean's import graph is acyclic by construction, so the cycle
+// guard is defensive: on a cycle (corrupt fixture, symlinked repo) it falls
+// back to the given order with `cyclic: true` rather than looping or
+// guessing an order it can't justify.
+export function topologicalRepairOrder(items, importsByModule) {
+  const list = Array.isArray(items) ? items : [];
+  const byModule = new Map(list.filter((item) => item.moduleName).map((item) => [item.moduleName, item]));
+
+  // For each batch item, which OTHER batch items it transitively imports --
+  // walked over the full project graph so A -> (non-batch) M -> B still
+  // orders B before A.
+  const batchDepsOf = (moduleName) => {
+    const deps = new Set();
+    const seen = new Set([moduleName]);
+    const queue = [...(importsByModule.get(moduleName) || [])];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (seen.has(current)) continue;
+      seen.add(current);
+      if (byModule.has(current)) deps.add(current);
+      for (const imported of importsByModule.get(current) || []) queue.push(imported);
+    }
+    return deps;
+  };
+
+  const ordered = [];
+  const placed = new Set();
+  const visiting = new Set();
+  let cyclic = false;
+  const visit = (item) => {
+    if (placed.has(item.moduleName)) return;
+    if (visiting.has(item.moduleName)) {
+      cyclic = true;
+      return;
+    }
+    visiting.add(item.moduleName);
+    for (const depModule of batchDepsOf(item.moduleName)) {
+      visit(byModule.get(depModule));
+    }
+    visiting.delete(item.moduleName);
+    if (!placed.has(item.moduleName)) {
+      placed.add(item.moduleName);
+      ordered.push(item);
+    }
+  };
+  for (const item of list) {
+    if (item.moduleName) visit(item);
+  }
+  for (const item of list) {
+    if (!item.moduleName) ordered.push(item);
+  }
+  return cyclic ? { ordered: [...list], cyclic: true } : { ordered, cyclic: false };
+}

@@ -720,12 +720,17 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const timers = [];
   const fetchCalls = [];
   const postedMessages = [];
+  const confirmCalls = [];
   let nextTimerId = 1;
 
   const window = {
     innerWidth: 1024,
     innerHeight: 768,
     location: { pathname: options.locationPath || "/project/project-1" },
+    confirm(text) {
+      confirmCalls.push(String(text));
+      return options.confirmResponse !== false;
+    },
     _listeners: new Map(),
     addEventListener(type, listener) {
       const listeners = this._listeners.get(type) || [];
@@ -771,10 +776,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     document,
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
+      const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
       return {
-        ok: true,
-        status: 200,
+        ok: !failingRepairStart,
+        status: failingRepairStart ? 502 : 200,
         async json() {
+          if (failingRepairStart) {
+            return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
+          }
           if (String(url).includes("/lean-pane/manifest")) {
             return typeof options.manifest === "function"
               ? options.manifest(fetchCalls)
@@ -803,6 +812,18 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
                   ownResult: { checkStatus: "ok", classification: { kind: "proof-only" } },
                   dependentsImpact: []
                 });
+          }
+          if (String(url).includes("/lean-pane/repair/start")) {
+            return options.repairStart || { status: "in_progress", jobId: "repair-job-1" };
+          }
+          if (String(url).includes("/lean-pane/repair/all/continue")) {
+            return options.repairContinue || options.repairAll || { ok: true, batchId: "batch-1", done: false, pausedOn: null, items: [] };
+          }
+          if (String(url).includes("/lean-pane/repair/all")) {
+            return options.repairAll || { ok: true, batchId: "batch-1", done: false, pausedOn: null, items: [] };
+          }
+          if (String(url).includes("/lean-pane/repair/status")) {
+            return options.repairStatus || options.repairAll || { ok: true, batchId: "batch-1", done: true, pausedOn: null, items: [] };
           }
           return { statuses: { [`${target.targetKind}:${target.targetLabel}`]: statusInfo } };
         }
@@ -858,12 +879,15 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     async loadStatusForVisibleTheorem() {
       await this.loadVisibleTheorems();
     },
-    async loadVisibleTheorems({ diagnostics = [] } = {}) {
+    async loadVisibleTheorems({ diagnostics = [], activeTex } = {}) {
       window.postMessage({
         type: "OL_LEAN_TARGETS_VISIBLE",
         targets: [target],
         diagnostics,
-        activeTex: "\\begin{theorem}\n% lea: formalize label=demo_theorem\nA theorem.\n\\end{theorem}",
+        // A caller-supplied activeTex marks the source as changed, which is
+        // what schedules a Lean-pane manifest refresh (content.js only
+        // refreshes the pane when the tex actually changed).
+        activeTex: activeTex || "\\begin{theorem}\n% lea: formalize label=demo_theorem\nA theorem.\n\\end{theorem}",
         activePath: "main.tex"
       }, "*");
       assert.ok(timers.length > 0, "expected status refresh to be scheduled");
@@ -899,6 +923,13 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     clickFirstPaneItem() {
       const button = document.body.querySelector(".ol-lean-project-item-header");
       assert.ok(button, "expected Lean pane item header");
+      button.click();
+    },
+    clickPaneItemHeaderText(text) {
+      const button = document.body
+        .querySelectorAll(".ol-lean-project-item-header")
+        .find((candidate) => candidate.textContent.includes(text));
+      assert.ok(button, `expected a pane item header containing "${text}"`);
       button.click();
     },
     clickFirstPaneTreeRow(kind = "") {
@@ -937,6 +968,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       await flushPromises();
     },
     fetchCalls,
+    confirmCalls,
     postedMessages,
     bodyText() {
       return document.body.textContent;
@@ -1195,3 +1227,346 @@ function matchesSelector(node, selector) {
 function toDatasetKey(name) {
   return name.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
 }
+
+// --- Self-repair (docs/FEATURE-overleaf-self-repair.md, Phase 5) -----------
+
+function brokenItem(overrides = {}) {
+  return editableItem({
+    id: "theorem:corollary_a:0",
+    label: "corollary_a",
+    leanDeclarationName: "corollary_a",
+    status: "invalid",
+    breakage: {
+      upstreamLabel: "main_theorem",
+      upstreamDeclarationName: "main_theorem_v2",
+      classificationKind: "renamed",
+      renamedFrom: "main_theorem",
+      renamedTo: "main_theorem_v2",
+      via: "chat",
+      editedAt: "2026-07-04T12:00:00.000Z",
+      selfBroken: false,
+      repair: { state: "offered" }
+    },
+    ...overrides
+  });
+}
+
+test("Lean pane 'Repair with Lea' appears for a broken item, confirms, and posts /lean-pane/repair/start", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [brokenItem()], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  // attribution copy is shown with the offer
+  assert.match(harness.bodyText(), /`main_theorem` was renamed to `main_theorem_v2`/);
+  assert.equal(harness.hasButtonText("Repair with Lea"), true);
+
+  harness.clickButtonText("Repair with Lea");
+  await flushPromises();
+
+  assert.equal(harness.confirmCalls.length, 1);
+  assert.match(harness.confirmCalls[0], /Repair 1 item with Lea: corollary_a\./);
+  assert.match(harness.confirmCalls[0], /renamed to `main_theorem_v2`/);
+  assert.match(harness.confirmCalls[0], /1 agent run/);
+
+  const startCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/repair/start"));
+  assert.ok(startCall, "expected a POST to /lean-pane/repair/start");
+  const body = JSON.parse(startCall.options.body);
+  assert.equal(body.targetLabel, "corollary_a");
+  assert.equal(body.targetKind, "theorem");
+});
+
+test("declining the repair confirmation makes no repair request", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      confirmResponse: false,
+      manifest: { ok: true, rootFile: "main.tex", items: [brokenItem()], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Repair with Lea");
+  await flushPromises();
+
+  assert.equal(harness.confirmCalls.length, 1);
+  assert.ok(!harness.fetchCalls.some((call) => call.url.includes("/lean-pane/repair/")));
+});
+
+test("no repair offer while the upstream item is itself broken (suppressed), with the redirecting copy", async () => {
+  const item = brokenItem();
+  item.breakage.repairSuppressed = "upstream_broken";
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [item], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  assert.equal(harness.hasButtonText("Repair with Lea"), false);
+});
+
+test("post-save impact summary offers 'Repair all (N)' and posts the batch; the batch panel renders", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [editableItem()], diagnostics: [] },
+      editSave: {
+        ok: true,
+        unchanged: false,
+        ownResult: { checkStatus: "ok", classification: { kind: "renamed", from: "main_theorem", to: "main_theorem_v2" } },
+        dependentsImpact: [
+          { targetLabel: "corollary_a", status: "invalid", attributed: true, busy: false, brokenByUpstream: { targetLabel: "main_theorem", renamed: true, via: "edit" } },
+          { targetLabel: "corollary_b", status: "invalid", attributed: true, busy: false, brokenByUpstream: { targetLabel: "main_theorem", renamed: true, via: "edit" } }
+        ]
+      },
+      repairAll: {
+        ok: true,
+        batchId: "batch-1",
+        done: false,
+        running: true,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "corollary_a", state: "running", reason: null, runJobId: "repair-1" },
+          { targetKind: "theorem", targetLabel: "corollary_b", state: "pending", reason: null, runJobId: null }
+        ]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Edit");
+  await flushPromises();
+  harness.setEditTextareaValue("theorem main_theorem_v2 : True := by\n  sorry\n");
+  harness.clickButtonText("Save");
+  await flushPromises();
+
+  assert.equal(harness.hasButtonText("Repair all (2)"), true);
+  harness.clickButtonText("Repair all (2)");
+  await flushPromises();
+
+  assert.equal(harness.confirmCalls.length, 1);
+  assert.match(harness.confirmCalls[0], /Repair 2 items with Lea: corollary_a, corollary_b\./);
+  assert.match(harness.confirmCalls[0], /2 agent runs/);
+
+  const batchCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/repair/all"));
+  assert.ok(batchCall, "expected a POST to /lean-pane/repair/all");
+  const body = JSON.parse(batchCall.options.body);
+  assert.deepEqual(body.items.map((i) => i.targetLabel), ["corollary_a", "corollary_b"]);
+
+  // the live batch panel renders per-item progress
+  assert.match(harness.bodyText(), /Repairing 2 items/);
+  assert.match(harness.bodyText(), /corollary_a: repairing\.\.\./);
+  assert.match(harness.bodyText(), /corollary_b: waiting\./);
+});
+
+// --- Stale-offer reconciliation (docs/PLAN-self-repair-stale-offers.md) ----
+
+test("the reported case: 'Repair all' under the edited item disappears once its dependent is fixed elsewhere", async () => {
+  // Live manifest truth, mutable: the dependent starts broken (as the save's
+  // cascade left it) and is later fixed through another path (per-item
+  // repair, manual edit -- the summary must not care which).
+  let dependentFixed = false;
+  const corollaryItem = () => ({
+    id: "theorem:corollary_a:1",
+    kind: "theorem",
+    label: "corollary_a",
+    sourceFile: "main.tex",
+    naturalLanguageLatex: "B.",
+    leanKind: "theorem",
+    leanDeclarationName: "corollary_a",
+    ...(dependentFixed
+      ? { status: "valid" }
+      : {
+          status: "invalid",
+          breakage: {
+            upstreamLabel: "main_theorem",
+            classificationKind: "signature",
+            via: "edit",
+            selfBroken: false,
+            repair: { state: "offered" }
+          }
+        })
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: () => ({ ok: true, rootFile: "main.tex", items: [editableItem(), corollaryItem()], diagnostics: [] }),
+      editSave: {
+        ok: true,
+        unchanged: false,
+        ownResult: { checkStatus: "ok", classification: { kind: "signature" } },
+        dependentsImpact: [
+          { targetLabel: "corollary_a", status: "invalid", attributed: true, busy: false, brokenByUpstream: { targetLabel: "main_theorem", renamed: false, via: "edit" } }
+        ]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickPaneItemHeaderText("main_theorem");
+  harness.clickButtonText("Edit");
+  await flushPromises();
+  harness.setEditTextareaValue("theorem main_theorem (h : True) : True := by\n  sorry\n");
+  harness.clickButtonText("Save");
+  await flushPromises();
+
+  // Snapshot and live truth agree: the offer is live.
+  assert.match(harness.bodyText(), /1 downstream item affected: 1 broken\./);
+  assert.equal(harness.hasButtonText("Repair all (1)"), true);
+
+  // The dependent gets fixed through some other path; the next pane refresh
+  // (here driven by a source change; in the reported flow, by the repair's
+  // own polling) reconciles the frozen save snapshot against live truth.
+  dependentFixed = true;
+  await harness.loadVisibleTheorems({
+    activeTex: "\\begin{theorem}\n% lea: formalize label=demo_theorem\nA theorem, revised.\n\\end{theorem}"
+  });
+
+  assert.equal(harness.hasButtonText("Repair all (1)"), false);
+  assert.match(harness.bodyText(), /1 downstream item was affected by this edit -- all since fixed or re-verified\./);
+  assert.match(harness.bodyText(), /corollary_a: broken by this edit -- since fixed\./);
+});
+
+test("a repair dispatch error renders only under the item it was dispatched for", async () => {
+  const brokenPaneItem = (name) => editableItem({
+    id: `theorem:${name}:0`,
+    label: name,
+    leanDeclarationName: name,
+    status: "invalid",
+    breakage: {
+      upstreamLabel: "main_theorem",
+      classificationKind: "signature",
+      via: "edit",
+      selfBroken: false,
+      repair: { state: "offered" }
+    }
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      failRepairStart: "dispatch exploded",
+      manifest: { ok: true, rootFile: "main.tex", items: [brokenPaneItem("corollary_x"), brokenPaneItem("corollary_y")], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickPaneItemHeaderText("corollary_x");
+  harness.clickButtonText("Repair with Lea");
+  await flushPromises();
+
+  // error shown under the item whose dispatch failed
+  assert.match(harness.bodyText(), /dispatch exploded/);
+
+  // collapse X, expand Y: Y carries its own offer but NOT X's error
+  harness.clickPaneItemHeaderText("corollary_x");
+  harness.clickPaneItemHeaderText("corollary_y");
+  assert.equal(harness.hasButtonText("Repair with Lea"), true);
+  assert.doesNotMatch(harness.bodyText(), /dispatch exploded/);
+});
+
+test("round 2: a dependent skipped as busy during the save joins 'Repair all' once its repair run ends broken", async () => {
+  // Live truth over time: the dependent's earlier repair run is live during
+  // the save (in-progress), then ends FAILED -- leaving it broken with a
+  // failed-repair marker (the second-rename-while-repairing case).
+  let repairEnded = false;
+  const corollaryItem = () => ({
+    id: "theorem:corollary_a:1",
+    kind: "theorem",
+    label: "corollary_a",
+    sourceFile: "main.tex",
+    naturalLanguageLatex: "B.",
+    leanKind: "theorem",
+    leanDeclarationName: "corollary_a",
+    ...(repairEnded
+      ? {
+          status: "invalid",
+          breakage: {
+            upstreamLabel: "main_theorem",
+            classificationKind: "renamed",
+            renamedFrom: "main_theorem",
+            renamedTo: "main_theorem_v2",
+            via: "edit",
+            selfBroken: false,
+            repair: { state: "failed", failureReason: "verification failed after the upstream changed again" }
+          }
+        }
+      : { status: "in-progress" })
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: () => ({ ok: true, rootFile: "main.tex", items: [editableItem(), corollaryItem()], diagnostics: [] }),
+      editSave: {
+        ok: true,
+        unchanged: false,
+        ownResult: { checkStatus: "ok", classification: { kind: "renamed", from: "main_theorem", to: "main_theorem_v2" } },
+        // the cascade skipped the dependent: a live run was in progress
+        dependentsImpact: [
+          { targetLabel: "corollary_a", status: "busy", attributed: true, busy: true, brokenByUpstream: null }
+        ]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickPaneItemHeaderText("main_theorem");
+  harness.clickButtonText("Edit");
+  await flushPromises();
+  harness.setEditTextareaValue("theorem main_theorem_v2 : True := by\n  sorry\n");
+  harness.clickButtonText("Save");
+  await flushPromises();
+
+  // While the dependent's run is still live: no offer, honest busy line.
+  assert.equal(harness.hasButtonText("Repair all (1)"), false);
+  assert.match(harness.bodyText(), /not re-checked yet .*-- repair in progress\./);
+
+  // Its repair ends broken; the next refresh must PROMOTE it into the offer
+  // (the bug: the snapshot-busy entry could never join stillBroken).
+  repairEnded = true;
+  await harness.loadVisibleTheorems({
+    activeTex: "\\begin{theorem}\n% lea: formalize label=demo_theorem\nA theorem, revised.\n\\end{theorem}"
+  });
+
+  assert.match(harness.bodyText(), /1 downstream item affected: 1 broken\./);
+  assert.match(harness.bodyText(), /corollary_a: was busy during this edit's re-check -- now broken\./);
+  assert.equal(harness.hasButtonText("Repair all (1)"), true);
+});

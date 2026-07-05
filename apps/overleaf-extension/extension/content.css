@@ -674,6 +674,90 @@
   margin-top: 4px;
 }
 
+/* Self-repair (docs/FEATURE-overleaf-self-repair.md) */
+.ol-lean-project-breakage {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid #e2b6b3;
+  border-radius: 7px;
+  background: rgba(179, 38, 30, 0.06);
+  color: var(--ol-ink-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ol-lean-project-breakage p {
+  margin: 0;
+}
+
+.ol-lean-project-breakage p + p {
+  margin-top: 4px;
+}
+
+.ol-lean-project-breakage-running {
+  font-style: italic;
+}
+
+.ol-lean-project-breakage-failed {
+  color: #b3261e;
+}
+
+.ol-lean-project-repair-review {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid #e0c982;
+  border-radius: 7px;
+  background: rgba(191, 144, 0, 0.08);
+  color: var(--ol-ink-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ol-lean-project-repair-batch {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel-2);
+  color: var(--ol-ink-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ol-lean-project-repair-batch p {
+  margin: 0;
+}
+
+.ol-lean-project-repair-batch p + p {
+  margin-top: 4px;
+}
+
+.ol-lean-project-repair-batch-item {
+  padding-left: 8px;
+}
+
+.ol-lean-chat-impact {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid #e2b6b3;
+  border-radius: 7px;
+  background: rgba(179, 38, 30, 0.06);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ol-lean-chat-impact p {
+  margin: 0;
+}
+
+.ol-lean-chat-impact p + p {
+  margin-top: 4px;
+}
+
+.ol-lean-chat-impact .ol-lean-repair-all-button {
+  margin-top: 6px;
+}
+
 .ol-lean-theorem-popover {
   position: fixed;
   z-index: 2147483647;
