@@ -407,6 +407,43 @@ export function canEditPaneItem(item) {
   return Boolean(item && item.leanArtifactContent);
 }
 
+// --- Item action hierarchy ---------------------------------------------------
+
+// The full action set for an expanded pane item, arranged by visual weight so
+// the card stays one row instead of a wall of same-looking buttons:
+//   primary  -- at most ONE status-derived accented text button (repair wins
+//               over formalize: breakage attribution means the guided path).
+//   rail     -- always-relevant navigation, rendered as icon buttons.
+//   overflow -- the rare alternatives, behind a "More actions" menu. A
+//               formalizable-but-broken item keeps Re-formalize here so no
+//               capability is lost when Repair takes the primary slot.
+// Copy actions are absent by design: they belong on the code blocks they copy.
+export function paneItemActions(item, { editing = false } = {}) {
+  const canFormalize = canFormalizePaneItem(item);
+  const formalizeAction = {
+    id: "formalize",
+    label: item?.status === "missing-stub" ? "Formalize" : "Re-formalize"
+  };
+
+  let primary = null;
+  if (!editing && canRepairPaneItem(item)) {
+    primary = { id: "repair", label: "Repair with Lea" };
+  } else if (!editing && canFormalize) {
+    primary = formalizeAction;
+  }
+
+  const rail = [{ id: "go-to-source", label: "Go to source" }];
+  if (canChatPaneItem(item)) rail.push({ id: "chat", label: "Chat" });
+  if (canViewPaneItemInLeaUi(item)) rail.push({ id: "view-in-lea", label: "Open in Lea UI" });
+
+  const overflow = [];
+  if (primary?.id === "repair" && canFormalize) overflow.push(formalizeAction);
+  if (canStubPaneItem(item)) overflow.push({ id: "stub", label: "Stub" });
+  if (!editing && canEditPaneItem(item)) overflow.push({ id: "edit", label: "Edit" });
+
+  return { primary, rail, overflow };
+}
+
 // Shape a manifest item into the LeanPaneEditTarget payload the companion's
 // /lean-pane/edit/* endpoints expect. Mirrors paneItemToChatTarget's shape.
 export function paneItemToEditTarget(item, overleafProjectId) {
@@ -570,24 +607,6 @@ export function formatBreakageAttribution(breakage) {
     return `Broken by ${via} to ${breakage.upstreamLabel} -- repair ${breakage.upstreamLabel} first (its file currently fails to compile).`;
   }
   return `Broken by ${via} to ${breakage.upstreamLabel}.`;
-}
-
-// The confirmation body shown before any repair run starts (feature spec
-// Part 2: which items, what upstream change, which agent, how many runs).
-export function formatRepairConfirmation({ items = [], breakage = null, modelLabel = "" } = {}) {
-  const count = items.length;
-  const names = items.map((item) => item?.targetLabel || item?.leanDeclarationName || item?.label).filter(Boolean).join(", ");
-  const lines = [];
-  lines.push(`Repair ${count} item${count === 1 ? "" : "s"} with Lea: ${names}.`);
-  if (breakage && !breakage.selfBroken) {
-    if (breakage.classificationKind === "renamed" && breakage.renamedFrom && breakage.renamedTo) {
-      lines.push(`Upstream change: \`${breakage.renamedFrom}\` was renamed to \`${breakage.renamedTo}\`.`);
-    } else if (breakage.upstreamLabel) {
-      lines.push(`Upstream change: ${breakage.upstreamLabel} changed (${breakage.classificationKind || "modified"}).`);
-    }
-  }
-  lines.push(`This will start ${count} agent run${count === 1 ? "" : "s"}${modelLabel ? ` with ${modelLabel}` : " with the configured Lea model"} and consume model usage.`);
-  return lines.join("\n");
 }
 
 // One line per item for the batch progress / outcome list.

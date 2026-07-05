@@ -296,8 +296,8 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
 
-  assert.equal(harness.hasButtonText("Copy stub"), true);
-  assert.equal(harness.hasButtonText("Copy artifact"), true);
+  assert.equal(harness.hasButtonLabel("Copy stub"), true);
+  assert.equal(harness.hasButtonLabel("Copy artifact"), true);
   assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
 });
 
@@ -345,8 +345,8 @@ test("Lean pane renders lightweight math and highlighted Lean code", async () =>
 
   harness.clickFirstPaneItem();
 
-  assert.equal(harness.hasButtonText("Copy stub"), true);
-  assert.equal(harness.hasButtonText("Copy artifact"), true);
+  assert.equal(harness.hasButtonLabel("Copy stub"), true);
+  assert.equal(harness.hasButtonLabel("Copy artifact"), true);
   assert.ok(harness.countSelector(".ol-lean-project-lean-com") >= 1);
 });
 
@@ -384,7 +384,7 @@ test("Lean pane 'Go to source' posts a navigate message with the item's offsets"
   await flushPromises();
   harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
-  harness.clickButtonText("Go to source");
+  harness.clickButtonLabel("Go to source");
 
   const navigate = harness.postedMessages.find((message) => message.type === "OL_LEAN_NAVIGATE");
   assert.ok(navigate, "expected an OL_LEAN_NAVIGATE message");
@@ -907,6 +907,18 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         .querySelectorAll("button")
         .some((button) => button.textContent === text);
     },
+    hasButtonLabel(label) {
+      return document.body
+        .querySelectorAll("button")
+        .some((button) => button.attributes["aria-label"] === label);
+    },
+    clickButtonLabel(label) {
+      const button = document.body
+        .querySelectorAll("button")
+        .find((candidate) => candidate.attributes["aria-label"] === label);
+      assert.ok(button, `expected a button labeled "${label}"`);
+      button.click();
+    },
     openTargetPopover() {
       window.postMessage({
         type: "OL_LEAN_TARGET_CLICK",
@@ -1251,7 +1263,7 @@ function brokenItem(overrides = {}) {
   });
 }
 
-test("Lean pane 'Repair with Lea' appears for a broken item, confirms, and posts /lean-pane/repair/start", async () => {
+test("Lean pane 'Repair with Lea' appears for a broken item and posts /lean-pane/repair/start", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
     {},
@@ -1273,38 +1285,14 @@ test("Lean pane 'Repair with Lea' appears for a broken item, confirms, and posts
   harness.clickButtonText("Repair with Lea");
   await flushPromises();
 
-  assert.equal(harness.confirmCalls.length, 1);
-  assert.match(harness.confirmCalls[0], /Repair 1 item with Lea: corollary_a\./);
-  assert.match(harness.confirmCalls[0], /renamed to `main_theorem_v2`/);
-  assert.match(harness.confirmCalls[0], /1 agent run/);
+  // no confirmation popup: the repair dispatches immediately
+  assert.equal(harness.confirmCalls.length, 0);
 
   const startCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/repair/start"));
   assert.ok(startCall, "expected a POST to /lean-pane/repair/start");
   const body = JSON.parse(startCall.options.body);
   assert.equal(body.targetLabel, "corollary_a");
   assert.equal(body.targetKind, "theorem");
-});
-
-test("declining the repair confirmation makes no repair request", async () => {
-  const harness = createContentHarness(
-    { status: "unformalized" },
-    {},
-    {
-      locationPath: "/project/unknown",
-      confirmResponse: false,
-      manifest: { ok: true, rootFile: "main.tex", items: [brokenItem()], diagnostics: [] }
-    }
-  );
-  await harness.loadVisibleTheorems();
-  harness.clickPaneTrigger();
-  await flushPromises();
-  harness.clickPaneTreeRowText("main.tex");
-  harness.clickFirstPaneItem();
-  harness.clickButtonText("Repair with Lea");
-  await flushPromises();
-
-  assert.equal(harness.confirmCalls.length, 1);
-  assert.ok(!harness.fetchCalls.some((call) => call.url.includes("/lean-pane/repair/")));
 });
 
 test("no repair offer while the upstream item is itself broken (suppressed), with the redirecting copy", async () => {
@@ -1371,9 +1359,8 @@ test("post-save impact summary offers 'Repair all (N)' and posts the batch; the 
   harness.clickButtonText("Repair all (2)");
   await flushPromises();
 
-  assert.equal(harness.confirmCalls.length, 1);
-  assert.match(harness.confirmCalls[0], /Repair 2 items with Lea: corollary_a, corollary_b\./);
-  assert.match(harness.confirmCalls[0], /2 agent runs/);
+  // no confirmation popup: the batch dispatches immediately
+  assert.equal(harness.confirmCalls.length, 0);
 
   const batchCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/repair/all"));
   assert.ok(batchCall, "expected a POST to /lean-pane/repair/all");

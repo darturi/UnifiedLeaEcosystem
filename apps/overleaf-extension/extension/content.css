@@ -623,8 +623,102 @@
 .ol-lean-project-detail-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin-top: 10px;
+}
+
+/* The item card's navigation actions, as compact icon buttons pushed to the
+   right of the (optional) primary text action. */
+.ol-lean-icon-rail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.ol-lean-icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel);
+  color: var(--ol-ink-2);
+  cursor: pointer;
+}
+
+.ol-lean-icon-action:hover:not(:disabled) {
+  background: var(--ol-panel-2);
+  color: var(--ol-ink);
+}
+
+.ol-lean-icon-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* "More actions" overflow menu on an item card. */
+.ol-lean-overflow {
+  position: relative;
+}
+
+.ol-lean-overflow-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel);
+  box-shadow: 0 8px 24px rgba(31, 30, 29, 0.14);
+}
+
+.ol-lean-overflow-menu[hidden] {
+  display: none;
+}
+
+.ol-lean-overflow-item {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ol-ink-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ol-lean-overflow-item:hover {
+  background: var(--ol-panel-2);
+  color: var(--ol-ink);
+}
+
+/* Copy control anchored to the code block it copies; revealed on hover or
+   keyboard focus. */
+.ol-lean-code-block {
+  position: relative;
+}
+
+.ol-lean-code-block .ol-lean-code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--ol-code-bg);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.ol-lean-code-block:hover .ol-lean-code-copy,
+.ol-lean-code-block .ol-lean-code-copy:focus-visible {
+  opacity: 1;
 }
 
 /* Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md). */
@@ -1144,16 +1238,16 @@
   background: var(--ol-panel-2);
 }
 
-/* Formalize is the pane's primary state-changing action — give it the accent so it
-   stands out from the passive copy/navigate actions and from the lighter Stub
-   alternative (which keeps plain secondary styling, matching the popover hierarchy). */
-.ol-lean-formalize-button {
+/* The item card's single status-derived primary action (Formalize / Repair) —
+   the accent marks the one state-changing step, against the quiet icon rail
+   and the overflow alternatives (leanPaneView.paneItemActions). */
+.ol-lean-item-primary-action {
   border-color: var(--ol-accent);
   color: var(--ol-accent-ink);
   background: var(--ol-accent-soft);
 }
 
-.ol-lean-formalize-button:hover:not(:disabled) {
+.ol-lean-item-primary-action:hover:not(:disabled) {
   background: var(--ol-accent-soft);
   border-color: var(--ol-accent-ink);
 }

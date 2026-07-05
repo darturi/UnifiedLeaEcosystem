@@ -87,6 +87,9 @@
   // "batch" (PLAN-self-repair-stale-offers Fix 4 -- a global string rendered
   // under every broken item was itself a member of the stale-copy class).
   let leanPaneRepairError = null;
+  // At most one item-card overflow ("More actions") menu is open at a time;
+  // the same global click/Escape listeners that dismiss popovers close it.
+  let activeOverflowMenu = null;
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -136,6 +139,10 @@
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (activeOverflowMenu) {
+      closeActiveOverflowMenu();
+      return;
+    }
     if (activePopover) {
       closePopover();
       return;
@@ -144,6 +151,9 @@
   });
 
   document.addEventListener("click", (event) => {
+    if (activeOverflowMenu && !activeOverflowMenu.wrap.contains(event.target)) {
+      closeActiveOverflowMenu();
+    }
     if (activePopover && !activePopover.contains(event.target)) {
       closePopover();
     }
@@ -218,18 +228,12 @@
 
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-pane-controls";
-    const exportButton = document.createElement("button");
-    exportButton.type = "button";
-    exportButton.className = "ol-lean-pane-action";
-    exportButton.title = "Download the Lean project as a zip";
-    exportButton.textContent = "Export";
-    exportButton.addEventListener("click", () => {
-      exportLeanProject(exportButton).catch(renderLeanPaneError);
-    });
+    // Export lives inside the Share panel (one header entry for everything
+    // that moves the project off this page: zip download + GitHub push).
     const shareButton = document.createElement("button");
     shareButton.type = "button";
     shareButton.className = "ol-lean-pane-action";
-    shareButton.title = "Share the Lean project to GitHub";
+    shareButton.title = "Share or export the Lean project";
     shareButton.textContent = "Share";
     shareButton.addEventListener("click", () => {
       toggleSharePanel().catch(renderLeanPaneError);
@@ -250,7 +254,6 @@
     close.setAttribute("aria-label", "Close Lean pane");
     close.textContent = "x";
     close.addEventListener("click", closeLeanPane);
-    controls.appendChild(exportButton);
     controls.appendChild(shareButton);
     controls.appendChild(refresh);
     controls.appendChild(close);
@@ -280,6 +283,7 @@
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
     closeLeanPaneChat();
+    closeActiveOverflowMenu();
     leanPaneSharePanel = null;
     leanPaneShareState = null;
     leanPaneShareBusy = false;
@@ -355,6 +359,9 @@
         <button type="button" class="ol-lean-provider-key-button" data-role="share-save">Save remote</button>
         <button type="button" class="ol-lean-save-button" data-role="share-push">Push to GitHub</button>
       </div>
+      <div class="ol-lean-share-actions">
+        <button type="button" class="ol-lean-provider-key-button" data-role="share-export" title="Download the Lean project as a zip">Download .zip</button>
+      </div>
       <p class="ol-lean-share-hint" data-role="share-hint" hidden></p>
       <p class="ol-lean-share-status" role="status" data-role="share-status">Loading share status...</p>
     `;
@@ -368,6 +375,10 @@
     });
     panel.querySelector("[data-role='share-push']").addEventListener("click", () => {
       pushShareRemote().catch((error) => setShareStatus(errorText(error)));
+    });
+    const exportButton = panel.querySelector("[data-role='share-export']");
+    exportButton?.addEventListener("click", () => {
+      exportLeanProject(exportButton).catch((error) => setShareStatus(errorText(error)));
     });
 
     try {
@@ -758,10 +769,7 @@
     }
 
     if (item.leanStub) {
-      const stub = document.createElement("pre");
-      stub.className = "ol-lean-project-code";
-      renderLeanPaneCode(stub, item.leanStub);
-      card.appendChild(stub);
+      card.appendChild(renderLeanCodeBlock("ol-lean-project-code", item.leanStub, "Copy stub"));
     } else {
       const missing = document.createElement("p");
       missing.className = "ol-lean-project-missing";
@@ -789,34 +797,23 @@
 
     const editing = leanPaneEditingItemId === item.id;
 
+    // One row, three visual weights (leanPaneView.paneItemActions): a single
+    // status-derived primary, an icon rail for navigation, and an overflow
+    // menu for the rare alternatives. Copy lives on the code blocks instead.
+    const { primary, rail, overflow } = leanPaneView.paneItemActions(item, { editing });
     const actions = document.createElement("div");
     actions.className = "ol-lean-project-detail-actions";
-    actions.appendChild(renderGoToSourceButton(item));
-    if (leanPaneView.canChatPaneItem(item)) {
-      actions.appendChild(renderChatButton(item));
+    if (primary) actions.appendChild(renderPaneItemPrimaryAction(item, primary));
+    const railElement = document.createElement("div");
+    railElement.className = "ol-lean-icon-rail";
+    for (const action of rail) {
+      railElement.appendChild(renderPaneItemIconAction(item, action));
     }
-    if (leanPaneView.canViewPaneItemInLeaUi(item)) {
-      actions.appendChild(renderViewInLeaButton(item));
+    if (overflow.length > 0) {
+      railElement.appendChild(renderPaneOverflowMenu(item, overflow));
     }
-    if (leanPaneView.canFormalizePaneItem(item)) {
-      actions.appendChild(renderFormalizeButton(item));
-    }
-    if (leanPaneView.canStubPaneItem(item)) {
-      actions.appendChild(renderStubButton(item));
-    }
-    if (!editing && leanPaneView.canEditPaneItem(item)) {
-      actions.appendChild(renderEditButton(item));
-    }
-    if (!editing && leanPaneView.canRepairPaneItem(item)) {
-      actions.appendChild(renderRepairButton(item));
-    }
-    if (item.leanStub) {
-      actions.appendChild(renderCopyButton("Copy stub", item.leanStub));
-    }
-    if (item.leanArtifactContent) {
-      actions.appendChild(renderCopyButton("Copy artifact", item.leanArtifactContent));
-    }
-    if (actions.children.length > 0) detail.appendChild(actions);
+    actions.appendChild(railElement);
+    detail.appendChild(actions);
 
     if (item.breakage) {
       detail.appendChild(renderLeanPaneBreakage(item));
@@ -831,10 +828,9 @@
     if (editing) {
       detail.appendChild(renderLeanPaneEditControls(item));
     } else if (item.leanArtifactContent) {
-      const artifact = document.createElement("pre");
-      artifact.className = "ol-lean-project-artifact";
-      renderLeanPaneCode(artifact, item.leanArtifactContent);
-      detail.appendChild(artifact);
+      detail.appendChild(
+        renderLeanCodeBlock("ol-lean-project-artifact", item.leanArtifactContent, "Copy artifact")
+      );
     } else {
       const empty = document.createElement("p");
       empty.className = "ol-lean-project-missing";
@@ -849,26 +845,12 @@
     return detail;
   }
 
-  // Manual edit entry point on a pane item (docs/FEATURE-overleaf-lean-pane-manual-edit.md).
-  function renderEditButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-edit-button";
-    button.textContent = "Edit";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openLeanPaneEdit(item);
-    });
-    return button;
-  }
-
   // --- Self-repair actions (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
 
   function renderRepairButton(item) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-repair-button";
+    button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-repair-button";
     button.textContent = "Repair with Lea";
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -877,8 +859,7 @@
       const target = leanPaneView.paneItemToEditTarget(item, projectId);
       requestRepair({
         overleafProjectId: projectId,
-        items: [{ targetKind: target.targetKind, targetLabel: target.targetLabel }],
-        breakage: item.breakage
+        items: [{ targetKind: target.targetKind, targetLabel: target.targetLabel }]
       });
     });
     return button;
@@ -913,28 +894,9 @@
     return container;
   }
 
-  // The configured model's display label, for the repair confirmation ("which
-  // agent will do it"). Best-effort: a missing label falls back to generic
-  // copy inside formatRepairConfirmation.
-  async function bestEffortModelLabel() {
-    try {
-      const stored = await getSettings();
-      const model = String(stored.leaModel || "");
-      const options = Array.isArray(stored.leaModelOptions) ? stored.leaModelOptions : [];
-      const found = options.find((option) => (option.value || option.id) === model);
-      return found?.label || model;
-    } catch {
-      return "";
-    }
-  }
-
-  // One confirmation, then dispatch: a single item goes through
-  // /lean-pane/repair/start; several go through the topologically ordered
-  // batch (/lean-pane/repair/all). Nothing runs without the confirm.
-  async function requestRepair({ overleafProjectId, items, breakage }) {
-    const modelLabel = await bestEffortModelLabel();
-    const text = leanPaneView.formatRepairConfirmation({ items, breakage, modelLabel });
-    if (!window.confirm(text)) return;
+  // Dispatch: a single item goes through /lean-pane/repair/start; several go
+  // through the topologically ordered batch (/lean-pane/repair/all).
+  async function requestRepair({ overleafProjectId, items }) {
     leanPaneRepairError = null;
     const errorKey = items.length === 1 ? items[0].targetLabel : "batch";
     try {
@@ -1292,18 +1254,9 @@
       repairAll.textContent = `Repair all (${broken.length})`;
       repairAll.addEventListener("click", () => {
         const projectId = itemsProjectId(lastLeanPaneManifest?.items || []);
-        const classification = result.ownResult?.classification || {};
         requestRepair({
           overleafProjectId: projectId,
-          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel })),
-          breakage: {
-            upstreamLabel: broken[0].brokenByUpstream?.targetLabel || (item?.leanDeclarationName ?? ""),
-            classificationKind: classification.kind,
-            renamedFrom: classification.from,
-            renamedTo: classification.to,
-            via: "edit",
-            selfBroken: false
-          }
+          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel }))
         });
       });
       actions.appendChild(repairAll);
@@ -1381,32 +1334,23 @@
 
   // Item 11: jump the Overleaf editor to this item's source block. The actual
   // scroll/select happens in pageBridge (page world) which owns the CodeMirror view.
-  function renderGoToSourceButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button";
-    button.textContent = "Go to source";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (leanPaneStatus) {
-        leanPaneStatus.textContent = item.sourceFile
-          ? `Opening ${item.sourceFile}...`
-          : "Opening source...";
-      }
-      window.postMessage({
-        type: "OL_LEAN_NAVIGATE",
-        sourceFile: item.sourceFile || "",
-        from: item.sourceStartOffset,
-        to: item.sourceEndOffset,
-        line: item.sourceStartLine,
-        // Text anchors let pageBridge locate the block even when byte offsets have
-        // drifted (edits) or the file path can't be matched exactly.
-        leanLabel: item.label || item.leanDeclarationName || "",
-        latexLabel: item.latexLabel || ""
-      }, "*");
-    });
-    return button;
+  function goToPaneItemSource(item) {
+    if (leanPaneStatus) {
+      leanPaneStatus.textContent = item.sourceFile
+        ? `Opening ${item.sourceFile}...`
+        : "Opening source...";
+    }
+    window.postMessage({
+      type: "OL_LEAN_NAVIGATE",
+      sourceFile: item.sourceFile || "",
+      from: item.sourceStartOffset,
+      to: item.sourceEndOffset,
+      line: item.sourceStartLine,
+      // Text anchors let pageBridge locate the block even when byte offsets have
+      // drifted (edits) or the file path can't be matched exactly.
+      leanLabel: item.label || item.leanDeclarationName || "",
+      latexLabel: item.latexLabel || ""
+    }, "*");
   }
 
   // Item 12: start a formalization run for this item, reusing the same /formalize
@@ -1415,7 +1359,7 @@
   function renderFormalizeButton(item) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-formalize-button";
+    button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-formalize-button";
     button.textContent = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
     button.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -1434,27 +1378,169 @@
     return button;
   }
 
-  // Sorry-stub a theorem from the pane, reusing the same /stub path the
-  // in-document badge popover uses, then refresh so the pane picks up the
-  // new stub-generated status.
-  function renderStubButton(item) {
+  // --- Item action row (leanPaneView.paneItemActions) ------------------------
+  // One primary text button, an icon rail, and an overflow menu per item card.
+
+  const PANE_ICON_SVG_ATTRS = 'viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  const PANE_ICON_SVG = {
+    "go-to-source": `<svg ${PANE_ICON_SVG_ATTRS}><circle cx="12" cy="12" r="7"></circle><line x1="12" y1="2" x2="12" y2="5"></line><line x1="12" y1="19" x2="12" y2="22"></line><line x1="2" y1="12" x2="5" y2="12"></line><line x1="19" y1="12" x2="22" y2="12"></line></svg>`,
+    chat: `<svg ${PANE_ICON_SVG_ATTRS}><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>`,
+    "view-in-lea": `<svg ${PANE_ICON_SVG_ATTRS}><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>`,
+    copy: `<svg ${PANE_ICON_SVG_ATTRS}><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
+    check: `<svg ${PANE_ICON_SVG_ATTRS}><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+    more: `<svg ${PANE_ICON_SVG_ATTRS}><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>`
+  };
+
+  function renderPaneItemPrimaryAction(item, action) {
+    return action.id === "repair" ? renderRepairButton(item) : renderFormalizeButton(item);
+  }
+
+  function renderPaneItemIconAction(item, action) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-stub-button";
-    button.textContent = "Stub";
+    button.className = "ol-lean-icon-action";
+    button.title = action.label;
+    button.setAttribute("aria-label", action.label);
+    button.innerHTML = PANE_ICON_SVG[action.id] || "";
     button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      button.disabled = true;
-      button.textContent = "Stubbing…";
-      try {
-        await stubTheorem(leanPaneView.paneItemToFormalizeTarget(item));
-        await refreshLeanPaneNow({ background: true });
-      } catch (error) {
-        button.disabled = false;
-        button.textContent = "Retry stub";
-        if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+      if (action.id === "go-to-source") {
+        goToPaneItemSource(item);
+        return;
       }
+      if (action.id === "chat") {
+        openLeanPaneChat(item);
+        return;
+      }
+      if (action.id === "view-in-lea") {
+        button.disabled = true;
+        if (leanPaneStatus) leanPaneStatus.textContent = "Opening Lea session...";
+        try {
+          const { sessionOpened } = await openLeaUiForPaneItem(item);
+          if (leanPaneStatus) {
+            leanPaneStatus.textContent = sessionOpened ? "Opened Lea session." : "Opened Lea UI.";
+          }
+        } catch (error) {
+          if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+        } finally {
+          button.disabled = false;
+        }
+      }
+    });
+    return button;
+  }
+
+  function renderPaneOverflowMenu(item, overflowActions) {
+    const wrap = document.createElement("div");
+    wrap.className = "ol-lean-overflow";
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "ol-lean-icon-action";
+    trigger.title = "More actions";
+    trigger.setAttribute("aria-label", "More actions");
+    trigger.setAttribute("aria-haspopup", "menu");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.innerHTML = PANE_ICON_SVG.more;
+    const menu = document.createElement("div");
+    menu.className = "ol-lean-overflow-menu";
+    menu.setAttribute("role", "menu");
+    menu.hidden = true;
+    for (const action of overflowActions) {
+      const entry = document.createElement("button");
+      entry.type = "button";
+      entry.className = "ol-lean-overflow-item";
+      entry.setAttribute("role", "menuitem");
+      entry.textContent = action.label;
+      entry.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeActiveOverflowMenu();
+        runPaneOverflowAction(item, action).catch(renderLeanPaneError);
+      });
+      menu.appendChild(entry);
+    }
+    trigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const wasOpen = !menu.hidden;
+      closeActiveOverflowMenu();
+      if (!wasOpen) {
+        menu.hidden = false;
+        trigger.setAttribute("aria-expanded", "true");
+        activeOverflowMenu = { wrap, menu, trigger };
+      }
+    });
+    wrap.appendChild(trigger);
+    wrap.appendChild(menu);
+    return wrap;
+  }
+
+  function closeActiveOverflowMenu() {
+    if (!activeOverflowMenu) return;
+    activeOverflowMenu.menu.hidden = true;
+    activeOverflowMenu.trigger.setAttribute("aria-expanded", "false");
+    activeOverflowMenu = null;
+  }
+
+  // Overflow actions report through the pane status line (the menu entry is
+  // gone once the menu closes, so per-button pending text has nowhere to live).
+  // Formalize/stub reuse the same companion paths as the primary button and
+  // the in-document popover.
+  async function runPaneOverflowAction(item, action) {
+    if (action.id === "edit") {
+      openLeanPaneEdit(item);
+      return;
+    }
+    if (action.id !== "formalize" && action.id !== "stub") return;
+    if (leanPaneStatus) {
+      leanPaneStatus.textContent = action.id === "stub"
+        ? "Creating Lean stub..."
+        : "Starting formalization...";
+    }
+    try {
+      const target = leanPaneView.paneItemToFormalizeTarget(item);
+      await (action.id === "stub" ? stubTheorem(target) : formalize(target));
+      await refreshLeanPaneNow({ background: true });
+    } catch (error) {
+      if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+    }
+  }
+
+  // A highlighted Lean code block with a hover-revealed copy control in its
+  // corner -- copy belongs to the content it copies, not to the action row.
+  function renderLeanCodeBlock(className, code, copyLabel) {
+    const wrap = document.createElement("div");
+    wrap.className = "ol-lean-code-block";
+    const pre = document.createElement("pre");
+    pre.className = className;
+    renderLeanPaneCode(pre, code);
+    wrap.appendChild(pre);
+    wrap.appendChild(renderCopyIconButton(copyLabel, code));
+    return wrap;
+  }
+
+  function renderCopyIconButton(label, text) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-icon-action ol-lean-code-copy";
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.innerHTML = PANE_ICON_SVG.copy;
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(text);
+        button.innerHTML = PANE_ICON_SVG.check;
+        button.title = "Copied";
+      } catch {
+        button.title = "Copy failed";
+      }
+      setTimeout(() => {
+        button.innerHTML = PANE_ICON_SVG.copy;
+        button.title = label;
+      }, 1500);
     });
     return button;
   }
@@ -1482,45 +1568,6 @@
     const uiBaseUrl = String(settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL).replace(/\/+$/, "");
     await openLeaSession({ url: uiBaseUrl, baseUrl: uiBaseUrl });
     return { sessionOpened: false };
-  }
-
-  function renderViewInLeaButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-view-in-lea-button";
-    button.textContent = "View in Lea UI";
-    button.addEventListener("click", async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      button.disabled = true;
-      if (leanPaneStatus) leanPaneStatus.textContent = "Opening Lea session...";
-      try {
-        const { sessionOpened } = await openLeaUiForPaneItem(item);
-        if (leanPaneStatus) {
-          leanPaneStatus.textContent = sessionOpened ? "Opened Lea session." : "Opened Lea UI.";
-        }
-      } catch (error) {
-        if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
-      } finally {
-        button.disabled = false;
-      }
-    });
-    return button;
-  }
-
-  // Chat mirror entry point on a pane item. Opens the compact transcript scoped
-  // to this item's Lea session (creating one on first message).
-  function renderChatButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-chat-button";
-    button.textContent = "Chat";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openLeanPaneChat(item);
-    });
-    return button;
   }
 
   function isChatResponseActive(payload) {
@@ -1898,18 +1945,9 @@
       repairAll.className = "ol-lean-primary-button ol-lean-repair-all-button";
       repairAll.textContent = `Repair all (${broken.length})`;
       repairAll.addEventListener("click", () => {
-        const classification = lastRunImpact.classification || {};
         requestRepair({
           overleafProjectId: leanPaneChatTarget?.overleafProjectId || itemsProjectId(lastLeanPaneManifest?.items || []),
-          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel })),
-          breakage: {
-            upstreamLabel: lastRunImpact.targetLabel || broken[0].brokenByUpstream?.targetLabel || "",
-            classificationKind: classification.kind,
-            renamedFrom: classification.from,
-            renamedTo: classification.to,
-            via: "chat",
-            selfBroken: false
-          }
+          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel }))
         });
       });
       container.appendChild(repairAll);
@@ -1956,24 +1994,6 @@
     if (lastIndex < line.length) {
       container.appendChild(document.createTextNode(line.slice(lastIndex)));
     }
-  }
-
-  function renderCopyButton(label, text) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button";
-    button.textContent = label;
-    button.addEventListener("click", async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      try {
-        await navigator.clipboard.writeText(text);
-        button.textContent = "Copied";
-      } catch {
-        button.textContent = "Copy failed";
-      }
-    });
-    return button;
   }
 
   function renderLeanPaneError(error) {

@@ -12,13 +12,13 @@ import {
   formatBreakageAttribution,
   formatDependentOutcome,
   formatDependentsImpact,
-  formatRepairConfirmation,
   formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
   hasInProgressItems,
   highlightLeanLine,
   overlayActiveTex,
+  paneItemActions,
   paneItemToEditTarget,
   paneItemToFormalizeTarget,
   deriveShareControls,
@@ -129,6 +129,67 @@ test("canViewPaneItemInLeaUi requires a target identity and a real run or artifa
   // Without a declaration name or label the session can't be resolved.
   assert.equal(canViewPaneItemInLeaUi({ status: "valid" }), false);
   assert.equal(canViewPaneItemInLeaUi(undefined), false);
+});
+
+test("paneItemActions puts Formalize primary with Stub in the overflow for an unformalized theorem", () => {
+  const item = { formalizable: true, inProgress: false, status: "missing-stub", leanKind: "theorem", label: "thm:main" };
+  const actions = paneItemActions(item);
+  assert.deepEqual(actions.primary, { id: "formalize", label: "Formalize" });
+  assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat"]);
+  assert.deepEqual(actions.overflow.map((action) => action.id), ["stub"]);
+});
+
+test("paneItemActions promotes Repair over Re-formalize on a broken item and keeps both reachable", () => {
+  const item = {
+    formalizable: true,
+    inProgress: false,
+    status: "invalid",
+    leanKind: "theorem",
+    label: "thm:dep",
+    leanDeclarationName: "dep_theorem",
+    leanArtifactContent: "theorem dep_theorem : True := by trivial",
+    breakage: { upstreamLabel: "upstream", via: "edit" }
+  };
+  const actions = paneItemActions(item);
+  assert.equal(actions.primary.id, "repair");
+  // Repair takes the primary slot, but Re-formalize and Edit stay reachable.
+  assert.deepEqual(actions.overflow.map((action) => action.label), ["Re-formalize", "Edit"]);
+  assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
+});
+
+test("paneItemActions leaves a settled valid item with no primary action", () => {
+  const item = {
+    formalizable: true,
+    inProgress: false,
+    status: "valid",
+    leanKind: "theorem",
+    label: "thm:main",
+    leanDeclarationName: "main_theorem",
+    leanArtifactContent: "theorem main_theorem : True := by trivial"
+  };
+  const actions = paneItemActions(item);
+  assert.equal(actions.primary, null);
+  assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
+  assert.deepEqual(actions.overflow.map((action) => action.id), ["edit"]);
+});
+
+test("paneItemActions suppresses state-changing actions while the item is being edited or running", () => {
+  const broken = {
+    formalizable: true,
+    inProgress: false,
+    status: "invalid",
+    label: "thm:x",
+    leanArtifactContent: "theorem x : True := by trivial",
+    breakage: { upstreamLabel: "up", via: "edit" }
+  };
+  const whileEditing = paneItemActions(broken, { editing: true });
+  assert.equal(whileEditing.primary, null);
+  assert.deepEqual(whileEditing.overflow, []);
+
+  const running = paneItemActions({ formalizable: true, inProgress: true, status: "in-progress", label: "thm:x" });
+  assert.equal(running.primary, null);
+  assert.deepEqual(running.overflow, []);
+  assert.deepEqual(running.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
 });
 
 test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item", () => {
@@ -413,21 +474,6 @@ test("formatBreakageAttribution distinguishes self-break, rename, suppression, a
     formatBreakageAttribution({ upstreamLabel: "a", classificationKind: "signature", via: "formalize" }),
     "Broken by a re-formalization to a."
   );
-});
-
-test("formatRepairConfirmation names the items, the upstream change, the model, and the run count", () => {
-  const text = formatRepairConfirmation({
-    items: [{ targetLabel: "b" }, { targetLabel: "c" }],
-    breakage: { upstreamLabel: "a", classificationKind: "renamed", renamedFrom: "a", renamedTo: "a2" },
-    modelLabel: "GPT-5"
-  });
-  assert.match(text, /Repair 2 items with Lea: b, c\./);
-  assert.match(text, /`a` was renamed to `a2`/);
-  assert.match(text, /2 agent runs with GPT-5/);
-
-  // no model label -> generic copy, never an empty "with"
-  const fallback = formatRepairConfirmation({ items: [{ targetLabel: "b" }], breakage: null });
-  assert.match(fallback, /1 agent run with the configured Lea model/);
 });
 
 test("formatRepairOutcome covers every batch item state", () => {
