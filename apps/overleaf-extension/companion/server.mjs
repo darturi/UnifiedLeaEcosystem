@@ -1177,6 +1177,25 @@ function findLatestJobWithLeaSessionByDeclarationName(jobs, projectSlug, declara
     .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
 }
 
+// Rename bookkeeping: `job.declarationName` caches "what Lean symbol does this
+// item's working file currently define" -- and an item has ONE working file,
+// so every job record under its key must agree. Updating only the newest
+// session-linked job (as this used to) left older records stale, and any
+// status reader that resolves through one of those (getTheoremStatus's
+// newest-terminal branch reads the formalize job even when a repair job is
+// newer) then hunted the session history for the OLD name and served a
+// pre-rename snapshot as the item's artifact.
+function recordRenamedDeclaration(jobs, jobKey, newName) {
+  let changed = false;
+  for (const job of Object.values(jobs || {})) {
+    if (job && job.jobKey === jobKey && job.declarationName !== newName) {
+      job.declarationName = newName;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 export async function handleLeanPaneEditStart(payload, state) {
   const validation = validateEditPayload(payload);
   if (!validation.ok) return errorResponse(400, validation.error, validation.message);
@@ -1321,19 +1340,19 @@ export async function handleLeanPaneEditSave(payload, state) {
 
   // The pane's own item identity (`targetLabel`) stays pinned to the LaTeX
   // marker's label=... forever -- that's correct, it's the doc-side anchor.
-  // But `linkedJob.declarationName` is a *cache* of "what Lean symbol does
-  // this session's file currently define," taken at formalize time, and nothing
-  // refreshed it on a manual rename until now. Everything that reads it
-  // (buildJobResponse, getLatestMappedJobStatus, and -- the concrete bug this
-  // fixes -- readLeanPaneArtifactFromSession's "does the latest step still
-  // contain this name" filter) was still searching for the OLD name after a
-  // rename, so the item's displayed artifact silently fell back to the last
-  // code_step that matched it: a stale, pre-rename snapshot, even though the
-  // real file on disk (and the session's actual latest code_step) already had
-  // the rename. Updating it here keeps every downstream reader looking for the
-  // name that's actually in the file now.
+  // But `declarationName` is a *cache* of "what Lean symbol does this
+  // session's file currently define," taken at formalize time. Everything
+  // that reads it (buildJobResponse, getLatestMappedJobStatus,
+  // readLeanPaneArtifactFromSession's "does the latest step still contain
+  // this name" filter) must see the name that's actually in the file now, or
+  // the item's displayed artifact silently falls back to the last code_step
+  // matching the OLD name: a stale, pre-rename snapshot. Updated on EVERY job
+  // under the item's key (recordRenamedDeclaration), not just linkedJob --
+  // status derivation can resolve through an older job than the newest
+  // session-linked one (e.g. the original formalize job after a repair).
   if (classification.kind === "renamed" && linkedJob) {
     linkedJob.declarationName = classification.to;
+    recordRenamedDeclaration(state.jobs, linkedJob.jobKey, classification.to);
     jobsChanged = true;
   }
 
@@ -1504,6 +1523,7 @@ async function runPostRunCascade({ state, overleafProjectId, targetLabel, snapsh
   // every declarationName reader has the same stale-cache bug otherwise.
   if (classification.kind === "renamed" && ownJob && ownJob.declarationName !== classification.to) {
     ownJob.declarationName = classification.to;
+    recordRenamedDeclaration(state.jobs, ownJob.jobKey, classification.to);
     jobsChanged = true;
   }
 
@@ -4787,6 +4807,7 @@ async function getTheoremStatus({
   });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
   const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
+  const repairedJob = findLatestJob(jobs, target.jobKey, "repaired");
   const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
   const needsReviewJob = findLatestJob(jobs, target.jobKey, "needs_review");
 
@@ -4824,8 +4845,16 @@ async function getTheoremStatus({
   // `needs_review` re-run (and the disproved branch had the same omission).
   // Ties resolve in favor of the more definitive status, in the list order
   // below -- matching the old `>=` guards' behavior.
+  // A verified repair (`repaired`, rebuild-checked in runLeaRepairJob) is as
+  // terminal as `formalized` -- and after an item is repaired it is the job
+  // carrying the item's CURRENT declarationName (the rename bookkeeping
+  // writes to the newest session-linked job). Leaving it out of this list
+  // made status fall back to the older formalize job, whose stale
+  // declarationName then steered the pane's artifact lookup onto a
+  // pre-rename snapshot.
   const terminalCandidates = [
     { job: formalizedJob, status: "formalized" },
+    { job: repairedJob, status: "formalized" },
     { job: needsReviewJob, status: "needs_review" },
     { job: disprovedJob, status: "disproved" },
     { job: failedJob, status: "failed" }

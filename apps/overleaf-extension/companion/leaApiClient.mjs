@@ -372,7 +372,10 @@ export async function streamApiRun({
     return { ok: false, error: `Could not open run event stream: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (!response?.ok || !response.body) {
-    return { ok: false, error: `Run event stream returned HTTP ${response?.status ?? "?"}.` };
+    // httpStatus lets the caller tell a transient rejection apart from a real
+    // failure — 409 means the adapter's single-run slot is held by another run
+    // (see runApiProofJob's re-attach loop), not that this run's proof failed.
+    return { ok: false, httpStatus: response?.status ?? null, error: `Run event stream returned HTTP ${response?.status ?? "?"}.` };
   }
 
   let doneStatus = null;
@@ -426,6 +429,35 @@ export async function streamApiRun({
   };
 }
 
+// Resolve to true after ms, or false immediately if/when the signal aborts —
+// so a queued run reacts to its timeout mid-wait instead of after the delay.
+function waitBeforeRetry(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    // Deliberately NOT unref'd: this delay gates forward progress (the next
+    // attach attempt), so it must keep the event loop alive to fire.
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
+
+// Read one run's { status, result_kind, result_detail } off the session detail.
+// Best-effort: null when the adapter or the row can't be reached.
+async function fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId, runId }) {
+  if (!sessionId) return null;
+  const detail = await fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId });
+  if (!detail.ok || !detail.body) return null;
+  const runs = Array.isArray(detail.body.runs) ? detail.body.runs : [];
+  return runs.find((r) => r && r.id === runId) || null;
+}
+
 // High-level: start a run and drive it to completion, returning the shape the
 // companion orchestration consumes:
 // { ok, timedOut, apiRunId, error, usage, costUsd }.
@@ -437,6 +469,7 @@ export async function runApiProofJob({
   sessionId = null,
   maxTurns = null,
   timeoutMs = 900000,
+  busyRetryDelayMs = 3000,
   autoApprove = true,
   autonomous = true,
   projectSlug = null,
@@ -471,12 +504,48 @@ export async function runApiProofJob({
   }, Math.max(1, timeoutMs));
   if (typeof timer.unref === "function") timer.unref();
 
+  // The adapter runs one prover job at a time and only *starts* a run when its
+  // event stream is first attached, so a 409 on the attach means "the single-run
+  // slot is held by another run" — NOT that this run failed. The created run
+  // stays `pending` adapter-side and is perfectly startable later, so wait and
+  // re-attach until the slot frees (bounded by the timeout timer above). A 409
+  // can also mean "run already completed" (something else saw it through), so
+  // consult the run row to pick retry vs. resolve — never fail on 409 alone.
   let outcome;
+  let loggedBusyWait = false;
   try {
-    outcome = await streamApiRun({
-      fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
-      signal: abort.signal, onEvent, onProgressUpdated,
-    });
+    for (;;) {
+      outcome = await streamApiRun({
+        fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
+        signal: abort.signal, onEvent, onProgressUpdated,
+      });
+      if (outcome.ok || outcome.aborted || outcome.httpStatus !== 409) break;
+
+      const row = await fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId: newSessionId, runId });
+      const rowStatus = String(row?.status || "").toLowerCase();
+      if (rowStatus && rowStatus !== "pending" && rowStatus !== "running") {
+        // Terminal without us attached: adopt the run row's outcome as if it
+        // had arrived on a `done` event.
+        const ok = SUCCESS_DONE_STATUS.has(rowStatus);
+        outcome = {
+          ok,
+          doneStatus: rowStatus,
+          resultKind: String(row.result_kind || rowStatus).toLowerCase() || null,
+          resultDetail: typeof row.result_detail === "string" ? row.result_detail : null,
+          error: ok ? null : `Lea run ended with status: ${rowStatus}`,
+        };
+        break;
+      }
+
+      if (!loggedBusyWait) {
+        loggedBusyWait = true;
+        await log("[backend] Lea adapter is busy (another run is active); waiting for the run slot...\n");
+      }
+      if (!(await waitBeforeRetry(busyRetryDelayMs, abort.signal))) {
+        outcome = { ok: false, aborted: true, error: "Run stream aborted." };
+        break;
+      }
+    }
   } finally {
     clearTimeout(timer);
   }

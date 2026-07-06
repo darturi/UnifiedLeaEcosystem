@@ -200,3 +200,49 @@ def test_run_events_rejects_when_a_different_run_is_active(tmp_path, monkeypatch
         assert exc.value.status_code == 409
     finally:
         bridge._set_active_run_id(None)
+
+
+def test_interrupt_pending_run_with_no_runner_fails_it_directly(tmp_path, monkeypatch):
+    """A pending run nobody is driving (created by POST /api/runs but its events
+    stream never attached — e.g. its client gave up waiting for the single-run
+    slot) has no runner to read a stop flag: interrupt must fail it directly so
+    the session's derived status doesn't show 'thinking' forever."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _patch_config(monkeypatch, tmp_path)
+
+    started = runs_route.create_run(RunRequest(message="prove it", autonomous=True))
+    run_id = started["run_id"]
+
+    bridge._set_active_run_id("some-other-run")
+    try:
+        result = runs_route.interrupt_run(run_id)
+    finally:
+        bridge._set_active_run_id(None)
+
+    assert result == {"status": "interrupted"}
+    run = store.get_run(run_id)
+    assert run["status"] == "failed"
+    assert run["result_kind"] == "failed"
+    assert "before the run started" in run["result_detail"]
+
+
+def test_interrupt_pending_run_being_driven_stays_cooperative(tmp_path, monkeypatch):
+    """When the pending run IS the slot holder (its runner just hasn't flipped it
+    to running yet), interrupt keeps the cooperative-stop path: flag set, status
+    left for the runner to finalize."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _patch_config(monkeypatch, tmp_path)
+
+    started = runs_route.create_run(RunRequest(message="prove it", autonomous=True))
+    run_id = started["run_id"]
+
+    bridge._set_active_run_id(run_id)
+    try:
+        result = runs_route.interrupt_run(run_id)
+    finally:
+        bridge._set_active_run_id(None)
+
+    assert result == {"status": "interrupting"}
+    assert store.get_run(run_id)["status"] == "pending"

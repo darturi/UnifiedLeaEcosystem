@@ -143,6 +143,18 @@ def interrupt_run(run_id: str) -> dict:
     if run["status"] not in {"pending", "running"}:
         raise HTTPException(status_code=409, detail="Run is not active")
     request_stop(run_id)
+    # A `pending` run that no runner is driving (created by POST /api/runs but its
+    # events stream never attached — e.g. its client gave up waiting for the
+    # single-run slot) has nothing to read the stop flag; fail it directly so the
+    # session's derived status doesn't show 'thinking' forever. The flag was still
+    # set above: if a runner thread does exist but hasn't claimed the slot yet
+    # (it queues on active_run_lock before _set_active_run_id), it adopts the
+    # pre-set flag (D18), stops cooperatively, and overwrites this status with
+    # its own terminal one.
+    if run["status"] == "pending" and bridge.current_active_run_id() != run_id:
+        store.update_run(run_id, "failed", result_kind="failed",
+                         result_detail="Interrupted before the run started.")
+        return {"status": "interrupted"}
     return {"status": "interrupting"}
 
 

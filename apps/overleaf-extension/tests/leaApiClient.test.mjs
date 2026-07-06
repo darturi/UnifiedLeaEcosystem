@@ -228,3 +228,139 @@ test("runApiProofJob: a run_error frame surfaces as the failure reason", async (
   assert.equal(result.ok, false);
   assert.match(result.error, /already active/);
 });
+
+// --- single-run-slot queueing -------------------------------------------------
+// The adapter starts a run only when its event stream first attaches, and 409s
+// the attach while another run holds the single-run slot. That is "wait your
+// turn", not "the proof failed": the client must keep the created run and
+// re-attach until the slot frees.
+
+test("runApiProofJob: 409 on stream attach while the run is still pending → waits and re-attaches", async () => {
+  let eventsCalls = 0;
+  const logLines = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-q", run_id: "run-q" });
+    }
+    if (url.includes("/api/runs/run-q/events")) {
+      eventsCalls += 1;
+      if (eventsCalls <= 2) {
+        return jsonResponse({ detail: "Another Lea run is already active." }, false, 409);
+      }
+      return sseResponse([frame("done", { status: "proved" })]);
+    }
+    if (url.includes("/api/sessions/sess-q")) {
+      return jsonResponse({ runs: [{ id: "run-q", status: "pending", input_tokens: 5, output_tokens: 3, cost_usd: 0.001 }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize queued",
+    timeoutMs: 5000,
+    busyRetryDelayMs: 5,
+    appendLog: async (_path, line) => logLines.push(line),
+    logPath: "/dev/null",
+  });
+
+  assert.equal(eventsCalls, 3);
+  assert.equal(result.ok, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.doneStatus, "proved");
+  assert.ok(logLines.some((l) => l.includes("waiting for the run slot")));
+});
+
+test("runApiProofJob: 409 but the run row is already terminal → adopts that outcome, no retry loop", async () => {
+  let eventsCalls = 0;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-t", run_id: "run-t" });
+    }
+    if (url.includes("/api/runs/run-t/events")) {
+      eventsCalls += 1;
+      return jsonResponse({ detail: "Run has already completed" }, false, 409);
+    }
+    if (url.includes("/api/sessions/sess-t")) {
+      return jsonResponse({ runs: [{ id: "run-t", status: "failed", result_kind: "failed", result_detail: "Interrupted before the run started." }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize terminal",
+    timeoutMs: 5000,
+    busyRetryDelayMs: 5,
+  });
+
+  assert.equal(eventsCalls, 1);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.doneStatus, "failed");
+  assert.equal(result.resultDetail, "Interrupted before the run started.");
+  assert.match(result.error, /failed/);
+});
+
+test("runApiProofJob: still queued at the deadline → times out and interrupts the pending run", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET" });
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-w", run_id: "run-w" });
+    }
+    if (url.includes("/api/runs/run-w/interrupt")) {
+      return jsonResponse({ status: "interrupted" });
+    }
+    if (url.includes("/api/runs/run-w/events")) {
+      return jsonResponse({ detail: "Another Lea run is already active." }, false, 409);
+    }
+    if (url.includes("/api/sessions/sess-w")) {
+      return jsonResponse({ runs: [{ id: "run-w", status: "pending" }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize starved",
+    timeoutMs: 40,
+    busyRetryDelayMs: 5,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.ok(calls.some((c) => c.url.includes("/api/runs/run-w/interrupt") && c.method === "POST"));
+});
+
+test("runApiProofJob: a non-409 stream failure still fails immediately (no retry)", async () => {
+  let eventsCalls = 0;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-e", run_id: "run-e" });
+    }
+    if (url.includes("/api/runs/run-e/events")) {
+      eventsCalls += 1;
+      return jsonResponse({ detail: "boom" }, false, 500);
+    }
+    if (url.includes("/api/sessions/sess-e")) {
+      return jsonResponse({ runs: [{ id: "run-e", status: "pending" }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize broken",
+    timeoutMs: 5000,
+    busyRetryDelayMs: 5,
+  });
+
+  assert.equal(eventsCalls, 1);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /HTTP 500/);
+});

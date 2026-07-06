@@ -739,6 +739,29 @@ def update_run(
         )
 
 
+def fail_stale_active_runs() -> int:
+    """Crash recovery, called once at startup: any run still `pending`/`running`
+    in the DB has no live runner thread (they died with the previous process), so
+    mark it failed. Without this, a run created but never driven — e.g. its client
+    gave up while queued for the single-run slot — sits `pending` forever and the
+    derived session status (D14) shows an eternal 'thinking'. Returns the count."""
+    now = utc_now()
+    detail = "Run did not finish: the adapter restarted (or the run was never started) before it completed."
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            update runs
+            set status = 'failed',
+                result_kind = coalesce(result_kind, 'failed'),
+                result_detail = coalesce(result_detail, ?),
+                updated_at = ?
+            where status in ('pending', 'running')
+            """,
+            (detail, now),
+        )
+        return cursor.rowcount
+
+
 def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
     now = utc_now()
     with connect() as conn:

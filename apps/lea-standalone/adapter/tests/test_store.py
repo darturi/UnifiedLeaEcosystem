@@ -523,3 +523,34 @@ def test_latest_agent_code_step_and_edit_notes_since(tmp_path, monkeypatch):
     assert store.edit_notes_since(session["id"], agent_step["seq"]) == ["swapped a lemma"]
     # nothing after a later position
     assert store.edit_notes_since(session["id"], 9999) == []
+
+
+def test_fail_stale_active_runs_reaps_only_active_rows(tmp_path, monkeypatch):
+    """Startup crash recovery: pending/running run rows have no live runner after
+    a restart (or were never started at all — e.g. their client gave up waiting
+    for the single-run slot), so they flip to failed; terminal rows are untouched.
+    Without this, the derived session status shows 'thinking' forever."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Reap me")
+    orphaned_pending = store.create_run(session["id"], "m", None, 3)
+    interrupted_running = store.create_run(session["id"], "m", None, 3)
+    store.update_run(interrupted_running["id"], "running")
+    finished = store.create_run(session["id"], "m", None, 3)
+    store.update_run(finished["id"], "needs_review", result_kind="needs_review",
+                     result_detail="NEEDS_REVIEW")
+
+    assert store.fail_stale_active_runs() == 2
+
+    assert store.get_run(orphaned_pending["id"])["status"] == "failed"
+    assert store.get_run(orphaned_pending["id"])["result_kind"] == "failed"
+    reaped_running = store.get_run(interrupted_running["id"])
+    assert reaped_running["status"] == "failed"
+    assert "restarted" in reaped_running["result_detail"]
+    # the finished run keeps its real outcome
+    survivor = store.get_run(finished["id"])
+    assert survivor["status"] == "needs_review"
+    assert survivor["result_detail"] == "NEEDS_REVIEW"
+
+    # idempotent: nothing left to reap
+    assert store.fail_stale_active_runs() == 0

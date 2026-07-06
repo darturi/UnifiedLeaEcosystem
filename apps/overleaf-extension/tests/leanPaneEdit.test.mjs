@@ -271,10 +271,10 @@ test("edit save: a signature edit cascades and reports a broken dependent, attri
   assert.equal(state.jobs.a.declarationName, undefined);
 });
 
-test("edit save: a rename updates the job's cached declarationName, not just the classification", async () => {
+test("edit save: a rename updates the cached declarationName on EVERY job under the item's key", async () => {
   // Regression test for a bug found live: the pane's item identity
   // (targetLabel) correctly stays pinned to the LaTeX marker's label=...
-  // forever, but linkedJob.declarationName is a *cache* of "what Lean symbol
+  // forever, but job.declarationName is a *cache* of "what Lean symbol
   // this session's file currently defines," taken once at formalize time.
   // Nothing refreshed it on a manual rename, so readLeanPaneArtifactFromSession
   // (which selects the latest code_step whose content still contains
@@ -282,6 +282,13 @@ test("edit save: a rename updates the job's cached declarationName, not just the
   // item's own displayed code block silently stayed stale even though the
   // rename itself, and the cascade break on its dependent, were both detected
   // and reported correctly. See docs/FEATURE-overleaf-lean-pane-manual-edit.md.
+  //
+  // Second live round of the same bug: updating only the NEWEST session-linked
+  // job left older records under the same key stale. After the item had been
+  // repaired, the rename landed on the repair job while getTheoremStatus's
+  // newest-terminal branch resolved through the original formalize job -- so
+  // the artifact lookup went hunting for the old name again. All jobs under
+  // the key describe the same one working file; they must all agree.
   const leaRepo = await makeLeaRepo();
   await writeProof(
     leaRepo,
@@ -291,7 +298,12 @@ test("edit save: a rename updates the job's cached declarationName, not just the
   const calls = [];
   const state = makeState({
     leaRepo,
-    jobs: { a: editedJob({ declarationName: "compactness_criterion" }), b: dependentJob() },
+    jobs: {
+      // the older formalize run for the same item -- must be renamed too
+      a0: editedJob({ declarationName: "compactness_criterion", finishedAt: "2026-01-01T00:00:00.000Z" }),
+      a: editedJob({ declarationName: "compactness_criterion", finishedAt: "2026-01-02T00:00:00.000Z" }),
+      b: dependentJob()
+    },
     fetchImpl: makeEditFetch(calls, {
       sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
       writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
@@ -320,9 +332,13 @@ test("edit save: a rename updates the job's cached declarationName, not just the
   assert.equal(res.body.ownResult.classification.from, "compactness_criterion");
   assert.equal(res.body.ownResult.classification.to, "compactness_thm");
 
-  // the actual fix: the job's cached identity now matches the file's real,
-  // current declaration -- not what it was when first formalized
+  // the actual fix: the cached identity now matches the file's real, current
+  // declaration -- not what it was when first formalized -- on every job
+  // record for this item, not just the newest session-linked one
   assert.equal(state.jobs.a.declarationName, "compactness_thm");
+  assert.equal(state.jobs.a0.declarationName, "compactness_thm");
+  // the dependent's own cache is a different item's file -- untouched
+  assert.equal(state.jobs.b.declarationName, undefined);
 
   // unaffected by the fix: the pane's own identity for this item stays pinned
   // to the LaTeX label, so the cascade impact on the dependent is still

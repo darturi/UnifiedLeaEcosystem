@@ -1426,6 +1426,61 @@ test("in-progress status links Lea UI session from leaSessionId (no recorder)", 
   assert.equal(statuses.body.statuses["theorem:in_progress_test"].leaSessionUrl, "http://localhost:5173/?session=sess-running");
 });
 
+test("a newer repaired job is terminal evidence: its declarationName beats the older formalize job's stale cache", async () => {
+  // Live bug: rename bookkeeping writes the item's current declarationName to
+  // its job records, but status derivation's terminal-candidate list didn't
+  // include `repaired` jobs at all. With no file evidence (no markdown entry,
+  // no conventional proof file), status fell back to the OLDER formalize job,
+  // whose stale declarationName then steered the pane's session-artifact
+  // lookup onto the newest pre-rename snapshot -- the item displayed code it
+  // had before the rename, while the editor (which reads the newest
+  // session-linked job) showed the renamed file.
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const base = {
+    jobKey: "project-1:theorem:renamed_after_repair",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetLabel: "renamed_after_repair",
+    leaSessionId: "sess-repair-rename",
+    leaUiBaseUrl: "http://localhost:5173"
+  };
+  state.jobs.formalize_run = {
+    ...base,
+    jobId: "formalize_run",
+    status: "formalized",
+    declarationName: "renamed_after_repair", // stale: never refreshed by the rename
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+  state.jobs.repair_run = {
+    ...base,
+    jobId: "repair_run",
+    status: "repaired",
+    mode: "repair",
+    declarationName: "renamed_after_repair_v2", // fresh: the rename landed here
+    lastEditCheckStatus: "ok",
+    startedAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:00:01.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{ targetKind: "theorem", targetLabel: "renamed_after_repair", targetText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  const status = statuses.body.statuses["theorem:renamed_after_repair"];
+  // a verified repair reads as formalized, from the repair job itself
+  assert.equal(status.status, "formalized");
+  assert.equal(status.jobId, "repair_run");
+  assert.equal(status.declarationName, "renamed_after_repair_v2");
+});
+
 test("statuses report saved sorry stubs", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
