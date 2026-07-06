@@ -582,6 +582,59 @@ test("lean pane manifest demotes a formalized item to stub-generated when its fi
   assert.equal(fixed.body.items[0].status, "valid");
 });
 
+// The same live report, one recording step earlier: the criterion's verified
+// formalize run never got a recordedProofPath (identifyLeaArtifact located
+// nothing -- the agent skipped self-registering a markdown entry), and no
+// project-markdown entry exists either. Every file-evidence source in
+// getTheoremStatus was keyed off those two records, so the stale-verdict
+// override had NOTHING to consult: a manual `sorry` edit could never demote
+// the chip, while the purely file-derived downstream scan (stubbedUpstreamOf)
+// plainly saw the sorry -- the two surfaces disagreed about the same file.
+// The direct probe now checks the project's conventional namespaced path.
+test("lean pane manifest demotes a stubbed item even when its job recorded no proof path and no markdown entry exists", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  sorry\n");
+  state.jobs.a = {
+    jobId: "a",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    finalStatus: "formalized",
+    resultKind: "proved",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    // deliberately NO recordedProofPath / moduleName -- the run was verified
+    // but nothing file-linked was ever recorded
+    lastEditCheckStatus: "ok", // the sorry edit itself compiled (warning only)
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "Every open cover has a finite subcover.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+
+  const withSorry = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(withSorry.statusCode, 200);
+  assert.equal(withSorry.body.items[0].status, "stub-generated");
+
+  // ...and back to valid once the proof is real again, still with no records.
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  trivial\n");
+  const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(fixed.body.items[0].status, "valid");
+});
+
 // The other half of the same report: the DEPENDENT (whose import is now a
 // sorry stub) showed the amber "!" on its document badge but a plain "valid"
 // chip in the pane -- the doc overlay renders statusInfo.stubbedTheoremUses,
@@ -898,6 +951,12 @@ test("records targetSyntax on the job for telemetry, defaulting to comment", asy
     // no syntax field
   }, defaultState);
   assert.equal(defaultState.jobs[defaultResult.body.jobId].targetSyntax, "comment");
+  // Snapshot NOW, at the same just-created lifecycle point the tag job will
+  // be snapshotted at -- the run continues in the background and starts
+  // mutating the job (leaSessionId, apiRunId, ...) while the second
+  // state/formalize is being set up, so a deferred snapshot races against
+  // run progress.
+  const defaultJob = { ...defaultState.jobs[defaultResult.body.jobId] };
 
   const tagState = await makeState({
     leaRepoPath: leaRepo,
@@ -912,14 +971,13 @@ test("records targetSyntax on the job for telemetry, defaulting to comment", asy
     syntax: "tag"
   }, tagState);
   assert.equal(tagState.jobs[tagResult.body.jobId].targetSyntax, "tag");
+  const tagJob = { ...tagState.jobs[tagResult.body.jobId] };
 
   // Identity (jobKey) and every field that reaches the prompt are unaffected
   // by syntax -- a tag-sourced and comment-sourced target with the same
   // targetKind/targetLabel/targetText/targetUses/targetContext produce
   // identical jobs apart from this one telemetry field and the inputs that
   // differ by construction (jobId/timestamps/label/jobKey/hash).
-  const defaultJob = { ...defaultState.jobs[defaultResult.body.jobId] };
-  const tagJob = { ...tagState.jobs[tagResult.body.jobId] };
   for (const key of ["jobId", "jobKey", "targetLabel", "targetSyntax", "targetTextHash", "startedAt", "logPath", "absolutePath", "relativePath", "declarationName"]) {
     delete defaultJob[key];
     delete tagJob[key];
@@ -1567,6 +1625,102 @@ test("formalize maps an Overleaf label to the Lean artifact Lea records", async 
     assert.equal(status.declarationName, "even_square_of_even");
     assert.equal(status.recordedProofPath, proofPath);
     assert.equal(status.leanStatement, "theorem even_square_of_even : True");
+  } finally {
+    restorePath();
+  }
+});
+
+// Root of the "manual sorry edit never demoted the chip" report: a verified
+// run where the agent never self-registered a project-markdown entry recorded
+// NO recordedProofPath/moduleName on the job and NO markdown entry -- leaving
+// the target with a terminal verdict and no file link at all. The finalizer
+// must backfill both from the file evidence that IS there (here: the direct
+// probe of the project's conventional proof path).
+test("a verified run that never self-registered still records proof path, module, and markdown entry", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  const restorePath = await installFakeLake();
+  try {
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          // the proof file lands on disk, but NO markdown entry is written --
+          // identifyLeaArtifact has nothing to diff
+          await writeLeaProjectProof(
+            leaRepo,
+            proofPath,
+            "theorem compactness_criterion : True := by\n  trivial\n"
+          );
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      targetText: "Every open cover has a finite subcover."
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    const job = state.jobs[result.body.jobId];
+    assert.equal(job.recordedProofPath, proofPath);
+    assert.equal(job.moduleName, "Lea.Project1.compactness_criterion");
+    const markdown = await fs.readFile(path.join(leaRepo, "workspace", "projects", "project-1.md"), "utf8");
+    assert.match(markdown, /lea:theorem name="compactness_criterion"/);
+  } finally {
+    restorePath();
+  }
+});
+
+// Same unregistered-artifact gap, but the agent picked a file name that does
+// not match the Overleaf label -- the conventional-path probe can't see it, so
+// the recovery must locate the file via the session's code_steps (previously
+// this recovery ran only for needs_review exits, never for verified runs).
+test("a verified unregistered run whose file name differs from the label is recovered via the session's code_steps", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "even_square_of_even.lean");
+  const code = "theorem even_square_of_even : True := by\n  trivial\n";
+  const restorePath = await installFakeLake();
+  try {
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        sessionBody: {
+          project_namespace: "Lea.Project1",
+          code_steps: [{ path: "even_square_of_even.lean", seq: 1, code }]
+        },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, proofPath, code);
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "epsilon_one",
+      targetText: [
+        "Theorem name: even_square_of_even",
+        "Lean signature:",
+        "theorem even_square_of_even : True := by"
+      ].join("\n")
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    const job = state.jobs[result.body.jobId];
+    assert.equal(job.declarationName, "even_square_of_even");
+    assert.equal(job.recordedProofPath, proofPath);
+    assert.equal(job.moduleName, "Lea.Project1.even_square_of_even");
+    const markdown = await fs.readFile(path.join(leaRepo, "workspace", "projects", "project-1.md"), "utf8");
+    assert.match(markdown, /lea:theorem name="even_square_of_even"/);
   } finally {
     restorePath();
   }
@@ -2890,7 +3044,10 @@ function makeLeaApiFetch(calls, options = {}) {
           input_tokens: usage.input_tokens || 0,
           output_tokens: usage.output_tokens || 0,
           cost_usd: options.statusBody?.result?.cost || 0
-        }]
+        }],
+        // extra session-detail fields (project_namespace, code_steps) for
+        // tests that exercise the unregistered-artifact session recovery
+        ...(options.sessionBody || {})
       });
     }
     if (String(url).endsWith("/interrupt")) {

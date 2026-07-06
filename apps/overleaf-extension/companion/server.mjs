@@ -3470,10 +3470,12 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
   // exit.ok and no leftover sorry: the adapter passed its own final verification,
   // so the theorem IS formalized. Run a local lean check for diagnostics only
   // when we happened to locate the proof file — a missing or failing local
-  // toolchain must NOT downgrade a run the adapter already verified.
+  // toolchain must NOT downgrade a run the adapter already verified. The
+  // session-recovery path attaches its already-run check as `local.leanCheck`;
+  // reuse it rather than paying for a second compile of the same file.
   let leanCheck = null;
   if (local.status === "formalized" && local.absolutePath) {
-    leanCheck = await runLeanCheck(job.leaWorkspacePath, local.absolutePath);
+    leanCheck = local.leanCheck || await runLeanCheck(job.leaWorkspacePath, local.absolutePath);
   }
   const effectiveStatus = local.status === "formalized" ? local : { ...local, status: "formalized" };
   return {
@@ -3645,16 +3647,24 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     })
     : status;
 
-  // needs_review recovery: markdown-diffing (identifyLeaArtifact, above) found
-  // nothing, most likely because the agent skipped self-registering a result
-  // it wasn't confident in. Check the target's own expected proof path
-  // directly instead -- if it's there, sorry-free, and genuinely compiles,
-  // there's real evidence to promote on, so record it the same way a located
-  // artifact normally would be (job fields + the project markdown entry the
-  // agent itself didn't write), rather than leaving this run's outcome stuck
-  // on "no local evidence found" forever.
+  // Recovery when markdown-diffing (identifyLeaArtifact, above) found nothing
+  // because the agent skipped self-registering its result -- which happens
+  // both on needs_review runs (not confident enough to self-report) and on
+  // fully verified runs (it simply never wrote the markdown entry). Locate
+  // the file the session actually wrote instead -- if it's there, sorry-free,
+  // and genuinely compiles, there's real evidence to record the same way a
+  // located artifact normally would be (job fields + the project markdown
+  // entry the agent itself didn't write). Without this, a verified run left a
+  // job with NO recordedProofPath and a markdown with NO entry: the target
+  // then had no file-linked evidence at all, so a later manual edit that put
+  // a `sorry` back could never demote the cached "formalized" verdict.
+  // `artifact.error` (ambiguous candidates) is excluded: that run is recorded
+  // as failed rather than guessed at, and must not upsert markdown either.
   let effectiveLocalStatus = localStatus;
-  if (exitResultKind === "needs_review" && localStatus.status === "unformalized") {
+  if (
+    (exitResultKind === "needs_review" || (exit.ok && !artifact?.error)) &&
+    localStatus.status === "unformalized"
+  ) {
     const recovered = await recoverFormalizedStatusFromTargetPath({ state, job, target });
     if (recovered) {
       // Carry the recovery's already-run, already-passing lean check along so
@@ -3672,12 +3682,41 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
         moduleName: recovered.status.moduleName,
         signature: recovered.status.leanStatement || "",
         description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
-        solvingProcess: "Lea flagged its own result as needs_review; an independent lean_check on the emitted file found it compiles cleanly with no sorry/admit, so it was recorded as a verified proof."
+        solvingProcess: exitResultKind === "needs_review"
+          ? "Lea flagged its own result as needs_review; an independent lean_check on the emitted file found it compiles cleanly with no sorry/admit, so it was recorded as a verified proof."
+          : "Lea verified the run but did not self-register a project markdown entry; the emitted file was located via the session's recorded steps, compiles cleanly, and contains no sorry/admit."
       });
     }
   }
 
   const outcome = await resolveProofOutcome({ job, localStatus: effectiveLocalStatus, exit, artifactError: artifact?.error || null });
+  // The other unregistered-artifact shape: the artifact was never located via
+  // markdown or the session, but the direct file probe (getLeaDirectProofStatus,
+  // via the localStatus chain above) already pinpointed the recorded file at
+  // the project's conventional proof path. Persist the same three job fields
+  // + markdown entry a located artifact records, so the target doesn't end up
+  // with a terminal verdict and no file link.
+  if (
+    outcome.jobStatus === "formalized" &&
+    !artifact?.ok &&
+    !job.recordedProofPath &&
+    outcome.effectiveStatus?.recordedProofPath
+  ) {
+    const evidence = outcome.effectiveStatus;
+    job.declarationName = evidence.declarationName || job.declarationName;
+    job.recordedProofPath = evidence.recordedProofPath;
+    job.moduleName = evidence.moduleName || null;
+    await upsertProjectTheoremEntry({
+      projectMarkdownPath: target.projectMarkdownPath,
+      projectId: target.projectSlug,
+      theoremName: job.declarationName,
+      proofPath: job.recordedProofPath,
+      moduleName: job.moduleName,
+      signature: evidence.leanStatement || "",
+      description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
+      solvingProcess: "Lea's run passed final verification but did not self-register a project markdown entry; the recorded file was found at the project's conventional proof path with no sorry/admit."
+    });
+  }
   if (outcome.leanCheck) {
     job.leanCheck = outcome.leanCheck;
   }
@@ -5018,47 +5057,70 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   };
 }
 
+// File-derived status straight from where a proof for this target would live
+// on disk, needing NO job record or project-markdown entry to exist. That
+// independence is the point: a verified run whose artifact was never
+// self-registered (identifyLeaArtifact found no new markdown entry) leaves a
+// job with no recordedProofPath and a markdown with no entry -- and then
+// mapped/project status both come up empty, so without this probe
+// getTheoremStatus has NO file evidence at all and a stale job verdict
+// ("formalized") can never be contradicted by the sorry that is actually in
+// the file right now. The namespaced per-project path is where every modern
+// run records its file (D24); the flat workspace/proofs/<name>.lean is the
+// legacy layout, kept as a fallback.
 async function getLeaDirectProofStatus({ leaRepoPath, target }) {
   const declarationName = target.declarationName || target.theoremLabel;
-  const proofPath = path.join("workspace", "proofs", `${declarationName}.lean`);
-  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
-  if (!absolutePath || !existsSync(absolutePath)) {
-    return null;
-  }
+  const stepPath = `${declarationName}.lean`;
+  const namespace = projectNamespaceFromSlug(target.projectSlug);
+  const candidates = [
+    {
+      proofPath: proofPathFromProjectStep({ namespace, stepPath }),
+      moduleName: moduleNameFromProjectStep({ namespace, stepPath })
+    },
+    { proofPath: path.join("workspace", "proofs", stepPath), moduleName: null }
+  ];
 
-  const content = await fs.readFile(absolutePath, "utf8");
-  if (!containsDeclaration(content, declarationName)) {
-    return null;
-  }
+  for (const candidate of candidates) {
+    const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: candidate.proofPath });
+    if (!absolutePath || !existsSync(absolutePath)) {
+      continue;
+    }
+    const content = await fs.readFile(absolutePath, "utf8");
+    if (!containsDeclaration(content, declarationName)) {
+      continue;
+    }
 
-  const responseBase = {
-    targetKind: target.targetKind,
-    targetLabel: target.targetLabel,
-    targetKey: targetKey(target),
-    declarationName,
-    relativePath: proofPath,
-    absolutePath,
-    projectId: target.projectId,
-    projectSlug: target.projectSlug,
-    projectMarkdownPath: target.projectMarkdownPath,
-    recordedProofPath: proofPath,
-    moduleName: null
-  };
+    const responseBase = {
+      targetKind: target.targetKind,
+      targetLabel: target.targetLabel,
+      targetKey: targetKey(target),
+      declarationName,
+      relativePath: candidate.proofPath,
+      absolutePath,
+      projectId: target.projectId,
+      projectSlug: target.projectSlug,
+      projectMarkdownPath: target.projectMarkdownPath,
+      recordedProofPath: candidate.proofPath,
+      moduleName: candidate.moduleName
+    };
 
-  if (/\bsorry\b|admit\b/.test(content)) {
+    if (/\bsorry\b|admit\b/.test(content)) {
+      return {
+        status: "sorry_stub",
+        ...responseBase,
+        leanStatement: extractLeanStatement(content, declarationName)
+      };
+    }
+
     return {
-      status: "sorry_stub",
+      status: "formalized",
       ...responseBase,
+      resultKind: target.targetKind === "definition" ? "defined" : "proved",
       leanStatement: extractLeanStatement(content, declarationName)
     };
   }
 
-  return {
-    status: "formalized",
-    ...responseBase,
-    resultKind: target.targetKind === "definition" ? "defined" : "proved",
-    leanStatement: extractLeanStatement(content, declarationName)
-  };
+  return null;
 }
 
 async function getLatestMappedJobStatus({
