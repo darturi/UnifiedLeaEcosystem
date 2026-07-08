@@ -4974,6 +4974,15 @@ async function getTheoremStatus({
   const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
   const activeJob = findActiveJob(jobs, target.jobKey);
 
+  // Valid-before-valid race: while the companion still has a live job, status
+  // must remain in_progress even if the run has already written a valid Lean
+  // file that local evidence can see. Manual edit/save is locked on this same
+  // activeJob, and the Lea UI derives "thinking" from the adapter's active run,
+  // so letting file evidence win here made the pane say "valid" too early.
+  if (activeJob) {
+    return buildJobResponse({ job: activeJob, status: "in_progress", target });
+  }
+
   // A manual edit (or a cascade re-check triggered by editing something this
   // target imports) may have broken a target that would otherwise still read
   // as "formalized" below -- mappedStatus/directProofStatus only re-derive
@@ -4989,7 +4998,7 @@ async function getTheoremStatus({
   // source). getCurrentTheoremProofStatus, used by `uses=` dependency
   // resolution at formalize time, does not yet honor this override -- left
   // as-is for this fix, which is scoped to the pane status chip.
-  if (!activeJob && linkedJob?.lastEditCheckStatus === "error") {
+  if (linkedJob?.lastEditCheckStatus === "error") {
     return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
   }
 
@@ -5004,21 +5013,6 @@ async function getTheoremStatus({
   const repairedJob = findLatestJob(jobs, target.jobKey, "repaired");
   const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
   const needsReviewJob = findLatestJob(jobs, target.jobKey, "needs_review");
-
-  if (activeJob) {
-    if (
-      mappedStatus?.status === "formalized" ||
-      projectStatus?.status === "formalized" ||
-      directProofStatus?.status === "formalized"
-    ) {
-      return withLeaSession(mappedStatus?.status === "formalized"
-        ? mappedStatus
-        : projectStatus?.status === "formalized"
-          ? projectStatus
-          : directProofStatus);
-    }
-    return buildJobResponse({ job: activeJob, status: "in_progress", target });
-  }
 
   if (mappedStatus?.status === "formalized") {
     return withLeaSession(mappedStatus);

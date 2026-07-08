@@ -1059,6 +1059,54 @@ test("lean pane manifest flags in-progress items for live polling", async () => 
   assert.equal(res.body.items[0].inProgress, true);
 });
 
+test("lean pane manifest keeps polling when an active job already has valid proof evidence", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "valid_before_valid_pane.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem valid_before_valid_pane : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "valid_before_valid_pane",
+    proofPath,
+    moduleName: "Lea.Project1.valid_before_valid_pane"
+  });
+  state.jobs.active_with_valid_file = {
+    jobId: "active_with_valid_file",
+    jobKey: "project-1:theorem:valid_before_valid_pane",
+    status: "in_progress",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetLabel: "valid_before_valid_pane",
+    declarationName: "valid_before_valid_pane",
+    leaSessionId: "sess-still-running",
+    leaUiBaseUrl: "http://localhost:5173",
+    leaRepoPath: leaRepo,
+    recordedProofPath: proofPath,
+    moduleName: "Lea.Project1.valid_before_valid_pane",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:valid-before-valid}",
+        "% lea: formalize label=valid_before_valid_pane",
+        "A theorem.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "in-progress");
+  assert.equal(res.body.items[0].inProgress, true);
+});
+
 test("settings clear max spend and reject negative caps", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({
@@ -1465,6 +1513,48 @@ test("in-progress status links Lea UI session from leaSessionId (no recorder)", 
   assert.equal(statuses.body.statuses["theorem:in_progress_test"].status, "in_progress");
   assert.equal(statuses.body.statuses["theorem:in_progress_test"].leaSessionId, "sess-running");
   assert.equal(statuses.body.statuses["theorem:in_progress_test"].leaSessionUrl, "http://localhost:5173/?session=sess-running");
+});
+
+test("active jobs stay in progress even when local proof evidence already looks formalized", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "valid_before_valid.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem valid_before_valid : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "valid_before_valid",
+    proofPath,
+    moduleName: "Lea.Project1.valid_before_valid"
+  });
+  state.jobs.active_with_valid_file = {
+    jobId: "active_with_valid_file",
+    jobKey: "project-1:theorem:valid_before_valid",
+    status: "in_progress",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetLabel: "valid_before_valid",
+    declarationName: "valid_before_valid",
+    leaSessionId: "sess-still-running",
+    leaUiBaseUrl: "http://localhost:5173",
+    leaRepoPath: leaRepo,
+    recordedProofPath: proofPath,
+    moduleName: "Lea.Project1.valid_before_valid",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{ targetKind: "theorem", targetLabel: "valid_before_valid", targetText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  const status = statuses.body.statuses["theorem:valid_before_valid"];
+  assert.equal(status.status, "in_progress");
+  assert.equal(status.leaSessionId, "sess-still-running");
+  assert.equal(status.leaSessionUrl, "http://localhost:5173/?session=sess-still-running");
 });
 
 test("a newer repaired job is terminal evidence: its declarationName beats the older formalize job's stale cache", async () => {
