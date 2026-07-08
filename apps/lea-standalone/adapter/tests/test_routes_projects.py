@@ -11,7 +11,15 @@ from starlette.datastructures import Headers
 from app import db, store
 from app.config import LeaConfig
 from app.routes import projects as projects_route
-from app.routes.projects import DocUpdate, FilePut, ProjectCreate, ProjectUpdate, SessionCreate
+from app.routes.projects import (
+    DocUpdate,
+    FilePut,
+    NamespacePreviewRequest,
+    ProjectCreate,
+    ProjectIdentityUpdate,
+    ProjectUpdate,
+    SessionCreate,
+)
 
 
 def _upload(project_id, filename, data, content_type=None):
@@ -95,6 +103,80 @@ def test_update_edits_title_and_description(tmp_path, monkeypatch):
     assert updated["title"] == "New"
     assert updated["description"] == "now described"
     assert updated["slug"] == project["slug"]  # immutable
+
+
+def test_project_identity_preview_and_display_rename_by_slug(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Old Name"))
+
+    preview = projects_route.namespace_preview(NamespacePreviewRequest(project_name="Fourier Series"))
+    assert preview["namespace"] == "Lea.FourierSeries"
+    assert preview["available"] is True
+
+    identity = projects_route.get_project_identity_by_slug(project["slug"])
+    assert identity["projectName"] == "Old Name"
+    assert identity["exists"] is True
+
+    result = projects_route.update_project_identity_by_slug(
+        project["slug"],
+        ProjectIdentityUpdate(project_name="Readable Name", mode="display-only"),
+    )
+    assert result["identity"]["projectName"] == "Readable Name"
+    assert result["identity"]["namespace"] == project["namespace"]
+
+
+def test_project_identity_put_can_create_without_get_side_effect(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(HTTPException) as missing:
+        projects_route.get_project_identity_by_slug("doc-a")
+    assert missing.value.status_code == 404
+    assert store.list_projects() == []
+
+    result = projects_route.update_project_identity_by_slug(
+        "doc-a",
+        ProjectIdentityUpdate(
+            project_name="Fourier Notes",
+            mode="rename-namespace",
+            namespace="Lea.FourierNotes",
+            create_if_missing=True,
+        ),
+    )
+    assert result["identity"]["projectName"] == "Fourier Notes"
+    assert result["identity"]["namespace"] == "Lea.FourierNotes"
+    assert store.get_project_by_slug("doc-a") is not None
+
+
+def test_project_namespace_migration_rewrites_files_and_updates_row(tmp_path, monkeypatch):
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Old Name"))
+    repo = proofs / "Lea" / "OldName"
+    (repo / "helper.lean").write_text(
+        "import Mathlib\nnamespace Lea.OldName\n\nlemma helper : True := by\n  trivial\n\nend Lea.OldName\n"
+    )
+
+    class CheckOk:
+        status = "ok"
+        detail = ""
+
+    monkeypatch.setattr(projects_route, "interface_check", lambda _path: CheckOk())
+    result = projects_route.update_project_identity_by_slug(
+        project["slug"],
+        ProjectIdentityUpdate(
+            project_name="New Name",
+            mode="rename-namespace",
+            namespace="Lea.NewName",
+            expected_namespace=project["namespace"],
+        ),
+    )
+
+    assert result["identity"]["namespace"] == "Lea.NewName"
+    new_repo = proofs / "Lea" / "NewName"
+    assert new_repo.is_dir()
+    assert not repo.exists()
+    assert "namespace Lea.NewName" in (new_repo / "helper.lean").read_text()
+    assert result["migration"]["checkedFiles"] == 1
+    assert result["migration"]["failedFiles"] == []
 
 
 def test_delete_removes_repo_and_rows(tmp_path, monkeypatch):

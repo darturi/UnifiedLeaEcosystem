@@ -53,6 +53,8 @@
   let leanPane = null;
   let leanPaneBody = null;
   let leanPaneStatus = null;
+  let leanPaneProjectTitle = null;
+  let leanPaneProjectNamespace = null;
   let leanPaneWidthPx = DEFAULT_LEAN_PANE_WIDTH_PX;
   let leanPaneResizeState = null;
   let leanPaneRefreshTimer = null;
@@ -63,6 +65,7 @@
   let leanPaneExpandedItemIds = new Set();
   let leanPaneHighlightTimer = null;
   let lastLeanPaneManifest = null;
+  let lastProjectIdentity = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
   // Share panel (D34): remote + push against the adapter's project repo, via the
@@ -266,13 +269,22 @@
     const header = document.createElement("div");
     header.className = "ol-lean-project-pane-header";
     const titleWrap = document.createElement("div");
+    const paneLabel = document.createElement("span");
+    paneLabel.className = "ol-lean-sr-only";
+    paneLabel.textContent = "Lean pane";
     const kicker = document.createElement("p");
     kicker.className = "ol-lean-project-pane-kicker";
     kicker.textContent = "Project preview";
     const title = document.createElement("h2");
     title.textContent = "Lean pane";
+    leanPaneProjectTitle = title;
+    leanPaneProjectNamespace = document.createElement("p");
+    leanPaneProjectNamespace.className = "ol-lean-project-pane-namespace";
+    leanPaneProjectNamespace.textContent = "Namespace: --";
+    titleWrap.appendChild(paneLabel);
     titleWrap.appendChild(kicker);
     titleWrap.appendChild(title);
+    titleWrap.appendChild(leanPaneProjectNamespace);
 
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-pane-controls";
@@ -285,6 +297,14 @@
     shareButton.textContent = "Share";
     shareButton.addEventListener("click", () => {
       toggleSharePanel().catch(renderLeanPaneError);
+    });
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.className = "ol-lean-pane-action";
+    renameButton.title = "Edit project name";
+    renameButton.textContent = "Rename";
+    renameButton.addEventListener("click", () => {
+      openProjectIdentityEditor({ source: "lean-pane" }).catch(renderLeanPaneError);
     });
     const refresh = document.createElement("button");
     refresh.type = "button";
@@ -303,6 +323,7 @@
     close.textContent = "x";
     close.addEventListener("click", closeLeanPane);
     controls.appendChild(shareButton);
+    controls.appendChild(renameButton);
     controls.appendChild(refresh);
     controls.appendChild(close);
     header.appendChild(titleWrap);
@@ -342,6 +363,8 @@
     leanPane = null;
     leanPaneBody = null;
     leanPaneStatus = null;
+    leanPaneProjectTitle = null;
+    leanPaneProjectNamespace = null;
     leanPaneExpandedTreeNodeIds = new Set();
     leanPaneTreeDefaultsKey = "";
   }
@@ -703,6 +726,11 @@
     const files = await getLeanPaneProjectFiles({ projectId, forceFetch });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    try {
+      const identity = await loadProjectIdentity({ baseUrl, projectId });
+      lastProjectIdentity = identity;
+      renderLeanPaneProjectIdentity(identity);
+    } catch {}
     const response = await fetch(`${baseUrl}/lean-pane/manifest`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -790,6 +818,89 @@
     }
 
     leanPaneBody.scrollTop = prevScrollTop;
+  }
+
+  function renderLeanPaneProjectIdentity(identity) {
+    if (!leanPaneProjectTitle || !leanPaneProjectNamespace) return;
+    const fallback = guessProjectName(lastLeanPaneFiles || []);
+    leanPaneProjectTitle.textContent = identity?.projectName || fallback;
+    leanPaneProjectNamespace.textContent = `Namespace: ${identity?.namespace || "--"}`;
+  }
+
+  async function loadProjectIdentity({ baseUrl, projectId }) {
+    const response = await fetch(`${baseUrl}/project/identity?overleafProjectId=${encodeURIComponent(projectId)}`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    return payload.identity || null;
+  }
+
+  async function previewProjectIdentity({ baseUrl, projectId, projectName, namespace = "", excludeProjectId = "" }) {
+    const response = await fetch(`${baseUrl}/project/identity/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overleafProjectId: projectId, projectName, namespace, excludeProjectId })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    return payload;
+  }
+
+  async function saveProjectIdentity({ baseUrl, projectId, projectName, mode, namespace = "", expectedNamespace = "", createIfMissing = false }) {
+    const response = await fetch(`${baseUrl}/project/identity`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overleafProjectId: projectId, projectName, mode, namespace, expectedNamespace, createIfMissing })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    return payload;
+  }
+
+  function guessProjectName(files = []) {
+    for (const file of files || []) {
+      const match = String(file?.content || "").match(/\\title\s*\{([^}]*)\}/);
+      if (match?.[1]?.trim()) return match[1].trim();
+    }
+    const title = String(document.title || "").replace(/\s*-\s*Overleaf\s*$/i, "").trim();
+    return title || "Overleaf Project";
+  }
+
+  async function openProjectIdentityEditor({ source = "lean-pane", popover = null } = {}) {
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const projectId = extractOverleafProjectId();
+    const identity = lastProjectIdentity || await loadProjectIdentity({ baseUrl, projectId });
+    const projectName = window.prompt("Project name", identity?.projectName || guessProjectName(lastLeanPaneFiles || []));
+    if (projectName === null) return;
+    const trimmed = projectName.trim();
+    if (!trimmed) throw new Error("Project name is required.");
+    const preview = await previewProjectIdentity({
+      baseUrl,
+      projectId,
+      projectName: trimmed,
+      excludeProjectId: identity?.projectId || ""
+    });
+    if (preview.available === false) {
+      throw new Error(`Namespace is already in use. Try ${preview.suggestions?.[0] || "another name"}.`);
+    }
+    const existingWithProofs = Boolean(identity?.exists && identity?.hasRecordedProofs);
+    const migrate = !existingWithProofs && preview.namespace !== identity?.namespace
+      ? true
+      : window.confirm(`Change Lean namespace to ${preview.namespace}? Choose Cancel to rename the display name only.`);
+    const mode = migrate ? "rename-namespace" : "display-only";
+    const result = await saveProjectIdentity({
+      baseUrl,
+      projectId,
+      projectName: trimmed,
+      mode,
+      namespace: migrate ? preview.namespace : "",
+      expectedNamespace: identity?.namespace || "",
+      createIfMissing: true
+    });
+    lastProjectIdentity = result.identity || null;
+    renderLeanPaneProjectIdentity(lastProjectIdentity);
+    if (popover) renderProjectSettingsSection(popover, lastProjectIdentity);
+    if (source === "lean-pane" && leanPaneStatus) leanPaneStatus.textContent = "Project name saved.";
   }
 
   function prepareLeanPaneTreeExpansion(manifest, tree) {
@@ -2484,6 +2595,20 @@
         <button type="button" class="ol-lean-icon-button" data-role="close" aria-label="Close Lea popover">x</button>
       </div>
       <div class="ol-lean-popover-body">
+        <section class="ol-lean-project-identity-panel" data-role="project-identity">
+          <div class="ol-lean-provider-title">Project</div>
+          <div class="ol-lean-provider-row">
+            <div class="ol-lean-provider-row-head">
+              <span data-role="project-name">Overleaf Project</span>
+              <strong data-role="project-exists">Not created</strong>
+            </div>
+            <p class="ol-lean-provider-note" data-role="project-namespace">Namespace: --</p>
+            <p class="ol-lean-provider-note" data-role="project-binding">Overleaf binding: --</p>
+            <div class="ol-lean-provider-key-controls">
+              <button type="button" class="ol-lean-provider-key-button" data-role="edit-project-name">Edit name</button>
+            </div>
+          </div>
+        </section>
         <section class="ol-lean-usage-panel" aria-live="polite">
           <div class="ol-lean-usage-row" data-usage="project">
             <div class="ol-lean-usage-row-head">
@@ -2634,6 +2759,15 @@
         githubClear.disabled = false;
       }
     });
+    popover.querySelector("[data-role='edit-project-name']").addEventListener("click", async () => {
+      status.textContent = "Updating project name...";
+      try {
+        await openProjectIdentityEditor({ source: "settings", popover });
+        status.textContent = "Project name saved.";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error);
+      }
+    });
     saveButton.addEventListener("click", async () => {
       saveButton.disabled = true;
       status.textContent = "Saving Lea settings...";
@@ -2766,6 +2900,7 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
@@ -2793,6 +2928,7 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
@@ -3330,6 +3466,26 @@
     popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     popover.dataset.savedTexMirror = String(texMirrorInput.checked);
     popover.querySelector("[data-role='save-settings']").disabled = true;
+    try {
+      const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+      lastProjectIdentity = await loadProjectIdentity({ baseUrl, projectId: extractOverleafProjectId() });
+      renderProjectSettingsSection(popover, lastProjectIdentity);
+      renderLeanPaneProjectIdentity(lastProjectIdentity);
+    } catch {
+      renderProjectSettingsSection(popover, null);
+    }
+  }
+
+  function renderProjectSettingsSection(popover, identity) {
+    const projectName = popover.querySelector("[data-role='project-name']");
+    const exists = popover.querySelector("[data-role='project-exists']");
+    const namespace = popover.querySelector("[data-role='project-namespace']");
+    const binding = popover.querySelector("[data-role='project-binding']");
+    const fallback = guessProjectName(lastLeanPaneFiles || []);
+    if (projectName) projectName.textContent = identity?.projectName || fallback;
+    if (exists) exists.textContent = identity?.exists ? "Created" : "Not created";
+    if (namespace) namespace.textContent = `Namespace: ${identity?.namespace || "--"}`;
+    if (binding) binding.textContent = `Overleaf binding: ${identity?.slug || extractOverleafProjectId() || "--"}`;
   }
 
   function renderGithubTokenStatus(popover, configured) {

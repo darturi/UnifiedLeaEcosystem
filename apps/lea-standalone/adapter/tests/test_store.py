@@ -393,6 +393,26 @@ def test_create_project_accepts_explicit_namespace_repo_and_description(tmp_path
     assert p["description"] == "a test project"
 
 
+def test_project_namespace_lookup_and_identity_update(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    p = store.create_project("doc-a", title="Doc A")
+    assert store.get_project_by_namespace(p["namespace"])["id"] == p["id"]
+
+    updated = store.update_project_identity(
+        p["id"],
+        title="Fourier Notes",
+        namespace="Lea.FourierNotes",
+        repo_path="proofs/Lea/FourierNotes",
+    )
+    assert updated["slug"] == "doc-a"
+    assert updated["title"] == "Fourier Notes"
+    assert updated["namespace"] == "Lea.FourierNotes"
+    assert updated["repo_path"] == "proofs/Lea/FourierNotes"
+    assert store.get_project_by_namespace("Lea.FourierNotes")["id"] == p["id"]
+
+
 def test_project_namespace_derivation_handles_digit_initial_slug(tmp_path, monkeypatch):
     # A Lean module segment can't start with a digit — guard with a prefix.
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")

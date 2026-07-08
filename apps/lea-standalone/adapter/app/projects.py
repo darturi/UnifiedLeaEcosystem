@@ -22,6 +22,14 @@ from . import store
 from .gitstore import GitStore
 
 
+class ProjectIdentityError(ValueError):
+    def __init__(self, code: str, message: str, *, status: int = 400, detail: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.detail = detail or {}
+
+
 def slugify(text: str) -> str:
     """A title → URL/namespace-safe slug: lowercase, non-alphanumeric runs become
     single hyphens, trimmed, capped at 80 chars. Empty input → ``"project"`` so the
@@ -43,10 +51,92 @@ def unique_slug(text: str) -> str:
     return f"{base}-{n}"
 
 
+def namespace_segment_from_name(name: str) -> str:
+    parts = re.split(r"[^A-Za-z0-9]+", str(name or "").strip())
+    segment = "".join(part[:1].upper() + part[1:] for part in parts if part)
+    segment = re.sub(r"[^A-Za-z0-9]", "", segment)
+    if not segment or not segment[0].isalpha():
+        segment = f"P{segment}"
+    return segment[:80] or "OverleafProject"
+
+
+def namespace_from_project_name(name: str) -> str:
+    return f"Lea.{namespace_segment_from_name(name)}"
+
+
+def normalize_namespace(namespace: str | None, project_name: str) -> str:
+    raw = str(namespace or "").strip()
+    value = raw if raw else namespace_from_project_name(project_name)
+    if not value.startswith("Lea."):
+        value = f"Lea.{value}"
+    try:
+        return store.validate_project_namespace(value)
+    except ValueError as exc:
+        raise ProjectIdentityError("invalid_namespace", str(exc), status=422) from None
+
+
+def namespace_preview(
+    project_name: str,
+    *,
+    namespace: str | None = None,
+    exclude_project_id: str | None = None,
+) -> dict:
+    project_title = (project_name or "").strip()
+    if not project_title:
+        raise ProjectIdentityError("missing_project_name", "Project name is required.")
+    normalized = normalize_namespace(namespace, project_title)
+    owner = store.get_project_by_namespace(normalized)
+    available = owner is None or owner.get("id") == exclude_project_id
+    suggestions: list[str] = []
+    if not available:
+        base = normalized
+        for suffix in ("2", "2026", "Project"):
+            candidate = f"{base}{suffix}"
+            if store.get_project_by_namespace(candidate) is None:
+                suggestions.append(candidate)
+        n = 3
+        while len(suggestions) < 3:
+            candidate = f"{base}{n}"
+            if store.get_project_by_namespace(candidate) is None:
+                suggestions.append(candidate)
+            n += 1
+    return {
+        "project_name": project_title,
+        "namespace": normalized,
+        "available": available,
+        "suggestions": suggestions,
+    }
+
+
+def unique_namespace_for_project_name(name: str) -> str:
+    base = namespace_from_project_name(name)
+    if store.get_project_by_namespace(base) is None:
+        return base
+    n = 2
+    while store.get_project_by_namespace(f"{base}{n}") is not None:
+        n += 1
+    return f"{base}{n}"
+
+
 def project_repo_dir(project: dict, proofs_root: Path) -> Path:
     """The on-disk repo for a project: ``proofs_root / Lea / <Project>`` (D22),
     derived from its cached namespace so it always matches ``repo_path``."""
     return proofs_root / Path(project["namespace"].replace(".", "/"))
+
+
+def project_identity(project: dict, *, overleaf_project_id: str | None = None) -> dict:
+    sessions = store.list_project_sessions(project["id"])
+    return {
+        "projectId": project["id"],
+        "overleafProjectId": overleaf_project_id or project["slug"],
+        "slug": project["slug"],
+        "projectName": project["title"],
+        "namespace": project["namespace"],
+        "namespaceEditable": True,
+        "repoPath": project.get("repo_path"),
+        "hasRecordedProofs": any(int(session.get("code_step_count") or 0) > 0 for session in sessions),
+        "exists": True,
+    }
 
 
 def repo_for_session(session: dict, proofs_root: Path, project: dict | None = None) -> Path:
@@ -304,7 +394,12 @@ def provision_project(
     return project
 
 
-def ensure_project(slug: str, proofs_root: Path | None, title: str | None = None) -> dict:
+def ensure_project(
+    slug: str,
+    proofs_root: Path | None,
+    title: str | None = None,
+    namespace: str | None = None,
+) -> dict:
     """Get-or-create a project by slug (the Overleaf path) AND ensure its on-disk repo is
     provisioned with the seeded ``.lea/*.md`` docs — the idempotent, slug-keyed analogue
     of :func:`provision_project`, so an Overleaf-originated project is provisioned exactly
@@ -315,13 +410,119 @@ def ensure_project(slug: str, proofs_root: Path | None, title: str | None = None
     on every run/mirror and backfills projects created tag-only before this existed. Disk
     provisioning is best-effort — the index row is the source of truth and is always
     returned; a missing ``proofs_root`` (lea_root unconfigured) just skips the disk half."""
-    project = store.get_or_create_project(slug, title=title)
+    existing = store.get_project_by_slug(slug)
+    if existing:
+        project = existing
+    else:
+        project_title = (title or slug).strip() or slug
+        ns = normalize_namespace(namespace, project_title) if namespace else unique_namespace_for_project_name(project_title)
+        if store.get_project_by_namespace(ns) is not None:
+            ns = unique_namespace_for_project_name(project_title)
+        project = store.create_project(
+            slug,
+            title=project_title,
+            namespace=ns,
+            repo_path=store.repo_path_for_namespace(ns),
+        )
     if proofs_root is not None:
         try:
             _provision_repo(project, proofs_root, overwrite=False)
         except Exception:
             pass  # never fail a run/mirror because seeding hiccuped
     return project
+
+
+def _rewrite_namespace_text(text: str, old_namespace: str, new_namespace: str) -> str:
+    pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(old_namespace)}(?=\.|\b)")
+    return pattern.sub(new_namespace, text)
+
+
+def _project_has_active_runs(project_id: str) -> bool:
+    return any(session.get("status") == "running" for session in store.list_project_sessions(project_id))
+
+
+def migrate_project_namespace(
+    project: dict,
+    proofs_root: Path,
+    *,
+    title: str,
+    namespace: str,
+    expected_namespace: str | None = None,
+    check_fn=None,
+) -> dict:
+    old_namespace = project["namespace"]
+    new_namespace = normalize_namespace(namespace, title)
+    if expected_namespace and expected_namespace != old_namespace:
+        raise ProjectIdentityError("namespace_conflict", "Project namespace changed; refresh and try again.", status=409)
+    owner = store.get_project_by_namespace(new_namespace)
+    if owner and owner.get("id") != project["id"]:
+        raise ProjectIdentityError("namespace_taken", "Another project already uses that namespace.", status=409)
+    if _project_has_active_runs(project["id"]):
+        raise ProjectIdentityError("project_busy", "A run is active in this project. Stop or wait for it before renaming.", status=409)
+
+    old_repo = project_repo_dir(project, proofs_root)
+    new_repo_path = store.repo_path_for_namespace(new_namespace)
+    new_repo = proofs_root / Path(new_namespace.replace(".", "/"))
+    if not old_repo.exists():
+        _provision_repo(project, proofs_root, overwrite=False)
+    if new_repo != old_repo and new_repo.exists():
+        raise ProjectIdentityError("namespace_path_exists", "The target namespace path already exists.", status=409)
+
+    changed_files: list[Path] = []
+    for path in sorted(old_repo.rglob("*")):
+        if not path.is_file() or ".git" in path.parts:
+            continue
+        if path.suffix not in {".lean", ".md"}:
+            continue
+        try:
+            original = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        updated = _rewrite_namespace_text(original, old_namespace, new_namespace)
+        if updated != original:
+            path.write_text(updated)
+            changed_files.append(path)
+
+    if new_repo != old_repo:
+        new_repo.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(old_repo), str(new_repo))
+        repo = new_repo
+    else:
+        repo = old_repo
+
+    commit_sha = GitStore(proofs_root).commit_all(
+        repo,
+        f"rename project namespace: {old_namespace} -> {new_namespace}",
+    )
+    updated_project = store.update_project_identity(
+        project["id"],
+        title=title,
+        namespace=new_namespace,
+        repo_path=new_repo_path,
+    )
+
+    failed_files = []
+    checked_files = 0
+    if check_fn is not None:
+        for lean_path in sorted(repo.rglob("*.lean")):
+            checked_files += 1
+            result = check_fn(str(lean_path))
+            if getattr(result, "status", None) != "ok":
+                failed_files.append({
+                    "path": lean_path.relative_to(repo).as_posix(),
+                    "message": getattr(result, "detail", "") or "Lean check failed.",
+                })
+
+    return {
+        "project": updated_project,
+        "migration": {
+            "oldNamespace": old_namespace,
+            "newNamespace": new_namespace,
+            "commitSha": commit_sha,
+            "checkedFiles": checked_files,
+            "failedFiles": failed_files,
+        },
+    }
 
 
 def delete_project(project_id: str, proofs_root: Path) -> bool:

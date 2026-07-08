@@ -158,6 +158,48 @@ export function fetchProjectShareStatus({ fetchImpl, baseUrl, slug }) {
   });
 }
 
+export function fetchProjectIdentityBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/identity`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+export function previewProjectNamespace({ fetchImpl, baseUrl, projectName, namespace = null, excludeProjectId = null }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/namespace-preview`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      project_name: projectName,
+      namespace,
+      exclude_project_id: excludeProjectId
+    }),
+  });
+}
+
+export function updateProjectIdentityBySlug({
+  fetchImpl,
+  baseUrl,
+  slug,
+  projectName,
+  mode,
+  namespace = null,
+  expectedNamespace = null,
+  createIfMissing = false,
+}) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/identity`, {
+    method: "PUT",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      project_name: projectName,
+      mode,
+      namespace,
+      expected_namespace: expectedNamespace,
+      create_if_missing: Boolean(createIfMissing)
+    }),
+  });
+}
+
 export function setProjectRemoteBySlug({ fetchImpl, baseUrl, slug, remoteUrl }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/git/remote`, {
     method: "PUT",
@@ -214,7 +256,7 @@ export async function exportProjectZipBySlug({ fetchImpl, baseUrl, slug }) {
   };
 }
 
-export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, origin = null, originUrl = null }) {
+export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, projectNamespace = null, origin = null, originUrl = null }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
   // end-to-end with zero human interaction. (The client also auto-resolves any
@@ -234,6 +276,7 @@ export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, session
   if (projectSlug) {
     body.project_slug = projectSlug;
     body.project_title = projectTitle || projectSlug;
+    if (projectNamespace) body.project_namespace = projectNamespace;
   }
   if (origin) body.origin = origin;
   if (originUrl) body.origin_url = originUrl;
@@ -487,6 +530,7 @@ export async function runApiProofJob({
   autonomous = true,
   projectSlug = null,
   projectTitle = null,
+  projectNamespace = null,
   origin = null,
   originUrl = null,
   appendLog = null,
@@ -499,7 +543,7 @@ export async function runApiProofJob({
     if (appendLog && logPath) await appendLog(logPath, line);
   };
 
-  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle, origin, originUrl });
+  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle, projectNamespace, origin, originUrl });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
   const runId = start.body?.run_id;

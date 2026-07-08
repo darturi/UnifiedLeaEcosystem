@@ -36,6 +36,18 @@
   --ol-serif: Georgia, "Times New Roman", serif;
 }
 
+.ol-lean-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .ol-lean-theorem {
   background: rgba(201, 100, 66, 0.12);
   border-bottom: 1px solid rgba(201, 100, 66, 0.55);
@@ -285,6 +297,14 @@ body.ol-lean-pane-resizing {
   margin: 0;
   color: var(--ol-ink);
   font: 700 20px/1.2 var(--ol-sans);
+}
+
+.ol-lean-project-pane-namespace {
+  margin: 4px 0 0;
+  max-width: 240px;
+  overflow-wrap: anywhere;
+  color: var(--ol-muted);
+  font: 11px/1.25 var(--ol-mono);
 }
 
 .ol-lean-project-pane-controls {
@@ -1369,12 +1389,19 @@ body.ol-lean-pane-resizing {
   color: var(--ol-red);
 }
 
-.ol-lean-provider-panel {
+.ol-lean-provider-panel,
+.ol-lean-project-identity-panel {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 10px 12px;
   border-top: 1px solid var(--ol-line);
+}
+
+.ol-lean-project-identity-panel {
+  border: 1px solid var(--ol-line-2);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel);
 }
 
 .ol-lean-provider-title {

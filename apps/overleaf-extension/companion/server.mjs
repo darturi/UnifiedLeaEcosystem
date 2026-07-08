@@ -49,15 +49,18 @@ import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
+  fetchProjectIdentityBySlug,
   fetchProjectShareStatus,
   interruptApiRun,
   mirrorProjectTexFiles,
+  previewProjectNamespace,
   pushProjectBySlug,
   putAdapterSettings,
   runApiProofJob,
   runApiSessionLeanCheck,
   rebuildApiSessionModule,
   setProjectRemoteBySlug,
+  updateProjectIdentityBySlug,
   writeApiSessionFile
 } from "./leaApiClient.mjs";
 
@@ -204,6 +207,7 @@ export async function handleGetStatuses(payload, state) {
     }
 
     statuses[targetKey({ targetKind, targetLabel })] = await getTargetStatus({
+      state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId: payload.overleafProjectId || "unknown",
       targetKind,
@@ -221,7 +225,7 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax } = validation;
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax, projectName, projectNamespace } = validation;
   const expectedHash = hashTargetText(targetText);
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match targetText.");
@@ -244,7 +248,9 @@ export async function handleFormalize(payload, state) {
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
-    targetLabel
+    targetLabel,
+    projectName,
+    projectNamespace
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -255,6 +261,7 @@ export async function handleFormalize(payload, state) {
   }
 
   const usesResolution = await resolveTheoremUses({
+    state,
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetUses,
@@ -286,6 +293,7 @@ export async function handleFormalize(payload, state) {
   // per-run LaTeX prep happens here anymore.
   const reusableStub = target.targetKind === "theorem"
     ? await findReusableStubForFormalization({
+        state,
         leaRepoPath: state.settings.leaRepoPath,
         target,
         jobs: state.jobs || {}
@@ -340,7 +348,7 @@ export async function handleStub(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax } = validation;
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax, projectName, projectNamespace } = validation;
   if (targetKind !== "theorem") {
     return errorResponse(400, "unsupported_stub_target", "Stub generation is only supported for theorem targets.");
   }
@@ -363,7 +371,9 @@ export async function handleStub(payload, state) {
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
-    targetLabel
+    targetLabel,
+    projectName,
+    projectNamespace
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -374,6 +384,7 @@ export async function handleStub(payload, state) {
   }
 
   const usesResolution = await resolveTheoremUses({
+    state,
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetUses,
@@ -488,8 +499,113 @@ function resolveShareTarget(payload, state) {
 // diverged-history "ask Lea to reconcile" hint) — forward them verbatim.
 function adapterDetail(result, fallback) {
   const detail = result.body?.detail;
+  if (detail && typeof detail === "object") return detail.message || JSON.stringify(detail);
   if (typeof detail === "string" && detail) return detail;
   return result.error || fallback;
+}
+
+function adapterErrorCode(result, fallback) {
+  const detail = result.body?.detail;
+  return (detail && typeof detail === "object" && detail.error) || result.body?.error || fallback;
+}
+
+function normalizeCompanionIdentity(identity, overleafProjectId) {
+  const slug = slugProjectId(overleafProjectId);
+  if (identity && typeof identity === "object") {
+    return {
+      projectId: identity.projectId || null,
+      overleafProjectId,
+      slug: identity.slug || slug,
+      projectName: identity.projectName || identity.title || identity.slug || slug,
+      namespace: identity.namespace || projectNamespaceFromSlug(slug),
+      namespaceEditable: identity.namespaceEditable !== false,
+      repoPath: identity.repoPath || null,
+      hasRecordedProofs: Boolean(identity.hasRecordedProofs),
+      exists: identity.exists !== false,
+      renameInProgress: Boolean(identity.renameInProgress)
+    };
+  }
+  return {
+    projectId: null,
+    overleafProjectId,
+    slug,
+    projectName: suggestedProjectName({ overleafProjectId }),
+    namespace: projectNamespaceFromSlug(slug),
+    namespaceEditable: true,
+    repoPath: null,
+    hasRecordedProofs: false,
+    exists: false
+  };
+}
+
+export async function handleProjectIdentity(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  const result = await fetchProjectIdentityBySlug(target);
+  if (!result.ok) {
+    if (result.status === 404) {
+      return { statusCode: 200, body: { ok: true, identity: normalizeCompanionIdentity(null, overleafProjectId) } };
+    }
+    return errorResponse(result.status || 502, "project_identity_failed", adapterDetail(result, "Could not load project identity."));
+  }
+  const identity = normalizeCompanionIdentity(result.body, overleafProjectId);
+  state.projectIdentities ||= {};
+  state.projectIdentities[identity.slug] = identity;
+  return { statusCode: 200, body: { ok: true, identity } };
+}
+
+export async function handleProjectIdentityPreview(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const projectName = String(payload.projectName || "").trim();
+  if (!projectName) return errorResponse(400, "missing_project_name", "Project name is required.");
+  const result = await previewProjectNamespace({
+    ...target,
+    projectName,
+    namespace: payload.namespace || null,
+    excludeProjectId: payload.excludeProjectId || null
+  });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, adapterErrorCode(result, "project_preview_failed"), adapterDetail(result, "Could not preview the namespace."));
+  }
+  return { statusCode: 200, body: { ok: true, ...result.body } };
+}
+
+export async function handleProjectIdentityUpdate(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  const projectName = String(payload.projectName || "").trim();
+  if (!projectName) return errorResponse(400, "missing_project_name", "Project name is required.");
+  const result = await updateProjectIdentityBySlug({
+    ...target,
+    projectName,
+    mode: payload.mode || "display-only",
+    namespace: payload.namespace || null,
+    expectedNamespace: payload.expectedNamespace || null,
+    createIfMissing: Boolean(payload.createIfMissing)
+  });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, adapterErrorCode(result, "project_identity_update_failed"), adapterDetail(result, "Could not update project identity."));
+  }
+  const identity = normalizeCompanionIdentity(result.body?.identity, overleafProjectId);
+  state.projectIdentities ||= {};
+  state.projectIdentities[identity.slug] = identity;
+  if (result.body?.migration) {
+    for (const job of Object.values(state.jobs || {})) {
+      if (job?.overleafProjectId === overleafProjectId || job?.projectSlug === target.slug) {
+        job.projectNamespace = identity.namespace;
+      }
+    }
+    await writeJson(state.jobsPath, state.jobs || {});
+  }
+  return { statusCode: 200, body: { ok: true, identity, migration: result.body?.migration || null } };
+}
+
+async function resolveProjectNamespace({ state, overleafProjectId, projectSlug = "" }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  return state?.projectIdentities?.[slug]?.namespace || projectNamespaceFromSlug(slug);
 }
 
 export async function handleShareStatus(payload, state) {
@@ -1609,6 +1725,8 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
+    projectName: target.projectName || target.projectSlug,
+    projectNamespace: target.projectNamespace || null,
     projectMarkdownPath: target.projectMarkdownPath,
     // Identity/display fields copied from the previous linked job, and the
     // broken-state fields mirrored, so this job -- which becomes the target's
@@ -1985,7 +2103,7 @@ export async function handleLeanPaneRepairAll(payload, state) {
   // Project import graph, for topological ordering and depends-on-failed
   // skipping. Full-project (not batch-only): a dependency path between two
   // batch items may pass through a module that isn't being repaired.
-  const namespace = projectNamespaceFromSlug(slugProjectId(overleafProjectId));
+  const namespace = await resolveProjectNamespace({ state, overleafProjectId });
   let files = [];
   try {
     files = await listProjectProofFiles({ leaRepoPath: state.settings.leaRepoPath, namespace });
@@ -2183,7 +2301,8 @@ function startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot = nu
     autoApprove: true,
     autonomous: true,
     projectSlug: target.projectSlug || null,
-    projectTitle: target.projectSlug || null,
+    projectTitle: target.projectName || target.projectSlug || null,
+    projectNamespace: target.projectNamespace || null,
     origin: "overleaf",
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
     onRunStarted: async (runId, sessionId) => {
@@ -2582,6 +2701,26 @@ async function routeRequest(request, response, state) {
       response.end(Buffer.from(result.zip.bytes));
       return;
     }
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/project/identity") {
+    const result = await handleProjectIdentity({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || ""
+    }, state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/project/identity/preview") {
+    const result = await handleProjectIdentityPreview(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "PUT" && url.pathname === "/project/identity") {
+    const result = await handleProjectIdentityUpdate(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -3065,6 +3204,8 @@ function validateTargetPayload(payload) {
   const targetLabel = String(payload.targetLabel || "");
   const targetText = String(payload.targetText || "");
   const targetContext = String(payload.targetContext || "").trim();
+  const projectName = String(payload.projectName || "").trim();
+  const projectNamespace = String(payload.projectNamespace || "").trim();
   const targetUses = Array.isArray(payload.targetUses)
     ? payload.targetUses.map((value) => String(value || "").trim()).filter(Boolean)
     : [];
@@ -3090,7 +3231,7 @@ function validateTargetPayload(payload) {
   if (!targetText.trim()) {
     return { ok: false, error: "missing_target_text", message: "Target text is required." };
   }
-  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax };
+  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax, projectName, projectNamespace };
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -3117,6 +3258,14 @@ export function buildOverleafDocumentUrl(overleafProjectId) {
   return `https://www.overleaf.com/project/${encodeURIComponent(id)}`;
 }
 
+function suggestedProjectName({ overleafProjectId, projectName = "" } = {}) {
+  const explicit = String(projectName || "").trim();
+  if (explicit) return explicit;
+  const id = String(overleafProjectId || "").trim();
+  if (!id || id === "unknown") return "Overleaf Project";
+  return "Overleaf Project";
+}
+
 function normalizeTargetKind(value) {
   const kind = String(value || "").trim();
   return kind === "theorem" || kind === "definition" ? kind : "";
@@ -3126,13 +3275,16 @@ function targetKey({ targetKind, targetLabel }) {
   return `${targetKind}:${targetLabel}`;
 }
 
-function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel }) {
+function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel, projectName = "", projectNamespace = "" }) {
   const projectSlug = slugProjectId(overleafProjectId);
   const projectMarkdownPath = buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId });
   return {
     overleafProjectId,
     projectId: overleafProjectId,
     projectSlug,
+    leaRepoPath,
+    projectName: suggestedProjectName({ overleafProjectId, projectName }),
+    projectNamespace: String(projectNamespace || "").trim() || null,
     targetKind,
     targetLabel,
     theoremLabel: targetLabel,
@@ -3144,8 +3296,9 @@ function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabe
   };
 }
 
-async function findReusableStubForFormalization({ leaRepoPath, target, jobs }) {
+async function findReusableStubForFormalization({ state, leaRepoPath, target, jobs }) {
   const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+    state,
     leaRepoPath,
     overleafProjectId: target.overleafProjectId,
     theoremLabel: target.theoremLabel,
@@ -3197,12 +3350,13 @@ function findLatestFinishedJob(jobs, jobKey) {
   return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status !== "in_progress")[0] || null;
 }
 
-async function resolveTheoremUses({ leaRepoPath, overleafProjectId, targetUses, jobs }) {
+async function resolveTheoremUses({ state, leaRepoPath, overleafProjectId, targetUses, jobs }) {
   const resolvedUses = [];
   const unresolvedUses = [];
 
   for (const theoremLabel of targetUses) {
     const status = await resolveTargetUseStatus({
+      state,
       leaRepoPath,
       overleafProjectId,
       targetLabel: theoremLabel,
@@ -3502,7 +3656,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
     timeoutMs: job.leaJobTimeoutSeconds * 1000,
     autoApprove: true,
     projectSlug: target.projectSlug || null,
-    projectTitle: target.projectSlug || null,
+    projectTitle: target.projectName || target.projectSlug || null,
+    projectNamespace: target.projectNamespace || job.projectNamespace || null,
     origin: "overleaf",
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
     appendLog,
@@ -3822,6 +3977,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
         projectMarkdownPath: target.projectMarkdownPath
       }
       : await getTheoremStatus({
+        state,
         leaRepoPath: state.settings.leaRepoPath,
         overleafProjectId: target.overleafProjectId,
         theoremLabel: target.targetLabel,
@@ -4533,7 +4689,7 @@ function buildJobResponse({ job, status, target }) {
     declarationName,
     relativePath: job.recordedProofPath || target.relativePath,
     absolutePath: job.recordedProofPath
-      ? buildLeaProofPath({ leaRepoPath: job.leaRepoPath, proofPath: job.recordedProofPath }) || target.absolutePath
+      ? buildLeaProofPath({ leaRepoPath: job.leaRepoPath || target.leaRepoPath, proofPath: job.recordedProofPath }) || target.absolutePath
       : target.absolutePath,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
@@ -4606,6 +4762,7 @@ async function findImportedStubbedTheoremUses({ proofPath, resolvedUses = [] }) 
 }
 
 async function findImportedCurrentlyStubbedTheoremUses({
+  state,
   leaRepoPath,
   overleafProjectId,
   proofPath,
@@ -4639,6 +4796,7 @@ async function findImportedCurrentlyStubbedTheoremUses({
   const stubbedUses = [];
   for (const use of importedUses) {
     const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+      state,
       leaRepoPath,
       overleafProjectId,
       targetKind: use.targetKind,
@@ -4663,6 +4821,7 @@ async function findImportedCurrentlyStubbedTheoremUses({
 }
 
 async function getTargetStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
   targetKind,
@@ -4670,13 +4829,14 @@ async function getTargetStatus({
   jobs = {}
 }) {
   const status = await getTheoremStatus({
+    state,
     leaRepoPath,
     overleafProjectId,
     targetKind,
     theoremLabel: targetLabel,
     jobs
   });
-  return attachTransitiveStubbedUpstream({ leaRepoPath, overleafProjectId, status });
+  return attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status });
 }
 
 // Enrich a formalized status with everything TRANSITIVELY upstream of it that
@@ -4694,7 +4854,7 @@ async function getTargetStatus({
 // default) -- which is why a downstream item could silently lose its warning
 // entirely after a restart, and why anything two hops from a stub never got
 // one at all. The file-derived scan below has neither limitation.
-async function attachTransitiveStubbedUpstream({ leaRepoPath, overleafProjectId, status }) {
+async function attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status }) {
   if (!status || status.status !== "formalized") return status;
   const proofPath = String(status.recordedProofPath || "").endsWith(".lean")
     ? status.recordedProofPath
@@ -4704,7 +4864,7 @@ async function attachTransitiveStubbedUpstream({ leaRepoPath, overleafProjectId,
     : (proofPath ? buildLeaProofPath({ leaRepoPath, proofPath }) : "");
   if (!absolutePath) return status;
 
-  const namespace = projectNamespaceFromSlug(slugProjectId(overleafProjectId));
+  const namespace = await resolveProjectNamespace({ state, overleafProjectId });
   let upstream = [];
   try {
     upstream = await stubbedUpstreamOf({
@@ -4760,6 +4920,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   let statusInfo;
   try {
     statusInfo = await getTargetStatus({
+      state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId,
       targetKind,
@@ -4945,21 +5106,23 @@ async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
 }
 
 async function resolveTargetUseStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
   targetLabel,
   jobs = {}
 }) {
   for (const targetKind of ["theorem", "definition"]) {
-    const status = await getTargetStatus({ leaRepoPath, overleafProjectId, targetKind, targetLabel, jobs });
+    const status = await getTargetStatus({ state, leaRepoPath, overleafProjectId, targetKind, targetLabel, jobs });
     if (["formalized", "sorry_stub"].includes(getEquivalentTheoremStatus(status).status)) {
       return status;
     }
   }
-  return getTargetStatus({ leaRepoPath, overleafProjectId, targetKind: "theorem", targetLabel, jobs });
+  return getTargetStatus({ state, leaRepoPath, overleafProjectId, targetKind: "theorem", targetLabel, jobs });
 }
 
 async function getTheoremStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
   targetKind = "theorem",
@@ -5000,6 +5163,7 @@ async function getTheoremStatus({
   }
 
   const { projectStatus, directProofStatus, mappedStatus } = await getCurrentTheoremProofStatuses({
+    state,
     leaRepoPath,
     target,
     jobs,
@@ -5065,10 +5229,22 @@ async function getTheoremStatus({
         return withLeaSession(stubEvidence);
       }
     }
+    if (newestTerminal.status === "formalized") {
+      const currentEvidence = [mappedStatus, projectStatus, directProofStatus]
+        .find((candidate) => candidate?.status === "formalized") || null;
+      if (currentEvidence) {
+        return withLeaSession(currentEvidence);
+      }
+    }
     return withLeaSession(buildJobResponse({ job: newestTerminal.job, status: newestTerminal.status, target }));
   }
 
   if (failedJob) {
+    const directPath = String(directProofStatus?.recordedProofPath || directProofStatus?.relativePath || "");
+    const legacyDirectPath = path.join("workspace", "proofs", `${directProofStatus?.declarationName || theoremLabel}.lean`);
+    if (directProofStatus?.status === "formalized" && directPath === legacyDirectPath) {
+      return withLeaSession(directProofStatus);
+    }
     return withLeaSession(buildFailedTheoremStatus({
       failedJob,
       target,
@@ -5077,12 +5253,12 @@ async function getTheoremStatus({
     }));
   }
 
-  if (projectStatus?.status === "formalized") {
-    return withLeaSession(projectStatus);
-  }
-
   if (mappedStatus?.status === "formalized") {
     return withLeaSession(mappedStatus);
+  }
+
+  if (projectStatus?.status === "formalized") {
+    return withLeaSession(projectStatus);
   }
 
   if (directProofStatus?.status === "formalized") {
@@ -5115,14 +5291,16 @@ async function getTheoremStatus({
 }
 
 async function getCurrentTheoremProofStatuses({
+  state,
   leaRepoPath,
   target,
   jobs = {},
   includeStubbedTheoremUses = false
 }) {
   const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
-  const directProofStatus = await getLeaDirectProofStatus({ leaRepoPath, target });
+  const directProofStatus = await getLeaDirectProofStatus({ state, leaRepoPath, target });
   const mappedStatus = await getLatestMappedJobStatus({
+    state,
     leaRepoPath,
     target,
     jobs,
@@ -5132,6 +5310,7 @@ async function getCurrentTheoremProofStatuses({
 }
 
 async function getCurrentTheoremProofStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
   targetKind = "theorem",
@@ -5140,6 +5319,7 @@ async function getCurrentTheoremProofStatus({
 }) {
   const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
   const { mappedStatus, projectStatus, directProofStatus } = await getCurrentTheoremProofStatuses({
+    state,
     leaRepoPath,
     target,
     jobs
@@ -5281,10 +5461,14 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
 // the file right now. The namespaced per-project path is where every modern
 // run records its file (D24); the flat workspace/proofs/<name>.lean is the
 // legacy layout, kept as a fallback.
-async function getLeaDirectProofStatus({ leaRepoPath, target }) {
+async function getLeaDirectProofStatus({ state, leaRepoPath, target }) {
   const declarationName = target.declarationName || target.theoremLabel;
   const stepPath = `${declarationName}.lean`;
-  const namespace = projectNamespaceFromSlug(target.projectSlug);
+  const namespace = target.projectNamespace || await resolveProjectNamespace({
+    state: state || {},
+    overleafProjectId: target.overleafProjectId,
+    projectSlug: target.projectSlug
+  });
   const candidates = [
     {
       proofPath: proofPathFromProjectStep({ namespace, stepPath }),
@@ -5337,6 +5521,7 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
 }
 
 async function getLatestMappedJobStatus({
+  state,
   leaRepoPath,
   target,
   jobs,
@@ -5368,6 +5553,7 @@ async function getLatestMappedJobStatus({
   }
   const stubbedTheoremUses = status.status === "formalized"
     ? await findImportedCurrentlyStubbedTheoremUses({
+      state,
       leaRepoPath,
       overleafProjectId: target.projectId,
       proofPath: status.absolutePath,

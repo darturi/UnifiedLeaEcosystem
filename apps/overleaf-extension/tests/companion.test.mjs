@@ -19,6 +19,9 @@ import {
   handleGithubTokenUpdate,
   handleLeanPaneManifest,
   handleMirrorTex,
+  handleProjectIdentity,
+  handleProjectIdentityPreview,
+  handleProjectIdentityUpdate,
   handleProjectExport,
   handleShareSetRemote,
   handleShareStatus,
@@ -120,6 +123,54 @@ test("builds Lea-compatible Overleaf project slugs and markdown paths", () => {
     buildLeaProjectMarkdownPath({ leaRepoPath: "/tmp/lea", overleafProjectId: "abc/123?x" }),
     path.join("/tmp/lea", "workspace", "projects", "abc_123_x.md")
   );
+});
+
+test("project identity endpoints proxy adapter state without creating on missing get", async () => {
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: await makeLeaRepo(),
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "GET") {
+        return jsonResponse(404, { detail: "No project" });
+      }
+      if (String(url).endsWith("/api/projects/namespace-preview")) {
+        return jsonResponse(200, { project_name: "Fourier Notes", namespace: "Lea.FourierNotes", available: true, suggestions: [] });
+      }
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "PUT") {
+        return jsonResponse(200, {
+          identity: {
+            projectId: "p1",
+            slug: "project-1",
+            projectName: "Fourier Notes",
+            namespace: "Lea.FourierNotes",
+            namespaceEditable: true,
+            repoPath: "proofs/Lea/FourierNotes",
+            hasRecordedProofs: false,
+            exists: true
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  });
+
+  const missing = await handleProjectIdentity({ overleafProjectId: "project-1" }, state);
+  assert.equal(missing.statusCode, 200);
+  assert.equal(missing.body.identity.exists, false);
+
+  const preview = await handleProjectIdentityPreview({ overleafProjectId: "project-1", projectName: "Fourier Notes" }, state);
+  assert.equal(preview.body.namespace, "Lea.FourierNotes");
+
+  const update = await handleProjectIdentityUpdate({
+    overleafProjectId: "project-1",
+    projectName: "Fourier Notes",
+    mode: "rename-namespace",
+    namespace: "Lea.FourierNotes",
+    createIfMissing: true
+  }, state);
+  assert.equal(update.body.identity.projectName, "Fourier Notes");
+  assert.equal(calls.find((call) => call.options.method === "PUT").body.create_if_missing, true);
 });
 
 test("settings response includes model families and key status", async () => {
@@ -3428,7 +3479,8 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
     overleafProjectId: "project-1",
     targetKind: "theorem",
     targetLabel: "t_api",
-    targetText: "A theorem."
+    targetText: "A theorem.",
+    projectName: "Friendly Project"
   }, state);
 
   assert.equal(result.statusCode, 200);
@@ -3436,6 +3488,7 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
   await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
   assert.ok(runCall.body.message.includes("project project-1"));
+  assert.equal(runCall.body.project_title, "Friendly Project");
   assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
 });
 

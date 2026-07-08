@@ -12,6 +12,7 @@ from .db import ROOT, connect, row_to_dict, utc_now
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+PROJECT_NAMESPACE_RE = re.compile(r"^Lea\.[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*$")
 # A skill slug is the stable id AND the materialized filename stem the prover reads
 # as `## Skill: <slug>` (D45) — lower-kebab, letter/digit-initial, ≤80 chars.
 SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
@@ -265,14 +266,24 @@ def get_project_by_slug(slug: str) -> dict | None:
     return row_to_dict(row) if row else None
 
 
-def project_namespace_for_slug(slug: str) -> str:
-    """Derive the Lean namespace `Lea.<Project>` from a slug (D22). `<Project>` must
-    be a valid Lean module-name segment: UpperCamel, alphanumeric, letter-initial.
-    The slug's `-`/`_`/space separators become CamelCase word boundaries.
+def get_project_by_namespace(namespace: str) -> dict | None:
+    value = validate_project_namespace(namespace)
+    with connect() as conn:
+        row = conn.execute("select * from projects where namespace = ?", (value,)).fetchone()
+    return row_to_dict(row) if row else None
 
-    P2's project service (which creates the on-disk `proofs/Lea/<Project>/` dir) is
-    the canonical caller; this lives here so the store can fill the NOT-NULL
-    `namespace`/`repo_path` columns for the Overleaf tag-only path too."""
+
+def validate_project_namespace(namespace: str) -> str:
+    value = str(namespace or "").strip()
+    if not PROJECT_NAMESPACE_RE.fullmatch(value):
+        raise ValueError("project namespace must be under Lea. with Lean identifier segments")
+    return value
+
+
+def project_namespace_for_slug(slug: str) -> str:
+    """Derive a fallback Lean namespace `Lea.<Project>` from a slug. The slug is the
+    immutable Overleaf/project binding; the namespace is cached and can migrate only
+    through the explicit project-identity rename flow."""
     parts = re.split(r"[-_\s]+", str(slug or "").strip())
     camel = "".join(p[:1].upper() + p[1:] for p in parts if p)
     camel = re.sub(r"[^A-Za-z0-9]", "", camel)
@@ -283,7 +294,8 @@ def project_namespace_for_slug(slug: str) -> str:
 
 def repo_path_for_namespace(namespace: str) -> str:
     """The shared dir / git repo for a namespace: `Lea.Foo` → `proofs/Lea/Foo` (D22)."""
-    return "proofs/" + namespace.replace(".", "/")
+    value = validate_project_namespace(namespace)
+    return "proofs/" + value.replace(".", "/")
 
 
 def get_or_create_project(slug: str, title: str | None = None) -> dict:
@@ -319,7 +331,7 @@ def create_project(
     now = utc_now()
     project_id = str(uuid4())
     project_title = (title or slug).strip() or slug
-    ns = namespace or project_namespace_for_slug(slug)
+    ns = validate_project_namespace(namespace) if namespace else project_namespace_for_slug(slug)
     repo = repo_path or repo_path_for_namespace(ns)
     with connect() as conn:
         conn.execute(
@@ -362,6 +374,33 @@ def update_project(
                 now,
                 project_id,
             ),
+        )
+        updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(updated)
+
+
+def update_project_identity(
+    project_id: str,
+    *,
+    title: str,
+    namespace: str,
+    repo_path: str,
+) -> dict | None:
+    """Update the mutable project identity fields. `slug` remains immutable; this is
+    reserved for the explicit namespace-migration path, not ordinary metadata edits."""
+    ns = validate_project_namespace(namespace)
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            """
+            update projects
+            set title = ?, namespace = ?, repo_path = ?, updated_at = ?
+            where id = ?
+            """,
+            ((title or "").strip() or row["title"], ns, repo_path, now, project_id),
         )
         updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(updated)
