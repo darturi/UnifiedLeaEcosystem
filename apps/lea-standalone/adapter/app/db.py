@@ -180,6 +180,7 @@ def init_db() -> None:
                 summary text,                             -- short label / narration
                 check_status text,                        -- 'ok' | 'error' | 'unchecked' (D6)
                 check_detail text,                        -- first error line (nullable)
+                artifact_kind text,                       -- 'proof' | 'definition' | 'mixed' | 'unknown' when check_status='ok'
                 created_at text not null
             );
 

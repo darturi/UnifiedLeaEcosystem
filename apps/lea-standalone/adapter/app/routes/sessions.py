@@ -22,6 +22,7 @@ from pydantic import BaseModel
 
 from lea.interface import check as interface_check, rebuild as interface_rebuild, verify as interface_verify
 
+from ..artifacts import classify_lean_artifact
 from ..config import load_config
 from .. import filesystem as fs_service, lsp_proxy, projects, store
 
@@ -191,6 +192,7 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
     """
     abs_path, rel = _resolve_proof_path(session_id, request.path)
     result = interface_check(abs_path)
+    artifact_kind = classify_lean_artifact(Path(abs_path).read_text()) if result.status == "ok" else None
     step = store.latest_code_step_for_path(session_id, rel)
     if request.author and step:
         new_step = store.add_code_step(
@@ -202,10 +204,11 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
             summary=request.summary,
             check_status=result.status,
             check_detail=result.detail,
+            artifact_kind=artifact_kind,
         )
         return {"path": rel, "status": result.status, "detail": result.detail, "code_step": new_step}
     if step:
-        store.set_code_step_check(step["id"], result.status, result.detail)
+        store.set_code_step_check(step["id"], result.status, result.detail, artifact_kind=artifact_kind)
     return {"path": rel, "status": result.status, "detail": result.detail}
 
 

@@ -36,7 +36,6 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("valid"), "valid");
   assert.equal(formatPaneStatus("defined"), "defined");
   assert.equal(formatPaneStatus("disproved"), "counterexample");
-  assert.equal(formatPaneStatus("needs-review"), "needs review");
   assert.equal(formatPaneStatus("in-progress"), "in progress");
   assert.equal(formatPaneStatus("stale"), "stale");
   assert.equal(formatPaneStatus("mixed"), "mixed");
@@ -117,7 +116,7 @@ test("canViewPaneItemInLeaUi requires a target identity and a real run or artifa
   assert.equal(canViewPaneItemInLeaUi(base), true);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "defined" }), true);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "disproved" }), true);
-  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "needs-review" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "needs-review" }), false);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "in-progress" }), true);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stub-generated" }), true);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stale" }), true);

@@ -137,8 +137,8 @@ export function Sidebar({
 
 function dotClass(session: SessionSummary, runningSessionId?: string): string {
   if (session.id === runningSessionId) return 'run';
-  if (session.status === 'ok' || session.status === 'proved') return 'ok';
-  if (session.status === 'disproved' || session.status === 'needs_review') return 'run';
+  if (session.status === 'ok' || session.status === 'proved' || session.status === 'defined') return 'ok';
+  if (session.status === 'disproved') return 'run';
   if (session.status === 'error') return 'fail';
   return 'idle';
 }

@@ -26,6 +26,7 @@ def test_init_db_creates_the_authoritative_v2_schema(tmp_path, monkeypatch):
     assert "author" in code_step_columns
     assert "check_status" in code_step_columns
     assert "check_detail" in code_step_columns
+    assert "artifact_kind" in code_step_columns
     assert "code" not in code_step_columns
     assert "used_project_formalizations" not in code_step_columns
     with sqlite3.connect(db_path) as conn:

@@ -3,8 +3,8 @@
 A session has no stored status column — its status is computed from the latest
 code_step's check_status on every read, so it can never drift from the source of
 truth. Run lifecycle (running/done/failed) is NOT here; it lives on runs.status.
-These tests pin the vocabulary (empty/unchecked/ok/error), the latest-wins rule,
-and that `list_sessions` and `session_detail` agree.
+These tests pin the vocabulary, the latest-wins rule, and that `list_sessions`
+and `session_detail` agree.
 """
 
 import sqlite3
@@ -54,22 +54,64 @@ def test_checked_agent_step_uses_run_outcome_for_proof_or_disproof(tmp_path, mon
     _fresh_db(tmp_path, monkeypatch)
     proved = store.create_session("Proved")
     proved_run = store.create_run(proved["id"], "gpt-4o", "openai", 3)
-    store.add_code_step(proved["id"], proved_run["id"], "p.lean", commit_sha="1" * 40, check_status="ok")
-    store.update_run(proved_run["id"], "proved", result_kind="proved")
+    store.add_code_step(
+        proved["id"], proved_run["id"], "p.lean",
+        commit_sha="1" * 40, check_status="ok", artifact_kind="proof",
+    )
+    store.update_run(proved_run["id"], "needs_review", result_kind="needs_review")
     assert store.session_detail(proved["id"])["status"] == "proved"
     assert _list_status(proved["id"]) == "proved"
 
     disproved = store.create_session("Disproved")
     disproved_run = store.create_run(disproved["id"], "gpt-4o", "openai", 3)
-    store.add_code_step(disproved["id"], disproved_run["id"], "d.lean", commit_sha="2" * 40, check_status="ok")
+    store.add_code_step(
+        disproved["id"], disproved_run["id"], "d.lean",
+        commit_sha="2" * 40, check_status="ok", artifact_kind="proof",
+    )
     store.update_run(disproved_run["id"], "disproved", result_kind="disproved")
     assert store.session_detail(disproved["id"])["status"] == "disproved"
     assert _list_status(disproved["id"]) == "disproved"
 
     # A later human edit is a new working copy with no run outcome attached.
-    store.add_code_step(disproved["id"], None, "d.lean", commit_sha="3" * 40, author="user", check_status="ok")
-    assert store.session_detail(disproved["id"])["status"] == "ok"
-    assert _list_status(disproved["id"]) == "ok"
+    store.add_code_step(
+        disproved["id"], None, "d.lean",
+        commit_sha="3" * 40, author="user", check_status="ok", artifact_kind="proof",
+    )
+    assert store.session_detail(disproved["id"])["status"] == "proved"
+    assert _list_status(disproved["id"]) == "proved"
+
+
+def test_checked_artifact_kind_drives_primary_status_when_run_needs_review(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    definition = store.create_session("Definition")
+    definition_run = store.create_run(definition["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(
+        definition["id"], definition_run["id"], "d.lean",
+        commit_sha="1" * 40, check_status="ok", artifact_kind="definition",
+    )
+    store.update_run(definition_run["id"], "needs_review", result_kind="needs_review")
+    assert store.session_detail(definition["id"])["status"] == "defined"
+    assert _list_status(definition["id"]) == "defined"
+
+    unknown = store.create_session("Unknown")
+    unknown_run = store.create_run(unknown["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(
+        unknown["id"], unknown_run["id"], "u.lean",
+        commit_sha="2" * 40, check_status="ok", artifact_kind="unknown",
+    )
+    store.update_run(unknown_run["id"], "needs_review", result_kind="needs_review")
+    assert store.session_detail(unknown["id"])["status"] == "ok"
+    assert _list_status(unknown["id"]) == "ok"
+
+
+def test_checked_ok_without_artifact_kind_stays_generic_ok(tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    session = store.create_session("Legacy row")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(session["id"], run["id"], "p.lean", commit_sha="1" * 40, check_status="ok")
+    store.update_run(run["id"], "needs_review", result_kind="needs_review")
+    assert store.session_detail(session["id"])["status"] == "ok"
+    assert _list_status(session["id"]) == "ok"
 
 
 def test_step_without_verdict_is_unchecked(tmp_path, monkeypatch):

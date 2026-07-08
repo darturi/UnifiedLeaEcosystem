@@ -401,13 +401,28 @@ test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => 
 test("lean pane manifest surfaces a disproof as a counterexample, not a failure", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "false_claim.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, [
+    "import Mathlib",
+    "",
+    "theorem false_claim_counterexample : True := by",
+    "  trivial",
+    ""
+  ].join("\n"));
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "false_claim",
+    proofPath
+  });
   state.jobs.disproved = {
     jobId: "disproved",
     jobKey: "project-1:theorem:false_claim",
     status: "disproved",
+    finalStatus: "disproved",
+    resultKind: "disproved",
     targetKind: "theorem",
     targetLabel: "false_claim",
     declarationName: "false_claim",
+    recordedProofPath: proofPath,
     targetTextHash: "",
     leaRepoPath: leaRepo,
     leaUiBaseUrl: "http://localhost:5173",
@@ -432,13 +447,12 @@ test("lean pane manifest surfaces a disproof as a counterexample, not a failure"
   assert.equal(res.body.items[0].status, "disproved");
 });
 
-test("lean pane manifest surfaces needs_review as its own badge, not invalid (regression)", async () => {
+test("lean pane manifest surfaces needs_review metadata as unknown, not valid", async () => {
   // Reproduces the real bug: a job finished `needs_review` with no markdown
   // entry recorded (mirrors production, where markdown recording was skipped
   // entirely for this resultKind before the fix) and no other local evidence.
-  // Before the fix this fell through to the unconditional failedJob branch and
-  // showed `invalid` -- indistinguishable from actually-broken code. It must
-  // now show its own `needs-review` badge instead.
+  // It should not keep a stale valid chip or invent a first-class needs-review
+  // status without checked artifact evidence.
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   state.jobs.needsReview = {
@@ -471,15 +485,15 @@ test("lean pane manifest surfaces needs_review as its own badge, not invalid (re
   }, state);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.items[0].status, "needs-review");
+  assert.equal(res.body.items[0].status, "unknown");
 });
 
 // The terminal-outcome branches in getTheoremStatus used pairwise recency
-// guards -- and the formalized branch's guards predated needs_review, so an
-// OLDER formalized job kept shadowing a NEWER needs_review re-run: the chip
-// stayed "valid" after a re-run the prover itself flagged. Now one selection
-// picks the newest terminal job; these two tests pin both directions.
-test("lean pane manifest: a newer needs_review re-run beats an older formalized job (regression)", async () => {
+// guards, so an older formalized job could shadow a newer unconfirmed re-run:
+// the chip stayed "valid" even though the latest run produced no confirmed
+// artifact. Now one selection picks the newest terminal job; these two tests pin
+// both directions.
+test("lean pane manifest: a newer unconfirmed re-run beats an older formalized job (regression)", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   const base = {
@@ -524,7 +538,7 @@ test("lean pane manifest: a newer needs_review re-run beats an older formalized 
   }, state);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.items[0].status, "needs-review");
+  assert.equal(res.body.items[0].status, "unknown");
 });
 
 test("lean pane manifest: a newer formalized re-run beats an older needs_review job", async () => {
@@ -3641,11 +3655,10 @@ test("resolveProofOutcome promotes a needs_review run to formalized when local e
   assert.equal(outcome.leanCheck, leanCheck);
 });
 
-test("resolveProofOutcome keeps needs_review when the fresh compile FAILS despite sorry-free file evidence", async () => {
+test("resolveProofOutcome fails unconfirmed needs_review when the fresh compile fails", async () => {
   // `local.status === "formalized"` is a sorry/admit regex over the file, not
   // a compile. A needs_review run whose file is sorry-free but doesn't
-  // actually compile must stay needs_review -- promoting on regex evidence
-  // alone was the original sin of this branch's first version.
+  // actually compile must not promote on regex evidence alone.
   const job = { targetKind: "theorem", targetLabel: "t5b", leaWorkspacePath: "/tmp/x" };
   const failingCheck = { ok: false, exitCode: 1, stdout: "", stderr: "unknown identifier: foo", message: "" };
   const outcome = await resolveProofOutcome({
@@ -3654,14 +3667,15 @@ test("resolveProofOutcome keeps needs_review when the fresh compile FAILS despit
     exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
   });
 
-  assert.equal(outcome.jobStatus, "needs_review");
-  assert.equal(outcome.finalStatus, "needs_review");
-  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "failed");
+  assert.equal(outcome.effectiveStatus.status, "failed");
+  assert.equal(outcome.resultKind, "needs_review");
   // the failing check is kept as the diagnostic explaining WHY
   assert.equal(outcome.leanCheck, failingCheck);
 });
 
-test("resolveProofOutcome keeps needs_review when no compile evidence is possible at all", async () => {
+test("resolveProofOutcome fails unconfirmed needs_review when no compile evidence is possible", async () => {
   // Sorry-free file evidence but no absolutePath to check and no attached
   // recovery check: nothing verifies this actually compiles, so it must not
   // promote. (Unlike the exit.ok path, where the ADAPTER verified the run and
@@ -3674,9 +3688,10 @@ test("resolveProofOutcome keeps needs_review when no compile evidence is possibl
     exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
   });
 
-  assert.equal(outcome.jobStatus, "needs_review");
-  assert.equal(outcome.finalStatus, "needs_review");
-  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "failed");
+  assert.equal(outcome.effectiveStatus.status, "failed");
+  assert.equal(outcome.resultKind, "needs_review");
   assert.equal(outcome.leanCheck, null);
 });
 
@@ -3819,16 +3834,15 @@ test("recoverFormalizedStatusFromTargetPath returns null when the run has no ses
   assert.equal(recovered, null);
 });
 
-test("resolveProofOutcome still reports needs_review when no local evidence was found (the real-world case)", async () => {
+test("resolveProofOutcome records unconfirmed needs_review as failed when no local evidence was found", async () => {
   // This is the actual shape production hits, not a hypothetical: the
   // project-markdown index identifyLeaArtifact diffs against is populated by
   // the agent's own in-run tool calls, and it appears to skip that call when
   // it isn't confident enough to self-report "proved" -- so localStatus stays
   // "unformalized" for essentially every real needs_review run, even when the
-  // emitted file compiles cleanly. A first version of this fix gated the
-  // needs_review -> needs_review promotion on `local.status === "formalized"`
-  // and silently fell back to "failed" here, which is the exact bug
-  // resurfacing under a different name. It must not.
+  // emitted file may compile cleanly. Without checked artifact evidence, the
+  // primary status should be failed/unconfirmed while resultKind preserves the
+  // classifier metadata.
   const job = { targetKind: "theorem", targetLabel: "t6", leaWorkspacePath: "/tmp/x" };
   const outcome = await resolveProofOutcome({
     job,
@@ -3836,11 +3850,11 @@ test("resolveProofOutcome still reports needs_review when no local evidence was 
     exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", error: "Lea run ended with status: needs_review" }
   });
 
-  assert.equal(outcome.jobStatus, "needs_review");
-  assert.equal(outcome.finalStatus, "needs_review");
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "failed");
   assert.equal(outcome.resultKind, "needs_review");
-  assert.equal(outcome.effectiveStatus.status, "needs_review");
-  assert.equal(outcome.error, null);
+  assert.equal(outcome.effectiveStatus.status, "failed");
+  assert.match(outcome.error, /could not confirm/);
 });
 
 test("formalize on the /api backend tags the theorem formalized when the run succeeds (regression)", async () => {

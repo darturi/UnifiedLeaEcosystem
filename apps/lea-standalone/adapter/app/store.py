@@ -141,6 +141,13 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                     limit 1
                 ) as latest_check_status,
                 (
+                    select cs.artifact_kind
+                    from code_steps cs
+                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
+                    order by cs.seq desc
+                    limit 1
+                ) as latest_artifact_kind,
+                (
                     select rcs.status
                     from code_steps cs
                     left join runs rcs on rcs.id = cs.run_id
@@ -173,6 +180,7 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
         data = row_to_dict(row)
         data["status"] = _derive_session_status(
             data.pop("latest_check_status", None),
+            data.pop("latest_artifact_kind", None),
             int(data.pop("code_step_count", 0) or 0),
             bool(data.pop("active_run_count", 0)),
             data.pop("latest_code_run_status", None),
@@ -973,6 +981,7 @@ def add_code_step(
     turn: int | None = None,
     check_status: str | None = None,
     check_detail: str | None = None,
+    artifact_kind: str | None = None,
 ) -> dict:
     """Record a curated timeline step pointing at a git commit (D7/D8).
 
@@ -998,9 +1007,9 @@ def add_code_step(
             """
             insert into code_steps (
                 id, session_id, run_id, seq, turn, author, path,
-                commit_sha, summary, check_status, check_detail, created_at
+                commit_sha, summary, check_status, check_detail, artifact_kind, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 step_id,
@@ -1014,6 +1023,7 @@ def add_code_step(
                 summary,
                 check_status,
                 check_detail,
+                artifact_kind if check_status == "ok" else None,
                 now,
             ),
         )
@@ -1059,7 +1069,12 @@ def upsert_user_code_step(session_id: str, path: str, *, commit_sha: str) -> dic
     return add_code_step(session_id, None, path, commit_sha=commit_sha, author="user")
 
 
-def set_code_step_check(step_id: str, check_status: str, check_detail: str | None = None) -> dict | None:
+def set_code_step_check(
+    step_id: str,
+    check_status: str,
+    check_detail: str | None = None,
+    artifact_kind: str | None = None,
+) -> dict | None:
     """Back-fill a code_step's verdict once `lean_check` returns (D6).
 
     A write is committed and its row inserted *before* the check runs (FileChanged
@@ -1070,8 +1085,8 @@ def set_code_step_check(step_id: str, check_status: str, check_detail: str | Non
     now = utc_now()
     with connect() as conn:
         conn.execute(
-            "update code_steps set check_status = ?, check_detail = ? where id = ?",
-            (check_status, check_detail, step_id),
+            "update code_steps set check_status = ?, check_detail = ?, artifact_kind = ? where id = ?",
+            (check_status, check_detail, artifact_kind if check_status == "ok" else None, step_id),
         )
         row = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
     return row_to_dict(row) if row else None
@@ -1240,6 +1255,7 @@ def session_detail(session_id: str) -> dict | None:
     # only 'ok' when an actual proof compiles, not when a throwaway probe does (M14).
     real_steps = [c for c in code_steps if "scratch" not in (c["path"] or "").lower()]
     latest_check_status = real_steps[-1]["check_status"] if real_steps else None
+    latest_artifact_kind = real_steps[-1]["artifact_kind"] if real_steps else None
     latest_code_run_status = None
     if real_steps and real_steps[-1]["run_id"]:
         with connect() as conn:
@@ -1252,7 +1268,7 @@ def session_detail(session_id: str) -> dict | None:
         **session,
         **usage,
         "status": _derive_session_status(
-            latest_check_status, len(real_steps), active_run is not None, latest_code_run_status
+            latest_check_status, latest_artifact_kind, len(real_steps), active_run is not None, latest_code_run_status
         ),
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
@@ -1268,6 +1284,7 @@ def session_detail(session_id: str) -> dict | None:
 
 def _derive_session_status(
     latest_check_status: str | None,
+    latest_artifact_kind: str | None,
     code_step_count: int,
     has_active_run: bool = False,
     latest_code_run_status: str | None = None,
@@ -1280,8 +1297,14 @@ def _derive_session_status(
     an Overleaf-driven one whose first file hasn't been written yet — surfaces as
     in-progress in the session list and stats the moment it starts."""
     if code_step_count:
-        if latest_check_status == "ok" and latest_code_run_status in {"proved", "disproved", "needs_review"}:
-            return latest_code_run_status
+        if latest_check_status == "ok":
+            if latest_code_run_status == "disproved":
+                return "disproved"
+            if latest_artifact_kind == "definition":
+                return "defined"
+            if latest_artifact_kind in {"proof", "mixed"}:
+                return "proved"
+            return "ok"
         return latest_check_status or "unchecked"
     if has_active_run:
         return "running"

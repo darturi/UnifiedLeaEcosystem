@@ -116,6 +116,10 @@ export function Canvas({
   const proofStatus = deriveCodeStepProofStatus(step);
   const verdict = proofStatus === 'proved'
     ? { cls: 'ok', text: '✓ compiles' }
+    : proofStatus === 'defined'
+    ? { cls: 'ok', text: '✓ definition' }
+    : proofStatus === 'checked'
+    ? { cls: 'ok', text: '✓ checked' }
     : proofStatus === 'stubbed'
     ? { cls: 'stub', text: '○ checked stub' }
     : proofStatus === 'failed'
@@ -204,7 +208,7 @@ export function Canvas({
       )}
 
       <div className="canvas-foot">
-        {proofStatus === 'proved' ? (
+        {proofStatus === 'proved' || proofStatus === 'defined' || proofStatus === 'checked' ? (
           <span className="badge compile">✓ lean_check: 0 errors</span>
         ) : proofStatus === 'stubbed' ? (
           <span className="badge stub">✓ lean_check: 0 errors · contains sorry</span>

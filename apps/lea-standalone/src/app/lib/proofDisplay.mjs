@@ -24,7 +24,10 @@ export function deriveCodeStepProofStatus(step) {
   if (!step || !step.check_status || step.check_status === 'unchecked') return 'unchecked';
   if (step.check_status === 'error') return 'failed';
   if (step.check_status !== 'ok') return 'unchecked';
-  return codeStepContainsSorry(step) ? 'stubbed' : 'proved';
+  if (codeStepContainsSorry(step)) return 'stubbed';
+  if (step.artifact_kind === 'definition') return 'defined';
+  if (step.artifact_kind === 'unknown') return 'checked';
+  return 'proved';
 }
 
 export function latestCodeStep(steps = []) {
@@ -37,10 +40,10 @@ export function latestCodeStep(steps = []) {
  * @param {string | null | undefined} resultKind
  */
 export function deriveRunCompletionStatus(runStatus, steps = [], resultKind = null) {
-  if (runStatus === 'disproved' || runStatus === 'needs_review') return runStatus;
-  if (runStatus !== 'proved' && runStatus !== 'success') return runStatus || 'pending';
+  if (runStatus === 'disproved') return runStatus;
+  if (runStatus !== 'proved' && runStatus !== 'success' && runStatus !== 'needs_review') return runStatus || 'pending';
   const latest = latestCodeStep(steps);
   const proofStatus = deriveCodeStepProofStatus(latest);
-  if (resultKind === 'defined' && proofStatus === 'proved') return 'defined';
+  if (proofStatus === 'defined' || ((resultKind === 'defined' || latest?.artifact_kind === 'definition') && proofStatus === 'proved')) return 'defined';
   return proofStatus === 'proved' || proofStatus === 'stubbed' ? proofStatus : 'answered';
 }

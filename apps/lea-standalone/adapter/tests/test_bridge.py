@@ -92,6 +92,7 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
     assert step["author"] == "agent" and step["turn"] == 1
     assert len(step["commit_sha"]) == 40
     assert step["check_status"] == "ok"
+    assert step["artifact_kind"] == "proof"
 
     # the SHA resolves to the file the fake wrote (git owns the content)
     gs = bridge.GitStore(tmp_path / "workspace" / "proofs")
@@ -160,6 +161,46 @@ def test_definition_artifact_persists_defined_result_kind(tmp_path, monkeypatch)
     assert done["type"] == "done"
     assert done["payload"]["status"] == "proved"
     assert done["payload"]["result_kind"] == "defined"
+
+
+def test_needs_review_proof_artifact_keeps_proved_session_status(tmp_path, monkeypatch):
+    ctx, queue = _context(tmp_path, monkeypatch, task="Prove True")
+
+    def script(proof_path):
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": proof_path})
+        yield FileChanged(proof_path)
+        yield ToolCalled("lean_check", {"path": proof_path})
+        yield CheckResult(proof_path, "ok", None)
+        yield Finished(
+            "completed",
+            "The file compiles, but the classifier is cautious.",
+            1,
+            ctx.session_id,
+            "gemini/test",
+            Usage(input_tokens=10, output_tokens=5),
+            0.01,
+            {},
+            result_kind="needs_review",
+            result_detail="NEEDS_REVIEW",
+        )
+
+    monkeypatch.setattr(bridge, "run_events", _fake_run_events(script))
+
+    bridge.run_lea(ctx)
+
+    detail = store.session_detail(ctx.session_id)
+    assert detail["status"] == "proved"
+    assert detail["code_steps"][0]["artifact_kind"] == "proof"
+
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "needs_review"
+    assert run["result_kind"] == "needs_review"
+
+    done = _drain(queue)[-1]
+    assert done["type"] == "done"
+    assert done["payload"]["status"] == "needs_review"
+    assert done["payload"]["result_kind"] == "needs_review"
 
 
 def test_disproof_result_persists_and_streams_distinct_outcome(tmp_path, monkeypatch):

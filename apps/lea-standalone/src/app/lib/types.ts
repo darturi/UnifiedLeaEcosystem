@@ -16,10 +16,11 @@ export type SessionStatus =
   | 'error'
   | 'running'
   | 'proved'
-  | 'disproved'
-  | 'needs_review';
+  | 'defined'
+  | 'disproved';
 // ── Run-level status (a single proof attempt) ─────────────────────────────────
-// 'proved' / 'disproved' / 'needs_review' are checked-artifact outcomes.
+// 'proved' / 'disproved' are checked-artifact outcomes; 'needs_review' is
+// preserved as classifier metadata, not a primary session/code status.
 // 'answered' = a chat / QA / sketch turn that finished cleanly but proved nothing.
 export type RunStatus =
   | 'pending'
@@ -218,6 +219,7 @@ export interface CodeStep {
   summary?: string | null;
   check_status?: 'ok' | 'error' | 'unchecked' | null;
   check_detail?: string | null;
+  artifact_kind?: 'proof' | 'definition' | 'mixed' | 'unknown' | string | null;
   created_at: string;
   // Hydrated from git on read; also present on the SSE `code_step` event.
   code: string;

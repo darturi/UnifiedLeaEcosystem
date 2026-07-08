@@ -3626,15 +3626,15 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
       }
     }
     return {
-      jobStatus: "needs_review",
-      finalStatus: "needs_review",
-      effectiveStatus: { ...local, status: "needs_review" },
+      jobStatus: "failed",
+      finalStatus: "failed",
+      effectiveStatus: { ...local, status: "failed" },
       resultKind: "needs_review",
       resultDetail: exit.resultDetail || null,
-      // A failing/absent check is kept as diagnostic metadata -- it explains
-      // WHY this stayed needs_review despite sorry-free file evidence.
+      // A failing/absent check is kept as diagnostic metadata -- it explains why
+      // this is unconfirmed despite sorry-free file evidence.
       leanCheck,
-      error: null
+      error: "Lea could not confirm a checked artifact for this run."
     };
   }
 
@@ -4779,7 +4779,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   const stale = Boolean(
     latestJob?.targetTextHash &&
     latestJob.targetTextHash !== item.sourceHash &&
-    ["stub-generated", "valid", "defined", "disproved", "needs-review", "invalid"].includes(paneStatus)
+    ["stub-generated", "valid", "defined", "disproved", "invalid"].includes(paneStatus)
   );
   const artifact = await readLeanPaneArtifact({
     leaRepoPath: state.settings.leaRepoPath,
@@ -4881,10 +4881,7 @@ function mapLeanPaneStatus(statusInfo, item) {
   if (status === "sorry_stub" || effective === "sorry_stub") return "stub-generated";
   if (status === "formalized") return item?.leanKind === "def" ? "defined" : "valid";
   if (status === "disproved") return "disproved";
-  // A checked, sorry-free proof the prover itself flagged for human review --
-  // deliberately not "valid" (that implies full confidence) nor "invalid"
-  // (the code compiles fine); see resolveProofOutcome's needs_review branch.
-  if (status === "needs_review") return "needs-review";
+  if (status === "needs_review") return "unknown";
   if (status === "failed") return "invalid";
   if (status === "in_progress") return "in-progress";
   return "unknown";
@@ -5014,14 +5011,6 @@ async function getTheoremStatus({
   const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
   const needsReviewJob = findLatestJob(jobs, target.jobKey, "needs_review");
 
-  if (mappedStatus?.status === "formalized") {
-    return withLeaSession(mappedStatus);
-  }
-
-  if (directProofStatus?.status === "formalized") {
-    return withLeaSession(directProofStatus);
-  }
-
   // Authoritative outcome: a finished job the finalizer recorded with a
   // terminal status is trusted even when project-markdown recording is
   // deferred and no local file evidence (mapped/project/direct) could be
@@ -5090,6 +5079,14 @@ async function getTheoremStatus({
 
   if (projectStatus?.status === "formalized") {
     return withLeaSession(projectStatus);
+  }
+
+  if (mappedStatus?.status === "formalized") {
+    return withLeaSession(mappedStatus);
+  }
+
+  if (directProofStatus?.status === "formalized") {
+    return withLeaSession(directProofStatus);
   }
 
   if (mappedStatus) {

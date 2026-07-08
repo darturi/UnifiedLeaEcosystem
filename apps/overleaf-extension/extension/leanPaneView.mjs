@@ -14,10 +14,6 @@ const PANE_STATUS_LABELS = {
   // A verified disproof is surfaced as a counterexample: a successful result, but
   // not a proof of the stated theorem (FEATURE-counterexample-workflows.md).
   disproved: "counterexample",
-  // A checked, sorry-free proof the prover flagged for human review -- not
-  // "invalid" (it compiles), not "valid" (not fully confident either); see
-  // server.mjs's mapLeanPaneStatus / resolveProofOutcome needs_review branch.
-  "needs-review": "needs review",
   "in-progress": "in progress",
   invalid: "invalid",
   stale: "stale",
@@ -327,11 +323,11 @@ export function paneItemToFormalizeTarget(item) {
 // Same rule the in-document popover applies before offering "View in Lea UI"
 // (companion statuses formalized / defined / disproved / in_progress /
 // sorry_stub), translated to the pane vocabulary and extended with the
-// pane-only artifact states (stale / invalid / needs-review), which also imply
+// pane-only artifact states (stale / invalid), which also imply
 // a recorded run. missing-stub / unknown / error stay excluded so stale
 // session metadata can't make unformalized items appear viewable.
 const LEA_UI_VIEWABLE_PANE_STATUSES = new Set([
-  "valid", "defined", "disproved", "needs-review", "in-progress",
+  "valid", "defined", "disproved", "in-progress",
   "stub-generated", "stale", "invalid"
 ]);
 
