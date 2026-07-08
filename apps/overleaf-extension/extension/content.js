@@ -11,6 +11,12 @@
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
+  const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
+  const DEFAULT_LEAN_PANE_WIDTH_PX = 520;
+  const MIN_LEAN_PANE_WIDTH_PX = 360;
+  const LEAN_PANE_VIEWPORT_GUTTER_PX = 24;
+  const LEAN_PANE_KEYBOARD_STEP_PX = 24;
+  const LEAN_PANE_KEYBOARD_LARGE_STEP_PX = 80;
   // Short debounce for an edit-triggered status refresh; a much longer cadence
   // for the in-progress self-poll so an active run doesn't hammer /statuses
   // (each hit does per-target FS scans + adapter fetches) four times a second
@@ -47,6 +53,8 @@
   let leanPane = null;
   let leanPaneBody = null;
   let leanPaneStatus = null;
+  let leanPaneWidthPx = DEFAULT_LEAN_PANE_WIDTH_PX;
+  let leanPaneResizeState = null;
   let leanPaneRefreshTimer = null;
   let leanPanePollTimer = null;
   let leanPaneView = null;
@@ -150,6 +158,7 @@
   requestTargetsSoon();
   renderSettingsButton();
   renderLeanPaneButton();
+  hydrateLeanPaneWidthFromStorage();
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
@@ -173,7 +182,10 @@
     }
   });
 
-  window.addEventListener("resize", renderStatusBadges);
+  window.addEventListener("resize", () => {
+    renderStatusBadges();
+    clampOpenLeanPaneToViewport();
+  });
   // Capture-phase scroll fires very frequently; coalesce to one update per
   // animation frame (AUDIT M4) instead of re-parsing the whole document and
   // re-laying out every badge on every scroll tick.
@@ -237,6 +249,19 @@
     leanPane.setAttribute("role", "complementary");
     leanPane.setAttribute("aria-label", "Lean project pane");
     leanPane.tabIndex = -1;
+    applyLeanPaneWidth();
+
+    const resizer = document.createElement("button");
+    resizer.type = "button";
+    resizer.className = "ol-lean-project-pane-resizer";
+    resizer.setAttribute("role", "separator");
+    resizer.setAttribute("aria-orientation", "vertical");
+    resizer.setAttribute("aria-label", "Resize Lean pane");
+    resizer.title = "Resize Lean pane";
+    resizer.tabIndex = 0;
+    resizer.addEventListener("pointerdown", startLeanPaneResize);
+    resizer.addEventListener("mousedown", startLeanPaneResize);
+    resizer.addEventListener("keydown", handleLeanPaneResizeKeydown);
 
     const header = document.createElement("div");
     header.className = "ol-lean-project-pane-header";
@@ -288,6 +313,7 @@
     leanPaneBody = document.createElement("div");
     leanPaneBody.className = "ol-lean-project-pane-body";
 
+    leanPane.appendChild(resizer);
     leanPane.appendChild(header);
     leanPane.appendChild(leanPaneStatus);
     leanPane.appendChild(leanPaneBody);
@@ -305,6 +331,7 @@
     leanPanePollTimer = null;
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
+    stopLeanPaneResize({ persist: false });
     closeLeanPaneChat();
     closeActiveOverflowMenu();
     leanPaneSharePanel = null;
@@ -317,6 +344,123 @@
     leanPaneStatus = null;
     leanPaneExpandedTreeNodeIds = new Set();
     leanPaneTreeDefaultsKey = "";
+  }
+
+  function hydrateLeanPaneWidthFromStorage() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.get({ [LEAN_PANE_WIDTH_STORAGE_KEY]: DEFAULT_LEAN_PANE_WIDTH_PX })
+      .then((settings) => {
+        leanPaneWidthPx = clampLeanPaneWidth(settings?.[LEAN_PANE_WIDTH_STORAGE_KEY]);
+        applyLeanPaneWidth();
+      })
+      .catch(() => {
+        leanPaneWidthPx = clampLeanPaneWidth(DEFAULT_LEAN_PANE_WIDTH_PX);
+        applyLeanPaneWidth();
+      });
+  }
+
+  function maxLeanPaneWidthPx() {
+    const viewportWidth = Number(window.innerWidth) || DEFAULT_LEAN_PANE_WIDTH_PX + LEAN_PANE_VIEWPORT_GUTTER_PX;
+    return Math.max(MIN_LEAN_PANE_WIDTH_PX, viewportWidth - LEAN_PANE_VIEWPORT_GUTTER_PX);
+  }
+
+  function clampLeanPaneWidth(width) {
+    const numeric = Number.parseInt(String(width), 10);
+    const fallback = Number.isFinite(numeric) ? numeric : DEFAULT_LEAN_PANE_WIDTH_PX;
+    return Math.min(Math.max(fallback, MIN_LEAN_PANE_WIDTH_PX), maxLeanPaneWidthPx());
+  }
+
+  function applyLeanPaneWidth(width = leanPaneWidthPx) {
+    leanPaneWidthPx = clampLeanPaneWidth(width);
+    if (leanPane) {
+      leanPane.style.setProperty("--ol-lean-pane-width", `${leanPaneWidthPx}px`);
+    }
+    return leanPaneWidthPx;
+  }
+
+  function persistLeanPaneWidth() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.set({ [LEAN_PANE_WIDTH_STORAGE_KEY]: leanPaneWidthPx }).catch(() => {});
+  }
+
+  function clampOpenLeanPaneToViewport() {
+    const nextWidth = clampLeanPaneWidth(leanPaneWidthPx);
+    if (nextWidth === leanPaneWidthPx) return;
+    applyLeanPaneWidth(nextWidth);
+    persistLeanPaneWidth();
+  }
+
+  function startLeanPaneResize(event) {
+    if (!leanPane || leanPaneResizeState) return;
+    if (event.type === "mousedown" && event.button !== undefined && event.button !== 0) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    leanPaneResizeState = {
+      startClientX: Number(event.clientX) || 0,
+      startWidth: leanPaneWidthPx,
+      pointerId: event.pointerId,
+      usingPointer: event.type === "pointerdown"
+    };
+    leanPane.classList.add("ol-lean-project-pane-resizing");
+    document.body?.classList?.add("ol-lean-pane-resizing");
+    if (leanPaneResizeState.usingPointer) {
+      document.addEventListener("pointermove", handleLeanPaneResizeMove, true);
+      document.addEventListener("pointerup", finishLeanPaneResize, true);
+      document.addEventListener("pointercancel", cancelLeanPaneResize, true);
+    } else {
+      document.addEventListener("mousemove", handleLeanPaneResizeMove, true);
+      document.addEventListener("mouseup", finishLeanPaneResize, true);
+    }
+  }
+
+  function handleLeanPaneResizeMove(event) {
+    if (!leanPaneResizeState) return;
+    if (leanPaneResizeState.pointerId !== undefined && event.pointerId !== undefined && event.pointerId !== leanPaneResizeState.pointerId) return;
+    event.preventDefault?.();
+    const currentClientX = Number(event.clientX) || 0;
+    const delta = leanPaneResizeState.startClientX - currentClientX;
+    applyLeanPaneWidth(leanPaneResizeState.startWidth + delta);
+  }
+
+  function finishLeanPaneResize(event) {
+    event?.preventDefault?.();
+    stopLeanPaneResize({ persist: true });
+  }
+
+  function cancelLeanPaneResize(event) {
+    event?.preventDefault?.();
+    stopLeanPaneResize({ persist: false });
+  }
+
+  function stopLeanPaneResize({ persist }) {
+    if (!leanPaneResizeState) return;
+    const usingPointer = leanPaneResizeState.usingPointer;
+    leanPaneResizeState = null;
+    if (usingPointer) {
+      document.removeEventListener?.("pointermove", handleLeanPaneResizeMove, true);
+      document.removeEventListener?.("pointerup", finishLeanPaneResize, true);
+      document.removeEventListener?.("pointercancel", cancelLeanPaneResize, true);
+    } else {
+      document.removeEventListener?.("mousemove", handleLeanPaneResizeMove, true);
+      document.removeEventListener?.("mouseup", finishLeanPaneResize, true);
+    }
+    leanPane?.classList.remove("ol-lean-project-pane-resizing");
+    document.body?.classList?.remove("ol-lean-pane-resizing");
+    if (persist) persistLeanPaneWidth();
+  }
+
+  function handleLeanPaneResizeKeydown(event) {
+    let nextWidth = null;
+    const step = event.shiftKey ? LEAN_PANE_KEYBOARD_LARGE_STEP_PX : LEAN_PANE_KEYBOARD_STEP_PX;
+    if (event.key === "ArrowLeft") nextWidth = leanPaneWidthPx + step;
+    else if (event.key === "ArrowRight") nextWidth = leanPaneWidthPx - step;
+    else if (event.key === "Home") nextWidth = MIN_LEAN_PANE_WIDTH_PX;
+    else if (event.key === "End") nextWidth = maxLeanPaneWidthPx();
+    if (nextWidth === null) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    applyLeanPaneWidth(nextWidth);
+    persistLeanPaneWidth();
   }
 
   // ── Export & GitHub sharing (D34) ──────────────────────────────────────────

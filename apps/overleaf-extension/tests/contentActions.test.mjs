@@ -134,6 +134,95 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /missing stub/);
 });
 
+test("Lean pane renders a persisted drag resize handle", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-project-pane-resizer"), 1);
+  assert.equal(harness.leanPaneWidthStyle(), "520px");
+});
+
+test("Lean pane drag resizing grows left, clamps at minimum, and persists", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.dragLeanPaneResizer({ startX: 520, moves: [420] });
+
+  assert.equal(harness.leanPaneWidthStyle(), "620px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 620 });
+
+  harness.dragLeanPaneResizer({ startX: 420, moves: [1000] });
+
+  assert.equal(harness.leanPaneWidthStyle(), "360px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 360 });
+});
+
+test("Lean pane applies stored width when reopened", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { leanPaneWidthPx: 700 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.equal(harness.leanPaneWidthStyle(), "700px");
+});
+
+test("Lean pane keyboard resizing honors min and max and persists", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { leanPaneWidthPx: 520 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.keyLeanPaneResizer("ArrowLeft");
+
+  assert.equal(harness.leanPaneWidthStyle(), "544px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 544 });
+
+  harness.keyLeanPaneResizer("ArrowRight", { shiftKey: true });
+  harness.keyLeanPaneResizer("ArrowRight", { shiftKey: true });
+  harness.keyLeanPaneResizer("ArrowRight", { shiftKey: true });
+
+  assert.equal(harness.leanPaneWidthStyle(), "360px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 360 });
+
+  harness.keyLeanPaneResizer("End");
+
+  assert.equal(harness.leanPaneWidthStyle(), "1000px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 1000 });
+});
+
+test("Lean pane viewport resize clamps an oversized stored width", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { leanPaneWidthPx: 900 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  assert.equal(harness.leanPaneWidthStyle(), "900px");
+
+  harness.window.innerWidth = 600;
+  harness.window.dispatchEvent({ type: "resize" });
+
+  assert.equal(harness.leanPaneWidthStyle(), "576px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 576 });
+});
+
 test("Lean pane renders every source file equally with file rows collapsed by default", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -721,6 +810,8 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const fetchCalls = [];
   const postedMessages = [];
   const confirmCalls = [];
+  const storageSetCalls = [];
+  const storageState = { ...(options.storage || {}) };
   let nextTimerId = 1;
 
   const window = {
@@ -736,6 +827,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       const listeners = this._listeners.get(type) || [];
       listeners.push(listener);
       this._listeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) {
+      removeListener(this._listeners, type, listener);
+    },
+    dispatchEvent(event) {
+      const eventObject = normalizeFakeEvent(event, this);
+      for (const listener of this._listeners.get(eventObject.type) || []) {
+        listener(eventObject);
+      }
+      return !eventObject.defaultPrevented;
     },
     postMessage(data) {
       postedMessages.push(data);
@@ -852,9 +953,12 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       storage: {
         sync: {
           async get(defaults) {
-            return defaults;
+            return { ...defaults, ...storageState };
           },
-          async set() {}
+          async set(values) {
+            storageSetCalls.push({ ...values });
+            Object.assign(storageState, values);
+          }
         }
       }
     }
@@ -972,6 +1076,35 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(textarea, "expected the edit textarea to be present");
       textarea.value = value;
     },
+    leanPane() {
+      return document.body.querySelector(".ol-lean-project-pane");
+    },
+    leanPaneResizer() {
+      return document.body.querySelector(".ol-lean-project-pane-resizer");
+    },
+    leanPaneWidthStyle() {
+      return this.leanPane()?.style["--ol-lean-pane-width"] || "";
+    },
+    dragLeanPaneResizer({ startX, moves }) {
+      const resizer = this.leanPaneResizer();
+      assert.ok(resizer, "expected Lean pane resizer");
+      resizer.dispatchEvent({
+        type: "mousedown",
+        button: 0,
+        clientX: startX,
+        preventDefault() {},
+        stopPropagation() {}
+      });
+      for (const clientX of moves) {
+        document.dispatchEvent({ type: "mousemove", clientX });
+      }
+      document.dispatchEvent({ type: "mouseup", clientX: moves[moves.length - 1] ?? startX });
+    },
+    keyLeanPaneResizer(key, patch = {}) {
+      const resizer = this.leanPaneResizer();
+      assert.ok(resizer, "expected Lean pane resizer");
+      resizer.dispatchEvent({ type: "keydown", key, ...patch });
+    },
     async runScheduledTimers() {
       const scheduledTimers = timers.splice(0, timers.length);
       for (const timer of scheduledTimers) {
@@ -981,7 +1114,12 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     fetchCalls,
     confirmCalls,
+    storageSetCalls,
+    storageState,
     postedMessages,
+    lastStorageSet() {
+      return storageSetCalls[storageSetCalls.length - 1] || null;
+    },
     bodyText() {
       return document.body.textContent;
     },
@@ -1022,6 +1160,18 @@ class FakeDocument {
     const listeners = this._listeners.get(type) || [];
     listeners.push(listener);
     this._listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    removeListener(this._listeners, type, listener);
+  }
+
+  dispatchEvent(event) {
+    const eventObject = normalizeFakeEvent(event, this);
+    for (const listener of this._listeners.get(eventObject.type) || []) {
+      listener(eventObject);
+    }
+    return !eventObject.defaultPrevented;
   }
 
   createElement(tagName) {
@@ -1164,6 +1314,18 @@ class FakeElement {
     this._listeners.set(type, listeners);
   }
 
+  removeEventListener(type, listener) {
+    removeListener(this._listeners, type, listener);
+  }
+
+  dispatchEvent(event) {
+    const eventObject = normalizeFakeEvent(event, this);
+    for (const listener of this._listeners.get(eventObject.type) || []) {
+      listener(eventObject);
+    }
+    return !eventObject.defaultPrevented;
+  }
+
   click() {
     for (const listener of this._listeners.get("click") || []) {
       listener({
@@ -1234,6 +1396,25 @@ function matchesSelector(node, selector) {
     return node.className.split(/\s+/).includes(selector.slice(1));
   }
   return node.tagName.toLowerCase() === selector.toLowerCase();
+}
+
+function removeListener(listenersByType, type, listener) {
+  const listeners = listenersByType.get(type) || [];
+  const index = listeners.indexOf(listener);
+  if (index !== -1) listeners.splice(index, 1);
+}
+
+function normalizeFakeEvent(event, target) {
+  const eventObject = typeof event === "string" ? { type: event } : { ...event };
+  eventObject.target ||= target;
+  eventObject.defaultPrevented = false;
+  const originalPreventDefault = eventObject.preventDefault;
+  eventObject.preventDefault = () => {
+    eventObject.defaultPrevented = true;
+    originalPreventDefault?.();
+  };
+  eventObject.stopPropagation ||= () => {};
+  return eventObject;
 }
 
 function toDatasetKey(name) {
