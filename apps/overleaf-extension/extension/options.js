@@ -5,6 +5,9 @@ const MODEL_FAMILY_LABELS = {
   google: "Google AI",
   anthropic: "Anthropic"
 };
+// Placeholder only, used before the first successful /settings fetch; the
+// companion (backed by packages/lea-model-catalog) is authoritative. Keep in
+// sync with the catalog default and content.js (AUDIT L9).
 const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_MODEL_OPTIONS = [
   { value: DEFAULT_LEA_MODEL, label: DEFAULT_LEA_MODEL, family: "openai" }

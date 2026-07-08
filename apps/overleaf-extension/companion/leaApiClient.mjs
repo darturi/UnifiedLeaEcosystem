@@ -429,6 +429,19 @@ export async function streamApiRun({
   };
 }
 
+// Consecutive failures to read the run row while the stream is also failing —
+// past this, the adapter is genuinely unreachable and the client gives up
+// (best-effort interrupting the run it may be orphaning) instead of spinning
+// until the job timeout.
+const MAX_RUN_ROW_MISSES = 5;
+
+// De-synchronize concurrent waiters: queued runs polling in lockstep would
+// all re-attach at the same instant when the slot frees; jitter gives earlier
+// arrivals a fair shot and avoids a thundering herd on the adapter.
+function retryDelayWithJitter(baseMs) {
+  return baseMs + Math.floor(Math.random() * baseMs * 0.5);
+}
+
 // Resolve to true after ms, or false immediately if/when the signal aborts —
 // so a queued run reacts to its timeout mid-wait instead of after the delay.
 function waitBeforeRetry(ms, signal) {
@@ -511,15 +524,28 @@ export async function runApiProofJob({
   // re-attach until the slot frees (bounded by the timeout timer above). A 409
   // can also mean "run already completed" (something else saw it through), so
   // consult the run row to pick retry vs. resolve — never fail on 409 alone.
+  //
+  // The same run-row consultation also covers a DROPPED stream (open transport
+  // error, mid-stream disconnect, or a clean close without a `done` frame):
+  // the run may well still be executing adapter-side, so failing the job here
+  // both abandoned a live, billing run and mislabeled its eventual outcome.
+  // Re-attach while the row reads pending/running; adopt the row's outcome
+  // once terminal. Only a non-409 HTTP rejection of the attach, or a stream
+  // that DID deliver a terminal status, is a real, immediate failure.
   let outcome;
   let loggedBusyWait = false;
+  let loggedStreamDrop = false;
+  let rowMisses = 0;
   try {
     for (;;) {
       outcome = await streamApiRun({
         fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
         signal: abort.signal, onEvent, onProgressUpdated,
       });
-      if (outcome.ok || outcome.aborted || outcome.httpStatus !== 409) break;
+      if (outcome.ok || outcome.aborted) break;
+      const busy409 = outcome.httpStatus === 409;
+      const streamDropped = outcome.httpStatus == null && !outcome.doneStatus;
+      if (!busy409 && !streamDropped) break;
 
       const row = await fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId: newSessionId, runId });
       const rowStatus = String(row?.status || "").toLowerCase();
@@ -536,12 +562,27 @@ export async function runApiProofJob({
         };
         break;
       }
+      if (!row && streamDropped) {
+        // Stream AND status read both failing: the adapter is unreachable.
+        rowMisses += 1;
+        if (rowMisses >= MAX_RUN_ROW_MISSES) {
+          await log("[backend] Lea adapter is unreachable; giving up on this run and requesting an interrupt.\n");
+          interruptApiRun({ fetchImpl, baseUrl, apiKey, runId }).catch(() => {});
+          break;
+        }
+      } else {
+        rowMisses = 0;
+      }
 
-      if (!loggedBusyWait) {
+      if (busy409 && !loggedBusyWait) {
         loggedBusyWait = true;
         await log("[backend] Lea adapter is busy (another run is active); waiting for the run slot...\n");
       }
-      if (!(await waitBeforeRetry(busyRetryDelayMs, abort.signal))) {
+      if (streamDropped && !loggedStreamDrop) {
+        loggedStreamDrop = true;
+        await log("[backend] Run event stream dropped while the run is still live; re-attaching...\n");
+      }
+      if (!(await waitBeforeRetry(retryDelayWithJitter(busyRetryDelayMs), abort.signal))) {
         outcome = { ok: false, aborted: true, error: "Run stream aborted." };
         break;
       }

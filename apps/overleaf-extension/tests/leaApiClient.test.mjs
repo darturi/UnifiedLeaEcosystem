@@ -364,3 +364,84 @@ test("runApiProofJob: a non-409 stream failure still fails immediately (no retry
   assert.equal(result.ok, false);
   assert.match(result.error, /HTTP 500/);
 });
+
+// --- mid-stream drop re-attach (AUDIT H4) ------------------------------------
+// An already-attached stream that ends WITHOUT a terminal `done` frame (a
+// transport drop / adapter hiccup) does not mean the run failed — the run may
+// still be executing. The client consults the run row: re-attaches while it's
+// pending/running, adopts its outcome once terminal, and only gives up (and
+// interrupts) when the adapter is genuinely unreachable.
+
+test("runApiProofJob: stream drops with no done frame, run row is terminal → adopts it (no false failure)", async () => {
+  let eventsCalls = 0;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-d", run_id: "run-d" });
+    }
+    if (url.includes("/api/runs/run-d/events")) {
+      eventsCalls += 1;
+      // A stream that yields a progress frame then ends — never a `done`.
+      return sseResponse([frame("status", { status: "tool_call", turn: 1 })]);
+    }
+    if (url.includes("/api/sessions/sess-d")) {
+      // The run actually finished proving while we were detached.
+      return jsonResponse({ runs: [{ id: "run-d", status: "proved", result_kind: "proved", input_tokens: 10, output_tokens: 4, cost_usd: 0.002 }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize dropped",
+    timeoutMs: 5000,
+    busyRetryDelayMs: 5,
+  });
+
+  assert.equal(eventsCalls, 1);
+  assert.equal(result.ok, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.doneStatus, "proved");
+  assert.equal(result.costUsd, 0.002);
+});
+
+test("runApiProofJob: stream drops and the adapter is unreachable → gives up after the miss cap and interrupts", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, method: options.method || "GET" });
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      return jsonResponse({ session_id: "sess-u", run_id: "run-u" });
+    }
+    if (url.includes("/api/runs/run-u/interrupt")) {
+      return jsonResponse({ status: "interrupted" });
+    }
+    if (url.includes("/api/runs/run-u/events")) {
+      // Open itself fails — a dropped/unreachable stream with no HTTP status.
+      throw new Error("socket hang up");
+    }
+    if (url.includes("/api/sessions/sess-u")) {
+      // Run-row read also fails: the adapter is genuinely unreachable.
+      throw new Error("ECONNREFUSED");
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize unreachable",
+    timeoutMs: 5000,
+    busyRetryDelayMs: 3,
+  });
+
+  assert.equal(result.ok, false);
+  // It stopped on the miss cap, not the timeout.
+  assert.equal(result.timedOut, false);
+  assert.ok(
+    calls.some((c) => c.url.includes("/api/runs/run-u/interrupt") && c.method === "POST"),
+    "should best-effort interrupt the run it is abandoning"
+  );
+  // Bounded: one attach + one row read per miss, capped at 5 misses.
+  const eventAttempts = calls.filter((c) => c.url.includes("/events")).length;
+  assert.ok(eventAttempts <= 5, `expected <= 5 attach attempts, got ${eventAttempts}`);
+});

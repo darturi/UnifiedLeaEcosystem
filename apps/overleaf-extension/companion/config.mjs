@@ -59,11 +59,17 @@ export function normalizeBoolean(value, fallback = false) {
   return fallback;
 }
 
+// Reading defaults from the environment must never crash the companion at
+// startup (AUDIT M8): a bad `LEA_MAX_SPEND_USD` (e.g. `abc` or `-1`) is warned
+// about and treated as "no cap" rather than throwing out of createServer. The
+// interactive settings path uses server.mjs's own normalizeLeaMaxSpendUsd,
+// which still throws so the UI can reject the value.
 function normalizeOptionalNonNegativeNumber(value, fieldName) {
   if (value === undefined || value === null || value === "") return null;
   const number = Number(value);
   if (!Number.isFinite(number) || number < 0) {
-    throw new Error(`${fieldName} must be greater than or equal to 0`);
+    console.warn(`[companion] Ignoring invalid ${fieldName}=${JSON.stringify(value)} (must be a number >= 0); treating as unset.`);
+    return null;
   }
   return number;
 }

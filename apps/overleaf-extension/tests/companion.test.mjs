@@ -7,6 +7,7 @@ import {
   LEA_MODEL_OPTIONS,
   buildOverleafDocumentUrl,
   buildSettingsResponse,
+  createServer,
   ensureStartupLeaRuntime,
   handleChatInterrupt,
   handleChatMessage,
@@ -65,6 +66,46 @@ test("startup records the derived Lea workspace without creating root Lean files
   assert.equal(state.settings.leaWorkspacePath, buildLeaWorkspacePath(leaRepo));
   assert.equal(await fileExists(path.join(path.dirname(state.settingsPath), "lean-toolchain")), false);
   assert.equal(await fileExists(path.join(path.dirname(state.settingsPath), "lakefile.lean")), false);
+});
+
+test("createServer recovers from a corrupt jobs.json instead of crashing (AUDIT H1)", async () => {
+  const appDir = await fs.mkdtemp(path.join(os.tmpdir(), "overleaf-lean-corrupt-"));
+  const jobsPath = path.join(appDir, "jobs.json");
+  // A truncated/torn state file — exactly what a crash mid-write could leave.
+  await fs.writeFile(jobsPath, '{ "job-1": { "status": "in_prog', "utf8");
+
+  // A complete env so startup produces no env patch and never touches the real
+  // root .env during the test.
+  const env = {
+    LEA_ROOT: path.join(appDir, "prover"),
+    LEA_API_BASE_URL: "http://127.0.0.1:8001",
+    LEA_UI_BASE_URL: "http://localhost:5173",
+    LEA_PROVIDER: "openai",
+    LEA_MODEL: "o4-mini",
+    LEA_MAX_TURNS: "20",
+    LEA_NARRATE_TOOL_STEPS: "true",
+    LEA_MAX_SPEND_USD: "5",
+    LEA_JOB_TIMEOUT_SECONDS: "900"
+  };
+
+  // The old readJson rethrew any JSON parse error, so this call would throw and
+  // the companion would refuse to boot until the file was deleted by hand.
+  const server = await createServer({
+    settingsPath: path.join(appDir, "settings.json"),
+    jobsPath,
+    chatSessionsPath: path.join(appDir, "chatSessions.json"),
+    env
+  });
+  server.close?.();
+
+  // Did not throw; jobs started from a clean slate.
+  assert.deepEqual(server.leaState.jobs, {});
+  // The corrupt bytes were preserved for forensics rather than silently lost.
+  const entries = await fs.readdir(appDir);
+  assert.ok(
+    entries.some((name) => name.startsWith("jobs.json.corrupt-")),
+    "corrupt jobs.json should be moved aside to a .corrupt-* backup"
+  );
 });
 
 test("builds Lea-compatible Overleaf project slugs and markdown paths", () => {

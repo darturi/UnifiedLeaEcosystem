@@ -1,6 +1,9 @@
 (function () {
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
   const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
+  // Placeholder only, used before the first successful /settings fetch; the
+  // companion (backed by packages/lea-model-catalog) is authoritative and may
+  // re-map it. Keep in sync with the catalog default and options.js (AUDIT L9).
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
@@ -8,6 +11,12 @@
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
+  // Short debounce for an edit-triggered status refresh; a much longer cadence
+  // for the in-progress self-poll so an active run doesn't hammer /statuses
+  // (each hit does per-target FS scans + adapter fetches) four times a second
+  // (AUDIT M4).
+  const STATUS_REFRESH_DEBOUNCE_MS = 250;
+  const STATUS_REFRESH_IN_PROGRESS_MS = 3000;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -68,6 +77,11 @@
   let leanPaneChatOptimistic = [];
   let leanPaneChatPollTimer = null;
   let leanPaneChatToken = 0;
+  // Consecutive transient poll failures (AUDIT M2): a thrown fetch used to stop
+  // polling entirely, freezing the panel on "Lea is working…". We now retry
+  // with backoff up to this cap before giving up and surfacing the error.
+  let leanPaneChatPollFailures = 0;
+  const LEAN_PANE_CHAT_POLL_MAX_FAILURES = 5;
   // Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md): at most one
   // item's edit view is open at a time, tracked by item id the same way
   // leanPaneExpandedItemIds tracks expansion -- module state survives the
@@ -160,9 +174,18 @@
   });
 
   window.addEventListener("resize", renderStatusBadges);
+  // Capture-phase scroll fires very frequently; coalesce to one update per
+  // animation frame (AUDIT M4) instead of re-parsing the whole document and
+  // re-laying out every badge on every scroll tick.
+  let scrollRafPending = false;
   window.addEventListener("scroll", () => {
-    requestTargets();
-    renderStatusBadges();
+    if (scrollRafPending) return;
+    scrollRafPending = true;
+    requestAnimationFrame(() => {
+      scrollRafPending = false;
+      requestTargets();
+      renderStatusBadges();
+    });
   }, true);
 
   function renderSettingsButton() {
@@ -1606,6 +1629,7 @@
     leanPaneChatSending = false;
     leanPaneChatError = null;
     leanPaneChatOptimistic = [];
+    leanPaneChatPollFailures = 0;
   }
 
   async function chatCompanionBaseUrl() {
@@ -1623,6 +1647,7 @@
     leanPaneChatRunId = "";
     leanPaneChatError = null;
     leanPaneChatOptimistic = [];
+    leanPaneChatPollFailures = 0;
     leanPaneChatLoading = true;
     leanPaneChatSending = false;
     ensureChatPanel();
@@ -1662,6 +1687,7 @@
     const token = leanPaneChatToken;
     leanPaneChatSending = true;
     leanPaneChatError = null;
+    leanPaneChatPollFailures = 0;
     leanPaneChatOptimistic.push({ role: "user", content: text, kind: "user" });
     if (input) input.value = "";
     renderChatPanel();
@@ -1694,20 +1720,41 @@
     }
   }
 
-  function startChatPolling() {
+  function startChatPolling(delayMs = LEAN_PANE_POLL_DELAY_MS) {
     clearTimeout(leanPaneChatPollTimer);
     leanPaneChatPollTimer = setTimeout(() => {
+      // pollChatSession handles its own transient errors; the catch is a
+      // last-resort guard against an unexpected synchronous throw.
       pollChatSession().catch(() => {});
-    }, LEAN_PANE_POLL_DELAY_MS);
+    }, delayMs);
   }
 
   async function pollChatSession() {
     if (!leanPaneChatSessionId) return;
     const token = leanPaneChatToken;
-    const baseUrl = await chatCompanionBaseUrl();
-    const response = await fetch(`${baseUrl}/lean-pane/chat/session/${encodeURIComponent(leanPaneChatSessionId)}`);
-    const payload = await response.json().catch(() => ({}));
+    let payload = null;
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/chat/session/${encodeURIComponent(leanPaneChatSessionId)}`);
+      payload = await response.json().catch(() => ({}));
+    } catch {
+      // Transient failure (companion restarting, network blip). AUDIT M2: do
+      // NOT stop polling and strand the panel on "Lea is working…" — retry
+      // with backoff up to a cap, only surfacing an error once we've truly
+      // given up.
+      if (token !== leanPaneChatToken) return;
+      leanPaneChatPollFailures += 1;
+      if (leanPaneChatPollFailures >= LEAN_PANE_CHAT_POLL_MAX_FAILURES) {
+        leanPaneChatSending = false;
+        leanPaneChatError = new Error("Lost contact with the companion while waiting for Lea. Check that it's running, then try again.");
+        renderChatPanel();
+        return;
+      }
+      startChatPolling(LEAN_PANE_POLL_DELAY_MS * (leanPaneChatPollFailures + 1));
+      return;
+    }
     if (token !== leanPaneChatToken) return;
+    leanPaneChatPollFailures = 0;
     if (payload && payload.ok) {
       leanPaneChatResponse = payload;
       leanPaneChatOptimistic = [];
@@ -1721,7 +1768,8 @@
         if (wasRunning) refreshLeanPaneNow({ background: true }).catch(() => {});
       }
     } else {
-      // Adapter unavailable mid-run: surface it and stop polling.
+      // Adapter reachable but reporting unavailable mid-run: surface it and
+      // stop polling.
       leanPaneChatSending = false;
       leanPaneChatResponse = payload;
     }
@@ -2620,13 +2668,13 @@
     };
   }
 
-  function scheduleStatusRefresh() {
+  function scheduleStatusRefresh(delayMs = STATUS_REFRESH_DEBOUNCE_MS) {
     clearTimeout(statusRefreshTimer);
     statusRefreshTimer = setTimeout(() => {
       refreshStatusesNow().catch((error) => {
         postStatusError(error);
       });
-    }, 250);
+    }, delayMs);
   }
 
   async function refreshStatusesNow() {
@@ -2660,7 +2708,7 @@
       if (target) updatePopoverStatus(activePopover, target);
     }
     if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
-      scheduleStatusRefresh();
+      scheduleStatusRefresh(STATUS_REFRESH_IN_PROGRESS_MS);
     }
   }
 
@@ -3012,7 +3060,14 @@
   }
 
   function buildLeaSessionUrl(baseUrl, sessionId) {
-    const url = new URL(baseUrl || DEFAULT_LEA_UI_BASE_URL);
+    // A malformed stored leaUiBaseUrl (a user typo in options) must not throw
+    // out of popover render (AUDIT L4) — fall back to the default origin.
+    let url;
+    try {
+      url = new URL(baseUrl || DEFAULT_LEA_UI_BASE_URL);
+    } catch {
+      url = new URL(DEFAULT_LEA_UI_BASE_URL);
+    }
     url.searchParams.set("session", sessionId);
     return url.toString();
   }
@@ -3336,7 +3391,9 @@
         if (status) status.textContent = error instanceof Error ? error.message : String(error);
       }
       scheduleUsageRefresh(popover);
-    }, 1000);
+      // 5s, not 1s (AUDIT M4): each refresh fans out to the adapter's
+      // /api/stats; the settings popover doesn't need per-second usage.
+    }, 5000);
   }
 
   function renderUsage(popover, key, usage) {

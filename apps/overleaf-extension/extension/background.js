@@ -50,6 +50,13 @@ async function openLeaSessionTab({ url, baseUrl }) {
 // path so we focus the *right* document, not just any Overleaf tab.
 async function openOverleafDocumentTab({ url }) {
   const targetUrl = normalizeHttpUrl(url, "Overleaf document URL");
+  // This message arrives from the uiBridge content script, which any page on
+  // its (local) origin can drive via postMessage — don't let it become a
+  // generic "open any URL in an active tab" primitive. Only Overleaf
+  // documents are a legitimate target here.
+  if (!isOverleafUrl(targetUrl)) {
+    throw new Error("Only overleaf.com document URLs can be opened this way.");
+  }
   const projectId = overleafProjectIdFromUrl(targetUrl);
   const pattern = `${new URL(targetUrl).origin}/*`;
   const tabs = await chrome.tabs.query({ url: pattern });
@@ -70,6 +77,15 @@ async function openOverleafDocumentTab({ url }) {
   }
 
   await chrome.tabs.create({ url: targetUrl, active: true });
+}
+
+function isOverleafUrl(value) {
+  try {
+    const { protocol, hostname } = new URL(value);
+    return protocol === "https:" && /(^|\.)overleaf\.com$/.test(hostname);
+  } catch {
+    return false;
+  }
 }
 
 function overleafProjectIdFromUrl(value) {

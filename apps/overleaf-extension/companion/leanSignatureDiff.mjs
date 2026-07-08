@@ -8,7 +8,12 @@
 
 import { normalizeTargetText } from "../shared/theoremParser.mjs";
 
-const DECLARATION_KEYWORD_PATTERN = "theorem|lemma|def|abbrev";
+// Mirrors server.mjs's DECLARATION_KEYWORDS (AUDIT L3): an item modelled as an
+// `inductive` or `instance` must parse a header too, or every proof-only edit
+// to it classifies as a blanket "signature" change and triggers a needless
+// cascade. All of these except theorem/lemma are def-like (see isDefLike), so
+// a body change to them cascades as a definition-body change.
+const DECLARATION_KEYWORD_PATTERN = "theorem|lemma|def|abbrev|structure|class|inductive|instance";
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -125,8 +130,16 @@ export function classifyEdit({ before, after, expectedName, ownCheckFailed = fal
   return { kind: "proof-only" };
 }
 
+// "Def-like" = a declaration whose BODY/value can be relied on downstream, so
+// a body change (not just a header change) is cascade-worthy. That's
+// everything except theorem/lemma, which are proof-irrelevant (their proof
+// body can't affect any importer). structure/class/inductive/instance
+// (AUDIT L3) all expose fields/constructors/resolution downstream, so a change
+// to their body must re-verify dependents just like a def would.
+const PROOF_IRRELEVANT_KEYWORDS = new Set(["theorem", "lemma"]);
+
 function isDefLike(header) {
-  return Boolean(header) && (header.keyword === "def" || header.keyword === "abbrev");
+  return Boolean(header) && !PROOF_IRRELEVANT_KEYWORDS.has(header.keyword);
 }
 
 // The single predicate edit-save handlers call: does this classification

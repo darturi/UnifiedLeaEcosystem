@@ -73,11 +73,19 @@ test("environment max spend overrides explicit local setting", () => {
   assert.equal(settings.leaMaxSpendUsd, 12.5);
 });
 
-test("negative max spend is rejected", () => {
-  assert.throws(
-    () => applyEnvDefaults({}, { LEA_MAX_SPEND_USD: "-1" }),
-    /leaMaxSpendUsd/
-  );
+test("invalid env max spend is ignored, not thrown (AUDIT M8)", () => {
+  // A bad env value must not crash startup; it is warned about and treated as
+  // "no cap" (null). The interactive settings path still rejects it.
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    assert.equal(applyEnvDefaults({}, { LEA_MAX_SPEND_USD: "-1" }).leaMaxSpendUsd, null);
+    assert.equal(applyEnvDefaults({}, { LEA_MAX_SPEND_USD: "abc" }).leaMaxSpendUsd, null);
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.ok(warnings.some((line) => line.includes("leaMaxSpendUsd")));
 });
 
 test("tex mirror defaults on and is overridable via env", () => {

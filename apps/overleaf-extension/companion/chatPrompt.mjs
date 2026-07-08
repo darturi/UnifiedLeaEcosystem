@@ -175,15 +175,6 @@ export function toChatSessionResponse(detail = {}, { targetKey = null, leaSessio
   };
 }
 
-// True while the run for this session is still going — the signal the extension
-// uses to keep polling and then stop once the run settles.
-export function isChatRunActive(response) {
-  if (!response || typeof response !== "object") return false;
-  if (response.activeRun) return true;
-  const status = String(response.activeRun?.status || "").toLowerCase();
-  return status === "running" || status === "pending" || status === "queued";
-}
-
 function isVisibleChatMessage(message) {
   if (!message || typeof message !== "object") return false;
   if (!VISIBLE_MESSAGE_ROLES.has(String(message.role || "").toLowerCase())) return false;

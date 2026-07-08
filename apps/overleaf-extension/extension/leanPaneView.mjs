@@ -304,11 +304,19 @@ export function canStubPaneItem(item) {
   return item.status === "missing-stub";
 }
 
-// Shape a manifest item into the target payload the existing /formalize flow expects.
+// Shape a manifest item into the target payload the existing /formalize flow
+// expects. targetLabel is the LaTeX marker `label` — NOT leanDeclarationName
+// (AUDIT M6): the companion keys jobs by the marker label (the doc-side anchor
+// that never changes), and the in-document badge always posts that label.
+// Sending the current declaration name here instead forked a renamed item's
+// job history — the pane and the badge would track two divergent jobKeys, and
+// their busy-checks and cleanup wouldn't compose. The declaration-name bridge
+// in resolveEditSession/resolveChatSession only exists because those paths
+// can't re-key; a formalize CAN and should just use the label.
 export function paneItemToFormalizeTarget(item) {
   return {
     targetKind: item?.leanKind === "def" ? "definition" : "theorem",
-    targetLabel: item?.leanDeclarationName || item?.label || "",
+    targetLabel: item?.label || item?.leanDeclarationName || "",
     targetText: item?.naturalLanguageLatex || "",
     targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
     targetContext: item?.targetContext || ""

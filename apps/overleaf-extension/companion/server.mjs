@@ -32,6 +32,7 @@ import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
 import { buildChatPrompt, buildRepairPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
+  containsSorryMarker,
   dependentsOf,
   listProjectProofFiles,
   moduleNameFromProjectStep,
@@ -140,16 +141,22 @@ export async function createServer({
   await ensureStartupLeaRuntime(state);
   await recoverInterruptedJobs(state);
 
-  return http.createServer(async (request, response) => {
+  const server = http.createServer(async (request, response) => {
     try {
       await routeRequest(request, response, state);
     } catch (error) {
-      sendJson(response, 500, {
-        error: "internal_error",
+      // httpError-tagged failures (bad JSON, oversized body) keep their real
+      // status; everything else is a genuine 500 (AUDIT M5).
+      const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+      sendJson(response, statusCode, {
+        error: typeof error?.code === "string" && error.code ? error.code : "internal_error",
         message: error instanceof Error ? error.message : String(error)
       });
     }
   });
+  // Exposed for the boot log's provider-aware readiness warning (AUDIT L10).
+  server.leaState = state;
+  return server;
 }
 
 export async function recoverInterruptedJobs(state) {
@@ -166,6 +173,11 @@ export async function recoverInterruptedJobs(state) {
     if (job.logPath) {
       await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
     }
+    // An interrupted re-formalize never got to produce a replacement for the
+    // artifact its pre-run cleanup deleted — restore it (AUDIT H2). The
+    // backups persist on job.retryCleanup precisely so this survives a
+    // restart.
+    await restorePreviousRunArtifacts({ state, job, target: { projectMarkdownPath: job.projectMarkdownPath } });
     changed = true;
   }
 
@@ -224,7 +236,7 @@ export async function handleFormalize(payload, state) {
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
-  if (spendLimitReached(state)) {
+  if (await spendLimitReached(state)) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
   }
 
@@ -312,6 +324,7 @@ export async function handleFormalize(payload, state) {
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
+    await restorePreviousRunArtifacts({ state, job, target });
     await writeJson(state.jobsPath, state.jobs);
   });
 
@@ -342,7 +355,7 @@ export async function handleStub(payload, state) {
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
-  if (spendLimitReached(state)) {
+  if (await spendLimitReached(state)) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
   }
 
@@ -880,7 +893,7 @@ export async function handleChatMessage(payload, state) {
   await syncSharedSettingsFromAdapter(state);
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
-  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
 
   const { leaSessionId, latestJobHash, activeJob } = resolveChatSession({ state, target });
   if (activeJob) {
@@ -909,9 +922,13 @@ export async function handleChatMessage(payload, state) {
   }
   // A new message supersedes the previous run's impact notice. Cleared here,
   // BEFORE the run starts -- clearing after would race this run's own
-  // continuation (see the record write below, which preserves it).
+  // continuation (see the record write below, which preserves it). Persist
+  // the clear immediately (AUDIT L2): if startChatRun then fails, we return
+  // early, and without this the on-disk record would still carry the impact
+  // the user's send was meant to supersede -- resurrecting it on restart.
   if (state.chatSessions?.[target.targetKey]?.lastRunImpact) {
     delete state.chatSessions[target.targetKey].lastRunImpact;
+    await persistChatSessions(state);
   }
 
   let started;
@@ -1167,14 +1184,12 @@ function resolveDependentSession({ state, overleafProjectId, targetLabel }) {
 // when the label-keyed fast path misses.
 function findLatestJobWithLeaSessionByDeclarationName(jobs, projectSlug, declarationName) {
   const prefix = `${projectSlug}:`;
-  return Object.values(jobs || {})
-    .filter((job) =>
-      job &&
-      typeof job.jobKey === "string" &&
-      job.jobKey.startsWith(prefix) &&
-      job.declarationName === declarationName &&
-      (job.leaSessionId || job.recorderSessionId))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) =>
+    job &&
+    typeof job.jobKey === "string" &&
+    job.jobKey.startsWith(prefix) &&
+    job.declarationName === declarationName &&
+    (job.leaSessionId || job.recorderSessionId))[0] || null;
 }
 
 // Rename bookkeeping: `job.declarationName` caches "what Lean symbol does this
@@ -1289,7 +1304,30 @@ export async function handleLeanPaneEditSave(payload, state) {
 
   const check = await runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path });
   if (!check.ok) {
-    return errorResponse(check.status || 502, "edit_check_failed", check.error || "Could not check the edit.");
+    // AUDIT M3: the WRITE already landed — the file on disk is the user's new
+    // content. A bare 502 here would leave the pane's chip reading the
+    // pre-edit verdict ("valid") for content that was never checked. Fail
+    // closed on the item itself instead (same vocabulary the cascade uses for
+    // an unverifiable dependent): record an error verdict with no breakage
+    // attribution, so the chip reads "invalid / could not verify" with the
+    // real reason, and the user is told the save landed but verification
+    // couldn't run. Dependents are deliberately not re-checked — there is no
+    // trustworthy build of the edited module to check them against.
+    const detail = `Saved, but the edit could not be verified: ${check.error || "the Lea adapter did not return a lean-check result."} Retry the save when the adapter is reachable.`;
+    if (linkedJob) {
+      recordEditCheckVerdict(linkedJob, { status: "error", detail });
+      await writeJson(state.jobsPath, state.jobs);
+    }
+    return {
+      statusCode: 200,
+      body: {
+        ok: true,
+        unchanged: false,
+        checkUnavailable: true,
+        ownResult: { path: before.path, checkStatus: "unknown", checkDetail: detail, classification: null },
+        dependentsImpact: []
+      }
+    };
   }
   const ownCheckFailed = String(check.body?.status || "").toLowerCase() !== "ok";
   // Snapshot BEFORE recordEditCheckVerdict mutates it -- this is the only
@@ -1872,7 +1910,7 @@ export async function handleLeanPaneRepairStart(payload, state) {
   await syncSharedSettingsFromAdapter(state);
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
-  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
 
   const started = await startRepairRun({ state, overleafProjectId, targetKind, targetLabel });
   if (started.status === "error") return errorResponse(started.statusCode, started.error, started.message);
@@ -1892,6 +1930,23 @@ export async function handleLeanPaneRepairStart(payload, state) {
 // restart mid-batch loses the loop but nothing an offer can't re-derive.
 
 let repairBatchCounter = 0;
+
+// Batch records (with their importsByModule maps) are held in memory only and
+// were never cleaned up (AUDIT L5). Before creating a new one, drop settled
+// batches beyond a small recent window so a long-running companion doesn't
+// accumulate them without bound. A still-running or paused batch is always
+// kept (its poller / continue endpoint still needs it).
+const MAX_RETAINED_REPAIR_BATCHES = 10;
+
+function pruneRepairBatches(batches) {
+  const settled = Object.values(batches)
+    .filter((batch) => batch && (batch.done || batch.pausedOn?.reason === "batch_error") && !batch.running)
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  const excess = settled.length - MAX_RETAINED_REPAIR_BATCHES;
+  for (let i = 0; i < excess; i += 1) {
+    delete batches[settled[i].batchId];
+  }
+}
 
 function repairBatchSnapshot(batch) {
   return {
@@ -1925,7 +1980,7 @@ export async function handleLeanPaneRepairAll(payload, state) {
   await syncSharedSettingsFromAdapter(state);
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
-  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
 
   // Project import graph, for topological ordering and depends-on-failed
   // skipping. Full-project (not batch-only): a dependency path between two
@@ -1962,6 +2017,7 @@ export async function handleLeanPaneRepairAll(payload, state) {
     done: false
   };
   state.repairBatches ||= {};
+  pruneRepairBatches(state.repairBatches);
   state.repairBatches[batch.batchId] = batch;
 
   runRepairBatch(state, batch).catch((error) => {
@@ -2016,7 +2072,7 @@ async function runRepairBatch(state, batch) {
       if (entry.state !== "pending") continue;
       // A cap reached mid-batch pauses (resumable once raised) rather than
       // failing the item.
-      if (spendLimitReached(state)) {
+      if (await spendLimitReached(state)) {
         batch.pausedOn = { targetLabel: entry.targetLabel, reason: "max_spend" };
         break;
       }
@@ -2353,7 +2409,7 @@ export async function handleGetUsage(payload, state) {
       allTime,
       leaMaxSpendUsd,
       leaCurrentSpendUsd: allTime.costUsd,
-      leaSpendLimitReached: spendLimitReached(state)
+      leaSpendLimitReached: await spendLimitReached(state)
     }
   };
 }
@@ -2448,11 +2504,24 @@ export async function ensureStartupLeaRuntime(state) {
 }
 
 async function routeRequest(request, response, state) {
-  setCorsHeaders(response);
+  setCorsHeaders(response, request);
 
   if (request.method === "OPTIONS") {
     response.writeHead(204);
     response.end();
+    return;
+  }
+
+  // Belt and suspenders over the CORS grant above: a cross-site "simple"
+  // request still executes server-side even when the page can't read the
+  // response, so a request that CARRIES a browser Origin we don't recognize
+  // is rejected outright rather than merely left unreadable.
+  const requestOrigin = String(request.headers?.origin || "");
+  if (requestOrigin && !isAllowedBrowserOrigin(requestOrigin)) {
+    sendJson(response, 403, {
+      error: "forbidden_origin",
+      message: `Requests from origin ${requestOrigin} are not allowed.`
+    });
     return;
   }
 
@@ -2505,7 +2574,6 @@ async function routeRequest(request, response, state) {
       overleafProjectId: url.searchParams.get("overleafProjectId") || ""
     }, state);
     if (result.zip) {
-      setCorsHeaders(response);
       response.writeHead(200, {
         "Content-Type": result.zip.contentType || "application/zip",
         "Content-Disposition": `attachment; filename="${result.zip.filename}"`,
@@ -2661,7 +2729,9 @@ export async function buildSettingsResponse(state) {
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
-    leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
+    // Same source of truth as enforcement (AUDIT H5): the adapter's global
+    // roll-up when reachable, the local job tally otherwise.
+    leaCurrentSpendUsd: await currentSpendUsd(state),
     leaTexMirrorEnabled: state.settings.leaTexMirrorEnabled !== false,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS,
     // Presence only (like provider keys): the raw token lives solely in the
@@ -3099,16 +3169,32 @@ function findActiveJob(jobs, jobKey) {
   return Object.values(jobs).find((job) => job.jobKey === jobKey && job.status === "in_progress");
 }
 
+// One recency definition for every "latest job" selection (AUDIT L6/L7): a
+// job's recency is when it FINISHED, falling back to when it started for a job
+// still lacking a finishedAt. The old findLatestJob/findLatestFinishedJob
+// sorted by startedAt alone, disagreeing with getTheoremStatus's
+// newest-terminal selection (finishedAt||startedAt) -- a run that started
+// earlier but finished later (now possible with the 409 run-queueing) could be
+// "latest" under one rule and not the other. `jobsByRecencyDesc` also uses
+// plain string comparison rather than localeCompare: ISO-8601 timestamps sort
+// correctly bytewise, and it's deterministic (no locale sensitivity, no odd
+// "null" coercion).
+function jobRecency(job) {
+  return String(job?.finishedAt || job?.startedAt || "");
+}
+
+function jobsByRecencyDesc(jobs, predicate) {
+  return Object.values(jobs || {})
+    .filter(predicate)
+    .sort((a, b) => (jobRecency(a) < jobRecency(b) ? 1 : jobRecency(a) > jobRecency(b) ? -1 : 0));
+}
+
 function findLatestJob(jobs, jobKey, status) {
-  return Object.values(jobs)
-    .filter((job) => job.jobKey === jobKey && job.status === status)
-    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status === status)[0] || null;
 }
 
 function findLatestFinishedJob(jobs, jobKey) {
-  return Object.values(jobs || {})
-    .filter((job) => job.jobKey === jobKey && job.status !== "in_progress")
-    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status !== "in_progress")[0] || null;
 }
 
 async function resolveTheoremUses({ leaRepoPath, overleafProjectId, targetUses, jobs }) {
@@ -3258,19 +3344,104 @@ async function cleanupPreviousRunArtifacts({ leaRepoPath, target, targetText, jo
     candidateProofPaths.add(entry.proofPath);
   }
 
+  // Back up what is about to be deleted (AUDIT H2): this cleanup runs BEFORE
+  // the new run, so if that run fails, times out, or hits the spend cap, the
+  // previous verified artifact would otherwise be gone for good — and every
+  // dependent that imports its module breaks with it. The backups ride on
+  // job.retryCleanup and are restored by restorePreviousRunArtifacts when the
+  // run does not end verified; dropped once it does.
   const removedProofPaths = [];
+  const proofFileBackups = [];
   for (const proofPath of candidateProofPaths) {
+    const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
+    let content = null;
+    if (absolutePath && existsSync(absolutePath)) {
+      try {
+        content = await fs.readFile(absolutePath, "utf8");
+      } catch {
+        content = null;
+      }
+    }
     if (await removeLeaProofFile({ leaRepoPath, proofPath })) {
       removedProofPaths.push(proofPath);
+      if (content !== null && content.length <= MAX_RETRY_BACKUP_BYTES) {
+        proofFileBackups.push({ proofPath, content });
+      }
     }
   }
 
-  const removedProjectEntries = await removeProjectTheoremEntries({
+  const removedSections = await removeProjectTheoremEntries({
     projectMarkdownPath: target.projectMarkdownPath,
     entriesToRemove
   });
 
-  return { removedProofPaths, removedProjectEntries };
+  return {
+    removedProofPaths,
+    removedProjectEntries: removedSections.map((section) => section.name),
+    backups: {
+      proofFiles: proofFileBackups,
+      markdownSections: removedSections
+        .filter((section) => section.text)
+        .map((section) => ({ name: section.name, text: section.text }))
+    }
+  };
+}
+
+// Cap on how much deleted proof content is stashed on a job record (the
+// backups are persisted with jobs.json); recorded Lean proofs are a few KB.
+const MAX_RETRY_BACKUP_BYTES = 256 * 1024;
+
+// Put back what cleanupPreviousRunArtifacts deleted, after a run that did NOT
+// produce a verified replacement (AUDIT H2). Conservative on purpose: a proof
+// file is only restored when nothing exists at its path (a partial file the
+// failed run left behind is never overwritten), and a markdown section only
+// when no entry with its name is present. Idempotent via retryCleanup.restored.
+async function restorePreviousRunArtifacts({ state, job, target }) {
+  const backups = job?.retryCleanup?.backups;
+  if (!backups || job.retryCleanup.restored) return false;
+  job.retryCleanup.restored = true;
+  let restored = false;
+
+  for (const file of backups.proofFiles || []) {
+    const absolutePath = buildLeaProofPath({
+      leaRepoPath: state.settings.leaRepoPath,
+      proofPath: file.proofPath
+    });
+    if (!absolutePath || existsSync(absolutePath)) continue;
+    try {
+      await atomicWriteFile(absolutePath, file.content, "utf8");
+      restored = true;
+    } catch {
+      // best-effort; the adapter's git history still has the bytes
+    }
+  }
+
+  const sections = backups.markdownSections || [];
+  const projectMarkdownPath = target?.projectMarkdownPath || job?.projectMarkdownPath;
+  if (sections.length > 0 && projectMarkdownPath) {
+    try {
+      const present = new Set((await readProjectTheoremEntries(projectMarkdownPath)).map((entry) => entry.name));
+      const missing = sections.filter((section) => section.name && !present.has(section.name));
+      if (missing.length > 0) {
+        let markdown = "";
+        try {
+          markdown = await fs.readFile(projectMarkdownPath, "utf8");
+        } catch {
+          markdown = "";
+        }
+        const restoredSections = missing.map((section) => section.text.trim()).join("\n\n");
+        await atomicWriteFile(projectMarkdownPath, `${markdown.trimEnd()}\n\n${restoredSections}\n`, "utf8");
+        restored = true;
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  if (restored && job.logPath) {
+    await appendLog(job.logPath, "\n[backend] Run did not produce a verified artifact; restored the previous run's proof and markdown entry.\n");
+  }
+  return restored;
 }
 
 async function removeLeaProofFile({ leaRepoPath, proofPath }) {
@@ -3307,8 +3478,13 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
   for (const section of [...sections].sort((a, b) => b.start - a.start)) {
     nextMarkdown = `${nextMarkdown.slice(0, section.start)}${nextMarkdown.slice(section.end)}`;
   }
-  await fs.writeFile(projectMarkdownPath, nextMarkdown.replace(/\n{3,}/g, "\n\n"), "utf8");
-  return sections.map((section) => section.entry.name);
+  await atomicWriteFile(projectMarkdownPath, collapseBlankRunsOutsideFences(nextMarkdown), "utf8");
+  // Name + original section text, so cleanupPreviousRunArtifacts can stash a
+  // restorable backup (AUDIT H2).
+  return sections.map((section) => ({
+    name: section.entry.name,
+    text: markdown.slice(section.start, section.end)
+  }));
 }
 
 // Run one autonomous proof job against the standalone adapter, returning the
@@ -3768,6 +3944,15 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     await appendLog(job.logPath, `[backend] ${job.error}\n`);
   }
   job.status = outcome.jobStatus;
+  // AUDIT H2: a verified outcome no longer needs the pre-run backups (drop
+  // them so jobs.json stays slim); a failed one restores what the pre-run
+  // cleanup deleted, so the target doesn't lose its last verified proof to a
+  // run that produced nothing.
+  if (["formalized", "disproved"].includes(outcome.jobStatus)) {
+    if (job.retryCleanup?.backups) delete job.retryCleanup.backups;
+  } else if (outcome.jobStatus === "failed") {
+    await restorePreviousRunArtifacts({ state, job, target });
+  }
   await writeJson(state.jobsPath, state.jobs);
 }
 
@@ -3784,7 +3969,13 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
     stubToComplete: job.stubToComplete || null
   });
   const exit = await runLeaProofJobForJob({ state, job, target, prompt });
-  if (job.finalStatus === "max_spend") return;
+  if (job.finalStatus === "max_spend") {
+    // The spend cap killed the run before it produced anything — put the
+    // previous verified artifact back (AUDIT H2).
+    await restorePreviousRunArtifacts({ state, job, target });
+    await writeJson(state.jobsPath, state.jobs);
+    return;
+  }
 
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 
@@ -3905,7 +4096,7 @@ function validateStubArtifact({ state, job, target, exit, sessionDetail, observe
     return { ok: false, error: `Lea did not write a .lean file containing theorem ${target.theoremLabel}.` };
   }
   const code = String(step.code || "");
-  if (!/\b(sorry|admit)\b/.test(code)) {
+  if (!containsSorryMarker(code)) {
     return { ok: false, error: `The generated file for ${target.theoremLabel} does not contain a sorry/admit stub.` };
   }
   if (step.check_status !== "ok") {
@@ -4093,48 +4284,6 @@ function recordJobTurnProgress(job, progress) {
   return true;
 }
 
-function extractTurnProgress(payload, defaultMaxTurns = null) {
-  const current = firstPositiveInteger(payload, [
-    "current_turn",
-    "currentTurn",
-    "turn",
-    "turn_index",
-    "turnIndex",
-    "agent_turn",
-    "agentTurn"
-  ]);
-  const max = firstPositiveInteger(payload, [
-    "max_turns",
-    "maxTurns",
-    "maximum_turns",
-    "maximumTurns"
-  ]) || toPositiveInteger(defaultMaxTurns);
-  if (!current || !max) return null;
-  return { current, max };
-}
-
-function firstPositiveInteger(payload, keys) {
-  for (const source of turnProgressSources(payload)) {
-    for (const key of keys) {
-      const value = toPositiveInteger(source?.[key]);
-      if (value) return value;
-    }
-  }
-  return 0;
-}
-
-function turnProgressSources(payload) {
-  if (!payload || typeof payload !== "object") return [];
-  return [
-    payload,
-    payload.progress,
-    payload.result,
-    payload.result?.progress,
-    payload.agent,
-    payload.agent?.progress
-  ].filter((source) => source && typeof source === "object");
-}
-
 function aggregateUsage(jobs, { overleafProjectId } = {}) {
   const projectSlug = overleafProjectId ? slugProjectId(overleafProjectId) : "";
   const aggregate = {
@@ -4187,10 +4336,38 @@ function normalizeLeaMaxSpendUsd(value) {
   return number;
 }
 
-function spendLimitReached(state) {
+// AUDIT H5: enforcement must read the same ledger the popover displays — the
+// adapter's /api/stats global roll-up (all-time, includes standalone-UI runs,
+// survives local resets). The companion's own jobs.json tally is only the
+// fallback when the adapter can't be reached: it is wiped by start-dev.sh's
+// default reset and blind to runs made outside this companion, so enforcing
+// against it let the cap silently reset. Cached briefly so preflights and the
+// batch-repair loop don't hammer /api/stats.
+const ADAPTER_SPEND_CACHE_TTL_MS = 5000;
+
+async function currentSpendUsd(state) {
+  const cache = state.adapterSpendCache;
+  if (cache && Date.now() - cache.at < ADAPTER_SPEND_CACHE_TTL_MS) {
+    return cache.costUsd ?? aggregateUsage(state.jobs || {}, {}).costUsd;
+  }
+  let costUsd = null;
+  try {
+    const baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+    const result = await fetchAdapterUsageStats({ fetchImpl: state.fetchImpl || fetch, baseUrl });
+    if (result.ok && result.body?.global && typeof result.body.global === "object") {
+      costUsd = toNonNegativeNumber(result.body.global.cost_usd);
+    }
+  } catch {
+    costUsd = null;
+  }
+  state.adapterSpendCache = { at: Date.now(), costUsd };
+  return costUsd ?? aggregateUsage(state.jobs || {}, {}).costUsd;
+}
+
+async function spendLimitReached(state) {
   const maxSpendUsd = normalizeLeaMaxSpendUsd(state.settings?.leaMaxSpendUsd);
   if (maxSpendUsd === null) return false;
-  return aggregateUsage(state.jobs || {}, {}).costUsd >= maxSpendUsd;
+  return (await currentSpendUsd(state)) >= maxSpendUsd;
 }
 
 async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
@@ -4199,7 +4376,10 @@ async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
   } else {
     recordJobUsageSnapshot(job, usage);
   }
-  if (spendLimitReached(state)) {
+  // The run just recorded fresh usage — bust the TTL cache so the enforcement
+  // read below sees the adapter's post-run total, not a pre-run snapshot.
+  state.adapterSpendCache = null;
+  if (await spendLimitReached(state)) {
     await markJobMaxSpend({ state, job, mode });
     return { stop: true, error: MAX_SPEND_MESSAGE };
   }
@@ -4234,13 +4414,33 @@ async function runLeanCheck(leaWorkspacePath, proofPath) {
   return new Promise((resolve) => {
     const child = spawn("lake", ["env", "lean", proofPath], {
       cwd: leaWorkspacePath,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      // Own process group so the timeout can kill `lake` AND the `lean` child
+      // it spawns, not just `lake` itself (AUDIT M9).
+      detached: true
     });
+
+    // Kill the whole process group; fall back to the bare child if the group
+    // signal isn't deliverable (e.g. the child already exited).
+    const killTree = (signal) => {
+      try {
+        if (typeof child.pid === "number") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        try { child.kill(signal); } catch { /* already gone */ }
+      }
+    };
 
     let stdout = "";
     let stderr = "";
+    let killTimer = null;
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      // SIGTERM first; a compiling `lean` can ignore it, so escalate to
+      // SIGKILL after a short grace period rather than leaking a core-bound
+      // compiler (AUDIT M9).
+      killTree("SIGTERM");
+      killTimer = setTimeout(() => killTree("SIGKILL"), 5_000);
+      killTimer.unref?.();
       resolve({
         ok: false,
         exitCode: null,
@@ -4258,6 +4458,7 @@ async function runLeanCheck(leaWorkspacePath, proofPath) {
     });
     child.on("error", (error) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({
         ok: false,
         exitCode: null,
@@ -4268,6 +4469,7 @@ async function runLeanCheck(leaWorkspacePath, proofPath) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
       resolve({
         ok: code === 0,
@@ -4304,14 +4506,6 @@ function buildLeaSessionUrl(baseUrl, sessionId) {
   return url.toString();
 }
 
-function delay(ms, { ref = true } = {}) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (!ref) {
-      timer.unref?.();
-    }
-  });
-}
 
 async function appendLog(logPath, text) {
   await fs.mkdir(path.dirname(logPath), { recursive: true });
@@ -4859,7 +5053,6 @@ async function getTheoremStatus({
     { job: disprovedJob, status: "disproved" },
     { job: failedJob, status: "failed" }
   ].filter((candidate) => candidate.job);
-  const jobRecency = (job) => String(job.finishedAt || job.startedAt || "");
   let newestTerminal = null;
   for (const candidate of terminalCandidates) {
     if (!newestTerminal || jobRecency(candidate.job) > jobRecency(newestTerminal.job)) {
@@ -5070,7 +5263,7 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   }
 
   const content = await fs.readFile(absolutePath, "utf8");
-  if (/\bsorry\b|admit\b/.test(content)) {
+  if (containsSorryMarker(content)) {
     return {
       status: "sorry_stub",
       ...responseBase,
@@ -5133,7 +5326,7 @@ async function getLeaDirectProofStatus({ leaRepoPath, target }) {
       moduleName: candidate.moduleName
     };
 
-    if (/\bsorry\b|admit\b/.test(content)) {
+    if (containsSorryMarker(content)) {
       return {
         status: "sorry_stub",
         ...responseBase,
@@ -5158,14 +5351,12 @@ async function getLatestMappedJobStatus({
   jobs,
   includeStubbedTheoremUses = false
 }) {
-  const mappedJob = Object.values(jobs || {})
-    .filter((job) => (
-      job.jobKey === target.jobKey &&
-      ["formalized", "sorry_stub"].includes(job.status) &&
-      job.declarationName &&
-      job.recordedProofPath
-    ))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+  const mappedJob = jobsByRecencyDesc(jobs, (job) => (
+    job.jobKey === target.jobKey &&
+    ["formalized", "sorry_stub"].includes(job.status) &&
+    job.declarationName &&
+    job.recordedProofPath
+  ))[0] || null;
 
   if (!mappedJob) {
     return null;
@@ -5213,9 +5404,7 @@ function addLeaSessionLink(status, job) {
 }
 
 function findLatestJobWithLeaSession(jobs, jobKey) {
-  return Object.values(jobs || {})
-    .filter((job) => job.jobKey === jobKey && (job.leaSessionId || job.recorderSessionId))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && (job.leaSessionId || job.recorderSessionId))[0] || null;
 }
 
 function findProjectTheoremEntry(markdown, theoremLabel) {
@@ -5315,8 +5504,21 @@ async function upsertProjectTheoremEntry({
   const next = section
     ? `${existing.slice(0, section.start).trimEnd()}\n\n${entry.trimEnd()}\n${existing.slice(section.end).trimStart() ? `\n${existing.slice(section.end).trimStart()}` : ""}`
     : `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
-  await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
-  await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
+  await atomicWriteFile(projectMarkdownPath, collapseBlankRunsOutsideFences(next), "utf8");
+}
+
+// Collapse runs of blank lines to one, but ONLY outside fenced code blocks
+// (AUDIT M7): the old whole-file `\n{3,}` squash silently reflowed recorded
+// Lean signatures (and any prose) containing consecutive blank lines inside
+// their ```lean fences whenever any other theorem was upserted. The split's
+// captured group alternates prose / fenced segments; an unterminated fence
+// falls into the prose tail and gets squashed — same as before, and the seam
+// text this module writes never opens a fence it doesn't close.
+function collapseBlankRunsOutsideFences(markdown) {
+  return String(markdown || "")
+    .split(/(```[\s\S]*?```)/)
+    .map((part, index) => (index % 2 === 1 ? part : part.replace(/\n{3,}/g, "\n\n")))
+    .join("");
 }
 
 function renderProjectTheoremEntry({
@@ -5419,16 +5621,6 @@ function findSectionHeadingStart(markdown, markerStart) {
   return beforeMarker.startsWith("## Theorem:") ? 0 : markerStart;
 }
 
-function findNamedSectionHeadingStart(markdown, markerStart, heading) {
-  const beforeMarker = markdown.slice(0, markerStart);
-  const pattern = `\n## ${heading}`;
-  const headingIndex = beforeMarker.lastIndexOf(pattern);
-  if (headingIndex !== -1) {
-    return headingIndex;
-  }
-  return beforeMarker.startsWith(`## ${heading}`) ? 0 : markerStart;
-}
-
 function markerKey(entry) {
   return `${entry.name}\u0000${entry.proofPath}\u0000${entry.moduleName || ""}`;
 }
@@ -5472,16 +5664,25 @@ function unescapeHtmlAttribute(value) {
     .replace(/&amp;/g, "&");
 }
 
+// Lean declaration keywords this app recognizes. Includes `inductive` and
+// `instance` (AUDIT L3): a definition the agent legitimately models as an
+// `inductive` type or an `instance` was previously invisible to
+// containsDeclaration -- session-step lookup then missed the file or fell back
+// to sole-`.lean`-step heuristics, and the signature diff blanket-classified
+// every proof-only edit to such a file as a "signature" change (a needless
+// full cascade).
+const DECLARATION_KEYWORDS = "theorem|lemma|def|abbrev|structure|class|inductive|instance";
+
 function containsDeclaration(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b`
+    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:${DECLARATION_KEYWORDS})\\s+${escapeRegExp(theoremLabel)}\\b`
   );
   return declarationPattern.test(content);
 }
 
 function extractLeanStatement(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
+    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:${DECLARATION_KEYWORDS})\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
   );
   const match = content.match(declarationPattern);
   if (!match) return "";
@@ -5496,38 +5697,104 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Generous enough for the mirror endpoint's whole-project .tex payloads, but
+// a bound nonetheless — an unbounded buffered body was an OOM lever (AUDIT M5).
+const MAX_BODY_BYTES = 50 * 1024 * 1024;
+
+function httpError(statusCode, code, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
 async function readBodyJson(request) {
   const chunks = [];
+  let total = 0;
   for await (const chunk of request) {
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) {
+      throw httpError(413, "body_too_large", "Request body exceeds the 50 MB limit.");
+    }
     chunks.push(chunk);
   }
   if (chunks.length === 0) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw httpError(400, "invalid_json", "Request body is not valid JSON.");
+  }
 }
 
 async function readJson(filePath, fallback) {
+  let raw;
   try {
-    return JSON.parse(await fs.readFile(filePath, "utf8"));
+    raw = await fs.readFile(filePath, "utf8");
   } catch (error) {
     if (error && error.code === "ENOENT") return fallback;
     throw error;
   }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // A torn/corrupt state file must never brick startup (writes are atomic
+    // now, but a file written by an older companion may be truncated). Keep
+    // the bytes for forensics and start from a clean slate.
+    const backupPath = `${filePath}.corrupt-${Date.now()}`;
+    try {
+      await fs.rename(filePath, backupPath);
+      console.warn(`[companion] ${filePath} contained invalid JSON; moved it to ${backupPath} and starting fresh.`);
+    } catch {
+      console.warn(`[companion] ${filePath} contained invalid JSON; starting fresh.`);
+    }
+    return fallback;
+  }
 }
 
-async function writeJson(filePath, value) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+// Serialized, atomic JSON persistence. Concurrent jobs (formalize + repair
+// batch + cascade continuations) all mutate state.jobs and call writeJson
+// freely; two overlapping fs.writeFile calls on one path can interleave and
+// corrupt the file. Chaining per path serializes them, and the temp+rename
+// write (atomicWriteJson) means a crash mid-write leaves the previous
+// complete file on disk, never a truncated one.
+const jsonWriteQueues = new Map();
+
+function writeJson(filePath, value) {
+  const tail = (jsonWriteQueues.get(filePath) || Promise.resolve())
+    .catch(() => {}) // a failed earlier write must not poison the queue
+    .then(() => atomicWriteJson(filePath, value));
+  jsonWriteQueues.set(filePath, tail);
+  return tail;
 }
 
 function sendJson(response, statusCode, body) {
-  setCorsHeaders(response);
   response.writeHead(statusCode, { "Content-Type": "application/json" });
   response.end(JSON.stringify(body));
 }
 
-function setCorsHeaders(response) {
-  response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+// AUDIT H3: this server can start paid runs, rewrite provider keys in .env,
+// set the GitHub push token/remote, and export the whole project. The old
+// `Access-Control-Allow-Origin: *` let ANY page in the user's browser do all
+// of that. Only the legitimate browser callers get a CORS grant: the Overleaf
+// content script (requests carry the page's https://www.overleaf.com origin)
+// and the extension's own pages (chrome-extension:// / moz-extension://
+// origins, e.g. the options page). Requests without an Origin header (curl,
+// local tooling, same-origin) were never gated by CORS and stay unaffected.
+function isAllowedBrowserOrigin(origin) {
+  if (!origin) return false;
+  return (
+    origin === "https://www.overleaf.com" ||
+    origin.startsWith("chrome-extension://") ||
+    origin.startsWith("moz-extension://")
+  );
+}
+
+function setCorsHeaders(response, request) {
+  const origin = String(request?.headers?.origin || "");
+  if (!isAllowedBrowserOrigin(origin)) return;
+  response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Vary", "Origin");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
@@ -5547,8 +5814,13 @@ if (isMain) {
   server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
     console.log(`Overleaf Lea companion listening at http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
     console.log(`Lea workspace: ${buildLeaWorkspacePath(applyEnvDefaults({}, process.env).leaRepoPath)}`);
-    if (!process.env.OPENAI_API_KEY) {
-      console.log("Warning: OPENAI_API_KEY is not set in the root .env or process environment. Lea jobs will not start.");
+    // Warn about the key the CONFIGURED model actually needs, not always
+    // OPENAI_API_KEY (AUDIT L10): a user on an Anthropic/Google model was told
+    // "Lea jobs will not start" over a missing OpenAI key they don't use, and
+    // a Google-model user with no key at all got no warning.
+    const readiness = validateLeaRuntime(server.leaState, { requireApiKey: true });
+    if (!readiness.ok && String(readiness.error || "").startsWith("missing_")) {
+      console.log(`Warning: ${readiness.message} Lea jobs will not start until it is set.`);
     }
     console.log("Run `npm run doctor` if setup fails.");
   });
