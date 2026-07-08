@@ -304,3 +304,125 @@ test("text between a tag and a later brace group prevents accidental absorption"
   assert.equal(result.targets.length, 0);
   assert.equal(result.diagnostics[0].code, "missing_environment");
 });
+
+// --- Code-block form: \begin{leacode}{...}...\end{leacode} renders its body
+// as a Lean listing, and that same code is sent to Lea verbatim as the target
+// text -- exactly like every other tag's statement, just typeset as code. See
+// docs/FEATURE-overleaf-inline-lea-tags.md ("Code-block form").
+
+test("a leacode block is a formalizable theorem target whose body is the raw code", () => {
+  const source = wrapDocument([
+    "\\begin{leacode}{label=add_zero, uses={my_lemma}, context={Use simp.}}",
+    "theorem add_zero (n : Nat) : n + 0 = n := by",
+    "  simp",
+    "\\end{leacode}"
+  ].join("\n"));
+  const result = parseTargetDocument(source);
+  assert.equal(result.diagnostics.length, 0);
+  assert.equal(result.targets.length, 1);
+  const [target] = result.targets;
+  assert.equal(target.targetKind, "theorem");
+  assert.equal(target.targetLabel, "add_zero");
+  assert.deepEqual(target.targetUses, ["my_lemma"]);
+  assert.equal(target.targetContext, "Use simp.");
+  assert.equal(target.targetText, "theorem add_zero (n : Nat) : n + 0 = n := by\n  simp");
+  assert.equal(target.latexEnvironment, "leacode");
+  assert.equal(target.syntax, "leacode");
+});
+
+test("a leacode block preserves Lean's catcode-hostile characters verbatim (_ \\ { } ->)", () => {
+  const code = "theorem foo {p : Nat -> Prop} : \\forall x, p x_0 = p x_0 := by rfl";
+  const source = wrapDocument([
+    "\\begin{leacode}{label=foo}",
+    code,
+    "\\end{leacode}"
+  ].join("\n"));
+  const [target] = parseTargets(source);
+  assert.equal(target.targetText, code);
+});
+
+test("leacode honors kind= like the generic \\lea{...}, defaulting to theorem", () => {
+  const asDefinition = wrapDocument([
+    "\\begin{leacode}{kind=definition, label=Even}",
+    "def Even (n : Nat) : Prop := \\exists k, n = 2 * k",
+    "\\end{leacode}"
+  ].join("\n"));
+  const [defTarget] = parseTargets(asDefinition);
+  assert.equal(defTarget.targetKind, "definition");
+
+  const asTheorem = wrapDocument([
+    "\\begin{leacode}{label=default_kind}",
+    "theorem default_kind : True := trivial",
+    "\\end{leacode}"
+  ].join("\n"));
+  const [thmTarget] = parseTargets(asTheorem);
+  assert.equal(thmTarget.targetKind, "theorem");
+});
+
+test("a leacode block needs no enclosing environment and never flags suspicious/mismatch", () => {
+  const source = wrapDocument([
+    "\\begin{figure}",
+    "\\begin{leacode}{label=inside_figure}",
+    "theorem inside_figure : True := trivial",
+    "\\end{leacode}",
+    "\\end{figure}"
+  ].join("\n"));
+  const result = parseTargetDocument(source);
+  // Its own body span is the target -- the enclosing figure is irrelevant, so
+  // no suspicious_environment (that warning is tag-only) and no mismatch.
+  assert.equal(result.targets.length, 1);
+  assert.equal(result.diagnostics.length, 0);
+  assert.equal(result.targets[0].latexEnvironment, "leacode");
+});
+
+test("a leacode block with an unterminated \\end is a malformed_tag diagnostic", () => {
+  const result = parseTargetDocument(wrapDocument([
+    "\\begin{leacode}{label=foo}",
+    "theorem foo : True := trivial"
+  ].join("\n")));
+  assert.equal(result.targets.length, 0);
+  assert.equal(result.diagnostics.some((d) => d.code === "malformed_tag"), true);
+});
+
+test("a leacode block with no metadata argument is a missing_label diagnostic", () => {
+  const result = parseTargetDocument(wrapDocument([
+    "\\begin{leacode}",
+    "theorem foo : True := trivial",
+    "\\end{leacode}"
+  ].join("\n")));
+  assert.equal(result.targets.length, 0);
+  assert.equal(result.diagnostics.some((d) => d.code === "missing_label"), true);
+});
+
+test("leacode triggers tag_package_not_loaded, and an inline lstnewenvironment suppresses it", () => {
+  const unloaded = parseTargetDocument([
+    "\\begin{document}",
+    "\\begin{leacode}{label=foo}",
+    "theorem foo : True := trivial",
+    "\\end{leacode}",
+    "\\end{document}"
+  ].join("\n"));
+  assert.equal(unloaded.diagnostics.some((d) => d.code === "tag_package_not_loaded"), true);
+
+  const inlineDefined = parseTargetDocument([
+    "\\usepackage{listings}",
+    "\\lstnewenvironment{leacode}[1]{}{}",
+    "\\begin{document}",
+    "\\begin{leacode}{label=foo}",
+    "theorem foo : True := trivial",
+    "\\end{leacode}",
+    "\\end{document}"
+  ].join("\n"));
+  assert.equal(inlineDefined.diagnostics.some((d) => d.code === "tag_package_not_loaded"), false);
+});
+
+test("a leacode block shown inside a verbatim documentation example is not a real target", () => {
+  const source = wrapDocument([
+    "\\begin{verbatim}",
+    "\\begin{leacode}{label=example_only}",
+    "theorem example_only : True := trivial",
+    "\\end{leacode}",
+    "\\end{verbatim}"
+  ].join("\n"));
+  assert.deepEqual(parseTargets(source), []);
+});

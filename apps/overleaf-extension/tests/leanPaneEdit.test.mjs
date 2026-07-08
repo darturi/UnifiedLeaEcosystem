@@ -1037,6 +1037,68 @@ test("recipe 4: a signature edit flips the broken dependent AND propagates to tr
   assert.match(byLabel.heine_borel_application.message, /compactness_corollary no longer compiles/);
 });
 
+// Live bug report reproduction (2026-07-08): formalize A (compactness_criterion)
+// and B (compactness_corollary, which does `exact compactness_criterion`), then
+// RENAME A's declaration to compactness_crt via a manual pane edit. B now
+// references a symbol that no longer exists and cannot compile, yet its chip
+// stayed "valid". Mirrors the exact on-disk state found in the workspace
+// (jobs.json showed B carried NO lastEditCheckStatus -- the cascade never wrote
+// to it). The discriminator vs. "recipe 4" above is the TRIGGER: a pure rename
+// (classification "renamed"), not a signature change.
+test("recipe: a pure RENAME of an upstream flips a dependent that references the old name", async () => {
+  const leaRepo = await makeLeaRepo();
+  await writeProof(
+    leaRepo,
+    "Lea/Project1/compactness_corollary.lean",
+    "import Lea.Project1.compactness_criterion\ntheorem compactness_corollary : True := by\n  exact compactness_criterion\n"
+  );
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    jobs: {
+      a: editedJob({ declarationName: "compactness_criterion" }),
+      b: dependentJob({ declarationName: "compactness_corollary" })
+    },
+    fetchImpl: makeEditFetch(calls, {
+      sessionDetails: { "sess-a": EDITED_SESSION_DETAIL },
+      writeResponses: { "sess-a": { unchanged: false, code_step: { id: "step-2" }, note: null } },
+      // the renamed upstream compiles fine on its own...
+      checkResponses: { "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null } },
+      rebuildResponses: {
+        "sess-a": { path: "compactness_criterion.lean", status: "ok", detail: null },
+        // ...but the dependent's `lake build` fails: it still says `exact
+        // compactness_criterion`, which no longer exists.
+        "sess-b": (body) => ({ path: body.path, status: "error", detail: "unknown identifier 'compactness_criterion'" })
+      }
+    })
+  });
+
+  const save = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      // pure rename: criterion -> crt, nothing else changed
+      content: "theorem compactness_crt : True := by\n  trivial\n"
+    },
+    state
+  );
+
+  assert.equal(save.statusCode, 200);
+  assert.equal(save.body.ownResult.classification.kind, "renamed");
+  assert.equal(save.body.ownResult.classification.to, "compactness_crt");
+  assert.equal(state.jobs.a.declarationName, "compactness_crt");
+
+  // The heart of the report: B must be re-checked and flipped to invalid.
+  assert.equal(save.body.dependentsImpact.length, 1);
+  const impact = save.body.dependentsImpact[0];
+  assert.equal(impact.targetLabel, "compactness_corollary");
+  assert.equal(impact.status, "invalid");
+  assert.equal(impact.brokenByUpstream.renamed, true);
+  assert.equal(state.jobs.b.lastEditCheckStatus, "error");
+  assert.match(state.jobs.b.lastEditCheckDetail, /unknown identifier/);
+});
+
 // --- Self-repair Phase 2: persisted breakage attribution -------------------
 // docs/FEATURE-overleaf-self-repair.md / docs/PLAN-overleaf-self-repair.md.
 // The repair offer must be re-derivable after a manifest refresh or a

@@ -41,10 +41,23 @@
 % If you don't want a second project file, the extension's options page can
 % copy this same set of command definitions (minus the two lines below) as
 % a paste-into-your-preamble snippet instead of \usepackage{lea-tags}.
+%
+% Finally, `leacode` is a code-block variant of the tags above: its body is
+% typeset verbatim as a Lean code listing (via the `listings` package) instead
+% of as prose, and that same code text is what gets sent to Lea -- exactly as
+% the other tags' statements are. Its one required argument is the usual
+% metadata argument; it is never typeset, only read by the extension:
+%
+%   \begin{leacode}{label=add_zero, uses={my_lemma}}
+%   theorem add_zero (n : Nat) : n + 0 = n := by simp
+%   \end{leacode}
+%
+% Like the generic \lea{...} command, `kind=` is honored (default: theorem).
 
 \NeedsTeXFormat{LaTeX2e}
-\ProvidesPackage{lea-tags}[2026/07/01 v0.2 Lea inline formalization tags]
+\ProvidesPackage{lea-tags}[2026/07/07 v0.3 Lea inline formalization tags]
 \RequirePackage{xparse}
+\RequirePackage{listings}
 
 % Generic form: caller states kind= explicitly, e.g.
 %   \lea{kind=theorem, label=foo, uses={bar}, context={...}}
@@ -57,3 +70,13 @@
 \NewDocumentCommand{\leaproposition}{m g}{\IfValueT{#2}{#2}}
 \NewDocumentCommand{\leacorollary}{m g}{\IfValueT{#2}{#2}}
 \NewDocumentCommand{\leadefinition}{m g}{\IfValueT{#2}{#2}}
+
+% Code-block form: renders its body verbatim as a Lean listing. The one
+% required argument (#1) is the usual metadata argument -- it is consumed but
+% never typeset, so it stays invisible in the PDF just like the tag commands'
+% metadata argument does. The body is read verbatim by `listings`, so Lean's
+% own characters (_ \ { } -> ...) survive untouched.
+\lstnewenvironment{leacode}[1]{%
+  \lstset{basicstyle=\ttfamily\small,breaklines=true,columns=fullflexible,%
+    keepspaces=true,showstringspaces=false,frame=none}%
+}{}

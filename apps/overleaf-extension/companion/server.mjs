@@ -3073,7 +3073,7 @@ function validateTargetPayload(payload) {
   // on the job for debugging/telemetry; it never affects the prompt, jobKey,
   // or any validation/dependency-resolution behavior below. Defaults to
   // "comment" for any client that predates this field.
-  const targetSyntax = payload.syntax === "tag" ? "tag" : "comment";
+  const targetSyntax = ["tag", "leacode"].includes(payload.syntax) ? payload.syntax : "comment";
   if (!overleafProjectId.trim()) {
     return { ok: false, error: "missing_project_id", message: "overleafProjectId is required." };
   }
