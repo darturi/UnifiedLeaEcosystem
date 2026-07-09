@@ -68,9 +68,16 @@ over the prose READMEs.
 ## Commands (run from the monorepo root)
 
 ```bash
+./install.sh                  # one-shot bootstrap: installs uv+elan if absent, then runs setup
 npm run setup                 # full provision: node deps, prover venv, Lean/Mathlib cache, .env, overleaf settings
+                              #   (runs scripts/preflight.mjs first — fails early with install hints if node/uv/lake missing)
 npm run setup -- --target ui  # or --target overleaf — provision just one app
+npm run setup -- --skip-verify # skip the SafeVerify build + its 2nd Mathlib download (/verify -> "unavailable")
 npm run update-lean-deps      # lake update + refresh the Mathlib cache
+
+# Zero-toolchain path (standalone UI only): prebuilt multi-arch image, published to
+# ghcr.io/<owner>/leaui by .github/workflows/docker-publish.yml.
+cd apps/lea-standalone && docker compose up   # open http://localhost:8001, add key in Settings
 
 npm run start:adapter         # start ONLY the shared FastAPI backend (:8001)
 npm run dev:ui                # adapter (:8001) + Vite (:5173) — the standalone UI
