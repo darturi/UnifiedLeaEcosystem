@@ -278,10 +278,11 @@ test("Lean pane renders every source file equally with file rows collapsed by de
 
   assert.match(harness.bodyText(), /3 labeled items across 3 \.tex files\./);
   assert.deepEqual(harness.paneTreeRowTexts().map((text) => text.replace(/\s+/g, " ")), [
-    "▸main.tex1 itemvalid",
+    "▸main.tex1 item",
     "▸sections/1 itemmissing stub",
-    "▸supp.tex1 itemvalid"
+    "▸supp.tex1 item"
   ]);
+  assert.equal(harness.countSelector(".ol-lean-project-progress"), 2);
   assert.doesNotMatch(harness.bodyText(), /Main theorem/);
   assert.doesNotMatch(harness.bodyText(), /Section definition/);
   assert.doesNotMatch(harness.bodyText(), /Supplemental lemma/);
@@ -293,6 +294,45 @@ test("Lean pane renders every source file equally with file rows collapsed by de
   assert.match(harness.bodyText(), /Section definition/);
   harness.clickPaneTreeRowText("supp.tex");
   assert.match(harness.bodyText(), /Supplemental lemma/);
+});
+
+test("Lean pane file rows render proportional progress segments", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [
+          { id: "t1", kind: "theorem", label: "t1", status: "valid", sourceFile: "main.tex", documentOrder: 0, naturalLanguageLatex: "A.", leanKind: "theorem" },
+          { id: "t2", kind: "theorem", label: "t2", status: "defined", sourceFile: "main.tex", documentOrder: 1, naturalLanguageLatex: "B.", leanKind: "def" },
+          { id: "t3", kind: "theorem", label: "t3", status: "disproved", sourceFile: "main.tex", documentOrder: 2, naturalLanguageLatex: "C.", leanKind: "theorem" },
+          { id: "t4", kind: "theorem", label: "t4", status: "stub-generated", sourceFile: "main.tex", documentOrder: 3, naturalLanguageLatex: "D.", leanKind: "theorem" },
+          { id: "t5", kind: "theorem", label: "t5", status: "invalid", sourceFile: "main.tex", documentOrder: 4, naturalLanguageLatex: "E.", leanKind: "theorem" },
+          { id: "t6", kind: "theorem", label: "t6", status: "missing-stub", sourceFile: "main.tex", documentOrder: 5, naturalLanguageLatex: "F.", leanKind: "theorem", inProgress: true },
+          { id: "t7", kind: "theorem", label: "t7", status: "stale", sourceFile: "main.tex", documentOrder: 6, naturalLanguageLatex: "G.", leanKind: "theorem" },
+          { id: "t8", kind: "theorem", label: "t8", status: "unknown", sourceFile: "main.tex", documentOrder: 7, naturalLanguageLatex: "H.", leanKind: "theorem" }
+        ],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  const [progress] = harness.paneProgresses();
+  assert.equal(progress.role, "img");
+  assert.equal(progress.label, "main.tex: 8 Lea items, 3 successful, 1 sorry-stubbed, 1 failed, 3 unformalized, 1 in progress.");
+  assert.equal(progress.inProgress, true);
+  assert.deepEqual(progress.segments.map((segment) => [segment.bucket, segment.count, segment.width]), [
+    ["success", "3", "37.5%"],
+    ["sorry-stubbed", "1", "12.5%"],
+    ["failed", "1", "12.5%"],
+    ["unformalized", "3", "37.5%"]
+  ]);
 });
 
 test("Lean pane polling refresh preserves expanded folder and file rows", async () => {
@@ -1147,6 +1187,24 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       return document.body
         .querySelectorAll(".ol-lean-project-tree-row")
         .map((row) => row.textContent);
+    },
+    paneProgresses() {
+      return document.body
+        .querySelectorAll(".ol-lean-project-progress")
+        .map((progress) => ({
+          role: progress.attributes.role,
+          label: progress.attributes["aria-label"],
+          inProgress: progress.classList.contains("ol-lean-project-progress-in-progress"),
+          segments: progress
+            .querySelectorAll(".ol-lean-project-progress-segment")
+            .map((segment) => ({
+              bucket: segment.dataset.bucket,
+              count: segment.dataset.count,
+              percent: segment.dataset.percent,
+              width: segment.style.width,
+              title: segment.title
+            }))
+        }));
     },
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");

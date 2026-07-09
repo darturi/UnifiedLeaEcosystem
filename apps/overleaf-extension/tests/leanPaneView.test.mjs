@@ -21,12 +21,16 @@ import {
   paneItemActions,
   paneItemToEditTarget,
   paneItemToFormalizeTarget,
+  paneProgressBucketForItem,
+  paneProgressSegments,
   deriveShareControls,
   filenameFromContentDisposition,
+  formatPaneProgressLabel,
   parsePaneLatex,
   reconcileDependentsImpact,
   shouldRefetchLeanPaneFiles,
   stillBrokenDependents,
+  summarizePaneProgress,
   treeAncestorIdsForFile
 } from "../extension/leanPaneView.mjs";
 
@@ -249,6 +253,119 @@ test("aggregatePaneStatus applies file status precedence", () => {
   assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "valid" }]), "valid");
   assert.equal(aggregatePaneStatus([{ status: "defined" }, { status: "defined" }]), "defined");
   assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "defined" }, { status: "disproved" }]), "mixed");
+});
+
+test("paneProgressBucketForItem maps pane and companion statuses to progress buckets", () => {
+  for (const status of ["valid", "formalized", "defined", "disproved"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "success");
+  }
+  for (const status of ["stub-generated", "sorry_stub"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "sorryStubbed");
+  }
+  for (const status of ["failed", "invalid", "error"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "failed");
+  }
+  for (const status of ["missing-stub", "unformalized", "unknown", "stale", "in-progress", undefined, "new-weird-status"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "unformalized");
+  }
+});
+
+test("summarizePaneProgress counts representative fractional file summaries", () => {
+  assert.deepEqual(summarizePaneProgress([
+    { status: "missing-stub" },
+    { status: "missing-stub" },
+    { status: "missing-stub" },
+    { status: "missing-stub" },
+    { status: "invalid" },
+    { status: "valid" },
+    { status: "valid" },
+    { status: "valid" }
+  ]), {
+    total: 8,
+    success: 3,
+    sorryStubbed: 0,
+    failed: 1,
+    unformalized: 4,
+    inProgress: 0
+  });
+
+  assert.deepEqual(summarizePaneProgress([
+    { status: "valid" },
+    { status: "defined" },
+    { status: "disproved" },
+    { status: "formalized" },
+    { status: "valid" },
+    { status: "defined" },
+    { status: "sorry_stub" },
+    { status: "missing-stub" }
+  ]), {
+    total: 8,
+    success: 6,
+    sorryStubbed: 1,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  });
+
+  assert.deepEqual(summarizePaneProgress([
+    { status: "stub-generated" },
+    { status: "stub-generated" },
+    { status: "unknown" }
+  ]), {
+    total: 3,
+    success: 0,
+    sorryStubbed: 2,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  });
+});
+
+test("paneProgressSegments returns ordered nonzero segments with percentages", () => {
+  assert.deepEqual(paneProgressSegments({
+    total: 8,
+    success: 6,
+    sorryStubbed: 1,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  }).map((segment) => [segment.id, segment.count, segment.percent, segment.title]), [
+    ["success", 6, 75, "Successful: 6 of 8, 75%"],
+    ["sorry-stubbed", 1, 12.5, "Sorry-stubbed: 1 of 8, 12.5%"],
+    ["unformalized", 1, 12.5, "Unformalized: 1 of 8, 12.5%"]
+  ]);
+
+  assert.deepEqual(paneProgressSegments({
+    total: 3,
+    success: 0,
+    sorryStubbed: 2,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  }).map((segment) => [segment.id, segment.count, segment.percent, segment.title]), [
+    ["sorry-stubbed", 2, 66.66666666666666, "Sorry-stubbed: 2 of 3, 66.7%"],
+    ["unformalized", 1, 33.33333333333333, "Unformalized: 1 of 3, 33.3%"]
+  ]);
+});
+
+test("formatPaneProgressLabel omits zero-count buckets and includes running count", () => {
+  assert.equal(formatPaneProgressLabel("main.tex", {
+    total: 8,
+    success: 6,
+    sorryStubbed: 0,
+    failed: 1,
+    unformalized: 1,
+    inProgress: 0
+  }), "main.tex: 8 Lea items, 6 successful, 1 failed, 1 unformalized.");
+
+  assert.equal(formatPaneProgressLabel("analysis.tex", {
+    total: 6,
+    success: 2,
+    sorryStubbed: 4,
+    failed: 0,
+    unformalized: 0,
+    inProgress: 1
+  }), "analysis.tex: 6 Lea items, 2 successful, 4 sorry-stubbed, 1 in progress.");
 });
 
 test("treeAncestorIdsForFile returns expandable folder and file ids", () => {

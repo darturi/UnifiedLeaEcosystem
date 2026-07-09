@@ -1008,10 +1008,14 @@
     count.textContent = `${node.itemCount} item${node.itemCount === 1 ? "" : "s"}`;
     row.appendChild(count);
 
-    const chip = document.createElement("span");
-    chip.className = `ol-lean-project-status ol-lean-project-tree-status ol-lean-project-status-${node.status || "unknown"}`;
-    chip.textContent = leanPaneView.formatPaneStatus(node.status || "unknown");
-    row.appendChild(chip);
+    if (node.type === "file") {
+      row.appendChild(renderLeanPaneFileProgress(node));
+    } else {
+      const chip = document.createElement("span");
+      chip.className = `ol-lean-project-status ol-lean-project-tree-status ol-lean-project-status-${node.status || "unknown"}`;
+      chip.textContent = leanPaneView.formatPaneStatus(node.status || "unknown");
+      row.appendChild(chip);
+    }
     section.appendChild(row);
 
     if (expanded) {
@@ -1030,6 +1034,26 @@
       section.appendChild(children);
     }
     return section;
+  }
+
+  function renderLeanPaneFileProgress(node) {
+    const summary = node.progress || leanPaneView.summarizePaneProgress(node.items || []);
+    const progress = document.createElement("span");
+    progress.className = `ol-lean-project-progress${summary.inProgress > 0 ? " ol-lean-project-progress-in-progress" : ""}`;
+    progress.setAttribute("role", "img");
+    progress.setAttribute("aria-label", leanPaneView.formatPaneProgressLabel(node.path || node.name, summary));
+
+    for (const segment of leanPaneView.paneProgressSegments(summary)) {
+      const element = document.createElement("span");
+      element.className = `ol-lean-project-progress-segment ol-lean-project-progress-segment-${segment.id}`;
+      element.style.setProperty("width", `${segment.percent}%`);
+      element.dataset.bucket = segment.id;
+      element.dataset.count = String(segment.count);
+      element.dataset.percent = String(segment.percent);
+      element.title = segment.title;
+      progress.appendChild(element);
+    }
+    return progress;
   }
 
   function toggleLeanPaneTreeNode(id) {

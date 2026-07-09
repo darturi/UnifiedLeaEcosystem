@@ -66,6 +66,16 @@ const DOUBLE_STRUCK = {
 };
 
 const SUCCESS_PANE_STATUSES = new Set(["valid", "defined", "disproved"]);
+const PROGRESS_SUCCESS_STATUSES = new Set(["valid", "formalized", "defined", "disproved"]);
+const PROGRESS_STUB_STATUSES = new Set(["stub-generated", "sorry_stub"]);
+const PROGRESS_FAILED_STATUSES = new Set(["failed", "invalid", "error"]);
+const PROGRESS_IN_PROGRESS_STATUSES = new Set(["in-progress", "in_progress"]);
+const PROGRESS_SEGMENT_DEFS = [
+  { id: "success", label: "Successful", countKey: "success" },
+  { id: "sorry-stubbed", label: "Sorry-stubbed", countKey: "sorryStubbed" },
+  { id: "failed", label: "Failed", countKey: "failed" },
+  { id: "unformalized", label: "Unformalized", countKey: "unformalized" }
+];
 
 export function formatPaneStatus(status) {
   return PANE_STATUS_LABELS[status] || "unknown";
@@ -233,6 +243,64 @@ export function aggregatePaneStatus(items) {
   }
   const unique = new Set(statuses);
   return unique.size === 1 ? statuses[0] : "mixed";
+}
+
+export function paneProgressBucketForItem(item) {
+  const status = String(item?.status || item?.effectiveStatus || "unknown").toLowerCase();
+  if (PROGRESS_SUCCESS_STATUSES.has(status)) return "success";
+  if (PROGRESS_STUB_STATUSES.has(status)) return "sorryStubbed";
+  if (PROGRESS_FAILED_STATUSES.has(status)) return "failed";
+  return "unformalized";
+}
+
+export function summarizePaneProgress(items) {
+  const summary = {
+    total: 0,
+    success: 0,
+    sorryStubbed: 0,
+    failed: 0,
+    unformalized: 0,
+    inProgress: 0
+  };
+  for (const item of Array.isArray(items) ? items : []) {
+    summary.total += 1;
+    summary[paneProgressBucketForItem(item)] += 1;
+    const status = String(item?.status || "").toLowerCase();
+    if (item?.inProgress || PROGRESS_IN_PROGRESS_STATUSES.has(status)) {
+      summary.inProgress += 1;
+    }
+  }
+  return summary;
+}
+
+export function paneProgressSegments(summary) {
+  const total = Number(summary?.total || 0);
+  if (!total) return [];
+  return PROGRESS_SEGMENT_DEFS
+    .map((segment) => {
+      const count = Number(summary?.[segment.countKey] || 0);
+      return {
+        ...segment,
+        count,
+        percent: (count / total) * 100,
+        title: `${segment.label}: ${count} of ${total}, ${formatProgressPercent((count / total) * 100)}`
+      };
+    })
+    .filter((segment) => segment.count > 0);
+}
+
+export function formatPaneProgressLabel(path, summary) {
+  const total = Number(summary?.total || 0);
+  const file = normalizePanePath(path) || "File";
+  const parts = [
+    `${file}: ${total} Lea item${total === 1 ? "" : "s"}`
+  ];
+  appendProgressLabelPart(parts, summary?.success, "successful");
+  appendProgressLabelPart(parts, summary?.sorryStubbed, "sorry-stubbed");
+  appendProgressLabelPart(parts, summary?.failed, "failed");
+  appendProgressLabelPart(parts, summary?.unformalized, "unformalized");
+  appendProgressLabelPart(parts, summary?.inProgress, "in progress");
+  return `${parts.join(", ")}.`;
 }
 
 export function treeAncestorIdsForFile(sourceFile) {
@@ -645,6 +713,7 @@ function finalizePaneTreeNodes(nodes) {
       node.items.sort((a, b) => paneItemOrder(a) - paneItemOrder(b));
       node.itemCount = node.items.length;
       node.status = aggregatePaneStatus(node.items);
+      node.progress = summarizePaneProgress(node.items);
     }
   }
 }
@@ -669,6 +738,16 @@ function paneTreeFileId(path) {
 
 function normalizePanePath(value) {
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").trim();
+}
+
+function appendProgressLabelPart(parts, count, label) {
+  const value = Number(count || 0);
+  if (value > 0) parts.push(`${value} ${label}`);
+}
+
+function formatProgressPercent(value) {
+  const rounded = Math.round(Number(value || 0) * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
 }
 
 function findNextMathDelimiter(text, cursor) {
