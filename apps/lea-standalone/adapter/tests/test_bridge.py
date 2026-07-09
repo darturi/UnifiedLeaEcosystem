@@ -288,6 +288,9 @@ def test_project_run_uses_shared_repo_namespace_and_context(tmp_path, monkeypatc
     first = captured["messages"][0]
     assert first["content"].startswith(projects.CONTEXT_MARKER)
     assert "## Project Instructions" in first["content"] and "Lea.Epsilon" in first["content"]
+    assert "project title is a human-facing display name" in first["content"]
+    assert "namespace `Lea.Epsilon` is authoritative" in first["content"]
+    assert "Do not derive a namespace from the display name" in first["content"]
 
     # D24: the proof committed to the SHARED project repo, not proofs/<session-id>.
     detail = store.session_detail(session["id"])

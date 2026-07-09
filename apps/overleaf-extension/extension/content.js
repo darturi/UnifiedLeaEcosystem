@@ -280,7 +280,7 @@
     leanPaneProjectTitle = title;
     leanPaneProjectNamespace = document.createElement("p");
     leanPaneProjectNamespace.className = "ol-lean-project-pane-namespace";
-    leanPaneProjectNamespace.textContent = "Namespace: --";
+    leanPaneProjectNamespace.textContent = "Lean namespace: --";
     titleWrap.appendChild(paneLabel);
     titleWrap.appendChild(kicker);
     titleWrap.appendChild(title);
@@ -824,7 +824,7 @@
     if (!leanPaneProjectTitle || !leanPaneProjectNamespace) return;
     const fallback = guessProjectName(lastLeanPaneFiles || []);
     leanPaneProjectTitle.textContent = identity?.projectName || fallback;
-    leanPaneProjectNamespace.textContent = `Namespace: ${identity?.namespace || "--"}`;
+    leanPaneProjectNamespace.textContent = `Lean namespace: ${identity?.namespace || "--"}`;
   }
 
   async function loadProjectIdentity({ baseUrl, projectId }) {
@@ -865,42 +865,87 @@
     return title || "Overleaf Project";
   }
 
+  function renderProjectIdentityFeedback({ source = "lean-pane", popover = null, message = "", kind = "info" } = {}) {
+    const text = String(message || "");
+    if (source === "lean-pane" && leanPaneStatus) {
+      leanPaneStatus.textContent = text;
+    }
+    const projectMessage = popover?.querySelector("[data-role='project-message']");
+    if (projectMessage) {
+      projectMessage.textContent = text;
+      projectMessage.dataset.kind = text ? kind : "";
+    }
+  }
+
   async function openProjectIdentityEditor({ source = "lean-pane", popover = null } = {}) {
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const projectId = extractOverleafProjectId();
     const identity = lastProjectIdentity || await loadProjectIdentity({ baseUrl, projectId });
     const projectName = window.prompt("Project name", identity?.projectName || guessProjectName(lastLeanPaneFiles || []));
-    if (projectName === null) return;
+    if (projectName === null) {
+      renderProjectIdentityFeedback({ source, popover });
+      return false;
+    }
     const trimmed = projectName.trim();
-    if (!trimmed) throw new Error("Project name is required.");
-    const preview = await previewProjectIdentity({
-      baseUrl,
-      projectId,
-      projectName: trimmed,
-      excludeProjectId: identity?.projectId || ""
-    });
+    if (!trimmed) {
+      renderProjectIdentityFeedback({ source, popover, message: "Project name is required.", kind: "error" });
+      return false;
+    }
+    let preview;
+    try {
+      preview = await previewProjectIdentity({
+        baseUrl,
+        projectId,
+        projectName: trimmed,
+        excludeProjectId: identity?.projectId || ""
+      });
+    } catch (error) {
+      renderProjectIdentityFeedback({ source, popover, message: normalizeErrorMessage(error), kind: "error" });
+      return false;
+    }
     if (preview.available === false) {
-      throw new Error(`Namespace is already in use. Try ${preview.suggestions?.[0] || "another name"}.`);
+      renderProjectIdentityFeedback({
+        source,
+        popover,
+        message: `That namespace is already in use. Try ${preview.suggestions?.[0] || "another name"}.`,
+        kind: "error"
+      });
+      return false;
     }
     const existingWithProofs = Boolean(identity?.exists && identity?.hasRecordedProofs);
     const migrate = !existingWithProofs && preview.namespace !== identity?.namespace
       ? true
       : window.confirm(`Change Lean namespace to ${preview.namespace}? Choose Cancel to rename the display name only.`);
     const mode = migrate ? "rename-namespace" : "display-only";
-    const result = await saveProjectIdentity({
-      baseUrl,
-      projectId,
-      projectName: trimmed,
-      mode,
-      namespace: migrate ? preview.namespace : "",
-      expectedNamespace: identity?.namespace || "",
-      createIfMissing: true
-    });
+    let result;
+    try {
+      result = await saveProjectIdentity({
+        baseUrl,
+        projectId,
+        projectName: trimmed,
+        mode,
+        namespace: migrate ? preview.namespace : "",
+        expectedNamespace: identity?.namespace || "",
+        createIfMissing: true
+      });
+    } catch (error) {
+      renderProjectIdentityFeedback({ source, popover, message: normalizeErrorMessage(error), kind: "error" });
+      return false;
+    }
     lastProjectIdentity = result.identity || null;
     renderLeanPaneProjectIdentity(lastProjectIdentity);
     if (popover) renderProjectSettingsSection(popover, lastProjectIdentity);
-    if (source === "lean-pane" && leanPaneStatus) leanPaneStatus.textContent = "Project name saved.";
+    const savedNamespace = result.identity?.namespace || identity?.namespace || preview.namespace || "";
+    renderProjectIdentityFeedback({
+      source,
+      popover,
+      message: mode === "display-only" && savedNamespace
+        ? `Project name saved. Lean files still use namespace ${savedNamespace}.`
+        : "Project name and Lean namespace saved.",
+      kind: "success"
+    });
+    return true;
   }
 
   function prepareLeanPaneTreeExpansion(manifest, tree) {
@@ -2602,8 +2647,9 @@
               <span data-role="project-name">Overleaf Project</span>
               <strong data-role="project-exists">Not created</strong>
             </div>
-            <p class="ol-lean-provider-note" data-role="project-namespace">Namespace: --</p>
+            <p class="ol-lean-provider-note" data-role="project-namespace">Lean namespace: --</p>
             <p class="ol-lean-provider-note" data-role="project-binding">Overleaf binding: --</p>
+            <p class="ol-lean-provider-note ol-lean-project-message" data-role="project-message"></p>
             <div class="ol-lean-provider-key-controls">
               <button type="button" class="ol-lean-provider-key-button" data-role="edit-project-name">Edit name</button>
             </div>
@@ -2762,8 +2808,8 @@
     popover.querySelector("[data-role='edit-project-name']").addEventListener("click", async () => {
       status.textContent = "Updating project name...";
       try {
-        await openProjectIdentityEditor({ source: "settings", popover });
-        status.textContent = "Project name saved.";
+        const saved = await openProjectIdentityEditor({ source: "settings", popover });
+        if (!saved) status.textContent = "";
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
       }
@@ -2901,6 +2947,7 @@
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
+        projectNamespace: lastProjectIdentity?.namespace || "",
         sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
@@ -2929,6 +2976,7 @@
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
+        projectNamespace: lastProjectIdentity?.namespace || "",
         sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
@@ -3484,7 +3532,7 @@
     const fallback = guessProjectName(lastLeanPaneFiles || []);
     if (projectName) projectName.textContent = identity?.projectName || fallback;
     if (exists) exists.textContent = identity?.exists ? "Created" : "Not created";
-    if (namespace) namespace.textContent = `Namespace: ${identity?.namespace || "--"}`;
+    if (namespace) namespace.textContent = `Lean namespace: ${identity?.namespace || "--"}`;
     if (binding) binding.textContent = `Overleaf binding: ${identity?.slug || extractOverleafProjectId() || "--"}`;
   }
 

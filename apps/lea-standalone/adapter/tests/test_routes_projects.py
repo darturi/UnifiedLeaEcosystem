@@ -106,8 +106,10 @@ def test_update_edits_title_and_description(tmp_path, monkeypatch):
 
 
 def test_project_identity_preview_and_display_rename_by_slug(tmp_path, monkeypatch):
-    _setup(tmp_path, monkeypatch)
+    proofs = _setup(tmp_path, monkeypatch)
     project = projects_route.create_project(ProjectCreate(title="Old Name"))
+    repo = proofs / "Lea" / "OldName"
+    assert "# Instructions — Old Name" in (repo / ".lea" / "instructions.md").read_text()
 
     preview = projects_route.namespace_preview(NamespacePreviewRequest(project_name="Fourier Series"))
     assert preview["namespace"] == "Lea.FourierSeries"
@@ -123,6 +125,9 @@ def test_project_identity_preview_and_display_rename_by_slug(tmp_path, monkeypat
     )
     assert result["identity"]["projectName"] == "Readable Name"
     assert result["identity"]["namespace"] == project["namespace"]
+    assert "# Instructions — Readable Name" in (repo / ".lea" / "instructions.md").read_text()
+    assert "# Memory — Readable Name" in (repo / ".lea" / "memory.md").read_text()
+    assert "# Blueprint — Readable Name" in (repo / ".lea" / "blueprint.md").read_text()
 
 
 def test_project_identity_put_can_create_without_get_side_effect(tmp_path, monkeypatch):
@@ -175,6 +180,7 @@ def test_project_namespace_migration_rewrites_files_and_updates_row(tmp_path, mo
     assert new_repo.is_dir()
     assert not repo.exists()
     assert "namespace Lea.NewName" in (new_repo / "helper.lean").read_text()
+    assert "# Instructions — New Name" in (new_repo / ".lea" / "instructions.md").read_text()
     assert result["migration"]["checkedFiles"] == 1
     assert result["migration"]["failedFiles"] == []
 

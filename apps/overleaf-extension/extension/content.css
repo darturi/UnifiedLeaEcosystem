@@ -1404,6 +1404,18 @@ body.ol-lean-pane-resizing {
   background: var(--ol-panel);
 }
 
+.ol-lean-project-message:empty {
+  display: none;
+}
+
+.ol-lean-project-message[data-kind="error"] {
+  color: var(--ol-red);
+}
+
+.ol-lean-project-message[data-kind="success"] {
+  color: var(--ol-green);
+}
+
 .ol-lean-provider-title {
   color: var(--ol-muted);
   font: 700 10px/1 var(--ol-mono);

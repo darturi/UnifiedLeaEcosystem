@@ -237,7 +237,10 @@ def compose_context_message(project: dict, repo: Path) -> dict | None:
         f"{CONTEXT_MARKER}\n"
         f"You are working in project **{project.get('title', namespace)}** "
         f"(namespace `{namespace}`). Reuse already-proved sibling lemmas in this "
-        f"project by importing them. The following is standing project context.\n\n"
+        f"project by importing them. The project title is a human-facing display name; "
+        f"the namespace `{namespace}` is authoritative for imports, declarations, and "
+        f"file placement. Do not derive a namespace from the display name. "
+        f"The following is standing project context.\n\n"
         f"## Project Instructions\n{instructions}\n\n"
         f"## Project Memory\n{memory}\n\n"
         f"**Maintaining this memory is part of your job.** `.lea/memory.md` (in your "
@@ -437,6 +440,50 @@ def _rewrite_namespace_text(text: str, old_namespace: str, new_namespace: str) -
     return pattern.sub(new_namespace, text)
 
 
+def _rewrite_project_doc_title(text: str, old_title: str, new_title: str) -> str:
+    """Refresh only the generated top heading in `.lea` docs after a display rename."""
+    if not old_title or old_title == new_title:
+        return text
+    replacements = {
+        f"# Instructions — {old_title}": f"# Instructions — {new_title}",
+        f"# Memory — {old_title}": f"# Memory — {new_title}",
+        f"# Blueprint — {old_title}": f"# Blueprint — {new_title}",
+    }
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    first_line = lines[0].rstrip("\n")
+    replacement = replacements.get(first_line)
+    if not replacement:
+        return text
+    ending = "\n" if lines[0].endswith("\n") else ""
+    lines[0] = f"{replacement}{ending}"
+    return "".join(lines)
+
+
+def refresh_project_title_docs(project: dict, proofs_root: Path, title: str) -> str | None:
+    """Update generated `.lea` headings so future project context uses the new name."""
+    new_title = (title or "").strip()
+    old_title = str(project.get("title") or "")
+    if not new_title or old_title == new_title:
+        return None
+    repo = project_repo_dir(project, proofs_root)
+    changed = False
+    for name in EDITABLE_DOCS:
+        path = repo / ".lea" / name
+        try:
+            original = path.read_text()
+        except OSError:
+            continue
+        updated = _rewrite_project_doc_title(original, old_title, new_title)
+        if updated != original:
+            path.write_text(updated)
+            changed = True
+    if not changed:
+        return None
+    return GitStore(proofs_root).commit_all(repo, f"rename project title: {old_title} -> {new_title}")
+
+
 def _project_has_active_runs(project_id: str) -> bool:
     return any(session.get("status") == "running" for session in store.list_project_sessions(project_id))
 
@@ -479,6 +526,7 @@ def migrate_project_namespace(
         except UnicodeDecodeError:
             continue
         updated = _rewrite_namespace_text(original, old_namespace, new_namespace)
+        updated = _rewrite_project_doc_title(updated, project.get("title", ""), title)
         if updated != original:
             path.write_text(updated)
             changed_files.append(path)

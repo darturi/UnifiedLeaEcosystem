@@ -162,6 +162,14 @@ test("project identity endpoints proxy adapter state without creating on missing
   const preview = await handleProjectIdentityPreview({ overleafProjectId: "project-1", projectName: "Fourier Notes" }, state);
   assert.equal(preview.body.namespace, "Lea.FourierNotes");
 
+  state.jobs.old = {
+    jobId: "old",
+    jobKey: "project-1:theorem:old",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectName: "Old Name",
+    projectNamespace: "Lea.OldName"
+  };
   const update = await handleProjectIdentityUpdate({
     overleafProjectId: "project-1",
     projectName: "Fourier Notes",
@@ -170,6 +178,8 @@ test("project identity endpoints proxy adapter state without creating on missing
     createIfMissing: true
   }, state);
   assert.equal(update.body.identity.projectName, "Fourier Notes");
+  assert.equal(state.jobs.old.projectName, "Fourier Notes");
+  assert.equal(state.jobs.old.projectNamespace, "Lea.OldName");
   assert.equal(calls.find((call) => call.options.method === "PUT").body.create_if_missing, true);
 });
 
@@ -3250,6 +3260,9 @@ function makeLeaApiFetch(calls, options = {}) {
     if (String(url).endsWith("/api/settings")) {
       return jsonResponse(404, { detail: "not found" });
     }
+    if (String(url).includes("/api/projects/by-slug/") && String(url).endsWith("/identity")) {
+      return jsonResponse(404, { detail: "No project" });
+    }
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     const recordedBody = body?.message ? { ...body, task: body.message } : body;
     calls.push({ url, options: requestOptions, body: recordedBody });
@@ -3474,22 +3487,153 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeAdapterApiFetch(calls)
   });
+  state.projectIdentities = {
+    "project-1": {
+      slug: "project-1",
+      projectName: "Renamed Project",
+      namespace: "Lea.RenamedProject"
+    }
+  };
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
     targetKind: "theorem",
     targetLabel: "t_api",
     targetText: "A theorem.",
-    projectName: "Friendly Project"
+    projectName: "Original Project"
   }, state);
 
   assert.equal(result.statusCode, 200);
   assert.equal(result.body.status, "in_progress");
   await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
-  assert.ok(runCall.body.message.includes("project project-1"));
-  assert.equal(runCall.body.project_title, "Friendly Project");
+  assert.ok(runCall.body.message.includes("Project display name: Renamed Project"));
+  assert.ok(runCall.body.message.includes("Lean namespace: Lea.RenamedProject"));
+  assert.ok(runCall.body.message.includes("Overleaf binding: project-1"));
+  assert.ok(runCall.body.message.includes("do not derive a namespace from the display name"));
+  assert.ok(!runCall.body.message.includes("in project project-1"));
+  assert.equal(runCall.body.project_title, "Renamed Project");
+  assert.equal(runCall.body.project_namespace, "Lea.RenamedProject");
   assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
+});
+
+test("formalize fetches adapter identity after companion restart before composing the prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapterFetch = makeAdapterApiFetch(calls);
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "GET") {
+        return jsonResponse(200, {
+          projectId: "adapter-project-1",
+          slug: "project-1",
+          projectName: "p1",
+          namespace: "Lea.P6a4584b313b8ddc4ba20e377",
+          namespaceEditable: true,
+          repoPath: "proofs/Lea/P6a4584b313b8ddc4ba20e377",
+          hasRecordedProofs: true,
+          exists: true
+        });
+      }
+      return adapterFetch(url, options);
+    }
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    targetText: "A theorem.",
+    projectName: "stale-title"
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.ok(calls.some((c) => String(c.url).endsWith("/api/projects/by-slug/project-1/identity") && c.options?.method === "GET"));
+  assert.ok(runCall.body.message.includes("Project display name: p1"));
+  assert.ok(runCall.body.message.includes("Lean namespace: Lea.P6a4584b313b8ddc4ba20e377"));
+  assert.ok(runCall.body.message.includes("Overleaf binding: project-1"));
+  assert.ok(!runCall.body.message.includes("Lean namespace: Lea.Project1"));
+  assert.equal(runCall.body.project_title, "p1");
+  assert.equal(runCall.body.project_namespace, "Lea.P6a4584b313b8ddc4ba20e377");
+});
+
+test("formalize refreshes stale fallback identity and dependency paths after project rename", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  await writeLeaProjectProof(
+    leaRepo,
+    path.join("workspace", "proofs", "Lea", "P1", "compactness_criterion.lean"),
+    "import Mathlib\n\nnamespace Lea.P1\n\ntheorem compactness_criterion : True := by\n  trivial\n\nend Lea.P1\n"
+  );
+  const adapterFetch = makeAdapterApiFetch(calls, { projectNamespace: "Lea.P1" });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "GET") {
+        return jsonResponse(200, {
+          projectId: "adapter-project-1",
+          slug: "project-1",
+          projectName: "p1",
+          namespace: "Lea.P1",
+          namespaceEditable: true,
+          repoPath: "proofs/Lea/P1",
+          hasRecordedProofs: true,
+          exists: true
+        });
+      }
+      return adapterFetch(url, options);
+    }
+  });
+  state.projectIdentities = {
+    "project-1": {
+      slug: "project-1",
+      projectName: "project-1",
+      namespace: "Lea.Project1",
+      exists: false
+    }
+  };
+  state.jobs.old = {
+    jobId: "old",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    recordedProofPath: path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean"),
+    moduleName: "Lea.Project1.compactness_criterion",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectName: "project-1",
+    projectNamespace: "Lea.Project1",
+    startedAt: "2026-07-09T01:48:17.300Z",
+    finishedAt: "2026-07-09T01:48:51.752Z"
+  };
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    targetText: "A consequence.",
+    targetUses: ["compactness_criterion"]
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.ok(runCall.body.message.includes("Project display name: p1"));
+  assert.ok(runCall.body.message.includes("Lean namespace: Lea.P1"));
+  assert.ok(runCall.body.message.includes(path.join("workspace", "proofs", "Lea", "P1", "compactness_criterion.lean")));
+  assert.ok(!runCall.body.message.includes("Lean namespace: Lea.Project1"));
+  assert.ok(!runCall.body.message.includes(path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean")));
+  assert.equal(runCall.body.project_title, "p1");
+  assert.equal(runCall.body.project_namespace, "Lea.P1");
 });
 
 test("stub on the /api backend records a checked sorry stub with a Lea session link", async () => {
@@ -3531,7 +3675,11 @@ test("stub on the /api backend records a checked sorry stub with a Lea session l
   assert.equal(result.body.leaSessionId, "sess-api-1");
   assert.equal(result.body.leaSessionUrl, "http://localhost:5173/?session=sess-api-1");
   assert.equal(state.jobs[result.body.jobId].recordedProofPath, proofPath);
-  assert.match(calls.find((c) => String(c.url).endsWith("/api/runs")).body.message, /Create a Lean sorry stub/);
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.match(runCall.body.message, /Create a Lean sorry stub/);
+  assert.match(runCall.body.message, /Project display name: Overleaf Project/);
+  assert.match(runCall.body.message, /Lean namespace: Lea\.Project1/);
+  assert.match(runCall.body.message, /do not derive a namespace from the display name/);
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
@@ -4073,6 +4221,13 @@ test("chat message starts a first-message session with the full context preamble
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeLeaApiFetch(calls)
   });
+  state.projectIdentities = {
+    "project-1": {
+      slug: "project-1",
+      projectName: "p1",
+      namespace: "Lea.P6a4584b313b8ddc4ba20e377"
+    }
+  };
 
   const res = await handleChatMessage({ target: CHAT_TARGET, message: "Why did this fail?" }, state);
 
@@ -4084,6 +4239,9 @@ test("chat message starts a first-message session with the full context preamble
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
   assert.equal(runCall.body.session_id, undefined);
   assert.match(runCall.body.message, /You are helping with this Overleaf item\./);
+  assert.match(runCall.body.message, /Project display name: p1/);
+  assert.match(runCall.body.message, /Lean namespace: Lea\.P6a4584b313b8ddc4ba20e377/);
+  assert.match(runCall.body.message, /do not derive a namespace from the display name/);
   assert.match(runCall.body.message, /Natural-language statement:/);
   assert.match(runCall.body.message, /User request:\nWhy did this fail\?/);
   // association recorded for a target that had no prior job

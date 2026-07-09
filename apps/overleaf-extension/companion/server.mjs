@@ -29,7 +29,7 @@ import {
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
 import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
-import { buildChatPrompt, buildRepairPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
+import { buildChatPrompt, buildRepairPrompt, chatTargetKey, projectIdentityPreambleLines, toChatSessionResponse } from "./chatPrompt.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
   containsSorryMarker,
@@ -244,13 +244,14 @@ export async function handleFormalize(payload, state) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
   }
 
+  const currentIdentity = await resolveRunProjectIdentity({ state, overleafProjectId, projectName, projectNamespace, refresh: true });
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
     targetLabel,
-    projectName,
-    projectNamespace
+    projectName: currentIdentity.projectName,
+    projectNamespace: currentIdentity.namespace
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -264,6 +265,8 @@ export async function handleFormalize(payload, state) {
     state,
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     targetUses,
     jobs: state.jobs || {}
   });
@@ -367,13 +370,14 @@ export async function handleStub(payload, state) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
   }
 
+  const currentIdentity = await resolveRunProjectIdentity({ state, overleafProjectId, projectName, projectNamespace, refresh: true });
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
     targetLabel,
-    projectName,
-    projectNamespace
+    projectName: currentIdentity.projectName,
+    projectNamespace: currentIdentity.namespace
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -387,6 +391,8 @@ export async function handleStub(payload, state) {
     state,
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     targetUses,
     jobs: state.jobs || {}
   });
@@ -555,6 +561,54 @@ export async function handleProjectIdentity(payload, state) {
   return { statusCode: 200, body: { ok: true, identity } };
 }
 
+function cachedProjectIdentity({ state, overleafProjectId, projectSlug = "" }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  return state?.projectIdentities?.[slug] || null;
+}
+
+function isCompleteProjectIdentity(identity) {
+  return Boolean(identity?.slug && identity?.projectName && identity?.namespace);
+}
+
+function isAuthoritativeProjectIdentity(identity) {
+  return isCompleteProjectIdentity(identity) && identity.exists !== false;
+}
+
+function fallbackRunProjectIdentity({ overleafProjectId, projectSlug = "", projectName = "", projectNamespace = "" }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  return {
+    projectId: null,
+    overleafProjectId,
+    slug,
+    projectName: suggestedProjectName({ overleafProjectId, projectName }),
+    namespace: String(projectNamespace || "").trim() || projectNamespaceFromSlug(slug),
+    namespaceEditable: true,
+    repoPath: null,
+    hasRecordedProofs: false,
+    exists: false
+  };
+}
+
+async function resolveRunProjectIdentity({ state, overleafProjectId, projectSlug = "", projectName = "", projectNamespace = "", refresh = false }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  const cached = cachedProjectIdentity({ state, overleafProjectId, projectSlug: slug });
+  if (!refresh && isAuthoritativeProjectIdentity(cached)) return cached;
+
+  const target = resolveShareTarget({ overleafProjectId }, state);
+  if (!target.error) {
+    const result = await fetchProjectIdentityBySlug(target);
+    if (result.ok) {
+      const identity = normalizeCompanionIdentity(result.body, overleafProjectId);
+      state.projectIdentities ||= {};
+      state.projectIdentities[identity.slug] = identity;
+      return identity;
+    }
+  }
+
+  if (isCompleteProjectIdentity(cached)) return cached;
+  return fallbackRunProjectIdentity({ overleafProjectId, projectSlug: slug, projectName, projectNamespace });
+}
+
 export async function handleProjectIdentityPreview(payload, state) {
   const target = resolveShareTarget(payload, state);
   if (target.error) return target.error;
@@ -592,14 +646,20 @@ export async function handleProjectIdentityUpdate(payload, state) {
   const identity = normalizeCompanionIdentity(result.body?.identity, overleafProjectId);
   state.projectIdentities ||= {};
   state.projectIdentities[identity.slug] = identity;
-  if (result.body?.migration) {
-    for (const job of Object.values(state.jobs || {})) {
-      if (job?.overleafProjectId === overleafProjectId || job?.projectSlug === target.slug) {
+  let jobsChanged = false;
+  for (const job of Object.values(state.jobs || {})) {
+    if (job?.overleafProjectId === overleafProjectId || job?.projectSlug === target.slug) {
+      if (job.projectName !== identity.projectName) {
+        job.projectName = identity.projectName;
+        jobsChanged = true;
+      }
+      if (result.body?.migration && job.projectNamespace !== identity.namespace) {
         job.projectNamespace = identity.namespace;
+        jobsChanged = true;
       }
     }
-    await writeJson(state.jobsPath, state.jobs || {});
   }
+  if (jobsChanged) await writeJson(state.jobsPath, state.jobs || {});
   return { statusCode: 200, body: { ok: true, identity, migration: result.body?.migration || null } };
 }
 
@@ -1010,6 +1070,14 @@ export async function handleChatMessage(payload, state) {
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
   if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  const currentIdentity = await resolveRunProjectIdentity({
+    state,
+    overleafProjectId: target.overleafProjectId,
+    projectSlug: target.projectSlug,
+    refresh: true
+  });
+  target.projectName = currentIdentity.projectName;
+  target.projectNamespace = currentIdentity.namespace;
 
   const { leaSessionId, latestJobHash, activeJob } = resolveChatSession({ state, target });
   if (activeJob) {
@@ -1739,7 +1807,6 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     recordedProofPath: linkedJob?.recordedProofPath || null,
     moduleName: linkedJob?.moduleName || null,
     leanStatement: linkedJob?.leanStatement || null,
-    projectNamespace: linkedJob?.projectNamespace || null,
     lastEditCheckStatus: linkedJob?.lastEditCheckStatus || null,
     lastEditCheckDetail: linkedJob?.lastEditCheckDetail || null,
     lastEditBreakage: breakage,
@@ -1986,10 +2053,20 @@ async function startRepairRun({ state, overleafProjectId, targetKind: requestedK
     return { status: "error", error: "repair_start_failed", statusCode: 502, message: "Could not read the item's recorded Lean file to repair against." };
   }
 
-  const target = buildLeaTarget({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId, targetKind, targetLabel });
+  const currentIdentity = await resolveRunProjectIdentity({ state, overleafProjectId, refresh: true });
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    targetKind,
+    targetLabel,
+    projectName: currentIdentity.projectName,
+    projectNamespace: currentIdentity.namespace
+  });
   const prompt = buildRepairPrompt(
     {
       projectSlug: target.projectSlug,
+      projectName: target.projectName,
+      projectNamespace: target.projectNamespace,
       targetKind,
       targetLabel,
       leanDeclarationName: linkedJob.declarationName || targetLabel,
@@ -3301,6 +3378,8 @@ async function findReusableStubForFormalization({ state, leaRepoPath, target, jo
     state,
     leaRepoPath,
     overleafProjectId: target.overleafProjectId,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     theoremLabel: target.theoremLabel,
     jobs
   }));
@@ -3350,7 +3429,7 @@ function findLatestFinishedJob(jobs, jobKey) {
   return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status !== "in_progress")[0] || null;
 }
 
-async function resolveTheoremUses({ state, leaRepoPath, overleafProjectId, targetUses, jobs }) {
+async function resolveTheoremUses({ state, leaRepoPath, overleafProjectId, projectName = "", projectNamespace = "", targetUses, jobs }) {
   const resolvedUses = [];
   const unresolvedUses = [];
 
@@ -3359,6 +3438,8 @@ async function resolveTheoremUses({ state, leaRepoPath, overleafProjectId, targe
       state,
       leaRepoPath,
       overleafProjectId,
+      projectName,
+      projectNamespace,
       targetLabel: theoremLabel,
       jobs
     });
@@ -3446,6 +3527,8 @@ async function createLeaJob({ state, target, targetText, targetContext = "", tar
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
+    projectName: target.projectName || target.projectSlug,
+    projectNamespace: target.projectNamespace || null,
     projectMarkdownPath: target.projectMarkdownPath,
     declarationName: target.targetLabel,
     declarationNameHint: declarationNameHint || null,
@@ -3668,6 +3751,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       job.projectNamespace = startBody.project_namespace || job.projectNamespace || null;
       job.projectSlug = startBody.project_slug || job.projectSlug || target.projectSlug;
       job.adapterProjectId = startBody.project_id || job.adapterProjectId || null;
+      if (startBody.project_namespace) target.projectNamespace = startBody.project_namespace;
+      if (startBody.project_slug) target.projectSlug = startBody.project_slug;
       await writeJson(state.jobsPath, state.jobs);
     },
     onEvent,
@@ -3980,6 +4065,8 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
         state,
         leaRepoPath: state.settings.leaRepoPath,
         overleafProjectId: target.overleafProjectId,
+        projectName: target.projectName,
+        projectNamespace: target.projectNamespace,
         theoremLabel: target.targetLabel,
         jobs: {}
       });
@@ -4117,6 +4204,8 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
   const prompt = buildLeaPrompt({
     targetKind: target.targetKind,
     projectSlug: target.projectSlug,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     targetLabel: target.targetLabel,
     targetText,
     targetContext,
@@ -4160,6 +4249,8 @@ async function runLeaStubJob({ state, job, target, targetText, targetContext = "
   const observedCodeSteps = new Map();
   const prompt = buildLeaStubPrompt({
     projectSlug: target.projectSlug,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     theoremLabel: target.targetLabel,
     theoremText: targetText,
     theoremContext: targetContext,
@@ -4271,10 +4362,16 @@ function validateStubArtifact({ state, job, target, exit, sessionDetail, observe
   };
 }
 
-function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+function buildProjectIdentityBlock({ projectSlug, projectName = "", projectNamespace = "" }) {
+  return projectIdentityPreambleLines({ projectSlug, projectName, projectNamespace }).join("\n");
+}
+
+function buildLeaPrompt({ targetKind, projectSlug, projectName = "", projectNamespace = "", targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
   if (targetKind === "definition") {
     return buildLeaDefinitionPrompt({
       projectSlug,
+      projectName,
+      projectNamespace,
       targetLabel,
       targetText,
       targetContext,
@@ -4284,6 +4381,8 @@ function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targ
   }
   return buildLeaTheoremPrompt({
     projectSlug,
+    projectName,
+    projectNamespace,
     theoremLabel: targetLabel,
     theoremText: targetText,
     theoremContext: targetContext,
@@ -4293,7 +4392,8 @@ function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targ
   });
 }
 
-function buildLeaTheoremPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+function buildLeaTheoremPrompt({ projectSlug, projectName = "", projectNamespace = "", theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+  const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -4315,7 +4415,10 @@ function buildLeaTheoremPrompt({ projectSlug, theoremLabel, theoremText, theorem
 Continue from this existing file and replace the sorry/admit in theorem ${stubToComplete.declarationName}. Do not delete, rename, or move the file unless Lean requires a minimal import adjustment.\n`
     : "";
 
-  return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
+  return `Formalize the Overleaf theorem labeled ${theoremLabel}.
+
+${projectIdentity}
+
 ${naming}
 ${usesGuidance}
 
@@ -4326,12 +4429,13 @@ ${stubGuidance}
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a statement for approval. If a detail is ambiguous (for example which number type to use), pick the most natural interpretation and proceed without waiting. Do everything in this run: write the Lean file under Lea's workspace and carry the proof through to completion.
 
 The final file must compile with no sorry/admit in theorem ${proofTarget}.
-Use the Lea project context to choose the project namespace and proof path.
+Use the exact Lean namespace shown above and in the project context for imports, declarations, and proof paths.
 Do not edit the project markdown during proof search; Lea will record the final result after the proof succeeds.
 Do not create placeholder files outside Lea's workspace. If you cannot complete the proof, leave the best partial Lean file in the Lea project proof directory.`;
 }
 
-function buildLeaDefinitionPrompt({ projectSlug, targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [] }) {
+function buildLeaDefinitionPrompt({ projectSlug, projectName = "", projectNamespace = "", targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [] }) {
+  const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const naming = declarationNameHint
     ? `The definition text appears to specify Lean declaration name ${declarationNameHint}; use that name for the primary declaration.`
     : `Use the declaration name ${targetLabel} for the primary declaration unless the text explicitly specifies a better Lean name.`;
@@ -4344,7 +4448,10 @@ function buildLeaDefinitionPrompt({ projectSlug, targetLabel, targetText, target
     ? `\nFormalization guidance:\n${targetContext.trim()}\n`
     : "";
 
-  return `Formalize the Overleaf definition labeled ${targetLabel} in project ${projectSlug}.
+  return `Formalize the Overleaf definition labeled ${targetLabel}.
+
+${projectIdentity}
+
 This target is a definition, not a theorem.
 
 Create the appropriate Lean declaration or small group of declarations for the mathematical concept described below. Do not create a fake theorem just to satisfy a proof workflow.
@@ -4357,7 +4464,7 @@ ${usesGuidance}
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a declaration for approval. If a detail is ambiguous, pick the most natural interpretation and proceed without waiting.
 
 The final Lean file must compile with no sorry/admit.
-Use the Lea project context to choose the project namespace and proof path.
+Use the exact Lean namespace shown above and in the project context for imports, declarations, and proof paths.
 Do not edit the project markdown during formalization; Lea will record the final result after the declaration compiles.
 Do not create placeholder files outside Lea's workspace.
 
@@ -4366,7 +4473,8 @@ ${targetText}
 ${formalizationGuidance}`;
 }
 
-function buildLeaStubPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", resolvedUses = [] }) {
+function buildLeaStubPrompt({ projectSlug, projectName = "", projectNamespace = "", theoremLabel, theoremText, theoremContext = "", resolvedUses = [] }) {
+  const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const usesGuidance = resolvedUses.length === 0
     ? ""
     : `\nAvailable already-recorded support declarations, if needed for the statement imports only:\n${resolvedUses.map((use) => (
@@ -4376,10 +4484,12 @@ function buildLeaStubPrompt({ projectSlug, theoremLabel, theoremText, theoremCon
     ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
     : "";
 
-  return `Create a Lean sorry stub for the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
+  return `Create a Lean sorry stub for the Overleaf theorem labeled ${theoremLabel}.
+
+${projectIdentity}
 
 Translate only the theorem statement into Lean. Use the declaration name exactly \`${theoremLabel}\`.
-Write exactly one .lean file in the active project namespace/directory, containing the translated theorem or lemma with body:
+Write exactly one .lean file in the exact Lean namespace/directory shown above, containing the translated theorem or lemma with body:
 
 \`\`\`lean
 by
@@ -4824,6 +4934,8 @@ async function getTargetStatus({
   state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetKind,
   targetLabel,
   jobs = {}
@@ -4832,6 +4944,8 @@ async function getTargetStatus({
     state,
     leaRepoPath,
     overleafProjectId,
+    projectName,
+    projectNamespace,
     targetKind,
     theoremLabel: targetLabel,
     jobs
@@ -5109,27 +5223,31 @@ async function resolveTargetUseStatus({
   state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetLabel,
   jobs = {}
 }) {
   for (const targetKind of ["theorem", "definition"]) {
-    const status = await getTargetStatus({ state, leaRepoPath, overleafProjectId, targetKind, targetLabel, jobs });
+    const status = await getTargetStatus({ state, leaRepoPath, overleafProjectId, projectName, projectNamespace, targetKind, targetLabel, jobs });
     if (["formalized", "sorry_stub"].includes(getEquivalentTheoremStatus(status).status)) {
       return status;
     }
   }
-  return getTargetStatus({ state, leaRepoPath, overleafProjectId, targetKind: "theorem", targetLabel, jobs });
+  return getTargetStatus({ state, leaRepoPath, overleafProjectId, projectName, projectNamespace, targetKind: "theorem", targetLabel, jobs });
 }
 
 async function getTheoremStatus({
   state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetKind = "theorem",
   theoremLabel,
   jobs = {}
 }) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
   const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
   const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
   const activeJob = findActiveJob(jobs, target.jobKey);
@@ -5313,11 +5431,13 @@ async function getCurrentTheoremProofStatus({
   state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetKind = "theorem",
   theoremLabel,
   jobs = {}
 }) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
   const { mappedStatus, projectStatus, directProofStatus } = await getCurrentTheoremProofStatuses({
     state,
     leaRepoPath,

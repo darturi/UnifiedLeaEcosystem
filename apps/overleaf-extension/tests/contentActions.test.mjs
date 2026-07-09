@@ -129,6 +129,7 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   await flushPromises();
 
   assert.match(harness.bodyText(), /Lean pane/);
+  assert.match(harness.bodyText(), /Lean namespace: Lea\.TestProject/);
   harness.clickPaneTreeRowText("main.tex");
   assert.match(harness.bodyText(), /Main theorem/);
   assert.match(harness.bodyText(), /missing stub/);
@@ -653,6 +654,8 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   assert.equal(body.targetKind, "theorem");
   assert.deepEqual(body.targetUses, ["helper_lemma"]);
   assert.equal(body.targetContext, "Use the helper.");
+  assert.equal(body.projectName, "Test Project");
+  assert.equal(body.projectNamespace, "Lea.TestProject");
 });
 
 // --- Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md) ----------
@@ -884,6 +887,20 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         async json() {
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
+          }
+          if (String(url).includes("/project/identity?")) {
+            return {
+              ok: true,
+              identity: options.projectIdentity || {
+                projectId: "adapter-project-1",
+                overleafProjectId: "project-1",
+                slug: "project-1",
+                projectName: "Test Project",
+                namespace: "Lea.TestProject",
+                exists: true,
+                hasRecordedProofs: true
+              }
+            };
           }
           if (String(url).includes("/lean-pane/manifest")) {
             return typeof options.manifest === "function"

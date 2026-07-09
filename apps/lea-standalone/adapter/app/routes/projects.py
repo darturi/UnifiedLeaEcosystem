@@ -411,6 +411,7 @@ def update_project_identity_by_slug(slug: str, request: ProjectIdentityUpdate) -
         raise HTTPException(status_code=400, detail="Project name is required")
 
     if request.mode == "display-only":
+        project_service.refresh_project_title_docs(project, _proofs_root(), title)
         updated = store.update_project(project["id"], title=title)
         return {"identity": project_service.project_identity(updated)}
 
