@@ -1,33 +1,23 @@
 # Lea Interface — run the whole app (frontend + adapter + Lean/Mathlib) in one
-# container. Multi-arch image (linux/amd64 + linux/arm64), so it runs on Intel &
-# Apple-Silicon Macs, Windows, and Linux.
+# container. The only thing you install is Docker.
 #
-# Fastest path — pull the prebuilt image:
-#   1. docker compose up              (pulls the published image; no local build)
-#   2. Open http://localhost:8001
-#   3. Add your API key in the Settings pane (no key needed to start).
+#   docker compose build      # builds the image from source (first run is slow —
+#                             #   it downloads + bakes Mathlib; later runs are cached)
+#   docker compose up         # start it; open http://localhost:8001
+#   # then add your API key in the Settings pane (no key needed to boot)
 #
-# No prebuilt image / want to build from source (slow first build — bakes Mathlib):
-#   docker compose build && docker compose up
+# The build targets your machine's own CPU architecture, so it works on Intel &
+# Apple-Silicon Macs, Windows, and Linux with no extra flags.
 #
 # Sessions, proof history, and your saved settings/key persist on the host in
-# ./data and ./config.
-#
-# Maintainers — the image is published automatically to GHCR by
-# .github/workflows/docker-publish.yml on push to main / tags. To build+push
-# a multi-arch image by hand:
-#   docker buildx build --platform linux/amd64,linux/arm64 \
-#     -t ghcr.io/darturi/leaui:latest --push .
+# ./data and ./config, so they survive restarts.
 
 services:
   lea:
-    image: ghcr.io/darturi/leaui:latest
-    # Local fallback: `docker compose build` builds this image from source when
-    # no prebuilt image is available (or you're offline).
     build:
       context: .
       dockerfile: Dockerfile
-    pull_policy: missing         # pull the published image if not already local
+    image: leaui:local         # name for the locally-built image
     ports:
       - "8001:8001"
     volumes:

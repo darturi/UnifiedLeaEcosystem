@@ -2,16 +2,15 @@
 
 # =============================================================================
 # Lea Interface — self-contained image (frontend + UI adapter with the prover
-# driven in-process + Lean 4 + Mathlib). Multi-arch: all base images and the
-# elan/Lean toolchain resolve per-arch, so this builds for linux/amd64 and
-# linux/arm64 from the same Dockerfile.
+# driven in-process + Lean 4 + Mathlib). Arch-independent: all base images and
+# the elan/Lean toolchain resolve per-arch, so it builds natively on amd64 and
+# arm64 hosts alike.
 #
-# Build (single arch, local):
-#   docker buildx build -t lea-interface:local --load .
-# Build + push (multi-arch, maintainers):
-#   docker buildx build --platform linux/amd64,linux/arm64 \
-#     -t ghcr.io/darturi/leaui:latest --push .
-# Run:  docker compose up
+# Normal use is via docker compose (see docker-compose.yml):
+#   docker compose build && docker compose up
+#
+# Multi-arch build+push, if you ever want to publish a prebuilt image:
+#   docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/leaui:latest --push .
 # =============================================================================
 
 # -----------------------------------------------------------------------------
