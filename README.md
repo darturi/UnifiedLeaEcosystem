@@ -36,8 +36,8 @@ Then pick one of the two paths below.
 
 ### Option A — Docker (no local toolchain) ⭐ easiest
 
-Runs the whole standalone app (UI + adapter + Lean + Mathlib) from a prebuilt,
-multi-arch image. The only thing you install is Docker.
+Runs the whole standalone app (UI + adapter + Lean + Mathlib) in one container.
+The only thing you install is Docker.
 
 1. **Install Docker Desktop** and start it: https://www.docker.com/products/docker-desktop/
    (verify with `docker --version`).
@@ -46,12 +46,12 @@ multi-arch image. The only thing you install is Docker.
    git clone https://github.com/darturi/UnifiedLeaEcosystem.git
    cd UnifiedLeaEcosystem/apps/lea-standalone
    ```
-3. **Start it:**
+3. **Build and start it:**
    ```sh
-   docker compose up          # pulls the prebuilt image; no build, no toolchain
+   docker compose build       # first build is slow — it downloads + bakes Mathlib
+   docker compose up          # start it (subsequent runs skip straight to here)
    ```
-   (No prebuilt image yet / offline? Run `docker compose build && docker compose up`
-   instead — the first build is slow because it bakes Mathlib.)
+   The build targets your machine's own CPU, so no arch flags are needed.
 4. **Open** http://localhost:8001 in your browser.
 5. **Add your key:** open the **Settings** pane and paste in your API key (no key
    is needed to boot). You're ready to prove.
