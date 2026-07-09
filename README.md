@@ -23,6 +23,85 @@ messages, usage, and code-step metadata; git stores proof content under the
 prover workspace. Overleaf-created formalizations go through the same adapter, so
 they appear in the standalone UI and can be opened with a `?session=<id>` link.
 
+## Quick start
+
+You supply one provider API key; everything else is provisioned for you. Get a
+key from whichever provider you'll use, then keep it handy for the last step:
+
+- **OpenAI** (default) — https://platform.openai.com/api-keys
+- **Anthropic** — https://console.anthropic.com/settings/keys
+- **Gemini** — https://aistudio.google.com/apikey
+
+Then pick one of the two paths below.
+
+### Option A — Docker (no local toolchain) ⭐ easiest
+
+Runs the whole standalone app (UI + adapter + Lean + Mathlib) from a prebuilt,
+multi-arch image. The only thing you install is Docker.
+
+1. **Install Docker Desktop** and start it: https://www.docker.com/products/docker-desktop/
+   (verify with `docker --version`).
+2. **Clone this repo and enter the app folder:**
+   ```sh
+   git clone https://github.com/darturi/UnifiedLeaEcosystem.git
+   cd UnifiedLeaEcosystem/apps/lea-standalone
+   ```
+3. **Start it:**
+   ```sh
+   docker compose up          # pulls the prebuilt image; no build, no toolchain
+   ```
+   (No prebuilt image yet / offline? Run `docker compose build && docker compose up`
+   instead — the first build is slow because it bakes Mathlib.)
+4. **Open** http://localhost:8001 in your browser.
+5. **Add your key:** open the **Settings** pane and paste in your API key (no key
+   is needed to boot). You're ready to prove.
+
+Sessions, proofs, and your saved key persist on your machine under
+`apps/lea-standalone/{data,config}`, so they survive restarts. Stop with `Ctrl+C`
+(or `docker compose down`).
+
+> Docker covers the **standalone UI** only. The Overleaf extension needs the
+> local install below (it side-loads a Chrome extension).
+
+### Option B — Local install (macOS / Linux)
+
+Needs three toolchains — **Node 22**, **[uv](https://docs.astral.sh/uv/)**, and
+the **[Lean toolchain (elan)](https://leanprover.github.io/)**. The bundled
+bootstrap installs the missing ones for you.
+
+1. **Install Node 22** if you don't have it (https://nodejs.org, or `nvm install 22`).
+   Check with `node --version`.
+2. **Clone this repo:**
+   ```sh
+   git clone https://github.com/darturi/UnifiedLeaEcosystem.git
+   cd UnifiedLeaEcosystem
+   ```
+3. **Bootstrap + provision** (installs `uv` and `elan` if absent, then sets
+   everything up). For the leanest test install, use the UI-only, no-SafeVerify
+   variant:
+   ```sh
+   ./install.sh --target ui --skip-verify
+   ```
+   Or `./install.sh` alone for the full stack (UI + Overleaf, with SafeVerify).
+   The first run downloads Mathlib and can take several minutes.
+4. **Add your key** to the root `.env` file (set `OPENAI_API_KEY=...`, or the
+   matching `ANTHROPIC_API_KEY` / `GEMINI_API_KEY`) — or skip this and paste it
+   into the app's Settings pane after it starts.
+5. **Start the app:**
+   ```sh
+   ./start-dev.sh
+   ```
+   Then open http://localhost:5173. Stop everything with `Ctrl+C`.
+
+Already have Node, `uv`, and `elan`? You can skip `install.sh` and run
+`npm run setup` directly (see [Setup](#setup)) — it runs a **preflight check**
+first and prints exact install commands for anything missing.
+
+> `--target ui --skip-verify` is the leanest install: it skips the Overleaf side
+> and the second Mathlib download that SafeVerify's `/verify` audit needs (the
+> audit then reports "unavailable"; nothing else is affected). Run
+> `npm run doctor` any time to health-check the install.
+
 ## Setup
 
 Run setup from the monorepo root:
@@ -31,15 +110,16 @@ Run setup from the monorepo root:
 npm run setup
 ```
 
-This installs workspace Node dependencies, writes root `.env` defaults, builds
-the standalone adapter/prover Python environments, refreshes the Lean/Mathlib
-cache, and writes Overleaf companion settings.
+This checks prerequisites, installs workspace Node dependencies, writes root
+`.env` defaults, builds the standalone adapter/prover Python environments,
+refreshes the Lean/Mathlib cache, and writes Overleaf companion settings.
 
-To provision only one side:
+To provision only one side, or trim the install:
 
 ```sh
-npm run setup -- --target ui
-npm run setup -- --target overleaf
+npm run setup -- --target ui       # standalone UI only
+npm run setup -- --target overleaf # Overleaf companion only
+npm run setup -- --skip-verify     # skip SafeVerify (second Mathlib build)
 ```
 
 To refresh Lean dependencies and the Mathlib cache:

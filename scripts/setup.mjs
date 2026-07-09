@@ -4,6 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { MONOREPO_ROOT, ROOT_ENV_PATH, patchEnvFile, readDotEnv } from "./env.mjs";
+import { preflight } from "./preflight.mjs";
 
 // Unified monorepo setup.
 //
@@ -41,6 +42,13 @@ await main();
 async function main() {
   console.log(`Lea ecosystem setup (${options.target})\n`);
 
+  // Fail fast with actionable install hints if a toolchain is missing, before
+  // any long-running step shells out to it. Skippable for CI/containers where
+  // the environment is known-good.
+  if (!options.skipPreflight) {
+    preflight({ exitOnFailure: true });
+  }
+
   await installNodeDependencies();
   await writeRootEnv();
   await setupStandaloneBackend();
@@ -50,6 +58,10 @@ async function main() {
   }
 
   console.log("\nSetup complete.");
+  if (options.skipVerify) {
+    console.log("(SafeVerify was skipped — the `/verify` kernel audit will report 'unavailable'.");
+    console.log(" Re-run `npm run setup` without --skip-verify to enable it.)");
+  }
   console.log("Next steps:");
   console.log("1. Put your provider API key in the monorepo root .env (or the app's Settings).");
   console.log("2. Run `npm run doctor` from the monorepo root.");
@@ -71,7 +83,12 @@ async function setupStandaloneBackend() {
     await run("lake", ["update"], { cwd: LEA_WORKSPACE });
   }
   console.log("Setting up the standalone Lea backend (adapter + prover + Lean cache)...");
-  await run("npm", ["run", "setup:api", "-w", "apps/lea-standalone"], { cwd: MONOREPO_ROOT });
+  // `--` forwards flags through npm to setup-api.mjs. --skip-verify omits the
+  // SafeVerify build + its Mathlib download (the `/verify` audit degrades to
+  // "unavailable"), roughly halving setup time/disk for quick test installs.
+  const apiArgs = ["run", "setup:api", "-w", "apps/lea-standalone"];
+  if (options.skipVerify) apiArgs.push("--", "--skip-verify");
+  await run("npm", apiArgs, { cwd: MONOREPO_ROOT });
 }
 
 async function writeRootEnv() {
@@ -115,12 +132,22 @@ function parseArgs(args) {
   const parsed = {
     target: "all",
     refreshLeanDeps: false,
+    skipVerify: false,
+    skipPreflight: false,
   };
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--refresh-lean-deps") {
       parsed.refreshLeanDeps = true;
+      continue;
+    }
+    if (arg === "--skip-verify") {
+      parsed.skipVerify = true;
+      continue;
+    }
+    if (arg === "--skip-preflight") {
+      parsed.skipPreflight = true;
       continue;
     }
     if (arg === "--target") {
@@ -151,7 +178,7 @@ function usage(error) {
   if (error) {
     console.error(`[setup] ${error}\n`);
   }
-  console.error(`Usage: node ${path.relative(MONOREPO_ROOT, path.join(SCRIPT_DIR, "setup.mjs"))} [--target all|ui|overleaf] [--refresh-lean-deps]`);
+  console.error(`Usage: node ${path.relative(MONOREPO_ROOT, path.join(SCRIPT_DIR, "setup.mjs"))} [--target all|ui|overleaf] [--refresh-lean-deps] [--skip-verify] [--skip-preflight]`);
   process.exit(error ? 1 : 0);
 }
 
