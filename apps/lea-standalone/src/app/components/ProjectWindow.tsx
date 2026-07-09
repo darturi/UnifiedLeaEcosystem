@@ -162,8 +162,8 @@ export function ProjectWindow({
 }
 
 function sessionDotClass(status: SessionStatus | string): string {
-  if (status === 'ok' || status === 'proved') return 'ok';
+  if (status === 'ok' || status === 'proved' || status === 'defined') return 'ok';
   if (status === 'error') return 'fail';
-  if (status === 'running' || status === 'disproved' || status === 'needs_review') return 'run';
+  if (status === 'running' || status === 'disproved') return 'run';
   return 'idle';
 }

@@ -221,6 +221,49 @@ environment-based marker does (which still shows up, just marked
 not-formalizable) -- see `docs/PLAN-overleaf-inline-lea-tags.md` for why,
 and treat this as a known gap rather than a Lean-pane bug if you hit it.
 
+### Code-block form: a statement typeset as a Lean listing
+
+`leacode` is a code-block variant of the tags above. Its body is typeset
+verbatim as a Lean code listing (via the `listings` package) instead of as
+prose, and that same code is sent to Lea verbatim as the target's statement
+text — it flows through the pipeline **exactly** like every other target, the
+only difference being how it renders in the PDF:
+
+```tex
+\begin{leacode}{label=add_zero, uses={my_lemma}, context={Use simp.}}
+theorem add_zero (n : Nat) : n + 0 = n := by simp
+\end{leacode}
+```
+
+Because `listings` reads the body verbatim, Lean's own catcode-hostile
+characters (`_`, `\`, `{`, `}`, `->`, …) survive untouched — which is why this
+is an environment rather than a braced macro argument. The single required
+argument is the usual metadata argument (`label`/`uses`/`context`/`kind`), read
+but never typeset. `kind=` is honored exactly as the generic `\lea{...}` command
+honors it (default: `theorem`).
+
+Detection specifics (`targetParserCore.mjs`):
+
+- `leacode` is registered as a verbatim-like environment, so its interior is
+  masked out of the comment/tag/environment scanners (a `\begin{theorem}` or
+  `% lea:` sitting *inside* the listed code is never a false marker). A
+  dedicated scanner, `findLeaCodeEnvironments`, then reads the **raw** source to
+  recover the block, skipping any `leacode` that appears inside *another*
+  verbatim-like block (a documentation example).
+- It produces the same synthetic-environment target shape a standalone tag does,
+  with `syntax: "leacode"` and `latexEnvironment: "leacode"`. Downstream
+  (companion prompt, adapter, staleness hashing, Lean pane) is unchanged — a
+  `leacode` theorem is indistinguishable from a `\leatheorem` one.
+- A missing `\usepackage{lea-tags}` (or inline `\lstnewenvironment{leacode}`)
+  triggers the same `tag_package_not_loaded` diagnostic the tag commands do.
+
+Note: because the body is passed through as-is, an author writing genuine Lean
+here is handing Lea already-formal code under the normal "formalize this
+statement" prompt. In practice Lea uses the Lean it is given; a future prompt
+variant could acknowledge the code is already Lean, but that is deliberately
+**not** part of this form — keeping the path identical to every other target is
+the whole point.
+
 ### Shorthand environment (not yet implemented)
 
 For authors who don't already use `amsthm`, a sugar environment could wrap

@@ -5,6 +5,9 @@ const MODEL_FAMILY_LABELS = {
   google: "Google AI",
   anthropic: "Anthropic"
 };
+// Placeholder only, used before the first successful /settings fetch; the
+// companion (backed by packages/lea-model-catalog) is authoritative. Keep in
+// sync with the catalog default and content.js (AUDIT L9).
 const DEFAULT_LEA_MODEL = "o4-mini";
 const DEFAULT_MODEL_OPTIONS = [
   { value: DEFAULT_LEA_MODEL, label: DEFAULT_LEA_MODEL, family: "openai" }
@@ -202,16 +205,18 @@ function clearProviderKeyInputs() {
 }
 
 // Paste-into-preamble alternative to \usepackage{lea-tags}, for users who
-// don't want to add a second project file. Must define the same commands as
-// extension/assets/lea-tags.sty (kept in sync by hand -- six short lines).
+// don't want to add a second project file. Must define the same commands and
+// environments as extension/assets/lea-tags.sty (kept in sync by hand).
 const LEA_TAGS_PREAMBLE_SNIPPET = [
   "\\RequirePackage{xparse}",
+  "\\RequirePackage{listings}",
   "\\NewDocumentCommand{\\lea}{m g}{\\IfValueT{#2}{#2}}",
   "\\NewDocumentCommand{\\leatheorem}{m g}{\\IfValueT{#2}{#2}}",
   "\\NewDocumentCommand{\\lealemma}{m g}{\\IfValueT{#2}{#2}}",
   "\\NewDocumentCommand{\\leaproposition}{m g}{\\IfValueT{#2}{#2}}",
   "\\NewDocumentCommand{\\leacorollary}{m g}{\\IfValueT{#2}{#2}}",
-  "\\NewDocumentCommand{\\leadefinition}{m g}{\\IfValueT{#2}{#2}}"
+  "\\NewDocumentCommand{\\leadefinition}{m g}{\\IfValueT{#2}{#2}}",
+  "\\lstnewenvironment{leacode}[1]{\\lstset{basicstyle=\\ttfamily\\small,breaklines=true,columns=fullflexible,keepspaces=true,showstringspaces=false,frame=none}}{}"
 ].join("\n");
 
 const leaTagsCopySnippetButton = document.querySelector("#lea-tags-copy-snippet");

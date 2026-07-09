@@ -102,6 +102,9 @@ def test_compose_context_message(tmp_path, monkeypatch):
     assert msg["role"] == "user"
     assert msg["content"].startswith(projects.CONTEXT_MARKER)
     assert "Lea.Eps" in msg["content"]
+    assert "project title is a human-facing display name" in msg["content"]
+    assert "namespace `Lea.Eps` is authoritative" in msg["content"]
+    assert "Do not derive a namespace from the display name" in msg["content"]
     assert "Prove continuity." in msg["content"]
     assert "`.lea/files/paper.txt`" in msg["content"]  # inventory line
     # D26: the agent is told, concretely, to keep memory.md current with edit_file.

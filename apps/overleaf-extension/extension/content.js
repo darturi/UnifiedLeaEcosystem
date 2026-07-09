@@ -1,6 +1,9 @@
 (function () {
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
   const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
+  // Placeholder only, used before the first successful /settings fetch; the
+  // companion (backed by packages/lea-model-catalog) is authoritative and may
+  // re-map it. Keep in sync with the catalog default and options.js (AUDIT L9).
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
@@ -8,6 +11,18 @@
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
+  const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
+  const DEFAULT_LEAN_PANE_WIDTH_PX = 520;
+  const MIN_LEAN_PANE_WIDTH_PX = 360;
+  const LEAN_PANE_VIEWPORT_GUTTER_PX = 24;
+  const LEAN_PANE_KEYBOARD_STEP_PX = 24;
+  const LEAN_PANE_KEYBOARD_LARGE_STEP_PX = 80;
+  // Short debounce for an edit-triggered status refresh; a much longer cadence
+  // for the in-progress self-poll so an active run doesn't hammer /statuses
+  // (each hit does per-target FS scans + adapter fetches) four times a second
+  // (AUDIT M4).
+  const STATUS_REFRESH_DEBOUNCE_MS = 250;
+  const STATUS_REFRESH_IN_PROGRESS_MS = 3000;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -38,6 +53,10 @@
   let leanPane = null;
   let leanPaneBody = null;
   let leanPaneStatus = null;
+  let leanPaneProjectTitle = null;
+  let leanPaneProjectNamespace = null;
+  let leanPaneWidthPx = DEFAULT_LEAN_PANE_WIDTH_PX;
+  let leanPaneResizeState = null;
   let leanPaneRefreshTimer = null;
   let leanPanePollTimer = null;
   let leanPaneView = null;
@@ -46,6 +65,7 @@
   let leanPaneExpandedItemIds = new Set();
   let leanPaneHighlightTimer = null;
   let lastLeanPaneManifest = null;
+  let lastProjectIdentity = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
   // Share panel (D34): remote + push against the adapter's project repo, via the
@@ -68,6 +88,11 @@
   let leanPaneChatOptimistic = [];
   let leanPaneChatPollTimer = null;
   let leanPaneChatToken = 0;
+  // Consecutive transient poll failures (AUDIT M2): a thrown fetch used to stop
+  // polling entirely, freezing the panel on "Lea is working…". We now retry
+  // with backoff up to this cap before giving up and surfacing the error.
+  let leanPaneChatPollFailures = 0;
+  const LEAN_PANE_CHAT_POLL_MAX_FAILURES = 5;
   // Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md): at most one
   // item's edit view is open at a time, tracked by item id the same way
   // leanPaneExpandedItemIds tracks expansion -- module state survives the
@@ -87,6 +112,9 @@
   // "batch" (PLAN-self-repair-stale-offers Fix 4 -- a global string rendered
   // under every broken item was itself a member of the stale-copy class).
   let leanPaneRepairError = null;
+  // At most one item-card overflow ("More actions") menu is open at a time;
+  // the same global click/Escape listeners that dismiss popovers close it.
+  let activeOverflowMenu = null;
   let costCapNotice = null;
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
@@ -133,9 +161,14 @@
   requestTargetsSoon();
   renderSettingsButton();
   renderLeanPaneButton();
+  hydrateLeanPaneWidthFromStorage();
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (activeOverflowMenu) {
+      closeActiveOverflowMenu();
+      return;
+    }
     if (activePopover) {
       closePopover();
       return;
@@ -144,15 +177,30 @@
   });
 
   document.addEventListener("click", (event) => {
+    if (activeOverflowMenu && !activeOverflowMenu.wrap.contains(event.target)) {
+      closeActiveOverflowMenu();
+    }
     if (activePopover && !activePopover.contains(event.target)) {
       closePopover();
     }
   });
 
-  window.addEventListener("resize", renderStatusBadges);
-  window.addEventListener("scroll", () => {
-    requestTargets();
+  window.addEventListener("resize", () => {
     renderStatusBadges();
+    clampOpenLeanPaneToViewport();
+  });
+  // Capture-phase scroll fires very frequently; coalesce to one update per
+  // animation frame (AUDIT M4) instead of re-parsing the whole document and
+  // re-laying out every badge on every scroll tick.
+  let scrollRafPending = false;
+  window.addEventListener("scroll", () => {
+    if (scrollRafPending) return;
+    scrollRafPending = true;
+    requestAnimationFrame(() => {
+      scrollRafPending = false;
+      requestTargets();
+      renderStatusBadges();
+    });
   }, true);
 
   function renderSettingsButton() {
@@ -204,35 +252,59 @@
     leanPane.setAttribute("role", "complementary");
     leanPane.setAttribute("aria-label", "Lean project pane");
     leanPane.tabIndex = -1;
+    applyLeanPaneWidth();
+
+    const resizer = document.createElement("button");
+    resizer.type = "button";
+    resizer.className = "ol-lean-project-pane-resizer";
+    resizer.setAttribute("role", "separator");
+    resizer.setAttribute("aria-orientation", "vertical");
+    resizer.setAttribute("aria-label", "Resize Lean pane");
+    resizer.title = "Resize Lean pane";
+    resizer.tabIndex = 0;
+    resizer.addEventListener("pointerdown", startLeanPaneResize);
+    resizer.addEventListener("mousedown", startLeanPaneResize);
+    resizer.addEventListener("keydown", handleLeanPaneResizeKeydown);
 
     const header = document.createElement("div");
     header.className = "ol-lean-project-pane-header";
     const titleWrap = document.createElement("div");
+    const paneLabel = document.createElement("span");
+    paneLabel.className = "ol-lean-sr-only";
+    paneLabel.textContent = "Lean pane";
     const kicker = document.createElement("p");
     kicker.className = "ol-lean-project-pane-kicker";
     kicker.textContent = "Project preview";
     const title = document.createElement("h2");
     title.textContent = "Lean pane";
+    leanPaneProjectTitle = title;
+    leanPaneProjectNamespace = document.createElement("p");
+    leanPaneProjectNamespace.className = "ol-lean-project-pane-namespace";
+    leanPaneProjectNamespace.textContent = "Lean namespace: --";
+    titleWrap.appendChild(paneLabel);
     titleWrap.appendChild(kicker);
     titleWrap.appendChild(title);
+    titleWrap.appendChild(leanPaneProjectNamespace);
 
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-pane-controls";
-    const exportButton = document.createElement("button");
-    exportButton.type = "button";
-    exportButton.className = "ol-lean-pane-action";
-    exportButton.title = "Download the Lean project as a zip";
-    exportButton.textContent = "Export";
-    exportButton.addEventListener("click", () => {
-      exportLeanProject(exportButton).catch(renderLeanPaneError);
-    });
+    // Export lives inside the Share panel (one header entry for everything
+    // that moves the project off this page: zip download + GitHub push).
     const shareButton = document.createElement("button");
     shareButton.type = "button";
     shareButton.className = "ol-lean-pane-action";
-    shareButton.title = "Share the Lean project to GitHub";
+    shareButton.title = "Share or export the Lean project";
     shareButton.textContent = "Share";
     shareButton.addEventListener("click", () => {
       toggleSharePanel().catch(renderLeanPaneError);
+    });
+    const renameButton = document.createElement("button");
+    renameButton.type = "button";
+    renameButton.className = "ol-lean-pane-action";
+    renameButton.title = "Edit project name";
+    renameButton.textContent = "Rename";
+    renameButton.addEventListener("click", () => {
+      openProjectIdentityEditor({ source: "lean-pane" }).catch(renderLeanPaneError);
     });
     const refresh = document.createElement("button");
     refresh.type = "button";
@@ -250,8 +322,8 @@
     close.setAttribute("aria-label", "Close Lean pane");
     close.textContent = "x";
     close.addEventListener("click", closeLeanPane);
-    controls.appendChild(exportButton);
     controls.appendChild(shareButton);
+    controls.appendChild(renameButton);
     controls.appendChild(refresh);
     controls.appendChild(close);
     header.appendChild(titleWrap);
@@ -262,6 +334,7 @@
     leanPaneBody = document.createElement("div");
     leanPaneBody.className = "ol-lean-project-pane-body";
 
+    leanPane.appendChild(resizer);
     leanPane.appendChild(header);
     leanPane.appendChild(leanPaneStatus);
     leanPane.appendChild(leanPaneBody);
@@ -279,7 +352,9 @@
     leanPanePollTimer = null;
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
+    stopLeanPaneResize({ persist: false });
     closeLeanPaneChat();
+    closeActiveOverflowMenu();
     leanPaneSharePanel = null;
     leanPaneShareState = null;
     leanPaneShareBusy = false;
@@ -288,8 +363,127 @@
     leanPane = null;
     leanPaneBody = null;
     leanPaneStatus = null;
+    leanPaneProjectTitle = null;
+    leanPaneProjectNamespace = null;
     leanPaneExpandedTreeNodeIds = new Set();
     leanPaneTreeDefaultsKey = "";
+  }
+
+  function hydrateLeanPaneWidthFromStorage() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.get({ [LEAN_PANE_WIDTH_STORAGE_KEY]: DEFAULT_LEAN_PANE_WIDTH_PX })
+      .then((settings) => {
+        leanPaneWidthPx = clampLeanPaneWidth(settings?.[LEAN_PANE_WIDTH_STORAGE_KEY]);
+        applyLeanPaneWidth();
+      })
+      .catch(() => {
+        leanPaneWidthPx = clampLeanPaneWidth(DEFAULT_LEAN_PANE_WIDTH_PX);
+        applyLeanPaneWidth();
+      });
+  }
+
+  function maxLeanPaneWidthPx() {
+    const viewportWidth = Number(window.innerWidth) || DEFAULT_LEAN_PANE_WIDTH_PX + LEAN_PANE_VIEWPORT_GUTTER_PX;
+    return Math.max(MIN_LEAN_PANE_WIDTH_PX, viewportWidth - LEAN_PANE_VIEWPORT_GUTTER_PX);
+  }
+
+  function clampLeanPaneWidth(width) {
+    const numeric = Number.parseInt(String(width), 10);
+    const fallback = Number.isFinite(numeric) ? numeric : DEFAULT_LEAN_PANE_WIDTH_PX;
+    return Math.min(Math.max(fallback, MIN_LEAN_PANE_WIDTH_PX), maxLeanPaneWidthPx());
+  }
+
+  function applyLeanPaneWidth(width = leanPaneWidthPx) {
+    leanPaneWidthPx = clampLeanPaneWidth(width);
+    if (leanPane) {
+      leanPane.style.setProperty("--ol-lean-pane-width", `${leanPaneWidthPx}px`);
+    }
+    return leanPaneWidthPx;
+  }
+
+  function persistLeanPaneWidth() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.set({ [LEAN_PANE_WIDTH_STORAGE_KEY]: leanPaneWidthPx }).catch(() => {});
+  }
+
+  function clampOpenLeanPaneToViewport() {
+    const nextWidth = clampLeanPaneWidth(leanPaneWidthPx);
+    if (nextWidth === leanPaneWidthPx) return;
+    applyLeanPaneWidth(nextWidth);
+    persistLeanPaneWidth();
+  }
+
+  function startLeanPaneResize(event) {
+    if (!leanPane || leanPaneResizeState) return;
+    if (event.type === "mousedown" && event.button !== undefined && event.button !== 0) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    leanPaneResizeState = {
+      startClientX: Number(event.clientX) || 0,
+      startWidth: leanPaneWidthPx,
+      pointerId: event.pointerId,
+      usingPointer: event.type === "pointerdown"
+    };
+    leanPane.classList.add("ol-lean-project-pane-resizing");
+    document.body?.classList?.add("ol-lean-pane-resizing");
+    if (leanPaneResizeState.usingPointer) {
+      document.addEventListener("pointermove", handleLeanPaneResizeMove, true);
+      document.addEventListener("pointerup", finishLeanPaneResize, true);
+      document.addEventListener("pointercancel", cancelLeanPaneResize, true);
+    } else {
+      document.addEventListener("mousemove", handleLeanPaneResizeMove, true);
+      document.addEventListener("mouseup", finishLeanPaneResize, true);
+    }
+  }
+
+  function handleLeanPaneResizeMove(event) {
+    if (!leanPaneResizeState) return;
+    if (leanPaneResizeState.pointerId !== undefined && event.pointerId !== undefined && event.pointerId !== leanPaneResizeState.pointerId) return;
+    event.preventDefault?.();
+    const currentClientX = Number(event.clientX) || 0;
+    const delta = leanPaneResizeState.startClientX - currentClientX;
+    applyLeanPaneWidth(leanPaneResizeState.startWidth + delta);
+  }
+
+  function finishLeanPaneResize(event) {
+    event?.preventDefault?.();
+    stopLeanPaneResize({ persist: true });
+  }
+
+  function cancelLeanPaneResize(event) {
+    event?.preventDefault?.();
+    stopLeanPaneResize({ persist: false });
+  }
+
+  function stopLeanPaneResize({ persist }) {
+    if (!leanPaneResizeState) return;
+    const usingPointer = leanPaneResizeState.usingPointer;
+    leanPaneResizeState = null;
+    if (usingPointer) {
+      document.removeEventListener?.("pointermove", handleLeanPaneResizeMove, true);
+      document.removeEventListener?.("pointerup", finishLeanPaneResize, true);
+      document.removeEventListener?.("pointercancel", cancelLeanPaneResize, true);
+    } else {
+      document.removeEventListener?.("mousemove", handleLeanPaneResizeMove, true);
+      document.removeEventListener?.("mouseup", finishLeanPaneResize, true);
+    }
+    leanPane?.classList.remove("ol-lean-project-pane-resizing");
+    document.body?.classList?.remove("ol-lean-pane-resizing");
+    if (persist) persistLeanPaneWidth();
+  }
+
+  function handleLeanPaneResizeKeydown(event) {
+    let nextWidth = null;
+    const step = event.shiftKey ? LEAN_PANE_KEYBOARD_LARGE_STEP_PX : LEAN_PANE_KEYBOARD_STEP_PX;
+    if (event.key === "ArrowLeft") nextWidth = leanPaneWidthPx + step;
+    else if (event.key === "ArrowRight") nextWidth = leanPaneWidthPx - step;
+    else if (event.key === "Home") nextWidth = MIN_LEAN_PANE_WIDTH_PX;
+    else if (event.key === "End") nextWidth = maxLeanPaneWidthPx();
+    if (nextWidth === null) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    applyLeanPaneWidth(nextWidth);
+    persistLeanPaneWidth();
   }
 
   // ── Export & GitHub sharing (D34) ──────────────────────────────────────────
@@ -355,6 +549,9 @@
         <button type="button" class="ol-lean-provider-key-button" data-role="share-save">Save remote</button>
         <button type="button" class="ol-lean-save-button" data-role="share-push">Push to GitHub</button>
       </div>
+      <div class="ol-lean-share-actions">
+        <button type="button" class="ol-lean-provider-key-button" data-role="share-export" title="Download the Lean project as a zip">Download .zip</button>
+      </div>
       <p class="ol-lean-share-hint" data-role="share-hint" hidden></p>
       <p class="ol-lean-share-status" role="status" data-role="share-status">Loading share status...</p>
     `;
@@ -368,6 +565,10 @@
     });
     panel.querySelector("[data-role='share-push']").addEventListener("click", () => {
       pushShareRemote().catch((error) => setShareStatus(errorText(error)));
+    });
+    const exportButton = panel.querySelector("[data-role='share-export']");
+    exportButton?.addEventListener("click", () => {
+      exportLeanProject(exportButton).catch((error) => setShareStatus(errorText(error)));
     });
 
     try {
@@ -525,6 +726,11 @@
     const files = await getLeanPaneProjectFiles({ projectId, forceFetch });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    try {
+      const identity = await loadProjectIdentity({ baseUrl, projectId });
+      lastProjectIdentity = identity;
+      renderLeanPaneProjectIdentity(identity);
+    } catch {}
     const response = await fetch(`${baseUrl}/lean-pane/manifest`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -614,6 +820,134 @@
     leanPaneBody.scrollTop = prevScrollTop;
   }
 
+  function renderLeanPaneProjectIdentity(identity) {
+    if (!leanPaneProjectTitle || !leanPaneProjectNamespace) return;
+    const fallback = guessProjectName(lastLeanPaneFiles || []);
+    leanPaneProjectTitle.textContent = identity?.projectName || fallback;
+    leanPaneProjectNamespace.textContent = `Lean namespace: ${identity?.namespace || "--"}`;
+  }
+
+  async function loadProjectIdentity({ baseUrl, projectId }) {
+    const response = await fetch(`${baseUrl}/project/identity?overleafProjectId=${encodeURIComponent(projectId)}`);
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    return payload.identity || null;
+  }
+
+  async function previewProjectIdentity({ baseUrl, projectId, projectName, namespace = "", excludeProjectId = "" }) {
+    const response = await fetch(`${baseUrl}/project/identity/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overleafProjectId: projectId, projectName, namespace, excludeProjectId })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    return payload;
+  }
+
+  async function saveProjectIdentity({ baseUrl, projectId, projectName, mode, namespace = "", expectedNamespace = "", createIfMissing = false }) {
+    const response = await fetch(`${baseUrl}/project/identity`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ overleafProjectId: projectId, projectName, mode, namespace, expectedNamespace, createIfMissing })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+    return payload;
+  }
+
+  function guessProjectName(files = []) {
+    for (const file of files || []) {
+      const match = String(file?.content || "").match(/\\title\s*\{([^}]*)\}/);
+      if (match?.[1]?.trim()) return match[1].trim();
+    }
+    const title = String(document.title || "").replace(/\s*-\s*Overleaf\s*$/i, "").trim();
+    return title || "Overleaf Project";
+  }
+
+  function renderProjectIdentityFeedback({ source = "lean-pane", popover = null, message = "", kind = "info" } = {}) {
+    const text = String(message || "");
+    if (source === "lean-pane" && leanPaneStatus) {
+      leanPaneStatus.textContent = text;
+    }
+    const projectMessage = popover?.querySelector("[data-role='project-message']");
+    if (projectMessage) {
+      projectMessage.textContent = text;
+      projectMessage.dataset.kind = text ? kind : "";
+    }
+  }
+
+  async function openProjectIdentityEditor({ source = "lean-pane", popover = null } = {}) {
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const projectId = extractOverleafProjectId();
+    const identity = lastProjectIdentity || await loadProjectIdentity({ baseUrl, projectId });
+    const projectName = window.prompt("Project name", identity?.projectName || guessProjectName(lastLeanPaneFiles || []));
+    if (projectName === null) {
+      renderProjectIdentityFeedback({ source, popover });
+      return false;
+    }
+    const trimmed = projectName.trim();
+    if (!trimmed) {
+      renderProjectIdentityFeedback({ source, popover, message: "Project name is required.", kind: "error" });
+      return false;
+    }
+    let preview;
+    try {
+      preview = await previewProjectIdentity({
+        baseUrl,
+        projectId,
+        projectName: trimmed,
+        excludeProjectId: identity?.projectId || ""
+      });
+    } catch (error) {
+      renderProjectIdentityFeedback({ source, popover, message: normalizeErrorMessage(error), kind: "error" });
+      return false;
+    }
+    if (preview.available === false) {
+      renderProjectIdentityFeedback({
+        source,
+        popover,
+        message: `That namespace is already in use. Try ${preview.suggestions?.[0] || "another name"}.`,
+        kind: "error"
+      });
+      return false;
+    }
+    const existingWithProofs = Boolean(identity?.exists && identity?.hasRecordedProofs);
+    const migrate = !existingWithProofs && preview.namespace !== identity?.namespace
+      ? true
+      : window.confirm(`Change Lean namespace to ${preview.namespace}? Choose Cancel to rename the display name only.`);
+    const mode = migrate ? "rename-namespace" : "display-only";
+    let result;
+    try {
+      result = await saveProjectIdentity({
+        baseUrl,
+        projectId,
+        projectName: trimmed,
+        mode,
+        namespace: migrate ? preview.namespace : "",
+        expectedNamespace: identity?.namespace || "",
+        createIfMissing: true
+      });
+    } catch (error) {
+      renderProjectIdentityFeedback({ source, popover, message: normalizeErrorMessage(error), kind: "error" });
+      return false;
+    }
+    lastProjectIdentity = result.identity || null;
+    renderLeanPaneProjectIdentity(lastProjectIdentity);
+    if (popover) renderProjectSettingsSection(popover, lastProjectIdentity);
+    const savedNamespace = result.identity?.namespace || identity?.namespace || preview.namespace || "";
+    renderProjectIdentityFeedback({
+      source,
+      popover,
+      message: mode === "display-only" && savedNamespace
+        ? `Project name saved. Lean files still use namespace ${savedNamespace}.`
+        : "Project name and Lean namespace saved.",
+      kind: "success"
+    });
+    return true;
+  }
+
   function prepareLeanPaneTreeExpansion(manifest, tree) {
     const key = [
       itemsProjectId(manifest?.items || [])
@@ -674,10 +1008,14 @@
     count.textContent = `${node.itemCount} item${node.itemCount === 1 ? "" : "s"}`;
     row.appendChild(count);
 
-    const chip = document.createElement("span");
-    chip.className = `ol-lean-project-status ol-lean-project-tree-status ol-lean-project-status-${node.status || "unknown"}`;
-    chip.textContent = leanPaneView.formatPaneStatus(node.status || "unknown");
-    row.appendChild(chip);
+    if (node.type === "file") {
+      row.appendChild(renderLeanPaneFileProgress(node));
+    } else {
+      const chip = document.createElement("span");
+      chip.className = `ol-lean-project-status ol-lean-project-tree-status ol-lean-project-status-${node.status || "unknown"}`;
+      chip.textContent = leanPaneView.formatPaneStatus(node.status || "unknown");
+      row.appendChild(chip);
+    }
     section.appendChild(row);
 
     if (expanded) {
@@ -696,6 +1034,26 @@
       section.appendChild(children);
     }
     return section;
+  }
+
+  function renderLeanPaneFileProgress(node) {
+    const summary = node.progress || leanPaneView.summarizePaneProgress(node.items || []);
+    const progress = document.createElement("span");
+    progress.className = `ol-lean-project-progress${summary.inProgress > 0 ? " ol-lean-project-progress-in-progress" : ""}`;
+    progress.setAttribute("role", "img");
+    progress.setAttribute("aria-label", leanPaneView.formatPaneProgressLabel(node.path || node.name, summary));
+
+    for (const segment of leanPaneView.paneProgressSegments(summary)) {
+      const element = document.createElement("span");
+      element.className = `ol-lean-project-progress-segment ol-lean-project-progress-segment-${segment.id}`;
+      element.style.setProperty("width", `${segment.percent}%`);
+      element.dataset.bucket = segment.id;
+      element.dataset.count = String(segment.count);
+      element.dataset.percent = String(segment.percent);
+      element.title = segment.title;
+      progress.appendChild(element);
+    }
+    return progress;
   }
 
   function toggleLeanPaneTreeNode(id) {
@@ -758,10 +1116,7 @@
     }
 
     if (item.leanStub) {
-      const stub = document.createElement("pre");
-      stub.className = "ol-lean-project-code";
-      renderLeanPaneCode(stub, item.leanStub);
-      card.appendChild(stub);
+      card.appendChild(renderLeanCodeBlock("ol-lean-project-code", item.leanStub, "Copy stub"));
     } else {
       const missing = document.createElement("p");
       missing.className = "ol-lean-project-missing";
@@ -789,28 +1144,23 @@
 
     const editing = leanPaneEditingItemId === item.id;
 
+    // One row, three visual weights (leanPaneView.paneItemActions): a single
+    // status-derived primary, an icon rail for navigation, and an overflow
+    // menu for the rare alternatives. Copy lives on the code blocks instead.
+    const { primary, rail, overflow } = leanPaneView.paneItemActions(item, { editing });
     const actions = document.createElement("div");
     actions.className = "ol-lean-project-detail-actions";
-    actions.appendChild(renderGoToSourceButton(item));
-    if (leanPaneView.canChatPaneItem(item)) {
-      actions.appendChild(renderChatButton(item));
+    if (primary) actions.appendChild(renderPaneItemPrimaryAction(item, primary));
+    const railElement = document.createElement("div");
+    railElement.className = "ol-lean-icon-rail";
+    for (const action of rail) {
+      railElement.appendChild(renderPaneItemIconAction(item, action));
     }
-    if (leanPaneView.canFormalizePaneItem(item)) {
-      actions.appendChild(renderFormalizeButton(item));
+    if (overflow.length > 0) {
+      railElement.appendChild(renderPaneOverflowMenu(item, overflow));
     }
-    if (!editing && leanPaneView.canEditPaneItem(item)) {
-      actions.appendChild(renderEditButton(item));
-    }
-    if (!editing && leanPaneView.canRepairPaneItem(item)) {
-      actions.appendChild(renderRepairButton(item));
-    }
-    if (item.leanStub) {
-      actions.appendChild(renderCopyButton("Copy stub", item.leanStub));
-    }
-    if (item.leanArtifactContent) {
-      actions.appendChild(renderCopyButton("Copy artifact", item.leanArtifactContent));
-    }
-    if (actions.children.length > 0) detail.appendChild(actions);
+    actions.appendChild(railElement);
+    detail.appendChild(actions);
 
     if (item.breakage) {
       detail.appendChild(renderLeanPaneBreakage(item));
@@ -825,10 +1175,9 @@
     if (editing) {
       detail.appendChild(renderLeanPaneEditControls(item));
     } else if (item.leanArtifactContent) {
-      const artifact = document.createElement("pre");
-      artifact.className = "ol-lean-project-artifact";
-      renderLeanPaneCode(artifact, item.leanArtifactContent);
-      detail.appendChild(artifact);
+      detail.appendChild(
+        renderLeanCodeBlock("ol-lean-project-artifact", item.leanArtifactContent, "Copy artifact")
+      );
     } else {
       const empty = document.createElement("p");
       empty.className = "ol-lean-project-missing";
@@ -843,26 +1192,12 @@
     return detail;
   }
 
-  // Manual edit entry point on a pane item (docs/FEATURE-overleaf-lean-pane-manual-edit.md).
-  function renderEditButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-edit-button";
-    button.textContent = "Edit";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      openLeanPaneEdit(item);
-    });
-    return button;
-  }
-
   // --- Self-repair actions (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
 
   function renderRepairButton(item) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-repair-button";
+    button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-repair-button";
     button.textContent = "Repair with Lea";
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -871,8 +1206,7 @@
       const target = leanPaneView.paneItemToEditTarget(item, projectId);
       requestRepair({
         overleafProjectId: projectId,
-        items: [{ targetKind: target.targetKind, targetLabel: target.targetLabel }],
-        breakage: item.breakage
+        items: [{ targetKind: target.targetKind, targetLabel: target.targetLabel }]
       });
     });
     return button;
@@ -907,28 +1241,9 @@
     return container;
   }
 
-  // The configured model's display label, for the repair confirmation ("which
-  // agent will do it"). Best-effort: a missing label falls back to generic
-  // copy inside formatRepairConfirmation.
-  async function bestEffortModelLabel() {
-    try {
-      const stored = await getSettings();
-      const model = String(stored.leaModel || "");
-      const options = Array.isArray(stored.leaModelOptions) ? stored.leaModelOptions : [];
-      const found = options.find((option) => (option.value || option.id) === model);
-      return found?.label || model;
-    } catch {
-      return "";
-    }
-  }
-
-  // One confirmation, then dispatch: a single item goes through
-  // /lean-pane/repair/start; several go through the topologically ordered
-  // batch (/lean-pane/repair/all). Nothing runs without the confirm.
-  async function requestRepair({ overleafProjectId, items, breakage }) {
-    const modelLabel = await bestEffortModelLabel();
-    const text = leanPaneView.formatRepairConfirmation({ items, breakage, modelLabel });
-    if (!window.confirm(text)) return;
+  // Dispatch: a single item goes through /lean-pane/repair/start; several go
+  // through the topologically ordered batch (/lean-pane/repair/all).
+  async function requestRepair({ overleafProjectId, items }) {
     leanPaneRepairError = null;
     const errorKey = items.length === 1 ? items[0].targetLabel : "batch";
     try {
@@ -1111,12 +1426,36 @@
       container.appendChild(note);
     }
 
+    // Overlay editor: the textarea stays the real input, but its text is
+    // transparent (caret excepted); the visible text is the same regex-highlighted
+    // rendering the read view uses (renderLeanPaneCode), in a backdrop layer kept
+    // in sync on input/scroll. Both layers share identical font/padding/wrapping
+    // so the glyphs line up exactly.
+    const editor = document.createElement("div");
+    editor.className = "ol-lean-project-edit-editor";
+
+    const highlightLayer = document.createElement("pre");
+    highlightLayer.className = "ol-lean-project-edit-highlight";
+    highlightLayer.setAttribute("aria-hidden", "true");
+    editor.appendChild(highlightLayer);
+
     const textarea = document.createElement("textarea");
     textarea.className = "ol-lean-project-edit-textarea";
     textarea.value = leanPaneEditDraft;
     textarea.spellcheck = false;
     textarea.setAttribute("aria-label", `Edit Lean source for ${item.leanDeclarationName || item.label || "this item"}`);
-    container.appendChild(textarea);
+    textarea.addEventListener("input", () => {
+      leanPaneEditDraft = textarea.value;
+      renderLeanPaneCode(highlightLayer, textarea.value);
+      highlightLayer.scrollTop = textarea.scrollTop;
+    });
+    textarea.addEventListener("scroll", () => {
+      highlightLayer.scrollTop = textarea.scrollTop;
+      highlightLayer.scrollLeft = textarea.scrollLeft;
+    });
+    editor.appendChild(textarea);
+    renderLeanPaneCode(highlightLayer, leanPaneEditDraft);
+    container.appendChild(editor);
 
     const errorLine = document.createElement("p");
     errorLine.className = "ol-lean-project-edit-error";
@@ -1262,18 +1601,9 @@
       repairAll.textContent = `Repair all (${broken.length})`;
       repairAll.addEventListener("click", () => {
         const projectId = itemsProjectId(lastLeanPaneManifest?.items || []);
-        const classification = result.ownResult?.classification || {};
         requestRepair({
           overleafProjectId: projectId,
-          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel })),
-          breakage: {
-            upstreamLabel: broken[0].brokenByUpstream?.targetLabel || (item?.leanDeclarationName ?? ""),
-            classificationKind: classification.kind,
-            renamedFrom: classification.from,
-            renamedTo: classification.to,
-            via: "edit",
-            selfBroken: false
-          }
+          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel }))
         });
       });
       actions.appendChild(repairAll);
@@ -1351,32 +1681,23 @@
 
   // Item 11: jump the Overleaf editor to this item's source block. The actual
   // scroll/select happens in pageBridge (page world) which owns the CodeMirror view.
-  function renderGoToSourceButton(item) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button";
-    button.textContent = "Go to source";
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (leanPaneStatus) {
-        leanPaneStatus.textContent = item.sourceFile
-          ? `Opening ${item.sourceFile}...`
-          : "Opening source...";
-      }
-      window.postMessage({
-        type: "OL_LEAN_NAVIGATE",
-        sourceFile: item.sourceFile || "",
-        from: item.sourceStartOffset,
-        to: item.sourceEndOffset,
-        line: item.sourceStartLine,
-        // Text anchors let pageBridge locate the block even when byte offsets have
-        // drifted (edits) or the file path can't be matched exactly.
-        leanLabel: item.label || item.leanDeclarationName || "",
-        latexLabel: item.latexLabel || ""
-      }, "*");
-    });
-    return button;
+  function goToPaneItemSource(item) {
+    if (leanPaneStatus) {
+      leanPaneStatus.textContent = item.sourceFile
+        ? `Opening ${item.sourceFile}...`
+        : "Opening source...";
+    }
+    window.postMessage({
+      type: "OL_LEAN_NAVIGATE",
+      sourceFile: item.sourceFile || "",
+      from: item.sourceStartOffset,
+      to: item.sourceEndOffset,
+      line: item.sourceStartLine,
+      // Text anchors let pageBridge locate the block even when byte offsets have
+      // drifted (edits) or the file path can't be matched exactly.
+      leanLabel: item.label || item.leanDeclarationName || "",
+      latexLabel: item.latexLabel || ""
+    }, "*");
   }
 
   // Item 12: start a formalization run for this item, reusing the same /formalize
@@ -1385,7 +1706,7 @@
   function renderFormalizeButton(item) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-formalize-button";
+    button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-formalize-button";
     button.textContent = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
     button.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -1404,19 +1725,196 @@
     return button;
   }
 
-  // Chat mirror entry point on a pane item. Opens the compact transcript scoped
-  // to this item's Lea session (creating one on first message).
-  function renderChatButton(item) {
+  // --- Item action row (leanPaneView.paneItemActions) ------------------------
+  // One primary text button, an icon rail, and an overflow menu per item card.
+
+  const PANE_ICON_SVG_ATTRS = 'viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  const PANE_ICON_SVG = {
+    "go-to-source": `<svg ${PANE_ICON_SVG_ATTRS}><circle cx="12" cy="12" r="7"></circle><line x1="12" y1="2" x2="12" y2="5"></line><line x1="12" y1="19" x2="12" y2="22"></line><line x1="2" y1="12" x2="5" y2="12"></line><line x1="19" y1="12" x2="22" y2="12"></line></svg>`,
+    chat: `<svg ${PANE_ICON_SVG_ATTRS}><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>`,
+    "view-in-lea": `<svg ${PANE_ICON_SVG_ATTRS}><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>`,
+    copy: `<svg ${PANE_ICON_SVG_ATTRS}><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`,
+    check: `<svg ${PANE_ICON_SVG_ATTRS}><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+    more: `<svg ${PANE_ICON_SVG_ATTRS}><circle cx="5" cy="12" r="1"></circle><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle></svg>`
+  };
+
+  function renderPaneItemPrimaryAction(item, action) {
+    return action.id === "repair" ? renderRepairButton(item) : renderFormalizeButton(item);
+  }
+
+  function renderPaneItemIconAction(item, action) {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = "ol-lean-secondary-button ol-lean-chat-button";
-    button.textContent = "Chat";
-    button.addEventListener("click", (event) => {
+    button.className = "ol-lean-icon-action";
+    button.title = action.label;
+    button.setAttribute("aria-label", action.label);
+    button.innerHTML = PANE_ICON_SVG[action.id] || "";
+    button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      openLeanPaneChat(item);
+      if (action.id === "go-to-source") {
+        goToPaneItemSource(item);
+        return;
+      }
+      if (action.id === "chat") {
+        openLeanPaneChat(item);
+        return;
+      }
+      if (action.id === "view-in-lea") {
+        button.disabled = true;
+        if (leanPaneStatus) leanPaneStatus.textContent = "Opening Lea session...";
+        try {
+          const { sessionOpened } = await openLeaUiForPaneItem(item);
+          if (leanPaneStatus) {
+            leanPaneStatus.textContent = sessionOpened ? "Opened Lea session." : "Opened Lea UI.";
+          }
+        } catch (error) {
+          if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+        } finally {
+          button.disabled = false;
+        }
+      }
     });
     return button;
+  }
+
+  function renderPaneOverflowMenu(item, overflowActions) {
+    const wrap = document.createElement("div");
+    wrap.className = "ol-lean-overflow";
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "ol-lean-icon-action";
+    trigger.title = "More actions";
+    trigger.setAttribute("aria-label", "More actions");
+    trigger.setAttribute("aria-haspopup", "menu");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.innerHTML = PANE_ICON_SVG.more;
+    const menu = document.createElement("div");
+    menu.className = "ol-lean-overflow-menu";
+    menu.setAttribute("role", "menu");
+    menu.hidden = true;
+    for (const action of overflowActions) {
+      const entry = document.createElement("button");
+      entry.type = "button";
+      entry.className = "ol-lean-overflow-item";
+      entry.setAttribute("role", "menuitem");
+      entry.textContent = action.label;
+      entry.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeActiveOverflowMenu();
+        runPaneOverflowAction(item, action).catch(renderLeanPaneError);
+      });
+      menu.appendChild(entry);
+    }
+    trigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const wasOpen = !menu.hidden;
+      closeActiveOverflowMenu();
+      if (!wasOpen) {
+        menu.hidden = false;
+        trigger.setAttribute("aria-expanded", "true");
+        activeOverflowMenu = { wrap, menu, trigger };
+      }
+    });
+    wrap.appendChild(trigger);
+    wrap.appendChild(menu);
+    return wrap;
+  }
+
+  function closeActiveOverflowMenu() {
+    if (!activeOverflowMenu) return;
+    activeOverflowMenu.menu.hidden = true;
+    activeOverflowMenu.trigger.setAttribute("aria-expanded", "false");
+    activeOverflowMenu = null;
+  }
+
+  // Overflow actions report through the pane status line (the menu entry is
+  // gone once the menu closes, so per-button pending text has nowhere to live).
+  // Formalize/stub reuse the same companion paths as the primary button and
+  // the in-document popover.
+  async function runPaneOverflowAction(item, action) {
+    if (action.id === "edit") {
+      openLeanPaneEdit(item);
+      return;
+    }
+    if (action.id !== "formalize" && action.id !== "stub") return;
+    if (leanPaneStatus) {
+      leanPaneStatus.textContent = action.id === "stub"
+        ? "Creating Lean stub..."
+        : "Starting formalization...";
+    }
+    try {
+      const target = leanPaneView.paneItemToFormalizeTarget(item);
+      await (action.id === "stub" ? stubTheorem(target) : formalize(target));
+      await refreshLeanPaneNow({ background: true });
+    } catch (error) {
+      if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+    }
+  }
+
+  // A highlighted Lean code block with a hover-revealed copy control in its
+  // corner -- copy belongs to the content it copies, not to the action row.
+  function renderLeanCodeBlock(className, code, copyLabel) {
+    const wrap = document.createElement("div");
+    wrap.className = "ol-lean-code-block";
+    const pre = document.createElement("pre");
+    pre.className = className;
+    renderLeanPaneCode(pre, code);
+    wrap.appendChild(pre);
+    wrap.appendChild(renderCopyIconButton(copyLabel, code));
+    return wrap;
+  }
+
+  function renderCopyIconButton(label, text) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ol-lean-icon-action ol-lean-code-copy";
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.innerHTML = PANE_ICON_SVG.copy;
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(text);
+        button.innerHTML = PANE_ICON_SVG.check;
+        button.title = "Copied";
+      } catch {
+        button.title = "Copy failed";
+      }
+      setTimeout(() => {
+        button.innerHTML = PANE_ICON_SVG.copy;
+        button.title = label;
+      }, 1500);
+    });
+    return button;
+  }
+
+  // Open this item's Lea session in the standalone UI, mirroring the popover's
+  // "View in Lea UI" action. The session is resolved through the companion's
+  // chat-session lookup (read-only: it never creates a session); when no
+  // session has been recorded yet, fall back to the Lea UI itself, matching
+  // the popover's base-link fallback.
+  async function openLeaUiForPaneItem(item) {
+    const baseUrl = await chatCompanionBaseUrl();
+    const target = leanPaneView.paneItemToChatTarget(item, itemsProjectId(lastLeanPaneManifest?.items || []));
+    const response = await fetch(`${baseUrl}/lean-pane/chat/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target })
+    });
+    const payload = await response.json().catch(() => ({}));
+    const sessionUrl = String(payload?.leaSessionUrl || "").trim();
+    if (sessionUrl) {
+      await openLeaSession({ url: sessionUrl, baseUrl: sessionUrl });
+      return { sessionOpened: true };
+    }
+    const settings = await getSettings();
+    const uiBaseUrl = String(settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL).replace(/\/+$/, "");
+    await openLeaSession({ url: uiBaseUrl, baseUrl: uiBaseUrl });
+    return { sessionOpened: false };
   }
 
   function isChatResponseActive(payload) {
@@ -1455,6 +1953,7 @@
     leanPaneChatSending = false;
     leanPaneChatError = null;
     leanPaneChatOptimistic = [];
+    leanPaneChatPollFailures = 0;
   }
 
   async function chatCompanionBaseUrl() {
@@ -1472,6 +1971,7 @@
     leanPaneChatRunId = "";
     leanPaneChatError = null;
     leanPaneChatOptimistic = [];
+    leanPaneChatPollFailures = 0;
     leanPaneChatLoading = true;
     leanPaneChatSending = false;
     ensureChatPanel();
@@ -1511,6 +2011,7 @@
     const token = leanPaneChatToken;
     leanPaneChatSending = true;
     leanPaneChatError = null;
+    leanPaneChatPollFailures = 0;
     leanPaneChatOptimistic.push({ role: "user", content: text, kind: "user" });
     if (input) input.value = "";
     renderChatPanel();
@@ -1543,20 +2044,41 @@
     }
   }
 
-  function startChatPolling() {
+  function startChatPolling(delayMs = LEAN_PANE_POLL_DELAY_MS) {
     clearTimeout(leanPaneChatPollTimer);
     leanPaneChatPollTimer = setTimeout(() => {
+      // pollChatSession handles its own transient errors; the catch is a
+      // last-resort guard against an unexpected synchronous throw.
       pollChatSession().catch(() => {});
-    }, LEAN_PANE_POLL_DELAY_MS);
+    }, delayMs);
   }
 
   async function pollChatSession() {
     if (!leanPaneChatSessionId) return;
     const token = leanPaneChatToken;
-    const baseUrl = await chatCompanionBaseUrl();
-    const response = await fetch(`${baseUrl}/lean-pane/chat/session/${encodeURIComponent(leanPaneChatSessionId)}`);
-    const payload = await response.json().catch(() => ({}));
+    let payload = null;
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/chat/session/${encodeURIComponent(leanPaneChatSessionId)}`);
+      payload = await response.json().catch(() => ({}));
+    } catch {
+      // Transient failure (companion restarting, network blip). AUDIT M2: do
+      // NOT stop polling and strand the panel on "Lea is working…" — retry
+      // with backoff up to a cap, only surfacing an error once we've truly
+      // given up.
+      if (token !== leanPaneChatToken) return;
+      leanPaneChatPollFailures += 1;
+      if (leanPaneChatPollFailures >= LEAN_PANE_CHAT_POLL_MAX_FAILURES) {
+        leanPaneChatSending = false;
+        leanPaneChatError = new Error("Lost contact with the companion while waiting for Lea. Check that it's running, then try again.");
+        renderChatPanel();
+        return;
+      }
+      startChatPolling(LEAN_PANE_POLL_DELAY_MS * (leanPaneChatPollFailures + 1));
+      return;
+    }
     if (token !== leanPaneChatToken) return;
+    leanPaneChatPollFailures = 0;
     if (payload && payload.ok) {
       leanPaneChatResponse = payload;
       leanPaneChatOptimistic = [];
@@ -1570,7 +2092,8 @@
         if (wasRunning) refreshLeanPaneNow({ background: true }).catch(() => {});
       }
     } else {
-      // Adapter unavailable mid-run: surface it and stop polling.
+      // Adapter reachable but reporting unavailable mid-run: surface it and
+      // stop polling.
       leanPaneChatSending = false;
       leanPaneChatResponse = payload;
     }
@@ -1794,18 +2317,9 @@
       repairAll.className = "ol-lean-primary-button ol-lean-repair-all-button";
       repairAll.textContent = `Repair all (${broken.length})`;
       repairAll.addEventListener("click", () => {
-        const classification = lastRunImpact.classification || {};
         requestRepair({
           overleafProjectId: leanPaneChatTarget?.overleafProjectId || itemsProjectId(lastLeanPaneManifest?.items || []),
-          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel })),
-          breakage: {
-            upstreamLabel: lastRunImpact.targetLabel || broken[0].brokenByUpstream?.targetLabel || "",
-            classificationKind: classification.kind,
-            renamedFrom: classification.from,
-            renamedTo: classification.to,
-            via: "chat",
-            selfBroken: false
-          }
+          items: broken.map((d) => ({ targetKind: "theorem", targetLabel: d.targetLabel }))
         });
       });
       container.appendChild(repairAll);
@@ -1852,24 +2366,6 @@
     if (lastIndex < line.length) {
       container.appendChild(document.createTextNode(line.slice(lastIndex)));
     }
-  }
-
-  function renderCopyButton(label, text) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ol-lean-secondary-button";
-    button.textContent = label;
-    button.addEventListener("click", async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      try {
-        await navigator.clipboard.writeText(text);
-        button.textContent = "Copied";
-      } catch {
-        button.textContent = "Copy failed";
-      }
-    });
-    return button;
   }
 
   function renderLeanPaneError(error) {
@@ -2168,6 +2664,21 @@
         <button type="button" class="ol-lean-icon-button" data-role="close" aria-label="Close Lea popover">x</button>
       </div>
       <div class="ol-lean-popover-body">
+        <section class="ol-lean-project-identity-panel" data-role="project-identity">
+          <div class="ol-lean-provider-title">Project</div>
+          <div class="ol-lean-provider-row">
+            <div class="ol-lean-provider-row-head">
+              <span data-role="project-name">Overleaf Project</span>
+              <strong data-role="project-exists">Not created</strong>
+            </div>
+            <p class="ol-lean-provider-note" data-role="project-namespace">Lean namespace: --</p>
+            <p class="ol-lean-provider-note" data-role="project-binding">Overleaf binding: --</p>
+            <p class="ol-lean-provider-note ol-lean-project-message" data-role="project-message"></p>
+            <div class="ol-lean-provider-key-controls">
+              <button type="button" class="ol-lean-provider-key-button" data-role="edit-project-name">Edit name</button>
+            </div>
+          </div>
+        </section>
         <section class="ol-lean-usage-panel" aria-live="polite">
           <div class="ol-lean-usage-row" data-usage="project">
             <div class="ol-lean-usage-row-head">
@@ -2318,6 +2829,15 @@
         githubClear.disabled = false;
       }
     });
+    popover.querySelector("[data-role='edit-project-name']").addEventListener("click", async () => {
+      status.textContent = "Updating project name...";
+      try {
+        const saved = await openProjectIdentityEditor({ source: "settings", popover });
+        if (!saved) status.textContent = "";
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : String(error);
+      }
+    });
     saveButton.addEventListener("click", async () => {
       saveButton.disabled = true;
       status.textContent = "Saving Lea settings...";
@@ -2450,6 +2970,8 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
+        projectNamespace: lastProjectIdentity?.namespace || "",
         sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
@@ -2477,6 +2999,8 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
+        projectNamespace: lastProjectIdentity?.namespace || "",
         sourceHash: await sha256(normalizeTargetText(target.targetText))
       })
     });
@@ -2496,13 +3020,13 @@
     };
   }
 
-  function scheduleStatusRefresh() {
+  function scheduleStatusRefresh(delayMs = STATUS_REFRESH_DEBOUNCE_MS) {
     clearTimeout(statusRefreshTimer);
     statusRefreshTimer = setTimeout(() => {
       refreshStatusesNow().catch((error) => {
         postStatusError(error);
       });
-    }, 250);
+    }, delayMs);
   }
 
   async function refreshStatusesNow() {
@@ -2536,7 +3060,7 @@
       if (target) updatePopoverStatus(activePopover, target);
     }
     if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
-      scheduleStatusRefresh();
+      scheduleStatusRefresh(STATUS_REFRESH_IN_PROGRESS_MS);
     }
   }
 
@@ -2888,7 +3412,14 @@
   }
 
   function buildLeaSessionUrl(baseUrl, sessionId) {
-    const url = new URL(baseUrl || DEFAULT_LEA_UI_BASE_URL);
+    // A malformed stored leaUiBaseUrl (a user typo in options) must not throw
+    // out of popover render (AUDIT L4) — fall back to the default origin.
+    let url;
+    try {
+      url = new URL(baseUrl || DEFAULT_LEA_UI_BASE_URL);
+    } catch {
+      url = new URL(DEFAULT_LEA_UI_BASE_URL);
+    }
     url.searchParams.set("session", sessionId);
     return url.toString();
   }
@@ -3007,6 +3538,26 @@
     popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     popover.dataset.savedTexMirror = String(texMirrorInput.checked);
     popover.querySelector("[data-role='save-settings']").disabled = true;
+    try {
+      const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+      lastProjectIdentity = await loadProjectIdentity({ baseUrl, projectId: extractOverleafProjectId() });
+      renderProjectSettingsSection(popover, lastProjectIdentity);
+      renderLeanPaneProjectIdentity(lastProjectIdentity);
+    } catch {
+      renderProjectSettingsSection(popover, null);
+    }
+  }
+
+  function renderProjectSettingsSection(popover, identity) {
+    const projectName = popover.querySelector("[data-role='project-name']");
+    const exists = popover.querySelector("[data-role='project-exists']");
+    const namespace = popover.querySelector("[data-role='project-namespace']");
+    const binding = popover.querySelector("[data-role='project-binding']");
+    const fallback = guessProjectName(lastLeanPaneFiles || []);
+    if (projectName) projectName.textContent = identity?.projectName || fallback;
+    if (exists) exists.textContent = identity?.exists ? "Created" : "Not created";
+    if (namespace) namespace.textContent = `Lean namespace: ${identity?.namespace || "--"}`;
+    if (binding) binding.textContent = `Overleaf binding: ${identity?.slug || extractOverleafProjectId() || "--"}`;
   }
 
   function renderGithubTokenStatus(popover, configured) {
@@ -3212,7 +3763,9 @@
         if (status) status.textContent = error instanceof Error ? error.message : String(error);
       }
       scheduleUsageRefresh(popover);
-    }, 1000);
+      // 5s, not 1s (AUDIT M4): each refresh fans out to the adapter's
+      // /api/stats; the settings popover doesn't need per-second usage.
+    }, 5000);
   }
 
   function renderUsage(popover, key, usage) {

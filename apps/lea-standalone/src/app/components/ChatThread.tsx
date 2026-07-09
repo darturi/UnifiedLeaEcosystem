@@ -241,14 +241,13 @@ export function ChatThread({
     ? { cls: 'run', text: '○ stubbed' }
     : latestRunOutcome === 'disproved' && latestProofStatus === 'proved'
     ? { cls: 'warn', text: '⊘ disproved' }
-    : (latestRunOutcome === 'proved' || latestRunOutcome === 'success') &&
+    : (latestRunOutcome === 'proved' || latestRunOutcome === 'success' || latestRunOutcome === 'needs_review') &&
         latestRunResultKind === 'defined' &&
-        latestProofStatus === 'proved'
+        (latestProofStatus === 'proved' || latestProofStatus === 'defined')
     ? { cls: 'ok', text: '✓ defined' }
-    : (latestRunOutcome === 'proved' || latestRunOutcome === 'success') && latestProofStatus === 'proved'
+    : (latestRunOutcome === 'proved' || latestRunOutcome === 'success' || latestRunOutcome === 'needs_review') &&
+        latestProofStatus === 'proved'
     ? { cls: 'ok', text: '✓ proved' }
-    : runStatus === 'needs_review' || latestRunOutcome === 'needs_review'
-    ? { cls: 'run', text: '○ review' }
     : runStatus === 'failed' || runStatus === 'max_turns'
     ? { cls: 'fail', text: '✕ unproved' }
     : runStatus === 'cancelled'
@@ -414,11 +413,11 @@ export function ChatThread({
                 {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
                 {finished && completion === 'defined' && <DefinedCard steps={steps} session={session} />}
                 {finished && completion === 'disproved' && <DisprovedCard steps={steps} session={session} />}
-                {finished && completion === 'needs_review' && <NeedsReviewCard />}
                 {finished && completion === 'stubbed' && <StubCard steps={steps} session={session} />}
                 {finished && (completion === 'failed' || completion === 'max_turns') && (
                   <FailedCard status={completion} />
                 )}
+                {finished && resultKind === 'needs_review' && <ReviewNote />}
               </Fragment>
             );
           })}
@@ -618,10 +617,10 @@ function DisprovedCard({ steps, session }: { steps: number; session?: SessionSum
   );
 }
 
-function NeedsReviewCard() {
+function ReviewNote() {
   return (
-    <div className="final stub">
-      <div className="fhead">○ Checked artifact needs review — Lea could not classify it as proof or disproof</div>
+    <div className="final review">
+      <div className="fhead">○ Review note — Lean checked this artifact, but Lea could not confirm it exactly matches the original request.</div>
     </div>
   );
 }

@@ -7,6 +7,7 @@ import {
   LEA_MODEL_OPTIONS,
   buildOverleafDocumentUrl,
   buildSettingsResponse,
+  createServer,
   ensureStartupLeaRuntime,
   handleChatInterrupt,
   handleChatMessage,
@@ -18,6 +19,9 @@ import {
   handleGithubTokenUpdate,
   handleLeanPaneManifest,
   handleMirrorTex,
+  handleProjectIdentity,
+  handleProjectIdentityPreview,
+  handleProjectIdentityUpdate,
   handleProjectExport,
   handleShareSetRemote,
   handleShareStatus,
@@ -67,6 +71,46 @@ test("startup records the derived Lea workspace without creating root Lean files
   assert.equal(await fileExists(path.join(path.dirname(state.settingsPath), "lakefile.lean")), false);
 });
 
+test("createServer recovers from a corrupt jobs.json instead of crashing (AUDIT H1)", async () => {
+  const appDir = await fs.mkdtemp(path.join(os.tmpdir(), "overleaf-lean-corrupt-"));
+  const jobsPath = path.join(appDir, "jobs.json");
+  // A truncated/torn state file — exactly what a crash mid-write could leave.
+  await fs.writeFile(jobsPath, '{ "job-1": { "status": "in_prog', "utf8");
+
+  // A complete env so startup produces no env patch and never touches the real
+  // root .env during the test.
+  const env = {
+    LEA_ROOT: path.join(appDir, "prover"),
+    LEA_API_BASE_URL: "http://127.0.0.1:8001",
+    LEA_UI_BASE_URL: "http://localhost:5173",
+    LEA_PROVIDER: "openai",
+    LEA_MODEL: "o4-mini",
+    LEA_MAX_TURNS: "20",
+    LEA_NARRATE_TOOL_STEPS: "true",
+    LEA_MAX_SPEND_USD: "5",
+    LEA_JOB_TIMEOUT_SECONDS: "900"
+  };
+
+  // The old readJson rethrew any JSON parse error, so this call would throw and
+  // the companion would refuse to boot until the file was deleted by hand.
+  const server = await createServer({
+    settingsPath: path.join(appDir, "settings.json"),
+    jobsPath,
+    chatSessionsPath: path.join(appDir, "chatSessions.json"),
+    env
+  });
+  server.close?.();
+
+  // Did not throw; jobs started from a clean slate.
+  assert.deepEqual(server.leaState.jobs, {});
+  // The corrupt bytes were preserved for forensics rather than silently lost.
+  const entries = await fs.readdir(appDir);
+  assert.ok(
+    entries.some((name) => name.startsWith("jobs.json.corrupt-")),
+    "corrupt jobs.json should be moved aside to a .corrupt-* backup"
+  );
+});
+
 test("builds Lea-compatible Overleaf project slugs and markdown paths", () => {
   const long = `9${"a".repeat(120)}`;
   assert.equal(slugProjectId("abc/123?x"), "abc_123_x");
@@ -79,6 +123,64 @@ test("builds Lea-compatible Overleaf project slugs and markdown paths", () => {
     buildLeaProjectMarkdownPath({ leaRepoPath: "/tmp/lea", overleafProjectId: "abc/123?x" }),
     path.join("/tmp/lea", "workspace", "projects", "abc_123_x.md")
   );
+});
+
+test("project identity endpoints proxy adapter state without creating on missing get", async () => {
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: await makeLeaRepo(),
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "GET") {
+        return jsonResponse(404, { detail: "No project" });
+      }
+      if (String(url).endsWith("/api/projects/namespace-preview")) {
+        return jsonResponse(200, { project_name: "Fourier Notes", namespace: "Lea.FourierNotes", available: true, suggestions: [] });
+      }
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "PUT") {
+        return jsonResponse(200, {
+          identity: {
+            projectId: "p1",
+            slug: "project-1",
+            projectName: "Fourier Notes",
+            namespace: "Lea.FourierNotes",
+            namespaceEditable: true,
+            repoPath: "proofs/Lea/FourierNotes",
+            hasRecordedProofs: false,
+            exists: true
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  });
+
+  const missing = await handleProjectIdentity({ overleafProjectId: "project-1" }, state);
+  assert.equal(missing.statusCode, 200);
+  assert.equal(missing.body.identity.exists, false);
+
+  const preview = await handleProjectIdentityPreview({ overleafProjectId: "project-1", projectName: "Fourier Notes" }, state);
+  assert.equal(preview.body.namespace, "Lea.FourierNotes");
+
+  state.jobs.old = {
+    jobId: "old",
+    jobKey: "project-1:theorem:old",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectName: "Old Name",
+    projectNamespace: "Lea.OldName"
+  };
+  const update = await handleProjectIdentityUpdate({
+    overleafProjectId: "project-1",
+    projectName: "Fourier Notes",
+    mode: "rename-namespace",
+    namespace: "Lea.FourierNotes",
+    createIfMissing: true
+  }, state);
+  assert.equal(update.body.identity.projectName, "Fourier Notes");
+  assert.equal(state.jobs.old.projectName, "Fourier Notes");
+  assert.equal(state.jobs.old.projectNamespace, "Lea.OldName");
+  assert.equal(calls.find((call) => call.options.method === "PUT").body.create_if_missing, true);
 });
 
 test("settings response includes model families and key status", async () => {
@@ -360,13 +462,28 @@ test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => 
 test("lean pane manifest surfaces a disproof as a counterexample, not a failure", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "false_claim.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, [
+    "import Mathlib",
+    "",
+    "theorem false_claim_counterexample : True := by",
+    "  trivial",
+    ""
+  ].join("\n"));
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "false_claim",
+    proofPath
+  });
   state.jobs.disproved = {
     jobId: "disproved",
     jobKey: "project-1:theorem:false_claim",
     status: "disproved",
+    finalStatus: "disproved",
+    resultKind: "disproved",
     targetKind: "theorem",
     targetLabel: "false_claim",
     declarationName: "false_claim",
+    recordedProofPath: proofPath,
     targetTextHash: "",
     leaRepoPath: leaRepo,
     leaUiBaseUrl: "http://localhost:5173",
@@ -391,13 +508,12 @@ test("lean pane manifest surfaces a disproof as a counterexample, not a failure"
   assert.equal(res.body.items[0].status, "disproved");
 });
 
-test("lean pane manifest surfaces needs_review as its own badge, not invalid (regression)", async () => {
+test("lean pane manifest surfaces needs_review metadata as unknown, not valid", async () => {
   // Reproduces the real bug: a job finished `needs_review` with no markdown
   // entry recorded (mirrors production, where markdown recording was skipped
   // entirely for this resultKind before the fix) and no other local evidence.
-  // Before the fix this fell through to the unconditional failedJob branch and
-  // showed `invalid` -- indistinguishable from actually-broken code. It must
-  // now show its own `needs-review` badge instead.
+  // It should not keep a stale valid chip or invent a first-class needs-review
+  // status without checked artifact evidence.
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   state.jobs.needsReview = {
@@ -430,15 +546,15 @@ test("lean pane manifest surfaces needs_review as its own badge, not invalid (re
   }, state);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.items[0].status, "needs-review");
+  assert.equal(res.body.items[0].status, "unknown");
 });
 
 // The terminal-outcome branches in getTheoremStatus used pairwise recency
-// guards -- and the formalized branch's guards predated needs_review, so an
-// OLDER formalized job kept shadowing a NEWER needs_review re-run: the chip
-// stayed "valid" after a re-run the prover itself flagged. Now one selection
-// picks the newest terminal job; these two tests pin both directions.
-test("lean pane manifest: a newer needs_review re-run beats an older formalized job (regression)", async () => {
+// guards, so an older formalized job could shadow a newer unconfirmed re-run:
+// the chip stayed "valid" even though the latest run produced no confirmed
+// artifact. Now one selection picks the newest terminal job; these two tests pin
+// both directions.
+test("lean pane manifest: a newer unconfirmed re-run beats an older formalized job (regression)", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   const base = {
@@ -483,7 +599,7 @@ test("lean pane manifest: a newer needs_review re-run beats an older formalized 
   }, state);
 
   assert.equal(res.statusCode, 200);
-  assert.equal(res.body.items[0].status, "needs-review");
+  assert.equal(res.body.items[0].status, "unknown");
 });
 
 test("lean pane manifest: a newer formalized re-run beats an older needs_review job", async () => {
@@ -577,6 +693,59 @@ test("lean pane manifest demotes a formalized item to stub-generated when its fi
   assert.equal(withSorry.body.items[0].status, "stub-generated");
 
   // ...and once the file is a real proof again, the chip returns to valid.
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  trivial\n");
+  const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(fixed.body.items[0].status, "valid");
+});
+
+// The same live report, one recording step earlier: the criterion's verified
+// formalize run never got a recordedProofPath (identifyLeaArtifact located
+// nothing -- the agent skipped self-registering a markdown entry), and no
+// project-markdown entry exists either. Every file-evidence source in
+// getTheoremStatus was keyed off those two records, so the stale-verdict
+// override had NOTHING to consult: a manual `sorry` edit could never demote
+// the chip, while the purely file-derived downstream scan (stubbedUpstreamOf)
+// plainly saw the sorry -- the two surfaces disagreed about the same file.
+// The direct probe now checks the project's conventional namespaced path.
+test("lean pane manifest demotes a stubbed item even when its job recorded no proof path and no markdown entry exists", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  sorry\n");
+  state.jobs.a = {
+    jobId: "a",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    finalStatus: "formalized",
+    resultKind: "proved",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    // deliberately NO recordedProofPath / moduleName -- the run was verified
+    // but nothing file-linked was ever recorded
+    lastEditCheckStatus: "ok", // the sorry edit itself compiled (warning only)
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:criterion}",
+      "% lea: formalize label=compactness_criterion",
+      "Every open cover has a finite subcover.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+
+  const withSorry = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(withSorry.statusCode, 200);
+  assert.equal(withSorry.body.items[0].status, "stub-generated");
+
+  // ...and back to valid once the proof is real again, still with no records.
   await writeLeaProjectProof(leaRepo, proofPath, "theorem compactness_criterion : True := by\n  trivial\n");
   const fixed = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
   assert.equal(fixed.body.items[0].status, "valid");
@@ -898,6 +1067,12 @@ test("records targetSyntax on the job for telemetry, defaulting to comment", asy
     // no syntax field
   }, defaultState);
   assert.equal(defaultState.jobs[defaultResult.body.jobId].targetSyntax, "comment");
+  // Snapshot NOW, at the same just-created lifecycle point the tag job will
+  // be snapshotted at -- the run continues in the background and starts
+  // mutating the job (leaSessionId, apiRunId, ...) while the second
+  // state/formalize is being set up, so a deferred snapshot races against
+  // run progress.
+  const defaultJob = { ...defaultState.jobs[defaultResult.body.jobId] };
 
   const tagState = await makeState({
     leaRepoPath: leaRepo,
@@ -912,14 +1087,13 @@ test("records targetSyntax on the job for telemetry, defaulting to comment", asy
     syntax: "tag"
   }, tagState);
   assert.equal(tagState.jobs[tagResult.body.jobId].targetSyntax, "tag");
+  const tagJob = { ...tagState.jobs[tagResult.body.jobId] };
 
   // Identity (jobKey) and every field that reaches the prompt are unaffected
   // by syntax -- a tag-sourced and comment-sourced target with the same
   // targetKind/targetLabel/targetText/targetUses/targetContext produce
   // identical jobs apart from this one telemetry field and the inputs that
   // differ by construction (jobId/timestamps/label/jobKey/hash).
-  const defaultJob = { ...defaultState.jobs[defaultResult.body.jobId] };
-  const tagJob = { ...tagState.jobs[tagResult.body.jobId] };
   for (const key of ["jobId", "jobKey", "targetLabel", "targetSyntax", "targetTextHash", "startedAt", "logPath", "absolutePath", "relativePath", "declarationName"]) {
     delete defaultJob[key];
     delete tagJob[key];
@@ -950,6 +1124,54 @@ test("lean pane manifest flags in-progress items for live polling", async () => 
         "\\begin{theorem}\\label{thm:compactness}",
         "% lea: formalize label=compactness_criterion",
         "Every open cover has a finite subcover.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "in-progress");
+  assert.equal(res.body.items[0].inProgress, true);
+});
+
+test("lean pane manifest keeps polling when an active job already has valid proof evidence", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "valid_before_valid_pane.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem valid_before_valid_pane : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "valid_before_valid_pane",
+    proofPath,
+    moduleName: "Lea.Project1.valid_before_valid_pane"
+  });
+  state.jobs.active_with_valid_file = {
+    jobId: "active_with_valid_file",
+    jobKey: "project-1:theorem:valid_before_valid_pane",
+    status: "in_progress",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetLabel: "valid_before_valid_pane",
+    declarationName: "valid_before_valid_pane",
+    leaSessionId: "sess-still-running",
+    leaUiBaseUrl: "http://localhost:5173",
+    leaRepoPath: leaRepo,
+    recordedProofPath: proofPath,
+    moduleName: "Lea.Project1.valid_before_valid_pane",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:valid-before-valid}",
+        "% lea: formalize label=valid_before_valid_pane",
+        "A theorem.",
         "\\end{theorem}"
       ].join("\n")
     }]
@@ -1368,6 +1590,103 @@ test("in-progress status links Lea UI session from leaSessionId (no recorder)", 
   assert.equal(statuses.body.statuses["theorem:in_progress_test"].leaSessionUrl, "http://localhost:5173/?session=sess-running");
 });
 
+test("active jobs stay in progress even when local proof evidence already looks formalized", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "valid_before_valid.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem valid_before_valid : True := by\n  trivial\n");
+  await writeLeaProjectMarkdown(leaRepo, "project-1", {
+    theoremName: "valid_before_valid",
+    proofPath,
+    moduleName: "Lea.Project1.valid_before_valid"
+  });
+  state.jobs.active_with_valid_file = {
+    jobId: "active_with_valid_file",
+    jobKey: "project-1:theorem:valid_before_valid",
+    status: "in_progress",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetLabel: "valid_before_valid",
+    declarationName: "valid_before_valid",
+    leaSessionId: "sess-still-running",
+    leaUiBaseUrl: "http://localhost:5173",
+    leaRepoPath: leaRepo,
+    recordedProofPath: proofPath,
+    moduleName: "Lea.Project1.valid_before_valid",
+    startedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{ targetKind: "theorem", targetLabel: "valid_before_valid", targetText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  const status = statuses.body.statuses["theorem:valid_before_valid"];
+  assert.equal(status.status, "in_progress");
+  assert.equal(status.leaSessionId, "sess-still-running");
+  assert.equal(status.leaSessionUrl, "http://localhost:5173/?session=sess-still-running");
+});
+
+test("a newer repaired job is terminal evidence: its declarationName beats the older formalize job's stale cache", async () => {
+  // Live bug: rename bookkeeping writes the item's current declarationName to
+  // its job records, but status derivation's terminal-candidate list didn't
+  // include `repaired` jobs at all. With no file evidence (no markdown entry,
+  // no conventional proof file), status fell back to the OLDER formalize job,
+  // whose stale declarationName then steered the pane's session-artifact
+  // lookup onto the newest pre-rename snapshot -- the item displayed code it
+  // had before the rename, while the editor (which reads the newest
+  // session-linked job) showed the renamed file.
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+  const base = {
+    jobKey: "project-1:theorem:renamed_after_repair",
+    overleafProjectId: "project-1",
+    projectId: "project-1",
+    projectSlug: "project-1",
+    targetLabel: "renamed_after_repair",
+    leaSessionId: "sess-repair-rename",
+    leaUiBaseUrl: "http://localhost:5173"
+  };
+  state.jobs.formalize_run = {
+    ...base,
+    jobId: "formalize_run",
+    status: "formalized",
+    declarationName: "renamed_after_repair", // stale: never refreshed by the rename
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+  state.jobs.repair_run = {
+    ...base,
+    jobId: "repair_run",
+    status: "repaired",
+    mode: "repair",
+    declarationName: "renamed_after_repair_v2", // fresh: the rename landed here
+    lastEditCheckStatus: "ok",
+    startedAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:00:01.000Z"
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{ targetKind: "theorem", targetLabel: "renamed_after_repair", targetText: "A theorem." }]
+  }, state);
+
+  assert.equal(statuses.statusCode, 200);
+  const status = statuses.body.statuses["theorem:renamed_after_repair"];
+  // a verified repair reads as formalized, from the repair job itself
+  assert.equal(status.status, "formalized");
+  assert.equal(status.jobId, "repair_run");
+  assert.equal(status.declarationName, "renamed_after_repair_v2");
+});
+
 test("statuses report saved sorry stubs", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -1567,6 +1886,102 @@ test("formalize maps an Overleaf label to the Lean artifact Lea records", async 
     assert.equal(status.declarationName, "even_square_of_even");
     assert.equal(status.recordedProofPath, proofPath);
     assert.equal(status.leanStatement, "theorem even_square_of_even : True");
+  } finally {
+    restorePath();
+  }
+});
+
+// Root of the "manual sorry edit never demoted the chip" report: a verified
+// run where the agent never self-registered a project-markdown entry recorded
+// NO recordedProofPath/moduleName on the job and NO markdown entry -- leaving
+// the target with a terminal verdict and no file link at all. The finalizer
+// must backfill both from the file evidence that IS there (here: the direct
+// probe of the project's conventional proof path).
+test("a verified run that never self-registered still records proof path, module, and markdown entry", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean");
+  const restorePath = await installFakeLake();
+  try {
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        onStatusRequest: async () => {
+          // the proof file lands on disk, but NO markdown entry is written --
+          // identifyLeaArtifact has nothing to diff
+          await writeLeaProjectProof(
+            leaRepo,
+            proofPath,
+            "theorem compactness_criterion : True := by\n  trivial\n"
+          );
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      targetText: "Every open cover has a finite subcover."
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    const job = state.jobs[result.body.jobId];
+    assert.equal(job.recordedProofPath, proofPath);
+    assert.equal(job.moduleName, "Lea.Project1.compactness_criterion");
+    const markdown = await fs.readFile(path.join(leaRepo, "workspace", "projects", "project-1.md"), "utf8");
+    assert.match(markdown, /lea:theorem name="compactness_criterion"/);
+  } finally {
+    restorePath();
+  }
+});
+
+// Same unregistered-artifact gap, but the agent picked a file name that does
+// not match the Overleaf label -- the conventional-path probe can't see it, so
+// the recovery must locate the file via the session's code_steps (previously
+// this recovery ran only for needs_review exits, never for verified runs).
+test("a verified unregistered run whose file name differs from the label is recovered via the session's code_steps", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "even_square_of_even.lean");
+  const code = "theorem even_square_of_even : True := by\n  trivial\n";
+  const restorePath = await installFakeLake();
+  try {
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeLeaApiFetch(calls, {
+        statusBody: { run_id: "api-run-1", status: "completed", result: { reason: "success" } },
+        sessionBody: {
+          project_namespace: "Lea.Project1",
+          code_steps: [{ path: "even_square_of_even.lean", seq: 1, code }]
+        },
+        onStatusRequest: async () => {
+          await writeLeaProjectProof(leaRepo, proofPath, code);
+        }
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "epsilon_one",
+      targetText: [
+        "Theorem name: even_square_of_even",
+        "Lean signature:",
+        "theorem even_square_of_even : True := by"
+      ].join("\n")
+    }, state);
+
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+    const job = state.jobs[result.body.jobId];
+    assert.equal(job.declarationName, "even_square_of_even");
+    assert.equal(job.recordedProofPath, proofPath);
+    assert.equal(job.moduleName, "Lea.Project1.even_square_of_even");
+    const markdown = await fs.readFile(path.join(leaRepo, "workspace", "projects", "project-1.md"), "utf8");
+    assert.match(markdown, /lea:theorem name="even_square_of_even"/);
   } finally {
     restorePath();
   }
@@ -2845,6 +3260,9 @@ function makeLeaApiFetch(calls, options = {}) {
     if (String(url).endsWith("/api/settings")) {
       return jsonResponse(404, { detail: "not found" });
     }
+    if (String(url).includes("/api/projects/by-slug/") && String(url).endsWith("/identity")) {
+      return jsonResponse(404, { detail: "No project" });
+    }
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     const recordedBody = body?.message ? { ...body, task: body.message } : body;
     calls.push({ url, options: requestOptions, body: recordedBody });
@@ -2890,7 +3308,10 @@ function makeLeaApiFetch(calls, options = {}) {
           input_tokens: usage.input_tokens || 0,
           output_tokens: usage.output_tokens || 0,
           cost_usd: options.statusBody?.result?.cost || 0
-        }]
+        }],
+        // extra session-detail fields (project_namespace, code_steps) for
+        // tests that exercise the unregistered-artifact session recovery
+        ...(options.sessionBody || {})
       });
     }
     if (String(url).endsWith("/interrupt")) {
@@ -3066,20 +3487,153 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeAdapterApiFetch(calls)
   });
+  state.projectIdentities = {
+    "project-1": {
+      slug: "project-1",
+      projectName: "Renamed Project",
+      namespace: "Lea.RenamedProject"
+    }
+  };
 
   const result = await handleFormalize({
     overleafProjectId: "project-1",
     targetKind: "theorem",
     targetLabel: "t_api",
-    targetText: "A theorem."
+    targetText: "A theorem.",
+    projectName: "Original Project"
   }, state);
 
   assert.equal(result.statusCode, 200);
   assert.equal(result.body.status, "in_progress");
   await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
-  assert.ok(runCall.body.message.includes("project project-1"));
+  assert.ok(runCall.body.message.includes("Project display name: Renamed Project"));
+  assert.ok(runCall.body.message.includes("Lean namespace: Lea.RenamedProject"));
+  assert.ok(runCall.body.message.includes("Overleaf binding: project-1"));
+  assert.ok(runCall.body.message.includes("do not derive a namespace from the display name"));
+  assert.ok(!runCall.body.message.includes("in project project-1"));
+  assert.equal(runCall.body.project_title, "Renamed Project");
+  assert.equal(runCall.body.project_namespace, "Lea.RenamedProject");
   assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
+});
+
+test("formalize fetches adapter identity after companion restart before composing the prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapterFetch = makeAdapterApiFetch(calls);
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "GET") {
+        return jsonResponse(200, {
+          projectId: "adapter-project-1",
+          slug: "project-1",
+          projectName: "p1",
+          namespace: "Lea.P6a4584b313b8ddc4ba20e377",
+          namespaceEditable: true,
+          repoPath: "proofs/Lea/P6a4584b313b8ddc4ba20e377",
+          hasRecordedProofs: true,
+          exists: true
+        });
+      }
+      return adapterFetch(url, options);
+    }
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    targetText: "A theorem.",
+    projectName: "stale-title"
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.ok(calls.some((c) => String(c.url).endsWith("/api/projects/by-slug/project-1/identity") && c.options?.method === "GET"));
+  assert.ok(runCall.body.message.includes("Project display name: p1"));
+  assert.ok(runCall.body.message.includes("Lean namespace: Lea.P6a4584b313b8ddc4ba20e377"));
+  assert.ok(runCall.body.message.includes("Overleaf binding: project-1"));
+  assert.ok(!runCall.body.message.includes("Lean namespace: Lea.Project1"));
+  assert.equal(runCall.body.project_title, "p1");
+  assert.equal(runCall.body.project_namespace, "Lea.P6a4584b313b8ddc4ba20e377");
+});
+
+test("formalize refreshes stale fallback identity and dependency paths after project rename", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  await writeLeaProjectProof(
+    leaRepo,
+    path.join("workspace", "proofs", "Lea", "P1", "compactness_criterion.lean"),
+    "import Mathlib\n\nnamespace Lea.P1\n\ntheorem compactness_criterion : True := by\n  trivial\n\nend Lea.P1\n"
+  );
+  const adapterFetch = makeAdapterApiFetch(calls, { projectNamespace: "Lea.P1" });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: async (url, options = {}) => {
+      calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "GET") {
+        return jsonResponse(200, {
+          projectId: "adapter-project-1",
+          slug: "project-1",
+          projectName: "p1",
+          namespace: "Lea.P1",
+          namespaceEditable: true,
+          repoPath: "proofs/Lea/P1",
+          hasRecordedProofs: true,
+          exists: true
+        });
+      }
+      return adapterFetch(url, options);
+    }
+  });
+  state.projectIdentities = {
+    "project-1": {
+      slug: "project-1",
+      projectName: "project-1",
+      namespace: "Lea.Project1",
+      exists: false
+    }
+  };
+  state.jobs.old = {
+    jobId: "old",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    recordedProofPath: path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean"),
+    moduleName: "Lea.Project1.compactness_criterion",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectName: "project-1",
+    projectNamespace: "Lea.Project1",
+    startedAt: "2026-07-09T01:48:17.300Z",
+    finishedAt: "2026-07-09T01:48:51.752Z"
+  };
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_corollary",
+    targetText: "A consequence.",
+    targetUses: ["compactness_criterion"]
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.ok(runCall.body.message.includes("Project display name: p1"));
+  assert.ok(runCall.body.message.includes("Lean namespace: Lea.P1"));
+  assert.ok(runCall.body.message.includes(path.join("workspace", "proofs", "Lea", "P1", "compactness_criterion.lean")));
+  assert.ok(!runCall.body.message.includes("Lean namespace: Lea.Project1"));
+  assert.ok(!runCall.body.message.includes(path.join("workspace", "proofs", "Lea", "Project1", "compactness_criterion.lean")));
+  assert.equal(runCall.body.project_title, "p1");
+  assert.equal(runCall.body.project_namespace, "Lea.P1");
 });
 
 test("stub on the /api backend records a checked sorry stub with a Lea session link", async () => {
@@ -3121,7 +3675,11 @@ test("stub on the /api backend records a checked sorry stub with a Lea session l
   assert.equal(result.body.leaSessionId, "sess-api-1");
   assert.equal(result.body.leaSessionUrl, "http://localhost:5173/?session=sess-api-1");
   assert.equal(state.jobs[result.body.jobId].recordedProofPath, proofPath);
-  assert.match(calls.find((c) => String(c.url).endsWith("/api/runs")).body.message, /Create a Lean sorry stub/);
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.match(runCall.body.message, /Create a Lean sorry stub/);
+  assert.match(runCall.body.message, /Project display name: Overleaf Project/);
+  assert.match(runCall.body.message, /Lean namespace: Lea\.Project1/);
+  assert.match(runCall.body.message, /do not derive a namespace from the display name/);
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
@@ -3298,11 +3856,10 @@ test("resolveProofOutcome promotes a needs_review run to formalized when local e
   assert.equal(outcome.leanCheck, leanCheck);
 });
 
-test("resolveProofOutcome keeps needs_review when the fresh compile FAILS despite sorry-free file evidence", async () => {
+test("resolveProofOutcome fails unconfirmed needs_review when the fresh compile fails", async () => {
   // `local.status === "formalized"` is a sorry/admit regex over the file, not
   // a compile. A needs_review run whose file is sorry-free but doesn't
-  // actually compile must stay needs_review -- promoting on regex evidence
-  // alone was the original sin of this branch's first version.
+  // actually compile must not promote on regex evidence alone.
   const job = { targetKind: "theorem", targetLabel: "t5b", leaWorkspacePath: "/tmp/x" };
   const failingCheck = { ok: false, exitCode: 1, stdout: "", stderr: "unknown identifier: foo", message: "" };
   const outcome = await resolveProofOutcome({
@@ -3311,14 +3868,15 @@ test("resolveProofOutcome keeps needs_review when the fresh compile FAILS despit
     exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
   });
 
-  assert.equal(outcome.jobStatus, "needs_review");
-  assert.equal(outcome.finalStatus, "needs_review");
-  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "failed");
+  assert.equal(outcome.effectiveStatus.status, "failed");
+  assert.equal(outcome.resultKind, "needs_review");
   // the failing check is kept as the diagnostic explaining WHY
   assert.equal(outcome.leanCheck, failingCheck);
 });
 
-test("resolveProofOutcome keeps needs_review when no compile evidence is possible at all", async () => {
+test("resolveProofOutcome fails unconfirmed needs_review when no compile evidence is possible", async () => {
   // Sorry-free file evidence but no absolutePath to check and no attached
   // recovery check: nothing verifies this actually compiles, so it must not
   // promote. (Unlike the exit.ok path, where the ADAPTER verified the run and
@@ -3331,9 +3889,10 @@ test("resolveProofOutcome keeps needs_review when no compile evidence is possibl
     exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", resultDetail: "NEEDS_REVIEW" }
   });
 
-  assert.equal(outcome.jobStatus, "needs_review");
-  assert.equal(outcome.finalStatus, "needs_review");
-  assert.equal(outcome.effectiveStatus.status, "needs_review");
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "failed");
+  assert.equal(outcome.effectiveStatus.status, "failed");
+  assert.equal(outcome.resultKind, "needs_review");
   assert.equal(outcome.leanCheck, null);
 });
 
@@ -3476,16 +4035,15 @@ test("recoverFormalizedStatusFromTargetPath returns null when the run has no ses
   assert.equal(recovered, null);
 });
 
-test("resolveProofOutcome still reports needs_review when no local evidence was found (the real-world case)", async () => {
+test("resolveProofOutcome records unconfirmed needs_review as failed when no local evidence was found", async () => {
   // This is the actual shape production hits, not a hypothetical: the
   // project-markdown index identifyLeaArtifact diffs against is populated by
   // the agent's own in-run tool calls, and it appears to skip that call when
   // it isn't confident enough to self-report "proved" -- so localStatus stays
   // "unformalized" for essentially every real needs_review run, even when the
-  // emitted file compiles cleanly. A first version of this fix gated the
-  // needs_review -> needs_review promotion on `local.status === "formalized"`
-  // and silently fell back to "failed" here, which is the exact bug
-  // resurfacing under a different name. It must not.
+  // emitted file may compile cleanly. Without checked artifact evidence, the
+  // primary status should be failed/unconfirmed while resultKind preserves the
+  // classifier metadata.
   const job = { targetKind: "theorem", targetLabel: "t6", leaWorkspacePath: "/tmp/x" };
   const outcome = await resolveProofOutcome({
     job,
@@ -3493,11 +4051,11 @@ test("resolveProofOutcome still reports needs_review when no local evidence was 
     exit: { ok: false, doneStatus: "needs_review", resultKind: "needs_review", error: "Lea run ended with status: needs_review" }
   });
 
-  assert.equal(outcome.jobStatus, "needs_review");
-  assert.equal(outcome.finalStatus, "needs_review");
+  assert.equal(outcome.jobStatus, "failed");
+  assert.equal(outcome.finalStatus, "failed");
   assert.equal(outcome.resultKind, "needs_review");
-  assert.equal(outcome.effectiveStatus.status, "needs_review");
-  assert.equal(outcome.error, null);
+  assert.equal(outcome.effectiveStatus.status, "failed");
+  assert.match(outcome.error, /could not confirm/);
 });
 
 test("formalize on the /api backend tags the theorem formalized when the run succeeds (regression)", async () => {
@@ -3663,6 +4221,13 @@ test("chat message starts a first-message session with the full context preamble
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeLeaApiFetch(calls)
   });
+  state.projectIdentities = {
+    "project-1": {
+      slug: "project-1",
+      projectName: "p1",
+      namespace: "Lea.P6a4584b313b8ddc4ba20e377"
+    }
+  };
 
   const res = await handleChatMessage({ target: CHAT_TARGET, message: "Why did this fail?" }, state);
 
@@ -3674,6 +4239,9 @@ test("chat message starts a first-message session with the full context preamble
   const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
   assert.equal(runCall.body.session_id, undefined);
   assert.match(runCall.body.message, /You are helping with this Overleaf item\./);
+  assert.match(runCall.body.message, /Project display name: p1/);
+  assert.match(runCall.body.message, /Lean namespace: Lea\.P6a4584b313b8ddc4ba20e377/);
+  assert.match(runCall.body.message, /do not derive a namespace from the display name/);
   assert.match(runCall.body.message, /Natural-language statement:/);
   assert.match(runCall.body.message, /User request:\nWhy did this fail\?/);
   // association recorded for a target that had no prior job

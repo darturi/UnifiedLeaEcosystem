@@ -30,6 +30,20 @@ export function chatTargetKey({ overleafProjectId, targetKind, targetLabel }) {
   return `${slugProjectId(overleafProjectId)}:${targetKind}:${targetLabel}`;
 }
 
+export function projectIdentityPreambleLines(target = {}) {
+  const binding = String(target.projectSlug || (target.overleafProjectId ? slugProjectId(target.overleafProjectId) : "") || "").trim();
+  const projectName = String(target.projectName || binding || "").trim();
+  const namespace = String(target.projectNamespace || target.namespace || "").trim();
+  const lines = [];
+  if (projectName) lines.push(`Project display name: ${projectName}`);
+  if (namespace) lines.push(`Lean namespace: ${namespace}`);
+  if (binding) lines.push(`Overleaf binding: ${binding}`);
+  if (namespace) {
+    lines.push("Use exactly this Lean namespace and project context; do not derive a namespace from the display name.");
+  }
+  return lines;
+}
+
 // Build the adapter run message for a chat send.
 //
 // First message (creating the session) carries the full theorem context preamble
@@ -54,8 +68,7 @@ export function buildChatPrompt(target = {}, { stale = false, firstMessage = tru
 // repair prompts open with: doc-side identity, source location, the item's
 // natural-language statement, and what is already recorded for it.
 function targetPreambleLines(target = {}) {
-  const lines = [];
-  if (target.projectSlug) lines.push(`Project: ${target.projectSlug}`);
+  const lines = [...projectIdentityPreambleLines(target)];
   lines.push(`Kind: ${target.targetKind || ""}`);
   lines.push(`Label: ${target.targetLabel || ""}`);
   if (target.latexLabel) lines.push(`LaTeX label: ${target.latexLabel}`);
@@ -173,15 +186,6 @@ export function toChatSessionResponse(detail = {}, { targetKey = null, leaSessio
     runs,
     activeRun
   };
-}
-
-// True while the run for this session is still going — the signal the extension
-// uses to keep polling and then stop once the run settles.
-export function isChatRunActive(response) {
-  if (!response || typeof response !== "object") return false;
-  if (response.activeRun) return true;
-  const status = String(response.activeRun?.status || "").toLowerCase();
-  return status === "running" || status === "pending" || status === "queued";
 }
 
 function isVisibleChatMessage(message) {

@@ -481,11 +481,19 @@ def run_lea(context: RunnerContext) -> None:
                 rel = _relativize(ev.path, repo)
                 step_id = step_id_by_path.get(rel)
                 if step_id:
-                    updated = store.set_code_step_check(step_id, ev.status, ev.detail)
+                    artifact_kind = None
+                    if ev.status == "ok":
+                        current_step = store.latest_code_step_for_path(session_id, rel)
+                        if current_step and current_step["id"] == step_id:
+                            try:
+                                artifact_kind = classify_lean_artifact(gs.snapshot(repo_key, current_step["commit_sha"], rel))
+                            except Exception:
+                                artifact_kind = None
+                    updated = store.set_code_step_check(step_id, ev.status, ev.detail, artifact_kind=artifact_kind)
                     if updated:
                         code = gs.snapshot(repo_key, updated["commit_sha"], rel)
                         if ev.status == "ok":
-                            checked_artifact_kind = classify_lean_artifact(code)
+                            checked_artifact_kind = updated.get("artifact_kind") or classify_lean_artifact(code)
                         emit(events, "code_step", {
                             **updated, "code": code,
                         })

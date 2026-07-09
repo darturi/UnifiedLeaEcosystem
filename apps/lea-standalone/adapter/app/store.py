@@ -12,6 +12,7 @@ from .db import ROOT, connect, row_to_dict, utc_now
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+PROJECT_NAMESPACE_RE = re.compile(r"^Lea\.[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*$")
 # A skill slug is the stable id AND the materialized filename stem the prover reads
 # as `## Skill: <slug>` (D45) — lower-kebab, letter/digit-initial, ≤80 chars.
 SKILL_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,79}$")
@@ -141,6 +142,13 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                     limit 1
                 ) as latest_check_status,
                 (
+                    select cs.artifact_kind
+                    from code_steps cs
+                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
+                    order by cs.seq desc
+                    limit 1
+                ) as latest_artifact_kind,
+                (
                     select rcs.status
                     from code_steps cs
                     left join runs rcs on rcs.id = cs.run_id
@@ -173,6 +181,7 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
         data = row_to_dict(row)
         data["status"] = _derive_session_status(
             data.pop("latest_check_status", None),
+            data.pop("latest_artifact_kind", None),
             int(data.pop("code_step_count", 0) or 0),
             bool(data.pop("active_run_count", 0)),
             data.pop("latest_code_run_status", None),
@@ -257,14 +266,24 @@ def get_project_by_slug(slug: str) -> dict | None:
     return row_to_dict(row) if row else None
 
 
-def project_namespace_for_slug(slug: str) -> str:
-    """Derive the Lean namespace `Lea.<Project>` from a slug (D22). `<Project>` must
-    be a valid Lean module-name segment: UpperCamel, alphanumeric, letter-initial.
-    The slug's `-`/`_`/space separators become CamelCase word boundaries.
+def get_project_by_namespace(namespace: str) -> dict | None:
+    value = validate_project_namespace(namespace)
+    with connect() as conn:
+        row = conn.execute("select * from projects where namespace = ?", (value,)).fetchone()
+    return row_to_dict(row) if row else None
 
-    P2's project service (which creates the on-disk `proofs/Lea/<Project>/` dir) is
-    the canonical caller; this lives here so the store can fill the NOT-NULL
-    `namespace`/`repo_path` columns for the Overleaf tag-only path too."""
+
+def validate_project_namespace(namespace: str) -> str:
+    value = str(namespace or "").strip()
+    if not PROJECT_NAMESPACE_RE.fullmatch(value):
+        raise ValueError("project namespace must be under Lea. with Lean identifier segments")
+    return value
+
+
+def project_namespace_for_slug(slug: str) -> str:
+    """Derive a fallback Lean namespace `Lea.<Project>` from a slug. The slug is the
+    immutable Overleaf/project binding; the namespace is cached and can migrate only
+    through the explicit project-identity rename flow."""
     parts = re.split(r"[-_\s]+", str(slug or "").strip())
     camel = "".join(p[:1].upper() + p[1:] for p in parts if p)
     camel = re.sub(r"[^A-Za-z0-9]", "", camel)
@@ -275,7 +294,8 @@ def project_namespace_for_slug(slug: str) -> str:
 
 def repo_path_for_namespace(namespace: str) -> str:
     """The shared dir / git repo for a namespace: `Lea.Foo` → `proofs/Lea/Foo` (D22)."""
-    return "proofs/" + namespace.replace(".", "/")
+    value = validate_project_namespace(namespace)
+    return "proofs/" + value.replace(".", "/")
 
 
 def get_or_create_project(slug: str, title: str | None = None) -> dict:
@@ -311,7 +331,7 @@ def create_project(
     now = utc_now()
     project_id = str(uuid4())
     project_title = (title or slug).strip() or slug
-    ns = namespace or project_namespace_for_slug(slug)
+    ns = validate_project_namespace(namespace) if namespace else project_namespace_for_slug(slug)
     repo = repo_path or repo_path_for_namespace(ns)
     with connect() as conn:
         conn.execute(
@@ -354,6 +374,33 @@ def update_project(
                 now,
                 project_id,
             ),
+        )
+        updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+    return row_to_dict(updated)
+
+
+def update_project_identity(
+    project_id: str,
+    *,
+    title: str,
+    namespace: str,
+    repo_path: str,
+) -> dict | None:
+    """Update the mutable project identity fields. `slug` remains immutable; this is
+    reserved for the explicit namespace-migration path, not ordinary metadata edits."""
+    ns = validate_project_namespace(namespace)
+    now = utc_now()
+    with connect() as conn:
+        row = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            """
+            update projects
+            set title = ?, namespace = ?, repo_path = ?, updated_at = ?
+            where id = ?
+            """,
+            ((title or "").strip() or row["title"], ns, repo_path, now, project_id),
         )
         updated = conn.execute("select * from projects where id = ?", (project_id,)).fetchone()
     return row_to_dict(updated)
@@ -739,6 +786,29 @@ def update_run(
         )
 
 
+def fail_stale_active_runs() -> int:
+    """Crash recovery, called once at startup: any run still `pending`/`running`
+    in the DB has no live runner thread (they died with the previous process), so
+    mark it failed. Without this, a run created but never driven — e.g. its client
+    gave up while queued for the single-run slot — sits `pending` forever and the
+    derived session status (D14) shows an eternal 'thinking'. Returns the count."""
+    now = utc_now()
+    detail = "Run did not finish: the adapter restarted (or the run was never started) before it completed."
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            update runs
+            set status = 'failed',
+                result_kind = coalesce(result_kind, 'failed'),
+                result_detail = coalesce(result_detail, ?),
+                updated_at = ?
+            where status in ('pending', 'running')
+            """,
+            (detail, now),
+        )
+        return cursor.rowcount
+
+
 def set_run_api_run_id(run_id: str, api_run_id: str) -> None:
     now = utc_now()
     with connect() as conn:
@@ -950,6 +1020,7 @@ def add_code_step(
     turn: int | None = None,
     check_status: str | None = None,
     check_detail: str | None = None,
+    artifact_kind: str | None = None,
 ) -> dict:
     """Record a curated timeline step pointing at a git commit (D7/D8).
 
@@ -975,9 +1046,9 @@ def add_code_step(
             """
             insert into code_steps (
                 id, session_id, run_id, seq, turn, author, path,
-                commit_sha, summary, check_status, check_detail, created_at
+                commit_sha, summary, check_status, check_detail, artifact_kind, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 step_id,
@@ -991,6 +1062,7 @@ def add_code_step(
                 summary,
                 check_status,
                 check_detail,
+                artifact_kind if check_status == "ok" else None,
                 now,
             ),
         )
@@ -1036,7 +1108,12 @@ def upsert_user_code_step(session_id: str, path: str, *, commit_sha: str) -> dic
     return add_code_step(session_id, None, path, commit_sha=commit_sha, author="user")
 
 
-def set_code_step_check(step_id: str, check_status: str, check_detail: str | None = None) -> dict | None:
+def set_code_step_check(
+    step_id: str,
+    check_status: str,
+    check_detail: str | None = None,
+    artifact_kind: str | None = None,
+) -> dict | None:
     """Back-fill a code_step's verdict once `lean_check` returns (D6).
 
     A write is committed and its row inserted *before* the check runs (FileChanged
@@ -1047,8 +1124,8 @@ def set_code_step_check(step_id: str, check_status: str, check_detail: str | Non
     now = utc_now()
     with connect() as conn:
         conn.execute(
-            "update code_steps set check_status = ?, check_detail = ? where id = ?",
-            (check_status, check_detail, step_id),
+            "update code_steps set check_status = ?, check_detail = ?, artifact_kind = ? where id = ?",
+            (check_status, check_detail, artifact_kind if check_status == "ok" else None, step_id),
         )
         row = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
     return row_to_dict(row) if row else None
@@ -1217,6 +1294,7 @@ def session_detail(session_id: str) -> dict | None:
     # only 'ok' when an actual proof compiles, not when a throwaway probe does (M14).
     real_steps = [c for c in code_steps if "scratch" not in (c["path"] or "").lower()]
     latest_check_status = real_steps[-1]["check_status"] if real_steps else None
+    latest_artifact_kind = real_steps[-1]["artifact_kind"] if real_steps else None
     latest_code_run_status = None
     if real_steps and real_steps[-1]["run_id"]:
         with connect() as conn:
@@ -1229,7 +1307,7 @@ def session_detail(session_id: str) -> dict | None:
         **session,
         **usage,
         "status": _derive_session_status(
-            latest_check_status, len(real_steps), active_run is not None, latest_code_run_status
+            latest_check_status, latest_artifact_kind, len(real_steps), active_run is not None, latest_code_run_status
         ),
         "messages": [row_to_dict(row) for row in messages],
         "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
@@ -1245,6 +1323,7 @@ def session_detail(session_id: str) -> dict | None:
 
 def _derive_session_status(
     latest_check_status: str | None,
+    latest_artifact_kind: str | None,
     code_step_count: int,
     has_active_run: bool = False,
     latest_code_run_status: str | None = None,
@@ -1257,8 +1336,14 @@ def _derive_session_status(
     an Overleaf-driven one whose first file hasn't been written yet — surfaces as
     in-progress in the session list and stats the moment it starts."""
     if code_step_count:
-        if latest_check_status == "ok" and latest_code_run_status in {"proved", "disproved", "needs_review"}:
-            return latest_code_run_status
+        if latest_check_status == "ok":
+            if latest_code_run_status == "disproved":
+                return "disproved"
+            if latest_artifact_kind == "definition":
+                return "defined"
+            if latest_artifact_kind in {"proof", "mixed"}:
+                return "proved"
+            return "ok"
         return latest_check_status or "unchecked"
     if has_active_run:
         return "running"

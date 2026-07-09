@@ -6,7 +6,9 @@ import test from "node:test";
 import { buildChatPrompt, buildRepairPrompt } from "../companion/chatPrompt.mjs";
 
 const TARGET = {
+  projectName: "p1",
   projectSlug: "project-1",
+  projectNamespace: "Lea.Project1",
   targetKind: "theorem",
   targetLabel: "compactness_corollary",
   latexLabel: "thm:corollary",
@@ -38,7 +40,10 @@ test("repair prompt: rename variant carries the mapping, headers, diagnostic, an
   });
 
   // identity preamble (shared with chat first messages)
-  assert.match(prompt, /Project: project-1/);
+  assert.match(prompt, /Project display name: p1/);
+  assert.match(prompt, /Lean namespace: Lea\.Project1/);
+  assert.match(prompt, /Overleaf binding: project-1/);
+  assert.match(prompt, /do not derive a namespace from the display name/);
   assert.match(prompt, /Label: compactness_corollary/);
   assert.match(prompt, /Natural-language statement:\nEvery compact subset is closed\./);
   // what changed: rename, explicitly "renamed, not removed", with the mapping
@@ -104,12 +109,15 @@ test("repair prompt: def-body variant explains definitional unfolding risk", () 
   assert.match(prompt, /came from a re-formalization run/);
 });
 
-test("preamble factor-out: buildChatPrompt first-message output is byte-identical to the pre-refactor shape", () => {
+test("preamble factor-out: buildChatPrompt first-message output includes explicit project identity", () => {
   const prompt = buildChatPrompt(TARGET, { stale: true, firstMessage: true, userText: "please fix" });
   assert.equal(prompt, [
     "You are helping with this Overleaf item.",
     "",
-    "Project: project-1",
+    "Project display name: p1",
+    "Lean namespace: Lea.Project1",
+    "Overleaf binding: project-1",
+    "Use exactly this Lean namespace and project context; do not derive a namespace from the display name.",
     "Kind: theorem",
     "Label: compactness_corollary",
     "LaTeX label: thm:corollary",
@@ -124,4 +132,13 @@ test("preamble factor-out: buildChatPrompt first-message output is byte-identica
     "User request:",
     "please fix"
   ].join("\n"));
+});
+
+test("preamble prefers the user-visible project name over the Overleaf slug", () => {
+  const prompt = buildChatPrompt(
+    { ...TARGET, projectName: "Friendly Project" },
+    { firstMessage: true, userText: "please fix" }
+  );
+  assert.match(prompt, /Project display name: Friendly Project/);
+  assert.doesNotMatch(prompt, /Project display name: project-1/);
 });

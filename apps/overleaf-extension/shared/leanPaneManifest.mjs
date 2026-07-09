@@ -15,6 +15,11 @@ import {
 // "theorem"; see leanKindFor.
 const DEFINITION_KINDS = new Set(["definition"]);
 
+// Target syntaxes whose target already carries its own body span (no enclosing
+// environment to find in `environments`), so they are pulled straight from the
+// strict target list rather than the environment loop.
+const STANDALONE_TARGET_SYNTAXES = new Set(["tag", "leacode"]);
+
 // The pane hashes the exact same canonical text the formalize path hashes
 // (`hashTargetText` over `stripLeaTargetText`), so an item's `sourceHash` and a
 // finished job's `targetTextHash` are directly comparable for staleness. These
@@ -154,7 +159,10 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
   // docs/PLAN-overleaf-inline-lea-tags.md for why this is an accepted, known
   // gap rather than an oversight.
   for (const target of targets) {
-    if (target.syntax !== "tag" || coveredOffsets.has(target.from)) continue;
+    // Both standalone forms carry their own body span from a synthetic
+    // environment (targetParserCore.mjs): "tag" is \leatheorem{...}{...}, and
+    // "leacode" is a \begin{leacode}...\end{leacode} code block.
+    if (!STANDALONE_TARGET_SYNTAXES.has(target.syntax) || coveredOffsets.has(target.from)) continue;
     candidates.push({
       kind: target.latexEnvironment,
       target,

@@ -55,11 +55,12 @@ def init_db() -> None:
             -- A project is a shared dir + git repo + this index row (D21). The DB
             -- never stores Instructions/Memory/Blueprint content — those are the
             -- three canonical `.lea/*.md` files (D25/D26/D28); only short metadata
-            -- lives here. `slug` is immutable (it determines the namespace + dir,
-            -- D22); `namespace`/`repo_path` are derivable-but-cached for queries.
+            -- lives here. `slug` is immutable (the durable Overleaf/project binding,
+            -- D22). `namespace`/`repo_path` are cached identity fields; Overleaf
+            -- project-name changes can migrate them through the explicit rename flow.
             create table if not exists projects (
                 id text primary key,
-                slug text not null unique,        -- immutable; → namespace Lea.<Project> (D22)
+                slug text not null unique,        -- immutable binding, never renamed
                 title text not null,
                 description text,                  -- short metadata for the project list/cards
                 namespace text not null,          -- cached 'Lea.<Project>' (derivable; cached)
@@ -180,6 +181,7 @@ def init_db() -> None:
                 summary text,                             -- short label / narration
                 check_status text,                        -- 'ok' | 'error' | 'unchecked' (D6)
                 check_detail text,                        -- first error line (nullable)
+                artifact_kind text,                       -- 'proof' | 'definition' | 'mixed' | 'unknown' when check_status='ok'
                 created_at text not null
             );
 

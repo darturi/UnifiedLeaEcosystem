@@ -158,6 +158,48 @@ export function fetchProjectShareStatus({ fetchImpl, baseUrl, slug }) {
   });
 }
 
+export function fetchProjectIdentityBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/identity`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+export function previewProjectNamespace({ fetchImpl, baseUrl, projectName, namespace = null, excludeProjectId = null }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/namespace-preview`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      project_name: projectName,
+      namespace,
+      exclude_project_id: excludeProjectId
+    }),
+  });
+}
+
+export function updateProjectIdentityBySlug({
+  fetchImpl,
+  baseUrl,
+  slug,
+  projectName,
+  mode,
+  namespace = null,
+  expectedNamespace = null,
+  createIfMissing = false,
+}) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/identity`, {
+    method: "PUT",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      project_name: projectName,
+      mode,
+      namespace,
+      expected_namespace: expectedNamespace,
+      create_if_missing: Boolean(createIfMissing)
+    }),
+  });
+}
+
 export function setProjectRemoteBySlug({ fetchImpl, baseUrl, slug, remoteUrl }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/git/remote`, {
     method: "PUT",
@@ -214,7 +256,7 @@ export async function exportProjectZipBySlug({ fetchImpl, baseUrl, slug }) {
   };
 }
 
-export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, origin = null, originUrl = null }) {
+export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, projectNamespace = null, origin = null, originUrl = null }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
   // end-to-end with zero human interaction. (The client also auto-resolves any
@@ -234,6 +276,7 @@ export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, session
   if (projectSlug) {
     body.project_slug = projectSlug;
     body.project_title = projectTitle || projectSlug;
+    if (projectNamespace) body.project_namespace = projectNamespace;
   }
   if (origin) body.origin = origin;
   if (originUrl) body.origin_url = originUrl;
@@ -372,7 +415,10 @@ export async function streamApiRun({
     return { ok: false, error: `Could not open run event stream: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (!response?.ok || !response.body) {
-    return { ok: false, error: `Run event stream returned HTTP ${response?.status ?? "?"}.` };
+    // httpStatus lets the caller tell a transient rejection apart from a real
+    // failure — 409 means the adapter's single-run slot is held by another run
+    // (see runApiProofJob's re-attach loop), not that this run's proof failed.
+    return { ok: false, httpStatus: response?.status ?? null, error: `Run event stream returned HTTP ${response?.status ?? "?"}.` };
   }
 
   let doneStatus = null;
@@ -426,6 +472,48 @@ export async function streamApiRun({
   };
 }
 
+// Consecutive failures to read the run row while the stream is also failing —
+// past this, the adapter is genuinely unreachable and the client gives up
+// (best-effort interrupting the run it may be orphaning) instead of spinning
+// until the job timeout.
+const MAX_RUN_ROW_MISSES = 5;
+
+// De-synchronize concurrent waiters: queued runs polling in lockstep would
+// all re-attach at the same instant when the slot frees; jitter gives earlier
+// arrivals a fair shot and avoids a thundering herd on the adapter.
+function retryDelayWithJitter(baseMs) {
+  return baseMs + Math.floor(Math.random() * baseMs * 0.5);
+}
+
+// Resolve to true after ms, or false immediately if/when the signal aborts —
+// so a queued run reacts to its timeout mid-wait instead of after the delay.
+function waitBeforeRetry(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    // Deliberately NOT unref'd: this delay gates forward progress (the next
+    // attach attempt), so it must keep the event loop alive to fire.
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+}
+
+// Read one run's { status, result_kind, result_detail } off the session detail.
+// Best-effort: null when the adapter or the row can't be reached.
+async function fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId, runId }) {
+  if (!sessionId) return null;
+  const detail = await fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId });
+  if (!detail.ok || !detail.body) return null;
+  const runs = Array.isArray(detail.body.runs) ? detail.body.runs : [];
+  return runs.find((r) => r && r.id === runId) || null;
+}
+
 // High-level: start a run and drive it to completion, returning the shape the
 // companion orchestration consumes:
 // { ok, timedOut, apiRunId, error, usage, costUsd }.
@@ -437,10 +525,12 @@ export async function runApiProofJob({
   sessionId = null,
   maxTurns = null,
   timeoutMs = 900000,
+  busyRetryDelayMs = 3000,
   autoApprove = true,
   autonomous = true,
   projectSlug = null,
   projectTitle = null,
+  projectNamespace = null,
   origin = null,
   originUrl = null,
   appendLog = null,
@@ -453,7 +543,7 @@ export async function runApiProofJob({
     if (appendLog && logPath) await appendLog(logPath, line);
   };
 
-  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle, origin, originUrl });
+  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle, projectNamespace, origin, originUrl });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
   const runId = start.body?.run_id;
@@ -471,12 +561,76 @@ export async function runApiProofJob({
   }, Math.max(1, timeoutMs));
   if (typeof timer.unref === "function") timer.unref();
 
+  // The adapter runs one prover job at a time and only *starts* a run when its
+  // event stream is first attached, so a 409 on the attach means "the single-run
+  // slot is held by another run" — NOT that this run failed. The created run
+  // stays `pending` adapter-side and is perfectly startable later, so wait and
+  // re-attach until the slot frees (bounded by the timeout timer above). A 409
+  // can also mean "run already completed" (something else saw it through), so
+  // consult the run row to pick retry vs. resolve — never fail on 409 alone.
+  //
+  // The same run-row consultation also covers a DROPPED stream (open transport
+  // error, mid-stream disconnect, or a clean close without a `done` frame):
+  // the run may well still be executing adapter-side, so failing the job here
+  // both abandoned a live, billing run and mislabeled its eventual outcome.
+  // Re-attach while the row reads pending/running; adopt the row's outcome
+  // once terminal. Only a non-409 HTTP rejection of the attach, or a stream
+  // that DID deliver a terminal status, is a real, immediate failure.
   let outcome;
+  let loggedBusyWait = false;
+  let loggedStreamDrop = false;
+  let rowMisses = 0;
   try {
-    outcome = await streamApiRun({
-      fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
-      signal: abort.signal, onEvent, onProgressUpdated,
-    });
+    for (;;) {
+      outcome = await streamApiRun({
+        fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
+        signal: abort.signal, onEvent, onProgressUpdated,
+      });
+      if (outcome.ok || outcome.aborted) break;
+      const busy409 = outcome.httpStatus === 409;
+      const streamDropped = outcome.httpStatus == null && !outcome.doneStatus;
+      if (!busy409 && !streamDropped) break;
+
+      const row = await fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId: newSessionId, runId });
+      const rowStatus = String(row?.status || "").toLowerCase();
+      if (rowStatus && rowStatus !== "pending" && rowStatus !== "running") {
+        // Terminal without us attached: adopt the run row's outcome as if it
+        // had arrived on a `done` event.
+        const ok = SUCCESS_DONE_STATUS.has(rowStatus);
+        outcome = {
+          ok,
+          doneStatus: rowStatus,
+          resultKind: String(row.result_kind || rowStatus).toLowerCase() || null,
+          resultDetail: typeof row.result_detail === "string" ? row.result_detail : null,
+          error: ok ? null : `Lea run ended with status: ${rowStatus}`,
+        };
+        break;
+      }
+      if (!row && streamDropped) {
+        // Stream AND status read both failing: the adapter is unreachable.
+        rowMisses += 1;
+        if (rowMisses >= MAX_RUN_ROW_MISSES) {
+          await log("[backend] Lea adapter is unreachable; giving up on this run and requesting an interrupt.\n");
+          interruptApiRun({ fetchImpl, baseUrl, apiKey, runId }).catch(() => {});
+          break;
+        }
+      } else {
+        rowMisses = 0;
+      }
+
+      if (busy409 && !loggedBusyWait) {
+        loggedBusyWait = true;
+        await log("[backend] Lea adapter is busy (another run is active); waiting for the run slot...\n");
+      }
+      if (streamDropped && !loggedStreamDrop) {
+        loggedStreamDrop = true;
+        await log("[backend] Run event stream dropped while the run is still live; re-attaching...\n");
+      }
+      if (!(await waitBeforeRetry(retryDelayWithJitter(busyRetryDelayMs), abort.signal))) {
+        outcome = { ok: false, aborted: true, error: "Run stream aborted." };
+        break;
+      }
+    }
   } finally {
     clearTimeout(timer);
   }

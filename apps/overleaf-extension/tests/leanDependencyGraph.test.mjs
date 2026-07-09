@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   buildReverseImportIndex,
+  containsSorryMarker,
   dependentsOf,
   listProjectProofFiles,
   moduleNameFromProjectStep,
@@ -23,6 +24,26 @@ async function writeProof(leaRepo, namespace, stepPath, content) {
   await fs.mkdir(path.dirname(absolute), { recursive: true });
   await fs.writeFile(absolute, content, "utf8");
 }
+
+test("containsSorryMarker detects real sorry/admit and ignores lookalikes and comments (AUDIT M1)", () => {
+  // Real incomplete proofs.
+  assert.equal(containsSorryMarker("theorem foo : True := by\n  sorry"), true);
+  assert.equal(containsSorryMarker("theorem foo : True := by\n  admit"), true);
+  assert.equal(containsSorryMarker("  exact sorry"), true);
+
+  // The concrete bug: a word ENDING in "admit" must not match (the old
+  // `/\bsorry\b|admit\b/` was missing the leading word boundary).
+  assert.equal(containsSorryMarker("def readmit : Nat := 0"), false);
+  assert.equal(containsSorryMarker("theorem t : Nat.readmit = 0 := rfl"), false);
+  assert.equal(containsSorryMarker("def sorryish : Nat := 0"), false);
+
+  // A finished proof that merely MENTIONS the words in a comment is complete.
+  assert.equal(containsSorryMarker("theorem foo : True := trivial -- no sorry needed"), false);
+  assert.equal(containsSorryMarker("/- this used to admit -/\ntheorem foo : True := trivial"), false);
+
+  // But a real sorry alongside a comment still counts.
+  assert.equal(containsSorryMarker("-- almost done\ntheorem foo : True := by sorry"), true);
+});
 
 test("projectNamespaceFromSlug/proofPathFromProjectStep/moduleNameFromProjectStep are unchanged from the original companion/server.mjs behavior", () => {
   assert.equal(projectNamespaceFromSlug("my-project"), "Lea.MyProject");

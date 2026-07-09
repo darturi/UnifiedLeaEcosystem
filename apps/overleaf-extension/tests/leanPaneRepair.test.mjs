@@ -284,6 +284,8 @@ test("repair run: dispatches on the item's own session with the repair prompt, v
   assert.equal(runCall.body.session_id, "sess-b");
   assert.equal(runCall.body.autonomous, true);
   assert.match(runCall.body.message, /You are repairing a broken Lean formalization/);
+  assert.match(runCall.body.message, /Lean namespace: Lea\.Project1/);
+  assert.match(runCall.body.message, /do not derive a namespace from the display name/);
   assert.match(runCall.body.message, /RENAMED to `compactness_thm`/);
   assert.match(runCall.body.message, /unknown constant 'Lea.Project1.compactness_criterion'/);
   assert.equal(job.mode, "repair");

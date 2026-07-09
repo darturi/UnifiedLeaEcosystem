@@ -40,6 +40,20 @@ class ProjectUpdate(BaseModel):
     description: str | None = None
 
 
+class NamespacePreviewRequest(BaseModel):
+    project_name: str
+    namespace: str | None = None
+    exclude_project_id: str | None = None
+
+
+class ProjectIdentityUpdate(BaseModel):
+    project_name: str
+    mode: str
+    namespace: str | None = None
+    expected_namespace: str | None = None
+    create_if_missing: bool = False
+
+
 class SessionCreate(BaseModel):
     title: str | None = None
 
@@ -95,6 +109,11 @@ def _proofs_root() -> Path:
     return config.lea_root / "workspace" / "proofs"
 
 
+def _project_identity_error(exc: project_service.ProjectIdentityError) -> HTTPException:
+    detail = {"error": exc.code, "message": str(exc), **exc.detail}
+    return HTTPException(status_code=exc.status, detail=detail)
+
+
 @router.get("/api/projects")
 def list_projects() -> dict:
     return {"projects": store.list_projects()}
@@ -124,6 +143,18 @@ def update_project(project_id: str, request: ProjectUpdate) -> dict:
     if updated is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return updated
+
+
+@router.post("/api/projects/namespace-preview")
+def namespace_preview(request: NamespacePreviewRequest) -> dict:
+    try:
+        return project_service.namespace_preview(
+            request.project_name,
+            namespace=request.namespace,
+            exclude_project_id=request.exclude_project_id,
+        )
+    except project_service.ProjectIdentityError as exc:
+        raise _project_identity_error(exc)
 
 
 @router.post("/api/projects/{project_id}/sessions", status_code=201)
@@ -344,6 +375,61 @@ def _require_project_by_slug(slug: str) -> dict:
     if project is None:
         raise HTTPException(status_code=404, detail="No Lea project exists for this document yet.")
     return project
+
+
+@router.get("/api/projects/by-slug/{slug}/identity")
+def get_project_identity_by_slug(slug: str) -> dict:
+    return project_service.project_identity(_require_project_by_slug(slug))
+
+
+@router.put("/api/projects/by-slug/{slug}/identity")
+def update_project_identity_by_slug(slug: str, request: ProjectIdentityUpdate) -> dict:
+    if request.mode not in {"display-only", "rename-namespace"}:
+        raise HTTPException(status_code=422, detail="mode must be 'display-only' or 'rename-namespace'")
+    try:
+        project = store.get_project_by_slug(slug)
+    except ValueError:
+        project = None
+    if project is None:
+        if not request.create_if_missing:
+            raise HTTPException(status_code=404, detail="No Lea project exists for this document yet.")
+        try:
+            project = project_service.ensure_project(
+                slug,
+                _proofs_root(),
+                title=request.project_name,
+                namespace=request.namespace,
+            )
+        except project_service.ProjectIdentityError as exc:
+            raise _project_identity_error(exc)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        return {"identity": project_service.project_identity(project)}
+
+    title = request.project_name.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Project name is required")
+
+    if request.mode == "display-only":
+        project_service.refresh_project_title_docs(project, _proofs_root(), title)
+        updated = store.update_project(project["id"], title=title)
+        return {"identity": project_service.project_identity(updated)}
+
+    try:
+        result = project_service.migrate_project_namespace(
+            project,
+            _proofs_root(),
+            title=title,
+            namespace=request.namespace or title,
+            expected_namespace=request.expected_namespace,
+            check_fn=interface_check,
+        )
+    except project_service.ProjectIdentityError as exc:
+        raise _project_identity_error(exc)
+    return {
+        "identity": project_service.project_identity(result["project"]),
+        "migration": result["migration"],
+    }
 
 
 @router.get("/api/projects/by-slug/{slug}/share")

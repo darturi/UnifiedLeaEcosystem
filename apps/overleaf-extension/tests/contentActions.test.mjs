@@ -129,9 +129,99 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   await flushPromises();
 
   assert.match(harness.bodyText(), /Lean pane/);
+  assert.match(harness.bodyText(), /Lean namespace: Lea\.TestProject/);
   harness.clickPaneTreeRowText("main.tex");
   assert.match(harness.bodyText(), /Main theorem/);
   assert.match(harness.bodyText(), /missing stub/);
+});
+
+test("Lean pane renders a persisted drag resize handle", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-project-pane-resizer"), 1);
+  assert.equal(harness.leanPaneWidthStyle(), "520px");
+});
+
+test("Lean pane drag resizing grows left, clamps at minimum, and persists", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.dragLeanPaneResizer({ startX: 520, moves: [420] });
+
+  assert.equal(harness.leanPaneWidthStyle(), "620px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 620 });
+
+  harness.dragLeanPaneResizer({ startX: 420, moves: [1000] });
+
+  assert.equal(harness.leanPaneWidthStyle(), "360px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 360 });
+});
+
+test("Lean pane applies stored width when reopened", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { leanPaneWidthPx: 700 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.equal(harness.leanPaneWidthStyle(), "700px");
+});
+
+test("Lean pane keyboard resizing honors min and max and persists", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { leanPaneWidthPx: 520 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.keyLeanPaneResizer("ArrowLeft");
+
+  assert.equal(harness.leanPaneWidthStyle(), "544px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 544 });
+
+  harness.keyLeanPaneResizer("ArrowRight", { shiftKey: true });
+  harness.keyLeanPaneResizer("ArrowRight", { shiftKey: true });
+  harness.keyLeanPaneResizer("ArrowRight", { shiftKey: true });
+
+  assert.equal(harness.leanPaneWidthStyle(), "360px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 360 });
+
+  harness.keyLeanPaneResizer("End");
+
+  assert.equal(harness.leanPaneWidthStyle(), "1000px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 1000 });
+});
+
+test("Lean pane viewport resize clamps an oversized stored width", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { leanPaneWidthPx: 900 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  assert.equal(harness.leanPaneWidthStyle(), "900px");
+
+  harness.window.innerWidth = 600;
+  harness.window.dispatchEvent({ type: "resize" });
+
+  assert.equal(harness.leanPaneWidthStyle(), "576px");
+  assert.deepEqual(harness.lastStorageSet(), { leanPaneWidthPx: 576 });
 });
 
 test("Lean pane renders every source file equally with file rows collapsed by default", async () => {
@@ -188,10 +278,11 @@ test("Lean pane renders every source file equally with file rows collapsed by de
 
   assert.match(harness.bodyText(), /3 labeled items across 3 \.tex files\./);
   assert.deepEqual(harness.paneTreeRowTexts().map((text) => text.replace(/\s+/g, " ")), [
-    "▸main.tex1 itemvalid",
+    "▸main.tex1 item",
     "▸sections/1 itemmissing stub",
-    "▸supp.tex1 itemvalid"
+    "▸supp.tex1 item"
   ]);
+  assert.equal(harness.countSelector(".ol-lean-project-progress"), 2);
   assert.doesNotMatch(harness.bodyText(), /Main theorem/);
   assert.doesNotMatch(harness.bodyText(), /Section definition/);
   assert.doesNotMatch(harness.bodyText(), /Supplemental lemma/);
@@ -203,6 +294,45 @@ test("Lean pane renders every source file equally with file rows collapsed by de
   assert.match(harness.bodyText(), /Section definition/);
   harness.clickPaneTreeRowText("supp.tex");
   assert.match(harness.bodyText(), /Supplemental lemma/);
+});
+
+test("Lean pane file rows render proportional progress segments", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [
+          { id: "t1", kind: "theorem", label: "t1", status: "valid", sourceFile: "main.tex", documentOrder: 0, naturalLanguageLatex: "A.", leanKind: "theorem" },
+          { id: "t2", kind: "theorem", label: "t2", status: "defined", sourceFile: "main.tex", documentOrder: 1, naturalLanguageLatex: "B.", leanKind: "def" },
+          { id: "t3", kind: "theorem", label: "t3", status: "disproved", sourceFile: "main.tex", documentOrder: 2, naturalLanguageLatex: "C.", leanKind: "theorem" },
+          { id: "t4", kind: "theorem", label: "t4", status: "stub-generated", sourceFile: "main.tex", documentOrder: 3, naturalLanguageLatex: "D.", leanKind: "theorem" },
+          { id: "t5", kind: "theorem", label: "t5", status: "invalid", sourceFile: "main.tex", documentOrder: 4, naturalLanguageLatex: "E.", leanKind: "theorem" },
+          { id: "t6", kind: "theorem", label: "t6", status: "missing-stub", sourceFile: "main.tex", documentOrder: 5, naturalLanguageLatex: "F.", leanKind: "theorem", inProgress: true },
+          { id: "t7", kind: "theorem", label: "t7", status: "stale", sourceFile: "main.tex", documentOrder: 6, naturalLanguageLatex: "G.", leanKind: "theorem" },
+          { id: "t8", kind: "theorem", label: "t8", status: "unknown", sourceFile: "main.tex", documentOrder: 7, naturalLanguageLatex: "H.", leanKind: "theorem" }
+        ],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  const [progress] = harness.paneProgresses();
+  assert.equal(progress.role, "img");
+  assert.equal(progress.label, "main.tex: 8 Lea items, 3 successful, 1 sorry-stubbed, 1 failed, 3 unformalized, 1 in progress.");
+  assert.equal(progress.inProgress, true);
+  assert.deepEqual(progress.segments.map((segment) => [segment.bucket, segment.count, segment.width]), [
+    ["success", "3", "37.5%"],
+    ["sorry-stubbed", "1", "12.5%"],
+    ["failed", "1", "12.5%"],
+    ["unformalized", "3", "37.5%"]
+  ]);
 });
 
 test("Lean pane polling refresh preserves expanded folder and file rows", async () => {
@@ -296,8 +426,8 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
 
-  assert.equal(harness.hasButtonText("Copy stub"), true);
-  assert.equal(harness.hasButtonText("Copy artifact"), true);
+  assert.equal(harness.hasButtonLabel("Copy stub"), true);
+  assert.equal(harness.hasButtonLabel("Copy artifact"), true);
   assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
 });
 
@@ -345,8 +475,8 @@ test("Lean pane renders lightweight math and highlighted Lean code", async () =>
 
   harness.clickFirstPaneItem();
 
-  assert.equal(harness.hasButtonText("Copy stub"), true);
-  assert.equal(harness.hasButtonText("Copy artifact"), true);
+  assert.equal(harness.hasButtonLabel("Copy stub"), true);
+  assert.equal(harness.hasButtonLabel("Copy artifact"), true);
   assert.ok(harness.countSelector(".ol-lean-project-lean-com") >= 1);
 });
 
@@ -384,7 +514,7 @@ test("Lean pane 'Go to source' posts a navigate message with the item's offsets"
   await flushPromises();
   harness.clickPaneTreeRowText("main.tex");
   harness.clickFirstPaneItem();
-  harness.clickButtonText("Go to source");
+  harness.clickButtonLabel("Go to source");
 
   const navigate = harness.postedMessages.find((message) => message.type === "OL_LEAN_NAVIGATE");
   assert.ok(navigate, "expected an OL_LEAN_NAVIGATE message");
@@ -564,6 +694,8 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   assert.equal(body.targetKind, "theorem");
   assert.deepEqual(body.targetUses, ["helper_lemma"]);
   assert.equal(body.targetContext, "Use the helper.");
+  assert.equal(body.projectName, "Test Project");
+  assert.equal(body.projectNamespace, "Lea.TestProject");
 });
 
 // --- Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md) ----------
@@ -721,6 +853,8 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const fetchCalls = [];
   const postedMessages = [];
   const confirmCalls = [];
+  const storageSetCalls = [];
+  const storageState = { ...(options.storage || {}) };
   let nextTimerId = 1;
 
   const window = {
@@ -736,6 +870,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       const listeners = this._listeners.get(type) || [];
       listeners.push(listener);
       this._listeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) {
+      removeListener(this._listeners, type, listener);
+    },
+    dispatchEvent(event) {
+      const eventObject = normalizeFakeEvent(event, this);
+      for (const listener of this._listeners.get(eventObject.type) || []) {
+        listener(eventObject);
+      }
+      return !eventObject.defaultPrevented;
     },
     postMessage(data) {
       postedMessages.push(data);
@@ -783,6 +927,20 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         async json() {
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
+          }
+          if (String(url).includes("/project/identity?")) {
+            return {
+              ok: true,
+              identity: options.projectIdentity || {
+                projectId: "adapter-project-1",
+                overleafProjectId: "project-1",
+                slug: "project-1",
+                projectName: "Test Project",
+                namespace: "Lea.TestProject",
+                exists: true,
+                hasRecordedProofs: true
+              }
+            };
           }
           if (String(url).includes("/lean-pane/manifest")) {
             return typeof options.manifest === "function"
@@ -852,9 +1010,12 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       storage: {
         sync: {
           async get(defaults) {
-            return defaults;
+            return { ...defaults, ...storageState };
           },
-          async set() {}
+          async set(values) {
+            storageSetCalls.push({ ...values });
+            Object.assign(storageState, values);
+          }
         }
       }
     }
@@ -906,6 +1067,18 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       return document.body
         .querySelectorAll("button")
         .some((button) => button.textContent === text);
+    },
+    hasButtonLabel(label) {
+      return document.body
+        .querySelectorAll("button")
+        .some((button) => button.attributes["aria-label"] === label);
+    },
+    clickButtonLabel(label) {
+      const button = document.body
+        .querySelectorAll("button")
+        .find((candidate) => candidate.attributes["aria-label"] === label);
+      assert.ok(button, `expected a button labeled "${label}"`);
+      button.click();
     },
     openTargetPopover() {
       window.postMessage({
@@ -960,6 +1133,35 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(textarea, "expected the edit textarea to be present");
       textarea.value = value;
     },
+    leanPane() {
+      return document.body.querySelector(".ol-lean-project-pane");
+    },
+    leanPaneResizer() {
+      return document.body.querySelector(".ol-lean-project-pane-resizer");
+    },
+    leanPaneWidthStyle() {
+      return this.leanPane()?.style["--ol-lean-pane-width"] || "";
+    },
+    dragLeanPaneResizer({ startX, moves }) {
+      const resizer = this.leanPaneResizer();
+      assert.ok(resizer, "expected Lean pane resizer");
+      resizer.dispatchEvent({
+        type: "mousedown",
+        button: 0,
+        clientX: startX,
+        preventDefault() {},
+        stopPropagation() {}
+      });
+      for (const clientX of moves) {
+        document.dispatchEvent({ type: "mousemove", clientX });
+      }
+      document.dispatchEvent({ type: "mouseup", clientX: moves[moves.length - 1] ?? startX });
+    },
+    keyLeanPaneResizer(key, patch = {}) {
+      const resizer = this.leanPaneResizer();
+      assert.ok(resizer, "expected Lean pane resizer");
+      resizer.dispatchEvent({ type: "keydown", key, ...patch });
+    },
     async runScheduledTimers() {
       const scheduledTimers = timers.splice(0, timers.length);
       for (const timer of scheduledTimers) {
@@ -969,7 +1171,12 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     fetchCalls,
     confirmCalls,
+    storageSetCalls,
+    storageState,
     postedMessages,
+    lastStorageSet() {
+      return storageSetCalls[storageSetCalls.length - 1] || null;
+    },
     bodyText() {
       return document.body.textContent;
     },
@@ -980,6 +1187,24 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       return document.body
         .querySelectorAll(".ol-lean-project-tree-row")
         .map((row) => row.textContent);
+    },
+    paneProgresses() {
+      return document.body
+        .querySelectorAll(".ol-lean-project-progress")
+        .map((progress) => ({
+          role: progress.attributes.role,
+          label: progress.attributes["aria-label"],
+          inProgress: progress.classList.contains("ol-lean-project-progress-in-progress"),
+          segments: progress
+            .querySelectorAll(".ol-lean-project-progress-segment")
+            .map((segment) => ({
+              bucket: segment.dataset.bucket,
+              count: segment.dataset.count,
+              percent: segment.dataset.percent,
+              width: segment.style.width,
+              title: segment.title
+            }))
+        }));
     },
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");
@@ -1010,6 +1235,18 @@ class FakeDocument {
     const listeners = this._listeners.get(type) || [];
     listeners.push(listener);
     this._listeners.set(type, listeners);
+  }
+
+  removeEventListener(type, listener) {
+    removeListener(this._listeners, type, listener);
+  }
+
+  dispatchEvent(event) {
+    const eventObject = normalizeFakeEvent(event, this);
+    for (const listener of this._listeners.get(eventObject.type) || []) {
+      listener(eventObject);
+    }
+    return !eventObject.defaultPrevented;
   }
 
   createElement(tagName) {
@@ -1152,6 +1389,18 @@ class FakeElement {
     this._listeners.set(type, listeners);
   }
 
+  removeEventListener(type, listener) {
+    removeListener(this._listeners, type, listener);
+  }
+
+  dispatchEvent(event) {
+    const eventObject = normalizeFakeEvent(event, this);
+    for (const listener of this._listeners.get(eventObject.type) || []) {
+      listener(eventObject);
+    }
+    return !eventObject.defaultPrevented;
+  }
+
   click() {
     for (const listener of this._listeners.get("click") || []) {
       listener({
@@ -1224,6 +1473,25 @@ function matchesSelector(node, selector) {
   return node.tagName.toLowerCase() === selector.toLowerCase();
 }
 
+function removeListener(listenersByType, type, listener) {
+  const listeners = listenersByType.get(type) || [];
+  const index = listeners.indexOf(listener);
+  if (index !== -1) listeners.splice(index, 1);
+}
+
+function normalizeFakeEvent(event, target) {
+  const eventObject = typeof event === "string" ? { type: event } : { ...event };
+  eventObject.target ||= target;
+  eventObject.defaultPrevented = false;
+  const originalPreventDefault = eventObject.preventDefault;
+  eventObject.preventDefault = () => {
+    eventObject.defaultPrevented = true;
+    originalPreventDefault?.();
+  };
+  eventObject.stopPropagation ||= () => {};
+  return eventObject;
+}
+
 function toDatasetKey(name) {
   return name.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
 }
@@ -1251,7 +1519,7 @@ function brokenItem(overrides = {}) {
   });
 }
 
-test("Lean pane 'Repair with Lea' appears for a broken item, confirms, and posts /lean-pane/repair/start", async () => {
+test("Lean pane 'Repair with Lea' appears for a broken item and posts /lean-pane/repair/start", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
     {},
@@ -1273,38 +1541,14 @@ test("Lean pane 'Repair with Lea' appears for a broken item, confirms, and posts
   harness.clickButtonText("Repair with Lea");
   await flushPromises();
 
-  assert.equal(harness.confirmCalls.length, 1);
-  assert.match(harness.confirmCalls[0], /Repair 1 item with Lea: corollary_a\./);
-  assert.match(harness.confirmCalls[0], /renamed to `main_theorem_v2`/);
-  assert.match(harness.confirmCalls[0], /1 agent run/);
+  // no confirmation popup: the repair dispatches immediately
+  assert.equal(harness.confirmCalls.length, 0);
 
   const startCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/repair/start"));
   assert.ok(startCall, "expected a POST to /lean-pane/repair/start");
   const body = JSON.parse(startCall.options.body);
   assert.equal(body.targetLabel, "corollary_a");
   assert.equal(body.targetKind, "theorem");
-});
-
-test("declining the repair confirmation makes no repair request", async () => {
-  const harness = createContentHarness(
-    { status: "unformalized" },
-    {},
-    {
-      locationPath: "/project/unknown",
-      confirmResponse: false,
-      manifest: { ok: true, rootFile: "main.tex", items: [brokenItem()], diagnostics: [] }
-    }
-  );
-  await harness.loadVisibleTheorems();
-  harness.clickPaneTrigger();
-  await flushPromises();
-  harness.clickPaneTreeRowText("main.tex");
-  harness.clickFirstPaneItem();
-  harness.clickButtonText("Repair with Lea");
-  await flushPromises();
-
-  assert.equal(harness.confirmCalls.length, 1);
-  assert.ok(!harness.fetchCalls.some((call) => call.url.includes("/lean-pane/repair/")));
 });
 
 test("no repair offer while the upstream item is itself broken (suppressed), with the redirecting copy", async () => {
@@ -1371,9 +1615,8 @@ test("post-save impact summary offers 'Repair all (N)' and posts the batch; the 
   harness.clickButtonText("Repair all (2)");
   await flushPromises();
 
-  assert.equal(harness.confirmCalls.length, 1);
-  assert.match(harness.confirmCalls[0], /Repair 2 items with Lea: corollary_a, corollary_b\./);
-  assert.match(harness.confirmCalls[0], /2 agent runs/);
+  // no confirmation popup: the batch dispatches immediately
+  assert.equal(harness.confirmCalls.length, 0);
 
   const batchCall = harness.fetchCalls.find((call) => call.url.includes("/lean-pane/repair/all"));
   assert.ok(batchCall, "expected a POST to /lean-pane/repair/all");

@@ -24,6 +24,10 @@ test('checked code without sorry is displayed as proved', () => {
   assert.equal(deriveCodeStepProofStatus(step()), 'proved');
 });
 
+test('checked unknown artifact is displayed as checked code, not proof', () => {
+  assert.equal(deriveCodeStepProofStatus(step({ artifact_kind: 'unknown' })), 'checked');
+});
+
 test('checked code with sorry is displayed as stubbed', () => {
   assert.equal(
     deriveCodeStepProofStatus(step({ code: 'theorem t : True := by\n  sorry\n' })),
@@ -72,8 +76,19 @@ test('run disproved is displayed as disproof, not proof', () => {
   assert.equal(deriveRunCompletionStatus('disproved', [step()]), 'disproved');
 });
 
-test('ambiguous checked artifacts are displayed as needing review', () => {
-  assert.equal(deriveRunCompletionStatus('needs_review', [step()]), 'needs_review');
+test('ambiguous checked theorem artifacts are displayed by artifact status', () => {
+  assert.equal(deriveRunCompletionStatus('needs_review', [step({ artifact_kind: 'proof' })]), 'proved');
+});
+
+test('ambiguous checked definition artifacts are displayed as definitions', () => {
+  assert.equal(
+    deriveRunCompletionStatus('needs_review', [step({ code: 'def d : Nat := 0\n', artifact_kind: 'definition' })]),
+    'defined',
+  );
+});
+
+test('ambiguous checked unknown artifacts are not displayed as proofs', () => {
+  assert.equal(deriveRunCompletionStatus('needs_review', [step({ artifact_kind: 'unknown' })]), 'answered');
 });
 
 test('Lean comments mentioning sorry do not make the code a stub', () => {

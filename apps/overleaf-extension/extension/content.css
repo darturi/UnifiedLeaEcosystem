@@ -36,6 +36,18 @@
   --ol-serif: Georgia, "Times New Roman", serif;
 }
 
+.ol-lean-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .ol-lean-theorem {
   background: rgba(201, 100, 66, 0.12);
   border-bottom: 1px solid rgba(201, 100, 66, 0.55);
@@ -219,12 +231,49 @@
   z-index: 2147483646;
   display: flex;
   flex-direction: column;
-  width: min(520px, calc(100vw - 24px));
+  box-sizing: border-box;
+  width: var(--ol-lean-pane-width, 520px);
+  min-width: 360px;
+  max-width: calc(100vw - 24px);
   color: var(--ol-ink);
   background: var(--ol-panel);
   border-left: 1px solid var(--ol-line);
   box-shadow: -16px 0 40px rgba(31, 30, 29, 0.18);
   font: 13px/1.45 var(--ol-sans);
+}
+
+.ol-lean-project-pane-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  z-index: 1;
+  width: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.ol-lean-project-pane-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: transparent;
+}
+
+.ol-lean-project-pane-resizer:hover::before,
+.ol-lean-project-pane-resizer:focus-visible::before,
+.ol-lean-project-pane-resizing .ol-lean-project-pane-resizer::before {
+  background: var(--ol-accent);
+}
+
+body.ol-lean-pane-resizing {
+  cursor: ew-resize;
+  user-select: none;
 }
 
 .ol-lean-project-pane-header {
@@ -248,6 +297,14 @@
   margin: 0;
   color: var(--ol-ink);
   font: 700 20px/1.2 var(--ol-sans);
+}
+
+.ol-lean-project-pane-namespace {
+  margin: 4px 0 0;
+  max-width: 240px;
+  overflow-wrap: anywhere;
+  color: var(--ol-muted);
+  font: 11px/1.25 var(--ol-mono);
 }
 
 .ol-lean-project-pane-controls {
@@ -420,6 +477,61 @@
 .ol-lean-project-tree-status {
   grid-row: auto;
   grid-column: auto;
+}
+
+.ol-lean-project-progress {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  justify-self: end;
+  width: clamp(84px, 22vw, 132px);
+  min-width: 84px;
+  height: 9px;
+  overflow: hidden;
+  border: 1px solid var(--ol-line);
+  border-radius: 999px;
+  background: var(--ol-line-2);
+}
+
+.ol-lean-project-progress-in-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.22) 0,
+    rgba(255, 255, 255, 0.22) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.22) 50%,
+    rgba(255, 255, 255, 0.22) 75%,
+    transparent 75%,
+    transparent 100%
+  );
+  background-size: 12px 12px;
+  pointer-events: none;
+}
+
+.ol-lean-project-progress-segment {
+  flex: 0 0 auto;
+  min-width: 0;
+  height: 100%;
+}
+
+.ol-lean-project-progress-segment-success {
+  background: var(--ol-green);
+}
+
+.ol-lean-project-progress-segment-sorry-stubbed {
+  background: var(--ol-amber);
+}
+
+.ol-lean-project-progress-segment-failed {
+  background: var(--ol-red);
+}
+
+.ol-lean-project-progress-segment-unformalized {
+  background: var(--ol-line-2);
 }
 
 .ol-lean-project-tree-items {
@@ -623,8 +735,102 @@
 .ol-lean-project-detail-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin-top: 10px;
+}
+
+/* The item card's navigation actions, as compact icon buttons pushed to the
+   right of the (optional) primary text action. */
+.ol-lean-icon-rail {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.ol-lean-icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel);
+  color: var(--ol-ink-2);
+  cursor: pointer;
+}
+
+.ol-lean-icon-action:hover:not(:disabled) {
+  background: var(--ol-panel-2);
+  color: var(--ol-ink);
+}
+
+.ol-lean-icon-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* "More actions" overflow menu on an item card. */
+.ol-lean-overflow {
+  position: relative;
+}
+
+.ol-lean-overflow-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel);
+  box-shadow: 0 8px 24px rgba(31, 30, 29, 0.14);
+}
+
+.ol-lean-overflow-menu[hidden] {
+  display: none;
+}
+
+.ol-lean-overflow-item {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ol-ink-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ol-lean-overflow-item:hover {
+  background: var(--ol-panel-2);
+  color: var(--ol-ink);
+}
+
+/* Copy control anchored to the code block it copies; revealed on hover or
+   keyboard focus. */
+.ol-lean-code-block {
+  position: relative;
+}
+
+.ol-lean-code-block .ol-lean-code-copy {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: var(--ol-code-bg);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.ol-lean-code-block:hover .ol-lean-code-copy,
+.ol-lean-code-block .ol-lean-code-copy:focus-visible {
+  opacity: 1;
 }
 
 /* Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md). */
@@ -632,21 +838,62 @@
   margin-top: 10px;
 }
 
+/* Overlay editor: the textarea is the input surface (transparent text, visible
+   caret); the highlight layer behind it shows the same regex-highlighted tokens
+   as the read view. The two layers must keep identical font/padding/wrapping
+   metrics or the glyphs drift out of alignment. */
+.ol-lean-project-edit-editor {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-code-bg);
+}
+
+.ol-lean-project-edit-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 10px;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--ol-ink-2);
+  font: 11px/1.45 var(--ol-mono);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
 .ol-lean-project-edit-textarea {
+  position: relative;
+  display: block;
   box-sizing: border-box;
   width: 100%;
   min-height: 180px;
   max-height: 420px;
   padding: 10px;
   resize: vertical;
-  border: 1px solid var(--ol-line);
-  border-radius: 7px;
-  background: var(--ol-code-bg);
-  color: var(--ol-ink-2);
+  border: none;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--ol-ink-2);
   font: 11px/1.45 var(--ol-mono);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
-.ol-lean-project-edit-textarea:disabled {
+/* A visible scrollbar would shrink the textarea's wrap width relative to the
+   highlight layer and misalign the two; scrolling still works (wheel/keys). */
+.ol-lean-project-edit-textarea::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* Selection must stay translucent so the highlighted text behind shows through. */
+.ol-lean-project-edit-textarea::selection {
+  background: rgba(96, 144, 232, 0.3);
+}
+
+.ol-lean-project-edit-editor:has(.ol-lean-project-edit-textarea:disabled) {
   opacity: 0.65;
 }
 
@@ -1103,15 +1350,16 @@
   background: var(--ol-panel-2);
 }
 
-/* The Formalize action is the pane's one state-changing button — give it the accent
-   so it reads as primary among the otherwise-passive copy/navigate actions. */
-.ol-lean-formalize-button {
+/* The item card's single status-derived primary action (Formalize / Repair) —
+   the accent marks the one state-changing step, against the quiet icon rail
+   and the overflow alternatives (leanPaneView.paneItemActions). */
+.ol-lean-item-primary-action {
   border-color: var(--ol-accent);
   color: var(--ol-accent-ink);
   background: var(--ol-accent-soft);
 }
 
-.ol-lean-formalize-button:hover:not(:disabled) {
+.ol-lean-item-primary-action:hover:not(:disabled) {
   background: var(--ol-accent-soft);
   border-color: var(--ol-accent-ink);
 }
@@ -1196,12 +1444,31 @@
   color: var(--ol-red);
 }
 
-.ol-lean-provider-panel {
+.ol-lean-provider-panel,
+.ol-lean-project-identity-panel {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 10px 12px;
   border-top: 1px solid var(--ol-line);
+}
+
+.ol-lean-project-identity-panel {
+  border: 1px solid var(--ol-line-2);
+  border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel);
+}
+
+.ol-lean-project-message:empty {
+  display: none;
+}
+
+.ol-lean-project-message[data-kind="error"] {
+  color: var(--ol-red);
+}
+
+.ol-lean-project-message[data-kind="success"] {
+  color: var(--ol-green);
 }
 
 .ol-lean-provider-title {

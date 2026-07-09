@@ -5,26 +5,32 @@ import {
   buildLeanPaneTree,
   canEditPaneItem,
   canFormalizePaneItem,
+  canStubPaneItem,
+  canViewPaneItemInLeaUi,
   canRepairPaneItem,
   capitalize,
   formatBreakageAttribution,
   formatDependentOutcome,
   formatDependentsImpact,
-  formatRepairConfirmation,
   formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
   hasInProgressItems,
   highlightLeanLine,
   overlayActiveTex,
+  paneItemActions,
   paneItemToEditTarget,
   paneItemToFormalizeTarget,
+  paneProgressBucketForItem,
+  paneProgressSegments,
   deriveShareControls,
   filenameFromContentDisposition,
+  formatPaneProgressLabel,
   parsePaneLatex,
   reconcileDependentsImpact,
   shouldRefetchLeanPaneFiles,
   stillBrokenDependents,
+  summarizePaneProgress,
   treeAncestorIdsForFile
 } from "../extension/leanPaneView.mjs";
 
@@ -34,7 +40,6 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("valid"), "valid");
   assert.equal(formatPaneStatus("defined"), "defined");
   assert.equal(formatPaneStatus("disproved"), "counterexample");
-  assert.equal(formatPaneStatus("needs-review"), "needs review");
   assert.equal(formatPaneStatus("in-progress"), "in progress");
   assert.equal(formatPaneStatus("stale"), "stale");
   assert.equal(formatPaneStatus("mixed"), "mixed");
@@ -96,6 +101,100 @@ test("canFormalizePaneItem requires a valid marker, an actionable state, and no 
   assert.equal(canFormalizePaneItem(undefined), false);
 });
 
+test("canStubPaneItem offers sorry-stubbing only for an unformalized theorem", () => {
+  const base = { formalizable: true, inProgress: false, status: "missing-stub", leanKind: "theorem" };
+  assert.equal(canStubPaneItem(base), true);
+  // Definitions always get a full body from Formalize; there is no stub form.
+  assert.equal(canStubPaneItem({ ...base, leanKind: "def" }), false);
+  // Once any artifact exists (stub or proof), Formalize is the right action.
+  assert.equal(canStubPaneItem({ ...base, status: "stub-generated" }), false);
+  assert.equal(canStubPaneItem({ ...base, status: "valid" }), false);
+  assert.equal(canStubPaneItem({ ...base, status: "stale" }), false);
+  assert.equal(canStubPaneItem({ ...base, inProgress: true }), false);
+  assert.equal(canStubPaneItem({ ...base, formalizable: false }), false);
+  assert.equal(canStubPaneItem(undefined), false);
+});
+
+test("canViewPaneItemInLeaUi requires a target identity and a real run or artifact", () => {
+  const base = { label: "thm:main", status: "valid" };
+  assert.equal(canViewPaneItemInLeaUi(base), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "defined" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "disproved" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "needs-review" }), false);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "in-progress" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stub-generated" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stale" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "invalid" }), true);
+  // Never-formalized or indeterminate items must not appear viewable.
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "missing-stub" }), false);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "unknown" }), false);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "error" }), false);
+  // Without a declaration name or label the session can't be resolved.
+  assert.equal(canViewPaneItemInLeaUi({ status: "valid" }), false);
+  assert.equal(canViewPaneItemInLeaUi(undefined), false);
+});
+
+test("paneItemActions puts Formalize primary with Stub in the overflow for an unformalized theorem", () => {
+  const item = { formalizable: true, inProgress: false, status: "missing-stub", leanKind: "theorem", label: "thm:main" };
+  const actions = paneItemActions(item);
+  assert.deepEqual(actions.primary, { id: "formalize", label: "Formalize" });
+  assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat"]);
+  assert.deepEqual(actions.overflow.map((action) => action.id), ["stub"]);
+});
+
+test("paneItemActions promotes Repair over Re-formalize on a broken item and keeps both reachable", () => {
+  const item = {
+    formalizable: true,
+    inProgress: false,
+    status: "invalid",
+    leanKind: "theorem",
+    label: "thm:dep",
+    leanDeclarationName: "dep_theorem",
+    leanArtifactContent: "theorem dep_theorem : True := by trivial",
+    breakage: { upstreamLabel: "upstream", via: "edit" }
+  };
+  const actions = paneItemActions(item);
+  assert.equal(actions.primary.id, "repair");
+  // Repair takes the primary slot, but Re-formalize and Edit stay reachable.
+  assert.deepEqual(actions.overflow.map((action) => action.label), ["Re-formalize", "Edit"]);
+  assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
+});
+
+test("paneItemActions leaves a settled valid item with no primary action", () => {
+  const item = {
+    formalizable: true,
+    inProgress: false,
+    status: "valid",
+    leanKind: "theorem",
+    label: "thm:main",
+    leanDeclarationName: "main_theorem",
+    leanArtifactContent: "theorem main_theorem : True := by trivial"
+  };
+  const actions = paneItemActions(item);
+  assert.equal(actions.primary, null);
+  assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
+  assert.deepEqual(actions.overflow.map((action) => action.id), ["edit"]);
+});
+
+test("paneItemActions suppresses state-changing actions while the item is being edited or running", () => {
+  const broken = {
+    formalizable: true,
+    inProgress: false,
+    status: "invalid",
+    label: "thm:x",
+    leanArtifactContent: "theorem x : True := by trivial",
+    breakage: { upstreamLabel: "up", via: "edit" }
+  };
+  const whileEditing = paneItemActions(broken, { editing: true });
+  assert.equal(whileEditing.primary, null);
+  assert.deepEqual(whileEditing.overflow, []);
+
+  const running = paneItemActions({ formalizable: true, inProgress: true, status: "in-progress", label: "thm:x" });
+  assert.equal(running.primary, null);
+  assert.deepEqual(running.overflow, []);
+  assert.deepEqual(running.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
+});
+
 test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item", () => {
   const target = paneItemToFormalizeTarget({
     leanKind: "def",
@@ -154,6 +253,119 @@ test("aggregatePaneStatus applies file status precedence", () => {
   assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "valid" }]), "valid");
   assert.equal(aggregatePaneStatus([{ status: "defined" }, { status: "defined" }]), "defined");
   assert.equal(aggregatePaneStatus([{ status: "valid" }, { status: "defined" }, { status: "disproved" }]), "mixed");
+});
+
+test("paneProgressBucketForItem maps pane and companion statuses to progress buckets", () => {
+  for (const status of ["valid", "formalized", "defined", "disproved"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "success");
+  }
+  for (const status of ["stub-generated", "sorry_stub"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "sorryStubbed");
+  }
+  for (const status of ["failed", "invalid", "error"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "failed");
+  }
+  for (const status of ["missing-stub", "unformalized", "unknown", "stale", "in-progress", undefined, "new-weird-status"]) {
+    assert.equal(paneProgressBucketForItem({ status }), "unformalized");
+  }
+});
+
+test("summarizePaneProgress counts representative fractional file summaries", () => {
+  assert.deepEqual(summarizePaneProgress([
+    { status: "missing-stub" },
+    { status: "missing-stub" },
+    { status: "missing-stub" },
+    { status: "missing-stub" },
+    { status: "invalid" },
+    { status: "valid" },
+    { status: "valid" },
+    { status: "valid" }
+  ]), {
+    total: 8,
+    success: 3,
+    sorryStubbed: 0,
+    failed: 1,
+    unformalized: 4,
+    inProgress: 0
+  });
+
+  assert.deepEqual(summarizePaneProgress([
+    { status: "valid" },
+    { status: "defined" },
+    { status: "disproved" },
+    { status: "formalized" },
+    { status: "valid" },
+    { status: "defined" },
+    { status: "sorry_stub" },
+    { status: "missing-stub" }
+  ]), {
+    total: 8,
+    success: 6,
+    sorryStubbed: 1,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  });
+
+  assert.deepEqual(summarizePaneProgress([
+    { status: "stub-generated" },
+    { status: "stub-generated" },
+    { status: "unknown" }
+  ]), {
+    total: 3,
+    success: 0,
+    sorryStubbed: 2,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  });
+});
+
+test("paneProgressSegments returns ordered nonzero segments with percentages", () => {
+  assert.deepEqual(paneProgressSegments({
+    total: 8,
+    success: 6,
+    sorryStubbed: 1,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  }).map((segment) => [segment.id, segment.count, segment.percent, segment.title]), [
+    ["success", 6, 75, "Successful: 6 of 8, 75%"],
+    ["sorry-stubbed", 1, 12.5, "Sorry-stubbed: 1 of 8, 12.5%"],
+    ["unformalized", 1, 12.5, "Unformalized: 1 of 8, 12.5%"]
+  ]);
+
+  assert.deepEqual(paneProgressSegments({
+    total: 3,
+    success: 0,
+    sorryStubbed: 2,
+    failed: 0,
+    unformalized: 1,
+    inProgress: 0
+  }).map((segment) => [segment.id, segment.count, segment.percent, segment.title]), [
+    ["sorry-stubbed", 2, 66.66666666666666, "Sorry-stubbed: 2 of 3, 66.7%"],
+    ["unformalized", 1, 33.33333333333333, "Unformalized: 1 of 3, 33.3%"]
+  ]);
+});
+
+test("formatPaneProgressLabel omits zero-count buckets and includes running count", () => {
+  assert.equal(formatPaneProgressLabel("main.tex", {
+    total: 8,
+    success: 6,
+    sorryStubbed: 0,
+    failed: 1,
+    unformalized: 1,
+    inProgress: 0
+  }), "main.tex: 8 Lea items, 6 successful, 1 failed, 1 unformalized.");
+
+  assert.equal(formatPaneProgressLabel("analysis.tex", {
+    total: 6,
+    success: 2,
+    sorryStubbed: 4,
+    failed: 0,
+    unformalized: 0,
+    inProgress: 1
+  }), "analysis.tex: 6 Lea items, 2 successful, 4 sorry-stubbed, 1 in progress.");
 });
 
 test("treeAncestorIdsForFile returns expandable folder and file ids", () => {
@@ -378,21 +590,6 @@ test("formatBreakageAttribution distinguishes self-break, rename, suppression, a
     formatBreakageAttribution({ upstreamLabel: "a", classificationKind: "signature", via: "formalize" }),
     "Broken by a re-formalization to a."
   );
-});
-
-test("formatRepairConfirmation names the items, the upstream change, the model, and the run count", () => {
-  const text = formatRepairConfirmation({
-    items: [{ targetLabel: "b" }, { targetLabel: "c" }],
-    breakage: { upstreamLabel: "a", classificationKind: "renamed", renamedFrom: "a", renamedTo: "a2" },
-    modelLabel: "GPT-5"
-  });
-  assert.match(text, /Repair 2 items with Lea: b, c\./);
-  assert.match(text, /`a` was renamed to `a2`/);
-  assert.match(text, /2 agent runs with GPT-5/);
-
-  // no model label -> generic copy, never an empty "with"
-  const fallback = formatRepairConfirmation({ items: [{ targetLabel: "b" }], breakage: null });
-  assert.match(fallback, /1 agent run with the configured Lea model/);
 });
 
 test("formatRepairOutcome covers every batch item state", () => {

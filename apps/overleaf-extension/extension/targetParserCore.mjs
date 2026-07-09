@@ -71,9 +71,16 @@ function parseMarkedTargets(source) {
     .map((group) => ({ ...group, syntax: "comment" }));
   const tagDetection = findLeaTagGroups(maskedSource);
   diagnostics.push(...tagDetection.diagnostics);
+  // leacode reads the RAW source: its interior is masked out of maskedSource
+  // (it is a verbatim-like environment), so the tag/comment scanners above
+  // never see it, and it is recovered here instead.
+  const codeDetection = findLeaCodeEnvironments(source);
+  diagnostics.push(...codeDetection.diagnostics);
 
-  if (tagDetection.groups.length > 0 && !hasLeaTagPackageLoaded(source)) {
-    const firstTag = tagDetection.groups[0];
+  const packageDependentGroups = [...tagDetection.groups, ...codeDetection.groups]
+    .sort((a, b) => a.from - b.from);
+  if (packageDependentGroups.length > 0 && !hasLeaTagPackageLoaded(source)) {
+    const firstTag = packageDependentGroups[0];
     diagnostics.push(buildDiagnostic({
       code: "tag_package_not_loaded",
       message: "A Lea tag command (e.g. \\leatheorem{...}) is used, but nothing in the preamble defines it. "
@@ -85,7 +92,7 @@ function parseMarkedTargets(source) {
   }
 
   const groupsByEnvironment = new Map();
-  for (const group of [...commentGroups, ...tagDetection.groups]) {
+  for (const group of [...commentGroups, ...tagDetection.groups, ...codeDetection.groups]) {
     // A tag with a body argument (the standalone form) already carries its
     // own ready-made environment-shaped object and needs no lookup at all.
     let environment = group.standaloneEnvironment;
@@ -332,6 +339,79 @@ function findLeaTagGroups(source) {
   return { groups, diagnostics };
 }
 
+// Detects \begin{leacode}{metadata}...\end{leacode} blocks (lea-tags.sty). The
+// body between the metadata argument and \end{leacode} is Lean code, read
+// verbatim and used as the target's statement text -- the same role the body
+// of a standalone \leatheorem{...}{...} tag plays, so this produces the same
+// synthetic-environment group shape and flows through the identical downstream
+// pipeline (kind inference, label validation, extractEnvironmentText). `kind=`
+// is honored exactly as the generic \lea{...} command honors it.
+//
+// Runs against the RAW source (not the masked source the other scanners use),
+// because leacode's own interior is masked out of that for everyone else. A
+// leacode block shown *inside* another verbatim-like environment (e.g. a
+// documentation example) is not a real block, so matches inside those other
+// opaque spans are skipped.
+function findLeaCodeEnvironments(source) {
+  const groups = [];
+  const diagnostics = [];
+  const offset = documentBodyOffset(source);
+  const otherOpaqueSpans = findOpaqueSpans(source, OPAQUE_ENVIRONMENT_NAMES);
+  const beginPattern = new RegExp(`\\\\begin\\s*\\{\\s*${LEA_CODE_ENVIRONMENT}\\s*\\}`, "g");
+  let match;
+
+  while ((match = beginPattern.exec(source))) {
+    const beginStart = match.index;
+    if (beginStart < offset) continue;
+    if (otherOpaqueSpans.some((span) => beginStart >= span.contentFrom && beginStart < span.contentTo)) continue;
+
+    const afterBegin = beginPattern.lastIndex;
+    // Metadata argument: a single balanced { } on the same line as \begin, the
+    // same single-line convention the tag commands' metadata argument uses.
+    const metaStart = skipInlineWhitespace(source, afterBegin);
+    const metaArg = source[metaStart] === "{" ? parseBalancedSuffix(source, metaStart) : { ok: false };
+
+    const endPattern = new RegExp(`\\\\end\\s*\\{\\s*${LEA_CODE_ENVIRONMENT}\\s*\\}`, "g");
+    endPattern.lastIndex = metaArg.ok ? metaArg.end : afterBegin;
+    const endMatch = endPattern.exec(source);
+    if (!endMatch) {
+      diagnostics.push(buildDiagnostic({
+        code: "malformed_tag",
+        message: `\\begin{${LEA_CODE_ENVIRONMENT}} is missing its \\end{${LEA_CODE_ENVIRONMENT}}.`,
+        from: beginStart,
+        to: afterBegin
+      }));
+      continue;
+    }
+
+    const bodyFrom = metaArg.ok ? metaArg.end : afterBegin;
+    const bodyTo = endMatch.index;
+    const metadata = parseMetadata(metaArg.ok ? source.slice(metaStart + 1, metaArg.end - 1) : "");
+
+    groups.push({
+      from: beginStart,
+      to: endPattern.lastIndex,
+      syntax: "leacode",
+      command: LEA_CODE_ENVIRONMENT,
+      hasFormalize: true,
+      hasDefine: false,
+      hasTargetMarker: true,
+      metadata,
+      standaloneEnvironment: {
+        name: LEA_CODE_ENVIRONMENT,
+        from: beginStart,
+        to: endPattern.lastIndex,
+        badgeFrom: beginStart,
+        bodyFrom,
+        bodyTo
+      }
+    });
+    beginPattern.lastIndex = endPattern.lastIndex;
+  }
+
+  return { groups, diagnostics };
+}
+
 // Like skipInlineWhitespace, but crosses newlines/blank lines -- used only to
 // check for a tag's optional body argument, matching real TeX argument
 // scanning (which skips arbitrary whitespace between macro arguments, not
@@ -382,6 +462,9 @@ function hasLeaTagPackageLoaded(source) {
     || /\\input\s*\{\s*lea-tags\s*\}/.test(preamble)
     || /\\(?:New|Renew|Provide)DocumentCommand\s*\{\s*\\lea\s*\}/.test(preamble)
     || /\\(?:new|renew|provide)command\*?\s*\{\s*\\lea\s*\}/.test(preamble)
+    // Inline-snippet users who only use the code-block form define just the
+    // `leacode` environment, without any \lea command -- recognize that too.
+    || new RegExp(`\\\\(?:lst)?newenvironment\\s*\\{\\s*${LEA_CODE_ENVIRONMENT}\\s*\\}`).test(preamble)
   );
 }
 
@@ -459,9 +542,20 @@ function findSupportedEnvironments(source) {
 //      *inner*, purely-illustrative "\begin{theorem}" text be matched as its
 //      own real environment, colliding on label with the actual target the
 //      example was describing. Masking the interior is what stops that.
-const VERBATIM_LIKE_ENVIRONMENTS = new Set([
+const OPAQUE_ENVIRONMENT_NAMES = [
   "verbatim", "verbatim*", "Verbatim", "lstlisting", "minted", "comment"
-]);
+];
+
+// The `leacode` environment (lea-tags.sty) is a `listings`-backed code block:
+// LaTeX reads its interior verbatim (like the names above), so for every
+// LaTeX-structure scanner it is just another opaque span and its interior must
+// be masked out. It differs in exactly one way -- unlike the others, its
+// interior IS a Lea target (the code the author wrote, sent to Lea verbatim as
+// the statement). That single exception is handled by findLeaCodeEnvironments,
+// which reads the RAW (pre-mask) source; every other scanner sees it masked.
+export const LEA_CODE_ENVIRONMENT = "leacode";
+
+const VERBATIM_LIKE_ENVIRONMENTS = new Set([...OPAQUE_ENVIRONMENT_NAMES, LEA_CODE_ENVIRONMENT]);
 
 // Structural environments that are never themselves a theorem/definition
 // target, even though they're syntactically just another \begin{X}...\end{X}
@@ -477,9 +571,9 @@ const NON_TARGET_ENVIRONMENTS = new Set(["document", ...VERBATIM_LIKE_ENVIRONMEN
 // Finds every [contentFrom, contentTo) span whose text lies strictly between
 // a \begin{name}...\end{name} pair for a verbatim-like name -- i.e. text
 // LaTeX itself would never tokenize as \begin/\end/%.
-function findOpaqueSpans(source) {
+function findOpaqueSpans(source, names = VERBATIM_LIKE_ENVIRONMENTS) {
   const spans = [];
-  for (const name of VERBATIM_LIKE_ENVIRONMENTS) {
+  for (const name of names) {
     const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const beginPattern = new RegExp(`\\\\begin\\s*\\{\\s*${escapedName}\\s*\\}`, "g");
     let beginMatch;

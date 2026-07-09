@@ -29,9 +29,10 @@ import {
   isValidLeanIdentifier
 } from "../shared/theoremParser.mjs";
 import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
-import { buildChatPrompt, buildRepairPrompt, chatTargetKey, toChatSessionResponse } from "./chatPrompt.mjs";
+import { buildChatPrompt, buildRepairPrompt, chatTargetKey, projectIdentityPreambleLines, toChatSessionResponse } from "./chatPrompt.mjs";
 import { applyEnvDefaults, loadDotEnv, normalizeBoolean } from "./config.mjs";
 import {
+  containsSorryMarker,
   dependentsOf,
   listProjectProofFiles,
   moduleNameFromProjectStep,
@@ -48,15 +49,18 @@ import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
+  fetchProjectIdentityBySlug,
   fetchProjectShareStatus,
   interruptApiRun,
   mirrorProjectTexFiles,
+  previewProjectNamespace,
   pushProjectBySlug,
   putAdapterSettings,
   runApiProofJob,
   runApiSessionLeanCheck,
   rebuildApiSessionModule,
   setProjectRemoteBySlug,
+  updateProjectIdentityBySlug,
   writeApiSessionFile
 } from "./leaApiClient.mjs";
 
@@ -140,16 +144,22 @@ export async function createServer({
   await ensureStartupLeaRuntime(state);
   await recoverInterruptedJobs(state);
 
-  return http.createServer(async (request, response) => {
+  const server = http.createServer(async (request, response) => {
     try {
       await routeRequest(request, response, state);
     } catch (error) {
-      sendJson(response, 500, {
-        error: "internal_error",
+      // httpError-tagged failures (bad JSON, oversized body) keep their real
+      // status; everything else is a genuine 500 (AUDIT M5).
+      const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+      sendJson(response, statusCode, {
+        error: typeof error?.code === "string" && error.code ? error.code : "internal_error",
         message: error instanceof Error ? error.message : String(error)
       });
     }
   });
+  // Exposed for the boot log's provider-aware readiness warning (AUDIT L10).
+  server.leaState = state;
+  return server;
 }
 
 export async function recoverInterruptedJobs(state) {
@@ -166,6 +176,11 @@ export async function recoverInterruptedJobs(state) {
     if (job.logPath) {
       await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
     }
+    // An interrupted re-formalize never got to produce a replacement for the
+    // artifact its pre-run cleanup deleted — restore it (AUDIT H2). The
+    // backups persist on job.retryCleanup precisely so this survives a
+    // restart.
+    await restorePreviousRunArtifacts({ state, job, target: { projectMarkdownPath: job.projectMarkdownPath } });
     changed = true;
   }
 
@@ -192,6 +207,7 @@ export async function handleGetStatuses(payload, state) {
     }
 
     statuses[targetKey({ targetKind, targetLabel })] = await getTargetStatus({
+      state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId: payload.overleafProjectId || "unknown",
       targetKind,
@@ -209,7 +225,7 @@ export async function handleFormalize(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax } = validation;
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax, projectName, projectNamespace } = validation;
   const expectedHash = hashTargetText(targetText);
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match targetText.");
@@ -224,15 +240,18 @@ export async function handleFormalize(payload, state) {
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
-  if (spendLimitReached(state)) {
+  if (await spendLimitReached(state)) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
   }
 
+  const currentIdentity = await resolveRunProjectIdentity({ state, overleafProjectId, projectName, projectNamespace, refresh: true });
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
-    targetLabel
+    targetLabel,
+    projectName: currentIdentity.projectName,
+    projectNamespace: currentIdentity.namespace
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -243,8 +262,11 @@ export async function handleFormalize(payload, state) {
   }
 
   const usesResolution = await resolveTheoremUses({
+    state,
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     targetUses,
     jobs: state.jobs || {}
   });
@@ -274,6 +296,7 @@ export async function handleFormalize(payload, state) {
   // per-run LaTeX prep happens here anymore.
   const reusableStub = target.targetKind === "theorem"
     ? await findReusableStubForFormalization({
+        state,
         leaRepoPath: state.settings.leaRepoPath,
         target,
         jobs: state.jobs || {}
@@ -312,6 +335,7 @@ export async function handleFormalize(payload, state) {
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
+    await restorePreviousRunArtifacts({ state, job, target });
     await writeJson(state.jobsPath, state.jobs);
   });
 
@@ -327,7 +351,7 @@ export async function handleStub(payload, state) {
     return errorResponse(400, validation.error, validation.message);
   }
 
-  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax } = validation;
+  const { overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax, projectName, projectNamespace } = validation;
   if (targetKind !== "theorem") {
     return errorResponse(400, "unsupported_stub_target", "Stub generation is only supported for theorem targets.");
   }
@@ -342,15 +366,18 @@ export async function handleStub(payload, state) {
   if (!leaValidation.ok) {
     return errorResponse(400, leaValidation.error, leaValidation.message);
   }
-  if (spendLimitReached(state)) {
+  if (await spendLimitReached(state)) {
     return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
   }
 
+  const currentIdentity = await resolveRunProjectIdentity({ state, overleafProjectId, projectName, projectNamespace, refresh: true });
   const target = buildLeaTarget({
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
-    targetLabel
+    targetLabel,
+    projectName: currentIdentity.projectName,
+    projectNamespace: currentIdentity.namespace
   });
   const activeJob = findActiveJob(state.jobs || {}, target.jobKey);
   if (activeJob) {
@@ -361,8 +388,11 @@ export async function handleStub(payload, state) {
   }
 
   const usesResolution = await resolveTheoremUses({
+    state,
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     targetUses,
     jobs: state.jobs || {}
   });
@@ -475,8 +505,167 @@ function resolveShareTarget(payload, state) {
 // diverged-history "ask Lea to reconcile" hint) — forward them verbatim.
 function adapterDetail(result, fallback) {
   const detail = result.body?.detail;
+  if (detail && typeof detail === "object") return detail.message || JSON.stringify(detail);
   if (typeof detail === "string" && detail) return detail;
   return result.error || fallback;
+}
+
+function adapterErrorCode(result, fallback) {
+  const detail = result.body?.detail;
+  return (detail && typeof detail === "object" && detail.error) || result.body?.error || fallback;
+}
+
+function normalizeCompanionIdentity(identity, overleafProjectId) {
+  const slug = slugProjectId(overleafProjectId);
+  if (identity && typeof identity === "object") {
+    return {
+      projectId: identity.projectId || null,
+      overleafProjectId,
+      slug: identity.slug || slug,
+      projectName: identity.projectName || identity.title || identity.slug || slug,
+      namespace: identity.namespace || projectNamespaceFromSlug(slug),
+      namespaceEditable: identity.namespaceEditable !== false,
+      repoPath: identity.repoPath || null,
+      hasRecordedProofs: Boolean(identity.hasRecordedProofs),
+      exists: identity.exists !== false,
+      renameInProgress: Boolean(identity.renameInProgress)
+    };
+  }
+  return {
+    projectId: null,
+    overleafProjectId,
+    slug,
+    projectName: suggestedProjectName({ overleafProjectId }),
+    namespace: projectNamespaceFromSlug(slug),
+    namespaceEditable: true,
+    repoPath: null,
+    hasRecordedProofs: false,
+    exists: false
+  };
+}
+
+export async function handleProjectIdentity(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  const result = await fetchProjectIdentityBySlug(target);
+  if (!result.ok) {
+    if (result.status === 404) {
+      return { statusCode: 200, body: { ok: true, identity: normalizeCompanionIdentity(null, overleafProjectId) } };
+    }
+    return errorResponse(result.status || 502, "project_identity_failed", adapterDetail(result, "Could not load project identity."));
+  }
+  const identity = normalizeCompanionIdentity(result.body, overleafProjectId);
+  state.projectIdentities ||= {};
+  state.projectIdentities[identity.slug] = identity;
+  return { statusCode: 200, body: { ok: true, identity } };
+}
+
+function cachedProjectIdentity({ state, overleafProjectId, projectSlug = "" }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  return state?.projectIdentities?.[slug] || null;
+}
+
+function isCompleteProjectIdentity(identity) {
+  return Boolean(identity?.slug && identity?.projectName && identity?.namespace);
+}
+
+function isAuthoritativeProjectIdentity(identity) {
+  return isCompleteProjectIdentity(identity) && identity.exists !== false;
+}
+
+function fallbackRunProjectIdentity({ overleafProjectId, projectSlug = "", projectName = "", projectNamespace = "" }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  return {
+    projectId: null,
+    overleafProjectId,
+    slug,
+    projectName: suggestedProjectName({ overleafProjectId, projectName }),
+    namespace: String(projectNamespace || "").trim() || projectNamespaceFromSlug(slug),
+    namespaceEditable: true,
+    repoPath: null,
+    hasRecordedProofs: false,
+    exists: false
+  };
+}
+
+async function resolveRunProjectIdentity({ state, overleafProjectId, projectSlug = "", projectName = "", projectNamespace = "", refresh = false }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  const cached = cachedProjectIdentity({ state, overleafProjectId, projectSlug: slug });
+  if (!refresh && isAuthoritativeProjectIdentity(cached)) return cached;
+
+  const target = resolveShareTarget({ overleafProjectId }, state);
+  if (!target.error) {
+    const result = await fetchProjectIdentityBySlug(target);
+    if (result.ok) {
+      const identity = normalizeCompanionIdentity(result.body, overleafProjectId);
+      state.projectIdentities ||= {};
+      state.projectIdentities[identity.slug] = identity;
+      return identity;
+    }
+  }
+
+  if (isCompleteProjectIdentity(cached)) return cached;
+  return fallbackRunProjectIdentity({ overleafProjectId, projectSlug: slug, projectName, projectNamespace });
+}
+
+export async function handleProjectIdentityPreview(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const projectName = String(payload.projectName || "").trim();
+  if (!projectName) return errorResponse(400, "missing_project_name", "Project name is required.");
+  const result = await previewProjectNamespace({
+    ...target,
+    projectName,
+    namespace: payload.namespace || null,
+    excludeProjectId: payload.excludeProjectId || null
+  });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, adapterErrorCode(result, "project_preview_failed"), adapterDetail(result, "Could not preview the namespace."));
+  }
+  return { statusCode: 200, body: { ok: true, ...result.body } };
+}
+
+export async function handleProjectIdentityUpdate(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  const projectName = String(payload.projectName || "").trim();
+  if (!projectName) return errorResponse(400, "missing_project_name", "Project name is required.");
+  const result = await updateProjectIdentityBySlug({
+    ...target,
+    projectName,
+    mode: payload.mode || "display-only",
+    namespace: payload.namespace || null,
+    expectedNamespace: payload.expectedNamespace || null,
+    createIfMissing: Boolean(payload.createIfMissing)
+  });
+  if (!result.ok) {
+    return errorResponse(result.status || 502, adapterErrorCode(result, "project_identity_update_failed"), adapterDetail(result, "Could not update project identity."));
+  }
+  const identity = normalizeCompanionIdentity(result.body?.identity, overleafProjectId);
+  state.projectIdentities ||= {};
+  state.projectIdentities[identity.slug] = identity;
+  let jobsChanged = false;
+  for (const job of Object.values(state.jobs || {})) {
+    if (job?.overleafProjectId === overleafProjectId || job?.projectSlug === target.slug) {
+      if (job.projectName !== identity.projectName) {
+        job.projectName = identity.projectName;
+        jobsChanged = true;
+      }
+      if (result.body?.migration && job.projectNamespace !== identity.namespace) {
+        job.projectNamespace = identity.namespace;
+        jobsChanged = true;
+      }
+    }
+  }
+  if (jobsChanged) await writeJson(state.jobsPath, state.jobs || {});
+  return { statusCode: 200, body: { ok: true, identity, migration: result.body?.migration || null } };
+}
+
+async function resolveProjectNamespace({ state, overleafProjectId, projectSlug = "" }) {
+  const slug = projectSlug || slugProjectId(overleafProjectId);
+  return state?.projectIdentities?.[slug]?.namespace || projectNamespaceFromSlug(slug);
 }
 
 export async function handleShareStatus(payload, state) {
@@ -880,7 +1069,15 @@ export async function handleChatMessage(payload, state) {
   await syncSharedSettingsFromAdapter(state);
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
-  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  const currentIdentity = await resolveRunProjectIdentity({
+    state,
+    overleafProjectId: target.overleafProjectId,
+    projectSlug: target.projectSlug,
+    refresh: true
+  });
+  target.projectName = currentIdentity.projectName;
+  target.projectNamespace = currentIdentity.namespace;
 
   const { leaSessionId, latestJobHash, activeJob } = resolveChatSession({ state, target });
   if (activeJob) {
@@ -909,9 +1106,13 @@ export async function handleChatMessage(payload, state) {
   }
   // A new message supersedes the previous run's impact notice. Cleared here,
   // BEFORE the run starts -- clearing after would race this run's own
-  // continuation (see the record write below, which preserves it).
+  // continuation (see the record write below, which preserves it). Persist
+  // the clear immediately (AUDIT L2): if startChatRun then fails, we return
+  // early, and without this the on-disk record would still carry the impact
+  // the user's send was meant to supersede -- resurrecting it on restart.
   if (state.chatSessions?.[target.targetKey]?.lastRunImpact) {
     delete state.chatSessions[target.targetKey].lastRunImpact;
+    await persistChatSessions(state);
   }
 
   let started;
@@ -1167,14 +1368,31 @@ function resolveDependentSession({ state, overleafProjectId, targetLabel }) {
 // when the label-keyed fast path misses.
 function findLatestJobWithLeaSessionByDeclarationName(jobs, projectSlug, declarationName) {
   const prefix = `${projectSlug}:`;
-  return Object.values(jobs || {})
-    .filter((job) =>
-      job &&
-      typeof job.jobKey === "string" &&
-      job.jobKey.startsWith(prefix) &&
-      job.declarationName === declarationName &&
-      (job.leaSessionId || job.recorderSessionId))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) =>
+    job &&
+    typeof job.jobKey === "string" &&
+    job.jobKey.startsWith(prefix) &&
+    job.declarationName === declarationName &&
+    (job.leaSessionId || job.recorderSessionId))[0] || null;
+}
+
+// Rename bookkeeping: `job.declarationName` caches "what Lean symbol does this
+// item's working file currently define" -- and an item has ONE working file,
+// so every job record under its key must agree. Updating only the newest
+// session-linked job (as this used to) left older records stale, and any
+// status reader that resolves through one of those (getTheoremStatus's
+// newest-terminal branch reads the formalize job even when a repair job is
+// newer) then hunted the session history for the OLD name and served a
+// pre-rename snapshot as the item's artifact.
+function recordRenamedDeclaration(jobs, jobKey, newName) {
+  let changed = false;
+  for (const job of Object.values(jobs || {})) {
+    if (job && job.jobKey === jobKey && job.declarationName !== newName) {
+      job.declarationName = newName;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 export async function handleLeanPaneEditStart(payload, state) {
@@ -1270,7 +1488,30 @@ export async function handleLeanPaneEditSave(payload, state) {
 
   const check = await runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path });
   if (!check.ok) {
-    return errorResponse(check.status || 502, "edit_check_failed", check.error || "Could not check the edit.");
+    // AUDIT M3: the WRITE already landed — the file on disk is the user's new
+    // content. A bare 502 here would leave the pane's chip reading the
+    // pre-edit verdict ("valid") for content that was never checked. Fail
+    // closed on the item itself instead (same vocabulary the cascade uses for
+    // an unverifiable dependent): record an error verdict with no breakage
+    // attribution, so the chip reads "invalid / could not verify" with the
+    // real reason, and the user is told the save landed but verification
+    // couldn't run. Dependents are deliberately not re-checked — there is no
+    // trustworthy build of the edited module to check them against.
+    const detail = `Saved, but the edit could not be verified: ${check.error || "the Lea adapter did not return a lean-check result."} Retry the save when the adapter is reachable.`;
+    if (linkedJob) {
+      recordEditCheckVerdict(linkedJob, { status: "error", detail });
+      await writeJson(state.jobsPath, state.jobs);
+    }
+    return {
+      statusCode: 200,
+      body: {
+        ok: true,
+        unchanged: false,
+        checkUnavailable: true,
+        ownResult: { path: before.path, checkStatus: "unknown", checkDetail: detail, classification: null },
+        dependentsImpact: []
+      }
+    };
   }
   const ownCheckFailed = String(check.body?.status || "").toLowerCase() !== "ok";
   // Snapshot BEFORE recordEditCheckVerdict mutates it -- this is the only
@@ -1321,19 +1562,19 @@ export async function handleLeanPaneEditSave(payload, state) {
 
   // The pane's own item identity (`targetLabel`) stays pinned to the LaTeX
   // marker's label=... forever -- that's correct, it's the doc-side anchor.
-  // But `linkedJob.declarationName` is a *cache* of "what Lean symbol does
-  // this session's file currently define," taken at formalize time, and nothing
-  // refreshed it on a manual rename until now. Everything that reads it
-  // (buildJobResponse, getLatestMappedJobStatus, and -- the concrete bug this
-  // fixes -- readLeanPaneArtifactFromSession's "does the latest step still
-  // contain this name" filter) was still searching for the OLD name after a
-  // rename, so the item's displayed artifact silently fell back to the last
-  // code_step that matched it: a stale, pre-rename snapshot, even though the
-  // real file on disk (and the session's actual latest code_step) already had
-  // the rename. Updating it here keeps every downstream reader looking for the
-  // name that's actually in the file now.
+  // But `declarationName` is a *cache* of "what Lean symbol does this
+  // session's file currently define," taken at formalize time. Everything
+  // that reads it (buildJobResponse, getLatestMappedJobStatus,
+  // readLeanPaneArtifactFromSession's "does the latest step still contain
+  // this name" filter) must see the name that's actually in the file now, or
+  // the item's displayed artifact silently falls back to the last code_step
+  // matching the OLD name: a stale, pre-rename snapshot. Updated on EVERY job
+  // under the item's key (recordRenamedDeclaration), not just linkedJob --
+  // status derivation can resolve through an older job than the newest
+  // session-linked one (e.g. the original formalize job after a repair).
   if (classification.kind === "renamed" && linkedJob) {
     linkedJob.declarationName = classification.to;
+    recordRenamedDeclaration(state.jobs, linkedJob.jobKey, classification.to);
     jobsChanged = true;
   }
 
@@ -1504,6 +1745,7 @@ async function runPostRunCascade({ state, overleafProjectId, targetLabel, snapsh
   // every declarationName reader has the same stale-cache bug otherwise.
   if (classification.kind === "renamed" && ownJob && ownJob.declarationName !== classification.to) {
     ownJob.declarationName = classification.to;
+    recordRenamedDeclaration(state.jobs, ownJob.jobKey, classification.to);
     jobsChanged = true;
   }
 
@@ -1551,6 +1793,8 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
+    projectName: target.projectName || target.projectSlug,
+    projectNamespace: target.projectNamespace || null,
     projectMarkdownPath: target.projectMarkdownPath,
     // Identity/display fields copied from the previous linked job, and the
     // broken-state fields mirrored, so this job -- which becomes the target's
@@ -1563,7 +1807,6 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     recordedProofPath: linkedJob?.recordedProofPath || null,
     moduleName: linkedJob?.moduleName || null,
     leanStatement: linkedJob?.leanStatement || null,
-    projectNamespace: linkedJob?.projectNamespace || null,
     lastEditCheckStatus: linkedJob?.lastEditCheckStatus || null,
     lastEditCheckDetail: linkedJob?.lastEditCheckDetail || null,
     lastEditBreakage: breakage,
@@ -1810,10 +2053,20 @@ async function startRepairRun({ state, overleafProjectId, targetKind: requestedK
     return { status: "error", error: "repair_start_failed", statusCode: 502, message: "Could not read the item's recorded Lean file to repair against." };
   }
 
-  const target = buildLeaTarget({ leaRepoPath: state.settings.leaRepoPath, overleafProjectId, targetKind, targetLabel });
+  const currentIdentity = await resolveRunProjectIdentity({ state, overleafProjectId, refresh: true });
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    targetKind,
+    targetLabel,
+    projectName: currentIdentity.projectName,
+    projectNamespace: currentIdentity.namespace
+  });
   const prompt = buildRepairPrompt(
     {
       projectSlug: target.projectSlug,
+      projectName: target.projectName,
+      projectNamespace: target.projectNamespace,
       targetKind,
       targetLabel,
       leanDeclarationName: linkedJob.declarationName || targetLabel,
@@ -1852,7 +2105,7 @@ export async function handleLeanPaneRepairStart(payload, state) {
   await syncSharedSettingsFromAdapter(state);
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
-  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
 
   const started = await startRepairRun({ state, overleafProjectId, targetKind, targetLabel });
   if (started.status === "error") return errorResponse(started.statusCode, started.error, started.message);
@@ -1872,6 +2125,23 @@ export async function handleLeanPaneRepairStart(payload, state) {
 // restart mid-batch loses the loop but nothing an offer can't re-derive.
 
 let repairBatchCounter = 0;
+
+// Batch records (with their importsByModule maps) are held in memory only and
+// were never cleaned up (AUDIT L5). Before creating a new one, drop settled
+// batches beyond a small recent window so a long-running companion doesn't
+// accumulate them without bound. A still-running or paused batch is always
+// kept (its poller / continue endpoint still needs it).
+const MAX_RETAINED_REPAIR_BATCHES = 10;
+
+function pruneRepairBatches(batches) {
+  const settled = Object.values(batches)
+    .filter((batch) => batch && (batch.done || batch.pausedOn?.reason === "batch_error") && !batch.running)
+    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  const excess = settled.length - MAX_RETAINED_REPAIR_BATCHES;
+  for (let i = 0; i < excess; i += 1) {
+    delete batches[settled[i].batchId];
+  }
+}
 
 function repairBatchSnapshot(batch) {
   return {
@@ -1905,12 +2175,12 @@ export async function handleLeanPaneRepairAll(payload, state) {
   await syncSharedSettingsFromAdapter(state);
   const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
   if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
-  if (spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
 
   // Project import graph, for topological ordering and depends-on-failed
   // skipping. Full-project (not batch-only): a dependency path between two
   // batch items may pass through a module that isn't being repaired.
-  const namespace = projectNamespaceFromSlug(slugProjectId(overleafProjectId));
+  const namespace = await resolveProjectNamespace({ state, overleafProjectId });
   let files = [];
   try {
     files = await listProjectProofFiles({ leaRepoPath: state.settings.leaRepoPath, namespace });
@@ -1942,6 +2212,7 @@ export async function handleLeanPaneRepairAll(payload, state) {
     done: false
   };
   state.repairBatches ||= {};
+  pruneRepairBatches(state.repairBatches);
   state.repairBatches[batch.batchId] = batch;
 
   runRepairBatch(state, batch).catch((error) => {
@@ -1996,7 +2267,7 @@ async function runRepairBatch(state, batch) {
       if (entry.state !== "pending") continue;
       // A cap reached mid-batch pauses (resumable once raised) rather than
       // failing the item.
-      if (spendLimitReached(state)) {
+      if (await spendLimitReached(state)) {
         batch.pausedOn = { targetLabel: entry.targetLabel, reason: "max_spend" };
         break;
       }
@@ -2107,7 +2378,8 @@ function startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot = nu
     autoApprove: true,
     autonomous: true,
     projectSlug: target.projectSlug || null,
-    projectTitle: target.projectSlug || null,
+    projectTitle: target.projectName || target.projectSlug || null,
+    projectNamespace: target.projectNamespace || null,
     origin: "overleaf",
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
     onRunStarted: async (runId, sessionId) => {
@@ -2333,7 +2605,7 @@ export async function handleGetUsage(payload, state) {
       allTime,
       leaMaxSpendUsd,
       leaCurrentSpendUsd: allTime.costUsd,
-      leaSpendLimitReached: spendLimitReached(state)
+      leaSpendLimitReached: await spendLimitReached(state)
     }
   };
 }
@@ -2428,11 +2700,24 @@ export async function ensureStartupLeaRuntime(state) {
 }
 
 async function routeRequest(request, response, state) {
-  setCorsHeaders(response);
+  setCorsHeaders(response, request);
 
   if (request.method === "OPTIONS") {
     response.writeHead(204);
     response.end();
+    return;
+  }
+
+  // Belt and suspenders over the CORS grant above: a cross-site "simple"
+  // request still executes server-side even when the page can't read the
+  // response, so a request that CARRIES a browser Origin we don't recognize
+  // is rejected outright rather than merely left unreadable.
+  const requestOrigin = String(request.headers?.origin || "");
+  if (requestOrigin && !isAllowedBrowserOrigin(requestOrigin)) {
+    sendJson(response, 403, {
+      error: "forbidden_origin",
+      message: `Requests from origin ${requestOrigin} are not allowed.`
+    });
     return;
   }
 
@@ -2485,7 +2770,6 @@ async function routeRequest(request, response, state) {
       overleafProjectId: url.searchParams.get("overleafProjectId") || ""
     }, state);
     if (result.zip) {
-      setCorsHeaders(response);
       response.writeHead(200, {
         "Content-Type": result.zip.contentType || "application/zip",
         "Content-Disposition": `attachment; filename="${result.zip.filename}"`,
@@ -2494,6 +2778,26 @@ async function routeRequest(request, response, state) {
       response.end(Buffer.from(result.zip.bytes));
       return;
     }
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/project/identity") {
+    const result = await handleProjectIdentity({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || ""
+    }, state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/project/identity/preview") {
+    const result = await handleProjectIdentityPreview(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "PUT" && url.pathname === "/project/identity") {
+    const result = await handleProjectIdentityUpdate(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
@@ -2641,7 +2945,9 @@ export async function buildSettingsResponse(state) {
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaMaxSpendUsd: normalizeLeaMaxSpendUsd(state.settings.leaMaxSpendUsd),
-    leaCurrentSpendUsd: aggregateUsage(state.jobs || {}, {}).costUsd,
+    // Same source of truth as enforcement (AUDIT H5): the adapter's global
+    // roll-up when reachable, the local job tally otherwise.
+    leaCurrentSpendUsd: await currentSpendUsd(state),
     leaTexMirrorEnabled: state.settings.leaTexMirrorEnabled !== false,
     leaJobTimeoutSeconds: state.settings.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS,
     // Presence only (like provider keys): the raw token lives solely in the
@@ -2975,6 +3281,8 @@ function validateTargetPayload(payload) {
   const targetLabel = String(payload.targetLabel || "");
   const targetText = String(payload.targetText || "");
   const targetContext = String(payload.targetContext || "").trim();
+  const projectName = String(payload.projectName || "").trim();
+  const projectNamespace = String(payload.projectNamespace || "").trim();
   const targetUses = Array.isArray(payload.targetUses)
     ? payload.targetUses.map((value) => String(value || "").trim()).filter(Boolean)
     : [];
@@ -2983,7 +3291,7 @@ function validateTargetPayload(payload) {
   // on the job for debugging/telemetry; it never affects the prompt, jobKey,
   // or any validation/dependency-resolution behavior below. Defaults to
   // "comment" for any client that predates this field.
-  const targetSyntax = payload.syntax === "tag" ? "tag" : "comment";
+  const targetSyntax = ["tag", "leacode"].includes(payload.syntax) ? payload.syntax : "comment";
   if (!overleafProjectId.trim()) {
     return { ok: false, error: "missing_project_id", message: "overleafProjectId is required." };
   }
@@ -3000,7 +3308,7 @@ function validateTargetPayload(payload) {
   if (!targetText.trim()) {
     return { ok: false, error: "missing_target_text", message: "Target text is required." };
   }
-  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax };
+  return { ok: true, overleafProjectId, targetKind, targetLabel, targetText, targetUses, targetContext, targetSyntax, projectName, projectNamespace };
 }
 
 async function atomicWriteJson(filePath, value) {
@@ -3027,6 +3335,14 @@ export function buildOverleafDocumentUrl(overleafProjectId) {
   return `https://www.overleaf.com/project/${encodeURIComponent(id)}`;
 }
 
+function suggestedProjectName({ overleafProjectId, projectName = "" } = {}) {
+  const explicit = String(projectName || "").trim();
+  if (explicit) return explicit;
+  const id = String(overleafProjectId || "").trim();
+  if (!id || id === "unknown") return "Overleaf Project";
+  return "Overleaf Project";
+}
+
 function normalizeTargetKind(value) {
   const kind = String(value || "").trim();
   return kind === "theorem" || kind === "definition" ? kind : "";
@@ -3036,13 +3352,16 @@ function targetKey({ targetKind, targetLabel }) {
   return `${targetKind}:${targetLabel}`;
 }
 
-function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel }) {
+function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel, projectName = "", projectNamespace = "" }) {
   const projectSlug = slugProjectId(overleafProjectId);
   const projectMarkdownPath = buildLeaProjectMarkdownPath({ leaRepoPath, overleafProjectId });
   return {
     overleafProjectId,
     projectId: overleafProjectId,
     projectSlug,
+    leaRepoPath,
+    projectName: suggestedProjectName({ overleafProjectId, projectName }),
+    projectNamespace: String(projectNamespace || "").trim() || null,
     targetKind,
     targetLabel,
     theoremLabel: targetLabel,
@@ -3054,10 +3373,13 @@ function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabe
   };
 }
 
-async function findReusableStubForFormalization({ leaRepoPath, target, jobs }) {
+async function findReusableStubForFormalization({ state, leaRepoPath, target, jobs }) {
   const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+    state,
     leaRepoPath,
     overleafProjectId: target.overleafProjectId,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     theoremLabel: target.theoremLabel,
     jobs
   }));
@@ -3079,26 +3401,45 @@ function findActiveJob(jobs, jobKey) {
   return Object.values(jobs).find((job) => job.jobKey === jobKey && job.status === "in_progress");
 }
 
+// One recency definition for every "latest job" selection (AUDIT L6/L7): a
+// job's recency is when it FINISHED, falling back to when it started for a job
+// still lacking a finishedAt. The old findLatestJob/findLatestFinishedJob
+// sorted by startedAt alone, disagreeing with getTheoremStatus's
+// newest-terminal selection (finishedAt||startedAt) -- a run that started
+// earlier but finished later (now possible with the 409 run-queueing) could be
+// "latest" under one rule and not the other. `jobsByRecencyDesc` also uses
+// plain string comparison rather than localeCompare: ISO-8601 timestamps sort
+// correctly bytewise, and it's deterministic (no locale sensitivity, no odd
+// "null" coercion).
+function jobRecency(job) {
+  return String(job?.finishedAt || job?.startedAt || "");
+}
+
+function jobsByRecencyDesc(jobs, predicate) {
+  return Object.values(jobs || {})
+    .filter(predicate)
+    .sort((a, b) => (jobRecency(a) < jobRecency(b) ? 1 : jobRecency(a) > jobRecency(b) ? -1 : 0));
+}
+
 function findLatestJob(jobs, jobKey, status) {
-  return Object.values(jobs)
-    .filter((job) => job.jobKey === jobKey && job.status === status)
-    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status === status)[0] || null;
 }
 
 function findLatestFinishedJob(jobs, jobKey) {
-  return Object.values(jobs || {})
-    .filter((job) => job.jobKey === jobKey && job.status !== "in_progress")
-    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status !== "in_progress")[0] || null;
 }
 
-async function resolveTheoremUses({ leaRepoPath, overleafProjectId, targetUses, jobs }) {
+async function resolveTheoremUses({ state, leaRepoPath, overleafProjectId, projectName = "", projectNamespace = "", targetUses, jobs }) {
   const resolvedUses = [];
   const unresolvedUses = [];
 
   for (const theoremLabel of targetUses) {
     const status = await resolveTargetUseStatus({
+      state,
       leaRepoPath,
       overleafProjectId,
+      projectName,
+      projectNamespace,
       targetLabel: theoremLabel,
       jobs
     });
@@ -3186,6 +3527,8 @@ async function createLeaJob({ state, target, targetText, targetContext = "", tar
     overleafProjectId: target.overleafProjectId,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
+    projectName: target.projectName || target.projectSlug,
+    projectNamespace: target.projectNamespace || null,
     projectMarkdownPath: target.projectMarkdownPath,
     declarationName: target.targetLabel,
     declarationNameHint: declarationNameHint || null,
@@ -3238,19 +3581,104 @@ async function cleanupPreviousRunArtifacts({ leaRepoPath, target, targetText, jo
     candidateProofPaths.add(entry.proofPath);
   }
 
+  // Back up what is about to be deleted (AUDIT H2): this cleanup runs BEFORE
+  // the new run, so if that run fails, times out, or hits the spend cap, the
+  // previous verified artifact would otherwise be gone for good — and every
+  // dependent that imports its module breaks with it. The backups ride on
+  // job.retryCleanup and are restored by restorePreviousRunArtifacts when the
+  // run does not end verified; dropped once it does.
   const removedProofPaths = [];
+  const proofFileBackups = [];
   for (const proofPath of candidateProofPaths) {
+    const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
+    let content = null;
+    if (absolutePath && existsSync(absolutePath)) {
+      try {
+        content = await fs.readFile(absolutePath, "utf8");
+      } catch {
+        content = null;
+      }
+    }
     if (await removeLeaProofFile({ leaRepoPath, proofPath })) {
       removedProofPaths.push(proofPath);
+      if (content !== null && content.length <= MAX_RETRY_BACKUP_BYTES) {
+        proofFileBackups.push({ proofPath, content });
+      }
     }
   }
 
-  const removedProjectEntries = await removeProjectTheoremEntries({
+  const removedSections = await removeProjectTheoremEntries({
     projectMarkdownPath: target.projectMarkdownPath,
     entriesToRemove
   });
 
-  return { removedProofPaths, removedProjectEntries };
+  return {
+    removedProofPaths,
+    removedProjectEntries: removedSections.map((section) => section.name),
+    backups: {
+      proofFiles: proofFileBackups,
+      markdownSections: removedSections
+        .filter((section) => section.text)
+        .map((section) => ({ name: section.name, text: section.text }))
+    }
+  };
+}
+
+// Cap on how much deleted proof content is stashed on a job record (the
+// backups are persisted with jobs.json); recorded Lean proofs are a few KB.
+const MAX_RETRY_BACKUP_BYTES = 256 * 1024;
+
+// Put back what cleanupPreviousRunArtifacts deleted, after a run that did NOT
+// produce a verified replacement (AUDIT H2). Conservative on purpose: a proof
+// file is only restored when nothing exists at its path (a partial file the
+// failed run left behind is never overwritten), and a markdown section only
+// when no entry with its name is present. Idempotent via retryCleanup.restored.
+async function restorePreviousRunArtifacts({ state, job, target }) {
+  const backups = job?.retryCleanup?.backups;
+  if (!backups || job.retryCleanup.restored) return false;
+  job.retryCleanup.restored = true;
+  let restored = false;
+
+  for (const file of backups.proofFiles || []) {
+    const absolutePath = buildLeaProofPath({
+      leaRepoPath: state.settings.leaRepoPath,
+      proofPath: file.proofPath
+    });
+    if (!absolutePath || existsSync(absolutePath)) continue;
+    try {
+      await atomicWriteFile(absolutePath, file.content, "utf8");
+      restored = true;
+    } catch {
+      // best-effort; the adapter's git history still has the bytes
+    }
+  }
+
+  const sections = backups.markdownSections || [];
+  const projectMarkdownPath = target?.projectMarkdownPath || job?.projectMarkdownPath;
+  if (sections.length > 0 && projectMarkdownPath) {
+    try {
+      const present = new Set((await readProjectTheoremEntries(projectMarkdownPath)).map((entry) => entry.name));
+      const missing = sections.filter((section) => section.name && !present.has(section.name));
+      if (missing.length > 0) {
+        let markdown = "";
+        try {
+          markdown = await fs.readFile(projectMarkdownPath, "utf8");
+        } catch {
+          markdown = "";
+        }
+        const restoredSections = missing.map((section) => section.text.trim()).join("\n\n");
+        await atomicWriteFile(projectMarkdownPath, `${markdown.trimEnd()}\n\n${restoredSections}\n`, "utf8");
+        restored = true;
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  if (restored && job.logPath) {
+    await appendLog(job.logPath, "\n[backend] Run did not produce a verified artifact; restored the previous run's proof and markdown entry.\n");
+  }
+  return restored;
 }
 
 async function removeLeaProofFile({ leaRepoPath, proofPath }) {
@@ -3287,8 +3715,13 @@ async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemov
   for (const section of [...sections].sort((a, b) => b.start - a.start)) {
     nextMarkdown = `${nextMarkdown.slice(0, section.start)}${nextMarkdown.slice(section.end)}`;
   }
-  await fs.writeFile(projectMarkdownPath, nextMarkdown.replace(/\n{3,}/g, "\n\n"), "utf8");
-  return sections.map((section) => section.entry.name);
+  await atomicWriteFile(projectMarkdownPath, collapseBlankRunsOutsideFences(nextMarkdown), "utf8");
+  // Name + original section text, so cleanupPreviousRunArtifacts can stash a
+  // restorable backup (AUDIT H2).
+  return sections.map((section) => ({
+    name: section.entry.name,
+    text: markdown.slice(section.start, section.end)
+  }));
 }
 
 // Run one autonomous proof job against the standalone adapter, returning the
@@ -3306,7 +3739,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
     timeoutMs: job.leaJobTimeoutSeconds * 1000,
     autoApprove: true,
     projectSlug: target.projectSlug || null,
-    projectTitle: target.projectSlug || null,
+    projectTitle: target.projectName || target.projectSlug || null,
+    projectNamespace: target.projectNamespace || job.projectNamespace || null,
     origin: "overleaf",
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
     appendLog,
@@ -3317,6 +3751,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       job.projectNamespace = startBody.project_namespace || job.projectNamespace || null;
       job.projectSlug = startBody.project_slug || job.projectSlug || target.projectSlug;
       job.adapterProjectId = startBody.project_id || job.adapterProjectId || null;
+      if (startBody.project_namespace) target.projectNamespace = startBody.project_namespace;
+      if (startBody.project_slug) target.projectSlug = startBody.project_slug;
       await writeJson(state.jobsPath, state.jobs);
     },
     onEvent,
@@ -3430,15 +3866,15 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
       }
     }
     return {
-      jobStatus: "needs_review",
-      finalStatus: "needs_review",
-      effectiveStatus: { ...local, status: "needs_review" },
+      jobStatus: "failed",
+      finalStatus: "failed",
+      effectiveStatus: { ...local, status: "failed" },
       resultKind: "needs_review",
       resultDetail: exit.resultDetail || null,
-      // A failing/absent check is kept as diagnostic metadata -- it explains
-      // WHY this stayed needs_review despite sorry-free file evidence.
+      // A failing/absent check is kept as diagnostic metadata -- it explains why
+      // this is unconfirmed despite sorry-free file evidence.
       leanCheck,
-      error: null
+      error: "Lea could not confirm a checked artifact for this run."
     };
   }
 
@@ -3470,10 +3906,12 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
   // exit.ok and no leftover sorry: the adapter passed its own final verification,
   // so the theorem IS formalized. Run a local lean check for diagnostics only
   // when we happened to locate the proof file — a missing or failing local
-  // toolchain must NOT downgrade a run the adapter already verified.
+  // toolchain must NOT downgrade a run the adapter already verified. The
+  // session-recovery path attaches its already-run check as `local.leanCheck`;
+  // reuse it rather than paying for a second compile of the same file.
   let leanCheck = null;
   if (local.status === "formalized" && local.absolutePath) {
-    leanCheck = await runLeanCheck(job.leaWorkspacePath, local.absolutePath);
+    leanCheck = local.leanCheck || await runLeanCheck(job.leaWorkspacePath, local.absolutePath);
   }
   const effectiveStatus = local.status === "formalized" ? local : { ...local, status: "formalized" };
   return {
@@ -3624,8 +4062,11 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
         projectMarkdownPath: target.projectMarkdownPath
       }
       : await getTheoremStatus({
+        state,
         leaRepoPath: state.settings.leaRepoPath,
         overleafProjectId: target.overleafProjectId,
+        projectName: target.projectName,
+        projectNamespace: target.projectNamespace,
         theoremLabel: target.targetLabel,
         jobs: {}
       });
@@ -3645,16 +4086,24 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     })
     : status;
 
-  // needs_review recovery: markdown-diffing (identifyLeaArtifact, above) found
-  // nothing, most likely because the agent skipped self-registering a result
-  // it wasn't confident in. Check the target's own expected proof path
-  // directly instead -- if it's there, sorry-free, and genuinely compiles,
-  // there's real evidence to promote on, so record it the same way a located
-  // artifact normally would be (job fields + the project markdown entry the
-  // agent itself didn't write), rather than leaving this run's outcome stuck
-  // on "no local evidence found" forever.
+  // Recovery when markdown-diffing (identifyLeaArtifact, above) found nothing
+  // because the agent skipped self-registering its result -- which happens
+  // both on needs_review runs (not confident enough to self-report) and on
+  // fully verified runs (it simply never wrote the markdown entry). Locate
+  // the file the session actually wrote instead -- if it's there, sorry-free,
+  // and genuinely compiles, there's real evidence to record the same way a
+  // located artifact normally would be (job fields + the project markdown
+  // entry the agent itself didn't write). Without this, a verified run left a
+  // job with NO recordedProofPath and a markdown with NO entry: the target
+  // then had no file-linked evidence at all, so a later manual edit that put
+  // a `sorry` back could never demote the cached "formalized" verdict.
+  // `artifact.error` (ambiguous candidates) is excluded: that run is recorded
+  // as failed rather than guessed at, and must not upsert markdown either.
   let effectiveLocalStatus = localStatus;
-  if (exitResultKind === "needs_review" && localStatus.status === "unformalized") {
+  if (
+    (exitResultKind === "needs_review" || (exit.ok && !artifact?.error)) &&
+    localStatus.status === "unformalized"
+  ) {
     const recovered = await recoverFormalizedStatusFromTargetPath({ state, job, target });
     if (recovered) {
       // Carry the recovery's already-run, already-passing lean check along so
@@ -3672,12 +4121,41 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
         moduleName: recovered.status.moduleName,
         signature: recovered.status.leanStatement || "",
         description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
-        solvingProcess: "Lea flagged its own result as needs_review; an independent lean_check on the emitted file found it compiles cleanly with no sorry/admit, so it was recorded as a verified proof."
+        solvingProcess: exitResultKind === "needs_review"
+          ? "Lea flagged its own result as needs_review; an independent lean_check on the emitted file found it compiles cleanly with no sorry/admit, so it was recorded as a verified proof."
+          : "Lea verified the run but did not self-register a project markdown entry; the emitted file was located via the session's recorded steps, compiles cleanly, and contains no sorry/admit."
       });
     }
   }
 
   const outcome = await resolveProofOutcome({ job, localStatus: effectiveLocalStatus, exit, artifactError: artifact?.error || null });
+  // The other unregistered-artifact shape: the artifact was never located via
+  // markdown or the session, but the direct file probe (getLeaDirectProofStatus,
+  // via the localStatus chain above) already pinpointed the recorded file at
+  // the project's conventional proof path. Persist the same three job fields
+  // + markdown entry a located artifact records, so the target doesn't end up
+  // with a terminal verdict and no file link.
+  if (
+    outcome.jobStatus === "formalized" &&
+    !artifact?.ok &&
+    !job.recordedProofPath &&
+    outcome.effectiveStatus?.recordedProofPath
+  ) {
+    const evidence = outcome.effectiveStatus;
+    job.declarationName = evidence.declarationName || job.declarationName;
+    job.recordedProofPath = evidence.recordedProofPath;
+    job.moduleName = evidence.moduleName || null;
+    await upsertProjectTheoremEntry({
+      projectMarkdownPath: target.projectMarkdownPath,
+      projectId: target.projectSlug,
+      theoremName: job.declarationName,
+      proofPath: job.recordedProofPath,
+      moduleName: job.moduleName,
+      signature: evidence.leanStatement || "",
+      description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
+      solvingProcess: "Lea's run passed final verification but did not self-register a project markdown entry; the recorded file was found at the project's conventional proof path with no sorry/admit."
+    });
+  }
   if (outcome.leanCheck) {
     job.leanCheck = outcome.leanCheck;
   }
@@ -3709,6 +4187,15 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     await appendLog(job.logPath, `[backend] ${job.error}\n`);
   }
   job.status = outcome.jobStatus;
+  // AUDIT H2: a verified outcome no longer needs the pre-run backups (drop
+  // them so jobs.json stays slim); a failed one restores what the pre-run
+  // cleanup deleted, so the target doesn't lose its last verified proof to a
+  // run that produced nothing.
+  if (["formalized", "disproved"].includes(outcome.jobStatus)) {
+    if (job.retryCleanup?.backups) delete job.retryCleanup.backups;
+  } else if (outcome.jobStatus === "failed") {
+    await restorePreviousRunArtifacts({ state, job, target });
+  }
   await writeJson(state.jobsPath, state.jobs);
 }
 
@@ -3717,6 +4204,8 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
   const prompt = buildLeaPrompt({
     targetKind: target.targetKind,
     projectSlug: target.projectSlug,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     targetLabel: target.targetLabel,
     targetText,
     targetContext,
@@ -3725,7 +4214,13 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
     stubToComplete: job.stubToComplete || null
   });
   const exit = await runLeaProofJobForJob({ state, job, target, prompt });
-  if (job.finalStatus === "max_spend") return;
+  if (job.finalStatus === "max_spend") {
+    // The spend cap killed the run before it produced anything — put the
+    // previous verified artifact back (AUDIT H2).
+    await restorePreviousRunArtifacts({ state, job, target });
+    await writeJson(state.jobsPath, state.jobs);
+    return;
+  }
 
   await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
 
@@ -3754,6 +4249,8 @@ async function runLeaStubJob({ state, job, target, targetText, targetContext = "
   const observedCodeSteps = new Map();
   const prompt = buildLeaStubPrompt({
     projectSlug: target.projectSlug,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
     theoremLabel: target.targetLabel,
     theoremText: targetText,
     theoremContext: targetContext,
@@ -3846,7 +4343,7 @@ function validateStubArtifact({ state, job, target, exit, sessionDetail, observe
     return { ok: false, error: `Lea did not write a .lean file containing theorem ${target.theoremLabel}.` };
   }
   const code = String(step.code || "");
-  if (!/\b(sorry|admit)\b/.test(code)) {
+  if (!containsSorryMarker(code)) {
     return { ok: false, error: `The generated file for ${target.theoremLabel} does not contain a sorry/admit stub.` };
   }
   if (step.check_status !== "ok") {
@@ -3865,10 +4362,16 @@ function validateStubArtifact({ state, job, target, exit, sessionDetail, observe
   };
 }
 
-function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+function buildProjectIdentityBlock({ projectSlug, projectName = "", projectNamespace = "" }) {
+  return projectIdentityPreambleLines({ projectSlug, projectName, projectNamespace }).join("\n");
+}
+
+function buildLeaPrompt({ targetKind, projectSlug, projectName = "", projectNamespace = "", targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
   if (targetKind === "definition") {
     return buildLeaDefinitionPrompt({
       projectSlug,
+      projectName,
+      projectNamespace,
       targetLabel,
       targetText,
       targetContext,
@@ -3878,6 +4381,8 @@ function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targ
   }
   return buildLeaTheoremPrompt({
     projectSlug,
+    projectName,
+    projectNamespace,
     theoremLabel: targetLabel,
     theoremText: targetText,
     theoremContext: targetContext,
@@ -3887,7 +4392,8 @@ function buildLeaPrompt({ targetKind, projectSlug, targetLabel, targetText, targ
   });
 }
 
-function buildLeaTheoremPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+function buildLeaTheoremPrompt({ projectSlug, projectName = "", projectNamespace = "", theoremLabel, theoremText, theoremContext = "", declarationNameHint, resolvedUses = [], stubToComplete = null }) {
+  const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const naming = declarationNameHint
     ? `The theorem text appears to specify Lean declaration name ${declarationNameHint}; use that name.`
     : `If the theorem text does not specify a Lean declaration name, use ${theoremLabel}.`;
@@ -3909,7 +4415,10 @@ function buildLeaTheoremPrompt({ projectSlug, theoremLabel, theoremText, theorem
 Continue from this existing file and replace the sorry/admit in theorem ${stubToComplete.declarationName}. Do not delete, rename, or move the file unless Lean requires a minimal import adjustment.\n`
     : "";
 
-  return `Formalize the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
+  return `Formalize the Overleaf theorem labeled ${theoremLabel}.
+
+${projectIdentity}
+
 ${naming}
 ${usesGuidance}
 
@@ -3920,12 +4429,13 @@ ${stubGuidance}
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a statement for approval. If a detail is ambiguous (for example which number type to use), pick the most natural interpretation and proceed without waiting. Do everything in this run: write the Lean file under Lea's workspace and carry the proof through to completion.
 
 The final file must compile with no sorry/admit in theorem ${proofTarget}.
-Use the Lea project context to choose the project namespace and proof path.
+Use the exact Lean namespace shown above and in the project context for imports, declarations, and proof paths.
 Do not edit the project markdown during proof search; Lea will record the final result after the proof succeeds.
 Do not create placeholder files outside Lea's workspace. If you cannot complete the proof, leave the best partial Lean file in the Lea project proof directory.`;
 }
 
-function buildLeaDefinitionPrompt({ projectSlug, targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [] }) {
+function buildLeaDefinitionPrompt({ projectSlug, projectName = "", projectNamespace = "", targetLabel, targetText, targetContext = "", declarationNameHint, resolvedUses = [] }) {
+  const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const naming = declarationNameHint
     ? `The definition text appears to specify Lean declaration name ${declarationNameHint}; use that name for the primary declaration.`
     : `Use the declaration name ${targetLabel} for the primary declaration unless the text explicitly specifies a better Lean name.`;
@@ -3938,7 +4448,10 @@ function buildLeaDefinitionPrompt({ projectSlug, targetLabel, targetText, target
     ? `\nFormalization guidance:\n${targetContext.trim()}\n`
     : "";
 
-  return `Formalize the Overleaf definition labeled ${targetLabel} in project ${projectSlug}.
+  return `Formalize the Overleaf definition labeled ${targetLabel}.
+
+${projectIdentity}
+
 This target is a definition, not a theorem.
 
 Create the appropriate Lean declaration or small group of declarations for the mathematical concept described below. Do not create a fake theorem just to satisfy a proof workflow.
@@ -3951,7 +4464,7 @@ ${usesGuidance}
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a declaration for approval. If a detail is ambiguous, pick the most natural interpretation and proceed without waiting.
 
 The final Lean file must compile with no sorry/admit.
-Use the Lea project context to choose the project namespace and proof path.
+Use the exact Lean namespace shown above and in the project context for imports, declarations, and proof paths.
 Do not edit the project markdown during formalization; Lea will record the final result after the declaration compiles.
 Do not create placeholder files outside Lea's workspace.
 
@@ -3960,7 +4473,8 @@ ${targetText}
 ${formalizationGuidance}`;
 }
 
-function buildLeaStubPrompt({ projectSlug, theoremLabel, theoremText, theoremContext = "", resolvedUses = [] }) {
+function buildLeaStubPrompt({ projectSlug, projectName = "", projectNamespace = "", theoremLabel, theoremText, theoremContext = "", resolvedUses = [] }) {
+  const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const usesGuidance = resolvedUses.length === 0
     ? ""
     : `\nAvailable already-recorded support declarations, if needed for the statement imports only:\n${resolvedUses.map((use) => (
@@ -3970,10 +4484,12 @@ function buildLeaStubPrompt({ projectSlug, theoremLabel, theoremText, theoremCon
     ? `\nFormalization Guidance: ${theoremContext.trim()}\n`
     : "";
 
-  return `Create a Lean sorry stub for the Overleaf theorem labeled ${theoremLabel} in project ${projectSlug}.
+  return `Create a Lean sorry stub for the Overleaf theorem labeled ${theoremLabel}.
+
+${projectIdentity}
 
 Translate only the theorem statement into Lean. Use the declaration name exactly \`${theoremLabel}\`.
-Write exactly one .lean file in the active project namespace/directory, containing the translated theorem or lemma with body:
+Write exactly one .lean file in the exact Lean namespace/directory shown above, containing the translated theorem or lemma with body:
 
 \`\`\`lean
 by
@@ -4034,48 +4550,6 @@ function recordJobTurnProgress(job, progress) {
   return true;
 }
 
-function extractTurnProgress(payload, defaultMaxTurns = null) {
-  const current = firstPositiveInteger(payload, [
-    "current_turn",
-    "currentTurn",
-    "turn",
-    "turn_index",
-    "turnIndex",
-    "agent_turn",
-    "agentTurn"
-  ]);
-  const max = firstPositiveInteger(payload, [
-    "max_turns",
-    "maxTurns",
-    "maximum_turns",
-    "maximumTurns"
-  ]) || toPositiveInteger(defaultMaxTurns);
-  if (!current || !max) return null;
-  return { current, max };
-}
-
-function firstPositiveInteger(payload, keys) {
-  for (const source of turnProgressSources(payload)) {
-    for (const key of keys) {
-      const value = toPositiveInteger(source?.[key]);
-      if (value) return value;
-    }
-  }
-  return 0;
-}
-
-function turnProgressSources(payload) {
-  if (!payload || typeof payload !== "object") return [];
-  return [
-    payload,
-    payload.progress,
-    payload.result,
-    payload.result?.progress,
-    payload.agent,
-    payload.agent?.progress
-  ].filter((source) => source && typeof source === "object");
-}
-
 function aggregateUsage(jobs, { overleafProjectId } = {}) {
   const projectSlug = overleafProjectId ? slugProjectId(overleafProjectId) : "";
   const aggregate = {
@@ -4128,10 +4602,38 @@ function normalizeLeaMaxSpendUsd(value) {
   return number;
 }
 
-function spendLimitReached(state) {
+// AUDIT H5: enforcement must read the same ledger the popover displays — the
+// adapter's /api/stats global roll-up (all-time, includes standalone-UI runs,
+// survives local resets). The companion's own jobs.json tally is only the
+// fallback when the adapter can't be reached: it is wiped by start-dev.sh's
+// default reset and blind to runs made outside this companion, so enforcing
+// against it let the cap silently reset. Cached briefly so preflights and the
+// batch-repair loop don't hammer /api/stats.
+const ADAPTER_SPEND_CACHE_TTL_MS = 5000;
+
+async function currentSpendUsd(state) {
+  const cache = state.adapterSpendCache;
+  if (cache && Date.now() - cache.at < ADAPTER_SPEND_CACHE_TTL_MS) {
+    return cache.costUsd ?? aggregateUsage(state.jobs || {}, {}).costUsd;
+  }
+  let costUsd = null;
+  try {
+    const baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+    const result = await fetchAdapterUsageStats({ fetchImpl: state.fetchImpl || fetch, baseUrl });
+    if (result.ok && result.body?.global && typeof result.body.global === "object") {
+      costUsd = toNonNegativeNumber(result.body.global.cost_usd);
+    }
+  } catch {
+    costUsd = null;
+  }
+  state.adapterSpendCache = { at: Date.now(), costUsd };
+  return costUsd ?? aggregateUsage(state.jobs || {}, {}).costUsd;
+}
+
+async function spendLimitReached(state) {
   const maxSpendUsd = normalizeLeaMaxSpendUsd(state.settings?.leaMaxSpendUsd);
   if (maxSpendUsd === null) return false;
-  return aggregateUsage(state.jobs || {}, {}).costUsd >= maxSpendUsd;
+  return (await currentSpendUsd(state)) >= maxSpendUsd;
 }
 
 async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
@@ -4140,7 +4642,10 @@ async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
   } else {
     recordJobUsageSnapshot(job, usage);
   }
-  if (spendLimitReached(state)) {
+  // The run just recorded fresh usage — bust the TTL cache so the enforcement
+  // read below sees the adapter's post-run total, not a pre-run snapshot.
+  state.adapterSpendCache = null;
+  if (await spendLimitReached(state)) {
     await markJobMaxSpend({ state, job, mode });
     return { stop: true, error: MAX_SPEND_MESSAGE };
   }
@@ -4175,13 +4680,33 @@ async function runLeanCheck(leaWorkspacePath, proofPath) {
   return new Promise((resolve) => {
     const child = spawn("lake", ["env", "lean", proofPath], {
       cwd: leaWorkspacePath,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      // Own process group so the timeout can kill `lake` AND the `lean` child
+      // it spawns, not just `lake` itself (AUDIT M9).
+      detached: true
     });
+
+    // Kill the whole process group; fall back to the bare child if the group
+    // signal isn't deliverable (e.g. the child already exited).
+    const killTree = (signal) => {
+      try {
+        if (typeof child.pid === "number") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        try { child.kill(signal); } catch { /* already gone */ }
+      }
+    };
 
     let stdout = "";
     let stderr = "";
+    let killTimer = null;
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      // SIGTERM first; a compiling `lean` can ignore it, so escalate to
+      // SIGKILL after a short grace period rather than leaking a core-bound
+      // compiler (AUDIT M9).
+      killTree("SIGTERM");
+      killTimer = setTimeout(() => killTree("SIGKILL"), 5_000);
+      killTimer.unref?.();
       resolve({
         ok: false,
         exitCode: null,
@@ -4199,6 +4724,7 @@ async function runLeanCheck(leaWorkspacePath, proofPath) {
     });
     child.on("error", (error) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       resolve({
         ok: false,
         exitCode: null,
@@ -4209,6 +4735,7 @@ async function runLeanCheck(leaWorkspacePath, proofPath) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
       resolve({
         ok: code === 0,
@@ -4245,14 +4772,6 @@ function buildLeaSessionUrl(baseUrl, sessionId) {
   return url.toString();
 }
 
-function delay(ms, { ref = true } = {}) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (!ref) {
-      timer.unref?.();
-    }
-  });
-}
 
 async function appendLog(logPath, text) {
   await fs.mkdir(path.dirname(logPath), { recursive: true });
@@ -4280,7 +4799,7 @@ function buildJobResponse({ job, status, target }) {
     declarationName,
     relativePath: job.recordedProofPath || target.relativePath,
     absolutePath: job.recordedProofPath
-      ? buildLeaProofPath({ leaRepoPath: job.leaRepoPath, proofPath: job.recordedProofPath }) || target.absolutePath
+      ? buildLeaProofPath({ leaRepoPath: job.leaRepoPath || target.leaRepoPath, proofPath: job.recordedProofPath }) || target.absolutePath
       : target.absolutePath,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
@@ -4353,6 +4872,7 @@ async function findImportedStubbedTheoremUses({ proofPath, resolvedUses = [] }) 
 }
 
 async function findImportedCurrentlyStubbedTheoremUses({
+  state,
   leaRepoPath,
   overleafProjectId,
   proofPath,
@@ -4386,6 +4906,7 @@ async function findImportedCurrentlyStubbedTheoremUses({
   const stubbedUses = [];
   for (const use of importedUses) {
     const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+      state,
       leaRepoPath,
       overleafProjectId,
       targetKind: use.targetKind,
@@ -4410,20 +4931,26 @@ async function findImportedCurrentlyStubbedTheoremUses({
 }
 
 async function getTargetStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetKind,
   targetLabel,
   jobs = {}
 }) {
   const status = await getTheoremStatus({
+    state,
     leaRepoPath,
     overleafProjectId,
+    projectName,
+    projectNamespace,
     targetKind,
     theoremLabel: targetLabel,
     jobs
   });
-  return attachTransitiveStubbedUpstream({ leaRepoPath, overleafProjectId, status });
+  return attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status });
 }
 
 // Enrich a formalized status with everything TRANSITIVELY upstream of it that
@@ -4441,7 +4968,7 @@ async function getTargetStatus({
 // default) -- which is why a downstream item could silently lose its warning
 // entirely after a restart, and why anything two hops from a stub never got
 // one at all. The file-derived scan below has neither limitation.
-async function attachTransitiveStubbedUpstream({ leaRepoPath, overleafProjectId, status }) {
+async function attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status }) {
   if (!status || status.status !== "formalized") return status;
   const proofPath = String(status.recordedProofPath || "").endsWith(".lean")
     ? status.recordedProofPath
@@ -4451,7 +4978,7 @@ async function attachTransitiveStubbedUpstream({ leaRepoPath, overleafProjectId,
     : (proofPath ? buildLeaProofPath({ leaRepoPath, proofPath }) : "");
   if (!absolutePath) return status;
 
-  const namespace = projectNamespaceFromSlug(slugProjectId(overleafProjectId));
+  const namespace = await resolveProjectNamespace({ state, overleafProjectId });
   let upstream = [];
   try {
     upstream = await stubbedUpstreamOf({
@@ -4507,6 +5034,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   let statusInfo;
   try {
     statusInfo = await getTargetStatus({
+      state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId,
       targetKind,
@@ -4526,7 +5054,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
   const stale = Boolean(
     latestJob?.targetTextHash &&
     latestJob.targetTextHash !== item.sourceHash &&
-    ["stub-generated", "valid", "defined", "disproved", "needs-review", "invalid"].includes(paneStatus)
+    ["stub-generated", "valid", "defined", "disproved", "invalid"].includes(paneStatus)
   );
   const artifact = await readLeanPaneArtifact({
     leaRepoPath: state.settings.leaRepoPath,
@@ -4628,10 +5156,7 @@ function mapLeanPaneStatus(statusInfo, item) {
   if (status === "sorry_stub" || effective === "sorry_stub") return "stub-generated";
   if (status === "formalized") return item?.leanKind === "def" ? "defined" : "valid";
   if (status === "disproved") return "disproved";
-  // A checked, sorry-free proof the prover itself flagged for human review --
-  // deliberately not "valid" (that implies full confidence) nor "invalid"
-  // (the code compiles fine); see resolveProofOutcome's needs_review branch.
-  if (status === "needs_review") return "needs-review";
+  if (status === "needs_review") return "unknown";
   if (status === "failed") return "invalid";
   if (status === "in_progress") return "in-progress";
   return "unknown";
@@ -4695,31 +5220,46 @@ async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
 }
 
 async function resolveTargetUseStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetLabel,
   jobs = {}
 }) {
   for (const targetKind of ["theorem", "definition"]) {
-    const status = await getTargetStatus({ leaRepoPath, overleafProjectId, targetKind, targetLabel, jobs });
+    const status = await getTargetStatus({ state, leaRepoPath, overleafProjectId, projectName, projectNamespace, targetKind, targetLabel, jobs });
     if (["formalized", "sorry_stub"].includes(getEquivalentTheoremStatus(status).status)) {
       return status;
     }
   }
-  return getTargetStatus({ leaRepoPath, overleafProjectId, targetKind: "theorem", targetLabel, jobs });
+  return getTargetStatus({ state, leaRepoPath, overleafProjectId, projectName, projectNamespace, targetKind: "theorem", targetLabel, jobs });
 }
 
 async function getTheoremStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetKind = "theorem",
   theoremLabel,
   jobs = {}
 }) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
   const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
   const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
   const activeJob = findActiveJob(jobs, target.jobKey);
+
+  // Valid-before-valid race: while the companion still has a live job, status
+  // must remain in_progress even if the run has already written a valid Lean
+  // file that local evidence can see. Manual edit/save is locked on this same
+  // activeJob, and the Lea UI derives "thinking" from the adapter's active run,
+  // so letting file evidence win here made the pane say "valid" too early.
+  if (activeJob) {
+    return buildJobResponse({ job: activeJob, status: "in_progress", target });
+  }
 
   // A manual edit (or a cascade re-check triggered by editing something this
   // target imports) may have broken a target that would otherwise still read
@@ -4736,11 +5276,12 @@ async function getTheoremStatus({
   // source). getCurrentTheoremProofStatus, used by `uses=` dependency
   // resolution at formalize time, does not yet honor this override -- left
   // as-is for this fix, which is scoped to the pane status chip.
-  if (!activeJob && linkedJob?.lastEditCheckStatus === "error") {
+  if (linkedJob?.lastEditCheckStatus === "error") {
     return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
   }
 
   const { projectStatus, directProofStatus, mappedStatus } = await getCurrentTheoremProofStatuses({
+    state,
     leaRepoPath,
     target,
     jobs,
@@ -4748,31 +5289,9 @@ async function getTheoremStatus({
   });
   const failedJob = findLatestJob(jobs, target.jobKey, "failed");
   const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
+  const repairedJob = findLatestJob(jobs, target.jobKey, "repaired");
   const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
   const needsReviewJob = findLatestJob(jobs, target.jobKey, "needs_review");
-
-  if (activeJob) {
-    if (
-      mappedStatus?.status === "formalized" ||
-      projectStatus?.status === "formalized" ||
-      directProofStatus?.status === "formalized"
-    ) {
-      return withLeaSession(mappedStatus?.status === "formalized"
-        ? mappedStatus
-        : projectStatus?.status === "formalized"
-          ? projectStatus
-          : directProofStatus);
-    }
-    return buildJobResponse({ job: activeJob, status: "in_progress", target });
-  }
-
-  if (mappedStatus?.status === "formalized") {
-    return withLeaSession(mappedStatus);
-  }
-
-  if (directProofStatus?.status === "formalized") {
-    return withLeaSession(directProofStatus);
-  }
 
   // Authoritative outcome: a finished job the finalizer recorded with a
   // terminal status is trusted even when project-markdown recording is
@@ -4785,13 +5304,20 @@ async function getTheoremStatus({
   // `needs_review` re-run (and the disproved branch had the same omission).
   // Ties resolve in favor of the more definitive status, in the list order
   // below -- matching the old `>=` guards' behavior.
+  // A verified repair (`repaired`, rebuild-checked in runLeaRepairJob) is as
+  // terminal as `formalized` -- and after an item is repaired it is the job
+  // carrying the item's CURRENT declarationName (the rename bookkeeping
+  // writes to the newest session-linked job). Leaving it out of this list
+  // made status fall back to the older formalize job, whose stale
+  // declarationName then steered the pane's artifact lookup onto a
+  // pre-rename snapshot.
   const terminalCandidates = [
     { job: formalizedJob, status: "formalized" },
+    { job: repairedJob, status: "formalized" },
     { job: needsReviewJob, status: "needs_review" },
     { job: disprovedJob, status: "disproved" },
     { job: failedJob, status: "failed" }
   ].filter((candidate) => candidate.job);
-  const jobRecency = (job) => String(job.finishedAt || job.startedAt || "");
   let newestTerminal = null;
   for (const candidate of terminalCandidates) {
     if (!newestTerminal || jobRecency(candidate.job) > jobRecency(newestTerminal.job)) {
@@ -4821,10 +5347,22 @@ async function getTheoremStatus({
         return withLeaSession(stubEvidence);
       }
     }
+    if (newestTerminal.status === "formalized") {
+      const currentEvidence = [mappedStatus, projectStatus, directProofStatus]
+        .find((candidate) => candidate?.status === "formalized") || null;
+      if (currentEvidence) {
+        return withLeaSession(currentEvidence);
+      }
+    }
     return withLeaSession(buildJobResponse({ job: newestTerminal.job, status: newestTerminal.status, target }));
   }
 
   if (failedJob) {
+    const directPath = String(directProofStatus?.recordedProofPath || directProofStatus?.relativePath || "");
+    const legacyDirectPath = path.join("workspace", "proofs", `${directProofStatus?.declarationName || theoremLabel}.lean`);
+    if (directProofStatus?.status === "formalized" && directPath === legacyDirectPath) {
+      return withLeaSession(directProofStatus);
+    }
     return withLeaSession(buildFailedTheoremStatus({
       failedJob,
       target,
@@ -4833,8 +5371,16 @@ async function getTheoremStatus({
     }));
   }
 
+  if (mappedStatus?.status === "formalized") {
+    return withLeaSession(mappedStatus);
+  }
+
   if (projectStatus?.status === "formalized") {
     return withLeaSession(projectStatus);
+  }
+
+  if (directProofStatus?.status === "formalized") {
+    return withLeaSession(directProofStatus);
   }
 
   if (mappedStatus) {
@@ -4863,14 +5409,16 @@ async function getTheoremStatus({
 }
 
 async function getCurrentTheoremProofStatuses({
+  state,
   leaRepoPath,
   target,
   jobs = {},
   includeStubbedTheoremUses = false
 }) {
   const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
-  const directProofStatus = await getLeaDirectProofStatus({ leaRepoPath, target });
+  const directProofStatus = await getLeaDirectProofStatus({ state, leaRepoPath, target });
   const mappedStatus = await getLatestMappedJobStatus({
+    state,
     leaRepoPath,
     target,
     jobs,
@@ -4880,14 +5428,18 @@ async function getCurrentTheoremProofStatuses({
 }
 
 async function getCurrentTheoremProofStatus({
+  state,
   leaRepoPath,
   overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
   targetKind = "theorem",
   theoremLabel,
   jobs = {}
 }) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel });
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
   const { mappedStatus, projectStatus, directProofStatus } = await getCurrentTheoremProofStatuses({
+    state,
     leaRepoPath,
     target,
     jobs
@@ -5002,7 +5554,7 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   }
 
   const content = await fs.readFile(absolutePath, "utf8");
-  if (/\bsorry\b|admit\b/.test(content)) {
+  if (containsSorryMarker(content)) {
     return {
       status: "sorry_stub",
       ...responseBase,
@@ -5018,63 +5570,89 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   };
 }
 
-async function getLeaDirectProofStatus({ leaRepoPath, target }) {
+// File-derived status straight from where a proof for this target would live
+// on disk, needing NO job record or project-markdown entry to exist. That
+// independence is the point: a verified run whose artifact was never
+// self-registered (identifyLeaArtifact found no new markdown entry) leaves a
+// job with no recordedProofPath and a markdown with no entry -- and then
+// mapped/project status both come up empty, so without this probe
+// getTheoremStatus has NO file evidence at all and a stale job verdict
+// ("formalized") can never be contradicted by the sorry that is actually in
+// the file right now. The namespaced per-project path is where every modern
+// run records its file (D24); the flat workspace/proofs/<name>.lean is the
+// legacy layout, kept as a fallback.
+async function getLeaDirectProofStatus({ state, leaRepoPath, target }) {
   const declarationName = target.declarationName || target.theoremLabel;
-  const proofPath = path.join("workspace", "proofs", `${declarationName}.lean`);
-  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
-  if (!absolutePath || !existsSync(absolutePath)) {
-    return null;
-  }
+  const stepPath = `${declarationName}.lean`;
+  const namespace = target.projectNamespace || await resolveProjectNamespace({
+    state: state || {},
+    overleafProjectId: target.overleafProjectId,
+    projectSlug: target.projectSlug
+  });
+  const candidates = [
+    {
+      proofPath: proofPathFromProjectStep({ namespace, stepPath }),
+      moduleName: moduleNameFromProjectStep({ namespace, stepPath })
+    },
+    { proofPath: path.join("workspace", "proofs", stepPath), moduleName: null }
+  ];
 
-  const content = await fs.readFile(absolutePath, "utf8");
-  if (!containsDeclaration(content, declarationName)) {
-    return null;
-  }
+  for (const candidate of candidates) {
+    const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: candidate.proofPath });
+    if (!absolutePath || !existsSync(absolutePath)) {
+      continue;
+    }
+    const content = await fs.readFile(absolutePath, "utf8");
+    if (!containsDeclaration(content, declarationName)) {
+      continue;
+    }
 
-  const responseBase = {
-    targetKind: target.targetKind,
-    targetLabel: target.targetLabel,
-    targetKey: targetKey(target),
-    declarationName,
-    relativePath: proofPath,
-    absolutePath,
-    projectId: target.projectId,
-    projectSlug: target.projectSlug,
-    projectMarkdownPath: target.projectMarkdownPath,
-    recordedProofPath: proofPath,
-    moduleName: null
-  };
+    const responseBase = {
+      targetKind: target.targetKind,
+      targetLabel: target.targetLabel,
+      targetKey: targetKey(target),
+      declarationName,
+      relativePath: candidate.proofPath,
+      absolutePath,
+      projectId: target.projectId,
+      projectSlug: target.projectSlug,
+      projectMarkdownPath: target.projectMarkdownPath,
+      recordedProofPath: candidate.proofPath,
+      moduleName: candidate.moduleName
+    };
 
-  if (/\bsorry\b|admit\b/.test(content)) {
+    if (containsSorryMarker(content)) {
+      return {
+        status: "sorry_stub",
+        ...responseBase,
+        leanStatement: extractLeanStatement(content, declarationName)
+      };
+    }
+
     return {
-      status: "sorry_stub",
+      status: "formalized",
       ...responseBase,
+      resultKind: target.targetKind === "definition" ? "defined" : "proved",
       leanStatement: extractLeanStatement(content, declarationName)
     };
   }
 
-  return {
-    status: "formalized",
-    ...responseBase,
-    resultKind: target.targetKind === "definition" ? "defined" : "proved",
-    leanStatement: extractLeanStatement(content, declarationName)
-  };
+  return null;
 }
 
 async function getLatestMappedJobStatus({
+  state,
   leaRepoPath,
   target,
   jobs,
   includeStubbedTheoremUses = false
 }) {
-  const mappedJob = Object.values(jobs || {})
-    .filter((job) => (
-      job.jobKey === target.jobKey &&
-      ["formalized", "sorry_stub"].includes(job.status) &&
-      job.declarationName &&
-      job.recordedProofPath
-    ))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+  const mappedJob = jobsByRecencyDesc(jobs, (job) => (
+    job.jobKey === target.jobKey &&
+    ["formalized", "sorry_stub"].includes(job.status) &&
+    job.declarationName &&
+    job.recordedProofPath
+  ))[0] || null;
 
   if (!mappedJob) {
     return null;
@@ -5095,6 +5673,7 @@ async function getLatestMappedJobStatus({
   }
   const stubbedTheoremUses = status.status === "formalized"
     ? await findImportedCurrentlyStubbedTheoremUses({
+      state,
       leaRepoPath,
       overleafProjectId: target.projectId,
       proofPath: status.absolutePath,
@@ -5122,9 +5701,7 @@ function addLeaSessionLink(status, job) {
 }
 
 function findLatestJobWithLeaSession(jobs, jobKey) {
-  return Object.values(jobs || {})
-    .filter((job) => job.jobKey === jobKey && (job.leaSessionId || job.recorderSessionId))
-    .sort((a, b) => String(b.finishedAt || b.startedAt).localeCompare(String(a.finishedAt || a.startedAt)))[0] || null;
+  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && (job.leaSessionId || job.recorderSessionId))[0] || null;
 }
 
 function findProjectTheoremEntry(markdown, theoremLabel) {
@@ -5224,8 +5801,21 @@ async function upsertProjectTheoremEntry({
   const next = section
     ? `${existing.slice(0, section.start).trimEnd()}\n\n${entry.trimEnd()}\n${existing.slice(section.end).trimStart() ? `\n${existing.slice(section.end).trimStart()}` : ""}`
     : `${existing.trimEnd()}\n\n${entry.trimEnd()}\n`;
-  await fs.mkdir(path.dirname(projectMarkdownPath), { recursive: true });
-  await fs.writeFile(projectMarkdownPath, next.replace(/\n{3,}/g, "\n\n"), "utf8");
+  await atomicWriteFile(projectMarkdownPath, collapseBlankRunsOutsideFences(next), "utf8");
+}
+
+// Collapse runs of blank lines to one, but ONLY outside fenced code blocks
+// (AUDIT M7): the old whole-file `\n{3,}` squash silently reflowed recorded
+// Lean signatures (and any prose) containing consecutive blank lines inside
+// their ```lean fences whenever any other theorem was upserted. The split's
+// captured group alternates prose / fenced segments; an unterminated fence
+// falls into the prose tail and gets squashed — same as before, and the seam
+// text this module writes never opens a fence it doesn't close.
+function collapseBlankRunsOutsideFences(markdown) {
+  return String(markdown || "")
+    .split(/(```[\s\S]*?```)/)
+    .map((part, index) => (index % 2 === 1 ? part : part.replace(/\n{3,}/g, "\n\n")))
+    .join("");
 }
 
 function renderProjectTheoremEntry({
@@ -5328,16 +5918,6 @@ function findSectionHeadingStart(markdown, markerStart) {
   return beforeMarker.startsWith("## Theorem:") ? 0 : markerStart;
 }
 
-function findNamedSectionHeadingStart(markdown, markerStart, heading) {
-  const beforeMarker = markdown.slice(0, markerStart);
-  const pattern = `\n## ${heading}`;
-  const headingIndex = beforeMarker.lastIndexOf(pattern);
-  if (headingIndex !== -1) {
-    return headingIndex;
-  }
-  return beforeMarker.startsWith(`## ${heading}`) ? 0 : markerStart;
-}
-
 function markerKey(entry) {
   return `${entry.name}\u0000${entry.proofPath}\u0000${entry.moduleName || ""}`;
 }
@@ -5381,16 +5961,25 @@ function unescapeHtmlAttribute(value) {
     .replace(/&amp;/g, "&");
 }
 
+// Lean declaration keywords this app recognizes. Includes `inductive` and
+// `instance` (AUDIT L3): a definition the agent legitimately models as an
+// `inductive` type or an `instance` was previously invisible to
+// containsDeclaration -- session-step lookup then missed the file or fell back
+// to sole-`.lean`-step heuristics, and the signature diff blanket-classified
+// every proof-only edit to such a file as a "signature" change (a needless
+// full cascade).
+const DECLARATION_KEYWORDS = "theorem|lemma|def|abbrev|structure|class|inductive|instance";
+
 function containsDeclaration(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b`
+    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:${DECLARATION_KEYWORDS})\\s+${escapeRegExp(theoremLabel)}\\b`
   );
   return declarationPattern.test(content);
 }
 
 function extractLeanStatement(content, theoremLabel) {
   const declarationPattern = new RegExp(
-    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:theorem|lemma|def|abbrev|structure|class)\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
+    `(^|\\n)\\s*(?:@\\[[^\\n]*\\]\\s*)*(?:(?:private|protected|noncomputable|unsafe|partial)\\s+)*(?:${DECLARATION_KEYWORDS})\\s+${escapeRegExp(theoremLabel)}\\b[\\s\\S]*?(?::=|where|$)`
   );
   const match = content.match(declarationPattern);
   if (!match) return "";
@@ -5405,38 +5994,104 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// Generous enough for the mirror endpoint's whole-project .tex payloads, but
+// a bound nonetheless — an unbounded buffered body was an OOM lever (AUDIT M5).
+const MAX_BODY_BYTES = 50 * 1024 * 1024;
+
+function httpError(statusCode, code, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
 async function readBodyJson(request) {
   const chunks = [];
+  let total = 0;
   for await (const chunk of request) {
+    total += chunk.length;
+    if (total > MAX_BODY_BYTES) {
+      throw httpError(413, "body_too_large", "Request body exceeds the 50 MB limit.");
+    }
     chunks.push(chunk);
   }
   if (chunks.length === 0) return {};
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw httpError(400, "invalid_json", "Request body is not valid JSON.");
+  }
 }
 
 async function readJson(filePath, fallback) {
+  let raw;
   try {
-    return JSON.parse(await fs.readFile(filePath, "utf8"));
+    raw = await fs.readFile(filePath, "utf8");
   } catch (error) {
     if (error && error.code === "ENOENT") return fallback;
     throw error;
   }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // A torn/corrupt state file must never brick startup (writes are atomic
+    // now, but a file written by an older companion may be truncated). Keep
+    // the bytes for forensics and start from a clean slate.
+    const backupPath = `${filePath}.corrupt-${Date.now()}`;
+    try {
+      await fs.rename(filePath, backupPath);
+      console.warn(`[companion] ${filePath} contained invalid JSON; moved it to ${backupPath} and starting fresh.`);
+    } catch {
+      console.warn(`[companion] ${filePath} contained invalid JSON; starting fresh.`);
+    }
+    return fallback;
+  }
 }
 
-async function writeJson(filePath, value) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+// Serialized, atomic JSON persistence. Concurrent jobs (formalize + repair
+// batch + cascade continuations) all mutate state.jobs and call writeJson
+// freely; two overlapping fs.writeFile calls on one path can interleave and
+// corrupt the file. Chaining per path serializes them, and the temp+rename
+// write (atomicWriteJson) means a crash mid-write leaves the previous
+// complete file on disk, never a truncated one.
+const jsonWriteQueues = new Map();
+
+function writeJson(filePath, value) {
+  const tail = (jsonWriteQueues.get(filePath) || Promise.resolve())
+    .catch(() => {}) // a failed earlier write must not poison the queue
+    .then(() => atomicWriteJson(filePath, value));
+  jsonWriteQueues.set(filePath, tail);
+  return tail;
 }
 
 function sendJson(response, statusCode, body) {
-  setCorsHeaders(response);
   response.writeHead(statusCode, { "Content-Type": "application/json" });
   response.end(JSON.stringify(body));
 }
 
-function setCorsHeaders(response) {
-  response.setHeader("Access-Control-Allow-Origin", "*");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+// AUDIT H3: this server can start paid runs, rewrite provider keys in .env,
+// set the GitHub push token/remote, and export the whole project. The old
+// `Access-Control-Allow-Origin: *` let ANY page in the user's browser do all
+// of that. Only the legitimate browser callers get a CORS grant: the Overleaf
+// content script (requests carry the page's https://www.overleaf.com origin)
+// and the extension's own pages (chrome-extension:// / moz-extension://
+// origins, e.g. the options page). Requests without an Origin header (curl,
+// local tooling, same-origin) were never gated by CORS and stay unaffected.
+function isAllowedBrowserOrigin(origin) {
+  if (!origin) return false;
+  return (
+    origin === "https://www.overleaf.com" ||
+    origin.startsWith("chrome-extension://") ||
+    origin.startsWith("moz-extension://")
+  );
+}
+
+function setCorsHeaders(response, request) {
+  const origin = String(request?.headers?.origin || "");
+  if (!isAllowedBrowserOrigin(origin)) return;
+  response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Vary", "Origin");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
@@ -5456,8 +6111,13 @@ if (isMain) {
   server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
     console.log(`Overleaf Lea companion listening at http://${DEFAULT_HOST}:${DEFAULT_PORT}`);
     console.log(`Lea workspace: ${buildLeaWorkspacePath(applyEnvDefaults({}, process.env).leaRepoPath)}`);
-    if (!process.env.OPENAI_API_KEY) {
-      console.log("Warning: OPENAI_API_KEY is not set in the root .env or process environment. Lea jobs will not start.");
+    // Warn about the key the CONFIGURED model actually needs, not always
+    // OPENAI_API_KEY (AUDIT L10): a user on an Anthropic/Google model was told
+    // "Lea jobs will not start" over a missing OpenAI key they don't use, and
+    // a Google-model user with no key at all got no warning.
+    const readiness = validateLeaRuntime(server.leaState, { requireApiKey: true });
+    if (!readiness.ok && String(readiness.error || "").startsWith("missing_")) {
+      console.log(`Warning: ${readiness.message} Lea jobs will not start until it is set.`);
     }
     console.log("Run `npm run doctor` if setup fails.");
   });

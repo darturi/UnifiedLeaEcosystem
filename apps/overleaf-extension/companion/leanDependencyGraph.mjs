@@ -43,6 +43,41 @@ export function moduleNameFromProjectStep({ namespace, stepPath }) {
   return [namespace || "Lea.Misc", moduleSuffix].filter(Boolean).join(".");
 }
 
+// Does this Lean source still contain a real `sorry` or `admit`? The single
+// shared implementation for every "is this file actually complete" check
+// (AUDIT M1): the old copies were inconsistent (`/\bsorry\b|admit\b/` missing
+// the leading word boundary matched `readmit`, `Nat.readmit`, etc.) and all
+// of them matched inside comments (`-- no sorry here` read as a stub). Line
+// (`--`) and block (`/- -/`, nestable) comments are stripped first so a
+// mention of the word in prose never demotes a finished proof.
+export function containsSorryMarker(content) {
+  return /\b(?:sorry|admit)\b/.test(stripLeanComments(String(content || "")));
+}
+
+function stripLeanComments(text) {
+  let out = "";
+  let i = 0;
+  let blockDepth = 0;
+  while (i < text.length) {
+    const two = text.slice(i, i + 2);
+    if (blockDepth > 0) {
+      if (two === "/-") { blockDepth += 1; i += 2; continue; }
+      if (two === "-/") { blockDepth -= 1; i += 2; continue; }
+      i += 1;
+      continue;
+    }
+    if (two === "/-") { blockDepth += 1; i += 2; continue; }
+    if (two === "--") {
+      const nl = text.indexOf("\n", i);
+      i = nl === -1 ? text.length : nl;
+      continue;
+    }
+    out += text[i];
+    i += 1;
+  }
+  return out;
+}
+
 // Every `import Foo.Bar` line in a Lean file, as a Set of module names.
 // Unchanged from the original companion/server.mjs implementation.
 export function parseLeanImports(content) {
@@ -204,7 +239,7 @@ export async function stubbedUpstreamOf({ leaRepoPath, namespace, moduleName, ab
       visited.add(imported);
       const file = byModule.get(imported);
       if (!file) continue; // outside the project namespace (Mathlib etc.)
-      if (/\bsorry\b|\badmit\b/.test(file.content)) {
+      if (containsSorryMarker(file.content)) {
         stubbed.push(file);
       }
       queue.push(imported);

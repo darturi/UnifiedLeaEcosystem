@@ -26,6 +26,7 @@ def test_init_db_creates_the_authoritative_v2_schema(tmp_path, monkeypatch):
     assert "author" in code_step_columns
     assert "check_status" in code_step_columns
     assert "check_detail" in code_step_columns
+    assert "artifact_kind" in code_step_columns
     assert "code" not in code_step_columns
     assert "used_project_formalizations" not in code_step_columns
     with sqlite3.connect(db_path) as conn:
@@ -392,6 +393,26 @@ def test_create_project_accepts_explicit_namespace_repo_and_description(tmp_path
     assert p["description"] == "a test project"
 
 
+def test_project_namespace_lookup_and_identity_update(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    p = store.create_project("doc-a", title="Doc A")
+    assert store.get_project_by_namespace(p["namespace"])["id"] == p["id"]
+
+    updated = store.update_project_identity(
+        p["id"],
+        title="Fourier Notes",
+        namespace="Lea.FourierNotes",
+        repo_path="proofs/Lea/FourierNotes",
+    )
+    assert updated["slug"] == "doc-a"
+    assert updated["title"] == "Fourier Notes"
+    assert updated["namespace"] == "Lea.FourierNotes"
+    assert updated["repo_path"] == "proofs/Lea/FourierNotes"
+    assert store.get_project_by_namespace("Lea.FourierNotes")["id"] == p["id"]
+
+
 def test_project_namespace_derivation_handles_digit_initial_slug(tmp_path, monkeypatch):
     # A Lean module segment can't start with a digit — guard with a prefix.
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
@@ -523,3 +544,34 @@ def test_latest_agent_code_step_and_edit_notes_since(tmp_path, monkeypatch):
     assert store.edit_notes_since(session["id"], agent_step["seq"]) == ["swapped a lemma"]
     # nothing after a later position
     assert store.edit_notes_since(session["id"], 9999) == []
+
+
+def test_fail_stale_active_runs_reaps_only_active_rows(tmp_path, monkeypatch):
+    """Startup crash recovery: pending/running run rows have no live runner after
+    a restart (or were never started at all — e.g. their client gave up waiting
+    for the single-run slot), so they flip to failed; terminal rows are untouched.
+    Without this, the derived session status shows 'thinking' forever."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Reap me")
+    orphaned_pending = store.create_run(session["id"], "m", None, 3)
+    interrupted_running = store.create_run(session["id"], "m", None, 3)
+    store.update_run(interrupted_running["id"], "running")
+    finished = store.create_run(session["id"], "m", None, 3)
+    store.update_run(finished["id"], "needs_review", result_kind="needs_review",
+                     result_detail="NEEDS_REVIEW")
+
+    assert store.fail_stale_active_runs() == 2
+
+    assert store.get_run(orphaned_pending["id"])["status"] == "failed"
+    assert store.get_run(orphaned_pending["id"])["result_kind"] == "failed"
+    reaped_running = store.get_run(interrupted_running["id"])
+    assert reaped_running["status"] == "failed"
+    assert "restarted" in reaped_running["result_detail"]
+    # the finished run keeps its real outcome
+    survivor = store.get_run(finished["id"])
+    assert survivor["status"] == "needs_review"
+    assert survivor["result_detail"] == "NEEDS_REVIEW"
+
+    # idempotent: nothing left to reap
+    assert store.fail_stale_active_runs() == 0

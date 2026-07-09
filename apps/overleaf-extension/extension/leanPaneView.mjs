@@ -14,10 +14,6 @@ const PANE_STATUS_LABELS = {
   // A verified disproof is surfaced as a counterexample: a successful result, but
   // not a proof of the stated theorem (FEATURE-counterexample-workflows.md).
   disproved: "counterexample",
-  // A checked, sorry-free proof the prover flagged for human review -- not
-  // "invalid" (it compiles), not "valid" (not fully confident either); see
-  // server.mjs's mapLeanPaneStatus / resolveProofOutcome needs_review branch.
-  "needs-review": "needs review",
   "in-progress": "in progress",
   invalid: "invalid",
   stale: "stale",
@@ -70,6 +66,16 @@ const DOUBLE_STRUCK = {
 };
 
 const SUCCESS_PANE_STATUSES = new Set(["valid", "defined", "disproved"]);
+const PROGRESS_SUCCESS_STATUSES = new Set(["valid", "formalized", "defined", "disproved"]);
+const PROGRESS_STUB_STATUSES = new Set(["stub-generated", "sorry_stub"]);
+const PROGRESS_FAILED_STATUSES = new Set(["failed", "invalid", "error"]);
+const PROGRESS_IN_PROGRESS_STATUSES = new Set(["in-progress", "in_progress"]);
+const PROGRESS_SEGMENT_DEFS = [
+  { id: "success", label: "Successful", countKey: "success" },
+  { id: "sorry-stubbed", label: "Sorry-stubbed", countKey: "sorryStubbed" },
+  { id: "failed", label: "Failed", countKey: "failed" },
+  { id: "unformalized", label: "Unformalized", countKey: "unformalized" }
+];
 
 export function formatPaneStatus(status) {
   return PANE_STATUS_LABELS[status] || "unknown";
@@ -239,6 +245,64 @@ export function aggregatePaneStatus(items) {
   return unique.size === 1 ? statuses[0] : "mixed";
 }
 
+export function paneProgressBucketForItem(item) {
+  const status = String(item?.status || item?.effectiveStatus || "unknown").toLowerCase();
+  if (PROGRESS_SUCCESS_STATUSES.has(status)) return "success";
+  if (PROGRESS_STUB_STATUSES.has(status)) return "sorryStubbed";
+  if (PROGRESS_FAILED_STATUSES.has(status)) return "failed";
+  return "unformalized";
+}
+
+export function summarizePaneProgress(items) {
+  const summary = {
+    total: 0,
+    success: 0,
+    sorryStubbed: 0,
+    failed: 0,
+    unformalized: 0,
+    inProgress: 0
+  };
+  for (const item of Array.isArray(items) ? items : []) {
+    summary.total += 1;
+    summary[paneProgressBucketForItem(item)] += 1;
+    const status = String(item?.status || "").toLowerCase();
+    if (item?.inProgress || PROGRESS_IN_PROGRESS_STATUSES.has(status)) {
+      summary.inProgress += 1;
+    }
+  }
+  return summary;
+}
+
+export function paneProgressSegments(summary) {
+  const total = Number(summary?.total || 0);
+  if (!total) return [];
+  return PROGRESS_SEGMENT_DEFS
+    .map((segment) => {
+      const count = Number(summary?.[segment.countKey] || 0);
+      return {
+        ...segment,
+        count,
+        percent: (count / total) * 100,
+        title: `${segment.label}: ${count} of ${total}, ${formatProgressPercent((count / total) * 100)}`
+      };
+    })
+    .filter((segment) => segment.count > 0);
+}
+
+export function formatPaneProgressLabel(path, summary) {
+  const total = Number(summary?.total || 0);
+  const file = normalizePanePath(path) || "File";
+  const parts = [
+    `${file}: ${total} Lea item${total === 1 ? "" : "s"}`
+  ];
+  appendProgressLabelPart(parts, summary?.success, "successful");
+  appendProgressLabelPart(parts, summary?.sorryStubbed, "sorry-stubbed");
+  appendProgressLabelPart(parts, summary?.failed, "failed");
+  appendProgressLabelPart(parts, summary?.unformalized, "unformalized");
+  appendProgressLabelPart(parts, summary?.inProgress, "in progress");
+  return `${parts.join(", ")}.`;
+}
+
 export function treeAncestorIdsForFile(sourceFile) {
   const parts = normalizePanePath(sourceFile).split("/").filter(Boolean);
   if (parts.length === 0) return [];
@@ -294,15 +358,52 @@ export function canFormalizePaneItem(item) {
   return FORMALIZABLE_PANE_STATUSES.has(item.status);
 }
 
-// Shape a manifest item into the target payload the existing /formalize flow expects.
+// Whether the pane should offer a sorry-stub action for an item. Mirrors the
+// in-document popover rule: stubbing only applies to a theorem with no Lean
+// artifact yet — definitions always get a full body, and once a stub or proof
+// exists, Formalize / Re-formalize is the right action.
+export function canStubPaneItem(item) {
+  if (!item || !item.formalizable || item.inProgress) return false;
+  if (item.leanKind === "def") return false;
+  return item.status === "missing-stub";
+}
+
+// Shape a manifest item into the target payload the existing /formalize flow
+// expects. targetLabel is the LaTeX marker `label` — NOT leanDeclarationName
+// (AUDIT M6): the companion keys jobs by the marker label (the doc-side anchor
+// that never changes), and the in-document badge always posts that label.
+// Sending the current declaration name here instead forked a renamed item's
+// job history — the pane and the badge would track two divergent jobKeys, and
+// their busy-checks and cleanup wouldn't compose. The declaration-name bridge
+// in resolveEditSession/resolveChatSession only exists because those paths
+// can't re-key; a formalize CAN and should just use the label.
 export function paneItemToFormalizeTarget(item) {
   return {
     targetKind: item?.leanKind === "def" ? "definition" : "theorem",
-    targetLabel: item?.leanDeclarationName || item?.label || "",
+    targetLabel: item?.label || item?.leanDeclarationName || "",
     targetText: item?.naturalLanguageLatex || "",
     targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
     targetContext: item?.targetContext || ""
   };
+}
+
+// Pane statuses that correspond to a real Lea run or saved proof artifact.
+// Same rule the in-document popover applies before offering "View in Lea UI"
+// (companion statuses formalized / defined / disproved / in_progress /
+// sorry_stub), translated to the pane vocabulary and extended with the
+// pane-only artifact states (stale / invalid), which also imply
+// a recorded run. missing-stub / unknown / error stay excluded so stale
+// session metadata can't make unformalized items appear viewable.
+const LEA_UI_VIEWABLE_PANE_STATUSES = new Set([
+  "valid", "defined", "disproved", "in-progress",
+  "stub-generated", "stale", "invalid"
+]);
+
+// Whether the pane should offer a "View in Lea UI" action for an item. Needs a
+// stable target identity (like chat) to resolve the associated Lea session.
+export function canViewPaneItemInLeaUi(item) {
+  if (!item || !(item.leanDeclarationName || item.label)) return false;
+  return LEA_UI_VIEWABLE_PANE_STATUSES.has(item.status);
 }
 
 // --- Lean-pane chat mirror -------------------------------------------------
@@ -376,6 +477,43 @@ export function chatBubbleClass(role) {
 // there.
 export function canEditPaneItem(item) {
   return Boolean(item && item.leanArtifactContent);
+}
+
+// --- Item action hierarchy ---------------------------------------------------
+
+// The full action set for an expanded pane item, arranged by visual weight so
+// the card stays one row instead of a wall of same-looking buttons:
+//   primary  -- at most ONE status-derived accented text button (repair wins
+//               over formalize: breakage attribution means the guided path).
+//   rail     -- always-relevant navigation, rendered as icon buttons.
+//   overflow -- the rare alternatives, behind a "More actions" menu. A
+//               formalizable-but-broken item keeps Re-formalize here so no
+//               capability is lost when Repair takes the primary slot.
+// Copy actions are absent by design: they belong on the code blocks they copy.
+export function paneItemActions(item, { editing = false } = {}) {
+  const canFormalize = canFormalizePaneItem(item);
+  const formalizeAction = {
+    id: "formalize",
+    label: item?.status === "missing-stub" ? "Formalize" : "Re-formalize"
+  };
+
+  let primary = null;
+  if (!editing && canRepairPaneItem(item)) {
+    primary = { id: "repair", label: "Repair with Lea" };
+  } else if (!editing && canFormalize) {
+    primary = formalizeAction;
+  }
+
+  const rail = [{ id: "go-to-source", label: "Go to source" }];
+  if (canChatPaneItem(item)) rail.push({ id: "chat", label: "Chat" });
+  if (canViewPaneItemInLeaUi(item)) rail.push({ id: "view-in-lea", label: "Open in Lea UI" });
+
+  const overflow = [];
+  if (primary?.id === "repair" && canFormalize) overflow.push(formalizeAction);
+  if (canStubPaneItem(item)) overflow.push({ id: "stub", label: "Stub" });
+  if (!editing && canEditPaneItem(item)) overflow.push({ id: "edit", label: "Edit" });
+
+  return { primary, rail, overflow };
 }
 
 // Shape a manifest item into the LeanPaneEditTarget payload the companion's
@@ -543,24 +681,6 @@ export function formatBreakageAttribution(breakage) {
   return `Broken by ${via} to ${breakage.upstreamLabel}.`;
 }
 
-// The confirmation body shown before any repair run starts (feature spec
-// Part 2: which items, what upstream change, which agent, how many runs).
-export function formatRepairConfirmation({ items = [], breakage = null, modelLabel = "" } = {}) {
-  const count = items.length;
-  const names = items.map((item) => item?.targetLabel || item?.leanDeclarationName || item?.label).filter(Boolean).join(", ");
-  const lines = [];
-  lines.push(`Repair ${count} item${count === 1 ? "" : "s"} with Lea: ${names}.`);
-  if (breakage && !breakage.selfBroken) {
-    if (breakage.classificationKind === "renamed" && breakage.renamedFrom && breakage.renamedTo) {
-      lines.push(`Upstream change: \`${breakage.renamedFrom}\` was renamed to \`${breakage.renamedTo}\`.`);
-    } else if (breakage.upstreamLabel) {
-      lines.push(`Upstream change: ${breakage.upstreamLabel} changed (${breakage.classificationKind || "modified"}).`);
-    }
-  }
-  lines.push(`This will start ${count} agent run${count === 1 ? "" : "s"}${modelLabel ? ` with ${modelLabel}` : " with the configured Lea model"} and consume model usage.`);
-  return lines.join("\n");
-}
-
 // One line per item for the batch progress / outcome list.
 export function formatRepairOutcome(entry) {
   if (!entry) return "";
@@ -593,6 +713,7 @@ function finalizePaneTreeNodes(nodes) {
       node.items.sort((a, b) => paneItemOrder(a) - paneItemOrder(b));
       node.itemCount = node.items.length;
       node.status = aggregatePaneStatus(node.items);
+      node.progress = summarizePaneProgress(node.items);
     }
   }
 }
@@ -617,6 +738,16 @@ function paneTreeFileId(path) {
 
 function normalizePanePath(value) {
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/").trim();
+}
+
+function appendProgressLabelPart(parts, count, label) {
+  const value = Number(count || 0);
+  if (value > 0) parts.push(`${value} ${label}`);
+}
+
+function formatProgressPercent(value) {
+  const rounded = Math.round(Number(value || 0) * 10) / 10;
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
 }
 
 function findNextMathDelimiter(text, cursor) {
