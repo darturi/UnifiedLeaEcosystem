@@ -4868,3 +4868,29 @@ test("adapter-side mid-run spend cap maps to finalStatus max_spend without an in
   // The run is already terminal adapter-side — no interrupt round-trip.
   assert.ok(!calls.some((call) => String(call.url).endsWith("/interrupt")));
 });
+
+test("formalize lifecycle publishes jobs-changed push events (PLAN 3.1)", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch([])
+  });
+  const { createEventBus } = await import("../companion/eventBus.mjs");
+  state.eventBus = createEventBus();
+  const seen = [];
+  state.eventBus.subscribe((event) => seen.push(event.type));
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "push_events_test",
+    targetText: "A theorem."
+  }, state);
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+
+  const jobsChanged = seen.filter((type) => type === "jobs-changed");
+  assert.ok(jobsChanged.length >= 2,
+    `expected registration + terminal jobs-changed events, saw ${seen.join(", ")}`);
+});

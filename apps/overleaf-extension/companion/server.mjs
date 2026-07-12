@@ -52,6 +52,7 @@ import {
   jobsByRecencyDesc,
   pruneJobs
 } from "./jobStore.mjs";
+import { createEventBus, publishEvent } from "./eventBus.mjs";
 import {
   exportProjectZipBySlug,
   fetchAdapterSettings,
@@ -147,7 +148,11 @@ export async function createServer({
     env,
     settings: applyEnvDefaults(await readJson(settingsPath, {}), env),
     jobs: await readJson(jobsPath, {}),
-    chatSessions: await readJson(chatSessionsPath, {})
+    chatSessions: await readJson(chatSessionsPath, {}),
+    // Push channel (PLAN 3.1): mutation sites publish here; GET /events
+    // streams it to the extension so it refetches on change instead of
+    // fast-polling.
+    eventBus: createEventBus()
   };
   await ensureStartupLeaRuntime(state);
   await recoverInterruptedJobs(state);
@@ -337,7 +342,7 @@ export async function handleFormalize(payload, state) {
   }
   job.retryCleanup = cleanup;
   state.jobs[job.jobId] = job;
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 
   runLeaJob({ state, job, target, targetText, targetContext, resolvedUses: usesResolution.resolvedUses }).catch(async (error) => {
     job.status = "failed";
@@ -345,7 +350,7 @@ export async function handleFormalize(payload, state) {
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
     await restorePreviousRunArtifacts({ state, job, target });
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
   });
 
   return {
@@ -419,7 +424,7 @@ export async function handleStub(payload, state) {
     mode: "stub"
   });
   state.jobs[job.jobId] = job;
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 
   try {
     await runLeaStubJob({
@@ -436,7 +441,7 @@ export async function handleStub(payload, state) {
     job.error = error instanceof Error ? error.message : String(error);
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
   }
 
   return {
@@ -672,7 +677,7 @@ export async function handleProjectIdentityUpdate(payload, state) {
       }
     }
   }
-  if (jobsChanged) await writeJson(state.jobsPath, state.jobs || {});
+  if (jobsChanged) await persistJobs(state);
   return { statusCode: 200, body: { ok: true, identity, migration: result.body?.migration || null } };
 }
 
@@ -928,6 +933,9 @@ function resolveChatSession({ state, target }) {
 async function persistChatSessions(state) {
   if (!state.chatSessionsPath) return;
   await writeJson(state.chatSessionsPath, state.chatSessions || {});
+  // Chat state changed (association, lastRunImpact, …) — nudge the mirror to
+  // refetch instead of waiting for its next poll (PLAN 3.1).
+  publishEvent(state, "chat-updated", {});
 }
 
 export async function handleChatSession(payload, state) {
@@ -1513,7 +1521,7 @@ export async function handleLeanPaneEditSave(payload, state) {
     const detail = `Saved, but the edit could not be verified: ${check.error || "the Lea adapter did not return a lean-check result."} Retry the save when the adapter is reachable.`;
     if (linkedJob) {
       recordEditCheckVerdict(linkedJob, { status: "error", detail });
-      await writeJson(state.jobsPath, state.jobs);
+      await persistJobs(state);
     }
     return {
       statusCode: 200,
@@ -1623,7 +1631,7 @@ export async function handleLeanPaneEditSave(payload, state) {
   }
 
   if (jobsChanged) {
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
   }
 
   return { statusCode: 200, body: { ok: true, unchanged: false, ownResult, dependentsImpact } };
@@ -1774,7 +1782,7 @@ async function runPostRunCascade({ state, overleafProjectId, targetLabel, snapsh
     jobsChanged = cascade.jobsChanged || jobsChanged;
   }
   if (jobsChanged) {
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
   }
   return { classification, afterHeader, checkStatus, dependentsImpact, finishedAt: new Date().toISOString() };
 }
@@ -2014,7 +2022,7 @@ async function runLeaRepairJob({ state, job, target, snapshot, breakage, prompt 
   job.timedOut = exit.timedOut;
   job.apiRunId = exit.apiRunId || job.apiRunId || null;
   job.finishedAt = new Date().toISOString();
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 }
 
 // The user-facing explanation of a failed repair: the agent's own final
@@ -2091,7 +2099,7 @@ async function startRepairRun({ state, overleafProjectId, targetKind: requestedK
 
   const job = await createRepairJob({ state, target, linkedJob, breakage, leaSessionId });
   state.jobs[job.jobId] = job;
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 
   const runPromise = runLeaRepairJob({ state, job, target, snapshot, breakage, prompt }).catch(async (error) => {
     job.status = "repair_failed";
@@ -2100,7 +2108,7 @@ async function startRepairRun({ state, overleafProjectId, targetKind: requestedK
     job.lastRepair = { state: "failed", failureReason: job.error, finishedAt: new Date().toISOString() };
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
   });
 
   return { status: "started", job, target, runPromise };
@@ -2274,6 +2282,11 @@ function importsReach(fromModule, toModule, importsByModule) {
 async function runRepairBatch(state, batch) {
   if (batch.running) return;
   batch.running = true;
+  const publishBatch = () => publishEvent(state, "repair-batch-updated", {
+    overleafProjectId: batch.overleafProjectId,
+    batchId: batch.batchId
+  });
+  publishBatch();
   try {
     for (const entry of batch.items) {
       if (batch.pausedOn) break;
@@ -2304,6 +2317,7 @@ async function runRepairBatch(state, batch) {
 
       entry.state = "running";
       entry.runJobId = started.job.jobId;
+      publishBatch();
       await started.runPromise;
 
       const finalJob = state.jobs[started.job.jobId] || started.job;
@@ -2332,6 +2346,7 @@ async function runRepairBatch(state, batch) {
   } finally {
     batch.running = false;
     batch.done = batch.items.every((entry) => entry.state !== "pending" && entry.state !== "running") && !batch.pausedOn;
+    publishBatch();
   }
 }
 
@@ -2398,13 +2413,28 @@ function startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot = nu
     onRunStarted: async (runId, sessionId) => {
       const resolvedSessionId = sessionId || leaSessionId || null;
       resolvedRunSessionId = resolvedSessionId;
+      publishEvent(state, "chat-updated", { overleafProjectId: target.overleafProjectId, targetKey: target.targetKey });
       finish({
         ok: true,
         runId,
         sessionId: resolvedSessionId,
         leaSessionUrl: resolvedSessionId ? buildLeaSessionUrl(uiBaseUrl, resolvedSessionId) : null
       });
-    }
+    },
+    // Live-ish chat mirror (PLAN 3.1): the run's adapter events flow through
+    // here anyway — throttle them into chat-updated nudges so the panel
+    // refetches the transcript within a second of new content instead of on
+    // its next poll tick.
+    onEvent: (() => {
+      let lastPublishAt = 0;
+      return async (type) => {
+        if (type !== "message" && type !== "assistant_delta" && type !== "done") return;
+        const now = Date.now();
+        if (type !== "done" && now - lastPublishAt < 1000) return;
+        lastPublishAt = now;
+        publishEvent(state, "chat-updated", { overleafProjectId: target.overleafProjectId, targetKey: target.targetKey });
+      };
+    })()
   });
 
   // If start failed (no run id, so onRunStarted never fired) settle from the run
@@ -2744,6 +2774,11 @@ async function routeRequest(request, response, state) {
       leaRepoConfigured: validation.ok,
       leaWorkspacePath: validation.ok ? validation.leaWorkspacePath : state.settings.leaWorkspacePath || ""
     });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/events") {
+    handleEventsStream(request, response, url, state);
     return;
   }
 
@@ -3419,11 +3454,21 @@ async function findReusableStubForFormalization({ state, leaRepoPath, target, jo
 // pruneJobs keeps a superset of everything the status/selection queries can
 // reach (see jobStore.mjs), so this is invisible to behavior. Each removed
 // job's log file goes with it — log files are 1:1 with jobIds.
+// The one jobs-persistence seam (PLAN 3.1): every job mutation flows through
+// here, so persisting doubles as the push signal — subscribers get one
+// coarse "jobs-changed" and refetch the (already batched, project-scoped)
+// statuses/pane payloads. Fine-grained events would save nothing: the
+// extension's refresh endpoints are per-project, not per-field.
+async function persistJobs(state) {
+  await writeJson(state.jobsPath, state.jobs);
+  publishEvent(state, "jobs-changed", {});
+}
+
 async function pruneAndPersistJobs(state) {
   const { jobs, removed, changed } = pruneJobs(state.jobs || {});
   if (!changed) return;
   state.jobs = jobs;
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
   for (const job of removed) {
     if (!job?.logPath) continue;
     try {
@@ -3758,12 +3803,12 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       job.adapterProjectId = startBody.project_id || job.adapterProjectId || null;
       if (startBody.project_namespace) target.projectNamespace = startBody.project_namespace;
       if (startBody.project_slug) target.projectSlug = startBody.project_slug;
-      await writeJson(state.jobsPath, state.jobs);
+      await persistJobs(state);
     },
     onEvent,
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
-      await writeJson(state.jobsPath, state.jobs);
+      await persistJobs(state);
     }
   });
   if (exit.resultKind === "max_spend") {
@@ -4213,7 +4258,7 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
   } else if (outcome.jobStatus === "failed") {
     await restorePreviousRunArtifacts({ state, job, target });
   }
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 }
 
 async function runLeaJob({ state, job, target, targetText, targetContext = "", resolvedUses = [] }) {
@@ -4235,7 +4280,7 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
     // The spend cap killed the run before it produced anything — put the
     // previous verified artifact back (AUDIT H2).
     await restorePreviousRunArtifacts({ state, job, target });
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
     return;
   }
 
@@ -4312,7 +4357,7 @@ async function runLeaStubJob({ state, job, target, targetText, targetContext = "
     job.error = artifact.error || exit.error || "Lea did not produce a valid sorry stub.";
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] Stub generation failed: ${job.error}\n`);
-    await writeJson(state.jobsPath, state.jobs);
+    await persistJobs(state);
     return;
   }
 
@@ -4339,7 +4384,7 @@ async function runLeaStubJob({ state, job, target, targetText, targetContext = "
     solvingProcess: "Stub only: Lean statement translated and checked; proof intentionally left as `sorry`."
   });
   await appendLog(job.logPath, `\n[backend] Stub generated at ${artifact.recordedProofPath}\n`);
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 }
 
 function validateStubArtifact({ state, job, target, exit, sessionDetail, observedCodeSteps = [] }) {
@@ -4666,7 +4711,7 @@ async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
     await markJobMaxSpend({ state, job, mode });
     return { stop: true, error: MAX_SPEND_MESSAGE };
   }
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
   return { stop: false };
 }
 
@@ -4696,7 +4741,7 @@ async function markJobMaxSpend({ state, job, mode, interrupt = true }) {
   } else if (mode) {
     await appendLog(job.logPath, `[backend] Cost cap reached before Lea API run id was available for ${mode}.\n`);
   }
-  await writeJson(state.jobsPath, state.jobs);
+  await persistJobs(state);
 }
 
 async function runLeanCheck(leaWorkspacePath, proofPath) {
@@ -6090,6 +6135,47 @@ function writeJson(filePath, value) {
 function sendJson(response, statusCode, body) {
   response.writeHead(statusCode, { "Content-Type": "application/json" });
   response.end(JSON.stringify(body));
+}
+
+// Push channel endpoint (PLAN-system-hardening 3.1): streams the event bus as
+// SSE so the extension refetches on change instead of fast-polling. Optional
+// ?projectId= filters to one Overleaf document; events carrying no
+// overleafProjectId (the coarse jobs-changed) always pass. CORS rides on the
+// same origin allowlist as every route (EventSource sends the page origin and
+// no custom headers). A keep-alive comment defeats idle-connection reaping.
+const SSE_KEEPALIVE_MS = 15000;
+
+function handleEventsStream(request, response, url, state) {
+  const projectFilter = String(url.searchParams.get("projectId") || "");
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+  // An immediate frame so EventSource fires `open` promptly and proxies flush.
+  response.write(`event: hello\ndata: {"ok":true}\n\n`);
+
+  state.eventBus ||= createEventBus();
+  const unsubscribe = state.eventBus.subscribe((event) => {
+    if (projectFilter && event.overleafProjectId && event.overleafProjectId !== projectFilter) return;
+    try {
+      response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    } catch {
+      // Half-closed socket — the close handler below unsubscribes.
+    }
+  });
+  const keepalive = setInterval(() => {
+    try {
+      response.write(":ka\n\n");
+    } catch {
+      // ditto
+    }
+  }, SSE_KEEPALIVE_MS);
+  if (typeof keepalive.unref === "function") keepalive.unref();
+  request.on("close", () => {
+    clearInterval(keepalive);
+    unsubscribe();
+  });
 }
 
 // AUDIT H3: this server can start paid runs, rewrite provider keys in .env,

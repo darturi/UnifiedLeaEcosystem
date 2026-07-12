@@ -24,6 +24,15 @@
   // (AUDIT M4).
   const STATUS_REFRESH_DEBOUNCE_MS = 250;
   const STATUS_REFRESH_IN_PROGRESS_MS = 3000;
+  // Push channel (PLAN-system-hardening 3.1): while the companion's /events
+  // stream is connected, the fast polls stretch to these slow reconciliation
+  // cadences — pushes drive updates, polls only catch missed events. When the
+  // stream drops, the schedulers fall back to the fast cadences above.
+  const STATUS_REFRESH_RECONCILE_MS = 30000;
+  const LEAN_PANE_POLL_RECONCILE_MS = 60000;
+  const LEAN_PANE_CHAT_POLL_RECONCILE_MS = 30000;
+  const REPAIR_BATCH_POLL_MS = 2000;
+  const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -129,6 +138,10 @@
   let editorHookWatchdog = null;
   let editorHookSignalSeen = false;
   let editorHookWarningBanner = null;
+  // Push channel (PLAN 3.1): one EventSource on the companion's /events.
+  // pushConnected is consulted by every poll scheduler when picking a delay.
+  let eventsClient = null;
+  let pushConnected = false;
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
@@ -174,6 +187,7 @@
 
   injectPageBridge();
   startEditorHookWatchdog();
+  startEventsClient();
   requestTargetsSoon();
   renderSettingsButton();
   renderLeanPaneButton();
@@ -770,7 +784,7 @@
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = setTimeout(() => {
       refreshLeanPaneNow({ background: true }).catch(renderLeanPaneError);
-    }, LEAN_PANE_POLL_DELAY_MS);
+    }, pushConnected ? LEAN_PANE_POLL_RECONCILE_MS : LEAN_PANE_POLL_DELAY_MS);
   }
 
   async function getLeanPaneProjectFiles({ projectId, forceFetch }) {
@@ -1290,12 +1304,17 @@
     scheduleLeanPaneRefresh();
   }
 
-  function startRepairBatchPolling() {
+  function startRepairBatchPolling({ immediate = false } = {}) {
     if (leanPaneRepairBatchTimer) clearTimeout(leanPaneRepairBatchTimer);
+    const delayMs = immediate
+      ? 0
+      : (pushConnected ? REPAIR_BATCH_POLL_RECONCILE_MS : REPAIR_BATCH_POLL_MS);
     leanPaneRepairBatchTimer = setTimeout(async () => {
       leanPaneRepairBatchTimer = 0;
       const batchId = leanPaneRepairBatch?.batchId;
       if (!batchId) return;
+      // (delay above: instant when a push event announced a change, slow
+      // reconciliation while the stream is up, fast poll when it's down)
       try {
         const baseUrl = await chatCompanionBaseUrl();
         const response = await fetch(`${baseUrl}/lean-pane/repair/status`, {
@@ -1313,7 +1332,7 @@
       if (leanPaneRepairBatch && !leanPaneRepairBatch.done && !leanPaneRepairBatch.pausedOn) {
         startRepairBatchPolling();
       }
-    }, 2000);
+    }, delayMs);
   }
 
   async function continueRepairBatch() {
@@ -2060,7 +2079,7 @@
     }
   }
 
-  function startChatPolling(delayMs = LEAN_PANE_POLL_DELAY_MS) {
+  function startChatPolling(delayMs = (pushConnected ? LEAN_PANE_CHAT_POLL_RECONCILE_MS : LEAN_PANE_POLL_DELAY_MS)) {
     clearTimeout(leanPaneChatPollTimer);
     leanPaneChatPollTimer = setTimeout(() => {
       // pollChatSession handles its own transient errors; the catch is a
@@ -3076,7 +3095,7 @@
       if (target) updatePopoverStatus(activePopover, target);
     }
     if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
-      scheduleStatusRefresh(STATUS_REFRESH_IN_PROGRESS_MS);
+      scheduleStatusRefresh(pushConnected ? STATUS_REFRESH_RECONCILE_MS : STATUS_REFRESH_IN_PROGRESS_MS);
     }
   }
 
@@ -4039,6 +4058,77 @@
     const data = new TextEncoder().encode(text);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function startEventsClient() {
+    try {
+      const module = await import(chrome.runtime.getURL("eventsClient.mjs"));
+      // The companion URL comes from settings (async); cache it for the
+      // client's synchronous url() and refresh the cache on every reconnect
+      // attempt so a settings change is picked up without a page reload.
+      let companionUrlCache = DEFAULT_COMPANION_URL;
+      const refreshUrlCache = () => {
+        getSettings()
+          .then((settings) => {
+            companionUrlCache = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+          })
+          .catch(() => {});
+      };
+      refreshUrlCache();
+      eventsClient = module.createEventsClient({
+        url: () => {
+          refreshUrlCache();
+          const projectId = extractOverleafProjectId();
+          const query = projectId && projectId !== "unknown"
+            ? `?projectId=${encodeURIComponent(projectId)}`
+            : "";
+          return `${companionUrlCache}/events${query}`;
+        },
+        onEvent: handlePushEvent,
+        onConnectionChange: (connected) => {
+          pushConnected = connected;
+          if (connected) {
+            // Reconcile once on (re)connect: anything that changed while the
+            // stream was down is picked up now instead of on the slow poll.
+            scheduleStatusRefresh();
+            if (leanPane) scheduleLeanPaneRefresh();
+          }
+        },
+        // Bind EventSource + timers to the content-script scope: the module's
+        // own defaults resolve in the module realm, which under the test
+        // harness is Node's — real sockets and a real clock (same trap as
+        // editorHookWatchdog). `typeof` guard: no EventSource here means the
+        // push channel is unavailable and the polls stay primary.
+        EventSourceImpl: typeof EventSource === "undefined" ? null : EventSource,
+        setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
+        clearTimeoutImpl: (id) => clearTimeout(id)
+      });
+      eventsClient.start();
+    } catch {
+      // Push is an optimization; the poll fallback keeps everything working.
+    }
+  }
+
+  function handlePushEvent(type, data) {
+    if (type === "jobs-changed") {
+      scheduleStatusRefresh();
+      if (leanPane) scheduleLeanPaneRefresh();
+      return;
+    }
+    if (type === "chat-updated") {
+      // Only refetch when the chat panel is open — and if the event names a
+      // target, only when it's the one being viewed.
+      if (!leanPaneChatPanel || !leanPaneChatItem) return;
+      const eventKey = data && typeof data.targetKey === "string" ? data.targetKey : "";
+      if (eventKey && leanPaneChatTarget?.targetKey && eventKey !== leanPaneChatTarget.targetKey) return;
+      pollChatSession().catch(() => {});
+      return;
+    }
+    if (type === "repair-batch-updated") {
+      if (!leanPaneRepairBatch?.batchId) return;
+      if (data && data.batchId && data.batchId !== leanPaneRepairBatch.batchId) return;
+      startRepairBatchPolling({ immediate: true });
+    }
   }
 
   async function startEditorHookWatchdog() {

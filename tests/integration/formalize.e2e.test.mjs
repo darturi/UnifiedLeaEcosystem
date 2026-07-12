@@ -269,6 +269,40 @@ test("companion end-to-end: /formalize drives a run to formalized with a session
   assert.equal(detail.body.origin, "overleaf");
 });
 
+test("companion push channel: /events streams jobs-changed during a formalize (PLAN 3.1)", async () => {
+  const response = await fetch(`${companionBaseUrl}/events?projectId=itest-doc`);
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const readUntil = async (needle, timeoutMs = 30000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!buffer.includes(needle)) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${needle}`);
+      const { value, done } = await reader.read();
+      if (done) throw new Error(`stream ended before ${needle} arrived`);
+      buffer += decoder.decode(value);
+    }
+  };
+
+  try {
+    await readUntil("event: hello");
+    const target = { targetKind: "theorem", targetLabel: "int_push_true", targetText: "True is true." };
+    const result = await postJson(`${companionBaseUrl}/formalize`, {
+      overleafProjectId: "itest-doc",
+      ...target
+    });
+    assert.equal(result.status, 200);
+    await readUntil("event: jobs-changed");
+    // And the run still completes normally underneath.
+    const info = await pollStatus("itest-doc", target, ["formalized", "failed"]);
+    assert.equal(info.status, "formalized");
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+});
+
 test("companion end-to-end: a failing run surfaces as failed, not as a hang", async () => {
   const target = {
     targetKind: "theorem",
