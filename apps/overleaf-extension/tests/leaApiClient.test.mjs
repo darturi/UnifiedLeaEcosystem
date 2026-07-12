@@ -42,7 +42,7 @@ test("parseSseFrame tolerates a missing/blank data line", () => {
   assert.equal(data, null);
 });
 
-test("runApiProofJob: success done → ok with usage read back from the run row", async () => {
+test("runApiProofJob: proved done → ok with usage read back from the run row", async () => {
   const calls = [];
   const fetchImpl = async (url, options = {}) => {
     calls.push({ url, method: options.method || "GET" });
@@ -53,7 +53,7 @@ test("runApiProofJob: success done → ok with usage read back from the run row"
       return sseResponse([
         frame("status", { status: "tool_call", message: "Running write_file", turn: 1 }),
         frame("code_step", { id: "cs1", turn: 1 }),
-        frame("done", { status: "success" }),
+        frame("done", { status: "proved" }),
       ], { chunkSize: 7 });
     }
     if (url.includes("/api/sessions/sess-1")) {
@@ -75,7 +75,7 @@ test("runApiProofJob: success done → ok with usage read back from the run row"
   assert.equal(result.timedOut, false);
   assert.equal(result.apiRunId, "run-1");
   assert.equal(result.sessionId, "sess-1");
-  assert.equal(result.doneStatus, "success");
+  assert.equal(result.doneStatus, "proved");
   assert.deepEqual(result.usage, { inputTokens: 100, outputTokens: 40, totalTokens: 140 });
   assert.equal(result.costUsd, 0.012);
   assert.ok(progress.some((p) => p.currentTurn === 1));
@@ -116,7 +116,7 @@ test("runApiProofJob: forwards origin/origin_url + project tags to POST /api/run
       return jsonResponse({ session_id: "sess-o", run_id: "run-o" });
     }
     if (url.includes("/api/runs/run-o/events")) {
-      return sseResponse([frame("done", { status: "success" })]);
+      return sseResponse([frame("done", { status: "proved" })]);
     }
     if (url.includes("/api/sessions/sess-o")) {
       return jsonResponse({ runs: [{ id: "run-o", input_tokens: 0, output_tokens: 0, cost_usd: 0 }] });
@@ -148,7 +148,7 @@ test("runApiProofJob: omits origin fields when not provided (interactive parity)
       return jsonResponse({ session_id: "sess-n", run_id: "run-n" });
     }
     if (url.includes("/api/runs/run-n/events")) {
-      return sseResponse([frame("done", { status: "success" })]);
+      return sseResponse([frame("done", { status: "proved" })]);
     }
     if (url.includes("/api/sessions/sess-n")) {
       return jsonResponse({ runs: [] });
@@ -172,7 +172,7 @@ test("runApiProofJob: auto-approves a gated tool call so the run stays autonomou
       return sseResponse([
         frame("approval_requested", { approval_id: "appr-1", tool_name: "bash", args: {} }),
         frame("approval_resolved", { approval_id: "appr-1", decision: "always_session" }),
-        frame("done", { status: "success" }),
+        frame("done", { status: "proved" }),
       ]);
     }
     if (url.includes("/api/runs/run-2/approvals/appr-1") && options.method === "POST") {
@@ -229,28 +229,28 @@ test("runApiProofJob: a run_error frame surfaces as the failure reason", async (
   assert.match(result.error, /already active/);
 });
 
-// --- single-run-slot queueing -------------------------------------------------
-// The adapter starts a run only when its event stream first attaches, and 409s
-// the attach while another run holds the single-run slot. That is "wait your
-// turn", not "the proof failed": the client must keep the created run and
-// re-attach until the slot frees.
+// --- server-side queue (Phase 2) ----------------------------------------------
+// The adapter queues runs FIFO and the events endpoint is a pure observer: a
+// queued run streams `queued` frames (with its position), and attach never
+// races a slot. The client just watches; the only retries left are transport
+// drops (next section).
 
-test("runApiProofJob: 409 on stream attach while the run is still pending → waits and re-attaches", async () => {
-  let eventsCalls = 0;
+test("runApiProofJob: queued frames stream through and are logged before the run starts", async () => {
   const logLines = [];
+  const observed = [];
   const fetchImpl = async (url, options = {}) => {
     if (url.endsWith("/api/runs") && options.method === "POST") {
-      return jsonResponse({ session_id: "sess-q", run_id: "run-q" });
+      return jsonResponse({ session_id: "sess-q", run_id: "run-q", queue_position: 1 });
     }
     if (url.includes("/api/runs/run-q/events")) {
-      eventsCalls += 1;
-      if (eventsCalls <= 2) {
-        return jsonResponse({ detail: "Another Lea run is already active." }, false, 409);
-      }
-      return sseResponse([frame("done", { status: "proved" })]);
+      return sseResponse([
+        frame("queued", { run_id: "run-q", position: 1 }),
+        frame("status", { status: "tool_call", turn: 1 }),
+        frame("done", { status: "proved" }),
+      ]);
     }
     if (url.includes("/api/sessions/sess-q")) {
-      return jsonResponse({ runs: [{ id: "run-q", status: "pending", input_tokens: 5, output_tokens: 3, cost_usd: 0.001 }] });
+      return jsonResponse({ runs: [{ id: "run-q", status: "proved", input_tokens: 5, output_tokens: 3, cost_usd: 0.001 }] });
     }
     throw new Error(`unexpected fetch ${url}`);
   };
@@ -263,45 +263,13 @@ test("runApiProofJob: 409 on stream attach while the run is still pending → wa
     busyRetryDelayMs: 5,
     appendLog: async (_path, line) => logLines.push(line),
     logPath: "/dev/null",
+    onEvent: async (type) => observed.push(type),
   });
 
-  assert.equal(eventsCalls, 3);
   assert.equal(result.ok, true);
-  assert.equal(result.timedOut, false);
   assert.equal(result.doneStatus, "proved");
-  assert.ok(logLines.some((l) => l.includes("waiting for the run slot")));
-});
-
-test("runApiProofJob: 409 but the run row is already terminal → adopts that outcome, no retry loop", async () => {
-  let eventsCalls = 0;
-  const fetchImpl = async (url, options = {}) => {
-    if (url.endsWith("/api/runs") && options.method === "POST") {
-      return jsonResponse({ session_id: "sess-t", run_id: "run-t" });
-    }
-    if (url.includes("/api/runs/run-t/events")) {
-      eventsCalls += 1;
-      return jsonResponse({ detail: "Run has already completed" }, false, 409);
-    }
-    if (url.includes("/api/sessions/sess-t")) {
-      return jsonResponse({ runs: [{ id: "run-t", status: "failed", result_kind: "failed", result_detail: "Interrupted before the run started." }] });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  const result = await runApiProofJob({
-    fetchImpl,
-    baseUrl: "http://127.0.0.1:8001",
-    message: "Formalize terminal",
-    timeoutMs: 5000,
-    busyRetryDelayMs: 5,
-  });
-
-  assert.equal(eventsCalls, 1);
-  assert.equal(result.ok, false);
-  assert.equal(result.timedOut, false);
-  assert.equal(result.doneStatus, "failed");
-  assert.equal(result.resultDetail, "Interrupted before the run started.");
-  assert.match(result.error, /failed/);
+  assert.ok(observed.includes("queued"), "queued frames reach onEvent");
+  assert.ok(logLines.some((l) => l.includes("queued this run (position 1)")));
 });
 
 test("runApiProofJob: still queued at the deadline → times out and interrupts the pending run", async () => {
@@ -315,7 +283,9 @@ test("runApiProofJob: still queued at the deadline → times out and interrupts 
       return jsonResponse({ status: "interrupted" });
     }
     if (url.includes("/api/runs/run-w/events")) {
-      return jsonResponse({ detail: "Another Lea run is already active." }, false, 409);
+      // The stream announces the queue position, then the connection recycles
+      // without a `done` — the run is still waiting its turn.
+      return sseResponse([frame("queued", { run_id: "run-w", position: 2 })]);
     }
     if (url.includes("/api/sessions/sess-w")) {
       return jsonResponse({ runs: [{ id: "run-w", status: "pending" }] });
@@ -336,7 +306,7 @@ test("runApiProofJob: still queued at the deadline → times out and interrupts 
   assert.ok(calls.some((c) => c.url.includes("/api/runs/run-w/interrupt") && c.method === "POST"));
 });
 
-test("runApiProofJob: a non-409 stream failure still fails immediately (no retry)", async () => {
+test("runApiProofJob: an HTTP rejection of the attach fails immediately (no retry)", async () => {
   let eventsCalls = 0;
   const fetchImpl = async (url, options = {}) => {
     if (url.endsWith("/api/runs") && options.method === "POST") {

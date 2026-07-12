@@ -1727,3 +1727,64 @@ body.ol-lean-pane-resizing {
 .ol-lean-chat-open:hover {
   text-decoration: underline;
 }
+
+/* Editor-hook watchdog banner (PLAN-system-hardening 0.4): shown when the
+   editor DOM is present but the page bridge never hooked Overleaf's
+   UNSTABLE_editor:extensions event — i.e. Overleaf changed and the
+   integration is silently dead. */
+.ol-lean-editor-hook-warning {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(440px, calc(100vw - 24px));
+  box-sizing: border-box;
+  padding: 10px 10px 10px 12px;
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+  border: 1px solid var(--ol-amber);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(184, 132, 42, 0.16);
+  font: 12px/1.35 var(--ol-sans);
+}
+
+.ol-lean-editor-hook-warning div {
+  min-width: 0;
+}
+
+.ol-lean-editor-hook-warning strong,
+.ol-lean-editor-hook-warning span {
+  display: block;
+}
+
+.ol-lean-editor-hook-warning strong {
+  margin-bottom: 2px;
+  color: #8a6420;
+  font-weight: 700;
+}
+
+.ol-lean-editor-hook-warning span {
+  color: #8a6420;
+}
+
+.ol-lean-editor-hook-warning button {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: #8a6420;
+  background: transparent;
+  cursor: pointer;
+  font: 700 14px/1 var(--ol-sans);
+}
+
+.ol-lean-editor-hook-warning button:hover,
+.ol-lean-editor-hook-warning button:focus-visible {
+  background: rgba(184, 132, 42, 0.16);
+}

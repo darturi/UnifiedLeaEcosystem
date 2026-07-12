@@ -9,6 +9,7 @@
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
   const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
+  const TEX_MIRROR_FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
   const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
@@ -46,6 +47,9 @@
   let texMirrorSyncedOnce = false;
   let texMirrorSyncTimer = null;
   let texMirrorSyncPromise = null;
+  // When the last zip-download full sync ran (PLAN 3.2): ordinary edits ship
+  // only the active buffer; the zip refresh happens on this cadence.
+  let lastTexMirrorFullSyncAt = 0;
   let latestStatuses = {};
   let badgeLayer = null;
   let settingsButton = null;
@@ -119,9 +123,20 @@
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
   let costCapUsageLimitReached = false;
+  // Editor-hook watchdog (PLAN-system-hardening 0.4): warns when the editor is
+  // visible but the page bridge never hooked Overleaf's UNSTABLE_ editor event
+  // — i.e. Overleaf changed and the integration is silently dead.
+  let editorHookWatchdog = null;
+  let editorHookSignalSeen = false;
+  let editorHookWarningBanner = null;
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
+    if (event.data?.type === "OL_LEAN_EDITOR_HOOKED") {
+      editorHookSignalSeen = true;
+      editorHookWatchdog?.editorHooked();
+      return;
+    }
     if (event.data?.type === "OL_LEAN_TARGET_CLICK") {
       rememberTarget(event.data.target);
       showTargetPopover(event.data.clientX, event.data.clientY, event.data.target);
@@ -158,6 +173,7 @@
   });
 
   injectPageBridge();
+  startEditorHookWatchdog();
   requestTargetsSoon();
   renderSettingsButton();
   renderLeanPaneButton();
@@ -3108,14 +3124,52 @@
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
 
     texMirrorSyncPromise = (async () => {
-      // Re-download + unzip the project only when the content may have changed (an edit
-      // set the dirty flag, a new project, or no cached set yet); otherwise reuse the
-      // cached .tex set so an unchanged formalize skips the expensive zip fetch.
-      const needFetch = texMirrorDirty || !lastMirrorFiles || lastMirrorProjectId !== projectId;
+      // Two sync tiers (PLAN-system-hardening 3.2): the whole-project zip
+      // download used to run on every edit-pause once a project was activated
+      // — heavy for large projects and unkind to Overleaf's servers. Now an
+      // ordinary edit ships just the active editor buffer (mode "upsert" —
+      // the adapter writes it without treating absent files as deleted); the
+      // zip + full reconcile runs only on activation, when the active file
+      // isn't in the cached set (new/renamed doc), on a periodic refresh to
+      // pick up collaborator edits, and stays the base of the forced
+      // pre-formalize sync.
+      const activeRel = String(latestActiveTexPath || "").replace(/^\/+/, "");
+      const cacheUsable = Boolean(lastMirrorFiles) && lastMirrorProjectId === projectId;
+      const activeKnown = !activeRel || (cacheUsable && lastMirrorFiles.some((file) => file.path === activeRel));
+      const fullSyncDue =
+        !cacheUsable ||
+        !activeKnown ||
+        Date.now() - lastTexMirrorFullSyncAt > TEX_MIRROR_FULL_SYNC_INTERVAL_MS;
+
+      if (!force && !fullSyncDue && activeRel && typeof latestActiveTex === "string") {
+        const response = await fetch(`${baseUrl}/mirror-tex`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            overleafProjectId: projectId,
+            mode: "upsert",
+            files: [{ path: activeRel, content: latestActiveTex }]
+          })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+        }
+        lastMirrorFiles = lastMirrorFiles.map((file) =>
+          file.path === activeRel ? { ...file, content: latestActiveTex } : file
+        );
+        texMirrorDirty = false;
+        return payload;
+      }
+
+      // Full tier. Re-download + unzip only when the cached set can't serve
+      // (new project / unknown active file / periodic refresh); a forced
+      // pre-formalize sync with a healthy cache POSTs the cached set — the
+      // adapter is authoritative and no-ops cheaply on identical content, so
+      // divergence self-heals without a zip per formalize.
+      const needFetch = !cacheUsable || !activeKnown ||
+        Date.now() - lastTexMirrorFullSyncAt > TEX_MIRROR_FULL_SYNC_INTERVAL_MS;
       const files = needFetch ? await collectProjectTexFiles(projectId) : lastMirrorFiles;
-      // Always POST: the adapter is authoritative and no-ops cheaply on identical
-      // content, so a backend reset (or any client/server divergence) self-heals instead
-      // of being masked by a stale client-side "already synced" cache.
       const response = await fetch(`${baseUrl}/mirror-tex`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3129,6 +3183,7 @@
       lastMirrorProjectId = projectId;
       texMirrorSyncedOnce = true;
       texMirrorDirty = false;
+      if (needFetch) lastTexMirrorFullSyncAt = Date.now();
       return payload;
     })().finally(() => {
       texMirrorSyncPromise = null;
@@ -3984,6 +4039,56 @@
     const data = new TextEncoder().encode(text);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function startEditorHookWatchdog() {
+    try {
+      const module = await import(chrome.runtime.getURL("editorHookWatchdog.mjs"));
+      editorHookWatchdog = module.createEditorHookWatchdog({
+        // querySelector guard: exotic embedding contexts (and the test
+        // harness's minimal document) may lack it — treat as "no editor".
+        isEditorPresent: () =>
+          typeof document.querySelector === "function" &&
+          Boolean(document.querySelector(".cm-editor, .cm-content")),
+        onWarn: renderEditorHookWarning,
+        onRecover: removeEditorHookWarning,
+        // Bind timers to the content-script scope: the module's own defaults
+        // resolve in the module realm, which under the test harness is the
+        // real Node clock rather than the page's (fake) one.
+        setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
+        clearTimeoutImpl: (id) => clearTimeout(id)
+      });
+      // The hook signal can beat the module import — honor it instead of arming.
+      if (editorHookSignalSeen) editorHookWatchdog.editorHooked();
+      else editorHookWatchdog.arm();
+    } catch {
+      // Best-effort: the watchdog must never break the page.
+    }
+  }
+
+  function renderEditorHookWarning() {
+    if (editorHookWarningBanner) return;
+    const banner = document.createElement("div");
+    banner.className = "ol-lean-editor-hook-warning";
+    const body = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = "Lea can't attach to the Overleaf editor";
+    const detail = document.createElement("span");
+    detail.textContent = "Overleaf may have changed its editor internals. Theorem badges and % lea: markers won't work until the extension is updated.";
+    body.append(title, detail);
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", removeEditorHookWarning);
+    banner.append(body, dismiss);
+    (document.body || document.documentElement).appendChild(banner);
+    editorHookWarningBanner = banner;
+  }
+
+  function removeEditorHookWarning() {
+    editorHookWarningBanner?.remove();
+    editorHookWarningBanner = null;
   }
 
   function injectPageBridge() {

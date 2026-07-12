@@ -45,6 +45,14 @@ import {
 import { classifyEdit, cascadeRequired, parseDeclarationHeader } from "./leanSignatureDiff.mjs";
 import { breakageDescriptor, runCascadeVerification } from "./cascadeVerify.mjs";
 import {
+  findActiveJob,
+  findLatestFinishedJob,
+  findLatestJob,
+  jobRecency,
+  jobsByRecencyDesc,
+  pruneJobs
+} from "./jobStore.mjs";
+import {
   exportProjectZipBySlug,
   fetchAdapterSettings,
   fetchAdapterUsageStats,
@@ -143,6 +151,7 @@ export async function createServer({
   };
   await ensureStartupLeaRuntime(state);
   await recoverInterruptedJobs(state);
+  await pruneAndPersistJobs(state);
 
   const server = http.createServer(async (request, response) => {
     try {
@@ -471,7 +480,11 @@ export async function handleMirrorTex(payload, state) {
     fetchImpl: state.fetchImpl || fetch,
     baseUrl,
     slug: slugProjectId(overleafProjectId),
-    files
+    files,
+    // "upsert" is the extension's active-buffer tier (PLAN 3.2): only the
+    // provided files are written, nothing is deleted. Anything else falls
+    // back to the full-truth reconcile.
+    mode: payload.mode === "upsert" ? "upsert" : "reconcile"
   });
   if (!result.ok) {
     return errorResponse(result.status || 502, "mirror_failed", result.error || "Could not mirror .tex to the Lea adapter.");
@@ -3397,36 +3410,28 @@ async function findReusableStubForFormalization({ state, leaRepoPath, target, jo
   };
 }
 
-function findActiveJob(jobs, jobKey) {
-  return Object.values(jobs).find((job) => job.jobKey === jobKey && job.status === "in_progress");
-}
+// findActiveJob / jobRecency / jobsByRecencyDesc / findLatestJob /
+// findLatestFinishedJob moved to jobStore.mjs (PLAN-system-hardening 0.2),
+// together with the retention prune below.
 
-// One recency definition for every "latest job" selection (AUDIT L6/L7): a
-// job's recency is when it FINISHED, falling back to when it started for a job
-// still lacking a finishedAt. The old findLatestJob/findLatestFinishedJob
-// sorted by startedAt alone, disagreeing with getTheoremStatus's
-// newest-terminal selection (finishedAt||startedAt) -- a run that started
-// earlier but finished later (now possible with the 409 run-queueing) could be
-// "latest" under one rule and not the other. `jobsByRecencyDesc` also uses
-// plain string comparison rather than localeCompare: ISO-8601 timestamps sort
-// correctly bytewise, and it's deterministic (no locale sensitivity, no odd
-// "null" coercion).
-function jobRecency(job) {
-  return String(job?.finishedAt || job?.startedAt || "");
-}
-
-function jobsByRecencyDesc(jobs, predicate) {
-  return Object.values(jobs || {})
-    .filter(predicate)
-    .sort((a, b) => (jobRecency(a) < jobRecency(b) ? 1 : jobRecency(a) > jobRecency(b) ? -1 : 0));
-}
-
-function findLatestJob(jobs, jobKey, status) {
-  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status === status)[0] || null;
-}
-
-function findLatestFinishedJob(jobs, jobKey) {
-  return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status !== "in_progress")[0] || null;
+// Retention (review B4): nothing ever removed finished jobs, so jobs.json and
+// its log directory grew without bound. Prune after each run and at startup;
+// pruneJobs keeps a superset of everything the status/selection queries can
+// reach (see jobStore.mjs), so this is invisible to behavior. Each removed
+// job's log file goes with it — log files are 1:1 with jobIds.
+async function pruneAndPersistJobs(state) {
+  const { jobs, removed, changed } = pruneJobs(state.jobs || {});
+  if (!changed) return;
+  state.jobs = jobs;
+  await writeJson(state.jobsPath, state.jobs);
+  for (const job of removed) {
+    if (!job?.logPath) continue;
+    try {
+      await fs.unlink(job.logPath);
+    } catch {
+      // already gone (or never created) — retention must never throw
+    }
+  }
 }
 
 async function resolveTheoremUses({ state, leaRepoPath, overleafProjectId, projectName = "", projectNamespace = "", targetUses, jobs }) {
@@ -3761,6 +3766,13 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       await writeJson(state.jobsPath, state.jobs);
     }
   });
+  if (exit.resultKind === "max_spend") {
+    // The adapter stopped this run mid-flight at the spend cap (bridge-side
+    // enforcement, PLAN-system-hardening 0.1). Mirror the between-runs
+    // bookkeeping so callers see the familiar finalStatus, without
+    // re-interrupting the already-terminal run.
+    await markJobMaxSpend({ state, job, mode: job.mode, interrupt: false });
+  }
   if (exit.usage || exit.costUsd !== undefined) {
     await recordUsageAndEnforceSpendLimit({
       state,
@@ -3769,6 +3781,11 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       mode: "formalization"
     });
   }
+  // Every run type (formalize / stub / repair) passes through here, so this is
+  // the one retention chokepoint: each run adds exactly one job, so pruning
+  // after each run keeps the store bounded. Never removes this run's job (it
+  // is the newest under its key) nor anything the status queries can reach.
+  await pruneAndPersistJobs(state);
   return exit;
 }
 
@@ -4653,14 +4670,20 @@ async function recordUsageAndEnforceSpendLimit({ state, job, usage, mode }) {
   return { stop: false };
 }
 
-async function markJobMaxSpend({ state, job, mode }) {
+async function markJobMaxSpend({ state, job, mode, interrupt = true }) {
+  // Idempotent: the adapter's mid-run enforcement and the companion's own
+  // post-run check can both conclude "max spend" for the same run.
+  if (job.finalStatus === "max_spend") return;
   job.status = "failed";
   job.finalStatus = "max_spend";
   job.error = MAX_SPEND_MESSAGE;
   job.exitCode = 1;
   job.finishedAt = new Date().toISOString();
   await appendLog(job.logPath, `\n[backend] ${MAX_SPEND_MESSAGE}\n`);
-  if (job.apiRunId) {
+  if (!interrupt) {
+    // The adapter's bridge-side cap enforcement already stopped this run
+    // (done arrived with result_kind "max_spend") — nothing live to interrupt.
+  } else if (job.apiRunId) {
     const cancel = await interruptApiRun({
       fetchImpl: state.fetchImpl || fetch,
       baseUrl: job.leaApiBaseUrl,

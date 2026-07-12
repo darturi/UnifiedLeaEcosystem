@@ -23,7 +23,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs", "leanPaneView.mjs"],
+      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs", "leanPaneView.mjs", "editorHookWatchdog.mjs"],
       "matches": ["https://www.overleaf.com/*"]
     }
   ],

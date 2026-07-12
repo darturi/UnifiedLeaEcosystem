@@ -1,12 +1,17 @@
-"""Run endpoints: start a run, stream its events (SSE), interrupt it, and answer
-a per-tool approval. One run streams at a time (enforced in the bridge)."""
+"""Run endpoints: create (enqueue) a run, observe its events (SSE), interrupt
+it, and answer a per-tool approval.
+
+Lifecycle (PLAN-system-hardening Phase 2): POST /api/runs enqueues; the
+bridge's single FIFO worker drives runs one at a time. GET /events is a pure
+observer — attach any time, any number of times: a queued run streams `queued`
+frames, a live run replays what was already emitted then tails, a finished run
+replays (or synthesizes) its history ending in `done`. There is no 409."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from queue import Empty, Queue
-from threading import Thread
+from queue import Empty
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -14,7 +19,7 @@ from pydantic import BaseModel
 
 from ..config import load_config, permission_tier
 from .. import bridge
-from ..bridge import RunnerContext, run_lea, request_stop
+from ..bridge import request_stop
 from .. import projects
 from .. import settings as settings_service
 from .. import store
@@ -112,6 +117,9 @@ def create_run(request: RunRequest) -> dict:
     run = store.create_run(session["id"], config.model, None, config.max_turns,
                            project_id=project_id, autonomous=autonomous)
     user_message = store.add_message(session["id"], "user", message, run["id"])
+    # Enqueue immediately (Phase 2): the run starts when the FIFO worker
+    # reaches it, not when a client happens to attach its event stream.
+    bridge.enqueue_run(run["id"])
     project = store.get_project(project_id) if project_id else None
     return {
         "session_id": session["id"],
@@ -120,6 +128,7 @@ def create_run(request: RunRequest) -> dict:
         "project_id": project_id,
         "project_slug": project["slug"] if project else None,
         "project_namespace": project["namespace"] if project else None,
+        "queue_position": store.queue_position(run["id"]),
     }
 
 
@@ -147,95 +156,66 @@ def interrupt_run(run_id: str) -> dict:
     if run["status"] not in {"pending", "running"}:
         raise HTTPException(status_code=409, detail="Run is not active")
     request_stop(run_id)
-    # A `pending` run that no runner is driving (created by POST /api/runs but its
-    # events stream never attached — e.g. its client gave up waiting for the
-    # single-run slot) has nothing to read the stop flag; fail it directly so the
-    # session's derived status doesn't show 'thinking' forever. The flag was still
-    # set above: if a runner thread does exist but hasn't claimed the slot yet
-    # (it queues on active_run_lock before _set_active_run_id), it adopts the
+    # A `pending` run is queued, not executing — there is no runner to read the
+    # stop flag, so fail it directly (dequeue-by-status: the worker skips
+    # non-pending runs) and seal its event stream so any attached observers get
+    # their terminal frame instead of waiting forever. The flag was still set
+    # above: if the worker picked it up in this same instant, it adopts the
     # pre-set flag (D18), stops cooperatively, and overwrites this status with
     # its own terminal one.
     if run["status"] == "pending" and bridge.current_active_run_id() != run_id:
         store.update_run(run_id, "failed", result_kind="failed",
                          result_detail="Interrupted before the run started.")
+        bridge.publish_terminal_from_row(run_id)
         return {"status": "interrupted"}
     return {"status": "interrupting"}
 
 
 @router.get("/api/runs/{run_id}/events")
 async def run_events(run_id: str) -> StreamingResponse:
+    """Pure observer (Phase 2): attaching never starts, restarts, or competes
+    with a run. Replays what the hub already buffered, then tails live events;
+    a queued run announces its position first; a terminal run that predates
+    the hub (older process, trimmed buffer) gets a `done` synthesized from its
+    persisted row. Multiple concurrent observers are fine."""
     run = store.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    if run["status"] not in {"pending", "running"}:
-        raise HTTPException(status_code=409, detail="Run has already completed")
 
-    # A second connection for a run already being driven (e.g. the lea-standalone
-    # UI opening an Overleaf run the companion is driving) must NOT spawn a second
-    # runner — that competitor loses the single-run lock and emits run_error +
-    # done(failed), which the UI's reconcile→reattach cycle turns into a request
-    # storm. Instead, attach as a passive viewer: tail the run's status and emit a
-    # single terminal `done` once it actually finishes. The run keeps making
-    # progress under its real driver; this connection just observes.
-    active_run_id = bridge.current_active_run_id()
-    if active_run_id is not None and active_run_id != run_id:
-        # A different run holds the single-run slot. Reject up front (409) instead
-        # of spawning a runner that loses the lock and emits done(failed) — the
-        # latter drives the UI's reconcile→reattach loop into a request storm.
-        raise HTTPException(status_code=409, detail="Another Lea run is already active.")
-
-    if active_run_id == run_id:
-        async def passive_view():
-            # Cap the wait so a wedged run can't hold the connection forever; the
-            # browser EventSource simply reconnects (and re-tails) if we time out.
-            for _ in range(36000):  # ~3h at 0.3s/iter
-                current = store.get_run(run_id)
-                if not current:
-                    yield sse("done", {"status": "failed"})
-                    return
-                if current["status"] not in {"pending", "running"}:
-                    yield sse("done", {"status": current["status"]})
-                    return
-                await asyncio.sleep(0.3)
-            yield sse("done", {"status": "running"})
-
-        return StreamingResponse(passive_view(), media_type="text/event-stream")
-
-    queue: Queue[dict] = Queue()
-    session = store.session_detail(run["session_id"])
-    if not session or not session["messages"]:
-        raise HTTPException(status_code=404, detail="Run task not found")
-
-    task = next(
-        (m["content"] for m in reversed(session["messages"])
-         if m["run_id"] == run_id and m["role"] == "user"),
-        None,
-    )
-    if not task:
-        raise HTTPException(status_code=404, detail="Run task not found")
-
-    context = RunnerContext(
-        session_id=run["session_id"],
-        run_id=run_id,
-        task=task,
-        config=load_config(),
-        events=queue,
-        autonomous=bool(run.get("autonomous")),
-    )
-    thread = Thread(target=run_lea, args=(context,), daemon=True)
-    thread.start()
+    replay, live = bridge.attach(run_id)
+    queue_position = store.queue_position(run_id)
 
     async def stream_events():
-        while True:
-            try:
-                item = queue.get_nowait()
-            except Empty:
-                if not thread.is_alive():
-                    break
-                await asyncio.sleep(0.1)
-                continue
-            yield sse(item["type"], item["payload"])
-            if item["type"] == "done":
-                break
+        try:
+            if queue_position is not None and not replay:
+                yield sse("queued", {"run_id": run_id, "position": queue_position})
+            for item in replay:
+                yield sse(item["type"], item["payload"])
+                if item["type"] == "done":
+                    return
+            if live is None:
+                # Terminal run with no buffered history: synthesize the
+                # terminal frame from the persisted row so every attach still
+                # ends in `done` (the old contract 409'd here).
+                current = store.get_run(run_id) or run
+                payload = {"status": current["status"]}
+                if current.get("result_kind"):
+                    payload["result_kind"] = current["result_kind"]
+                if current.get("result_detail"):
+                    payload["result_detail"] = current["result_detail"]
+                yield sse("done", payload)
+                return
+            while True:
+                try:
+                    item = live.get_nowait()
+                except Empty:
+                    await asyncio.sleep(0.1)
+                    continue
+                yield sse(item["type"], item["payload"])
+                if item["type"] == "done":
+                    return
+        finally:
+            if live is not None:
+                bridge.detach(run_id, live)
 
     return StreamingResponse(stream_events(), media_type="text/event-stream")

@@ -10,9 +10,10 @@ const TOOL_APPROVAL_DECISION = "always_session";
 // done.status values the adapter emits (see bridge._FINISH_STATUS + run_lea):
 //   proved | disproved | needs_review | answered | max_turns | cancelled | failed
 // For a *formalization* job, "proved" and "disproved" are completed checked work;
-// "answered" finished cleanly but proved nothing. "success" is accepted only as a
-// backward-compatible alias for older adapter test doubles.
-const SUCCESS_DONE_STATUS = new Set(["proved", "disproved", "success"]);
+// "answered" finished cleanly but proved nothing. The old "success" alias (kept
+// for pre-vocabulary test doubles) was removed once the integration harness
+// (tests/integration/) began asserting the real wire vocabulary.
+const SUCCESS_DONE_STATUS = new Set(["proved", "disproved"]);
 
 function toNonNegativeNumber(value) {
   const n = Number(value);
@@ -138,11 +139,13 @@ export function fetchAdapterUsageStats({ fetchImpl, baseUrl }) {
 // The adapter reconciles synchronously and defers the git commit, so this returns
 // quickly; `files` is `[{ path, content }]` (.tex only). Best-effort: a transport
 // failure surfaces as `{ ok:false }` and the caller logs/ignores it.
-export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files }) {
+export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files, mode = "reconcile" }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/mirror`, {
     method: "POST",
     headers: buildHeaders(null, { "Content-Type": "application/json" }),
-    body: JSON.stringify({ source: "overleaf", files: files || [] }),
+    // mode "upsert" (PLAN 3.2) writes only the provided files — the active-
+    // buffer tier; "reconcile" treats the payload as the full truth set.
+    body: JSON.stringify({ source: "overleaf", mode, files: files || [] }),
   });
 }
 
@@ -415,9 +418,9 @@ export async function streamApiRun({
     return { ok: false, error: `Could not open run event stream: ${error instanceof Error ? error.message : String(error)}` };
   }
   if (!response?.ok || !response.body) {
-    // httpStatus lets the caller tell a transient rejection apart from a real
-    // failure — 409 means the adapter's single-run slot is held by another run
-    // (see runApiProofJob's re-attach loop), not that this run's proof failed.
+    // httpStatus lets the caller tell an HTTP rejection (real failure — the
+    // Phase 2 adapter has no busy/finished 409s) apart from a dropped
+    // transport (httpStatus null), which runApiProofJob retries.
     return { ok: false, httpStatus: response?.status ?? null, error: `Run event stream returned HTTP ${response?.status ?? "?"}.` };
   }
 
@@ -478,9 +481,8 @@ export async function streamApiRun({
 // until the job timeout.
 const MAX_RUN_ROW_MISSES = 5;
 
-// De-synchronize concurrent waiters: queued runs polling in lockstep would
-// all re-attach at the same instant when the slot frees; jitter gives earlier
-// arrivals a fair shot and avoids a thundering herd on the adapter.
+// De-synchronize concurrent re-attachers after a transport drop (e.g. the
+// adapter restarting mid-run) so they don't hammer it in lockstep.
 function retryDelayWithJitter(baseMs) {
   return baseMs + Math.floor(Math.random() * baseMs * 0.5);
 }
@@ -561,35 +563,40 @@ export async function runApiProofJob({
   }, Math.max(1, timeoutMs));
   if (typeof timer.unref === "function") timer.unref();
 
-  // The adapter runs one prover job at a time and only *starts* a run when its
-  // event stream is first attached, so a 409 on the attach means "the single-run
-  // slot is held by another run" — NOT that this run failed. The created run
-  // stays `pending` adapter-side and is perfectly startable later, so wait and
-  // re-attach until the slot frees (bounded by the timeout timer above). A 409
-  // can also mean "run already completed" (something else saw it through), so
-  // consult the run row to pick retry vs. resolve — never fail on 409 alone.
+  // Phase 2 contract (PLAN-system-hardening): the adapter queues runs
+  // server-side and the events endpoint is a pure observer — attach is
+  // idempotent, a queued run streams `queued` frames, and a finished run
+  // replays to a terminal `done`. The old 409 busy/finished disambiguation is
+  // gone; any HTTP rejection of the attach is a real failure.
   //
-  // The same run-row consultation also covers a DROPPED stream (open transport
-  // error, mid-stream disconnect, or a clean close without a `done` frame):
-  // the run may well still be executing adapter-side, so failing the job here
-  // both abandoned a live, billing run and mislabeled its eventual outcome.
-  // Re-attach while the row reads pending/running; adopt the row's outcome
-  // once terminal. Only a non-409 HTTP rejection of the attach, or a stream
-  // that DID deliver a terminal status, is a real, immediate failure.
+  // What remains client-side is transport robustness: a DROPPED stream (open
+  // error, mid-stream disconnect, or close without a `done` frame) does not
+  // mean the run failed — it may still be executing adapter-side, so failing
+  // the job here would abandon a live, billing run and mislabel its outcome.
+  // Consult the run row: re-attach while it reads pending/running, adopt its
+  // outcome once terminal, and give up (with a best-effort interrupt) only
+  // when the adapter is unreachable past MAX_RUN_ROW_MISSES.
+  let loggedQueued = false;
+  const observeEvent = async (type, data) => {
+    if (type === "queued" && !loggedQueued) {
+      loggedQueued = true;
+      await log(`[backend] Lea adapter queued this run (position ${Number.isFinite(data?.position) ? data.position : "?"}).\n`);
+    }
+    if (onEvent) await onEvent(type, data);
+  };
+
   let outcome;
-  let loggedBusyWait = false;
   let loggedStreamDrop = false;
   let rowMisses = 0;
   try {
     for (;;) {
       outcome = await streamApiRun({
         fetchImpl, baseUrl, apiKey, runId, maxTurns, autoApprove,
-        signal: abort.signal, onEvent, onProgressUpdated,
+        signal: abort.signal, onEvent: observeEvent, onProgressUpdated,
       });
       if (outcome.ok || outcome.aborted) break;
-      const busy409 = outcome.httpStatus === 409;
       const streamDropped = outcome.httpStatus == null && !outcome.doneStatus;
-      if (!busy409 && !streamDropped) break;
+      if (!streamDropped) break;
 
       const row = await fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId: newSessionId, runId });
       const rowStatus = String(row?.status || "").toLowerCase();
@@ -606,7 +613,7 @@ export async function runApiProofJob({
         };
         break;
       }
-      if (!row && streamDropped) {
+      if (!row) {
         // Stream AND status read both failing: the adapter is unreachable.
         rowMisses += 1;
         if (rowMisses >= MAX_RUN_ROW_MISSES) {
@@ -618,11 +625,7 @@ export async function runApiProofJob({
         rowMisses = 0;
       }
 
-      if (busy409 && !loggedBusyWait) {
-        loggedBusyWait = true;
-        await log("[backend] Lea adapter is busy (another run is active); waiting for the run slot...\n");
-      }
-      if (streamDropped && !loggedStreamDrop) {
+      if (!loggedStreamDrop) {
         loggedStreamDrop = true;
         await log("[backend] Run event stream dropped while the run is still live; re-attaching...\n");
       }

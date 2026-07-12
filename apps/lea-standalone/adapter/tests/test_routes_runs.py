@@ -19,6 +19,10 @@ def _patch_config(monkeypatch, tmp_path):
         runs_route, "load_config",
         lambda: LeaConfig(model="m", max_turns=3, lea_root=tmp_path, max_spend_usd=None),
     )
+    # These tests exercise create_run's tagging, not execution: keep the FIFO
+    # worker out of it (a real enqueue would try to drive the run with the
+    # real prover).
+    monkeypatch.setattr(runs_route.bridge, "enqueue_run", lambda run_id: None)
 
 
 def test_create_run_tags_session_and_run_with_project_slug(tmp_path, monkeypatch):
@@ -130,10 +134,10 @@ def _drain_done_status(response):
     return asyncio.run(collect())
 
 
-def test_run_events_for_an_already_driven_run_attaches_passively(tmp_path, monkeypatch):
-    """A second connection for a run already being driven must NOT spawn a runner;
-    it tails the run and emits a single terminal `done`. This is what stops the
-    Overleaf-viewed-in-UI request storm."""
+def test_run_events_replays_buffered_history_then_tails_live(tmp_path, monkeypatch):
+    """Phase 2 observer contract: attaching mid-run replays everything the hub
+    already buffered, then tails live events to the terminal `done` — attach
+    never starts or competes with a run."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
     _patch_config(monkeypatch, tmp_path)
@@ -143,63 +147,68 @@ def test_run_events_for_an_already_driven_run_attaches_passively(tmp_path, monke
     )
     run_id = started["run_id"]
     store.update_run(run_id, "running")
+    bridge._hub_publish(run_id, {"type": "status", "payload": {"status": "tool_call", "turn": 1}})
 
-    # Pretend the companion is already driving this run.
-    bridge._set_active_run_id(run_id)
-    # Any attempt to spawn a competing runner thread should fail the test.
-    def _no_thread(*args, **kwargs):
-        raise AssertionError("passive view must not spawn a runner thread")
-    monkeypatch.setattr(runs_route, "Thread", _no_thread)
+    async def run_case():
+        response = await runs_route.run_events(run_id)
 
-    try:
-        # Flip the run to terminal shortly after the passive view starts tailing.
         async def finish_soon():
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(0.2)
             store.update_run(run_id, "proved")
+            bridge._hub_publish(run_id, {"type": "done", "payload": {"status": "proved"}})
 
-        async def run_case():
-            response = await runs_route.run_events(run_id)
-            asyncio.create_task(finish_soon())
-            frames = []
-            async for chunk in response.body_iterator:
-                frames.append(chunk if isinstance(chunk, str) else chunk.decode())
-                if "event: done" in frames[-1]:
-                    break
-            return "".join(frames)
+        asyncio.create_task(finish_soon())
+        frames = []
+        async for chunk in response.body_iterator:
+            frames.append(chunk if isinstance(chunk, str) else chunk.decode())
+            if "event: done" in frames[-1]:
+                break
+        return "".join(frames)
 
-        out = asyncio.run(run_case())
-    finally:
-        bridge._set_active_run_id(None)
-
+    out = asyncio.run(run_case())
+    assert "event: status" in out, "buffered history replays first"
     assert "event: done" in out
     assert '"status": "proved"' in out
 
 
-def test_run_events_rejects_when_a_different_run_is_active(tmp_path, monkeypatch):
-    """While a different run holds the single-run slot, attaching to another run
-    returns 409 (no doomed runner, no storm)."""
-    import pytest
-    from fastapi import HTTPException
-
+def test_run_events_for_terminal_run_synthesizes_done(tmp_path, monkeypatch):
+    """Attaching to an already-finished run is no longer a 409: the stream ends
+    with a `done` synthesized from the persisted row (result labels intact)."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
     _patch_config(monkeypatch, tmp_path)
 
     started = runs_route.create_run(RunRequest(message="prove it", autonomous=True))
     run_id = started["run_id"]
-    store.update_run(run_id, "running")
+    store.update_run(run_id, "disproved", result_kind="disproved", result_detail="DISPROVED")
 
-    bridge._set_active_run_id("some-other-run")
-    monkeypatch.setattr(
-        runs_route, "Thread",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not spawn a runner")),
-    )
-    try:
-        with pytest.raises(HTTPException) as exc:
-            asyncio.run(runs_route.run_events(run_id))
-        assert exc.value.status_code == 409
-    finally:
-        bridge._set_active_run_id(None)
+    out = _drain_done_status(asyncio.run(runs_route.run_events(run_id)))
+    assert "event: done" in out
+    assert '"status": "disproved"' in out
+    assert '"result_kind": "disproved"' in out
+
+
+def test_run_events_for_queued_run_announces_position(tmp_path, monkeypatch):
+    """A pending (queued) run's stream opens with a `queued` frame carrying the
+    run's FIFO position, so clients can render an honest waiting state."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _patch_config(monkeypatch, tmp_path)
+
+    first = runs_route.create_run(RunRequest(message="first", autonomous=True))
+    second = runs_route.create_run(RunRequest(message="second", autonomous=True))
+    assert first["queue_position"] == 0
+    assert second["queue_position"] == 1
+
+    async def read_first_frame():
+        response = await runs_route.run_events(second["run_id"])
+        async for chunk in response.body_iterator:
+            return chunk if isinstance(chunk, str) else chunk.decode()
+        return ""
+
+    frame = asyncio.run(read_first_frame())
+    assert "event: queued" in frame
+    assert '"position": 1' in frame
 
 
 def test_interrupt_pending_run_with_no_runner_fails_it_directly(tmp_path, monkeypatch):

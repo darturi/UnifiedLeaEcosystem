@@ -546,25 +546,24 @@ def test_latest_agent_code_step_and_edit_notes_since(tmp_path, monkeypatch):
     assert store.edit_notes_since(session["id"], 9999) == []
 
 
-def test_fail_stale_active_runs_reaps_only_active_rows(tmp_path, monkeypatch):
-    """Startup crash recovery: pending/running run rows have no live runner after
-    a restart (or were never started at all — e.g. their client gave up waiting
-    for the single-run slot), so they flip to failed; terminal rows are untouched.
-    Without this, the derived session status shows 'thinking' forever."""
+def test_fail_stale_active_runs_reaps_running_but_keeps_queued(tmp_path, monkeypatch):
+    """Startup crash recovery (Phase 2 semantics): a `running` row has no live
+    worker after a restart → failed. A `pending` row is an honest queue entry
+    that recovery re-enqueues — it must NOT be reaped. Terminal rows untouched."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
     session = store.create_session("Reap me")
-    orphaned_pending = store.create_run(session["id"], "m", None, 3)
+    queued_pending = store.create_run(session["id"], "m", None, 3)
     interrupted_running = store.create_run(session["id"], "m", None, 3)
     store.update_run(interrupted_running["id"], "running")
     finished = store.create_run(session["id"], "m", None, 3)
     store.update_run(finished["id"], "needs_review", result_kind="needs_review",
                      result_detail="NEEDS_REVIEW")
 
-    assert store.fail_stale_active_runs() == 2
+    assert store.fail_stale_active_runs() == 1
 
-    assert store.get_run(orphaned_pending["id"])["status"] == "failed"
-    assert store.get_run(orphaned_pending["id"])["result_kind"] == "failed"
+    assert store.get_run(queued_pending["id"])["status"] == "pending", \
+        "queued work survives a restart (recovery re-enqueues it)"
     reaped_running = store.get_run(interrupted_running["id"])
     assert reaped_running["status"] == "failed"
     assert "restarted" in reaped_running["result_detail"]
@@ -575,3 +574,34 @@ def test_fail_stale_active_runs_reaps_only_active_rows(tmp_path, monkeypatch):
 
     # idempotent: nothing left to reap
     assert store.fail_stale_active_runs() == 0
+
+
+def test_queue_position_counts_earlier_pending_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Queue me")
+    first = store.create_run(session["id"], "m", None, 3)
+    second = store.create_run(session["id"], "m", None, 3)
+    assert store.queue_position(first["id"]) == 0
+    assert store.queue_position(second["id"]) == 1
+    store.update_run(first["id"], "running")
+    assert store.queue_position(first["id"]) is None
+    assert store.queue_position(second["id"]) == 0
+
+
+def test_session_detail_run_rows_carry_usage(tmp_path, monkeypatch):
+    """The Overleaf companion reads a run's tokens/cost off the session-detail
+    run row (fetchApiRunUsage). These columns were missing from the per-run
+    select, so every companion job recorded $0 — caught by the Phase 1
+    integration harness (PLAN-system-hardening)."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Usage on run rows")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.update_run(run["id"], "proved", input_tokens=11, output_tokens=7, cost_usd=0.002)
+
+    row = store.session_detail(session["id"])["runs"][0]
+    assert row["id"] == run["id"]
+    assert row["input_tokens"] == 11
+    assert row["output_tokens"] == 7
+    assert abs(row["cost_usd"] - 0.002) < 1e-9

@@ -26,10 +26,11 @@ interrupt is D7; diff-on-divergence context is D6.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Queue
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from typing import Any
 
 from uuid import uuid4
@@ -49,7 +50,7 @@ from lea.interface import (
 )
 
 from .artifacts import classify_lean_artifact
-from .config import LeaConfig
+from .config import LeaConfig, load_config
 from .gitstore import GitStore, GitStoreError
 from . import projects, skills_catalog, store, uploads
 
@@ -97,6 +98,181 @@ def request_stop(run_id: str) -> None:
     _stop_events.setdefault(run_id, Event()).set()
 
 
+# --- Run queue + event hub (PLAN-system-hardening Phase 2) -------------------
+# Runs used to start when their SSE stream was first attached, and a second
+# attach got an overloaded 409 ("slot busy" OR "already finished") — forcing
+# every client to carry re-attach/disambiguation machinery. Now POST /api/runs
+# enqueues, a single worker drains FIFO, and the events endpoint is a pure
+# observer: attach any time, any number of times, and get a catch-up replay of
+# everything already emitted followed by the live tail (or a synthesized
+# terminal `done` for a run that predates this process). There is no 409.
+
+# Per-run event buffers + live subscribers. Only the active run and the last
+# few finished runs are kept; older terminal runs replay as a synthesized
+# `done` from their persisted row, which is all a late client needs.
+_hub_lock = Lock()
+_hub: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_HUB_FINISHED_KEEP = 8
+
+
+def _hub_entry(run_id: str) -> dict[str, Any]:
+    """Get or create a run's hub entry. Caller holds _hub_lock."""
+    entry = _hub.get(run_id)
+    if entry is None:
+        entry = {"events": [], "done": False, "subscribers": []}
+        _hub[run_id] = entry
+    return entry
+
+
+def _hub_publish(run_id: str, item: dict[str, Any]) -> None:
+    with _hub_lock:
+        entry = _hub_entry(run_id)
+        if entry["done"]:
+            return  # the stream is sealed; drop late/double terminal frames
+        entry["events"].append(item)
+        for subscriber in entry["subscribers"]:
+            subscriber.put(item)
+        if item.get("type") == "done":
+            entry["done"] = True
+            entry["subscribers"] = []
+            # Trim old finished buffers, keeping the most recent few for
+            # late viewers (e.g. the UI opening an Overleaf run just after
+            # it ended).
+            finished = [rid for rid, e in _hub.items() if e["done"]]
+            for rid in finished[:-_HUB_FINISHED_KEEP]:
+                _hub.pop(rid, None)
+
+
+def publish_terminal_from_row(run_id: str) -> None:
+    """Seal a run's stream with a `done` synthesized from its persisted row —
+    used when a run is finalized without run_lea (interrupted while queued,
+    skipped by the worker, orphaned by a restart)."""
+    run = store.get_run(run_id)
+    if not run:
+        return
+    payload: dict[str, Any] = {"status": run["status"]}
+    if run.get("result_kind"):
+        payload["result_kind"] = run["result_kind"]
+    if run.get("result_detail"):
+        payload["result_detail"] = run["result_detail"]
+    _hub_publish(run_id, {"type": "done", "payload": payload})
+
+
+def attach(run_id: str) -> tuple[list[dict[str, Any]], Queue | None]:
+    """Subscribe to a run's event stream.
+
+    Returns (replay, live): `replay` is everything already emitted; `live` is a
+    queue of subsequent events, or None when the stream is already sealed (the
+    replay then ends with `done`, or is empty for a pre-hub terminal run — the
+    endpoint synthesizes the terminal frame from the run row in that case).
+    Snapshot and subscription happen under one lock, so no event can fall
+    between them."""
+    with _hub_lock:
+        entry = _hub.get(run_id)
+        if entry is None:
+            return [], None
+        if entry["done"]:
+            return list(entry["events"]), None
+        subscriber: Queue = Queue()
+        entry["subscribers"].append(subscriber)
+        return list(entry["events"]), subscriber
+
+
+def detach(run_id: str, subscriber: Queue) -> None:
+    with _hub_lock:
+        entry = _hub.get(run_id)
+        if entry and subscriber in entry["subscribers"]:
+            entry["subscribers"].remove(subscriber)
+
+
+class _HubQueue:
+    """Duck-types the Queue RunnerContext expects, fanning out via the hub."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+
+    def put(self, item: dict[str, Any]) -> None:
+        _hub_publish(self.run_id, item)
+
+
+_run_queue: "Queue[str]" = Queue()
+_worker_guard = Lock()
+_worker_thread: Thread | None = None
+
+
+def _resolve_task(run: dict[str, Any]) -> str | None:
+    session = store.session_detail(run["session_id"])
+    if not session or not session.get("messages"):
+        return None
+    return next(
+        (m["content"] for m in reversed(session["messages"])
+         if m["run_id"] == run["id"] and m["role"] == "user"),
+        None,
+    )
+
+
+def _worker_loop() -> None:
+    while True:
+        run_id = _run_queue.get()
+        try:
+            run = store.get_run(run_id)
+            if not run or run["status"] != "pending":
+                # Interrupted (or otherwise finalized) while queued — make sure
+                # any attached observers still get their terminal frame.
+                if run:
+                    publish_terminal_from_row(run_id)
+                continue
+            task = _resolve_task(run)
+            if task is None:
+                store.update_run(run_id, "failed", result_kind="failed",
+                                 result_detail="Run task not found.")
+                publish_terminal_from_row(run_id)
+                continue
+            context = RunnerContext(
+                session_id=run["session_id"],
+                run_id=run_id,
+                task=task,
+                config=load_config(),
+                events=_HubQueue(run_id),
+                autonomous=bool(run.get("autonomous")),
+            )
+            run_lea(context)
+        except Exception:  # noqa: BLE001 — the worker must survive any single run
+            logger.exception("Run worker failed while driving run %s", run_id)
+            try:
+                store.update_run(run_id, "failed")
+            except Exception:
+                logger.exception("Failed to mark run %s failed", run_id)
+            publish_terminal_from_row(run_id)
+
+
+def enqueue_run(run_id: str) -> None:
+    """FIFO-enqueue a created run; the single worker drives it when its turn
+    comes. Called by POST /api/runs and by startup recovery."""
+    global _worker_thread
+    with _hub_lock:
+        _hub_entry(run_id)
+    # M15's heir: a run parked on an unanswered approval (its audience is
+    # gone) must not wedge the queue — ask it to stop; it bails to `deny`
+    # within its 0.5 s poll and the worker advances.
+    active = current_active_run_id()
+    if active and active != run_id and active in _pending_approvals:
+        request_stop(active)
+    with _worker_guard:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = Thread(target=_worker_loop, daemon=True, name="lea-run-worker")
+            _worker_thread.start()
+    _run_queue.put(run_id)
+
+
+def recover_runs_at_startup() -> None:
+    """Called once at app startup (after store.fail_stale_active_runs reaps the
+    orphaned 'running' rows): re-enqueue still-pending runs FIFO, so queued
+    work survives a restart instead of being stranded."""
+    for run in store.list_runs_by_status("pending"):
+        enqueue_run(run["id"])
+
+
 # --- Per-tool approval gate (D19) ------------------------------------------
 # Impactful tools prompt the human for allow/deny/always-session before running;
 # read-only tools + lean_check are auto-allowed (never gated). "Always allow this
@@ -105,6 +281,7 @@ def request_stop(run_id: str) -> None:
 # hook (A8); the adapter owns the policy + the human relay.
 GATED_TOOLS = {"bash", "write_file", "edit_file"}
 _APPROVAL_DECISIONS = {"allow", "deny", "always_session"}
+APPROVAL_DECISION_TIMEOUT_SECONDS = 900
 
 _session_allowlists: dict[str, set[str]] = {}
 # One in-flight approval per active run (one run at a time): run_id -> the pending
@@ -146,8 +323,16 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
         "tool_name": ev.tool_name, "args": ev.args,
     })
     pending = _pending_approvals[run_id]
+    # Deadline (Phase 2): with a serial FIFO worker, a run parked forever on an
+    # unanswered approval would wedge every queued run behind it (the old
+    # design let a competing runner thread steal the lock; that thread no
+    # longer exists). An unanswered approval times out to the safe `deny`.
+    waited = 0.0
     while not pending["event"].wait(timeout=0.5):
         if stop_event.is_set():
+            break
+        waited += 0.5
+        if waited >= APPROVAL_DECISION_TIMEOUT_SECONDS:
             break
     _pending_approvals.pop(run_id, None)
 
@@ -190,6 +375,12 @@ _FINISH_STATUS = {
 }
 
 _COMPLETED_RESULTS = {"proved", "disproved", "needs_review"}
+
+# Shown as result_detail when the bridge's own spend-cap stop ended the run, so
+# clients can tell a cap stop (result_kind="max_spend") from a user cancel. The
+# persisted run *status* stays "cancelled" — the status vocabulary is unchanged.
+_MAX_SPEND_DETAIL = "Max spend limit reached; the run was stopped at a turn boundary."
+
 
 def _finished_status(ev: Finished) -> str:
     if ev.reason == "completed":
@@ -390,6 +581,40 @@ def run_lea(context: RunnerContext) -> None:
     final_result_kind: str | None = None
     final_result_detail: str | None = None
 
+    # Mid-run spend enforcement (PLAN-system-hardening 0.1): the cap used to be
+    # checked only at POST /api/runs, so a single run could overshoot it by its
+    # entire cost. Track this run's accumulated cost on top of the all-time
+    # baseline and request a cooperative stop the moment the cap is crossed —
+    # the agent halts at the next turn boundary, so one *turn* may overshoot
+    # but a run can no longer run away. The cap is the one this run started
+    # with; a cap edited mid-run applies from the next run. The baseline read
+    # excludes this run (its usage is persisted only on Finished) and no other
+    # run can execute concurrently (single-run slot), so baseline + run cost
+    # is the true global total at every check.
+    max_spend_usd = cfg.max_spend_usd
+    spend_baseline: float | None = None
+    run_cost_usd = 0.0
+    spend_capped = False
+
+    def check_spend_cap() -> None:
+        nonlocal spend_baseline, spend_capped
+        if spend_capped or max_spend_usd is None:
+            return
+        if spend_baseline is None:
+            try:
+                spend_baseline = float(store.usage_stats()["global"]["cost_usd"])
+            except Exception:
+                logger.exception("Could not read the spend baseline; skipping this cap check")
+                return
+        if spend_baseline + run_cost_usd >= float(max_spend_usd):
+            spend_capped = True
+            stop_event.set()
+            emit(events, "status", {
+                "status": "max_spend",
+                "message": "Max spend limit reached — stopping this run.",
+                "turn": current_turn,
+            })
+
     def persist_assistant(text: str) -> None:
         nonlocal last_persisted
         text = text.strip()
@@ -454,6 +679,7 @@ def run_lea(context: RunnerContext) -> None:
             elif isinstance(ev, TurnStarted):
                 flush_narration()
                 current_turn = ev.turn
+                check_spend_cap()
 
             elif isinstance(ev, ToolCalled):
                 intent = flush_narration()
@@ -504,6 +730,8 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, UsageUpdated):
                 usage.add(current_turn, ev.input_tokens, ev.output_tokens, ev.cost)
+                run_cost_usd += float(ev.cost or 0.0)
+                check_spend_cap()
 
             elif isinstance(ev, ToolResulted):
                 # A project asset write (D33): a non-.lean write_file/edit_file in a
@@ -535,11 +763,17 @@ def run_lea(context: RunnerContext) -> None:
                 final_status, result_kind = _completed_artifact_result(ev, checked_artifact_kind)
                 final_result_kind = result_kind
                 final_result_detail = None if result_kind == "defined" else ev.result_detail
+                if spend_capped and ev.reason != "completed":
+                    # Our own cap-triggered stop, not a user cancel: label it. A
+                    # run that completed anyway (finished the proof in the same
+                    # turn the cap tripped) keeps its real result.
+                    final_result_kind = "max_spend"
+                    final_result_detail = _MAX_SPEND_DETAIL
                 store.update_run(
                     run_id, final_status, final_text=final_text,
                     input_tokens=ev.usage.input_tokens, output_tokens=ev.usage.output_tokens,
                     cost_usd=ev.cost,
-                    result_kind=result_kind, result_detail=final_result_detail,
+                    result_kind=final_result_kind, result_detail=final_result_detail,
                 )
                 store.replace_run_usage_breakdown(run_id, usage.rows())
                 # Persist the faithful conversation for the next activation to replay

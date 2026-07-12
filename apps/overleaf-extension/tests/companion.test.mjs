@@ -3289,6 +3289,11 @@ function makeLeaApiFetch(calls, options = {}) {
           })()
         };
       }
+      // Legacy fixtures say reason "success"; the adapter vocabulary has no
+      // such status (the client alias was removed once the integration
+      // harness pinned the real wire values), so the fake maps it to the real
+      // "proved" in one place instead of touching every fixture.
+      const rawDone = options.statusBody?.result?.reason || options.doneStatus || "proved";
       const frames = options.eventFrames
         ? options.eventFrames.map((event) => ({
             type: event.type === "usage_updated" ? "status" : event.type,
@@ -3296,7 +3301,7 @@ function makeLeaApiFetch(calls, options = {}) {
           }))
         : [
             { type: "status", data: { status: "tool_call", turn: 1 } },
-            { type: "done", data: { status: options.statusBody?.result?.reason || options.doneStatus || "success" } }
+            { type: "done", data: { status: rawDone === "success" ? "proved" : rawDone } }
           ];
       return adapterSseResponse(frames);
     }
@@ -3460,7 +3465,7 @@ function makeAdapterApiFetch(calls, options = {}) {
     if (String(url).includes("/api/runs/") && String(url).endsWith("/events")) {
       return adapterSseResponse(options.eventFrames || [
         { type: "status", data: { status: "tool_call", message: "Running write_file", turn: 1 } },
-        { type: "done", data: { status: options.doneStatus || "success" } }
+        { type: "done", data: { status: options.doneStatus || "proved" } }
       ]);
     }
     if (String(url).includes("/approvals/")) {
@@ -4822,4 +4827,44 @@ test("chat lastRunImpact is annotated with each dependent's LIVE state at serve 
   const whileRepairing = await handleChatSession({ target: CHAT_TARGET }, state);
   assert.equal(whileRepairing.body.lastRunImpact.dependentsImpact[0].nowRepairing, true);
   assert.equal(whileRepairing.body.lastRunImpact.dependentsImpact[0].stillBroken, false);
+});
+
+test("adapter-side mid-run spend cap maps to finalStatus max_spend without an interrupt", async () => {
+  // PLAN-system-hardening 0.1: the bridge stops a run at the cap and labels the
+  // terminal done frame result_kind="max_spend" (status stays "cancelled").
+  // The companion must adopt its usual max-spend bookkeeping without trying to
+  // interrupt the already-terminal run.
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeLeaApiFetch(calls, {
+      eventFrames: [
+        { type: "status", status: "max_spend", turn: 1 },
+        {
+          type: "done",
+          status: "cancelled",
+          result_kind: "max_spend",
+          result_detail: "Max spend limit reached; the run was stopped at a turn boundary."
+        }
+      ]
+    })
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "adapter_cap_test",
+    targetText: "A theorem."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => state.jobs[result.body.jobId]?.finalStatus === "max_spend");
+
+  const job = state.jobs[result.body.jobId];
+  assert.equal(job.status, "failed");
+  assert.equal(job.error, "Max spend limit reached. Lea run was cancelled.");
+  // The run is already terminal adapter-side — no interrupt round-trip.
+  assert.ok(!calls.some((call) => String(call.url).endsWith("/interrupt")));
 });

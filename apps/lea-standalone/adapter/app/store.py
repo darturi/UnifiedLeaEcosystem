@@ -787,13 +787,13 @@ def update_run(
 
 
 def fail_stale_active_runs() -> int:
-    """Crash recovery, called once at startup: any run still `pending`/`running`
-    in the DB has no live runner thread (they died with the previous process), so
-    mark it failed. Without this, a run created but never driven — e.g. its client
-    gave up while queued for the single-run slot — sits `pending` forever and the
-    derived session status (D14) shows an eternal 'thinking'. Returns the count."""
+    """Crash recovery, called once at startup: a run still `running` in the DB
+    has no live worker after a restart, so mark it failed. `pending` runs are
+    NOT reaped anymore (Phase 2): they are honest queue entries that
+    bridge.recover_runs_at_startup re-enqueues, so queued work survives a
+    restart instead of being stranded. Returns the count reaped."""
     now = utc_now()
-    detail = "Run did not finish: the adapter restarted (or the run was never started) before it completed."
+    detail = "Run did not finish: the adapter restarted before it completed."
     with connect() as conn:
         cursor = conn.execute(
             """
@@ -802,7 +802,7 @@ def fail_stale_active_runs() -> int:
                 result_kind = coalesce(result_kind, 'failed'),
                 result_detail = coalesce(result_detail, ?),
                 updated_at = ?
-            where status in ('pending', 'running')
+            where status = 'running'
             """,
             (detail, now),
         )
@@ -924,6 +924,34 @@ def get_run(run_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
     return _normalize_run(row_to_dict(row)) if row else None
+
+
+def list_runs_by_status(status: str) -> list[dict]:
+    """All runs with a given status, in creation (FIFO) order — used by the run
+    worker's startup recovery (PLAN-system-hardening Phase 2)."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from runs where status = ? order by created_at asc, id asc",
+            (status,),
+        ).fetchall()
+    return [_normalize_run(row_to_dict(row)) for row in rows]
+
+
+def queue_position(run_id: str) -> int | None:
+    """How many pending runs precede this pending run (0 = next up). None when
+    the run is not pending. Derived, never stored — invariant 2."""
+    with connect() as conn:
+        row = conn.execute(
+            "select created_at, id, status from runs where id = ?", (run_id,)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            return None
+        ahead = conn.execute(
+            "select count(*) as n from runs where status = 'pending'"
+            " and (created_at < ? or (created_at = ? and id < ?))",
+            (row["created_at"], row["created_at"], row["id"]),
+        ).fetchone()
+    return int(ahead["n"])
 
 
 def set_run_transcript(run_id: str, messages: list) -> None:
@@ -1270,8 +1298,14 @@ def session_detail(session_id: str) -> dict | None:
         ).fetchone()
         # Per-run outcomes (id + status), so the UI can place the "Proved"
         # milestone after the run that completed — live and on reload (M16).
+        # Usage columns ride along for the Overleaf companion, whose
+        # fetchApiRunUsage reads this run's tokens/cost off the persisted row
+        # (they were missing here, so every companion job recorded $0 — caught
+        # by the Phase 1 integration harness, PLAN-system-hardening).
         runs = conn.execute(
-            "select id, status, result_kind, result_detail from runs where session_id = ? order by created_at asc, id asc",
+            "select id, status, result_kind, result_detail,"
+            " input_tokens, output_tokens, cost_usd"
+            " from runs where session_id = ? order by created_at asc, id asc",
             (session_id,),
         ).fetchall()
         project = None

@@ -75,6 +75,10 @@ class MirrorFile(BaseModel):
 class MirrorRequest(BaseModel):
     files: list[MirrorFile]
     source: str = "overleaf"
+    # "reconcile" (default) treats the payload as the full truth set — absent
+    # files are deleted. "upsert" writes only the provided files (the active-
+    # buffer tier of the tex mirror, PLAN-system-hardening 3.2).
+    mode: str = "reconcile"
 
 
 class RemoteUpdate(BaseModel):
@@ -494,8 +498,9 @@ def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: Bac
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     incoming = [{"path": f.path, "content": f.content} for f in request.files]
+    mode = "upsert" if request.mode == "upsert" else "reconcile"
     try:
-        summary = uploads.sync_overleaf_tex(project, proofs_root, incoming, commit=False)
+        summary = uploads.sync_overleaf_tex(project, proofs_root, incoming, commit=False, mode=mode)
     except uploads.UploadError as exc:
         raise HTTPException(status_code=_UPLOAD_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
     if summary.get("changed"):
