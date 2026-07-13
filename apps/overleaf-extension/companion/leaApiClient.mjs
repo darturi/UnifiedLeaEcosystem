@@ -154,6 +154,47 @@ export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files, mode = 
 // are keyed by the same document slug the mirror/run paths use. None of them ever
 // create a project — an unknown slug is a 404 ("nothing to export yet").
 
+// Structured artifact index (PLAN-system-hardening 4.1/4.2): which declaration
+// lives in which file, as recorded by the adapter's run finalizer. The primary
+// artifact-identification source; registry-markdown diffing is the fallback.
+export function fetchProjectArtifactsBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/artifacts`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+// Ledger-side target evidence (PLAN-system-hardening 4.4): per-declaration
+// file existence / sorry scan / newest check verdict, straight from the
+// adapter's own records. One of the two sources the ledger status engine
+// merges (the other is the companion's job overlay).
+export function fetchProjectTargetStatusBySlug({ fetchImpl, baseUrl, slug, declarations }) {
+  const query = encodeURIComponent((declarations || []).join(","));
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/target-status?declarations=${query}`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+// Single-writer retirement (PLAN-system-hardening 4.5): a retry deletes the
+// previous proof through the adapter's git layer — a commit, not a bare
+// unlink — and restores it from that commit when the retry doesn't verify.
+export function retireProjectArtifactBySlug({ fetchImpl, baseUrl, slug, path }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/artifacts/retire`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ path }),
+  });
+}
+
+export function restoreProjectArtifactBySlug({ fetchImpl, baseUrl, slug, path, retireCommit }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/artifacts/restore`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ path, retire_commit: retireCommit }),
+  });
+}
+
 export function fetchProjectShareStatus({ fetchImpl, baseUrl, slug }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/share`, {
     method: "GET",

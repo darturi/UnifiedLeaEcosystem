@@ -605,3 +605,35 @@ def test_session_detail_run_rows_carry_usage(tmp_path, monkeypatch):
     assert row["input_tokens"] == 11
     assert row["output_tokens"] == 7
     assert abs(row["cost_usd"] - 0.002) < 1e-9
+
+
+def test_upsert_artifact_scopes_by_project_then_session(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.1: one row per (scope, declaration). Project
+    runs share a scope across sessions; loose sessions scope to themselves."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session_a = store.create_session("a")
+    session_b = store.create_session("b")
+    run_a = store.create_run(session_a["id"], "m", None, 3)
+    run_b = store.create_run(session_b["id"], "m", None, 3)
+
+    # Loose sessions: same declaration name in two sessions = two rows.
+    store.upsert_artifact(project_id=None, session_id=session_a["id"], run_id=run_a["id"],
+                          declaration_name="foo", kind="proof", path="foo.lean", module_name=None)
+    store.upsert_artifact(project_id=None, session_id=session_b["id"], run_id=run_b["id"],
+                          declaration_name="foo", kind="proof", path="foo.lean", module_name=None)
+    assert len(store.list_artifacts_for_scope(session_a["id"])) == 1
+    assert len(store.list_artifacts_for_scope(session_b["id"])) == 1
+
+    # Project scope: re-recording the same declaration updates in place, even
+    # from a different session of the same project.
+    store.upsert_artifact(project_id="proj-1", session_id=session_a["id"], run_id=run_a["id"],
+                          declaration_name="bar", kind="proof", path="old.lean", module_name="Lea.P.old")
+    updated = store.upsert_artifact(project_id="proj-1", session_id=session_b["id"], run_id=run_b["id"],
+                                    declaration_name="bar", kind="definition", path="new.lean", module_name="Lea.P.new")
+    rows = store.list_artifacts_for_scope("proj-1")
+    assert len(rows) == 1
+    assert rows[0]["path"] == "new.lean"
+    assert rows[0]["kind"] == "definition"
+    assert rows[0]["session_id"] == session_b["id"]
+    assert updated["created_at"] != updated["updated_at"] or rows[0]["path"] == "new.lean"

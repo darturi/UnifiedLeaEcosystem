@@ -211,6 +211,31 @@ def init_db() -> None:
                 event_count integer not null default 0,
                 created_at text not null
             );
+
+            -- Structured artifact index (PLAN-system-hardening 4.1): which
+            -- declaration lives in which file, written by the run finalizer
+            -- from the run's own FileChanged set (declaration name parsed
+            -- server-side). Clients previously reverse-engineered this by
+            -- diffing the project-markdown registry; this table is the durable
+            -- answer. One row per (scope, declaration): a re-formalize updates
+            -- the row in place. `scope` = project_id for project runs (all
+            -- targets of one Overleaf document share a repo), else session_id.
+            create table if not exists artifacts (
+                id text primary key,
+                scope text not null,
+                project_id text references projects(id),
+                -- NULL session/run: a row backfilled from a pre-index
+                -- registry markdown (PLAN 4.3) rather than recorded by a run.
+                session_id text references sessions(id),
+                run_id text references runs(id),
+                declaration_name text not null,
+                kind text,                                -- 'proof' | 'definition' | 'mixed' | 'unknown'
+                path text not null,                       -- repo-relative, same convention as code_steps.path
+                module_name text,                         -- Lean module (namespace + path), NULL for loose sessions
+                created_at text not null,
+                updated_at text not null,
+                unique (scope, declaration_name)
+            );
             """
         )
         # No in-place ALTER migrations anywhere: v2 is a clean rebuild (no backward

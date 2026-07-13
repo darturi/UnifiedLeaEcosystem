@@ -450,6 +450,160 @@ def get_share_status_by_slug(slug: str) -> dict:
     }
 
 
+def _ensure_artifacts_backfilled(project: dict) -> None:
+    """4.3: one-time import of a pre-index project's registry markdown into
+    the artifacts table, so the index answers for artifacts that predate 4.1
+    and the markdown becomes write-only for machines. No-op once any row
+    exists (run-recorded or previously backfilled)."""
+    from .. import registry_backfill
+
+    if store.list_artifacts_for_scope(project["id"]):
+        return
+    config = load_config()
+    if not config.lea_root:
+        return
+    registry = Path(config.lea_root) / "workspace" / "projects" / f"{project['slug']}.md"
+    registry_backfill.backfill_artifacts_from_registry(project, _proofs_root(), registry)
+
+
+@router.get("/api/projects/by-slug/{slug}/artifacts")
+def project_artifacts_by_slug(slug: str) -> dict:
+    """Structured artifact index (PLAN-system-hardening 4.1): which declaration
+    lives in which file, as recorded by the run finalizer. The Overleaf
+    companion reads this instead of reverse-engineering artifacts from
+    registry-markdown diffs. Like every by-slug route, never creates a
+    project — an unknown slug is a 404 ("nothing recorded yet")."""
+    project = _require_project_by_slug(slug)
+    _ensure_artifacts_backfilled(project)
+    return {
+        "project_id": project["id"],
+        "slug": project["slug"],
+        "artifacts": store.list_artifacts_for_scope(project["id"]),
+    }
+
+
+# Cap on the file content echoed back by target-status: recorded proofs are a
+# few KB; anything bigger is truncated for display (verdict fields are computed
+# from the full content either way).
+_TARGET_STATUS_CONTENT_CAP = 64 * 1024
+
+
+@router.get("/api/projects/by-slug/{slug}/target-status")
+def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
+    """Ledger-side target evidence (PLAN-system-hardening 4.4): for each named
+    declaration, what the adapter's own records say — the artifact row, whether
+    the recorded file exists and still holds the declaration, whether it leans
+    on sorry/admit, and the newest recorded check verdict (agent run, manual
+    edit, or cascade re-check alike). This is one of the two sources the
+    companion's ledger status engine merges; the other is its own job overlay.
+    `content` rides along (capped) purely for display extraction client-side —
+    the verdict fields here are authoritative."""
+    from .. import artifacts as artifacts_service
+
+    project = _require_project_by_slug(slug)
+    _ensure_artifacts_backfilled(project)
+    names = [name for name in (part.strip() for part in declarations.split(",")) if name]
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    rows = {row["declaration_name"]: row for row in store.list_artifacts_for_scope(project["id"])}
+
+    targets = []
+    for name in names:
+        row = rows.get(name)
+        if not row:
+            targets.append({"declaration_name": name, "recorded": False})
+            continue
+        absolute = repo / row["path"]
+        exists = absolute.is_file()
+        content = ""
+        if exists:
+            try:
+                content = absolute.read_text()
+            except OSError:
+                exists = False
+        check = store.latest_check_for_project_path(project["id"], row["path"])
+        targets.append({
+            "declaration_name": name,
+            "recorded": True,
+            "path": row["path"],
+            "module_name": row["module_name"],
+            "kind": row["kind"],
+            "exists": exists,
+            "declaration_present": artifacts_service.declaration_present(content, name) if exists else False,
+            "has_sorry": artifacts_service.contains_sorry_marker(content) if exists else None,
+            "check_status": check["check_status"] if check else None,
+            "check_detail": check["check_detail"] if check else None,
+            "check_author": check["author"] if check else None,
+            "content": content[:_TARGET_STATUS_CONTENT_CAP] if exists else None,
+        })
+    return {"project_id": project["id"], "slug": project["slug"], "targets": targets}
+
+
+class ArtifactRetireRequest(BaseModel):
+    path: str  # repo-relative, same convention as the artifact rows
+
+
+class ArtifactRestoreRequest(BaseModel):
+    path: str
+    retire_commit: str
+
+
+def _resolve_repo_file(project: dict, rel: str) -> tuple[Path, Path, str]:
+    """(repo, absolute, normalized-rel) for a repo-relative path, rejecting
+    anything that escapes the project repo."""
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    candidate = Path(str(rel or ""))
+    if candidate.is_absolute():
+        raise HTTPException(status_code=422, detail="path must be repo-relative")
+    absolute = (repo / candidate).resolve()
+    if not absolute.is_relative_to(repo.resolve()):
+        raise HTTPException(status_code=422, detail="path escapes the project repo")
+    return repo, absolute, absolute.relative_to(repo.resolve()).as_posix()
+
+
+@router.post("/api/projects/by-slug/{slug}/artifacts/retire")
+def retire_project_artifact_by_slug(slug: str, request: ArtifactRetireRequest) -> dict:
+    """Single-writer retirement (PLAN-system-hardening 4.5): a retry deletes the
+    previous proof file THROUGH the adapter's git layer — a commit, not a bare
+    unlink — so history stays the undo mechanism and the working tree never
+    diverges from HEAD. The Overleaf companion used to unlink directly and
+    stash the bytes on its job record; now /artifacts/restore reverts from the
+    returned commit instead."""
+    project = _require_project_by_slug(slug)
+    repo, absolute, rel = _resolve_repo_file(project, request.path)
+    if not absolute.is_file():
+        raise HTTPException(status_code=404, detail="No recorded file at that path")
+    absolute.unlink()
+    try:
+        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry")
+    except GitStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"retire_commit": sha, "path": rel}
+
+
+@router.post("/api/projects/by-slug/{slug}/artifacts/restore")
+def restore_project_artifact_by_slug(slug: str, request: ArtifactRestoreRequest) -> dict:
+    """Undo a retirement after a retry that produced no verified replacement:
+    restore the file from the retire commit's parent. Conservative like the
+    companion's old stash-restore: never overwrites a file the failed run left
+    at the path (restored=False instead)."""
+    project = _require_project_by_slug(slug)
+    repo, absolute, rel = _resolve_repo_file(project, request.path)
+    if absolute.exists():
+        return {"restored": False, "reason": "occupied", "path": rel}
+    gs = GitStore(repo.parent)
+    try:
+        content = gs.snapshot(repo.name, f"{request.retire_commit}^", rel)
+    except GitStoreError:
+        raise HTTPException(status_code=404, detail="No such file in the retire commit's parent")
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    absolute.write_text(content)
+    try:
+        sha = GitStore(repo.parent).commit_all(repo, f"restore {rel} after unverified retry")
+    except GitStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"restored": True, "commit": sha, "path": rel}
+
+
 @router.get("/api/projects/by-slug/{slug}/export")
 def export_project_by_slug(slug: str) -> Response:
     return _export_project_response(_require_project_by_slug(slug))

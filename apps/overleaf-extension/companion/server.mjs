@@ -58,6 +58,10 @@ import {
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
+  fetchProjectArtifactsBySlug,
+  fetchProjectTargetStatusBySlug,
+  restoreProjectArtifactBySlug,
+  retireProjectArtifactBySlug,
   fetchProjectIdentityBySlug,
   fetchProjectShareStatus,
   interruptApiRun,
@@ -319,6 +323,7 @@ export async function handleFormalize(payload, state) {
   const cleanup = reusableStub
     ? { removedProofPaths: [], removedProjectEntries: [] }
     : await cleanupPreviousRunArtifacts({
+        state,
         leaRepoPath: state.settings.leaRepoPath,
         target,
         targetText,
@@ -3606,7 +3611,20 @@ async function createLeaJob({ state, target, targetText, targetContext = "", tar
   };
 }
 
-async function cleanupPreviousRunArtifacts({ leaRepoPath, target, targetText, jobs }) {
+// Convert a leaRepoPath-relative recorded proof path
+// ("workspace/proofs/Lea/Project1/x.lean") into the project-repo-relative path
+// the adapter's artifact retire/restore endpoints speak ("x.lean"). Null when
+// the namespace is unknown or the path lives elsewhere — callers fall back to
+// the legacy local unlink/stash.
+function repoRelativeProofPath(target, proofPath) {
+  const namespacePath = String(targetNamespace(target) || "").split(".").filter(Boolean).join("/");
+  if (!namespacePath) return null;
+  const prefix = `${LEA_PROOFS_DIR}/${namespacePath}/`.replace(/\\/g, "/");
+  const normalized = String(proofPath || "").replace(/\\/g, "/");
+  return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : null;
+}
+
+async function cleanupPreviousRunArtifacts({ state = null, leaRepoPath, target, targetText, jobs }) {
   const previousJob = findLatestFinishedJob(jobs, target.jobKey);
   if (!previousJob) {
     return { removedProofPaths: [], removedProjectEntries: [] };
@@ -3639,7 +3657,39 @@ async function cleanupPreviousRunArtifacts({ leaRepoPath, target, targetText, jo
   // run does not end verified; dropped once it does.
   const removedProofPaths = [];
   const proofFileBackups = [];
+  const retiredFiles = [];
+  let adapterBaseUrl = null;
+  try {
+    adapterBaseUrl = normalizeLeaApiBaseUrl(state?.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    adapterBaseUrl = null;
+  }
   for (const proofPath of candidateProofPaths) {
+    // Single-writer path (PLAN-system-hardening 4.5): retire through the
+    // adapter's git layer, so the deletion is a commit and the undo is a
+    // revert — the working tree never diverges from HEAD and no proof bytes
+    // ride on the job record. The legacy unlink+stash below survives only as
+    // the fallback for adapters without the endpoint (or unmappable paths).
+    const repoRelativePath = repoRelativeProofPath(target, proofPath);
+    if (adapterBaseUrl && repoRelativePath && target.projectSlug) {
+      const retired = await retireProjectArtifactBySlug({
+        fetchImpl: state?.fetchImpl || fetch,
+        baseUrl: adapterBaseUrl,
+        slug: target.projectSlug,
+        path: repoRelativePath
+      });
+      if (retired.ok && retired.body?.retire_commit) {
+        removedProofPaths.push(proofPath);
+        retiredFiles.push({ proofPath, repoRelativePath, retireCommit: retired.body.retire_commit });
+        continue;
+      }
+      const absolute = buildLeaProofPath({ leaRepoPath, proofPath });
+      if (retired.status === 404 && (!absolute || !existsSync(absolute))) {
+        continue; // recorded nowhere — nothing to retire on either side
+      }
+      // Adapter unavailable / predates the endpoint / path mismatch: fall
+      // through to the legacy local unlink+stash.
+    }
     const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
     let content = null;
     if (absolutePath && existsSync(absolutePath)) {
@@ -3667,6 +3717,7 @@ async function cleanupPreviousRunArtifacts({ leaRepoPath, target, targetText, jo
     removedProjectEntries: removedSections.map((section) => section.name),
     backups: {
       proofFiles: proofFileBackups,
+      retiredFiles,
       markdownSections: removedSections
         .filter((section) => section.text)
         .map((section) => ({ name: section.name, text: section.text }))
@@ -3688,6 +3739,26 @@ async function restorePreviousRunArtifacts({ state, job, target }) {
   if (!backups || job.retryCleanup.restored) return false;
   job.retryCleanup.restored = true;
   let restored = false;
+
+  // Files retired through the adapter's git layer (4.5) come back the same
+  // way: a revert from the retire commit. The adapter refuses to overwrite a
+  // partial file the failed run left behind, mirroring the legacy stash's
+  // conservatism. Best-effort — the retire commit stays in history either way.
+  for (const file of backups.retiredFiles || []) {
+    try {
+      const baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+      const result = await restoreProjectArtifactBySlug({
+        fetchImpl: state.fetchImpl || fetch,
+        baseUrl,
+        slug: job.projectSlug || target?.projectSlug,
+        path: file.repoRelativePath,
+        retireCommit: file.retireCommit
+      });
+      if (result.ok && result.body?.restored) restored = true;
+    } catch {
+      // unreachable adapter; the commit still holds the bytes
+    }
+  }
 
   for (const file of backups.proofFiles || []) {
     const absolutePath = buildLeaProofPath({
@@ -4090,19 +4161,49 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
   // proof isn't discarded sight-unseen just because the prover wasn't fully
   // confident in it.
   const exitResultKind = String(exit.resultKind || exit.doneStatus || "").toLowerCase();
-  const artifact = (exit.ok || exitResultKind === "needs_review")
-    ? await identifyLeaArtifact({
-      leaRepoPath: state.settings.leaRepoPath,
-      target,
-      beforeMarkers,
-      job
-    })
-    : null;
+  // 4.2: the adapter's structured index is the primary identification source;
+  // the registry-markdown diff survives as the fallback for adapters that
+  // predate the index (and for transport failures).
+  let artifact = null;
+  if (exit.ok || exitResultKind === "needs_review") {
+    artifact = await identifyArtifactFromAdapter({ state, job, target });
+    if (!artifact) {
+      artifact = await identifyLeaArtifact({
+        leaRepoPath: state.settings.leaRepoPath,
+        target,
+        beforeMarkers,
+        job
+      });
+      if (artifact?.ok) {
+        await appendLog(job.logPath, `[backend] Artifact resolved from the markdown-diff fallback: ${artifact.entry.name}.\n`);
+      }
+    }
+  }
 
   if (artifact?.ok) {
     job.declarationName = artifact.entry.name;
     job.recordedProofPath = artifact.entry.proofPath;
     job.moduleName = artifact.entry.moduleName || null;
+    if (artifact.source === "adapter") {
+      // Until 4.3 demotes the registry markdown to a generated view, the
+      // markdown-dependent readers (uses= resolution, project status) still
+      // need an entry — and the agent may not have self-registered one. Only
+      // fill a MISSING entry; an existing one may carry the agent's richer
+      // prose and must not be clobbered.
+      const markdown = await fs.readFile(target.projectMarkdownPath, "utf8").catch(() => "");
+      if (!findProjectTheoremEntry(markdown, artifact.entry.name)) {
+        await upsertProjectTheoremEntry({
+          projectMarkdownPath: target.projectMarkdownPath,
+          projectId: target.projectSlug,
+          theoremName: artifact.entry.name,
+          proofPath: artifact.entry.proofPath,
+          moduleName: artifact.entry.moduleName,
+          signature: "",
+          description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
+          solvingProcess: "Recorded from the adapter's structured artifact index (the agent did not self-register a markdown entry)."
+        });
+      }
+    }
   }
   recordJobUsage(job, exit);
 
@@ -5305,7 +5406,187 @@ async function resolveTargetUseStatus({
   return getTargetStatus({ state, leaRepoPath, overleafProjectId, projectName, projectNamespace, targetKind: "theorem", targetLabel, jobs });
 }
 
-async function getTheoremStatus({
+// Engine dispatch (PLAN-system-hardening 4.4): `ledger` is the two-source
+// merge — the companion's job overlay over the adapter's per-declaration
+// ledger evidence. `legacy` (the default for this release) is the original
+// five-source recomputation below. The toggle is read per call so the
+// integration harness can diff both engines on one live stack.
+function statusEngine(state) {
+  return String(state?.env?.LEA_STATUS_ENGINE || "legacy").toLowerCase() === "ledger" ? "ledger" : "legacy";
+}
+
+async function getTheoremStatus(args) {
+  if (statusEngine(args.state) === "ledger") {
+    return getTheoremStatusLedger(args);
+  }
+  return getTheoremStatusLegacy(args);
+}
+
+// The project namespace for path mapping: the target's own when resolved,
+// else derived from the slug the same way the adapter provisions it (D24) —
+// the /statuses path often builds targets before identity resolution.
+function targetNamespace(target) {
+  const explicit = String(target?.projectNamespace || "").trim();
+  return explicit || projectNamespaceFromSlug(String(target?.projectSlug || ""));
+}
+
+// leaRepoPath-relative proof path for an adapter repo-relative one — the
+// inverse of repoRelativeProofPath.
+function ledgerProofPath(target, repoRelativePath) {
+  const namespacePath = String(targetNamespace(target) || "").split(".").filter(Boolean).join("/");
+  return namespacePath
+    ? ["workspace", "proofs", namespacePath, repoRelativePath].join("/")
+    : String(repoRelativePath || "");
+}
+
+function ledgerStatusBase({ leaRepoPath, target, entry }) {
+  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: entry.proofPath });
+  return {
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
+    targetKey: targetKey(target),
+    declarationName: entry.name,
+    relativePath: entry.proofPath,
+    absolutePath: absolutePath || "",
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath,
+    recordedProofPath: entry.proofPath,
+    moduleName: entry.moduleName || null
+  };
+}
+
+async function fetchTargetStatusFromAdapter({ state, target, declarations }) {
+  if (!target.projectSlug || declarations.length === 0) return null;
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state?.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return null;
+  }
+  const result = await fetchProjectTargetStatusBySlug({
+    fetchImpl: state?.fetchImpl || fetch,
+    baseUrl,
+    slug: target.projectSlug,
+    declarations
+  });
+  if (!result.ok || !Array.isArray(result.body?.targets)) return null;
+  return Object.fromEntries(result.body.targets.map((entry) => [entry.declaration_name, entry]));
+}
+
+// The ledger engine (PLAN 4.4). Two sources, strict roles:
+//   overlay — run lifecycle the companion owns: active job → in_progress,
+//             newest terminal job for outcomes the ledger can't know
+//             (failed runs produce no artifact), log-tail enrichment;
+//   ledger  — file truth the adapter owns: does the recorded file exist,
+//             does it still lean on sorry, what was its newest real check
+//             verdict (agent run, manual edit, and cascade re-check alike).
+// The legacy engine's markdown parsing, direct-FS regex probes, and
+// stale-verdict override chains have no equivalent here — that is the point.
+async function getTheoremStatusLedger({
+  state,
+  leaRepoPath,
+  overleafProjectId = "unknown",
+  projectName = "",
+  projectNamespace = "",
+  targetKind = "theorem",
+  theoremLabel,
+  jobs = {}
+}) {
+  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
+  const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
+  const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
+  const activeJob = findActiveJob(jobs, target.jobKey);
+  if (activeJob) {
+    return buildJobResponse({ job: activeJob, status: "in_progress", target });
+  }
+
+  const candidates = [...new Set([
+    linkedJob?.declarationName,
+    linkedJob?.declarationNameHint,
+    target.targetLabel
+  ].filter(Boolean))];
+  const ledger = await fetchTargetStatusFromAdapter({ state, target, declarations: candidates });
+  const evidence = candidates.map((name) => ledger?.[name]).find((entry) => entry?.recorded) || null;
+
+  if (evidence && evidence.exists) {
+    const entry = {
+      name: evidence.declaration_name,
+      proofPath: ledgerProofPath(target, evidence.path),
+      moduleName: evidence.module_name || null
+    };
+    const base = ledgerStatusBase({ leaRepoPath, target, entry });
+    const leanStatement = extractLeanStatement(evidence.content || "", entry.name);
+    if (evidence.has_sorry) {
+      return withLeaSession({ status: "sorry_stub", ...base, leanStatement });
+    }
+    if (evidence.check_status === "error") {
+      // The recorded file's newest real verdict is a compile error (manual
+      // edit or cascade re-check) — the ledger twin of the legacy
+      // lastEditCheckStatus override.
+      if (linkedJob) {
+        return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
+      }
+      return { status: "failed", ...base, effectiveStatus: "unformalized", message: evidence.check_detail || "This item no longer compiles." };
+    }
+    const status = {
+      status: "formalized",
+      ...base,
+      resultKind: target.targetKind === "definition" ? "defined" : "proved",
+      leanStatement
+    };
+    return withLeaSession(await attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status }));
+  }
+
+  // No usable file evidence: the overlay's newest terminal run decides. An
+  // index that KNOWS the file is gone (recorded && !exists — a retired retry)
+  // must not resurrect a stale "formalized" job verdict; an index that has
+  // simply never seen the declaration (pre-index artifacts) defers to the
+  // job record, exactly like 4.2's identification fallback.
+  const indexKnowsGone = Boolean(evidence && !evidence.exists);
+  const terminalCandidates = [
+    { job: findLatestJob(jobs, target.jobKey, "formalized"), status: "formalized" },
+    { job: findLatestJob(jobs, target.jobKey, "repaired"), status: "formalized" },
+    { job: findLatestJob(jobs, target.jobKey, "needs_review"), status: "needs_review" },
+    { job: findLatestJob(jobs, target.jobKey, "disproved"), status: "disproved" },
+    { job: findLatestJob(jobs, target.jobKey, "sorry_stub"), status: "sorry_stub" },
+    { job: findLatestJob(jobs, target.jobKey, "failed"), status: "failed" }
+  ].filter((candidate) => candidate.job && !(indexKnowsGone && candidate.status === "formalized"));
+  let newest = null;
+  for (const candidate of terminalCandidates) {
+    if (!newest || jobRecency(candidate.job) > jobRecency(newest.job)) {
+      newest = candidate;
+    }
+  }
+
+  if (newest?.status === "failed") {
+    const logTail = await readLogTail(newest.job.logPath);
+    return withLeaSession(buildFailedTheoremStatus({
+      failedJob: newest.job,
+      target,
+      equivalentStatus: getEquivalentTheoremStatus({ status: "unformalized" }),
+      logTail
+    }));
+  }
+  if (newest) {
+    return withLeaSession(buildJobResponse({ job: newest.job, status: newest.status, target }));
+  }
+
+  return {
+    status: "unformalized",
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel,
+    targetKey: targetKey(target),
+    declarationName: target.declarationName,
+    relativePath: target.relativePath,
+    absolutePath: target.absolutePath,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectMarkdownPath: target.projectMarkdownPath
+  };
+}
+
+async function getTheoremStatusLegacy({
   state,
   leaRepoPath,
   overleafProjectId = "unknown",
@@ -5780,6 +6061,56 @@ function findProjectTheoremEntry(markdown, theoremLabel) {
     return entry;
   }
   return null;
+}
+
+// Primary artifact identification (PLAN-system-hardening 4.2): ask the
+// adapter's structured index (written by its run finalizer from the run's own
+// FileChanged set, 4.1) which declaration this run produced — instead of
+// reverse-engineering it from registry-markdown diffs. Returns the same
+// { ok, entry } shape identifyLeaArtifact yields, tagged source: "adapter";
+// null means "index unavailable or no row" → the caller falls back to the
+// markdown diff. Best-effort by design: any transport/shape problem is a
+// silent fallback, never a failed job.
+async function identifyArtifactFromAdapter({ state, job, target }) {
+  if (!job.apiRunId || !target.projectSlug) return null;
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return null;
+  }
+  const result = await fetchProjectArtifactsBySlug({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    slug: target.projectSlug
+  });
+  if (!result.ok || !Array.isArray(result.body?.artifacts)) return null;
+
+  // This run's own rows are authoritative; the declaration hint / target
+  // label break the tie when the run touched several declarations.
+  const mine = result.body.artifacts.filter((row) => row && row.run_id === job.apiRunId);
+  const preferred =
+    (mine.length === 1 ? mine[0] : null) ||
+    mine.find((row) => row.declaration_name === job.declarationNameHint) ||
+    mine.find((row) => row.declaration_name === target.targetLabel) ||
+    null;
+  if (!preferred || !preferred.declaration_name || !preferred.path) return null;
+
+  // The adapter's path is repo-relative (repo root IS the project namespace
+  // dir); the companion's entries are leaRepoPath-relative.
+  const namespacePath = String(job.projectNamespace || target.projectNamespace || "")
+    .split(".")
+    .filter(Boolean)
+    .join("/");
+  if (!namespacePath) return null;
+
+  const entry = {
+    name: preferred.declaration_name,
+    proofPath: ["workspace", "proofs", namespacePath, preferred.path].join("/"),
+    moduleName: preferred.module_name || null
+  };
+  await appendLog(job.logPath, `[backend] Artifact resolved from the adapter index: ${entry.name} at ${entry.proofPath}.\n`);
+  return { ok: true, entry, source: "adapter" };
 }
 
 async function identifyLeaArtifact({ leaRepoPath, target, beforeMarkers, job }) {

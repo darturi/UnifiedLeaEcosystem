@@ -874,3 +874,86 @@ def test_interrupted_queued_run_is_skipped_and_stream_sealed(tmp_path, monkeypat
     replay, _ = bridge.attach(run["id"])
     assert replay[-1]["type"] == "done"
     assert replay[-1]["payload"]["status"] == "failed"
+
+
+def test_run_records_structured_artifact_rows(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.1: the finalizer writes one artifact row per
+    checked file — declaration parsed server-side, kind from the step, module
+    from the project namespace."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    proofs_root = tmp_path / "workspace" / "proofs"
+    project = projects.provision_project("Epsilon", proofs_root)
+    session = store.create_session("prove foo", project_id=project["id"])
+    run = store.create_run(session["id"], "gemini/test", None, 3, project_id=project["id"])
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="prove foo", config=config, events=queue,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        proof = Path(working_dir) / "chapter" / "foo_theorem.lean"
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text("import Mathlib\n\ntheorem foo_theorem : True := by trivial\n")
+        broken = Path(working_dir) / "broken.lean"
+        broken.write_text("theorem broken_one : False := by trivial\n")
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": str(proof)})
+        yield FileChanged(str(proof))
+        yield CheckResult(str(proof), "ok", None)
+        yield ToolCalled("write_file", {"path": str(broken)})
+        yield FileChanged(str(broken))
+        yield CheckResult(str(broken), "error", "type mismatch")
+        yield Finished("completed", "Proved.", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    rows = store.list_artifacts_for_scope(project["id"])
+    assert len(rows) == 1, "only checked-ok files become artifact rows"
+    row = rows[0]
+    assert row["declaration_name"] == "foo_theorem"
+    assert row["kind"] == "proof"
+    assert row["path"] == "chapter/foo_theorem.lean"
+    assert row["module_name"] == "Lea.Epsilon.chapter.foo_theorem"
+    assert row["run_id"] == run["id"]
+
+
+def test_reformalize_updates_the_artifact_row_in_place(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    proofs_root = tmp_path / "workspace" / "proofs"
+    project = projects.provision_project("Epsilon", proofs_root)
+    session = store.create_session("prove foo", project_id=project["id"])
+
+    def make_run(path_name):
+        run = store.create_run(session["id"], "gemini/test", None, 3, project_id=project["id"])
+        config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+        ctx = bridge.RunnerContext(
+            session_id=session["id"], run_id=run["id"], task="prove foo",
+            config=config, events=Queue(),
+        )
+
+        def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+            proof = Path(working_dir) / path_name
+            proof.write_text("import Mathlib\n\ntheorem same_decl : True := by trivial\n")
+            yield TurnStarted(1)
+            yield ToolCalled("write_file", {"path": str(proof)})
+            yield FileChanged(str(proof))
+            yield CheckResult(str(proof), "ok", None)
+            yield Finished("completed", "Proved.", 1, session_id, "gemini/test",
+                           Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+        monkeypatch.setattr(bridge, "run_events", fake)
+        bridge.run_lea(ctx)
+        return run
+
+    make_run("first_home.lean")
+    second = make_run("second_home.lean")
+
+    rows = store.list_artifacts_for_scope(project["id"])
+    assert len(rows) == 1, "same declaration re-recorded updates in place"
+    assert rows[0]["path"] == "second_home.lean"
+    assert rows[0]["run_id"] == second["id"]

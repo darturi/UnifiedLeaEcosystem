@@ -590,3 +590,202 @@ def test_by_slug_never_creates_a_project(tmp_path, monkeypatch):
             call()
         assert exc.value.status_code == 404
     assert store.list_projects() == []  # nothing was created as a side effect
+
+
+def test_artifacts_by_slug_returns_recorded_rows_and_404s_unknown(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.1: the by-slug artifact index the Overleaf
+    companion reads instead of diffing registry markdown. Never creates a
+    project — unknown slug is a 404."""
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    session = store.create_session("prove", project_id=project["id"])
+    run = store.create_run(session["id"], "m", None, 3, project_id=project["id"])
+    store.upsert_artifact(
+        project_id=project["id"], session_id=session["id"], run_id=run["id"],
+        declaration_name="cauchy_bound", kind="proof",
+        path="cauchy_bound.lean", module_name="Lea.Analysis.cauchy_bound",
+    )
+
+    payload = projects_route.project_artifacts_by_slug(project["slug"])
+    assert payload["project_id"] == project["id"]
+    assert len(payload["artifacts"]) == 1
+    row = payload["artifacts"][0]
+    assert row["declaration_name"] == "cauchy_bound"
+    assert row["module_name"] == "Lea.Analysis.cauchy_bound"
+
+    with pytest.raises(HTTPException) as exc:
+        projects_route.project_artifacts_by_slug("no-such-slug")
+    assert exc.value.status_code == 404
+
+
+def test_artifact_retire_and_restore_round_trip_through_git(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.5 (single writer): a retry retires the previous
+    proof through the adapter's git layer (a commit, not a bare unlink), and an
+    unverified retry restores it from that commit's parent."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    repo = proofs / "Lea" / "Analysis"
+    proof = repo / "cauchy_bound.lean"
+    proof.write_text("theorem cauchy_bound : True := by\n  trivial\n")
+    from app.gitstore import GitStore
+    GitStore(repo.parent).commit_all(repo, "record cauchy_bound")
+
+    retired = projects_route.retire_project_artifact_by_slug(
+        project["slug"], projects_route.ArtifactRetireRequest(path="cauchy_bound.lean")
+    )
+    assert not proof.exists(), "the file is gone from the working tree"
+    assert len(retired["retire_commit"]) == 40
+
+    restored = projects_route.restore_project_artifact_by_slug(
+        project["slug"],
+        projects_route.ArtifactRestoreRequest(path="cauchy_bound.lean", retire_commit=retired["retire_commit"]),
+    )
+    assert restored["restored"] is True
+    assert proof.read_text().startswith("theorem cauchy_bound")
+
+
+def test_artifact_restore_never_overwrites_an_occupied_path(tmp_path, monkeypatch):
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    repo = proofs / "Lea" / "Analysis"
+    proof = repo / "kept.lean"
+    proof.write_text("theorem kept : True := trivial\n")
+    from app.gitstore import GitStore
+    GitStore(repo.parent).commit_all(repo, "record kept")
+    retired = projects_route.retire_project_artifact_by_slug(
+        project["slug"], projects_route.ArtifactRetireRequest(path="kept.lean")
+    )
+    # The failed retry left its own partial file at the path.
+    proof.write_text("theorem kept : True := by sorry\n")
+
+    result = projects_route.restore_project_artifact_by_slug(
+        project["slug"],
+        projects_route.ArtifactRestoreRequest(path="kept.lean", retire_commit=retired["retire_commit"]),
+    )
+    assert result["restored"] is False
+    assert "sorry" in proof.read_text(), "the partial file is untouched"
+
+
+def test_artifact_retire_rejects_escapes_and_missing_files(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+
+    with pytest.raises(HTTPException) as escape:
+        projects_route.retire_project_artifact_by_slug(
+            project["slug"], projects_route.ArtifactRetireRequest(path="../../etc/passwd")
+        )
+    assert escape.value.status_code == 422
+
+    with pytest.raises(HTTPException) as missing:
+        projects_route.retire_project_artifact_by_slug(
+            project["slug"], projects_route.ArtifactRetireRequest(path="never_recorded.lean")
+        )
+    assert missing.value.status_code == 404
+
+
+def test_target_status_serves_ledger_evidence(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.4: per-declaration ledger evidence — artifact
+    row, file existence, sorry scan, and the newest check verdict across all
+    the project's sessions — for the companion's ledger status engine."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    repo = proofs / "Lea" / "Analysis"
+    session = store.create_session("prove", project_id=project["id"])
+    run = store.create_run(session["id"], "m", None, 3, project_id=project["id"])
+
+    (repo / "proved_one.lean").write_text("import Mathlib\n\ntheorem proved_one : True := by\n  trivial\n")
+    store.upsert_artifact(project_id=project["id"], session_id=session["id"], run_id=run["id"],
+                          declaration_name="proved_one", kind="proof",
+                          path="proved_one.lean", module_name="Lea.Analysis.proved_one")
+    store.add_code_step(session["id"], run["id"], "proved_one.lean",
+                        commit_sha="a" * 40, check_status="ok")
+
+    (repo / "stubbed_one.lean").write_text("theorem stubbed_one : True := by\n  sorry\n")
+    store.upsert_artifact(project_id=project["id"], session_id=session["id"], run_id=run["id"],
+                          declaration_name="stubbed_one", kind="proof",
+                          path="stubbed_one.lean", module_name="Lea.Analysis.stubbed_one")
+
+    store.upsert_artifact(project_id=project["id"], session_id=session["id"], run_id=run["id"],
+                          declaration_name="retired_one", kind="proof",
+                          path="retired_one.lean", module_name="Lea.Analysis.retired_one")
+
+    payload = projects_route.project_target_status_by_slug(
+        project["slug"], declarations="proved_one,stubbed_one,retired_one,never_seen"
+    )
+    by_name = {t["declaration_name"]: t for t in payload["targets"]}
+
+    proved = by_name["proved_one"]
+    assert proved["recorded"] and proved["exists"] and proved["declaration_present"]
+    assert proved["has_sorry"] is False
+    assert proved["check_status"] == "ok"
+    assert "theorem proved_one" in proved["content"]
+
+    stubbed = by_name["stubbed_one"]
+    assert stubbed["exists"] and stubbed["has_sorry"] is True
+
+    retired = by_name["retired_one"]
+    assert retired["recorded"] is True and retired["exists"] is False
+
+    assert by_name["never_seen"] == {"declaration_name": "never_seen", "recorded": False}
+
+
+def test_target_status_check_verdict_spans_sessions(tmp_path, monkeypatch):
+    """A cascade/user re-check recorded in a DIFFERENT session of the same
+    project supersedes the original run's verdict — the repo is shared (D24)."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    repo = proofs / "Lea" / "Analysis"
+    (repo / "x.lean").write_text("theorem x : True := trivial\n")
+
+    first = store.create_session("run", project_id=project["id"])
+    first_run = store.create_run(first["id"], "m", None, 3, project_id=project["id"])
+    store.upsert_artifact(project_id=project["id"], session_id=first["id"], run_id=first_run["id"],
+                          declaration_name="x", kind="proof", path="x.lean", module_name="Lea.Analysis.x")
+    store.add_code_step(first["id"], first_run["id"], "x.lean", commit_sha="a" * 40, check_status="ok")
+
+    second = store.create_session("edit", project_id=project["id"])
+    store.add_code_step(second["id"], None, "x.lean", commit_sha="b" * 40,
+                        author="cascade", check_status="error", check_detail="broke downstream")
+
+    payload = projects_route.project_target_status_by_slug(project["slug"], declarations="x")
+    target = payload["targets"][0]
+    assert target["check_status"] == "error"
+    assert target["check_detail"] == "broke downstream"
+    assert target["check_author"] == "cascade"
+
+
+def test_artifacts_backfill_from_legacy_registry_markdown(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.3: a pre-index project's registry markdown is
+    imported into the artifacts table once, so the index answers for artifacts
+    that predate 4.1. Backfilled rows have no run (session/run NULL); a second
+    read adds nothing."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    repo = proofs / "Lea" / "Analysis"
+    (repo / "old_thm.lean").write_text("import Mathlib\n\ntheorem old_thm : True := by\n  trivial\n")
+
+    registry = tmp_path / "workspace" / "projects" / f"{project['slug']}.md"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        "# Lea Project\n\n## Theorem: old_thm\n\n"
+        '<!-- lea:theorem name="old_thm" proof="workspace/proofs/Lea/Analysis/old_thm.lean" module="Lea.Analysis.old_thm" -->\n'
+        "\n## Theorem: gone_thm\n\n"
+        '<!-- lea:theorem name="gone_thm" proof="workspace/proofs/Lea/Analysis/gone_thm.lean" -->\n'
+    )
+
+    payload = projects_route.project_artifacts_by_slug(project["slug"])
+    by_name = {row["declaration_name"]: row for row in payload["artifacts"]}
+    assert by_name["old_thm"]["path"] == "old_thm.lean"
+    assert by_name["old_thm"]["kind"] == "proof"
+    assert by_name["old_thm"]["module_name"] == "Lea.Analysis.old_thm"
+    assert by_name["old_thm"]["run_id"] is None
+    assert by_name["gone_thm"]["kind"] is None
+
+    again = projects_route.project_artifacts_by_slug(project["slug"])
+    assert len(again["artifacts"]) == 2
+
+    # And the ledger endpoint serves backfilled targets like any other.
+    status = projects_route.project_target_status_by_slug(project["slug"], declarations="old_thm,gone_thm")
+    by_status = {t["declaration_name"]: t for t in status["targets"]}
+    assert by_status["old_thm"]["exists"] is True and by_status["old_thm"]["has_sorry"] is False
+    assert by_status["gone_thm"]["recorded"] is True and by_status["gone_thm"]["exists"] is False

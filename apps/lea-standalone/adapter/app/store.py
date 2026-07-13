@@ -937,6 +937,79 @@ def list_runs_by_status(status: str) -> list[dict]:
     return [_normalize_run(row_to_dict(row)) for row in rows]
 
 
+# --- Structured artifact index (PLAN-system-hardening 4.1) -------------------
+# One row per (scope, declaration): "declaration X currently lives at path Y".
+# Written by the run finalizer; read by the Overleaf companion instead of
+# reverse-engineering artifacts from registry-markdown diffs.
+
+def upsert_artifact(
+    *,
+    project_id: str | None,
+    session_id: str | None,
+    run_id: str | None,
+    declaration_name: str,
+    kind: str | None,
+    path: str,
+    module_name: str | None,
+) -> dict:
+    scope = project_id or session_id
+    if not scope:
+        raise ValueError("an artifact needs a project or a session scope")
+    now = utc_now()
+    with connect() as conn:
+        existing = conn.execute(
+            "select id from artifacts where scope = ? and declaration_name = ?",
+            (scope, declaration_name),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "update artifacts set project_id = ?, session_id = ?, run_id = ?,"
+                " kind = ?, path = ?, module_name = ?, updated_at = ? where id = ?",
+                (project_id, session_id, run_id, kind, path, module_name, now, existing["id"]),
+            )
+            artifact_id = existing["id"]
+        else:
+            artifact_id = str(uuid4())
+            conn.execute(
+                "insert into artifacts (id, scope, project_id, session_id, run_id,"
+                " declaration_name, kind, path, module_name, created_at, updated_at)"
+                " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (artifact_id, scope, project_id, session_id, run_id,
+                 declaration_name, kind, path, module_name, now, now),
+            )
+        row = conn.execute("select * from artifacts where id = ?", (artifact_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def latest_check_for_project_path(project_id: str, path: str) -> dict | None:
+    """The newest recorded check verdict for a repo-relative path across ALL of
+    a project's sessions (they share one repo, D24). One of the ledger facts
+    the target-status endpoint serves (PLAN 4.4): agent runs, manual edits,
+    and cascade re-checks all land here as code_steps."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select cs.check_status, cs.check_detail, cs.author, cs.created_at
+            from code_steps cs
+            join sessions s on s.id = cs.session_id
+            where s.project_id = ? and cs.path = ? and cs.check_status is not null
+            order by cs.created_at desc, cs.seq desc
+            limit 1
+            """,
+            (project_id, path),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def list_artifacts_for_scope(scope: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from artifacts where scope = ? order by declaration_name asc",
+            (scope,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
 def queue_position(run_id: str) -> int | None:
     """How many pending runs precede this pending run (0 = next up). None when
     the run is not pending. Derived, never stored — invariant 2."""

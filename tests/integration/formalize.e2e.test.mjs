@@ -10,7 +10,7 @@
 // Run with: npm run test:integration  (needs the adapter venv provisioned)
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -267,6 +267,20 @@ test("companion end-to-end: /formalize drives a run to formalized with a session
   });
   assert.equal(detail.ok, true);
   assert.equal(detail.body.origin, "overleaf");
+
+  // 4.1 + 4.2 together, over the real wire: the adapter's run finalizer
+  // recorded a structured artifact row, and the companion identified the
+  // artifact from that index (not from registry-markdown diffing — the stub
+  // prover never writes markdown).
+  const artifacts = await fetch(`${adapterBaseUrl}/api/projects/by-slug/itest-doc/artifacts`)
+    .then((res) => res.json());
+  const row = (artifacts.artifacts || []).find((a) => a.declaration_name === "int_e2e_true");
+  assert.ok(row, "the adapter recorded an artifact row for the run's declaration");
+  assert.equal(row.kind, "proof");
+  assert.ok(job.recordedProofPath?.endsWith(`/${row.path}`),
+    "companion's recorded path resolves the adapter's repo-relative path");
+  const jobLog = await fs.readFile(job.logPath, "utf8");
+  assert.match(jobLog, /Artifact resolved from the adapter index/);
 });
 
 test("companion push channel: /events streams jobs-changed during a formalize (PLAN 3.1)", async () => {
@@ -303,6 +317,51 @@ test("companion push channel: /events streams jobs-changed during a formalize (P
   }
 });
 
+test("retry lifecycle: a failed re-formalize restores the previous proof via adapter git (PLAN 4.5)", async () => {
+  const target = { targetKind: "theorem", targetLabel: "int_retry_true", targetText: "True is true." };
+  const first = await postJson(`${companionBaseUrl}/formalize`, { overleafProjectId: "itest-doc", ...target });
+  assert.equal(first.status, 200);
+  const firstInfo = await pollStatus("itest-doc", target, ["formalized", "failed"]);
+  assert.equal(firstInfo.status, "formalized");
+
+  const jobsAfterFirst = JSON.parse(await fs.readFile(companionJobsPath, "utf8"));
+  const firstJob = jobsAfterFirst[first.body.jobId];
+  assert.ok(firstJob.recordedProofPath, "first run records its proof file");
+  const absoluteProof = path.join(home, "prover", firstJob.recordedProofPath);
+  const original = await fs.readFile(absoluteProof, "utf8");
+  assert.match(original, /theorem int_retry_true/);
+
+  // Retry the same target with a scripted failure: the pre-run cleanup must
+  // retire the previous proof through the adapter's git layer, and the failed
+  // outcome must bring it back from that commit.
+  const retry = await postJson(`${companionBaseUrl}/formalize`, {
+    overleafProjectId: "itest-doc",
+    ...target,
+    targetText: "True is true. [stub:fail]"
+  });
+  assert.equal(retry.status, 200);
+  await waitFor(async () => {
+    const jobs = JSON.parse(await fs.readFile(companionJobsPath, "utf8"));
+    return jobs[retry.body.jobId]?.status === "failed";
+  }, { timeoutMs: 45000, label: "retry to reach failed" });
+
+  const restoredContent = await fs.readFile(absoluteProof, "utf8");
+  assert.equal(restoredContent, original, "the previous verified proof is back on disk");
+
+  // Both operations are real commits in the project repo — git is the undo
+  // mechanism, not stashed bytes on the job record.
+  const repoDir = path.dirname(absoluteProof);
+  const gitLog = execSync(`git -C ${JSON.stringify(repoDir)} log --format=%s`, { encoding: "utf8" });
+  assert.match(gitLog, /retire .* for retry/);
+  assert.match(gitLog, /restore .* after unverified retry/);
+
+  const retryJob = JSON.parse(await fs.readFile(companionJobsPath, "utf8"))[retry.body.jobId];
+  assert.ok(retryJob.retryCleanup?.backups?.retiredFiles?.length >= 1,
+    "the retire went through the adapter");
+  assert.equal((retryJob.retryCleanup.backups.proofFiles || []).length, 0,
+    "no proof bytes stashed on the job record");
+});
+
 test("companion end-to-end: a failing run surfaces as failed, not as a hang", async () => {
   const target = {
     targetKind: "theorem",
@@ -317,4 +376,35 @@ test("companion end-to-end: a failing run surfaces as failed, not as a hang", as
 
   const info = await pollStatus("itest-doc", target, ["failed"]);
   assert.equal(info.status, "failed");
+});
+
+test("status engines agree on the scripted scenarios (PLAN 4.4 dual-engine diff)", async () => {
+  const targets = [
+    { targetKind: "theorem", targetLabel: "int_e2e_true", targetText: "True is true." },
+    { targetKind: "theorem", targetLabel: "int_push_true", targetText: "True is true." },
+    { targetKind: "theorem", targetLabel: "int_e2e_fails", targetText: "True is true. [stub:fail]" }
+  ];
+  const statusesWith = async (engine) => {
+    // The engine toggle is read per call from the companion's env, so one
+    // live stack can answer as both engines back to back.
+    if (engine) companion.leaState.env.LEA_STATUS_ENGINE = engine;
+    else delete companion.leaState.env.LEA_STATUS_ENGINE;
+    const res = await postJson(`${companionBaseUrl}/statuses`, { overleafProjectId: "itest-doc", targets });
+    assert.equal(res.status, 200);
+    return Object.fromEntries(Object.entries(res.body.statuses).map(([key, info]) => [key, info.status]));
+  };
+
+  try {
+    const legacy = await statusesWith(null);
+    const ledger = await statusesWith("ledger");
+    // The retried-then-restored target (int_retry_true) is deliberately NOT
+    // diffed: after a restore, legacy reports the newest (failed) run while
+    // ledger reports the restored file's validity — a semantic question to
+    // settle before ledger becomes the default.
+    assert.deepEqual(ledger, legacy, "engines disagree on a scripted scenario");
+    assert.equal(ledger["theorem:int_e2e_true"], "formalized");
+    assert.equal(ledger["theorem:int_e2e_fails"], "failed");
+  } finally {
+    delete companion.leaState.env.LEA_STATUS_ENGINE;
+  }
 });

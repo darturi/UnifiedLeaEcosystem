@@ -49,7 +49,7 @@ from lea.interface import (
     run_events,
 )
 
-from .artifacts import classify_lean_artifact
+from .artifacts import classify_lean_artifact, extract_declaration_name
 from .config import LeaConfig, load_config
 from .gitstore import GitStore, GitStoreError
 from . import projects, skills_catalog, store, uploads
@@ -446,6 +446,43 @@ def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | N
     return "\n".join(parts)
 
 
+def _artifact_module_name(namespace: str | None, rel: str) -> str | None:
+    """Lean module for a repo-relative .lean path in a project repo (whose root
+    IS the namespace): `Lea.Project1` + `chapter/decl.lean` → `Lea.Project1.chapter.decl`.
+    None for loose sessions (no stable namespace) and non-.lean files."""
+    if not namespace or not rel.endswith(".lean"):
+        return None
+    return f"{namespace}.{rel[:-len('.lean')].replace('/', '.')}"
+
+
+def _record_run_artifacts(session_id, run_id, project, namespace, repo_key, gs, paths) -> None:
+    """Write the structured artifact index rows for this run's checked files
+    (PLAN-system-hardening 4.1). Only files whose latest step verdict is ok
+    are recorded — a broken write is not an artifact. Best-effort by design:
+    the index is a convenience the companion falls back gracefully without,
+    so failures log rather than fail the run."""
+    for rel in paths:
+        try:
+            step = store.latest_code_step_for_path(session_id, rel)
+            if not step or step.get("check_status") != "ok":
+                continue
+            code = gs.snapshot(repo_key, step["commit_sha"], rel)
+            declaration = extract_declaration_name(code)
+            if not declaration:
+                continue
+            store.upsert_artifact(
+                project_id=project["id"] if project else None,
+                session_id=session_id,
+                run_id=run_id,
+                declaration_name=declaration,
+                kind=step.get("artifact_kind") or classify_lean_artifact(code),
+                path=rel,
+                module_name=_artifact_module_name(namespace, rel),
+            )
+        except Exception:
+            logger.exception("Could not record artifact row for %s in run %s", rel, run_id)
+
+
 def _relativize(path: str, repo: Path) -> str:
     """A code_step's path is relative to the session repo (so `git show <sha>:<path>`
     resolves). The agent writes absolute paths under the per-session workspace
@@ -779,6 +816,10 @@ def run_lea(context: RunnerContext) -> None:
                 # Persist the faithful conversation for the next activation to replay
                 # (multi-turn, D16). Only here, on Finished — an errored run stores none.
                 store.set_run_transcript(run_id, ev.transcript.get("messages", []))
+                # Structured artifact index (4.1): record which declarations this
+                # run's checked files hold, keyed to the run's own FileChanged set.
+                _record_run_artifacts(session_id, run_id, project, namespace,
+                                      repo_key, gs, list(step_id_by_path))
 
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)

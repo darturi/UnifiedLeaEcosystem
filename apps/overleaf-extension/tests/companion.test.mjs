@@ -3477,6 +3477,25 @@ function makeAdapterApiFetch(calls, options = {}) {
         code_steps: []
       });
     }
+    if (String(url).includes("/api/projects/by-slug/") && String(url).endsWith("/artifacts")) {
+      // The structured artifact index (PLAN 4.1/4.2); absent option = adapter
+      // without the index (404) → companion falls back to markdown diffing.
+      return options.artifacts
+        ? jsonResponse(200, { project_id: "adapter-project-1", slug: "project-1", artifacts: options.artifacts })
+        : jsonResponse(404, { detail: "No project" });
+    }
+    if (String(url).includes("/api/projects/by-slug/") && String(url).includes("/target-status")) {
+      // Ledger evidence for the ledger status engine (PLAN 4.4). The option
+      // maps declaration name → entry; unnamed declarations answer
+      // { recorded: false } like the real endpoint.
+      const requested = decodeURIComponent(String(url).split("declarations=")[1] || "").split(",").filter(Boolean);
+      const known = options.targetStatus || {};
+      return jsonResponse(200, {
+        project_id: "adapter-project-1",
+        slug: "project-1",
+        targets: requested.map((name) => known[name] || { declaration_name: name, recorded: false })
+      });
+    }
     if (String(url).endsWith("/interrupt")) {
       return jsonResponse(200, { status: "interrupting" });
     }
@@ -4893,4 +4912,173 @@ test("formalize lifecycle publishes jobs-changed push events (PLAN 3.1)", async 
   const jobsChanged = seen.filter((type) => type === "jobs-changed");
   assert.ok(jobsChanged.length >= 2,
     `expected registration + terminal jobs-changed events, saw ${seen.join(", ")}`);
+});
+
+test("formalize resolves the artifact from the adapter index, no agent markdown needed (PLAN 4.2)", async () => {
+  const leaRepo = await makeLeaRepo();
+  // A located artifact makes resolveProofOutcome run its diagnostics
+  // lean-check — neutralize the spawn like every artifact-locating test.
+  const restorePath = await installFakeLake();
+  try {
+    const proofPath = path.join("workspace", "proofs", "Lea", "Project1", "adapter_index_test.lean");
+    // The agent wrote a valid proof file but never self-registered a markdown
+    // entry — the adapter's structured index is the only identification source.
+    await writeLeaProjectProof(
+      leaRepo,
+      proofPath,
+      "import Mathlib\n\ntheorem adapter_index_test : True := by\n  trivial\n"
+    );
+    const state = await makeState({
+      leaRepoPath: leaRepo,
+      env: { OPENAI_API_KEY: "test-key" },
+      fetchImpl: makeAdapterApiFetch([], {
+        projectNamespace: "Lea.Project1",
+        artifacts: [{
+          run_id: "api-run-1",
+          declaration_name: "adapter_index_test",
+          kind: "proof",
+          path: "adapter_index_test.lean",
+          module_name: "Lea.Project1.adapter_index_test"
+        }]
+      })
+    });
+
+    const result = await handleFormalize({
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "adapter_index_test",
+      targetText: "A theorem."
+    }, state);
+    assert.equal(result.statusCode, 200);
+    await waitFor(() => state.jobs[result.body.jobId]?.status === "formalized");
+
+    const job = state.jobs[result.body.jobId];
+    assert.equal(job.declarationName, "adapter_index_test");
+    assert.equal(job.recordedProofPath, "workspace/proofs/Lea/Project1/adapter_index_test.lean");
+    assert.equal(job.moduleName, "Lea.Project1.adapter_index_test");
+
+    // The registry markdown got a consistency entry (until 4.3 demotes it to a
+    // view, markdown-dependent readers still need one).
+    const markdown = await fs.readFile(
+      buildLeaProjectMarkdownPath({ leaRepoPath: leaRepo, overleafProjectId: "project-1" }),
+      "utf8"
+    );
+    assert.match(markdown, /lea:theorem name="adapter_index_test"/);
+
+    const log = await fs.readFile(job.logPath, "utf8");
+    assert.match(log, /Artifact resolved from the adapter index/);
+  } finally {
+    restorePath();
+  }
+});
+
+// --- ledger status engine (PLAN 4.4, LEA_STATUS_ENGINE=ledger) ---------------
+// Two sources only: the adapter's per-declaration ledger evidence + the
+// companion's job overlay. No markdown parsing, no direct-FS regex probes.
+
+function ledgerEntry(name, overrides = {}) {
+  return {
+    declaration_name: name,
+    recorded: true,
+    path: `${name}.lean`,
+    module_name: `Lea.Project1.${name}`,
+    kind: "proof",
+    exists: true,
+    declaration_present: true,
+    has_sorry: false,
+    check_status: "ok",
+    check_detail: null,
+    check_author: "agent",
+    content: `import Mathlib\n\ntheorem ${name} : True := by\n  trivial\n`,
+    ...overrides
+  };
+}
+
+async function makeLedgerState(targetStatus, overrides = {}) {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key", LEA_STATUS_ENGINE: "ledger" },
+    fetchImpl: makeAdapterApiFetch([], { targetStatus }),
+    ...overrides
+  });
+  return { state, leaRepo };
+}
+
+async function ledgerStatusFor(state, targetLabel) {
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{ targetKind: "theorem", targetLabel, targetText: "A theorem." }]
+  }, state);
+  assert.equal(statuses.statusCode, 200);
+  return statuses.body.statuses[`theorem:${targetLabel}`];
+}
+
+test("ledger engine: recorded + clean check reads formalized with the lean statement", async () => {
+  const { state } = await makeLedgerState({ ledger_ok: ledgerEntry("ledger_ok") });
+  const info = await ledgerStatusFor(state, "ledger_ok");
+  assert.equal(info.status, "formalized");
+  assert.equal(info.resultKind, "proved");
+  assert.equal(info.recordedProofPath, "workspace/proofs/Lea/Project1/ledger_ok.lean");
+  assert.match(info.leanStatement || "", /theorem ledger_ok/);
+});
+
+test("ledger engine: a sorry in the recorded file reads sorry_stub", async () => {
+  const { state } = await makeLedgerState({
+    ledger_sorry: ledgerEntry("ledger_sorry", {
+      has_sorry: true,
+      content: "theorem ledger_sorry : True := by\n  sorry\n"
+    })
+  });
+  const info = await ledgerStatusFor(state, "ledger_sorry");
+  assert.equal(info.status, "sorry_stub");
+});
+
+test("ledger engine: an error check verdict on the recorded file reads broken", async () => {
+  const { state } = await makeLedgerState({
+    ledger_broken: ledgerEntry("ledger_broken", { check_status: "error", check_detail: "type mismatch" })
+  });
+  const info = await ledgerStatusFor(state, "ledger_broken");
+  assert.equal(info.status, "failed");
+  assert.equal(info.effectiveStatus, "unformalized");
+  assert.match(info.message || "", /type mismatch/);
+});
+
+test("ledger engine: index-known-gone artifact ignores a stale formalized job and reads failed from the overlay", async () => {
+  const { state, leaRepo } = await makeLedgerState({
+    ledger_retired: ledgerEntry("ledger_retired", { exists: false, has_sorry: null, content: null })
+  });
+  const logPath = path.join(path.dirname(state.jobsPath), "ledger-retired.log");
+  await fs.writeFile(logPath, "old formalize\n", "utf8");
+  state.jobs.stale_formalized = {
+    jobId: "stale_formalized", jobKey: "project-1:theorem:ledger_retired", status: "formalized",
+    targetKind: "theorem", targetLabel: "ledger_retired", declarationName: "ledger_retired",
+    overleafProjectId: "project-1", projectSlug: "project-1", logPath,
+    leaRepoPath: leaRepo, startedAt: "2026-01-01T00:00:00.000Z", finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+  state.jobs.newer_failed = {
+    jobId: "newer_failed", jobKey: "project-1:theorem:ledger_retired", status: "failed",
+    targetKind: "theorem", targetLabel: "ledger_retired", declarationName: "ledger_retired",
+    overleafProjectId: "project-1", projectSlug: "project-1", logPath, error: "retry failed",
+    leaRepoPath: leaRepo, startedAt: "2026-01-02T00:00:00.000Z", finishedAt: "2026-01-02T00:00:01.000Z"
+  };
+  const info = await ledgerStatusFor(state, "ledger_retired");
+  assert.equal(info.status, "failed");
+  assert.match(info.logTail || "", /old formalize/);
+});
+
+test("ledger engine: unrecorded declaration with no jobs reads unformalized; a formalized job wins index ignorance", async () => {
+  const { state, leaRepo } = await makeLedgerState({});
+  const empty = await ledgerStatusFor(state, "ledger_unknown");
+  assert.equal(empty.status, "unformalized");
+
+  state.jobs.pre_index = {
+    jobId: "pre_index", jobKey: "project-1:theorem:ledger_preindex", status: "formalized",
+    targetKind: "theorem", targetLabel: "ledger_preindex", declarationName: "ledger_preindex",
+    overleafProjectId: "project-1", projectSlug: "project-1",
+    leaRepoPath: leaRepo, startedAt: "2026-01-01T00:00:00.000Z", finishedAt: "2026-01-01T00:00:01.000Z"
+  };
+  const preIndex = await ledgerStatusFor(state, "ledger_preindex");
+  assert.equal(preIndex.status, "formalized",
+    "an index that never saw the declaration defers to the job record");
 });
