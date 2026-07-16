@@ -120,13 +120,15 @@
   </div>
 
   <div class="bar"><i style="width:4%"></i></div>
-  <div class="counts"><b>1 / 25 built · 1 / 25 tested</b> · 13 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
+  <div class="counts"><b>1 / 26 built · 1 / 26 tested</b> · 14 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
     <b>1 is landed and green</b> (10/10 runs fail on <code>main</code>, 5/5 pass with the fix, full 290-test suite
-    green). <b>Item count dropped 27 → 25:</b> the old 2 + 3 + 23 collapsed into the new <b>2</b> — measurement showed
-    the git lock and the path-scoped <code>add</code> are one change, and that <i>either half alone is worse than
-    today</i>, which removed the case for a partial git fix and opened the case for removing git as the store at all.
-    <b>Next: 2</b> — SQL owns content, git becomes transport. Every concurrency test here is <b>written to fail on
-    <code>main</code> first</b>; that's the evidence these hazards are real, not theoretical.</div>
+    green). <b>27 → 25 → 26:</b> the old 2 + 3 + 23 collapsed into the new <b>2</b> (measurement showed the git lock
+    and the path-scoped <code>add</code> are one change, and that <i>either half alone is worse than today</i> — which
+    removed the case for a partial git fix and opened the case for dropping git as the store); then <b>3</b> was added
+    back for migrations, which item 2 forces by making the DB non-disposable. <b>Next: 3 → 2</b> (3 blocks 2 — no
+    schema change without a migration path now that SQL holds the only copy). Every concurrency test here is
+    <b>written to fail on <code>main</code> first</b>; that's the evidence these hazards are real, not theoretical.
+    <b>🔴 One open call blocks 2's schema</b> — see C4 counter ownership above.</div>
 
   <div class="legend">
     <span><i class="dot d-unplanned"></i> Needs a design pass</span>
@@ -157,6 +159,25 @@
     item 2:</b> this used to read "per-repo lock + path-scoped <code>git add</code>" — measurement killed that. The
     shared dir stays (Lean requires it) but it stops being a <i>repo</i>: it becomes a re-materializable cache, and
     ordering moves to SQL, which has real transactions.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>🔴 OPEN CALL: C4's shared counter is <i>unenforceable</i> — who should own <code>seq</code>?</b>
+    <span class="fix">Item 1 fixed the race, but the guarantee still rests on <b>transaction discipline</b>, which is
+    the same class of thing as the false docstring that caused it: a rule nothing checks. The schema-level answer is
+    <code>UNIQUE(session_id, seq)</code> — and <b>it cannot be written</b>. <code>seq</code> is shared across
+    <i>two</i> tables (<code>code_steps</code> + <code>messages</code>); a unique index on each catches intra-table
+    duplicates and <b>misses the cross-table collision entirely</b> — a message and a code_step can still take the same
+    seq. That is exactly the case <code>test_concurrent_mixed_writers</code> exercises (a run narrating while it
+    writes), i.e. the real shape, not a corner. No SQL constraint spans two tables.</span>
+    <b>The fix is for one table to own the counter</b> — a small allocation table both FK into, or the generic timeline
+    table the STORAGE doc considered and rejected. <b>Item 2 is the moment</b>: it already rewrites
+    <code>code_steps</code>, and the live DB is <b>clean right now (0 duplicate pairs / 114 rows</b>, since everything
+    so far ran under cap-1<b>)</b> — a constraint applies free today and gets expensive the moment 16 flips the cap.
+    <b>Two sub-decisions</b>: (a) <code>BEGIN IMMEDIATE</code>/<code>busy_timeout</code> are SQLite-only and do
+    <b>not</b> port — under Postgres MVCC this needs a sequence, <code>SELECT … FOR UPDATE</code>, or unique+retry, so
+    the constraint is the <i>portable</i> half of the guarantee and the transaction discipline is not. (b) <b>Is
+    gapless required, or only total order?</b> The merge needs an order; contiguity may be incidental —
+    <code>test_db_seq_concurrent</code> asserting <code>1..N</code> may be over-specifying, and it matters because
+    Postgres sequences have gaps <i>by design</i> (rollbacks don't reclaim). <b>Undecided — owner's call.</b>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>⚠️ Cross-phase ordering: 12 must land before 16.</b> <span class="fix">Item 2 stores <i>one</i> blob pointer per
     step and computes "before" as the previous step's after. That inference is sound <b>only while a lock guarantees
@@ -348,6 +369,65 @@
         becomes false, not later. <b>Flag on the STORAGE doc's schema:</b> its proposed <code>patch, additions,
         deletions</code> columns are <i>derived</i> from the before/after blobs — either compute on read or label them a
         cache explicitly, or it's <code>_next_seq</code> again (a comment asserting what nothing enforces).</div>
+    </div>
+    <div class="todo is-planned">
+      <div class="top"><span class="id">3</span><span class="title">Migrations — the DB stops being disposable</span>
+        <span class="tag be">adapter</span><span class="badge b-planned">Planned · blocks 2</span></div>
+      <div class="scope"><b>Item 2 kills a documented policy, so it has to be replaced in the same breath.</b>
+        <code>db.py</code> states it outright: <i>"No in-place ALTER migrations anywhere: v2 is a clean rebuild (no
+        backward compat — <b>single user, disposable/rebuildable DB</b>) … a schema change means a fresh DB
+        (<code>npm run reset:local</code>), not a migration."</i> <span class="fix">That policy is <b>predicated on git
+        owning the content</b> — the DB was disposable precisely <i>because</i> it was only an index. Once SQL holds
+        the only copy of every proof, "just reset it" stops meaning "rebuild the index" and starts meaning "delete the
+        user's work."</span> Same shape as the <code>CLAUDE.md</code> invariant: the premise dies in the commit that
+        moves content, so the policy changes there too — not later.
+        <b>Knock-on:</b> <code>scripts/reset-local-state.mjs:91</code> deletes <code>*.sqlite3</code> by glob. Harmless
+        today; destroys proofs after 2. Its semantics must change in the same PR.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Decision: Alembic</b> — and <i>not</i> for the usual reason. Autogenerate needs SQLAlchemy models; this
+        codebase is raw <code>sqlite3</code> with none, so <b>every migration is hand-written under any tool</b> and
+        Alembic's headline feature is unused. <span class="fix">It wins on <code>batch_alter_table</code>: SQLite
+        cannot alter a column's constraints, and item 2 needs exactly that
+        (<code>code_steps.commit_sha</code> is <code>not null</code> and must go; <code>after_blob_id</code> must
+        <i>become</i> <code>not null</code> after backfill). The only route is the 12-step rebuild — create/copy/drop/
+        rename + recreate every index and FK. Hand-writing it is high-risk here because <code>foreign_keys</code> is
+        OFF and <code>delete_project_cascade</code>'s cascades are manual, so a botched rebuild fails <b>silently</b>.
+        Alembic implements it; yoyo doesn't.</span>
+        <b>Runners-up and why not:</b> <i>yoyo</i> — lighter, raw SQL, fits the style, no ORM; loses only on the
+        rebuild, and would win if we knew we'd never leave SQLite. <i>Flyway/Liquibase</i> (JVM), <i>dbmate/Atlas/
+        golang-migrate</i> (per-platform Go binary) — all add a toolchain to an <code>install.sh</code> that already
+        provisions uv + elan + multi-GB Mathlib. Alembic rides the existing <code>uv</code> venv. <i>Prisma/Drizzle</i>
+        — nothing in Node touches this DB.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Probed, not assumed — one of these would have shipped broken.</b>
+        <table style="border-collapse:collapse;margin:8px 0;font-size:12px">
+          <tr><td style="padding:1px 12px 1px 0"><code>executescript()</code> inside <code>BEGIN IMMEDIATE</code></td>
+            <td>⚠️ <b>commits early</b> — <code>in_transaction</code> True→False, rollback then errors
+              <i>"no transaction is active"</i>, row survives. <b>Migrations are not atomic if written the obvious
+              way.</b></td></tr>
+          <tr><td style="padding:1px 12px 1px 0"><code>execute()</code> per statement</td><td>atomic ✓</td></tr>
+          <tr><td style="padding:1px 12px 1px 0">DDL in a txn</td>
+            <td>transactional ✓ — a migration dying mid-way rolls back <code>alter</code> <i>and</i>
+              <code>create</code>; no partial schema</td></tr>
+          <tr><td style="padding:1px 12px 1px 0">8 concurrent <code>migrate()</code></td>
+            <td>exactly-once ✓ under <code>BEGIN IMMEDIATE</code> + check-then-apply</td></tr>
+        </table>
+        <b>Verify against Alembic, don't assume it inherits this:</b> it needs <code>transaction_per_migration</code>
+        (<b>off by default</b>), and the DDL-rollback + concurrent-startup properties get a test — the harness exists.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Baseline = revision 1, one path for everyone.</b> The live DB has <b>8 sessions / 32 code_steps at
+        <code>user_version=0</code></b>, so <code>alembic stamp</code> won't do: revision 1 is today's frozen
+        <code>create table if not exists</code> schema, which no-ops on the existing DB and builds a fresh one. A fresh
+        DB then walks the <i>same</i> revisions as a year-old one and can't drift. The baseline is frozen — never edit
+        it to add a column.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Which world we're in (this is why the tool matters less than it looks).</b> (1) SQLite local + Postgres prod
+        <i>forever</i> = every migration dual-dialect, permanently. (2) <b>SQLite now, one-time cutover</b> — squash to
+        a fresh Postgres baseline, port data once; the SQLite revision history is <b>retired, not ported</b>.
+        (3) Postgres everywhere now = a DB daemon in the local path of a project whose pitch is
+        <code>docker compose up</code>. <span class="fix">We're in <b>2</b> — so Postgres-readiness does <i>not</i>
+        come from the tool. It comes from not baking SQLite-only semantics into the schema's guarantees. See the C4
+        open call above.</span></div>
     </div>
     <div class="todo">
       <div class="top"><span class="id">4</span><span class="title">Fix the lock leak (setup outside the <code>try:</code>)</span>
