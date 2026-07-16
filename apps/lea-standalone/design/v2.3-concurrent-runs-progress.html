@@ -158,6 +158,13 @@
     shared dir stays (Lean requires it) but it stops being a <i>repo</i>: it becomes a re-materializable cache, and
     ordering moves to SQL, which has real transactions.</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>⚠️ Cross-phase ordering: 12 must land before 16.</b> <span class="fix">Item 2 stores <i>one</i> blob pointer per
+    step and computes "before" as the previous step's after. That inference is sound <b>only while a lock guarantees
+    one writer per path</b> — today's global cap-1 lock covers it, and item 12's path locks replace that. Item 16 flips
+    the cap. If 16 lands before 12 there is a window with <i>neither</i> lock, and every diff in the system silently
+    becomes wrong (before = someone else's write). This is the one ordering constraint that isn't self-evident from
+    the phase numbers.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>SQL is now the sole source of truth — so its concurrency correctness is load-bearing, not one item of 25.</b>
     <span class="fix">Item 1 is the foundation everything else stands on. Corollary from its measurement: <b>WAL must
     never be enabled before a read-modify-write is inside <code>db.write()</code></b> — added alone it makes silent
@@ -258,6 +265,61 @@
         <b>We never used git as git.</b> No branch, no merge, no rebase — only content-addressing, <code>show</code>,
         and <code>diff</code>. sha256 + a blob table + <code>difflib</code> cover all three, with no subprocess per
         write and no repo-wide index mutex.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Schema — <i>one</i> pointer per step, not two.</b>
+        <code>artifact_blobs(id, sha256 unique, content, created_at)</code> +
+        <code>code_steps.after_blob_id</code>. "Before" is the previous step's <code>after_blob_id</code> for that
+        path, <b>computed on read</b>; the first step's before is null (the file didn't exist). <b>This overrides
+        <code>docs/STORAGE-code-steps-vs-timeline.md</code></b>, which proposes
+        <code>before_blob_id</code>+<code>after_blob_id</code> — see the next two boxes for why that doesn't transfer.
+        The write path <i>shrinks</i>: <code>read → sha256 → insert → emit</code> replaces four git subprocesses
+        (<code>add</code>, <code>diff --cached</code>, <code>commit</code>, <code>rev-parse</code>). Blobs dedupe by
+        sha256, so an unchanged file across steps costs one row, not N.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Capture rule: blob on <code>FileChanged</code>, read from disk. No new mechanism needed.</b>
+        <code>events.py:56</code> already states the contract — FileChanged carries <i>"<code>path</code> only; the
+        bytes are read from disk / <code>git show</code> (filesystem-canonical, D3/D8), never shipped in the event"</i>
+        — and <code>bridge.py:478</code> already reads the content back (via <code>gs.snapshot</code>) purely to stream
+        it. So this is a <b>substitution</b>, not an addition, and it needs <b>zero prover changes</b>: D17 means the
+        adapter never decodes <i>which</i> of the two write tools ran. <b>Rejected alternative:</b> a whole-dir hash
+        scan at step end (opencode-style completeness) — unnecessary once the two points below hold.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Why one pointer is sound — and the exact condition it depends on.</b> opencode stores <b>both</b>
+        endpoints (<code>snapshot:{start,end}</code>, <code>packages/schema/src/session-message.ts:171-175</code>)
+        because <code>start</code> is an <b>observed tree scan</b> and they have <i>no ownership model</i> — an
+        unlocked tree can drift under them, so both ends must be observed. <span class="fix">We capture on an event
+        under a lock instead: with only one writer per path, the previous blob <b>provably is</b> the disk content
+        immediately before this write (handlers run sequentially, <code>agent.py:729</code>), so an observed "before"
+        would be derived state twice over.</span> <b>The invariant: item 2's inference is sound only while a lock
+        guarantees one writer per path — today's global cap-1 lock, or item 12's path locks. It must never be
+        neither, so 12 lands before 16 flips the cap.</b> (OpenHands sits at the opposite extreme: full
+        <code>old_content</code>+<code>new_content</code> inline per edit,
+        <code>file_editor/definition.py:69-89</code> — ~2 whole copies of the file per edit, diff recomputed at render
+        time, and their reconstruction path is <i>latent but unimplemented</i>. Neither extreme is ours.)
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Do NOT observe "before" at <code>ToolCalled</code> — it is a batching trap.</b> It <i>looks</i> safe:
+        <code>ToolCalled</code> is yielded at <code>agent.py:600</code>, the handler doesn't run until
+        <code>:729</code>, and because <code>run_events</code> is a generator the adapter's read at that yield is
+        guaranteed to precede the write (genuinely unlike opencode, whose hook fires but whose AI SDK runs the tool
+        first). <span class="fix">But a turn's ToolCalls are <b>all</b> emitted during the streaming loop before
+        <i>any</i> handler runs — <code>ToolCalled(A), ToolCalled(B), handler(A), handler(B)</code>. If A and B touch
+        one path, B's "before" was read before A's write landed. That is opencode's empty-diff race in a different
+        costume.</span> This is the surviving form of old item 23's capture-point rule.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Close the <code>bash</code> hole via <code>CheckResult</code> — it's a live bug already.</b> The prover's
+        <code>bash</code> tool is <i>explicitly</i> told to do <i>"file I/O outside the dedicated tools"</i>
+        (<code>tools.py</code> description, echoed at <code>prompt.py:95</code>), and
+        <code>FileChanged</code> fires <b>only</b> for <code>write_file</code>/<code>edit_file</code>, only on
+        <code>.lean</code>, only on success (<code>agent.py:260-266</code>). So a bash-created file emits no event.
+        <span class="fix">Today <code>bridge.py:483</code> does <code>if step_id:</code> — <b>a bash-created file that
+        compiles fine has its verdict silently dropped</b>: no code_step, invisible in canvas and timeline. Fix: when
+        <code>CheckResult</code> (which carries a path, <code>events.py:66</code>) arrives with no step for that path,
+        blob the file and create the step, attributed <code>out-of-band</code>.</span> Bounded by design: a
+        bash-written <code>.lean</code> nobody compiles is dead weight. Note this is a <i>coverage</i> hole, not a
+        concurrency one — <b>resource locks are a declaration, not a sandbox</b>; nothing stops bash writing an
+        undeclared path. Still far smaller than <code>add -A</code>, which contaminates by design rather than by
+        misbehavior. <b>Accepted:</b> if bash edits a file that a later <code>edit_file</code> touches, the content is
+        still correct (we read disk), only the <i>attribution</i> blurs — bash's change folds into that tool's diff.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Carve-outs — this is "demote", not "delete".</b>
         <b>(a) Lean needs real files on disk</b> (<code>lean_check</code> compiles <code>workspace/proofs/…</code>;
@@ -562,7 +624,10 @@
         comes back empty. We're immune <b>only by construction</b> — we capture on the prover's explicit
         <code>FileChanged</code> event, an actual write, not a lifecycle guess. That property must survive the move to
         blobs: <b>write a blob on <code>FileChanged</code>, never on a turn/step boundary.</b> Nothing in the schema
-        enforces it, so it's a review rule.</div>
+        enforces it, so it's a review rule.
+        <b>Sharpened in item 2:</b> the same race reappears if you try to read an observed "before" at
+        <code>ToolCalled</code> — a turn's tool calls are all announced before any handler runs, so two calls on one
+        path give the second a stale before. Item 2 carries the worked example.</div>
     </div>
     <div class="todo is-planned">
       <div class="top"><span class="id fe">24</span><span class="title">Sub-agents in the UI — <a href="mock-subagents-sidebar.html" style="color:var(--accent)">live mock ↗</a></span>
