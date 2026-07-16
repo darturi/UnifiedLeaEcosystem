@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="refresh" content="8" />
+<title>LeaUI v2.3 — Concurrent Runs → Subagents</title>
+<style>
+  :root {
+    --bg: #f5f4ef; --panel: #fffefb; --ink: #2a2724; --muted: #8a847c;
+    --line: #e6e2da; --accent: #c96442; --green: #4f8a5b; --red: #c0564a;
+    --amber: #b8842a; --blue: #4a6fa5; --violet: #7a5a9a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: 32px 0 80px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+  header { margin-bottom: 8px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .intro { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 16px; margin: 18px 0 8px; font-size: 13px; color: #4a463f; }
+  .intro b { color: var(--ink); }
+  .danger { background: #fbeeec; border: 1px solid #ecc9c2; border-left: 3px solid var(--red);
+    border-radius: 10px; padding: 12px 16px; margin: 14px 0 8px; font-size: 12.5px; color: #6a3a32; }
+  .danger h3 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--red); }
+  .danger b { color: var(--ink); }
+  .gaps { background: #fbf4e6; border: 1px solid #ecdcbb; border-left: 3px solid var(--amber);
+    border-radius: 10px; padding: 12px 16px; margin: 14px 0 26px; font-size: 12.5px; color: #5a4a2a; }
+  .gaps h3 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--amber); }
+  .gaps b { color: var(--ink); }
+  .gaps .fix { color: #7a6a44; }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 18px 0 6px; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+  .counts { color: var(--muted); font-size: 12.5px; margin-bottom: 26px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 14px 0 28px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 99px; display: inline-block; }
+  .d-queued { background: #cdc8be; } .d-planned { background: var(--amber); }
+  .d-prog { background: var(--blue); } .d-tested { background: #7aa37f; } .d-done { background: var(--green); }
+  .d-unplanned { background: #b79ad0; }
+
+  .group { margin-bottom: 30px; }
+  .group > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    margin: 0 0 4px; font-weight: 600; }
+  .group > .ghint { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+
+  .todo { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 15px; margin-bottom: 9px; }
+  .todo.is-planned { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(184,132,42,.15); }
+  .todo.is-tested { border-color: var(--green); box-shadow: 0 0 0 1px rgba(79,138,91,.15); }
+  .todo.is-dropped { opacity: .62; background: var(--bg); }
+  .todo.is-dropped .title s { text-decoration-thickness: 1px; }
+  .todo.is-done { opacity: .62; }
+  .todo .top { display: flex; align-items: center; gap: 10px; }
+  .id { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px; min-width: 26px;
+    text-align: center; }
+  .id.fe { color: var(--accent); border-color: #e7cabd; background: #fbf1ec; }
+  .id.sub { color: var(--violet); border-color: #d8c8e6; background: #f5eef9; }
+  .title { font-weight: 550; flex: 1; }
+  .tag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+    padding: 1px 7px; border-radius: 99px; }
+  .tag.be { background: #eef0ec; color: #6a7d63; }
+  .tag.fe { background: #fbf1ec; color: var(--accent); }
+  .tag.prover { background: #eceef4; color: #5a6a8a; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 99px; white-space: nowrap; }
+  .b-queued { background: #efece6; color: #8a847c; }
+  .b-planned { background: #f7ecd6; color: var(--amber); }
+  .b-prog { background: #e4ecf6; color: var(--blue); }
+  .b-tested { background: #e2efe4; color: #5a8a62; }
+  .b-done { background: #dcefe1; color: var(--green); }
+  .b-unplanned { background: #efe7f3; color: #7a5a9a; }
+  .b-dropped { background: #ecebe8; color: #8a847c; text-decoration: none; }
+  .scope { color: var(--muted); font-size: 13px; margin: 6px 0 0 0; }
+  .haz { display: inline-block; font: 600 10.5px ui-monospace, monospace; color: var(--red);
+    background: #fbeeec; border: 1px solid #ecc9c2; border-radius: 5px; padding: 0 5px; margin-right: 4px; }
+  code { background: #f0ede6; border-radius: 4px; padding: 1px 5px; font: 12px ui-monospace, monospace; }
+  footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LeaUI v2.3 — Concurrent Runs → Subagents</h1>
+    <div class="sub">Live progress · design <code>v2.3-concurrent-runs-architecture.md</code> ·
+      proposal <code>PROPOSAL-subagents.md</code> · make the shared resources safe, raise the concurrency cap,
+      then let one run spawn many · auto-refreshes every 8s</div>
+  </header>
+
+  <div class="intro">
+    <b>Where this ends up:</b> a coordinator run that spawns specialist child runs — three proof attempts on the same
+    hard lemma in parallel, each in a clean context, first one that compiles wins. <b>Where it starts:</b> today the
+    second chat dies with <code>409 "Another Lea run is already active."</code> (<code>routes/runs.py:180</code>) — the
+    visible edge of a global mutex in <code>bridge.py:62</code> whose comment is the system's entire safety argument:
+    <i>"they share the on-disk workspace and the warm LSP daemon."</i> <b>Both halves are load-bearing.</b> Subagents
+    are just concurrent runs with a parent, so <b>every hazard below is a subagent hazard too</b> — that's why the
+    substrate comes first. <b>Build rhythm:</b> plan → your input → build + tests → tested → done.
+  </div>
+
+  <div class="danger">
+    <h3>What the lock is hiding — the wrong-answer tier</h3>
+    <b>The Lean daemon returns another session's verdict.</b> All sessions share one
+    <code>LeanDaemon</code>. <code>check_via_lsp</code> holds <code>_lock</code> only for the registry lookup —
+    <code>d.check()</code> (<code>lsp_daemon.py:283</code>) runs <b>outside it</b>, destructively purging one shared
+    queue (<code>:109-114</code>) and <b>dropping</b> messages for other URIs (<code>:147-172</code>). Different
+    files → mutual starvation → 900s timeout → silent 88s cold fallback. <b>Same file → thread A returns a verdict
+    computed from thread B's content</b> → a false <b>"Proved."</b>
+    <hr style="border:none;border-top:1px solid #ecc9c2;margin:11px 0">
+    <b>SafeVerify cross-contaminates.</b> <code>interface.py:131-152</code> keys scratch files by <b>file stem</b> in
+    one shared dir and unlinks in a <code>finally</code>. Two sessions on <code>Div6.lean</code> verify <b>A's
+    submission against B's target</b> — a wrong <code>ok</code>/<code>rejected</code> on the strongest claim the
+    system makes.
+    <hr style="border:none;border-top:1px solid #ecc9c2;margin:11px 0">
+    <b>The agent is told a peer's theorem is "the human's edit".</b> <code>bridge.py:238</code> diffs the
+    <b>whole repo</b>; project sessions share one. A peer's commit is handed to the next run prefixed <i>"The human
+    edited the proof files since your last turn."</i>
+  </div>
+
+  <div class="bar"><i style="width:4%"></i></div>
+  <div class="counts"><b>1 / 25 built · 1 / 25 tested</b> · 13 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
+    <b>1 is landed and green</b> (10/10 runs fail on <code>main</code>, 5/5 pass with the fix, full 290-test suite
+    green). <b>Item count dropped 27 → 25:</b> the old 2 + 3 + 23 collapsed into the new <b>2</b> — measurement showed
+    the git lock and the path-scoped <code>add</code> are one change, and that <i>either half alone is worse than
+    today</i>, which removed the case for a partial git fix and opened the case for removing git as the store at all.
+    <b>Next: 2</b> — SQL owns content, git becomes transport. Every concurrency test here is <b>written to fail on
+    <code>main</code> first</b>; that's the evidence these hazards are real, not theoretical.</div>
+
+  <div class="legend">
+    <span><i class="dot d-unplanned"></i> Needs a design pass</span>
+    <span><i class="dot d-queued"></i> Queued</span>
+    <span><i class="dot d-planned"></i> Planned (next)</span>
+    <span><i class="dot d-prog"></i> Built (not yet confirmed)</span>
+    <span><i class="dot d-tested"></i> Tested ✓</span>
+    <span style="margin-left:auto"><span class="tag be">adapter</span> &nbsp; <span class="tag prover">prover</span>
+      &nbsp; <span class="tag fe">frontend</span></span>
+  </div>
+
+  <div class="gaps">
+    <h3>Design assumptions &amp; open calls</h3>
+    <b>Lean already solved the concurrency problem.</b> Lean's server is a watchdog with <b>one file-worker process
+    per open file</b>, explicitly designed for concurrent requests. Every real LSP client dispatches by JSON-RPC
+    <code>id</code> and <code>uri</code>. <span class="fix">Lea's daemon simply isn't one — it's a synchronous shim.
+    So the rewrite is a <i>correction</i>, not a novel design, and it keeps <b>one</b> resident Mathlib.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Keep the 409 — redefine it as "at capacity".</b> The Overleaf companion <b>already fires runs concurrently</b>
+    and <b>uses the 409 as its queue</b> (<code>leaApiClient.mjs:564-633</code>). <span class="fix">So: zero companion
+    changes, and <code>npm test -w apps/overleaf-extension</code> staying green <i>without modification</i> is the
+    proof we got it right. Removing the 409 without admission control would be <b>worse than today</b> — a 20-theorem
+    doc would fire 20 simultaneous prover runs.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Concurrency inside one project directory is allowed.</b> <span class="fix">Serializing per project = the status
+    quo with extra steps (all N theorems of one Overleaf doc live in one project). Worktrees and per-session subdirs
+    both break Lean's <code>srcDir := "proofs"</code> module resolution. So: shared dir, different files. <b>Updated by
+    item 2:</b> this used to read "per-repo lock + path-scoped <code>git add</code>" — measurement killed that. The
+    shared dir stays (Lean requires it) but it stops being a <i>repo</i>: it becomes a re-materializable cache, and
+    ordering moves to SQL, which has real transactions.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>SQL is now the sole source of truth — so its concurrency correctness is load-bearing, not one item of 25.</b>
+    <span class="fix">Item 1 is the foundation everything else stands on. Corollary from its measurement: <b>WAL must
+    never be enabled before a read-modify-write is inside <code>db.write()</code></b> — added alone it makes silent
+    seq duplication <i>worse</i> (~110 → ~155 per 200), and it's exactly the kind of change that looks like a harmless
+    perf tweak.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Subagent prompts <i>compose</i> the Lean core — they never replace it.</b> opencode swaps the whole system
+    prompt per agent; we can't. <span class="fix">Every child must keep the hard rules (never modify a theorem
+    statement, no <code>sorry</code>/<code>axiom</code>/<code>native_decide</code>). A replaced prompt could let a
+    proof-candidate quietly prove a <i>weakened</i> statement — the exact cheat SafeVerify exists to catch.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Deferred on purpose:</b> per-subagent token/cost accounting and budget UI. <span class="fix">Depth and step
+    caps stay (they're runaway guards, not accounting). Cost reporting is a reporting problem we can solve once the
+    functionality exists — it isn't on the critical path and it isn't what makes this correct.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>⚠️ Phase 5 is mandatory before Phase 6.</b> <code>useProofStream.ts:283-302</code> re-attaches on
+    <code>onerror</code> with <b>no backoff and no cap</b>, and a browser <code>EventSource</code> can't read a 409
+    status. <span class="fix">The moment the server can 409, that's an unthrottled request storm.</span>
+  </div>
+
+  <!-- ============ PHASE 0 ============ -->
+  <div class="group">
+    <h2>Phase 0 · Concurrency-safe substrate &nbsp;·&nbsp; behavior-neutral</h2>
+    <div class="ghint">Harden the shared state <b>while the global lock is still in place</b>, so nothing can
+      regress. No API surface, no user-visible change. If you want an even smaller first PR: <b>1 + 2 only</b>.</div>
+
+    <div class="todo is-tested">
+      <div class="top"><span class="id">1</span><span class="title">SQLite: <code>db.write()</code> — explicit <code>BEGIN IMMEDIATE</code></span>
+        <span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><code>store._next_seq</code> does SELECT-max+1-then-INSERT, and its docstring asserted the
+        safety argument: <i>"Runs on the insert's own connection, so the read+write are atomic under SQLite's
+        single-writer lock."</i> <b>That is false.</b> Python's <code>sqlite3</code> at its default
+        <code>isolation_level=""</code> opens a transaction before INSERT/UPDATE/DELETE but <b>not before SELECT</b> —
+        the SELECT runs in <b>autocommit</b>, holds no lock, and the read+write are not atomic. The failure is
+        <b>silent</b> (not <code>database is locked</code>) and it corrupts the one thing <code>seq</code> exists for:
+        the <code>ORDER BY seq</code> merge, and the <i>latest</i>-code_step lookup that session status derives from.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Measured</b>, 8 threads × 25 inserts = 200, mirroring <code>db.py</code> exactly (deferred, rollback
+        journal, and the <code>busy_timeout=5000</code> that <code>sqlite3.connect(timeout=5.0)</code> already applies
+        by default):
+        <table style="border-collapse:collapse;margin:8px 0;font-size:12px">
+          <tr><td style="padding:1px 12px 1px 0">baseline (= <code>main</code>)</td><td>0 errors</td>
+            <td><b>99–119 duplicate seqs</b></td><td>silent</td></tr>
+          <tr><td style="padding:1px 12px 1px 0">+ WAL only</td><td>0 errors</td>
+            <td><b>151–158 duplicates</b></td><td>⚠️ <b>worse</b></td></tr>
+          <tr><td style="padding:1px 12px 1px 0">explicit deferred <code>BEGIN</code></td><td>~145/200 lost</td>
+            <td>0 duplicates</td><td>loud, instant</td></tr>
+          <tr><td style="padding:1px 12px 1px 0"><code>BEGIN IMMEDIATE</code>, <code>busy_timeout=0</code></td>
+            <td>~182/200 lost</td><td>0 duplicates</td><td>loud</td></tr>
+          <tr><td style="padding:1px 12px 1px 0"><b><code>BEGIN IMMEDIATE</code> + <code>busy_timeout</code></b></td>
+            <td><b>0 errors</b></td><td><b>200/200, contiguous 1..N</b></td><td>✓</td></tr>
+        </table>
+        <b>Two corrections to the original plan, both from measurement.</b> <b>(a) WAL is not part of the fix</b> — the
+        fix passes identically under the rollback journal, and WAL added <i>alone</i> to today's code pushes duplicates
+        from ~110 to ~155, because it admits more concurrency and widens the race. It's an orthogonal throughput change
+        and was dropped from this PR; <code>db._open</code> now carries a comment saying it must never land before the
+        read-modify-writes move to <code>write()</code>. <b>(b) It must be <code>BEGIN IMMEDIATE</code>, not
+        <code>BEGIN</code></b> — a deferred BEGIN starts the SELECT as a reader and upgrades on the INSERT; SQLite does
+        <i>not</i> run the busy handler for that upgrade, so it returns <code>database is locked</code> immediately
+        regardless of <code>busy_timeout</code> (fails in 0.15s, not after a wait). <code>busy_timeout</code> <i>is</i>
+        load-bearing for IMMEDIATE.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Shipped:</b> new <code>db.write()</code> contextmanager (<code>isolation_level=None</code> + explicit
+        <code>BEGIN IMMEDIATE</code>/commit/rollback) alongside the existing <code>connect()</code>. <b>Scope was cut
+        from the original plan:</b> not a mechanical pass over ~40 sites — only the <b>2</b> real read-modify-writes
+        (<code>add_message</code>, <code>add_code_step</code>) move, since flipping <code>connect()</code> globally
+        would have silently dropped the implicit transaction from every multi-statement block. <code>foreign_keys</code>
+        stays off (<code>delete_project_cascade</code> depends on it). <code>_next_seq</code>'s false docstring is
+        replaced with the actual precondition.
+        <b>Tests:</b> new <code>test_db_seq_concurrent.py</code> (3 tests) — <b>10/10 runs fail on <code>main</code></b>,
+        5/5 pass with the fix, and the full 290-test suite is green.</div>
+    </div>
+    <div class="todo is-planned">
+      <div class="top"><span class="id">2</span><span class="title">Demote git: SQL owns content, git becomes transport</span>
+        <span class="tag be">adapter</span><span class="badge b-planned">Planned · supersedes old 2 + 3 + 23</span></div>
+      <div class="scope"><b>Absorbs the old "per-repo lock", "path-scope the diffs", and "shadow <code>GIT_DIR</code>"
+        items — all three defended a store we're removing.</b> Content moves to a content-addressed blob table
+        (<code>artifact_blobs(id, sha256, content)</code> + <code>code_steps.before/after_blob_id</code>) — the direction
+        <code>docs/STORAGE-code-steps-vs-timeline.md</code> already proposed, and the rule <code>ghimport.py</code>'s
+        D45 already follows for skills (<i>"the row is the source of truth, not a live link"</i>). Driver: a per-session
+        git repo on one machine's filesystem is the single thing preventing a stateless, hostable app server.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Why not just fix the locking — measured.</b> 24 concurrent writers, each writing its <i>own distinct file</i>
+        into one repo (the shape project sessions already have, <code>projects.py:142-149</code>):
+        <table style="border-collapse:collapse;margin:8px 0;font-size:12px">
+          <tr><td style="padding:1px 12px 1px 0">today</td><td>18 × <code>index.lock</code> errors</td>
+            <td><b>24 writes → 1 commit</b></td><td>6 commits contain other writers' files</td></tr>
+          <tr><td style="padding:1px 12px 1px 0">path-scoped <code>add</code> alone</td><td>18 errors</td>
+            <td>6/24 commits</td><td>⚠️ <b>18 files never reach HEAD</b></td></tr>
+          <tr><td style="padding:1px 12px 1px 0">per-repo lock alone</td><td><b>0 errors</b></td>
+            <td>1/24 commits</td><td>⚠️ <b>24/24 contaminated</b> — silences the error, worsens the bug</td></tr>
+          <tr><td style="padding:1px 12px 1px 0">lock + path-scoped</td><td>0 errors</td><td>24/24</td><td>✓</td></tr>
+        </table>
+        The two halves are <b>one change, not two</b> — and either half <i>alone</i> is worse than today (scoping loses
+        data; locking makes contamination total, because the working tree is written outside the lock). That kills any
+        argument for landing a partial git fix early, which is what frees us to remove git as the store instead.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>We never used git as git.</b> No branch, no merge, no rebase — only content-addressing, <code>show</code>,
+        and <code>diff</code>. sha256 + a blob table + <code>difflib</code> cover all three, with no subprocess per
+        write and no repo-wide index mutex.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Carve-outs — this is "demote", not "delete".</b>
+        <b>(a) Lean needs real files on disk</b> (<code>lean_check</code> compiles <code>workspace/proofs/…</code>;
+        Lake can't read a blob table). The worktree stays — it's <b>demoted from truth to cache</b>, re-materializable
+        from the DB. That's the actual invariant win: today a SHA in the DB points into a <i>second</i> store and the
+        two can drift with no reconciliation. It also means hosting is "stateless read path + stateful Lean worker",
+        <i>not</i> serverless — the worker still needs a disk and a multi-GB Mathlib.
+        <b>(b) Git stays as transport:</b> <code>ghimport</code>'s clone and <code>push_to_github</code> (D34) survive
+        untouched; push becomes materialize-then-push.
+        <b>(c) Binaries don't belong in SQL</b> — <code>uploads.py</code> commits PDFs to git today; keep the blob store
+        behind an interface so they can move to object storage later without touching call sites.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Don't lose the old item 3's hazard in the migration — it's a live bug and survives the rewrite.</b>
+        <code>bridge.py:238</code> <code>_divergence_context</code> diffs the <b>whole repo</b>, so a peer session's
+        commit is handed to this run as <i>"The human edited the proof files since your last turn"</i> — showing
+        someone else's theorem, which the agent may then go edit. Same on the canvas-save path
+        (<code>uncommitted_diff</code> + <code>routes/sessions.py:149</code>); the modal editor lock is per-session, so
+        it doesn't stop a human saving in session A while an agent drives session B of the same project. Blob-diffing
+        makes the scoping natural (query this session's paths) but <b>not automatic</b> — it stays an explicit
+        acceptance criterion, with <code>test_bridge_divergence.py</code>. <b>Fails today.</b>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Surface:</b> 8 app modules (<code>gitstore</code>, <code>bridge</code>, <code>projects</code>,
+        <code>uploads</code>, <code>filesystem</code>, <code>ghimport</code>, <code>routes/{sessions,projects}</code>)
+        + 6 test files. <b>Also update <code>CLAUDE.md</code> in the same PR</b> — "Git owns proof content / proof bytes
+        live in git, not the DB" is a documented invariant this deliberately inverts, and it must change where it
+        becomes false, not later. <b>Flag on the STORAGE doc's schema:</b> its proposed <code>patch, additions,
+        deletions</code> columns are <i>derived</i> from the before/after blobs — either compute on read or label them a
+        cache explicitly, or it's <code>_next_seq</code> again (a comment asserting what nothing enforces).</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">4</span><span class="title">Fix the lock leak (setup outside the <code>try:</code>)</span>
+        <span class="tag be">adapter</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">The lock is acquired at <code>bridge.py:317</code> but the <code>try:</code> only starts at
+        <code>:407</code>. Anything in <code>:335-371</code> (<code>gs.init_repo</code>,
+        <code>repo_for_session</code>, <code>materialize_project_skills</code>) that throws <b>leaks the lock
+        permanently</b> — every later run 409s until restart. Move the setup block inside the <code>try:</code>.
+        (Phase 3 makes this structurally impossible anyway, but it's a live bug on <code>main</code> and worth fixing
+        on its own.)</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 1 ============ -->
+  <div class="group">
+    <h2>Phase 1 · Make <code>lsp_daemon.py</code> a real LSP client</h2>
+    <div class="ghint">The heart of it. Lean's server is a watchdog with <b>one file-worker per open file</b> and is
+      built for concurrent requests — so this buys <b>real parallel checking</b>, not just correctness, on <b>one</b>
+      resident Mathlib. Still serialized in prod by the run lock, so the exercised path stays a strict subset of the
+      new one — low landing risk.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">5</span><span class="title">Dispatcher: per-request queues, id/uri routing, leases</span>
+        <span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Rewrite the transport (~150 lines of a 317-line file). One reader thread dispatching
+        <b>responses by JSON-RPC <code>id</code></b> and <b>notifications by <code>uri</code></b> into <b>per-request
+        queues</b>; the shared <code>self.queue</code> is <b>deleted</b>, and with it the destructive purge and the
+        message-dropping. Plus: <code>_io_lock</code> around <code>_send</code> (two threads on an <b>unbuffered</b>
+        pipe can interleave <code>Content-Length</code> headers with bodies and <b>permanently desync the
+        framing</b>); <code>_state_lock</code> for <code>opened</code>/version/<code>calls</code>; a <b>per-URI
+        lock</b> for the same-document case (a Lean file worker holds one doc state per URI — versions can't fix that,
+        a lock can); and <b>leases</b> so a stale daemon is retired from the registry and shut down only when its last
+        in-flight check drains (today a <code>mark_stale</code> from any session calls <code>shutdown()</code>
+        <i>under</i> another session's live check). Inject a <code>_Transport</code> seam so the dispatcher is
+        testable without Lean.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">6</span><span class="title">Bound the fallbacks: cold-check semaphore + lake-build lock</span>
+        <span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>lean_check</code> swallows <i>any</i> LSP exception and falls back to a cold
+        <code>lake env lean</code> (~88s, full Mathlib). The run lock caps that at one today — without a semaphore, one
+        LSP hiccup under N runs spawns <b>N Mathlib processes</b>. And
+        <code>docs/PLAN-edit-save-latency.md:231</code> documents concurrent <code>lake build</code> against the
+        shared workspace as an explicit <b>non-goal</b> → a global build lock keyed by lake_root, with
+        <code>mark_stale()</code> called <i>inside</i> it. <code>lean_check</code> via the daemon is a different
+        process, so it stays <b>parallel with builds</b> — that's the win.</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 2 ============ -->
+  <div class="group">
+    <h2>Phase 2 · SafeVerify + run context</h2>
+    <div class="ghint">The second wrong-answer hazard, plus the ContextVar seam that the whole subagent architecture
+      stands on.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">7</span><span class="title">SafeVerify: per-call scratch dir + semaphore</span>
+        <span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Per-call <code>TemporaryDirectory</code> under <code>.sv_scratch</code> (kept under
+        <code>workspace/</code> but outside <code>proofs/</code>, so <code>srcDir := "proofs"</code> never globs it),
+        and actually pass <code>scratch_dir=</code> through to <code>safeverify.verify_proof</code> — the parameter
+        <b>exists and is currently ignored</b>. Plus a semaphore: <code>verify</code>'s own docstring says <i>"the
+        adapter serializes calls"</i>, and <b>that serialization is the run lock we're deleting</b> (~2 Mathlib
+        compiles each, called from a sync route → FastAPI threadpool). Tests:
+        <code>test_safeverify_scratch.py</code> — two threads, two files with the <b>same stem</b>, distinct scratch
+        dirs, no cross-deletion.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">8</span><span class="title"><code>runctx.py</code> ContextVars + <code>bash(cwd=)</code></span>
+        <span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">New <code>prover/lea/runctx.py</code>: <code>working_dir</code> / <code>run_key</code> /
+        <code>candidate_dir</code> as <code>ContextVar</code>s, set in <code>agent._run_events_inner</code>.
+        ContextVars are per-thread <b>and</b> per-async-task, and <b>inherit into children</b> — exactly the primitive
+        a subagent architecture needs. Immediately fixes <code>bash</code> (<code>tools.py:338</code> runs
+        <code>subprocess.run(shell=True)</code> with <b>no <code>cwd=</code></b>, inheriting the process-global cwd)
+        and gives per-activation scratch keys.</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 3 ============ -->
+  <div class="group">
+    <h2>Phase 3 · The run registry &nbsp;·&nbsp; structural, externally a no-op</h2>
+    <div class="ghint">Replace the global mutex with a real registry — and <b>ship it at
+      <code>LEA_MAX_CONCURRENT_RUNS=1</code></b>, i.e. byte-for-byte today's behavior on a correct implementation.
+      This is the trick that de-risks the whole rewrite.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">9</span><span class="title"><code>runregistry.py</code> + admission moves into the endpoint</span>
+        <span class="tag be">adapter</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">One lock, <code>dict[run_id → ActiveRun]</code>, <code>dict[session_id → run_id]</code>, and
+        <code>try_admit() → admitted | already_active | session_busy | at_capacity</code>. <b>Admission moves into
+        <code>routes/runs.py</code>, before the thread is spawned.</b> Today the claim happens <i>inside</i> the
+        thread (<code>bridge.py:317</code>) while the endpoint separately peeks at the scalar
+        (<code>runs.py:180</code>) — a <b>TOCTOU</b> where two attaches both see <code>None</code>, both spawn, and
+        one loses and emits <code>done(failed)</code>. 409 becomes <i>"Lea is at capacity (n/N)"</i> with
+        <code>Retry-After</code>. Knob: <code>LEA_MAX_CONCURRENT_RUNS</code>, <b>default 1</b>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">10</span><span class="title">Delete the scalar; per-session supersede; exact interrupt</span>
+        <span class="tag be">adapter</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Delete <code>active_run_lock</code>, <code>_active_run_guard</code>,
+        <code>_active_run_id</code>, <code>current_active_run_id()</code>. Supersede narrows from <i>"shoot down
+        whoever holds the box"</i> to <i>"shoot down the incumbent <b>for this session</b>"</i> — a new chat never
+        kills another chat's run. The passive-view path stays, gated on <code>already_active</code>. And
+        <code>interrupt</code>'s pending-run check (<code>runs.py:158</code>) becomes <b>exact</b> rather than a
+        heuristic: a pending run absent from the registry <i>provably</i> has no driver. Tests:
+        <code>test_runregistry.py</code>, <code>test_routes_runs_concurrency.py</code>.</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 4 ============ -->
+  <div class="group">
+    <h2>Phase 4 · Path ownership + resource locks</h2>
+    <div class="ghint">The last shared thing nobody guards: <b>files</b>. Two runs in one project can pick the same
+      filename; a subagent writing a candidate must never touch the canonical proof. This phase is what makes "many
+      writers, one workspace" actually safe.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id">11</span><span class="title">Canonical path leases + temp candidate dirs</span>
+        <span class="tag be">adapter</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Each live run leases the canonical <code>.lean</code> paths it owns. Enforcement reuses the
+        <b>existing approval-gate seam</b>: the adapter's <code>gate(tool_name, args)</code> denies a
+        <code>write_file</code> whose path is leased by another live run, and the bridge immediately
+        <code>.send("deny")</code> with no human in the loop — <b>works for autonomous runs too, and needs no prover
+        change</b>. Children write to <code>.lea/tmp/&lt;run_id&gt;/</code>, which is git-ignored and <b>never becomes
+        a user-visible <code>code_step</code></b> unless the parent promotes it. Tests:
+        <code>test_project_path_ownership.py</code>, <code>test_candidate_workspace.py</code>,
+        <code>test_subagent_transcripts_do_not_create_code_steps.py</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">12</span><span class="title">Tools declare the resources they touch</span>
+        <span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">A tool declares which resources it needs (<code>lean_file:&lt;path&gt;</code>,
+        <code>lake_build:&lt;root&gt;</code>, <code>safeverify</code>, <code>lsp_uri:&lt;uri&gt;</code>); the executor
+        acquires them <b>in sorted order</b> (deadlock-free) from a FIFO lock manager with <b>per-prefix
+        timeouts</b> — a <code>lean_file</code> wait is pathological at 30s, a <code>lake_build</code> wait is normal
+        at 300s. The important part is the <b>three-state</b> default: a tool that declares <i>nothing</i> gets a
+        tool-wide mutex, so <b>an undeclared tool is safe by default</b> and the failure mode of forgetting is
+        slowness, not corruption. Tests: <code>test_resource_locks.py</code>.</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 5 ============ -->
+  <div class="group">
+    <h2>Phase 5 · UI &nbsp;·&nbsp; ⚠️ mandatory before Phase 6</h2>
+    <div class="ghint"><b>No N-EventSource rework.</b> Everything a background run emits is already persisted and
+      re-derivable from <code>GET /api/sessions/{id}</code> — that's the whole point of the git/SQLite split. Keep
+      <b>one</b> live stream for the open session; track background runs through the <code>sessions_changed</code>
+      stream that already exists.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id fe">13</span><span class="title">Sidebar running dot for background runs</span>
+        <span class="tag fe">frontend</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>store.py:164-169</code> <b>already computes <code>active_run_count</code></b> and then
+        <code>pop()</code>s it at <code>:186</code>; <code>sessions_digest</code> already includes
+        <code>active_runs</code>, so <code>/api/sessions/events</code> <b>already fires</b> on every run
+        start/finish. Stop dropping the count; <code>Sidebar.tsx:138-144</code> reads it (it currently never maps
+        <code>status === 'running'</code> at all, so 4 concurrent background runs would render as <b>idle</b>).
+        Derived <code>status</code> is untouched. <b>~3 lines, no new server stream.</b></div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">14</span><span class="title">SSE reattach: backoff + cap</span>
+        <span class="tag fe">frontend</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><b>The blocker for raising the cap.</b> <code>useProofStream.ts:283-302</code> re-attaches on
+        <code>onerror</code> with <b>no delay and no cap</b>, and a browser <code>EventSource</code> <b>cannot read a
+        409 status</b> — it just fires <code>onerror</code>. So the moment the server can 409, that's an unthrottled
+        request storm. Exponential backoff + jitter (1s→2s→4s, cap 15s, ~20 attempts) and a <i>"waiting for a free
+        run slot…"</i> chip. Mirrors the companion's already-proven loop.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id fe">15</span><span class="title">Reattach on session switch</span>
+        <span class="tag fe">frontend</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><code>applyDetail</code> already hydrates <code>currentRunId</code>/<code>isRunning</code>
+        from the fetched detail — attach the stream if the newly-opened session has a live run. Then
+        <code>isRunning</code> naturally means <i>"the open session is running"</i>, so the composer gate
+        (<code>App.tsx:282</code>) and Stop button (<code>:317</code>) need <b>no change</b> — they were already
+        per-open-session in intent; the bug was that the state was global and never rehydrated on switch.</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 6 ============ -->
+  <div class="group">
+    <h2>Phase 6 · Flip the cap &nbsp;·&nbsp; 🎉 the first shippable feature</h2>
+    <div class="ghint">One line of behavior change plus tests — everything it depends on has already shipped and been
+      running in production at cap=1. <b>Four chats formalize at once.</b></div>
+
+    <div class="todo">
+      <div class="top"><span class="id">16</span><span class="title"><code>LEA_MAX_CONCURRENT_RUNS=4</code> + cheap run-row endpoint</span>
+        <span class="tag be">adapter</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope">Default the cap to 4. Add <code>GET /api/runs/{run_id}</code> and point the companion's
+        <code>fetchApiRunRow</code> (<code>leaApiClient.mjs:509</code>) at it — it currently pays a <b>full session
+        detail</b> (messages + code_steps + status_events + usage) on <b>every 3s retry</b>. ~10-line companion
+        change, and it removes a self-inflicted DB-contention source.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id">17</span><span class="title">Verdict-integrity e2e + the dispatch unit test</span>
+        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
+      <div class="scope"><b>Write <code>test_dispatch_unit.py</code> first</b> (deterministic, no Lean,
+        milliseconds): a fake transport emits frames in an <b>adversarial order</b> — B's diagnostics before A's, an
+        unrelated third URI, a <code>window/logMessage</code>, an interleaved <code>fileProgress</code> — while two
+        threads call <code>check()</code>. Assert each gets <b>its own</b> file's diagnostics. <i>On today's code
+        this test cannot even be written</i> (no seam). Then the acceptance test,
+        <code>test_concurrent_runs_e2e.py</code>: six concurrent runs, three provable + three false; assert
+        <b>exactly</b> the three provable ones end <code>proved</code> — any LSP/SafeVerify/git cross-talk shows up as
+        a mislabeled session. Regression: <code>npm test -w apps/overleaf-extension</code> must stay green
+        <b>without changes</b>.</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 7 ============ -->
+  <div class="group">
+    <h2>Phase 7 · Subagents &nbsp;·&nbsp; 🟣 what this was all for</h2>
+    <div class="ghint">A run can spawn child runs. Everything here rests on seams that already exist in the prover —
+      <code>registry.build_toolset(selected)</code> already scopes tools by name, <code>skills.py</code> already
+      injects declarative markdown, <code>events.py</code> is already a typed stream. Each item still wants a short
+      design pass before it's buildable.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id sub">18</span><span class="title"><code>spawn_subagent</code> tool + child activations</span>
+        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope">A parent tool call starts a child activation with its own message list, its own
+        <code>candidate_dir</code>, and a fresh context. Two independent recursion guards: a depth walk (<b>default
+        1</b> — children can't spawn) <b>and</b> <code>spawn_subagent</code> denied by default in the child's toolset.
+        Either alone would do; both means a bug in one isn't a fork bomb. Step and check caps are runaway guards, not
+        accounting. Tests: <code>test_subagent_depth_budget.py</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id sub">19</span><span class="title">Declarative agent profiles (markdown + frontmatter)</span>
+        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope">One file per role in <code>prover/lea/agents/</code>: YAML frontmatter (<code>model</code>,
+        <code>tools</code>, <code>permission_mode</code>, caps) + a markdown body that <i>is</i> the role's prompt.
+        <code>tools:</code> maps straight onto the existing <code>build_toolset(selected)</code> — the list both
+        filters <b>and</b> orders. Roles: coordinator · proof-candidate · mathlib-scout · error-triage · statement-check ·
+        refactor. Adding a role becomes writing a file, not writing code. Tests:
+        <code>test_subagent_profile_loading.py</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id sub">20</span><span class="title">Prompts <i>compose</i> the Lean core — never replace it</span>
+        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope"><b>Safety-critical, and where we deliberately diverge from opencode</b> (which replaces the
+        base prompt wholesale). Every child gets: shared Lean core (workspace · tools · tactic cascade · phrasebook ·
+        <b>hard rules</b>) → per-role head → volatile tail (workspace path, namespace, divergence context). A child
+        that lost the hard rules could prove a <i>weakened</i> statement and report success. The layering is also
+        cache-friendly: the shared core is a stable prefix across every child.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id sub">21</span><span class="title">Permissions compose by tightening only</span>
+        <span class="tag be">adapter</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope">A child's effective permissions = its own declared caps <b>∪ the parent's deny rules</b> ∪
+        path rules. A child can never hold a permission its parent lacked — spawning is not a privilege-escalation
+        path. Tests: <code>test_subagent_permissions.py</code>.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id sub">22</span><span class="title">Typed result envelope + transcript storage</span>
+        <span class="tag be">adapter</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope">A child returns a <b>typed</b> result (candidate path, check verdict, what it tried, why it
+        stopped), not free prose the parent has to re-parse. The result id doubles as a resume handle and as the audit
+        link from a promoted <code>code_step</code> back to the transcript that produced it — so "which attempt
+        actually won, and what did it do" stays answerable. Transcripts are stored separately; they are <b>not</b>
+        <code>code_steps</code>.</div>
+    </div>
+    <div class="todo is-dropped">
+      <div class="top"><span class="id sub">23</span><span class="title"><s>Candidate snapshots via a <b>shadow GIT_DIR</b></s></span>
+        <span class="tag be">adapter</span><span class="badge b-dropped">Superseded by 2</span></div>
+      <div class="scope"><b>Dropped: this borrowed opencode's snapshot layer to keep candidate commits out of the
+        project repo. Item 2 removes the repo from the write path entirely</b>, so a child's writes are just blob rows
+        scoped by its own <code>session_id</code> — no shadow <code>GIT_DIR</code>, no second git config to get wrong,
+        and "diffable without polluting the history the user reads" falls out of the schema instead of being
+        engineered. Kept here because the constraint below outlived the mechanism.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Carry this to item 2 — it is a capture-point rule, not a git rule.</b> opencode ships
+        <code>test/session/snapshot-tool-race.test.ts</code> documenting a live bug: they hook <i>start-step</i> to
+        capture "before", the AI SDK runs the tool first, both snapshots get the <b>same tree hash</b>, and the diff
+        comes back empty. We're immune <b>only by construction</b> — we capture on the prover's explicit
+        <code>FileChanged</code> event, an actual write, not a lifecycle guess. That property must survive the move to
+        blobs: <b>write a blob on <code>FileChanged</code>, never on a turn/step boundary.</b> Nothing in the schema
+        enforces it, so it's a review rule.</div>
+    </div>
+    <div class="todo is-planned">
+      <div class="top"><span class="id fe">24</span><span class="title">Sub-agents in the UI — <a href="mock-subagents-sidebar.html" style="color:var(--accent)">live mock ↗</a></span>
+        <span class="tag fe">frontend</span><span class="badge b-planned">Mock — iterating</span></div>
+      <div class="scope"><b>Design surface: <code>mock-subagents-sidebar.html</code> — clickable, edit it as ideas
+        land.</b> Tokens and the sidebar rules are copied <i>verbatim</i> from <code>src/styles/lea-v2.css</code>, so
+        it previews the real thing and the additive CSS (<code>.sa-group</code>) can be lifted straight into the
+        stylesheet at build time; everything invented is fenced under a <b>MOCK-ONLY</b> comment and marked
+        <code>NEW:</code>.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>A child is a session, not a chat.</b> Same shell, same <code>SessionList</code>/<code>Canvas</code>
+        rendering, <b>read-only</b> — the composer is replaced by a provenance bar (<i>"delegated by … turn 4"</i>),
+        because the child's interlocutor is the <b>parent</b>, which is blocked awaiting the typed result from 22.
+        Typing there would inject the user into a delegation the parent thinks it owns.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>The contextual Sub-agents block</b> is a fourth <code>.proj-group</code>, appearing only for sessions in a
+        tree. <b>The rule is <code>children(parent_id ?? id)</code> — scoped to the tree <i>root</i>, not the
+        selection.</b> Scope it to the selection and the block vanishes the instant you click a candidate (children
+        have no children at depth 1) — the section disappears exactly when it's being used, taking the sibling list
+        and the way back with it. This is why <b>depth 1 keeps the list flat</b>: no recursion, no indent rules. If
+        depth ever grows past 1, this design needs revisiting.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>It composes with the timeline node, not instead of it</b> — the <code>spawn_subagent</code> node answers
+        <i>when &amp; why</i> in <code>seq</code> order; the sidebar answers <i>where are they now</i>. Both select the
+        same child. And this is the debugging payoff 23 exists for: when the coordinator says "3 candidates, #2 won",
+        the losers are otherwise <b>invisible</b> — which is the failure mode of every multi-agent system, and the only
+        way to answer <i>"is the coordinator earning its 3× tokens?"</i> Live dots need <b>no new server work</b> (13
+        already stops dropping <code>active_run_count</code>; <code>sessions_digest</code> already fires on run
+        start/finish).</div>
+    </div>
+  </div>
+
+  <!-- ============ PHASE 8 ============ -->
+  <div class="group">
+    <h2>Phase 8 · Collation + specialization</h2>
+    <div class="ghint">The parent has N candidates. Now make choosing between them principled, and make each child
+      sharper than a generalist would be.</div>
+
+    <div class="todo">
+      <div class="top"><span class="id sub">25</span><span class="title">Parent collation: rank candidates, promote the winner</span>
+        <span class="tag be">adapter</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope">Only the coordinator promotes to the canonical path and to <code>code_steps</code>. Ranking is
+        <b>not</b> a vote and <b>not</b> the model's opinion — it's the compiler: <code>lean_check</code> clean beats
+        SafeVerify-rejected beats errors, ties broken by proof length / <code>sorry</code>-free. The candidate that
+        wins is the one Lean says wins.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id sub">26</span><span class="title">Domain-scoped tactic cascades via path triggers</span>
+        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope">Today <code>_TACTIC_CASCADE</code> is <b>one flat table for all of mathematics</b> — every
+        run carries measure-theory tactics whether or not it's doing measure theory. Trigger extra cascade fragments
+        on the imports/namespaces actually in play (<code>MeasureTheory</code> → <code>measurability</code>,
+        <code>fun_prop</code>), injected <b>at tool-use time</b> so the cached prompt prefix is untouched. Each child
+        gets a sharper ladder and a shorter one.</div>
+    </div>
+    <div class="todo">
+      <div class="top"><span class="id sub">27</span><span class="title">ContextVar-scoped tool registry</span>
+        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+      <div class="scope"><code>registry.py:42-43</code> <code>REGISTRY</code>/<code>_ORDER</code> are process-global
+        and mutated per activation by MCP (<code>mcp.py:146,150-153</code>) — two concurrent MCP-enabled activations
+        corrupt each other's toolsets (A's <code>stop()</code> unregisters B's tools <b>by name</b>). <b>Dormant
+        today</b> (the adapter never sets <code>mcp_servers</code>) — and live the moment children get their own
+        tools. <code>build_toolset</code> reads a ContextVar-scoped snapshot instead of the module global.</div>
+    </div>
+  </div>
+
+  <footer>LeaUI v2.3 · one backend on :8001 · git still owns proof bytes · session status stays derived ·
+    the 409 survives — it just means "at capacity" now</footer>
+</div>
+</body>
+</html>

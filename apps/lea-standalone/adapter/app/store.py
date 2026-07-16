@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from typing import Any
 
-from .db import ROOT, connect, row_to_dict, utc_now
+from .db import ROOT, connect, row_to_dict, utc_now, write
 
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
@@ -977,7 +977,7 @@ def add_message(
     channel; it rides the same path that feeds context to the prover."""
     now = utc_now()
     message_id = str(uuid4())
-    with connect() as conn:
+    with write() as conn:  # read-modify-write on seq — see db.write()
         seq = _next_seq(conn, session_id)
         conn.execute(
             """
@@ -994,8 +994,12 @@ def add_message(
 def _next_seq(conn, session_id: str) -> int:
     """The next shared timeline position for a session (C4): one monotonic counter
     that both messages and code_steps draw from, so the thread is an ORDER BY seq
-    merge. Runs on the insert's own connection, so the read+write are atomic under
-    SQLite's single-writer lock (same max+1 pattern the old step_number used)."""
+    merge.
+
+    This is a read-modify-write and is only atomic if `conn` is already inside a
+    `db.write()` (BEGIN IMMEDIATE) transaction — callers must open one. Under a
+    plain `connect()` the SELECT runs outside any transaction and concurrent
+    callers silently duplicate seqs; see `db.write()` for the measurement."""
     row = conn.execute(
         """
         select coalesce(max(seq), 0) + 1 as next from (
@@ -1040,7 +1044,7 @@ def add_code_step(
     """
     now = utc_now()
     step_id = str(uuid4())
-    with connect() as conn:
+    with write() as conn:  # read-modify-write on seq — see db.write()
         seq = _next_seq(conn, session_id)
         conn.execute(
             """
