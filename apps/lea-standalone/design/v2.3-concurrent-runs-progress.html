@@ -128,7 +128,10 @@
     back for migrations, which item 2 forces by making the DB non-disposable. <b>Next: 3 → 2</b> (3 blocks 2 — no
     schema change without a migration path now that SQL holds the only copy). Every concurrency test here is
     <b>written to fail on <code>main</code> first</b>; that's the evidence these hazards are real, not theoretical.
-    <b>🔴 One open call blocks 2's schema</b> — see C4 counter ownership above.</div>
+    <b>✅ 2's schema is settled</b> — the C4 counter call resolved by merging <code>messages</code> +
+    <code>code_steps</code> into one <code>timeline</code> table, which makes item 1's race <b>unrepresentable</b>
+    rather than defended against. Item 1 is superseded-by-design — the intended outcome, not waste: it proved the bug
+    was real and produced the measurements that justified the merge.</div>
 
   <div class="legend">
     <span><i class="dot d-unplanned"></i> Needs a design pass</span>
@@ -160,24 +163,36 @@
     shared dir stays (Lean requires it) but it stops being a <i>repo</i>: it becomes a re-materializable cache, and
     ordering moves to SQL, which has real transactions.</span>
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
-    <b>🔴 OPEN CALL: C4's shared counter is <i>unenforceable</i> — who should own <code>seq</code>?</b>
-    <span class="fix">Item 1 fixed the race, but the guarantee still rests on <b>transaction discipline</b>, which is
-    the same class of thing as the false docstring that caused it: a rule nothing checks. The schema-level answer is
-    <code>UNIQUE(session_id, seq)</code> — and <b>it cannot be written</b>. <code>seq</code> is shared across
-    <i>two</i> tables (<code>code_steps</code> + <code>messages</code>); a unique index on each catches intra-table
-    duplicates and <b>misses the cross-table collision entirely</b> — a message and a code_step can still take the same
-    seq. That is exactly the case <code>test_concurrent_mixed_writers</code> exercises (a run narrating while it
-    writes), i.e. the real shape, not a corner. No SQL constraint spans two tables.</span>
-    <b>The fix is for one table to own the counter</b> — a small allocation table both FK into, or the generic timeline
-    table the STORAGE doc considered and rejected. <b>Item 2 is the moment</b>: it already rewrites
-    <code>code_steps</code>, and the live DB is <b>clean right now (0 duplicate pairs / 114 rows</b>, since everything
-    so far ran under cap-1<b>)</b> — a constraint applies free today and gets expensive the moment 16 flips the cap.
-    <b>Two sub-decisions</b>: (a) <code>BEGIN IMMEDIATE</code>/<code>busy_timeout</code> are SQLite-only and do
-    <b>not</b> port — under Postgres MVCC this needs a sequence, <code>SELECT … FOR UPDATE</code>, or unique+retry, so
-    the constraint is the <i>portable</i> half of the guarantee and the transaction discipline is not. (b) <b>Is
-    gapless required, or only total order?</b> The merge needs an order; contiguity may be incidental —
-    <code>test_db_seq_concurrent</code> asserting <code>1..N</code> may be over-specifying, and it matters because
-    Postgres sequences have gaps <i>by design</i> (rollbacks don't reclaim). <b>Undecided — owner's call.</b>
+    <b>✅ RESOLVED (was: who owns <code>seq</code>?) — the counter is <i>deleted</i>, not fixed.</b>
+    <span class="fix">The problem: item 1 fixed the race, but the guarantee still rested on <b>transaction
+    discipline</b> — the same class of thing as the false docstring that caused it. The schema answer,
+    <code>UNIQUE(session_id, seq)</code>, <b>could not be written</b>: <code>seq</code> spans <i>two</i> tables, a
+    unique index on each misses the cross-table collision, and no SQL constraint spans two tables. That collision is
+    the case <code>test_concurrent_mixed_writers</code> covers — a run narrating <i>while</i> it writes — i.e. the real
+    shape, not a corner.</span>
+    <b>Resolution (owner's call): merge the two tables.</b> One <code>timeline</code> table whose
+    <code>integer primary key autoincrement</code> <b>is</b> the ordering key. No <code>seq</code> column, no
+    allocation table, no <code>max()+1</code>. <span class="fix">The read-modify-write is <b>deleted, not guarded</b>,
+    so item 1's race is <b>unrepresentable</b> rather than defended against, and uniqueness becomes a primary key —
+    the strongest guarantee the DB has, and one a future caller cannot forget. <code>_next_seq</code> goes away
+    entirely.</span>
+    <b>Probed (8×25=200 concurrent inserts):</b> <code>autoincrement</code> with <b>no transaction at all</b> →
+    200/200 unique, <b>0</b> <code>lastrowid</code> mismatches (every thread got back its <i>own</i> row).
+    <code>BEGIN IMMEDIATE</code> buys nothing here and is <i>slower</i> (0.16s vs 0.11s). Throughput vs today is only
+    1.4× — <b>not the reason</b>; the reason is that the bug stops existing.
+    <b>⚠️ The <code>AUTOINCREMENT</code> keyword is mandatory:</b> a plain <code>integer primary key</code> passes the
+    concurrency test but <b>reuses ids after a delete</b> (measured: deleted id=2, next insert got id=2) — a later row
+    would inherit a dead row's position. With the keyword: fresh id=3.
+    <b>⚠️ Correction — gaps are a <i>Postgres</i> property, not SQLite's:</b> measured, a SQLite rollback does
+    <b>not</b> burn an id (<code>sqlite_sequence</code> is transactional; ids came back <code>[1,2]</code>, not
+    <code>[1,3]</code>). Postgres sequences are non-transactional and <i>do</i> burn. Deletes leave gaps either way, so
+    <b>nothing may rely on contiguity</b> — which the frontend already proves it doesn't: <code>useProofStream.ts:92,
+    232</code> invent <b>fractional</b> seqs (<code>+0.5</code>, <code>+1e-4</code>) to interleave approvals, so
+    contiguity is <i>already</i> deliberately violated client-side. Every consumer only sorts or compares
+    (<code>ORDER BY seq</code>, <code>Math.max</code>, <code>edit_notes_since</code>); nothing counts steps or shows a
+    number. <b>Total order is the requirement; gapless never was</b> — so
+    <code>test_db_seq_concurrent</code>'s <code>contiguous 1..N</code> assertion is over-specified and must relax to
+    unique + strictly increasing. Per-session restart-at-1 also disappears (global ids); nothing consumes it.
     <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
     <b>⚠️ Cross-phase ordering: 12 must land before 16.</b> <span class="fix">Item 2 stores <i>one</i> blob pointer per
     step and computes "before" as the previous step's after. That inference is sound <b>only while a lock guarantees
@@ -287,15 +302,48 @@
         and <code>diff</code>. sha256 + a blob table + <code>difflib</code> cover all three, with no subprocess per
         write and no repo-wide index mutex.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
-        <b>Schema — <i>one</i> pointer per step, not two.</b>
-        <code>artifact_blobs(id, sha256 unique, content, created_at)</code> +
-        <code>code_steps.after_blob_id</code>. "Before" is the previous step's <code>after_blob_id</code> for that
-        path, <b>computed on read</b>; the first step's before is null (the file didn't exist). <b>This overrides
+        <b>Schema — one <code>timeline</code> table, typed columns for guarantees, JSON for tool specifics.</b>
+        <pre style="margin:6px 0;padding:8px;background:#f0ede6;border-radius:6px;font:11.5px ui-monospace,monospace;overflow-x:auto">artifact_blobs(id, sha256 <b>unique</b>, content, created_at)
+
+timeline(
+  id integer primary key <b>autoincrement</b>,   -- IS the order. no seq column.
+  session_id text not null, run_id text, kind text not null,
+  turn integer, author text, path text,        -- typed: carry guarantees
+  after_blob_id text, check_status text, check_detail text, artifact_kind text,
+  data text,                                   -- JSON: per-tool specifics only
+  created_at text not null)
+index (session_id, id) · partial index where after_blob_id is not null</pre>
+        <b>Merging the two tables is what makes the counter safe</b> — see the resolved C4 call above. The PK is the
+        ordering key, so <code>_next_seq</code> and its race are deleted outright.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>One blob pointer per step, not two.</b> "Before" is the previous row's <code>after_blob_id</code> for that
+        path, <b>computed on read</b>; the first is null (the file didn't exist). <b>Overrides
         <code>docs/STORAGE-code-steps-vs-timeline.md</code></b>, which proposes
-        <code>before_blob_id</code>+<code>after_blob_id</code> — see the next two boxes for why that doesn't transfer.
-        The write path <i>shrinks</i>: <code>read → sha256 → insert → emit</code> replaces four git subprocesses
-        (<code>add</code>, <code>diff --cached</code>, <code>commit</code>, <code>rev-parse</code>). Blobs dedupe by
-        sha256, so an unchanged file across steps costs one row, not N.
+        <code>before_blob_id</code>+<code>after_blob_id</code> — see the next two boxes. The write path <i>shrinks</i>:
+        <code>read → sha256 → insert → emit</code> replaces four git subprocesses (<code>add</code>,
+        <code>diff --cached</code>, <code>commit</code>, <code>rev-parse</code>). Blobs dedupe by sha256, so an
+        unchanged file across steps costs one row, not N.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Why the blob pointer must NOT live in the JSON.</b> Both references go generic — opencode's
+        <code>part</code> table is <code>{id, message_id, session_id, timestamps, data:json}</code>; OpenHands stores
+        events as flat JSON files with no table at all. <span class="fix">But this whole workstream has been moving
+        guarantees from "a comment claims it" to "the schema enforces it", and <b>JSON is a docstring in data
+        form</b> — the maximally unenforceable store. Once <code>after_blob_id</code> is the only pointer to the only
+        copy of a proof, a dangling reference is a <b>silently lost proof</b>, and
+        <code>json_extract(data,'$.after_blob_id')</code> can't be <code>NOT NULL</code> or <code>CHECK</code>ed.</span>
+        So: typed columns for anything carrying a guarantee, JSON only for what genuinely varies per tool (args,
+        previews, diagnostics). <b>This is what opencode actually does</b> — <code>summary_additions</code>/
+        <code>summary_deletions</code>/<code>summary_files</code> are typed columns on <code>session</code> <i>beside</i>
+        the JSON part data.
+        <b>It also doesn't contradict the STORAGE doc</b>, which rejected a <i>fully generic</i>
+        <code>timeline_events(type, data_json)</code> because Lea's five core queries would go through JSON parsing.
+        With typed columns they stay simple — proof history is <code>where after_blob_id is not null order by id</code>
+        + a partial index. The doc still needs rewriting, recording <i>why</i> the rejection no longer applies rather
+        than quietly contradicting it.
+        <b>Honest limit:</b> a typed column buys <code>NOT NULL</code>/<code>CHECK</code> (enforced regardless) but
+        <b>not</b> referential integrity — <code>foreign_keys</code> is <b>off</b> repo-wide because
+        <code>delete_project_cascade</code>'s cascades are hand-written to depend on that. Turning it on gets much more
+        valuable once a dangling pointer means a lost proof; that's <b>its own item</b>, not smuggled into this one.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Capture rule: blob on <code>FileChanged</code>, read from disk. No new mechanism needed.</b>
         <code>events.py:56</code> already states the contract — FileChanged carries <i>"<code>path</code> only; the
