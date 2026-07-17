@@ -277,20 +277,40 @@
     <div class="todo is-planned">
       <div class="top"><span class="id">2</span><span class="title">Demote git: SQL owns content, git becomes transport</span>
         <span class="tag be">adapter</span><span class="badge b-prog">Expand done · supersedes old 2 + 3 + 23</span></div>
-      <div class="scope" style="color:var(--ink-2)"><b>Landed: <code>0003_timeline_and_blobs</code> — the expand step.</b>
-        <code>timeline</code> + <code>artifact_blobs</code> exist; nothing reads/writes them yet, old tables untouched,
-        no behaviour change. <b>expand → migrate → contract</b> so any stage can fail recoverably. <b>Next:
-        <code>0004</code> backfill</b>, then switch <code>bridge.py</code>, then drop the old tables.
+      <div class="scope" style="color:var(--ink-2)"><b>Landed: <code>0003</code> (expand) + <code>0004</code>
+        (backfill).</b> The tables exist and every legacy row is carried into them; old tables are still untouched and
+        nothing reads <code>timeline</code> yet. <b>expand → migrate → contract</b> so any stage fails recoverably.
+        <b>Next: switch <code>bridge.py</code> to write blobs</b>, then drop the old tables.
+        <b>Verified on a copy of the real DB:</b> 82 messages + 32 code_steps → <b>114 timeline rows</b>, content
+        recovered <b>31</b>, lost <b>1</b>, <b>27</b> distinct blobs, and <b>old <code>seq</code> order ==  new
+        <code>id</code> order for every session</b> (the message/code interleave the shared counter existed for).
+        The <code>role</code>/<code>kind</code> incoherence is resolved in the process: the 26 rows that were
+        <code>role='user'</code> + <code>kind='assistant'</code> are now plainly <code>kind='message'</code> +
+        <code>author='user'</code>. Migration is automatic on startup — an older DB upgrades by launching the app;
+        nothing to run by hand. Guarded on <code>timeline</code> being empty so a re-run after a restore can't double
+        rows.
         <b>CHECKs are tested to <i>reject</i></b>, not merely to exist — including <code>artifact_kind</code> requiring
         <code>check_status='ok'</code>, which was enforced in Python and could therefore drift.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
-        <b>🔴 Found while designing 0003: 20 of the 32 <code>code_steps</code> are <i>already unrecoverable</i>.</b>
-        <span class="fix">Six sessions hold DB rows pointing at git repos that no longer exist —
-        <code>reset-local-state.mjs</code> deletes the proofs dir while the SQLite rows survive. This is the
-        "two sources of truth with no reconciliation" hazard <b>in the live data</b>, not in theory. 0004 cannot restore
-        them.</span> <b>Owner's call: record, don't delete</b> — <code>content_lost=1</code>, since losing the bytes is
-        already a failure and deleting the user's history compounds it. That marker is also what lets the
-        content-pointer CHECK stay strict for every row we <i>can</i> back.
+        <b>🔴 A git pointer in the live DB is <i>wrong</i>, and always was — the sharpest evidence for this item.</b>
+        <span class="fix">One <code>code_step</code> reads <code>RealLeAbsSelf.lean @ 51b6adf</code>. Commit
+        <code>51b6adf</code>'s subject is <b>"edit .lea/memory.md"</b> and its tree <b>does not contain the file</b>.
+        That is <code>commit_write</code>'s early return — <code>staged = git diff --cached --name-only;
+        if not staged: return git rev-parse HEAD</code> — handing back an <i>unrelated</i> commit's sha. The pointer
+        was wrong <b>the moment it was written</b> and nothing ever verified the sha contained the path.</span>
+        This is the synthetic hazard measured above (24 writes → 1 commit, rows sharing a sha) <b>found in production
+        data</b>. <b>No lock would have caught it</b> — which is exactly why content moves behind a constraint-checked
+        column instead of an unverified pointer into a second store.
+        <b>Owner's call: record, don't delete</b> — <code>content_lost=1</code>. Losing the bytes is already a failure;
+        deleting the user's history compounds it. The marker is what lets the content-pointer CHECK stay strict for
+        every row we <i>can</i> back.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Correction — an earlier entry here claimed "20 of 32 code_steps unrecoverable". That was wrong: the true
+        number is 1.</b> <span class="fix">The measurement looked only at <code>proofs/&lt;session-id&gt;</code>, but
+        <b>6 of the 8 sessions are project sessions</b> whose content lives in the <i>shared</i> repo
+        <code>proofs/Lea/&lt;Project&gt;</code> (D24). The repos were never deleted. <b>31 of 32 recover.</b> Mis-resolving
+        a project repo doesn't fail loudly — it <i>silently reports content as lost</i>, so
+        <code>test_project_sessions_resolve_the_shared_repo</code> now pins it.</span>
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Correction — dedup is NOT why blobs are a separate table.</b> Measured on the real data: ratio <b>0.83</b>
         (18% saved), which wouldn't justify a join. Each write <i>changes</i> the file, so consecutive steps are
