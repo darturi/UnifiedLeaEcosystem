@@ -43,10 +43,30 @@ def _config() -> Config:
     return cfg
 
 
+def head_revision() -> str | None:
+    """The newest revision on disk (what `upgrade` would migrate *to*)."""
+    from alembic.script import ScriptDirectory
+
+    return ScriptDirectory.from_config(_config()).get_current_head()
+
+
 def upgrade_to_head() -> None:
     """Bring the database at `db.DB_PATH` up to the latest revision.
 
-    Idempotent: already-current is a no-op. Safe to call on every startup."""
+    Idempotent: already-current is a no-op, and takes no snapshot — startup must not
+    accumulate a backup per boot.
+
+    When a migration *is* pending, the database is snapshotted first (`backup.py`).
+    Now that SQL owns proof content, a bad revision is the event most likely to
+    destroy the user's work, and it is the one moment we always see coming. If the
+    snapshot fails the migration does not run: refusing to start is recoverable,
+    migrating the only copy without a fallback is not."""
+    current = current_revision()
+    if current != head_revision():
+        from .backup import snapshot
+
+        snapshot(tag=current or "unstamped")  # raises BackupError -> no migration
+
     command.upgrade(_config(), "head")
 
 

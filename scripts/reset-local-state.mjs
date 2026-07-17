@@ -87,8 +87,19 @@ function writeJsonFile(label, filePath, value) {
   console.log(`${dryRun ? "Would write" : "Wrote"} ${rel(filePath)}`);
 }
 
+// `data/backups/` holds pre-migration snapshots (adapter/app/backup.py) and is the
+// recovery path now that SQL — not git — owns proof content. It must survive a
+// reset: a safety net that vanishes exactly when someone reaches for it is worse
+// than none, since "just reset it" is precisely what you try when things look
+// broken. Everything else under data/ is still fair game.
+const BACKUPS_DIR_NAME = "backups";
+const isInBackups = (filePath) =>
+  path.relative(uiDataDir, filePath).split(path.sep).includes(BACKUPS_DIR_NAME);
+
 const isSqlite = (filePath, isDir) =>
-  !isDir && /\.(db|sqlite|sqlite3)(-(journal|shm|wal))?$/.test(path.basename(filePath));
+  !isDir &&
+  !isInBackups(filePath) &&
+  /\.(db|sqlite|sqlite3)(-(journal|shm|wal))?$/.test(path.basename(filePath));
 const sqliteFiles = [
   ...collectEntries(uiDataDir, isSqlite, [], true),
   ...collectEntries(legacyUiDataDir, isSqlite, [], true),
