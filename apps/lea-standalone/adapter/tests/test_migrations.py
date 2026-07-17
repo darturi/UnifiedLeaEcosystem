@@ -30,6 +30,11 @@ BASELINE_TABLES = {
 }
 
 
+def _cols(path, table: str) -> set[str]:
+    with sqlite3.connect(path) as conn:
+        return {r[1] for r in conn.execute(f"pragma table_info({table})")}
+
+
 def _tables(path) -> set[str]:
     with sqlite3.connect(path) as conn:
         return {
@@ -82,6 +87,57 @@ def test_baseline_is_a_noop_on_a_preexisting_database(tmp_path, monkeypatch):
         rows = conn.execute("select title from sessions").fetchall()
     assert rows == [("keep me",)], "baseline destroyed pre-existing data"
     assert migrations.current_revision() is not None
+
+
+def test_reconcile_repairs_a_legacy_database_missing_artifact_kind(tmp_path, monkeypatch):
+    """The real drift, reproduced: this repo's actual database was missing
+    `code_steps.artifact_kind` (added in 98d69ef) because `create table if not
+    exists` never alters an existing table. It looked healthy and threw
+    `OperationalError: table code_steps has no column named artifact_kind` on the
+    next write.
+
+    The legacy DB is built by genuinely removing the column, so this fails without
+    revision 0002 rather than passing vacuously."""
+    path = _fresh(tmp_path, monkeypatch)
+    db.init_db()
+
+    # Rewind to the pre-98d69ef shape, keeping a row to prove data survives.
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "insert into sessions (id, title, origin, created_at, updated_at)"
+            " values ('s1','legacy','ui','t','t')"
+        )
+        conn.execute(
+            "insert into code_steps (id, session_id, seq, path, commit_sha, author, created_at)"
+            " values ('c1','s1',1,'p.lean','deadbeef','agent','t')"
+        )
+        conn.execute("alter table code_steps drop column artifact_kind")
+        conn.execute("delete from alembic_version")  # unstamped, as it really was
+        conn.commit()
+
+    assert "artifact_kind" not in _cols(path, "code_steps"), "precondition: drift not reproduced"
+
+    db.init_db()  # adopt + reconcile
+
+    assert "artifact_kind" in _cols(path, "code_steps"), "0002 did not repair the drift"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("select path from code_steps").fetchall() == [("p.lean",)]
+
+    # The actual symptom must be gone: a write that used to raise now works.
+    from app import store
+    session = store.create_session("after repair")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+    store.add_code_step(session["id"], run["id"], "q.lean", commit_sha="b" * 40)
+
+
+def test_reconcile_is_a_noop_when_the_column_is_already_present(tmp_path, monkeypatch):
+    """A database created *after* 98d69ef already has the column. An unconditional
+    add_column would fail on it — which is why 0002 inspects first."""
+    path = _fresh(tmp_path, monkeypatch)
+    db.init_db()
+    assert "artifact_kind" in _cols(path, "code_steps")
+    db.init_db()  # must not raise "duplicate column name"
+    assert "artifact_kind" in _cols(path, "code_steps")
 
 
 def test_env_resolves_url_from_db_path_not_the_ini(tmp_path, monkeypatch):
