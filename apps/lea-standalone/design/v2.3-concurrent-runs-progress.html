@@ -119,8 +119,8 @@
     edited the proof files since your last turn."</i>
   </div>
 
-  <div class="bar"><i style="width:10%"></i></div>
-  <div class="counts"><b>3 / 26 built · 2 / 26 tested</b> · 14 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
+  <div class="bar"><i style="width:15%"></i></div>
+  <div class="counts"><b>4 / 26 built · 3 / 26 tested</b> · 14 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
     <b>1 and 3 are landed and green; 2 is mid-flight</b> — <code>0003</code> created
     <code>timeline</code>+<code>artifact_blobs</code> (expand); next is the <code>0004</code> backfill, then switching
     <code>bridge.py</code>, then dropping the old tables. 308 tests pass. <b>27 → 25 → 26:</b> the old 2 + 3 + 23
@@ -274,13 +274,55 @@
         <b>Tests:</b> new <code>test_db_seq_concurrent.py</code> (3 tests) — <b>10/10 runs fail on <code>main</code></b>,
         5/5 pass with the fix, and the full 290-test suite is green.</div>
     </div>
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id">2</span><span class="title">Demote git: SQL owns content, git becomes transport</span>
-        <span class="tag be">adapter</span><span class="badge b-prog">Expand done · supersedes old 2 + 3 + 23</span></div>
+        <span class="tag be">adapter</span><span class="badge b-tested">Switched ✓ · contract pending · supersedes old 2 + 3 + 23</span></div>
       <div class="scope" style="color:var(--ink-2)"><b>Landed: <code>0003</code> (expand) + <code>0004</code>
-        (backfill).</b> The tables exist and every legacy row is carried into them; old tables are still untouched and
-        nothing reads <code>timeline</code> yet. <b>expand → migrate → contract</b> so any stage fails recoverably.
-        <b>Next: switch <code>bridge.py</code> to write blobs</b>, then drop the old tables.
+        (backfill) + <b>the switch</b> (<code>c831fee</code>).</b> <code>bridge.py</code> no longer commits to git: it
+        reads the file's after-state and stores it as a content-addressed blob, and <code>timeline</code> replaces
+        <code>messages</code> + <code>code_steps</code>. Readers moved in the <i>same</i> commit — a writer and a
+        reader pointed at different tables is not a state worth having, even briefly.
+        <b>Cut over directly rather than dual-writing</b>: two stores that can disagree is precisely the failure being
+        deleted, and item 3's snapshots are the recovery path. <b>expand → migrate → switch → contract</b>, so any
+        stage fails recoverably. <b>Remaining: drop the old tables</b> (a separate revision — until it runs, a restored
+        snapshot can still be inspected against the rows it came from).
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Three failure classes deleted, not fixed.</b>
+        <span class="fix">(1) <b>The seq race is gone by design</b> — <code>timeline.id</code> is an autoincrement PK,
+        so the position is assigned by SQLite under the write lock. No read-then-write remains to lose, so a future
+        writer can't get it wrong by forgetting a lock. (2) <b>Hydration is gone</b> — the read path used to shell out
+        to <code>git show &lt;sha&gt;:&lt;path&gt;</code> and degrade to <code>code: ""</code> on failure, i.e. a real
+        proof rendering as an empty canvas with no error. Content arrives with the row. (3) <b>Pointer/content
+        disagreement is unrepresentable</b> — there is one store.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Same root cause, fixed here: <code>_divergence_context</code> was repo-wide</b> (the old item 3 hazard).
+        <span class="fix">It ran <code>git diff &lt;sha&gt; HEAD</code> across the whole tree, so in a <b>shared project
+        repo (D24)</b> an edit to <i>any</i> file — including one belonging to a different session — reported as this
+        session's divergence and got pasted into its task. Now per-file, comparing the agent's stored content against
+        disk: the two things it actually claims to compare.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Measured, and the guess was wrong.</b>
+        <span class="fix">Racing <code>_put_blob</code> on a plain <code>connect()</code> (the exact shape
+        <code>_next_seq</code> had) does <b>not</b> silently duplicate: 8×25 identical writes gave <b>1 blob and 4
+        loud IntegrityErrors</b> — <code>sha256 UNIQUE</code> makes the race impossible to hide. That's the structural
+        difference from the old counter, which had <i>no constraint behind it</i>, which is why its race was invisible.
+        So the assertion with teeth is <code>not errors</code>, not the blob count. The test says so rather than
+        claiming a duplication that doesn't happen.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ Known gap (pre-existing, not introduced):</b>
+        <span class="fix"><code>PUT /api/projects/{id}/file</code> — the project file explorer — writes a
+        <code>.lean</code> to disk + git and creates <b>no timeline row</b>, so that content isn't in SQL. It never
+        created a <code>code_step</code> either, so this isn't a regression; but it <i>is</i> an exception to "SQL owns
+        proof content" and should be closed before the invariant is stated without caveat.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Tests inverted, not deleted.</b>
+        <span class="fix">The files pinning the old contract now pin the new one and say what changed and why:
+        <code>seq</code> no longer restarts per session and is no longer contiguous — both deliberate, since the
+        frontend already invented fractional seqs (<code>+0.5</code>, <code>+1e-4</code> in
+        <code>useProofStream</code>), so contiguity was never real. <b>326 adapter + 45 frontend tests, tsc clean.</b>
+        <code>CLAUDE.md</code>'s "proof bytes live in git" invariant was rewritten in the same commit that made it
+        false.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Verified on a copy of the real DB:</b> 82 messages + 32 code_steps → <b>114 timeline rows</b>, content
         recovered <b>31</b>, lost <b>1</b>, <b>27</b> distinct blobs, and <b>old <code>seq</code> order ==  new
         <code>id</code> order for every session</b> (the message/code interleave the shared counter existed for).
@@ -422,10 +464,11 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         (<code>tools.py</code> description, echoed at <code>prompt.py:95</code>), and
         <code>FileChanged</code> fires <b>only</b> for <code>write_file</code>/<code>edit_file</code>, only on
         <code>.lean</code>, only on success (<code>agent.py:260-266</code>). So a bash-created file emits no event.
-        <span class="fix">Today <code>bridge.py:483</code> does <code>if step_id:</code> — <b>a bash-created file that
-        compiles fine has its verdict silently dropped</b>: no code_step, invisible in canvas and timeline. Fix: when
-        <code>CheckResult</code> (which carries a path, <code>events.py:66</code>) arrives with no step for that path,
-        blob the file and create the step, attributed <code>out-of-band</code>.</span> Bounded by design: a
+        <span class="fix"><b>Fixed in <code>c831fee</code>.</b> <code>bridge.py</code> used to do
+        <code>if step_id:</code> — <b>a bash-created file that compiled fine had its verdict silently dropped</b>: no
+        code_step, invisible in canvas and timeline. Now a <code>CheckResult</code> (which carries a path,
+        <code>events.py:66</code>) with no step for that path <b>reads the file, blobs it and creates the step</b>
+        carrying the verdict. A verdict with nowhere to go is a result the user never sees.</span> Bounded by design: a
         bash-written <code>.lean</code> nobody compiles is dead weight. Note this is a <i>coverage</i> hole, not a
         concurrency one — <b>resource locks are a declaration, not a sandbox</b>; nothing stops bash writing an
         undeclared path. Still far smaller than <code>add -A</code>, which contaminates by design rather than by
@@ -449,13 +492,15 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         someone else's theorem, which the agent may then go edit. Same on the canvas-save path
         (<code>uncommitted_diff</code> + <code>routes/sessions.py:149</code>); the modal editor lock is per-session, so
         it doesn't stop a human saving in session A while an agent drives session B of the same project. Blob-diffing
-        makes the scoping natural (query this session's paths) but <b>not automatic</b> — it stays an explicit
-        acceptance criterion, with <code>test_bridge_divergence.py</code>. <b>Fails today.</b>
+        makes the scoping natural (query this session's paths) but <b>not automatic</b> — it stayed an explicit
+        acceptance criterion. <b>Fixed in <code>c831fee</code>:</b> per-file now, comparing the agent's stored content
+        against disk. The canvas-save path's <code>uncommitted_diff</code> is gone with it — the no-op check compares
+        bytes to the stored step instead of asking git whether HEAD moved.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Surface:</b> 8 app modules (<code>gitstore</code>, <code>bridge</code>, <code>projects</code>,
         <code>uploads</code>, <code>filesystem</code>, <code>ghimport</code>, <code>routes/{sessions,projects}</code>)
-        + 6 test files. <b>Also update <code>CLAUDE.md</code> in the same PR</b> — "Git owns proof content / proof bytes
-        live in git, not the DB" is a documented invariant this deliberately inverts, and it must change where it
+        + 6 test files. <b>✓ <code>CLAUDE.md</code> updated in the same commit</b> — "Git owns proof content / proof
+        bytes live in git, not the DB" was a documented invariant this deliberately inverts, and it changed where it
         becomes false, not later. <b>Flag on the STORAGE doc's schema:</b> its proposed <code>patch, additions,
         deletions</code> columns are <i>derived</i> from the before/after blobs — either compute on read or label them a
         cache explicitly, or it's <code>_next_seq</code> again (a comment asserting what nothing enforces).</div>
@@ -464,6 +509,28 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
       <div class="top"><span class="id">3</span><span class="title">Migrations — the DB stops being disposable</span>
         <span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope" style="color:var(--ink-2)">
+        <b>Snapshots landed (<code>5e22338</code>) — the recovery path, now that losing the DB means losing proofs.</b>
+        <span class="fix">Any <i>pending</i> migration snapshots the DB first (<code>app/backup.py</code> →
+        <code>data/backups/</code>, newest 5 kept); already-current startups take none, so boots don't accumulate
+        backups. <b>A failed snapshot aborts the migration</b> — refusing to start is recoverable, migrating the only
+        copy without a fallback isn't. Uses SQLite's <b>online backup API</b>, not <code>cp</code>: a probe did
+        <i>not</i> reproduce <code>cp</code> tearing a live file, but the write window was tiny, so that's evidence the
+        test was weak — not that the copy is safe. <b>The old tables are not a backup</b>: they freeze at the cutover
+        and go stale immediately. Neither is git, once it stops accumulating.
+        <b>Also fixed <code>reset:local</code></b>, which recursively globs <code>*.sqlite3</code> and would have
+        deleted the snapshots — a safety net that vanishes exactly when you reach for it is worse than none, since
+        "just reset it" is what you try when things look broken.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>⚠️ The bug the tests caught is the one worth remembering.</b>
+        <span class="fix"><code>backup.py</code> did <code>from .db import DB_PATH</code>, which <b>binds at import
+        time</b> — so redirecting <code>db.DB_PATH</code> didn't move it and it copied the <b>real database</b> during
+        test runs. That is the <i>identical</i> hazard <code>env.py</code> has a comment warning about ("a hardcoded URL
+        would silently migrate the developer's real database") — reproduced one file over. Everything resolves through
+        the module per call now. Second: <code>DB_PATH.exists()</code> is not a proxy for "there is a database" —
+        opening a connection <i>creates</i> the file, so every fresh install backed up an empty one. The check had to
+        be <b>"has tables"</b>, not "is unstamped", because a <b>legacy unstamped DB full of rows</b> is exactly the
+        case that most needs a snapshot.</span>
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>🔥 It found a live bug within minutes of existing — the best argument for it isn't in this tracker.</b>
         <span class="fix">The repo's <b>real database was broken for writes</b>: <code>code_steps.artifact_kind</code>
         (added in <code>98d69ef</code>) was <b>absent</b>, because <code>create table if not exists</code> never alters
