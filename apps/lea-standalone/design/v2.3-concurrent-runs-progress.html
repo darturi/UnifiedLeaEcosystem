@@ -119,15 +119,16 @@
     edited the proof files since your last turn."</i>
   </div>
 
-  <div class="bar"><i style="width:4%"></i></div>
-  <div class="counts"><b>1 / 26 built · 1 / 26 tested</b> · 14 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
-    <b>1 is landed and green</b> (10/10 runs fail on <code>main</code>, 5/5 pass with the fix, full 290-test suite
-    green). <b>27 → 25 → 26:</b> the old 2 + 3 + 23 collapsed into the new <b>2</b> (measurement showed the git lock
-    and the path-scoped <code>add</code> are one change, and that <i>either half alone is worse than today</i> — which
-    removed the case for a partial git fix and opened the case for dropping git as the store); then <b>3</b> was added
-    back for migrations, which item 2 forces by making the DB non-disposable. <b>Next: 3 → 2</b> (3 blocks 2 — no
-    schema change without a migration path now that SQL holds the only copy). Every concurrency test here is
-    <b>written to fail on <code>main</code> first</b>; that's the evidence these hazards are real, not theoretical.
+  <div class="bar"><i style="width:10%"></i></div>
+  <div class="counts"><b>3 / 26 built · 2 / 26 tested</b> · 14 adapter/prover + 4 frontend + 8 subagent across 9 phases ·
+    <b>1 and 3 are landed and green; 2 is mid-flight</b> — <code>0003</code> created
+    <code>timeline</code>+<code>artifact_blobs</code> (expand); next is the <code>0004</code> backfill, then switching
+    <code>bridge.py</code>, then dropping the old tables. 308 tests pass. <b>27 → 25 → 26:</b> the old 2 + 3 + 23
+    collapsed into the new <b>2</b> (measurement showed the git lock and the path-scoped <code>add</code> are one
+    change, and that <i>either half alone is worse than today</i> — which removed the case for a partial git fix and
+    opened the case for dropping git as the store); then <b>3</b> was added back for migrations, which item 2 forces by
+    making the DB non-disposable. Every concurrency test here is <b>written to fail on <code>main</code> first</b> —
+    and item 3 went one better, finding a <b>live broken database</b> rather than a predicted one.
     <b>✅ 2's schema is settled</b> — the C4 counter call resolved by merging <code>messages</code> +
     <code>code_steps</code> into one <code>timeline</code> table, which makes item 1's race <b>unrepresentable</b>
     rather than defended against. Item 1 is superseded-by-design — the intended outcome, not waste: it proved the bug
@@ -275,7 +276,28 @@
     </div>
     <div class="todo is-planned">
       <div class="top"><span class="id">2</span><span class="title">Demote git: SQL owns content, git becomes transport</span>
-        <span class="tag be">adapter</span><span class="badge b-planned">Planned · supersedes old 2 + 3 + 23</span></div>
+        <span class="tag be">adapter</span><span class="badge b-prog">Expand done · supersedes old 2 + 3 + 23</span></div>
+      <div class="scope" style="color:var(--ink-2)"><b>Landed: <code>0003_timeline_and_blobs</code> — the expand step.</b>
+        <code>timeline</code> + <code>artifact_blobs</code> exist; nothing reads/writes them yet, old tables untouched,
+        no behaviour change. <b>expand → migrate → contract</b> so any stage can fail recoverably. <b>Next:
+        <code>0004</code> backfill</b>, then switch <code>bridge.py</code>, then drop the old tables.
+        <b>CHECKs are tested to <i>reject</i></b>, not merely to exist — including <code>artifact_kind</code> requiring
+        <code>check_status='ok'</code>, which was enforced in Python and could therefore drift.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>🔴 Found while designing 0003: 20 of the 32 <code>code_steps</code> are <i>already unrecoverable</i>.</b>
+        <span class="fix">Six sessions hold DB rows pointing at git repos that no longer exist —
+        <code>reset-local-state.mjs</code> deletes the proofs dir while the SQLite rows survive. This is the
+        "two sources of truth with no reconciliation" hazard <b>in the live data</b>, not in theory. 0004 cannot restore
+        them.</span> <b>Owner's call: record, don't delete</b> — <code>content_lost=1</code>, since losing the bytes is
+        already a failure and deleting the user's history compounds it. That marker is also what lets the
+        content-pointer CHECK stay strict for every row we <i>can</i> back.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Correction — dedup is NOT why blobs are a separate table.</b> Measured on the real data: ratio <b>0.83</b>
+        (18% saved), which wouldn't justify a join. Each write <i>changes</i> the file, so consecutive steps are
+        naturally distinct; dedup only pays on cascade steps, reverts and cross-session repeats. <span class="fix">The
+        reasons that survive: <b>access pattern</b> (timeline is scanned hot and ordered; content is cold, fetched once
+        per canvas open), <b>the object-storage seam</b> for binaries — inline content has nowhere to move to — and
+        many-to-one being <i>true modelling</i>.</span></div>
       <div class="scope"><b>Absorbs the old "per-repo lock", "path-scope the diffs", and "shadow <code>GIT_DIR</code>"
         items — all three defended a store we're removing.</b> Content moves to a content-addressed blob table
         (<code>artifact_blobs(id, sha256, content)</code> + <code>code_steps.before/after_blob_id</code>) — the direction
@@ -418,9 +440,49 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         deletions</code> columns are <i>derived</i> from the before/after blobs — either compute on read or label them a
         cache explicitly, or it's <code>_next_seq</code> again (a comment asserting what nothing enforces).</div>
     </div>
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id">3</span><span class="title">Migrations — the DB stops being disposable</span>
-        <span class="tag be">adapter</span><span class="badge b-planned">Planned · blocks 2</span></div>
+        <span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope" style="color:var(--ink-2)">
+        <b>🔥 It found a live bug within minutes of existing — the best argument for it isn't in this tracker.</b>
+        <span class="fix">The repo's <b>real database was broken for writes</b>: <code>code_steps.artifact_kind</code>
+        (added in <code>98d69ef</code>) was <b>absent</b>, because <code>create table if not exists</code> never alters
+        an existing table and the old policy's answer — "a schema change means a fresh DB" — only works if you reset
+        <i>every</i> time. This DB (Jul 8, predating that commit) didn't. Measured, not hypothetical:
+        <code>add_code_step → OperationalError: table code_steps has no column named artifact_kind</code>. It looked
+        healthy and failed on write.</span> That also proved <code>0001_baseline</code> alone was <b>dishonest</b> — it
+        stamps a legacy DB "at baseline" when it isn't; the first no-op test couldn't catch it because it built its
+        "pre-existing" DB <i>from</i> the baseline.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Shipped:</b> <code>0001_baseline</code> (frozen, <b>extracted</b> from <code>db.py</code> and verified
+        byte-identical — not retyped; <code>db.py</code> shed 190 lines and <code>init_db()</code> is now a wrapper) ·
+        <code>0002_reconcile_legacy_drift</code> (repairs the above; <b>conditional by necessity</b> — there is no
+        single pre-Alembic state to migrate <i>from</i>, since a DB made after <code>98d69ef</code> has the column and
+        one made before doesn't, and both stamp <code>0001</code>). Verified on a <b>copy</b> of the real DB: column
+        restored, 8 sessions / 32 code_steps / 82 messages intact, the failing write now succeeds.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Four bugs the tests caught — each one I had asserted was fine.</b>
+        <b>(1) Atomic revisions on SQLite need <i>three</i> things.</b> Alembic logs <i>"Will assume non-transactional
+        DDL"</i> and its SQLite dialect hardcodes <code>transactional_ddl=False</code>; a failed revision left its
+        <code>create table c</code> behind. <code>transaction_per_migration</code> + <code>transactional_ddl=True</code>
+        <b>still didn't fix it</b> — the load-bearing piece is forcing a real <code>BEGIN</code>, because
+        <span class="fix">it is the <b>same pysqlite quirk as item 1</b>: the driver opens its implicit transaction only
+        before INSERT/UPDATE/DELETE — not before SELECT (item 1), and <b>not before DDL</b>. One driver quirk produced
+        both the silent seq corruption and non-atomic migrations.</span>
+        <b>(2)</b> Alembic's engine doesn't inherit <code>busy_timeout</code> → concurrent startup died with
+        <code>database is locked</code> (test has teeth: <code>timeout=0</code> makes it fail).
+        <b>(3)</b> <code>current_revision()</code> passed a raw sqlite3 conn where SQLAlchemy was required.
+        <b>(4)</b> The generated <code>fileConfig()</code> races across threads (<code>KeyError: 'config'</code>).
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>The concurrency test uses PROCESSES, not threads</b> — <code>alembic.context</code> is a module-level global
+        proxy, so two threads calling <code>command.upgrade()</code> in one interpreter destroy each other's state.
+        That's not the deployment shape (N worker processes, own interpreters, serializing on SQLite's write lock), so
+        a thread test would fail for a reason production never hits. <b><code>alembic.ini</code>'s url is deliberately
+        empty</b>; <code>env.py</code> resolves from <code>db.DB_PATH</code> at call time — a hardcoded url would
+        migrate the developer's real DB during the suite.
+        <b>Cost:</b> +3 deps (alembic, sqlalchemy, mako); suite ~4s slower (every test DB now migrates).
+        <b>⏳ Deadline:</b> <code>reset:local</code> is still a safe recovery answer <i>today</i> because git owns
+        content — it stops being safe the moment 2 lands.</div>
       <div class="scope"><b>Item 2 kills a documented policy, so it has to be replaced in the same breath.</b>
         <code>db.py</code> states it outright: <i>"No in-place ALTER migrations anywhere: v2 is a clean rebuild (no
         backward compat — <b>single user, disposable/rebuildable DB</b>) … a schema change means a fresh DB
