@@ -20,6 +20,7 @@ dependencies = [
   # The vendored prover, imported in-process as a library (D1/D20). Editable
   # path dep so edits under prover/lea are picked up without re-syncing.
   "lea-prover",
+  "alembic>=1.18.5",
 ]
 
 [tool.uv.sources]
