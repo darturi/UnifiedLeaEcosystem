@@ -20,15 +20,15 @@ def test_init_db_creates_the_authoritative_v2_schema(tmp_path, monkeypatch):
     assert "pending_approval" in columns
     assert "transcript" in columns  # the multi-turn replay conversation (D16)
     with sqlite3.connect(db_path) as conn:
-        code_step_columns = [row[1] for row in conn.execute("pragma table_info(code_steps)").fetchall()]
-    # code_steps is a git pointer + verdict, not file text
-    assert "commit_sha" in code_step_columns
-    assert "author" in code_step_columns
-    assert "check_status" in code_step_columns
-    assert "check_detail" in code_step_columns
-    assert "artifact_kind" in code_step_columns
-    assert "code" not in code_step_columns
-    assert "used_project_formalizations" not in code_step_columns
+        timeline_columns = [row[1] for row in conn.execute("pragma table_info(timeline)").fetchall()]
+    # a code row carries its content (via a blob) + verdict; the git pointer is gone
+    assert "after_blob_id" in timeline_columns
+    assert "author" in timeline_columns
+    assert "check_status" in timeline_columns
+    assert "check_detail" in timeline_columns
+    assert "artifact_kind" in timeline_columns
+    assert "commit_sha" not in timeline_columns
+    assert "used_project_formalizations" not in timeline_columns
     with sqlite3.connect(db_path) as conn:
         usage_columns = [row[1] for row in conn.execute("pragma table_info(run_usage_breakdown)").fetchall()]
     assert "phase" in usage_columns
@@ -46,10 +46,10 @@ def test_session_status_ignores_scratch_files(tmp_path, monkeypatch):
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
     # The real proof errored…
     store.add_code_step(session["id"], run["id"], "Lea/Misc/Foo.lean",
-                        commit_sha="a" * 40, check_status="error")
+                        content="proof-a", check_status="error")
     # …then a later scratch probe compiled cleanly.
     store.add_code_step(session["id"], run["id"], "Lea/Misc/scratch.lean",
-                        commit_sha="b" * 40, check_status="ok")
+                        content="proof-b", check_status="ok")
 
     detail = store.session_detail(session["id"])
     assert detail["status"] == "error", "scratch 'ok' must not mask the real proof's error"
@@ -66,7 +66,7 @@ def test_safe_verify_persists_on_latest_run(tmp_path, monkeypatch):
     session = store.create_session("Verify me")
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
     store.add_code_step(session["id"], run["id"], "Lea/Misc/Foo.lean",
-                        commit_sha="a" * 40, check_status="ok")
+                        content="proof-a", check_status="ok")
 
     assert store.session_detail(session["id"])["safe_verify"] is None
     store.set_session_safe_verify(session["id"], "ok", None)
@@ -80,7 +80,7 @@ def test_session_status_scratch_only_is_empty(tmp_path, monkeypatch):
     session = store.create_session("Probes only")
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
     store.add_code_step(session["id"], run["id"], "Lea/Misc/Scratch.lean",  # capital → case-insensitive
-                        commit_sha="c" * 40, check_status="ok")
+                        content="proof-c", check_status="ok")
     # While the run is active, an in-progress session reads 'running' — an active run
     # with no *real* proof yet still surfaces as in-progress (the 'running' feature).
     assert store.session_detail(session["id"])["status"] == "running"
@@ -115,7 +115,7 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
         session["id"],
         run["id"],
         "workspace/proofs/test.lean",
-        commit_sha="a1b2c3d4" * 5,
+        content="theorem t : True := by trivial",
         summary="Turn 2: wrote the proof skeleton.",
         turn=2,
         check_status="ok",
@@ -136,11 +136,12 @@ def test_session_messages_and_code_steps_persist(tmp_path, monkeypatch):
     assert detail["active_run"]["id"] == run["id"]
     assert detail["active_run"]["pending_approval"]["approval_id"] == "ap-1"
     assert detail["code_steps"][0]["id"] == step["id"]
-    # shared timeline seq (C4): the message took seq 1, the code_step seq 2
-    assert detail["messages"][0]["seq"] == 1
-    assert detail["code_steps"][0]["seq"] == 2
+    # one timeline (C4): the message came first, the code step after it. This used
+    # to assert seq == 1 and 2 — a shared per-session counter. It's now the table's
+    # autoincrement id, so the *order* is the contract and the values are not.
+    assert detail["messages"][0]["seq"] < detail["code_steps"][0]["seq"]
     assert detail["code_steps"][0]["author"] == "agent"
-    assert detail["code_steps"][0]["commit_sha"] == "a1b2c3d4" * 5
+    assert detail["code_steps"][0]["code"] == "theorem t : True := by trivial"
     assert detail["code_steps"][0]["check_status"] == "ok"
     assert detail["code_steps"][0]["summary"].startswith("Turn 2")
     assert detail["code_steps"][0]["turn"] == 2
@@ -532,14 +533,13 @@ def test_latest_agent_code_step_and_edit_notes_since(tmp_path, monkeypatch):
     session = store.create_session("Divergence helpers")
     run = store.create_run(session["id"], "m", None, 3)
     agent_step = store.add_code_step(session["id"], run["id"], "p.lean",
-                                     commit_sha="a" * 40, author="agent", turn=1)
+                                     content="proof-a", author="agent", turn=1)
     # a user edit + note land after the agent's step
-    store.add_code_step(session["id"], None, "p.lean", commit_sha="b" * 40, author="user")
-    store.add_message(session["id"], "user", "swapped a lemma", None,
-                      kind="edit_note", commit_sha="b" * 40)
+    store.add_code_step(session["id"], None, "p.lean", content="proof-b", author="user")
+    store.add_message(session["id"], "user", "swapped a lemma", None, kind="edit_note")
 
     latest_agent = store.latest_agent_code_step(session["id"])
-    assert latest_agent["commit_sha"] == "a" * 40  # the agent step, not the later user one
+    assert latest_agent["code"] == "proof-a"  # the agent step, not the later user one
     # notes recorded after the agent's timeline position
     assert store.edit_notes_since(session["id"], agent_step["seq"]) == ["swapped a lemma"]
     # nothing after a later position

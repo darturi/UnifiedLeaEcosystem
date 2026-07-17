@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -116,8 +117,8 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                 count(distinct r.id) as run_count,
                 (
                     select count(*)
-                    from messages m
-                    where m.session_id = s.id
+                    from timeline m
+                    where m.session_id = s.id and m.kind != 'code'
                 ) as message_count,
                 (
                     select r2.model
@@ -136,29 +137,33 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                 s.updated_at as ended_at,
                 (
                     select cs.check_status
-                    from code_steps cs
-                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
-                    order by cs.seq desc
+                    from timeline cs
+                    where cs.session_id = s.id and cs.kind = 'code'
+                      and lower(cs.path) not like '%scratch%'
+                    order by cs.id desc
                     limit 1
                 ) as latest_check_status,
                 (
                     select cs.artifact_kind
-                    from code_steps cs
-                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
-                    order by cs.seq desc
+                    from timeline cs
+                    where cs.session_id = s.id and cs.kind = 'code'
+                      and lower(cs.path) not like '%scratch%'
+                    order by cs.id desc
                     limit 1
                 ) as latest_artifact_kind,
                 (
                     select rcs.status
-                    from code_steps cs
+                    from timeline cs
                     left join runs rcs on rcs.id = cs.run_id
-                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
-                    order by cs.seq desc
+                    where cs.session_id = s.id and cs.kind = 'code'
+                      and lower(cs.path) not like '%scratch%'
+                    order by cs.id desc
                     limit 1
                 ) as latest_code_run_status,
                 (
-                    select count(*) from code_steps cs
-                    where cs.session_id = s.id and lower(cs.path) not like '%scratch%'
+                    select count(*) from timeline cs
+                    where cs.session_id = s.id and cs.kind = 'code'
+                      and lower(cs.path) not like '%scratch%'
                 ) as code_step_count,
                 (
                     select count(*)
@@ -489,9 +494,21 @@ def delete_project_cascade(project_id: str) -> bool:
         ]
         if session_ids:
             marks = ",".join("?" for _ in session_ids)
-            for table in ("messages", "code_steps", "status_events", "run_usage_breakdown", "runs"):
+            # `messages`/`code_steps` are pre-cutover rows kept until the contract
+            # step drops them; they're still cleared so a delete doesn't leave half
+            # a session behind in tables that are still readable.
+            for table in ("timeline", "messages", "code_steps", "status_events",
+                          "run_usage_breakdown", "runs"):
                 conn.execute(f"delete from {table} where session_id in ({marks})", session_ids)
             conn.execute(f"delete from sessions where id in ({marks})", session_ids)
+            # Blobs are content-addressed and therefore *shared* — the same file
+            # content in another project is the same row. So they can't be deleted
+            # by session; drop only the ones nothing points at any more. Deleting
+            # eagerly here would silently blank another project's history.
+            conn.execute(
+                "delete from artifact_blobs where id not in "
+                "(select after_blob_id from timeline where after_blob_id is not null)"
+            )
         conn.execute("delete from project_files where project_id = ?", (project_id,))
         # Drop any skill assignments pointing at this project (D47) — the skills
         # themselves survive (they may be global or assigned elsewhere).
@@ -846,33 +863,33 @@ def set_session_safe_verify(session_id: str, status: str, detail: str | None) ->
 
 
 def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
-    """The most recent code_step for a file in a session (newest seq wins).
+    """The most recent code step for a file in a session (newest id wins).
 
     The standalone lean-check / verify endpoints use this to back-fill the verdict
     onto the current working step (the canvas's latest snapshot of that file)."""
     with connect() as conn:
         row = conn.execute(
-            "select * from code_steps where session_id = ? and path = ? "
-            "order by seq desc, created_at desc limit 1",
+            "select * from timeline where session_id = ? and kind = 'code' and path = ? "
+            "order by id desc limit 1",
             (session_id, path),
         ).fetchone()
-    return row_to_dict(row) if row else None
+    return _code_step_from_row(row) if row else None
 
 
 def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
-    """Every code_step for a file across a project's sessions, newest first — the raw
+    """Every code step for a file across a project's sessions, newest first — the raw
     material for a blueprint node's status + session attribution (D29). Joins on the
     session's project_id so loose sessions never leak in. Ordered by `created_at`
-    (cross-session recency; `seq` is only meaningful within one session), so the first
-    row is the latest verdict and the distinct session order is newest-touched-first."""
+    (cross-session recency; `id` only orders within one session), so the first row is
+    the latest verdict and the distinct session order is newest-touched-first."""
     with connect() as conn:
         rows = conn.execute(
-            "select c.* from code_steps c join sessions s on s.id = c.session_id "
-            "where s.project_id = ? and c.path = ? "
-            "order by c.created_at desc, c.seq desc",
+            "select c.* from timeline c join sessions s on s.id = c.session_id "
+            "where s.project_id = ? and c.kind = 'code' and c.path = ? "
+            "order by c.created_at desc, c.id desc",
             (project_id, path),
         ).fetchall()
-    return [row_to_dict(r) for r in rows]
+    return [_code_step_from_row(r) for r in rows]
 
 
 def safe_verify_ok_sessions(project_id: str) -> set[str]:
@@ -897,15 +914,30 @@ def safe_verify_ok_sessions(project_id: str) -> set[str]:
 
 
 def latest_agent_code_step(session_id: str) -> dict | None:
-    """The most recent agent-authored code_step — the proof state the agent last
-    'knew' (D12). Diffing its commit against HEAD reveals any human edits since."""
+    """The most recent agent-authored code step — the proof state the agent last
+    'knew' (D12). Its content vs. the file's current content reveals human edits."""
     with connect() as conn:
         row = conn.execute(
-            "select * from code_steps where session_id = ? and author = 'agent' "
-            "order by seq desc limit 1",
+            "select * from timeline where session_id = ? and kind = 'code' and author = 'agent' "
+            "order by id desc limit 1",
             (session_id,),
         ).fetchone()
-    return row_to_dict(row) if row else None
+    return _code_step_from_row(row) if row else None
+
+
+def latest_agent_code_step_for_path(session_id: str, path: str) -> dict | None:
+    """As above, but for one file — the per-file 'before' the agent last saw (D12).
+
+    Divergence is a property of a *file*, not a repo: `git diff <sha> HEAD` compared
+    whole trees, so an edit to any file in a shared project repo (D24) reported every
+    other session's file as diverged too. Keying on the path is what scopes it."""
+    with connect() as conn:
+        row = conn.execute(
+            "select * from timeline where session_id = ? and kind = 'code' "
+            "and author = 'agent' and path = ? order by id desc limit 1",
+            (session_id, path),
+        ).fetchone()
+    return _code_step_from_row(row) if row else None
 
 
 def edit_notes_since(session_id: str, seq: int) -> list[str]:
@@ -913,8 +945,8 @@ def edit_notes_since(session_id: str, seq: int) -> list[str]:
     the human's words about edits made since the agent last acted (D12)."""
     with connect() as conn:
         rows = conn.execute(
-            "select content from messages where session_id = ? and kind = 'edit_note' and seq > ? "
-            "order by seq asc",
+            "select content from timeline where session_id = ? and kind = 'edit_note' and id > ? "
+            "order by id asc",
             (session_id, seq),
         ).fetchall()
     return [row["content"] for row in rows]
@@ -964,6 +996,106 @@ def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = 
     return json.loads(row["transcript"])
 
 
+# ---------------------------------------------------------------------------
+# timeline (C4) — one table, one counter
+#
+# `messages` and `code_steps` were two tables sharing one hand-rolled `seq`
+# counter, which is what made a session's thread an ORDER BY merge. That counter
+# was a read-modify-write across both tables, and under concurrent writers it
+# silently issued duplicate seqs (measured: ~110/200 collisions; see db.write()).
+#
+# Merging the tables retires the counter: `timeline.id` is an autoincrement
+# primary key, so ordering is assigned by SQLite under the write lock. The race
+# isn't fixed, it's unrepresentable — there is no read-then-write to lose. The
+# `seq` key below is that id, kept so callers and the frontend read unchanged.
+#
+# Content lives in `artifact_blobs` (D7 inverted): a code row points at a blob by
+# id, and the schema CHECKs that a code row has one (or is explicitly marked
+# `content_lost`). Git was an unverified pointer into a second store — the 0004
+# backfill found a code_step naming a commit whose tree never held the file.
+# ---------------------------------------------------------------------------
+
+
+def _put_blob(conn, content: str) -> str:
+    """Insert-or-find a blob by content hash. Dedup is the schema's job (`sha256`
+    is UNIQUE), so this stays a dumb upsert. Identical content across steps — a
+    revert, a cascade re-check, an unchanged save — costs one row, not a copy.
+
+    Must run inside a `write()`: this is a read-then-insert, and the UNIQUE index
+    is what makes a concurrent duplicate an error rather than a silent second copy.
+    """
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    row = conn.execute("select id from artifact_blobs where sha256 = ?", (digest,)).fetchone()
+    if row:
+        return row["id"]
+    blob_id = str(uuid4())
+    conn.execute(
+        "insert into artifact_blobs (id, sha256, content, created_at) values (?, ?, ?, ?)",
+        (blob_id, digest, content, utc_now()),
+    )
+    return blob_id
+
+
+def blob_content(blob_id: str | None) -> str | None:
+    """A blob's text, or None if absent (a `content_lost` row, or no blob)."""
+    if not blob_id:
+        return None
+    with connect() as conn:
+        row = conn.execute("select content from artifact_blobs where id = ?", (blob_id,)).fetchone()
+    return row["content"] if row else None
+
+
+def _message_from_row(row) -> dict:
+    """A timeline message row in the shape the API has always returned.
+
+    `role` is reconstructed from `author`: they were the same concept spelled
+    twice, and the old `kind` column defaulted to 'assistant' — a *role* value used
+    as a kind default — so it lied for every row nobody set explicitly. The new
+    schema keeps `kind` for what a row *is* and `author` for who made it, which is
+    the split OpenHands draws (`SourceType`) and opencode conflates.
+    """
+    d = row_to_dict(row)
+    return {
+        "id": str(d["id"]),
+        "session_id": d["session_id"],
+        "run_id": d["run_id"],
+        "role": "user" if d["author"] == "user" else "assistant",
+        "content": d["content"],
+        "kind": "edit_note" if d["kind"] == "edit_note" else "assistant",
+        "seq": d["id"],
+        "created_at": d["created_at"],
+    }
+
+
+def _code_step_from_row(row, *, code: str | None = None) -> dict:
+    """A timeline code row in the shape the API has always returned.
+
+    `code` is passed when the caller already has the bytes (it just wrote them);
+    otherwise it's read from the blob. A `content_lost` row yields `""` — the row
+    survives to say a step happened, which is more honest than deleting history
+    because its bytes are gone.
+    """
+    d = row_to_dict(row)
+    if code is None:
+        code = blob_content(d["after_blob_id"]) or ""
+    return {
+        "id": str(d["id"]),
+        "session_id": d["session_id"],
+        "run_id": d["run_id"],
+        "seq": d["id"],
+        "turn": d["turn"],
+        "author": d["author"],
+        "path": d["path"],
+        "summary": d["summary"],
+        "check_status": d["check_status"],
+        "check_detail": d["check_detail"],
+        "artifact_kind": d["artifact_kind"],
+        "content_lost": bool(d["content_lost"]),
+        "created_at": d["created_at"],
+        "code": code,
+    }
+
+
 def add_message(
     session_id: str,
     role: str,
@@ -973,44 +1105,31 @@ def add_message(
     commit_sha: str | None = None,
 ) -> dict:
     """Append a transcript message. A user's edit explanation (D11) is just this
-    with `kind='edit_note'` + `commit_sha` set to the edit's commit — no bespoke
-    channel; it rides the same path that feeds context to the prover."""
-    now = utc_now()
-    message_id = str(uuid4())
-    with write() as conn:  # read-modify-write on seq — see db.write()
-        seq = _next_seq(conn, session_id)
-        conn.execute(
+    with `kind='edit_note'` — no bespoke channel; it rides the same path that feeds
+    context to the prover.
+
+    `commit_sha` is accepted and ignored: git no longer stores content, so there is
+    no commit to point at. The parameter stays only so callers can be moved off it
+    one at a time.
+    """
+    with write() as conn:
+        cur = conn.execute(
             """
-            insert into messages (id, session_id, run_id, role, content, kind, commit_sha, seq, created_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into timeline (session_id, run_id, kind, author, content, created_at)
+            values (?, ?, ?, ?, ?, ?)
             """,
-            (message_id, session_id, run_id, role, content, kind, commit_sha, seq, now),
+            (
+                session_id,
+                run_id,
+                "edit_note" if kind == "edit_note" else "message",
+                "user" if role == "user" else "agent",
+                content,
+                utc_now(),
+            ),
         )
-        row = conn.execute("select * from messages where id = ?", (message_id,)).fetchone()
+        row = conn.execute("select * from timeline where id = ?", (cur.lastrowid,)).fetchone()
     touch_session(session_id)
-    return row_to_dict(row)
-
-
-def _next_seq(conn, session_id: str) -> int:
-    """The next shared timeline position for a session (C4): one monotonic counter
-    that both messages and code_steps draw from, so the thread is an ORDER BY seq
-    merge.
-
-    This is a read-modify-write and is only atomic if `conn` is already inside a
-    `db.write()` (BEGIN IMMEDIATE) transaction — callers must open one. Under a
-    plain `connect()` the SELECT runs outside any transaction and concurrent
-    callers silently duplicate seqs; see `db.write()` for the measurement."""
-    row = conn.execute(
-        """
-        select coalesce(max(seq), 0) + 1 as next from (
-            select seq from code_steps where session_id = ?
-            union all
-            select seq from messages where session_id = ?
-        )
-        """,
-        (session_id, session_id),
-    ).fetchone()
-    return int(row["next"])
+    return _message_from_row(row)
 
 
 def add_code_step(
@@ -1018,7 +1137,7 @@ def add_code_step(
     run_id: str | None,
     path: str,
     *,
-    commit_sha: str,
+    content: str,
     author: str = "agent",
     summary: str | None = None,
     turn: int | None = None,
@@ -1026,53 +1145,52 @@ def add_code_step(
     check_detail: str | None = None,
     artifact_kind: str | None = None,
 ) -> dict:
-    """Record a curated timeline step pointing at a git commit (D7/D8).
+    """Record a timeline step holding a file's full contents after a write.
 
-    `commit_sha` is the pointer into the session's git repo where the content
-    lives — it is keyword-only and required, so a v1-style positional call that
-    passed file *text* fails loudly instead of silently storing code as a sha.
+    `content` is the file's bytes and is keyword-only and required — it replaces
+    the old `commit_sha` pointer, so a stale caller still passing a sha fails
+    loudly rather than storing a 40-char sha as if it were a proof.
+
     `run_id` is NULL for user edits made outside a run (D9); `turn` is NULL for
     user edits. The verdict (`check_status`/`check_detail`) is recorded here, not
-    in the commit message (D6), and may be back-filled once `lean_check` returns.
+    in a commit message (D6), and may be back-filled once `lean_check` returns.
 
-    `author` is a free-text convention, not an enforced enum: `'agent'` (a
-    model turn), `'user'` (a manual canvas edit, D9), or `'cascade'` (a
-    re-verification of an *unchanged* file, triggered by an edit to something
-    it imports elsewhere in the project — see
-    docs/FEATURE-overleaf-lean-pane-manual-edit.md). A cascade step typically
-    reuses the file's existing `commit_sha` since nothing on disk changed.
+    `author` is constrained by the schema to 'user' | 'agent' | 'environment'.
+    Note 'cascade' — a re-verification of an *unchanged* file — is NOT an author:
+    it's a *reason*, and it was only ever in this column because the old schema had
+    nowhere else to put it. It rides in `data` instead; the file is still the
+    agent's work regardless of what prompted the re-check.
     """
     now = utc_now()
-    step_id = str(uuid4())
-    with write() as conn:  # read-modify-write on seq — see db.write()
-        seq = _next_seq(conn, session_id)
-        conn.execute(
+    reason = None if author in ("user", "agent", "environment") else author
+    with write() as conn:
+        blob_id = _put_blob(conn, content)
+        cur = conn.execute(
             """
-            insert into code_steps (
-                id, session_id, run_id, seq, turn, author, path,
-                commit_sha, summary, check_status, check_detail, artifact_kind, created_at
+            insert into timeline (
+                session_id, run_id, kind, author, turn, path, after_blob_id,
+                summary, check_status, check_detail, artifact_kind, data, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                step_id,
                 session_id,
                 run_id,
-                seq,
+                "agent" if reason else author,
                 turn,
-                author,
                 path,
-                commit_sha,
+                blob_id,
                 summary,
                 check_status,
                 check_detail,
                 artifact_kind if check_status == "ok" else None,
+                json.dumps({"reason": reason}) if reason else None,
                 now,
             ),
         )
-        inserted = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
+        row = conn.execute("select * from timeline where id = ?", (cur.lastrowid,)).fetchone()
     touch_session(session_id)
-    return row_to_dict(inserted)
+    return _code_step_from_row(row, code=content)
 
 
 def has_active_run(session_id: str) -> bool:
@@ -1087,29 +1205,34 @@ def has_active_run(session_id: str) -> bool:
     return row is not None
 
 
-def upsert_user_code_step(session_id: str, path: str, *, commit_sha: str) -> dict:
+def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
     """Record a user edit, coalescing rapid successive edits into one timeline step.
 
-    Auto-save (v2.2) commits on every debounced keystroke-pause, which would spray
-    the History stepper with one 'your edit' step per save. So if the file's latest
-    step is already an *uncommitted-to-a-run* user edit (author='user', run_id NULL),
-    we repoint that step at the new commit and clear its stale verdict — one step
-    that tracks the newest content — instead of inserting a new row. A step authored
-    by the agent (or a user edit for a different file) still starts a fresh step, so
-    the human/agent boundary in the timeline is preserved. Git keeps every commit;
-    only the curated timeline coalesces (D7/D8)."""
+    Auto-save (v2.2) saves on every debounced keystroke-pause, which would spray the
+    History stepper with one 'your edit' step per save. So if the file's latest step
+    is already an *uncommitted-to-a-run* user edit (author='user', run_id NULL), we
+    repoint that step at the new content and clear its stale verdict — one step that
+    tracks the newest bytes — instead of inserting a new row. A step authored by the
+    agent (or a user edit for a different file) still starts a fresh step, so the
+    human/agent boundary in the timeline is preserved.
+
+    Coalescing now drops the superseded *content*, where git kept every commit. The
+    dropped versions are debounced keystroke states of the file the user is actively
+    looking at, so the editor — not history — is their undo. Blobs are content-
+    addressed, so an intermediate state that recurs anywhere else is still reachable."""
     latest = latest_code_step_for_path(session_id, path)
     if latest and latest.get("author") == "user" and latest.get("run_id") is None:
-        with connect() as conn:
+        with write() as conn:
+            blob_id = _put_blob(conn, content)
             conn.execute(
-                "update code_steps set commit_sha = ?, check_status = NULL, check_detail = NULL "
-                "where id = ?",
-                (commit_sha, latest["id"]),
+                "update timeline set after_blob_id = ?, content_lost = 0, check_status = NULL, "
+                "check_detail = NULL, artifact_kind = NULL where id = ?",
+                (blob_id, int(latest["id"])),
             )
-            row = conn.execute("select * from code_steps where id = ?", (latest["id"],)).fetchone()
+            row = conn.execute("select * from timeline where id = ?", (int(latest["id"]),)).fetchone()
         touch_session(session_id)
-        return row_to_dict(row)
-    return add_code_step(session_id, None, path, commit_sha=commit_sha, author="user")
+        return _code_step_from_row(row, code=content)
+    return add_code_step(session_id, None, path, content=content, author="user")
 
 
 def set_code_step_check(
@@ -1118,21 +1241,20 @@ def set_code_step_check(
     check_detail: str | None = None,
     artifact_kind: str | None = None,
 ) -> dict | None:
-    """Back-fill a code_step's verdict once `lean_check` returns (D6).
+    """Back-fill a code step's verdict once `lean_check` returns (D6).
 
-    A write is committed and its row inserted *before* the check runs (FileChanged
-    precedes CheckResult), so the verdict lands here, on the existing row, rather
-    than in the commit message. Returns the updated row, or None if the id is
-    unknown.
+    The write's row is inserted *before* the check runs (FileChanged precedes
+    CheckResult), so the verdict lands here, on the existing row, rather than in a
+    commit message. Returns the updated row, or None if the id is unknown.
     """
-    now = utc_now()
     with connect() as conn:
         conn.execute(
-            "update code_steps set check_status = ?, check_detail = ?, artifact_kind = ? where id = ?",
-            (check_status, check_detail, artifact_kind if check_status == "ok" else None, step_id),
+            "update timeline set check_status = ?, check_detail = ?, artifact_kind = ? "
+            "where id = ? and kind = 'code'",
+            (check_status, check_detail, artifact_kind if check_status == "ok" else None, int(step_id)),
         )
-        row = conn.execute("select * from code_steps where id = ?", (step_id,)).fetchone()
-    return row_to_dict(row) if row else None
+        row = conn.execute("select * from timeline where id = ?", (int(step_id),)).fetchone()
+    return _code_step_from_row(row) if row else None
 
 
 def add_status_event(
@@ -1244,14 +1366,12 @@ def session_detail(session_id: str) -> dict | None:
             """,
             (session_id, session_id),
         ).fetchone()
-        # both ordered by the shared timeline seq (C4) so the frontend merges them
-        # into one thread by a single key, not by index-pairing
-        messages = conn.execute(
-            "select * from messages where session_id = ? order by seq asc",
-            (session_id,),
-        ).fetchall()
-        code_steps = conn.execute(
-            "select * from code_steps where session_id = ? order by seq asc",
+        # One table, one order (C4). These were two tables sharing a hand-rolled
+        # counter so the frontend could merge them by a single key; now they're the
+        # same rows, split apart on the way out only because the API shape predates
+        # the merge. `id` is the order — nothing can disagree about it.
+        rows = conn.execute(
+            "select * from timeline where session_id = ? order by id asc",
             (session_id,),
         ).fetchall()
         status_events = conn.execute(
@@ -1284,6 +1404,11 @@ def session_detail(session_id: str) -> dict | None:
                 "select * from projects where id = ?",
                 (session["project_id"],),
             ).fetchone()
+    # Split back into the two lists the API exposes. Code rows carry their content
+    # already — a read no longer needs a second store to be reachable, so there is
+    # no separate hydrate step that can silently come back empty.
+    messages = [_message_from_row(r) for r in rows if r["kind"] != "code"]
+    code_steps = [_code_step_from_row(r) for r in rows if r["kind"] == "code"]
     usage = _normalize_usage_session(
         {
             **(row_to_dict(usage_row) if usage_row else {}),
@@ -1313,8 +1438,8 @@ def session_detail(session_id: str) -> dict | None:
         "status": _derive_session_status(
             latest_check_status, latest_artifact_kind, len(real_steps), active_run is not None, latest_code_run_status
         ),
-        "messages": [row_to_dict(row) for row in messages],
-        "code_steps": [_normalize_code_step(row_to_dict(row)) for row in code_steps],
+        "messages": messages,
+        "code_steps": [_normalize_code_step(step) for step in code_steps],
         "status_events": [row_to_dict(row) for row in status_events],
         "approval_events": approval_events_for_session(session_id),
         "usage_breakdown": usage_breakdown_for_session(session_id),

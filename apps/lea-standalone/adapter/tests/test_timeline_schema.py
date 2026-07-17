@@ -166,9 +166,14 @@ def test_artifact_kind_requires_a_passing_check(tmp_path, monkeypatch):
         _code(conn, after_blob_id=bid, check_status="ok", artifact_kind="proof")
 
 
-def test_expand_step_leaves_the_old_tables_alone(tmp_path, monkeypatch):
-    """0003 is additive: nothing reads or writes timeline yet, so the existing code
-    must be completely unaffected."""
+def test_writes_go_to_timeline_and_the_old_tables_still_exist(tmp_path, monkeypatch):
+    """Was `test_expand_step_leaves_the_old_tables_alone`, when 0003 was additive and
+    "nothing reads or writes timeline yet". The switch landed, so this now pins the
+    other half of expand→migrate→**contract**: new writes go to `timeline`, and the
+    old tables are still present, holding whatever 0004 backfilled.
+
+    Dropping them is a separate revision on purpose — until it runs, a restored
+    snapshot can still be inspected against the rows it came from."""
     path = _fresh(tmp_path, monkeypatch)
     with sqlite3.connect(path) as conn:
         tables = {r[0] for r in conn.execute("select name from sqlite_master where type='table'")}
@@ -178,6 +183,9 @@ def test_expand_step_leaves_the_old_tables_alone(tmp_path, monkeypatch):
     session = store.create_session("still works")
     run = store.create_run(session["id"], "gpt-4o", "openai", 3)
     store.add_message(session["id"], "user", "hi", run["id"])
-    store.add_code_step(session["id"], run["id"], "p.lean", commit_sha="a" * 40)
+    store.add_code_step(session["id"], run["id"], "p.lean", content="theorem t : True := by trivial")
     with db.connect() as conn:
-        assert conn.execute("select count(*) from timeline").fetchone()[0] == 0
+        assert conn.execute("select count(*) from timeline").fetchone()[0] == 2
+        # nothing writes the old tables any more
+        assert conn.execute("select count(*) from code_steps").fetchone()[0] == 0
+        assert conn.execute("select count(*) from messages").fetchone()[0] == 0

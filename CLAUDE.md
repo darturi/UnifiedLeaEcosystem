@@ -37,13 +37,22 @@ stream. Both front ends talk to this single adapter on **:8001**.
 Persistence is split deliberately (see design-decision tags `D1`/`D6`/`D7`/`D8`/`D14`
 sprinkled through the adapter source, documented in `docs/`):
 
-- **Git owns proof content.** Every `FileChanged` is committed to the session's git
-  repo (`gitstore.py`); a `code_step` DB row stores only the SHA + path.
-- **SQLite owns metadata.** `adapter/app/db.py` defines `sessions`, `runs`,
-  `code_steps`, messages, usage. A session has **no stored status** — its status is
-  *derived* from the latest `code_step`'s check verdict so it can't drift.
-- The streamed SSE payload carries the file snapshot for the live canvas; the
-  `lean_check` verdict is **back-filled** into the `code_step` row when it returns.
+- **SQL owns proof content** (inverted in v2.3 — git used to own it). Every
+  `FileChanged` reads the file's after-state and stores it as a content-addressed
+  blob (`artifact_blobs`); the `timeline` row points at it. Git is now only
+  *transport* for non-proof assets (uploads, project files), never the store.
+- **One `timeline` table** holds messages and code steps (`adapter/app/db.py`
+  defines it via Alembic revisions in `adapter/migrations/`). Its autoincrement
+  `id` IS the ordering key — the old per-session `seq` counter was a
+  read-modify-write across two tables that silently issued duplicates under
+  concurrent writers. A session has **no stored status** — it's *derived* from the
+  latest code row's check verdict so it can't drift.
+- The streamed SSE payload and the stored row carry the **same bytes**, so the live
+  canvas and a reload can't disagree; the `lean_check` verdict is **back-filled**
+  onto the row when it returns.
+- **Migrations are real** (`adapter/migrations/`, Alembic). The DB is no longer
+  disposable — "just reset it" now means "delete the user's proofs". Any pending
+  migration snapshots the DB first (`adapter/app/backup.py` → `data/backups/`).
 
 `autonomous` runs (the Overleaf path, `D19`) disable the per-tool approval gate and
 use the non-interactive prompt variant; interactive UI runs keep the approval gate.
@@ -151,8 +160,14 @@ scripts/              monorepo setup.mjs, env.mjs (.env read/patch), reset-local
 
 - **Keep the two apps talking to one backend on :8001.** Don't reintroduce a
   separate prover HTTP server — the adapter drives the prover in-process.
-- **Don't store derived state.** Session status is computed from the latest
-  `code_step` verdict; proof bytes live in git, not the DB. Preserve that split.
+- **Don't store derived state.** Session status is computed from the latest code
+  row's verdict — never stored.
+- **Proof bytes live in the DB, not git** (v2.3 inverted this; older docs and
+  comments may still say the opposite). Don't reintroduce a git pointer for proof
+  content: a pointer is a claim about a second store that nothing verifies, and at
+  least one shipped row pointed at a commit whose tree never held the file.
+- **Schema changes go through a new Alembic revision** — never edit an applied one,
+  and never hand-`ALTER` at startup.
 - The shared model list is consumed by both Node apps via `packages/lea-model-catalog`
   and by the adapter's `models_catalog.py` — keep them consistent.
 - Changes to the vendored prover under `apps/lea-standalone/prover/` are picked up

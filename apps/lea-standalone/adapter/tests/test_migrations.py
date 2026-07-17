@@ -123,11 +123,22 @@ def test_reconcile_repairs_a_legacy_database_missing_artifact_kind(tmp_path, mon
     with sqlite3.connect(path) as conn:
         assert conn.execute("select path from code_steps").fetchall() == [("p.lean",)]
 
-    # The actual symptom must be gone: a write that used to raise now works.
-    from app import store
-    session = store.create_session("after repair")
-    run = store.create_run(session["id"], "gpt-4o", "openai", 3)
-    store.add_code_step(session["id"], run["id"], "q.lean", commit_sha="b" * 40)
+    # The actual symptom must be gone. This used to be an `add_code_step` call —
+    # the live write that raised `OperationalError: table code_steps has no column
+    # named artifact_kind`. Writes go to `timeline` now, so that call no longer
+    # touches this table and would pass vacuously. The column still has to be
+    # repaired, though: 0004 SELECTs `code_steps.artifact_kind` to backfill, so
+    # without 0002 the migration chain itself breaks on a drifted database.
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "insert into code_steps (id, session_id, seq, path, commit_sha, author,"
+            " artifact_kind, created_at)"
+            " values ('c2','s1',2,'q.lean','deadbeef','agent','proof','t')"
+        )
+        conn.commit()
+        assert conn.execute(
+            "select artifact_kind from code_steps where id='c2'"
+        ).fetchone() == ("proof",)
 
 
 def test_reconcile_is_a_noop_when_the_column_is_already_present(tmp_path, monkeypatch):

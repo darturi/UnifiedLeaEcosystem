@@ -200,7 +200,6 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   kind?: 'assistant' | 'edit_note' | string;
-  commit_sha?: string | null;
   seq?: number;
   created_at: string;
   // Frontend-only marker for the streaming bubble before its persisted twin lands.
@@ -215,13 +214,16 @@ export interface CodeStep {
   turn?: number | null;
   author: 'agent' | 'user';
   path: string;
-  commit_sha: string;
   summary?: string | null;
+  // True when the step's content couldn't be recovered (a pre-v2.3 row whose git
+  // pointer didn't resolve). The step still exists — it says something happened.
+  content_lost?: boolean;
   check_status?: 'ok' | 'error' | 'unchecked' | null;
   check_detail?: string | null;
   artifact_kind?: 'proof' | 'definition' | 'mixed' | 'unknown' | string | null;
   created_at: string;
-  // Hydrated from git on read; also present on the SSE `code_step` event.
+  // The step's content: SQL owns it (v2.3), so it arrives with the row on read and
+  // on the SSE `code_step` event alike. No hydrate step, no empty-canvas failure.
   code: string;
 }
 

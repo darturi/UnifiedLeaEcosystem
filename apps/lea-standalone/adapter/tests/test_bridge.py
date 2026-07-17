@@ -85,18 +85,20 @@ def test_happy_path_commits_steps_and_persists_run(tmp_path, monkeypatch):
 
     detail = store.session_detail(ctx.session_id)
 
-    # exactly one curated code step, pointing at a real commit, verdict back-filled
+    # exactly one curated code step, holding the proof, verdict back-filled
     assert len(detail["code_steps"]) == 1
     step = detail["code_steps"][0]
     assert step["path"] == "Lea/Misc/proof.lean"
     assert step["author"] == "agent" and step["turn"] == 1
-    assert len(step["commit_sha"]) == 40
+    assert "theorem t : True := by trivial" in step["code"]  # the file's after-state
     assert step["check_status"] == "ok"
     assert step["artifact_kind"] == "proof"
 
-    # the SHA resolves to the file the fake wrote (git owns the content)
-    gs = bridge.GitStore(tmp_path / "workspace" / "proofs")
-    assert "theorem t : True" in gs.snapshot(ctx.session_id, step["commit_sha"], step["path"])
+    # The step's content IS the file the fake wrote. This used to resolve the SHA
+    # through git — the pointer and the bytes were two things that had to agree.
+    # Now the row carries the bytes, so the read can't disagree with the write.
+    on_disk = (tmp_path / "workspace" / "proofs" / ctx.session_id / step["path"]).read_text()
+    assert step["code"] == on_disk
 
     # narration + terminal text landed as assistant messages
     contents = [m["content"] for m in detail["messages"] if m["role"] == "assistant"]
@@ -297,8 +299,12 @@ def test_project_run_uses_shared_repo_namespace_and_context(tmp_path, monkeypatc
     steps = detail["code_steps"]
     assert len(steps) == 1 and steps[0]["path"] == "Foo.lean"
     assert not (proofs_root / session["id"]).exists()  # no loose per-session repo
-    gs = bridge.GitStore(proofs_root / "Lea")
-    assert "theorem foo" in gs.snapshot("Epsilon", steps[0]["commit_sha"], "Foo.lean")
+    # The step holds the proof itself — this used to read it back out of the shared
+    # repo via `gs.snapshot(..., commit_sha, ...)`, which is what D24 had to get
+    # right. The step is still attributed to the shared repo's path; the content
+    # just no longer depends on resolving that repo correctly to be readable.
+    assert "theorem foo" in steps[0]["code"]
+    assert (proofs_root / "Lea" / "Epsilon" / "Foo.lean").exists()  # still on disk (D3)
 
     # D33: the asset write emitted a project_updated signal and NO extra code_step.
     events = _drain(queue)
@@ -577,15 +583,17 @@ def _seed_agent_then_user_edit(tmp_path, *, user_edit: bool):
     proof = repo / "Lea" / "Misc" / "P.lean"
     proof.parent.mkdir(parents=True, exist_ok=True)
     proof.write_text("theorem p : True := by trivial\n")
-    sha1 = gs.commit_write(session["id"], turn=1, author="agent", tool="write_file")
     run0 = store.create_run(session["id"], "m", None, 3)
-    store.add_code_step(session["id"], run0["id"], "Lea/Misc/P.lean", commit_sha=sha1, author="agent", turn=1)
+    store.add_code_step(session["id"], run0["id"], "Lea/Misc/P.lean",
+                        content="theorem p : True := by trivial\n", author="agent", turn=1)
     if user_edit:
+        # The human's edit: the file on disk moves on, the agent's stored step does
+        # not. Divergence is exactly that gap — the agent's last known content vs.
+        # what's on disk now — rather than a diff between two git revisions.
         proof.write_text("theorem p : True := by exact trivial\n")
-        sha2 = gs.commit_write(session["id"], turn=None, author="user", tool="edit")
-        store.add_code_step(session["id"], None, "Lea/Misc/P.lean", commit_sha=sha2, author="user")
-        store.add_message(session["id"], "user", "used exact instead", None,
-                          kind="edit_note", commit_sha=sha2)
+        store.add_code_step(session["id"], None, "Lea/Misc/P.lean",
+                            content="theorem p : True := by exact trivial\n", author="user")
+        store.add_message(session["id"], "user", "used exact instead", None, kind="edit_note")
     return session, store.create_run(session["id"], "m", None, 3)
 
 

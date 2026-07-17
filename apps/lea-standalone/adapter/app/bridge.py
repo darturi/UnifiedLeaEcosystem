@@ -8,15 +8,19 @@ meaning-level events, so this is a flat ``isinstance`` dispatch:
   AssistantTextDelta -> assistant_delta      (narration, buffered)
   TurnStarted        -> flush narration into a `message`, mark the turn
   ToolCalled         -> flush narration, emit a status chip
-  FileChanged        -> commit to the session's git repo + insert a code_step
+  FileChanged        -> store the file's contents + insert a code_step
   CheckResult        -> back-fill that step's verdict
   UsageUpdated       -> accumulate per-turn token/cost rows
   Finished           -> terminal message + persist run + usage, then `done`
 
-Git owns proof content (D7/D8): on every write the adapter commits the session
-repo and the code_step row stores only the SHA + path; the streamed payload
-carries the snapshot for the live canvas. The verdict lives in the DB, not the
-commit message (D6), and is back-filled when ``lean_check`` returns.
+SQL owns proof content (C1/D7, inverted in v2.3): on every write the adapter reads
+the file's after-state and stores it as a content-addressed blob, and the code_step
+row points at that blob; the same bytes go out on the stream for the live canvas.
+Content and pointer can't disagree because there is only one store. The verdict
+lives on the row (D6) and is back-filled when ``lean_check`` returns.
+
+Git is no longer the store — it stays only as *transport* for non-proof assets
+(uploads, project files), which have their own path.
 
 Scope (D1·bridge): single activation — ``messages = [{user: task}]``. Faithful
 multi-turn transcript replay is D1·multiturn; the per-tool gate is D9/D10;
@@ -25,6 +29,7 @@ interrupt is D7; diff-on-divergence context is D6.
 
 from __future__ import annotations
 
+import difflib
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -223,21 +228,57 @@ def _final_text_for_result(ev: Finished) -> str:
     return f"{prefix}\n\n{text}".strip()
 
 
+def _read_after(path: str) -> str:
+    """The file's contents after a write. Unreadable (deleted, binary, races with a
+    later write) yields "" rather than raising: a code step whose content we failed
+    to capture is still a step that happened, and the schema records that honestly
+    via `content_lost` rather than losing the row."""
+    try:
+        return Path(path).read_text()
+    except (OSError, UnicodeDecodeError):
+        logger.debug("Could not read after-state of %s", path, exc_info=True)
+        return ""
+
+
+def _classify(code: str) -> str | None:
+    """`classify_lean_artifact`, but a parse failure is not a run failure."""
+    try:
+        return classify_lean_artifact(code)
+    except Exception:  # noqa: BLE001 — classification is a presentation detail
+        return None
+
+
 def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | None:
     """Diff-on-divergence (D12): if the human edited the proof since the agent last
-    acted, return a context block (the `git diff` + any edit notes) to fold into the
-    next run's task — so the agent sees and acknowledges the changes (D13). None
-    when nothing diverged (cold start, or no edits since the agent's last write).
+    acted, return a context block (a diff + any edit notes) to fold into the next
+    run's task — so the agent sees and acknowledges the changes (D13). None when
+    nothing diverged (cold start, or no edits since the agent's last write).
 
-    The DB lookup keys on the real ``session_id``; the git diff keys on ``repo_key``
-    (the resolved repo's dir name — D24), so a project session diffs its shared repo."""
+    Scoped to the file the agent last wrote. It used to be a repo-wide
+    `git diff <sha> HEAD`, which is wrong for a *shared* project repo (D24): an edit
+    to any file in the project — including one belonging to a different session —
+    reported as this session's divergence and got pasted into its task.
+
+    The 'before' is the agent's last stored content and the 'after' is the file on
+    disk, so this compares the two things it actually claims to compare. The old
+    version compared two git revisions, and its `before` was only as good as a
+    pointer nobody verified (see 0004's backfill: one such pointer named a commit
+    whose tree never contained the file)."""
     agent_step = store.latest_agent_code_step(session_id)
-    if not agent_step:
+    if not agent_step or not agent_step.get("path"):
         return None
-    try:
-        diff = gs.diff(repo_key, agent_step["commit_sha"], "HEAD")
-    except GitStoreError:
+    path = agent_step["path"]
+    repo = gs.init_session(repo_key)
+    before = agent_step.get("code") or ""
+    after = _read_after(str(repo / path))
+    if before == after:
         return None
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            fromfile=f"a/{path}", tofile=f"b/{path}",
+        )
+    )
     if not diff.strip():
         return None
 
@@ -469,34 +510,49 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, FileChanged):
                 rel = _relativize(ev.path, repo)
-                sha = gs.commit_write(repo_key, turn=current_turn, author="agent", tool=last_tool or "write_file")
+                # The file on disk *is* the after-state — the prover has already
+                # written it. Reading it here is what makes the stored content and
+                # the streamed snapshot the same bytes by construction, rather than
+                # two derivations of it that can disagree (the old path committed to
+                # git, then asked git what it had committed).
                 step = store.add_code_step(
-                    session_id, run_id, rel, commit_sha=sha, author="agent", turn=current_turn,
-                    summary=last_intent,
+                    session_id, run_id, rel, content=_read_after(ev.path),
+                    author="agent", turn=current_turn, summary=last_intent,
                 )
                 step_id_by_path[rel] = step["id"]
-                emit(events, "code_step", {**step, "code": gs.snapshot(repo_key, sha, rel)})
+                emit(events, "code_step", step)  # already carries `code`
 
             elif isinstance(ev, CheckResult):
                 rel = _relativize(ev.path, repo)
                 step_id = step_id_by_path.get(rel)
-                if step_id:
+                if step_id is None:
+                    # A file this run never wrote through write_file/edit_file — a
+                    # bash-written file, or one checked before its first write. It
+                    # has no step from this run to back-fill, so the verdict had
+                    # nowhere to go and was dropped. Record the check against the
+                    # file's current content instead: a verdict with no step is a
+                    # result the user never sees.
+                    step = store.add_code_step(
+                        session_id, run_id, rel, content=_read_after(ev.path),
+                        author="agent", turn=current_turn, summary=last_intent,
+                        check_status=ev.status, check_detail=ev.detail,
+                        artifact_kind=_classify(_read_after(ev.path)) if ev.status == "ok" else None,
+                    )
+                    step_id_by_path[rel] = step["id"]
+                    if ev.status == "ok":
+                        checked_artifact_kind = step.get("artifact_kind")
+                    emit(events, "code_step", step)
+                else:
                     artifact_kind = None
                     if ev.status == "ok":
                         current_step = store.latest_code_step_for_path(session_id, rel)
                         if current_step and current_step["id"] == step_id:
-                            try:
-                                artifact_kind = classify_lean_artifact(gs.snapshot(repo_key, current_step["commit_sha"], rel))
-                            except Exception:
-                                artifact_kind = None
+                            artifact_kind = _classify(current_step["code"])
                     updated = store.set_code_step_check(step_id, ev.status, ev.detail, artifact_kind=artifact_kind)
                     if updated:
-                        code = gs.snapshot(repo_key, updated["commit_sha"], rel)
                         if ev.status == "ok":
-                            checked_artifact_kind = updated.get("artifact_kind") or classify_lean_artifact(code)
-                        emit(events, "code_step", {
-                            **updated, "code": code,
-                        })
+                            checked_artifact_kind = updated.get("artifact_kind") or _classify(updated["code"])
+                        emit(events, "code_step", updated)
                 emit(events, "status", {
                     "status": "lean_check", "message": f"lean_check: {ev.status}",
                     "turn": current_turn, "check_status": ev.status, "check_detail": ev.detail,
