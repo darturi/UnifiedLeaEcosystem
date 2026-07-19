@@ -109,6 +109,7 @@ export function ChatThread({
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
   const error = useProofSession((s) => s.error);
+  const reconnecting = useProofSession((s) => s.reconnecting);
   const activeCodeIndex = useProofSession((s) => s.codeIndex);
   const messages = useProofSession((s) => s.messages);
   const codeSteps = useProofSession((s) => s.codeSteps);
@@ -434,6 +435,12 @@ export function ChatThread({
             </div>
           )}
 
+          {reconnecting && (
+            <div className="reconnect-chip">
+              <span className="reconnect-spinner" />
+              {reconnecting}
+            </div>
+          )}
           {error && <div className="err-banner">{error}</div>}
         </div>
       </div>

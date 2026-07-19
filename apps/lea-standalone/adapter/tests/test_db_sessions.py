@@ -146,6 +146,26 @@ def test_active_run_does_not_override_an_existing_verdict(tmp_path, monkeypatch)
     assert _list_status(session["id"]) == "ok"
 
 
+def test_list_sessions_surfaces_active_run_count_alongside_verdict(tmp_path, monkeypatch):
+    # v2.3 item 13: because a session that already has code reads its verdict
+    # ('ok'/'proved') even while re-running (D14), the sidebar can't learn about a
+    # live background run from `status` alone. `list_sessions` carries a separate
+    # `active_run_count` so a running dot can light regardless of the derived status.
+    _fresh_db(tmp_path, monkeypatch)
+    session = store.create_session("Proved, and re-running")
+    run = store.create_run(session["id"], "gpt-4o", "openai", 3)  # stays 'pending'
+    store.add_code_step(session["id"], run["id"], "p.lean", content="proof-9", check_status="ok")
+
+    row = next(s for s in store.list_sessions() if s["id"] == session["id"])
+    assert row["status"] == "ok"           # verdict unchanged (D14)
+    assert row["active_run_count"] == 1    # ...but the live run is still visible
+
+    store.update_run(run["id"], "proved")  # run leaves the active set
+    row = next(s for s in store.list_sessions() if s["id"] == session["id"])
+    assert row["active_run_count"] == 0     # count drops; status stays the verdict
+    assert row["status"] == "ok"
+
+
 def test_running_flips_to_verdict_when_run_finishes(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
     session = store.create_session("Lifecycle")

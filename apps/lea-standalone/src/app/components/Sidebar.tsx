@@ -136,7 +136,12 @@ export function Sidebar({
 }
 
 function dotClass(session: SessionSummary, runningSessionId?: string): string {
+  // The open session's live run shows instantly via runningSessionId; background
+  // runs (a different chat, incl. an Overleaf-driven one) surface through
+  // active_run_count, which the sessions_changed feed refreshes on every run
+  // start/finish. Either one lights the running dot (v2.3 item 13).
   if (session.id === runningSessionId) return 'run';
+  if ((session.active_run_count ?? 0) > 0) return 'run';
   if (session.status === 'ok' || session.status === 'proved' || session.status === 'defined') return 'ok';
   if (session.status === 'disproved') return 'run';
   if (session.status === 'error') return 'fail';

@@ -4,7 +4,40 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+
+from .runctx import current_working_dir
+
+# Item 6 / D74 — bound the two fallbacks that each load their OWN full Mathlib
+# in a fresh subprocess. The warm daemon (lsp_daemon.py) is a single process and
+# needs no bound; these guard the paths that don't share it. Both bounds only
+# bite once more than one run checks concurrently — at LEA_MAX_CONCURRENT_RUNS=1
+# the run lock already caps concurrency at one — but they must exist before that
+# cap is raised (Phase 3), or one daemon hiccup under N runs becomes N cold
+# Mathlib processes.
+
+# Cold `lake env lean <file>` fallback: caps concurrent full-Mathlib compiles
+# (each ~GBs resident). Not a correctness bound — a memory one.
+_COLD_CHECK_CONCURRENCY = max(1, int(os.environ.get("LEA_COLD_CHECK_CONCURRENCY", "2")))
+_cold_check_sem = threading.BoundedSemaphore(_COLD_CHECK_CONCURRENCY)
+
+# `lake build` writes the shared workspace's `.lake` artifacts; two concurrent
+# builds against one lake_root race on them (a documented non-goal). One lock
+# per lake_root serializes builds. Daemon `lean_check` is a *different process*
+# and deliberately does NOT take this lock, so checks stay parallel with builds.
+_build_locks: dict[str, threading.Lock] = {}
+_build_locks_guard = threading.Lock()
+
+
+def _build_lock_for(lake_root: str) -> threading.Lock:
+    with _build_locks_guard:
+        lk = _build_locks.get(lake_root)
+        if lk is None:
+            lk = threading.Lock()
+            _build_locks[lake_root] = lk
+        return lk
+
 
 TOOLS_SCHEMA = [
     {
@@ -185,18 +218,22 @@ def lean_check(path: str, *, use_lsp: bool = True) -> str:
         cwd = str(p.parent)
 
     timeout = int(os.environ.get("LEAN_CHECK_TIMEOUT", "900"))
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd
-        )
-        output = (result.stdout + "\n" + result.stderr).strip()
-        if result.returncode == 0 and not output:
-            return "OK — no errors, no warnings."
-        return output if output else f"Exit code {result.returncode} (no output)."
-    except subprocess.TimeoutExpired:
-        return f"Error: lean timed out after {timeout}s."
-    except FileNotFoundError:
-        return "Error: `lean` or `lake` not found. Is Lean 4 installed?"
+    # Semaphore-bound: this cold compile loads a full Mathlib. Under concurrent
+    # runs a single daemon hiccup would otherwise let every run spawn one at
+    # once (D74 / item 6). Held across the whole compile so waiters queue.
+    with _cold_check_sem:
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd
+            )
+            output = (result.stdout + "\n" + result.stderr).strip()
+            if result.returncode == 0 and not output:
+                return "OK — no errors, no warnings."
+            return output if output else f"Exit code {result.returncode} (no output)."
+        except subprocess.TimeoutExpired:
+            return f"Error: lean timed out after {timeout}s."
+        except FileNotFoundError:
+            return "Error: `lean` or `lake` not found. Is Lean 4 installed?"
 
 
 def lean_check_cold(path: str) -> str:
@@ -251,54 +288,60 @@ def rebuild_module(path: str) -> str:
     module_name = ".".join(module_rel.with_suffix("").parts)
 
     timeout = int(os.environ.get("LEAN_CHECK_TIMEOUT", "900"))
-    try:
-        result = subprocess.run(
-            ["lake", "build", module_name],
-            # Explicit UTF-8: Lean's own output is full of non-ASCII (✖, ⊢,
-            # Mathlib's unicode notation). `text=True` alone decodes with the
-            # ambient locale's default encoding, which is not guaranteed to be
-            # UTF-8 for a background-launched process -- a decoding failure
-            # there would raise uncaught (not TimeoutExpired/FileNotFoundError)
-            # and surface as an opaque 500 instead of a real verdict.
-            # errors="replace" so a genuinely malformed byte can't crash the
-            # rebuild outright either.
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=timeout, cwd=lake_root,
-        )
-        output = (result.stdout + "\n" + result.stderr).strip()
-        if result.returncode == 0:
-            # This module's .olean on disk just changed, but a persistent LSP
-            # daemon (lsp_daemon.py) already holding it imported keeps its own
-            # in-memory copy for the life of its process -- this subprocess
-            # rebuild can't reach into that other process to fix it. Flag the
-            # daemon (if one exists for this lake_root) so its *next* check
-            # restarts it first, rather than silently serving the pre-rebuild
-            # environment forever. Best-effort: a project with LEA_DISABLE_LSP
-            # set, or no daemon started yet, has nothing to flag.
-            try:
-                from lea.lsp_daemon import mark_stale
-                mark_stale(lake_root)
-            except Exception:
-                pass
-            return output if output else "OK — rebuilt."
-        # Lake's own build-failure report (e.g. "✗ [n/total] Building <module>
-        # (Ns)" plus a `trace:` block showing the invocation it ran) is NOT the
-        # same format `lean`'s direct CLI/LSP diagnostics use -- the
-        # `file.lean:L:C: error: ...` line `_lean_check_has_error`/
-        # `_first_error_line` (lea/interface.py `rebuild`) scan for may be
-        # buried deep in Lake's own log, or, for some failure modes, absent
-        # from the captured output entirely even though the build genuinely
-        # failed. A non-zero exit code from `lake build` is authoritative on
-        # its own -- don't make error detection depend on Lake's own log
-        # happening to contain the literal word "error". Prefix unambiguously
-        # so the downstream text-based classifiers can never miss a real
-        # build failure regardless of how Lake chose to phrase it.
-        label = output or f"lake build exited with code {result.returncode} (no output)."
-        return f"error: lake build failed for {module_name} (exit {result.returncode}):\n{label}"
-    except subprocess.TimeoutExpired:
-        return f"Error: lake build timed out after {timeout}s."
-    except FileNotFoundError:
-        return "Error: `lake` not found. Is Lean 4 installed?"
+    # Serialize builds per lake_root: concurrent `lake build` against one shared
+    # workspace races on its `.lake` artifacts (a documented non-goal). mark_stale
+    # is called INSIDE this lock (D74 / item 6) so the daemon is flagged before
+    # the lock releases — no build completes without its stale flag, and no other
+    # build interleaves between this build writing the olean and that flag.
+    with _build_lock_for(lake_root):
+        try:
+            result = subprocess.run(
+                ["lake", "build", module_name],
+                # Explicit UTF-8: Lean's own output is full of non-ASCII (✖, ⊢,
+                # Mathlib's unicode notation). `text=True` alone decodes with the
+                # ambient locale's default encoding, which is not guaranteed to be
+                # UTF-8 for a background-launched process -- a decoding failure
+                # there would raise uncaught (not TimeoutExpired/FileNotFoundError)
+                # and surface as an opaque 500 instead of a real verdict.
+                # errors="replace" so a genuinely malformed byte can't crash the
+                # rebuild outright either.
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=timeout, cwd=lake_root,
+            )
+            output = (result.stdout + "\n" + result.stderr).strip()
+            if result.returncode == 0:
+                # This module's .olean on disk just changed, but a persistent LSP
+                # daemon (lsp_daemon.py) already holding it imported keeps its own
+                # in-memory copy for the life of its process -- this subprocess
+                # rebuild can't reach into that other process to fix it. Flag the
+                # daemon (if one exists for this lake_root) so its *next* check
+                # restarts it first, rather than silently serving the pre-rebuild
+                # environment forever. Best-effort: a project with LEA_DISABLE_LSP
+                # set, or no daemon started yet, has nothing to flag.
+                try:
+                    from lea.lsp_daemon import mark_stale
+                    mark_stale(lake_root)
+                except Exception:
+                    pass
+                return output if output else "OK — rebuilt."
+            # Lake's own build-failure report (e.g. "✗ [n/total] Building <module>
+            # (Ns)" plus a `trace:` block showing the invocation it ran) is NOT the
+            # same format `lean`'s direct CLI/LSP diagnostics use -- the
+            # `file.lean:L:C: error: ...` line `_lean_check_has_error`/
+            # `_first_error_line` (lea/interface.py `rebuild`) scan for may be
+            # buried deep in Lake's own log, or, for some failure modes, absent
+            # from the captured output entirely even though the build genuinely
+            # failed. A non-zero exit code from `lake build` is authoritative on
+            # its own -- don't make error detection depend on Lake's own log
+            # happening to contain the literal word "error". Prefix unambiguously
+            # so the downstream text-based classifiers can never miss a real
+            # build failure regardless of how Lake chose to phrase it.
+            label = output or f"lake build exited with code {result.returncode} (no output)."
+            return f"error: lake build failed for {module_name} (exit {result.returncode}):\n{label}"
+        except subprocess.TimeoutExpired:
+            return f"Error: lake build timed out after {timeout}s."
+        except FileNotFoundError:
+            return "Error: `lake` not found. Is Lean 4 installed?"
 
 
 # --- output classifiers -----------------------------------------------------
@@ -336,9 +379,14 @@ def _first_error_line(output: str) -> str | None:
 
 
 def bash(command: str, timeout: int = 120) -> str:
+    # Run in the active run's working dir (item 8) instead of the process-global
+    # cwd, so under concurrent runs one run's shell command can't land in
+    # another's tree. `None` (no run context — a standalone/test call) tells
+    # subprocess to use the inherited cwd, i.e. today's behavior unchanged.
+    cwd = current_working_dir()
     try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout
+            command, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd
         )
         output = (result.stdout + result.stderr).strip()
         if not output:

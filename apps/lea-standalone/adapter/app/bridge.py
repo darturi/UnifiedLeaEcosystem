@@ -34,7 +34,7 @@ import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Queue
-from threading import Event, Lock
+from threading import Event
 from typing import Any
 
 from uuid import uuid4
@@ -56,39 +56,17 @@ from lea.interface import (
 from .artifacts import classify_lean_artifact
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import projects, skills_catalog, store, uploads
+from . import projects, runbroker, runregistry, skills_catalog, store, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
-# Only one Lea activation may run at a time — they share the on-disk workspace
-# and the warm LSP daemon. A new run doesn't queue or get rejected; it supersedes
-# whatever holds the lock (most often a run parked on an unanswered approval whose
-# event stream is gone), so the UI is never permanently blocked (M15).
-active_run_lock = Lock()
-
-# The run_id currently being driven (holding `active_run_lock`), or None. Lets the
-# SSE endpoint tell "start + drive this run" apart from "a second viewer attaching
-# to a run already in flight" (e.g. the lea-standalone UI opening an Overleaf run
-# the companion is driving). Without this, every extra connection spawned another
-# runner that lost the lock and emitted run_error+done(failed), which the UI's
-# reconcile→reattach cycle turned into a request storm. Guarded by its own lock so
-# reads from the async endpoint never tear against the run thread's write.
-_active_run_guard = Lock()
-_active_run_id: str | None = None  # the run currently holding active_run_lock
-
-
-def current_active_run_id() -> str | None:
-    """The run_id currently being driven, or None. Used by the SSE endpoint to
-    route a second connection for the same run to a passive (read-only) view
-    instead of spawning a competing runner."""
-    with _active_run_guard:
-        return _active_run_id
-
-
-def _set_active_run_id(run_id: str | None) -> None:
-    global _active_run_id
-    with _active_run_guard:
-        _active_run_id = run_id
+# Admission — which run may start and whether there's room — now lives in
+# `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim,
+# decided at the SSE endpoint *before* this module's run thread is spawned. That
+# replaces the old split where the endpoint peeked an `_active_run_id` scalar while
+# the real claim happened later here (an `active_run_lock.acquire` inside the thread)
+# — a TOCTOU where two attaches both peeked None and both spawned. run_lea no longer
+# holds a single-slot lock or a scalar; it releases its admitted slot in the finally.
 
 # Per-run cooperative stop flags (D18). The run registers its Event when it starts
 # and the interrupt endpoint sets it; the agent checks it at each turn boundary and
@@ -150,6 +128,16 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
         "approval_id": approval_id, "run_id": run_id, "session_id": session_id,
         "tool_name": ev.tool_name, "args": ev.args,
     })
+    # Persist the pending approval onto the run row so it survives a stream drop,
+    # a reconnect, or a session switch: `session_detail` re-surfaces
+    # `active_run.pending_approval` and the UI rebuilds the same card. Without this
+    # the approval lives ONLY in the one-shot `approval_requested` SSE event — a
+    # client that missed it (reattached after it fired, or switched away and back)
+    # waits forever with no card. The persisted bytes mirror the live event so the
+    # rebuilt card is identical (same principle as the streamed/stored code rows).
+    store.set_run_pending_approval(run_id, {
+        "approval_id": approval_id, "tool_name": ev.tool_name, "args": ev.args,
+    })
     pending = _pending_approvals[run_id]
     while not pending["event"].wait(timeout=0.5):
         if stop_event.is_set():
@@ -161,6 +149,9 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
         decision = "deny"
     if decision == "always_session":
         _session_allowlists.setdefault(session_id, set()).add(ev.tool_name)
+    # Gate resolved → clear the persisted card so a reconnect doesn't re-raise a
+    # decision the run has already consumed.
+    store.set_run_pending_approval(run_id, None)
     emit(events, "approval_resolved", {"approval_id": approval_id, "decision": decision})
     return decision
 
@@ -174,13 +165,16 @@ class RunnerContext:
     run_id: str
     task: str
     config: LeaConfig
-    events: Queue[dict[str, Any]]
+    # A rejoinable RunBroker in the live endpoint; a plain Queue in unit tests. Both
+    # expose `.put({"type","payload"})`, which is all `emit()` needs.
+    events: "runbroker.RunBroker | Queue[dict[str, Any]]"
     # Autonomous (D19): no approval gate + the non-interactive `default` prompt
     # variant, so the run formalizes with zero human interaction (Overleaf path).
     autonomous: bool = False
 
 
-def emit(events: Queue[dict[str, Any]], event_type: str, payload: dict[str, Any]) -> None:
+def emit(events: "runbroker.RunBroker | Queue[dict[str, Any]]",
+         event_type: str, payload: dict[str, Any]) -> None:
     events.put({"type": event_type, "payload": payload})
 
 
@@ -355,61 +349,20 @@ def run_lea(context: RunnerContext) -> None:
     session_id = context.session_id
     run_id = context.run_id
 
-    if not active_run_lock.acquire(blocking=False):
-        # A prior run still holds the lock — usually one parked on an approval
-        # nobody answered (its event stream is gone). Supersede it: ask it to stop
-        # (its approval wait + turn loop are stop-aware) and take over once it
-        # releases, so starting a new run is never permanently blocked (M15).
-        stuck = current_active_run_id()
-        if stuck and stuck != run_id:
-            request_stop(stuck)
-        if not active_run_lock.acquire(timeout=15):
-            emit(events, "run_error", {"message": "A previous run is still finishing — try again in a moment."})
-            emit(events, "done", {"status": "failed"})
-            return
-    # We hold the slot — record which run is being driven so a second connection
-    # for THIS run attaches passively instead of spawning a doomed competitor.
-    _set_active_run_id(run_id)
+    # Admission (which run may start, and whether there's room) already happened at
+    # the endpoint (runregistry.try_admit) before this thread was spawned. run_lea no
+    # longer acquires a slot — it owns the one it was admitted into and releases it in
+    # the finally. Crucially the whole body, INCLUDING the setup that used to sit
+    # outside the try, now runs inside one guarded region: a throw in setup releases
+    # the slot instead of leaking it forever (v2.3 items 4/9).
 
     # Register (or adopt) this run's cooperative stop flag — the interrupt endpoint
     # may have created+set it already if Stop was hit before we got here (D18).
     stop_event = _stop_events.setdefault(run_id, Event())
 
     # Per-run temp dir holding materialized skill .md files (W3/D48); None until
-    # resolved below. Declared before any setup that could throw so the `finally`
-    # can always clean it up.
+    # resolved inside the try. Declared before it so the `finally` can always clean up.
     skills_tempdir: str | None = None
-
-    lea_root = cfg.lea_root or (Path(__file__).resolve().parents[2] / "prover")
-    proofs_root = Path(lea_root) / "workspace" / "proofs"
-    # Resolve the session's repo (D24): a project session writes the shared
-    # proofs/Lea/<Project> repo; a loose session its own proofs/<session-id>. Root
-    # the GitStore at the repo's parent and key by its dir name, so every
-    # session-keyed primitive below operates on the right repo unchanged. The real
-    # session_id still keys all DB rows.
-    session = store.get_session(session_id)
-    project = (
-        store.get_project(session["project_id"])
-        if session and session.get("project_id") else None
-    )
-    repo = projects.repo_for_session(session or {"id": session_id}, proofs_root, project)
-    gs = GitStore(repo.parent)
-    repo_key = repo.name
-    gs.init_repo(repo)  # idempotent; a project repo already exists from provisioning
-    # Guard the Overleaf .tex mirror so the agent compiling the document mid-run can't
-    # get its build artifacts (.pdf/.synctex.gz/.aux/...) swept in by commit-on-write.
-    if project:
-        uploads.ensure_overleaf_gitignore(project, proofs_root)
-    # Project namespace for the prompt (D32): None → the default Lea.Misc block.
-    namespace = project["namespace"] if project else None
-    # Skill resolution (W3/D48): a project run picks up the skills that resolve for
-    # it (global ∪ assigned, D47), materialized to per-run temp .md files fed to the
-    # prover via cfg.skills. Loose sessions resolve to none (project is None), so
-    # cfg.skills stays empty — no behavior change on the loose path.
-    if project:
-        skill_paths, skills_tempdir = skills_catalog.materialize_project_skills(project["id"])
-        if skill_paths:
-            cfg = replace(cfg, skills=skill_paths)
 
     narration: list[str] = []
     current_turn = 0
@@ -427,6 +380,8 @@ def run_lea(context: RunnerContext) -> None:
     checked_artifact_kind = "unknown"
     usage = _UsageByTurn()
     last_persisted: str | None = None
+    # Declared before the try so the finally's `done` event always has them, even if
+    # setup throws before the run reaches its Finished handler.
     final_status = "failed"
     final_result_kind: str | None = None
     final_result_detail: str | None = None
@@ -446,6 +401,36 @@ def run_lea(context: RunnerContext) -> None:
         return text.strip()
 
     try:
+        lea_root = cfg.lea_root or (Path(__file__).resolve().parents[2] / "prover")
+        proofs_root = Path(lea_root) / "workspace" / "proofs"
+        # Resolve the session's repo (D24): a project session writes the shared
+        # proofs/Lea/<Project> repo; a loose session its own proofs/<session-id>. Root
+        # the GitStore at the repo's parent and key by its dir name, so every
+        # session-keyed primitive below operates on the right repo unchanged. The real
+        # session_id still keys all DB rows.
+        session = store.get_session(session_id)
+        project = (
+            store.get_project(session["project_id"])
+            if session and session.get("project_id") else None
+        )
+        repo = projects.repo_for_session(session or {"id": session_id}, proofs_root, project)
+        gs = GitStore(repo.parent)
+        repo_key = repo.name
+        gs.init_repo(repo)  # idempotent; a project repo already exists from provisioning
+        # Guard the Overleaf .tex mirror so the agent compiling the document mid-run can't
+        # get its build artifacts (.pdf/.synctex.gz/.aux/...) swept in by commit-on-write.
+        if project:
+            uploads.ensure_overleaf_gitignore(project, proofs_root)
+        # Project namespace for the prompt (D32): None → the default Lea.Misc block.
+        namespace = project["namespace"] if project else None
+        # Skill resolution (W3/D48): a project run picks up the skills that resolve for
+        # it (global ∪ assigned, D47), materialized to per-run temp .md files fed to the
+        # prover via cfg.skills. Loose sessions resolve to none (project is None), so
+        # cfg.skills stays empty — no behavior change on the loose path.
+        if project:
+            skill_paths, skills_tempdir = skills_catalog.materialize_project_skills(project["id"])
+            if skill_paths:
+                cfg = replace(cfg, skills=skill_paths)
         store.update_run(run_id, "running")
         # Multi-turn (D16): replay the session's prior conversation so a follow-up
         # continues with full context — the prover is stateless, so the adapter
@@ -615,12 +600,18 @@ def run_lea(context: RunnerContext) -> None:
         skills_catalog.cleanup(skills_tempdir)
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
-        if current_active_run_id() == run_id:
-            _set_active_run_id(None)
-        active_run_lock.release()
+        # Release the admission slot (paired with the endpoint's try_admit). Idempotent,
+        # so a run that reaches here unadmitted — e.g. a direct unit-test call to
+        # run_lea, which never goes through the endpoint — is a harmless no-op.
+        runregistry.registry.release(run_id)
         done_payload = {"status": final_status}
         if final_result_kind:
             done_payload["result_kind"] = final_result_kind
         if final_result_detail:
             done_payload["result_detail"] = final_result_detail
         emit(events, "done", done_payload)
+        # The run has ended: retire its broker so no new connection attaches to a
+        # finished stream (a late reconnect is caught by the endpoint's terminal-status
+        # 409). Subscribers still draining hold their own reference and exit on `done`.
+        # Idempotent, so a direct unit-test call to run_lea (no broker) is a no-op.
+        runbroker.drop(run_id)

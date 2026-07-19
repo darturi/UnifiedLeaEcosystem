@@ -27,8 +27,9 @@ from lea.interface import (
 )
 from lea.providers import Usage
 
-from app import bridge, db, projects, store
+from app import bridge, db, projects, runregistry, store
 from app.config import LeaConfig
+from app.runregistry import RunRegistry
 
 
 def _drain(q: Queue) -> list[dict]:
@@ -560,6 +561,42 @@ def test_approval_relay_allow(tmp_path, monkeypatch):
     assert "approval_requested" in types and "approval_resolved" in types
 
 
+def test_pending_approval_is_persisted_so_it_survives_a_reconnect(tmp_path, monkeypatch):
+    # The gate must live on the run row too, not only in the one-shot SSE event:
+    # session_detail re-surfaces active_run.pending_approval so a client that missed
+    # the live `approval_requested` (reattached after it fired, or switched away and
+    # back) still rebuilds the Allow/Deny card instead of waiting forever with none.
+    ctx, queue = _context(tmp_path, monkeypatch)
+    received: dict = {}
+    monkeypatch.setattr(bridge, "run_events", _gated_fake(received))
+
+    t = Thread(target=bridge.run_lea, args=(ctx,))
+    t.start()
+    approval_id = None
+    for _ in range(200):  # up to ~4s for the gate to raise
+        pending = bridge._pending_approvals.get(ctx.run_id)
+        if pending:
+            approval_id = pending["approval_id"]
+            break
+        time.sleep(0.02)
+    assert approval_id, "run never raised a pending approval"
+
+    # While the gate blocks, the run row carries the approval — exactly the bytes a
+    # reconnecting client reads back through session_detail.
+    persisted = store.get_run(ctx.run_id)["pending_approval"]
+    assert persisted is not None, "pending approval was not persisted for reconnect"
+    assert persisted["approval_id"] == approval_id
+    assert persisted["tool_name"] == "bash"
+    assert persisted["args"] == {"command": "ls"}
+
+    assert bridge.resolve_approval(ctx.run_id, approval_id, "allow")
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+    # Resolved → cleared, so a later reconnect can't re-raise a consumed decision.
+    assert store.get_run(ctx.run_id)["pending_approval"] is None
+
+
 def test_approval_relay_always_session_updates_allowlist(tmp_path, monkeypatch):
     ctx, queue = _context(tmp_path, monkeypatch)
     bridge._session_allowlists.pop(ctx.session_id, None)
@@ -689,16 +726,45 @@ def test_loose_run_resolves_no_skills(tmp_path, monkeypatch):
     assert received["skills"] == []
 
 
-def test_second_concurrent_run_is_rejected(tmp_path, monkeypatch):
+def test_run_lea_releases_its_admission_slot(tmp_path, monkeypatch):
+    """Admission now happens at the endpoint; run_lea owns the admitted slot and must
+    release it on the happy path so the next run can be admitted."""
     ctx, queue = _context(tmp_path, monkeypatch)
-    # hold the lock as if another run were active
-    assert bridge.active_run_lock.acquire(blocking=False)
-    try:
-        bridge.run_lea(ctx)
-    finally:
-        bridge.active_run_lock.release()
+    reg = RunRegistry(max_concurrent=1)
+    monkeypatch.setattr(runregistry, "registry", reg)
+    reg.try_admit(ctx.run_id, ctx.session_id)  # endpoint would have done this
 
+    monkeypatch.setattr(bridge, "run_events", _fake_run_events(
+        lambda proof: [Finished(reason="assistant", text="ok", usage=Usage(0, 0), cost=0.0,
+                                transcript={"messages": []})]
+    ))
+    bridge.run_lea(ctx)
+
+    assert not reg.is_active(ctx.run_id), "run_lea must release its slot when it finishes"
+    assert reg.try_admit("next", "next-sess").outcome == runregistry.ADMITTED
+
+
+def test_setup_failure_still_releases_the_slot(tmp_path, monkeypatch):
+    """Item 4, fixed by construction (item 9): run_lea's setup now runs INSIDE the
+    try/finally, so a throw during setup releases the admitted slot instead of
+    leaking it forever. On `main` the setup sat outside the try, so this exception
+    would propagate out of run_lea and the slot would never be freed."""
+    ctx, queue = _context(tmp_path, monkeypatch)
+    reg = RunRegistry(max_concurrent=1)
+    monkeypatch.setattr(runregistry, "registry", reg)
+    reg.try_admit(ctx.run_id, ctx.session_id)
+
+    def _boom(*a, **k):
+        raise RuntimeError("setup blew up")
+    # repo_for_session is in the setup block that used to sit outside the try.
+    monkeypatch.setattr(bridge.projects, "repo_for_session", _boom)
+
+    bridge.run_lea(ctx)  # must NOT raise — the failure is surfaced as events
+
+    assert not reg.is_active(ctx.run_id), "a setup throw leaked the admission slot"
     items = _drain(queue)
     types = [i["type"] for i in items]
-    assert types == ["run_error", "done"]
-    assert items[-1]["payload"]["status"] == "failed"
+    assert types[-1] == "done" and items[-1]["payload"]["status"] == "failed"
+    assert "run_error" in types
+    # And the slot is genuinely free for the next run.
+    assert reg.try_admit("next", "next-sess").outcome == runregistry.ADMITTED

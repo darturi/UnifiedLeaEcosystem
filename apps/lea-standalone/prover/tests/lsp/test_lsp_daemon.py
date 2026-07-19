@@ -34,24 +34,38 @@ def check(name: str, cond: bool) -> None:
 
 
 class _FakeDaemon:
-    """Stands in for LeanDaemon so these tests need no real `lake`/`lean`."""
+    """Stands in for LeanDaemon so these tests need no real `lake`/`lean`.
+
+    Mirrors the lease/retire surface `check_via_lsp` drives: a retired daemon
+    shuts down once its (here always already-released) lease drains."""
 
     def __init__(self, lake_root):
         self.lake_root = lake_root
         self.broken = False
         self.stale = False
-        self.calls = 0
+        self._check_count = 0
+        self._leases = 0
         self.shutdown_called = False
 
     def start(self):
         return True
 
     def check(self, file_path, content):
-        self.calls += 1
+        self._check_count += 1
         return "OK — no errors, no warnings."
 
     def shutdown(self):
         self.shutdown_called = True
+
+    def _acquire_lease(self):
+        self._leases += 1
+
+    def _release_lease(self):
+        self._leases -= 1
+
+    def _retire(self):
+        if self._leases == 0:
+            self.shutdown()
 
 
 def _reset():

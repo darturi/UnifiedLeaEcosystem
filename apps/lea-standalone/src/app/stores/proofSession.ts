@@ -37,6 +37,13 @@ interface ProofSessionState {
   error?: string;
   setError: (error?: string) => void;
 
+  // Transient reconnect notice (v2.3 item 14): set while the run EventSource is
+  // backing off between reattach attempts (a dropped stream, or a 409 the browser
+  // can't read as anything but onerror — e.g. waiting for a free run slot).
+  // Cleared once the stream reopens, the run settles, or we give up.
+  reconnecting?: string;
+  setReconnecting: (reconnecting?: string) => void;
+
   // Persisted SafeVerify verdict for the latest proof, shown in the canvas foot.
   // Set on verify / load; cleared on edit / new session.
   safeVerify: SafeVerifyResult | null;
@@ -96,6 +103,9 @@ export const useProofSession = create<ProofSessionState>((set) => ({
 
   error: undefined,
   setError: (error) => set({ error }),
+
+  reconnecting: undefined,
+  setReconnecting: (reconnecting) => set({ reconnecting }),
 
   safeVerify: null,
   setSafeVerify: (safeVerify) => set({ safeVerify }),

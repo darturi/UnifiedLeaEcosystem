@@ -184,13 +184,20 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
     sessions = []
     for row in rows:
         data = row_to_dict(row)
+        # v2.3 item 13: keep the integer active-run count on the row (not just the
+        # bool the derived status consumes). Derived status deliberately stays a
+        # working-copy verdict (D14), so a session that already has code but is
+        # re-running reads 'proved'/'ok', never 'running' — the sidebar needs this
+        # separate signal to show a running dot for background runs.
+        active_run_count = int(data.pop("active_run_count", 0) or 0)
         data["status"] = _derive_session_status(
             data.pop("latest_check_status", None),
             data.pop("latest_artifact_kind", None),
             int(data.pop("code_step_count", 0) or 0),
-            bool(data.pop("active_run_count", 0)),
+            bool(active_run_count),
             data.pop("latest_code_run_status", None),
         )
+        data["active_run_count"] = active_run_count
         sessions.append(_normalize_usage_session(data))
     return sessions
 

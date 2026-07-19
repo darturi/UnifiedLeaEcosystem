@@ -11,6 +11,7 @@ hand back a structured verdict (a CheckResult / VerifyResult). No agent run — 
 adapter can verify a user-edited file on demand (the writeable canvas).
 """
 
+import tempfile
 from pathlib import Path
 
 from . import safeverify
@@ -108,8 +109,9 @@ def verify(path: str) -> VerifyResult:
 
     No agent run. Derives the target from the proof's own main theorem, so it
     catches `sorry`/`axiom`/`native_decide`/shadowing tricks a plain compile
-    misses. Expensive (~two compiles + a replay), so the adapter runs it once on
-    the final artifact and serializes calls.
+    misses. Expensive (~two compiles + a replay); concurrent calls are bounded by
+    a semaphore in `safeverify.verify_proof` (D74/H9, `LEA_SAFEVERIFY_CONCURRENCY`)
+    rather than by the adapter run lock, which v2.3 removes.
 
     status: 'ok' (passed) | 'rejected' (cheat caught) | 'error' (couldn't run /
     no theorem) | 'unavailable' (binary not built). 'error'/'unavailable' are
@@ -129,24 +131,33 @@ def verify(path: str) -> VerifyResult:
         return VerifyResult("error", "Could not find a theorem/lemma to verify in the proof.")
 
     workspace = safeverify.WORKSPACE
-    scratch = workspace / ".sv_scratch"
-    scratch.mkdir(parents=True, exist_ok=True)
+    # Per-call scratch dir (H2). The old code keyed target/submission by file
+    # *stem* in one shared `.sv_scratch`, so two concurrent runs on `Div6.lean`
+    # verified A's submission against B's target and the `finally` unlink deleted
+    # files the peer was mid-compile on. A unique subdir per call is collision-
+    # proof, and its RAII cleanup deletes only this call's files. Kept under
+    # `.sv_scratch` (directly below `workspace/`, outside `proofs/`) so the Lake
+    # `srcDir := "proofs"` glob never picks it up.
+    sv_root = workspace / ".sv_scratch"
+    sv_root.mkdir(parents=True, exist_ok=True)
     stem = p.stem or "proof"
-    target = scratch / f"{stem}_sv_target.lean"
-    submission = scratch / f"{stem}_sv_submission.lean"
     # Reproduce the submission's namespace so the target's declaration shares the
     # submission's fully-qualified name (e.g. `Lea.Misc.div_6`). Without this the
     # target declares a root-level `div_6`, which SafeVerify can't find in the
     # namespaced submission and rejects a valid proof.
     ns_open, ns_close = safeverify.namespace_context(code)
-    target.write_text("import Mathlib\n\n" + ns_open + signature + " := by\n  sorry\n" + ns_close)
-    submission.write_text(code if code.endswith("\n") else code + "\n")
 
-    try:
-        ok, detail = safeverify.verify_proof(target, submission, workspace)
-        return VerifyResult("ok" if ok else "rejected", None if ok else detail)
-    except Exception as exc:  # noqa: BLE001 — report any failure as an error verdict, not a crash
-        return VerifyResult("error", f"{type(exc).__name__}: {exc}")
-    finally:
-        target.unlink(missing_ok=True)
-        submission.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(dir=sv_root, prefix=f"{stem}_") as td:
+        scratch = Path(td)
+        target = scratch / f"{stem}_sv_target.lean"
+        submission = scratch / f"{stem}_sv_submission.lean"
+        target.write_text("import Mathlib\n\n" + ns_open + signature + " := by\n  sorry\n" + ns_close)
+        submission.write_text(code if code.endswith("\n") else code + "\n")
+        try:
+            # Thread the per-call dir down to the olean/report scratch too — the
+            # parameter existed but interface.verify never passed it, so the lower
+            # layer (safeverify.py) fell back to the same shared, stem-keyed dir.
+            ok, detail = safeverify.verify_proof(target, submission, workspace, scratch_dir=scratch)
+            return VerifyResult("ok" if ok else "rejected", None if ok else detail)
+        except Exception as exc:  # noqa: BLE001 — report any failure as an error verdict, not a crash
+            return VerifyResult("error", f"{type(exc).__name__}: {exc}")

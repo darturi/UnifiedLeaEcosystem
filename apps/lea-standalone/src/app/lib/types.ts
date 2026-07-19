@@ -64,6 +64,10 @@ export interface SessionSummary {
   run_count: number;
   message_count: number;
   code_step_count: number;
+  // v2.3 item 13: count of this session's pending/running runs. Non-zero means a
+  // background run is live even when the derived `status` reads a settled verdict
+  // (a re-run of an already-proved session), so the sidebar can show a running dot.
+  active_run_count?: number;
   primary_model?: string | null;
   models: string[];
   latest_check_status?: 'ok' | 'error' | 'unchecked' | null;

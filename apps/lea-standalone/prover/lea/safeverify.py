@@ -31,11 +31,21 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 PROVER_ROOT = Path(__file__).resolve().parent.parent
 SAFE_VERIFY_DIR = PROVER_ROOT / "third_party" / "SafeVerify"
 WORKSPACE = PROVER_ROOT / "workspace"
+
+# D74/H9 — SafeVerify is the single heaviest operation (~two full Mathlib
+# compiles + a kernel replay). `interface.verify` used to lean on the adapter's
+# run lock for serialization; that lock is being deleted (v2.3), so bound the
+# fan-out here where the expensive subprocesses actually launch, guarding every
+# caller of `verify_proof` regardless of entry point. Default 2 mirrors the cold
+# `lean_check` bound (D74); raise via env for a beefier host.
+_SAFEVERIFY_CONCURRENCY = max(1, int(os.environ.get("LEA_SAFEVERIFY_CONCURRENCY", "2")))
+_verify_sem = threading.BoundedSemaphore(_SAFEVERIFY_CONCURRENCY)
 
 
 # --- availability -----------------------------------------------------------
@@ -208,32 +218,35 @@ def verify_proof(
     submission_olean = scratch / f"{stem}_submission.olean"
     report_path = scratch / f"{stem}_report.json"
 
-    try:
-        ok, out = _compile_to_olean(target_src, target_olean, lake_project, compile_timeout)
-        if not ok:
-            return False, f"Target compile failed: {out}"
-
-        ok, out = _compile_to_olean(submission_src, submission_olean, lake_project, compile_timeout)
-        if not ok:
-            return False, f"Submission compile failed: {out}"
-
+    # Held across both compiles + the replay (D74/H9). The scratch paths above are
+    # cheap to name outside the gate; only the subprocess launches are bounded.
+    with _verify_sem:
         try:
-            result = subprocess.run(
-                ["lake", "exe", "safe_verify", "-v",
-                 str(target_olean.resolve()), str(submission_olean.resolve()),
-                 "--disallow-partial", "-s", str(report_path.resolve())],
-                capture_output=True, text=True, timeout=safe_verify_timeout,
-                cwd=str(SAFE_VERIFY_DIR), env=_replay_env(lake_project),
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"SafeVerify timed out ({safe_verify_timeout}s)"
+            ok, out = _compile_to_olean(target_src, target_olean, lake_project, compile_timeout)
+            if not ok:
+                return False, f"Target compile failed: {out}"
 
-        output = (result.stdout + "\n" + result.stderr).strip()
-        if result.returncode == 0:
-            return True, "OK (SafeVerify passed)"
-        if "theorem type mismatch" in output and _universe_alpha_equiv(output):
-            return True, "OK (SafeVerify rejected on universe/hygiene-only naming difference; types alpha-equivalent)"
-        return False, output if output else f"SafeVerify exit code {result.returncode}"
-    finally:
-        for p in (target_olean, submission_olean, report_path):
-            p.unlink(missing_ok=True)
+            ok, out = _compile_to_olean(submission_src, submission_olean, lake_project, compile_timeout)
+            if not ok:
+                return False, f"Submission compile failed: {out}"
+
+            try:
+                result = subprocess.run(
+                    ["lake", "exe", "safe_verify", "-v",
+                     str(target_olean.resolve()), str(submission_olean.resolve()),
+                     "--disallow-partial", "-s", str(report_path.resolve())],
+                    capture_output=True, text=True, timeout=safe_verify_timeout,
+                    cwd=str(SAFE_VERIFY_DIR), env=_replay_env(lake_project),
+                )
+            except subprocess.TimeoutExpired:
+                return False, f"SafeVerify timed out ({safe_verify_timeout}s)"
+
+            output = (result.stdout + "\n" + result.stderr).strip()
+            if result.returncode == 0:
+                return True, "OK (SafeVerify passed)"
+            if "theorem type mismatch" in output and _universe_alpha_equiv(output):
+                return True, "OK (SafeVerify rejected on universe/hygiene-only naming difference; types alpha-equivalent)"
+            return False, output if output else f"SafeVerify exit code {result.returncode}"
+        finally:
+            for p in (target_olean, submission_olean, report_path):
+                p.unlink(missing_ok=True)
