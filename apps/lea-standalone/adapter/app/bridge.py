@@ -51,13 +51,14 @@ from lea.interface import (
     ToolResulted,
     TurnStarted,
     UsageUpdated,
+    check as _lean_check_file,
     run_events,
 )
 
 from .artifacts import classify_lean_artifact
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import projects, runbroker, runregistry, skills_catalog, store, uploads
+from . import collation, projects, runbroker, runregistry, skills_catalog, store, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
@@ -417,6 +418,69 @@ def _materialize_subagent(
     return child
 
 
+def _promote_winner(
+    subagent_results: list[SubagentFinished],
+    *,
+    session_id: str,
+    run_id: str,
+    repo: Path,
+    namespace: str | None,
+    turn: int,
+    events,
+) -> dict | None:
+    """Deterministic collation (item 25): promote the best *compiling* sub-agent candidate
+    as the coordinator's proof, and record it as a code_step — the compiler decides, not
+    the model. Returns the promoted step, or None if nothing was promoted.
+
+    The ranking is `collation`'s (lean_check clean > SafeVerify-rejected > error, ties by
+    sorry-free / shorter). Only a clean candidate is promotable. Two safety rails make this
+    safe to run automatically:
+
+      * the caller only invokes this when the coordinator produced NO clean proof itself
+        (so a promotion fills a gap, never clobbers the coordinator's own answer);
+      * the winner is **re-verified at the canonical path** before it's recorded — the
+        child's lean_check ran in its scratch dir, so we don't trust that verdict at a new
+        location; if it doesn't re-verify clean, nothing is promoted (the coordinator's
+        result stands) rather than recording an unchecked "ok".
+    """
+    if not subagent_results:
+        return None
+    candidates = [collation.candidate_from_event(ev, base_dir=repo) for ev in subagent_results]
+    winner = collation.select_promotable(candidates)
+    if winner is None or not winner.candidate_path:
+        return None
+    # The session's canonical proofs dir: its namespace path (loose → Lea/Misc).
+    ns_path = (namespace or "Lea.Misc").replace(".", "/")
+    canonical = repo / ns_path / Path(winner.candidate_path).name
+    try:
+        collation.promote(winner, canonical)
+    except ValueError:
+        return None
+    # Re-verify at the NEW path — the child checked a different location.
+    verdict = _lean_check_file(str(canonical))
+    if verdict.status != "ok":
+        logger.warning(
+            "sub-agent candidate %s did not re-verify at %s (%s); not promoting",
+            winner.result_id, canonical, verdict.detail,
+        )
+        return None
+    rel = _relativize(str(canonical), repo)
+    step = store.add_code_step(
+        session_id, run_id, rel, content=winner.text or "", author="agent", turn=turn,
+        summary=f"Promoted the winning sub-agent candidate ({winner.result_id}).",
+        check_status="ok", check_detail=None,
+        artifact_kind=_classify(winner.text or ""),
+        provenance={"promoted_from": winner.result_id},
+    )
+    emit(events, "code_step", step)
+    emit(events, "status", {
+        "status": "promoted",
+        "message": f"Promoted the winning sub-agent candidate ({winner.result_id}).",
+        "turn": turn,
+    })
+    return step
+
+
 def run_lea(context: RunnerContext) -> None:
     """Run one Lea activation, streaming normalized SSE events onto the queue.
 
@@ -476,6 +540,10 @@ def run_lea(context: RunnerContext) -> None:
     # Finished sub-agents (item 24), in the order they completed — surfaced as child
     # sessions and kept for the collation pass (item 25) on the coordinator's Finished.
     subagent_results: list[SubagentFinished] = []
+    # Whether the coordinator ITSELF produced a clean (non-scratch) proof this run. If it
+    # did, the collation pass leaves it alone; if it didn't, the best compiling child
+    # candidate is promoted to fill the gap (item 25).
+    produced_clean = False
     last_persisted: str | None = None
     # Declared before the try so the finally's `done` event always has them, even if
     # setup throws before the run reaches its Finished handler.
@@ -623,6 +691,8 @@ def run_lea(context: RunnerContext) -> None:
                     step_id_by_path[rel] = step["id"]
                     if ev.status == "ok":
                         checked_artifact_kind = step.get("artifact_kind")
+                        if "scratch" not in rel.lower():
+                            produced_clean = True
                     emit(events, "code_step", step)
                 else:
                     artifact_kind = None
@@ -634,6 +704,8 @@ def run_lea(context: RunnerContext) -> None:
                     if updated:
                         if ev.status == "ok":
                             checked_artifact_kind = updated.get("artifact_kind") or _classify(updated["code"])
+                            if "scratch" not in rel.lower():
+                                produced_clean = True
                         emit(events, "code_step", updated)
                 emit(events, "status", {
                     "status": "lean_check", "message": f"lean_check: {ev.status}",
@@ -699,6 +771,19 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, Finished):
                 flush_narration()
+                # Deterministic collation (item 25): if the coordinator delegated but
+                # produced no clean proof of its own, promote the best compiling child
+                # candidate as the session's proof (re-verified at the canonical path).
+                # Runs BEFORE the artifact-result classification so the promoted verdict
+                # settles the session's outcome. Never clobbers a clean coordinator proof.
+                if not produced_clean and subagent_results:
+                    promoted = _promote_winner(
+                        subagent_results, session_id=session_id, run_id=run_id,
+                        repo=repo, namespace=namespace, turn=current_turn, events=events,
+                    )
+                    if promoted:
+                        checked_artifact_kind = promoted.get("artifact_kind") or checked_artifact_kind
+                        produced_clean = True
                 final_text = _final_text_for_result(ev)
                 persist_assistant(final_text)
                 final_status, result_kind = _completed_artifact_result(ev, checked_artifact_kind)

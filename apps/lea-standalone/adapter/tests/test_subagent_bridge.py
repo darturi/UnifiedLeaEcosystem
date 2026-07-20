@@ -15,11 +15,24 @@ These pin the adapter side of sub-agents, without a live prover run:
 from pathlib import Path
 from queue import Queue
 
-from lea.interface import AssistantTextDelta, Finished, SubagentFinished, TurnStarted
+from lea.interface import (
+    AssistantTextDelta,
+    CheckResult,
+    FileChanged,
+    Finished,
+    SubagentFinished,
+    ToolCalled,
+    TurnStarted,
+)
 from lea.providers import Usage
 
 from app import bridge, db, store
 from app.config import LeaConfig
+
+
+def _ok_recheck(monkeypatch):
+    """Stub the canonical-path re-verification so promotion tests need no Lean env."""
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda path: CheckResult(path, "ok", None))
 
 
 def _drain(q: Queue) -> list[dict]:
@@ -180,6 +193,7 @@ def test_run_lea_materializes_child_and_emits_sse(tmp_path, monkeypatch):
         yield Finished("completed", "A candidate compiled.", 1, ctx.session_id,
                        "gemini/test", Usage(input_tokens=5, output_tokens=3), 0.0, {})
 
+    _ok_recheck(monkeypatch)  # the coordinator delegated + wrote nothing → promotion fires
     monkeypatch.setattr(bridge, "run_events", fake)
     bridge.run_lea(ctx)
 
@@ -192,13 +206,131 @@ def test_run_lea_materializes_child_and_emits_sse(tmp_path, monkeypatch):
     assert cdetail["code_steps"] and cdetail["code_steps"][0]["check_status"] == "ok"
     assert any("done, it compiles" in m["content"] for m in cdetail["messages"])
 
-    # the SSE stream carried a subagent_finished event with the child id
+    # collation promoted the winning candidate onto the PARENT session (item 25): the
+    # coordinator delegated and wrote no proof itself, so the winner fills the gap.
+    pdetail = store.session_detail(session["id"])
+    promoted = [s for s in pdetail["code_steps"] if s["path"] == "Lea/Misc/Sqrt2.lean"]
+    assert len(promoted) == 1 and promoted[0]["check_status"] == "ok"
+    assert pdetail["status"] == "proved"                       # derived from the promoted proof
+
+    # the SSE stream carried a subagent_finished event + a promoted status
     events = _drain(queue)
     subagent_events = [e for e in events if e["type"] == "subagent_finished"]
     assert len(subagent_events) == 1
     assert subagent_events[0]["payload"]["child_id"] == child["id"]
     assert subagent_events[0]["payload"]["parent_id"] == session["id"]
     assert subagent_events[0]["payload"]["check_status"] == "ok"
+    assert any(e["type"] == "status" and e["payload"].get("status") == "promoted" for e in events)
+
+
+def test_promote_winner_writes_canonical_reverifies_and_links_provenance(tmp_path, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _ok_recheck(monkeypatch)
+    session = store.create_session("root")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    repo = tmp_path / "repo"
+    scratch = repo / ".lea" / "tmp" / "run" / "agent"
+    scratch.mkdir(parents=True)
+    (scratch / "Win.lean").write_text(_OK_CANDIDATE)
+    ev = _finished(candidate_path=".lea/tmp/run/agent/Win.lean", check_status="ok")
+
+    step = bridge._promote_winner(
+        [ev], session_id=session["id"], run_id=run["id"],
+        repo=repo, namespace=None, turn=2, events=Queue(),
+    )
+    assert step is not None
+    # winner bytes written to the canonical proofs dir (loose → Lea/Misc)
+    assert (repo / "Lea" / "Misc" / "Win.lean").read_text() == _OK_CANDIDATE
+    assert step["path"] == "Lea/Misc/Win.lean" and step["check_status"] == "ok"
+    # recorded on the PARENT session, deriving it 'proved'
+    detail = store.session_detail(session["id"])
+    assert detail["status"] == "proved"
+    # provenance links the promoted step back to the child result (item 25)
+    with sqlite3.connect(tmp_path / "test.sqlite3") as conn:
+        data = conn.execute(
+            "select data from timeline where path = 'Lea/Misc/Win.lean'"
+        ).fetchone()[0]
+    assert ev.result_id in data and "promoted_from" in data
+
+
+def test_promote_winner_skips_when_no_clean_candidate(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _ok_recheck(monkeypatch)  # recheck would pass, but an error candidate isn't promotable
+    session = store.create_session("root")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    ev = _finished(candidate_path=".lea/tmp/run/agent/Bad.lean", check_status="error",
+                   check_detail="boom")
+    step = bridge._promote_winner(
+        [ev], session_id=session["id"], run_id=run["id"],
+        repo=tmp_path / "repo", namespace=None, turn=1, events=Queue(),
+    )
+    assert step is None
+    assert store.session_detail(session["id"])["code_steps"] == []
+
+
+def test_promote_winner_skips_when_reverify_fails(tmp_path, monkeypatch):
+    # the child's candidate compiled in scratch, but it does NOT re-verify at the
+    # canonical path → nothing is promoted (never record an unchecked 'ok').
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "error", "moved-module boom"))
+    session = store.create_session("root")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    repo = tmp_path / "repo"
+    scratch = repo / ".lea" / "tmp" / "run" / "agent"
+    scratch.mkdir(parents=True)
+    (scratch / "Win.lean").write_text(_OK_CANDIDATE)
+    ev = _finished(candidate_path=".lea/tmp/run/agent/Win.lean", check_status="ok")
+    step = bridge._promote_winner(
+        [ev], session_id=session["id"], run_id=run["id"],
+        repo=repo, namespace=None, turn=1, events=Queue(),
+    )
+    assert step is None
+    assert store.session_detail(session["id"])["code_steps"] == []
+
+
+def test_run_lea_does_not_promote_over_a_clean_coordinator_proof(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _ok_recheck(monkeypatch)
+    session = store.create_session("Prove it")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="Prove it", config=cfg, events=Queue(),
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        proof = Path(working_dir) / "Lea" / "Misc" / "Main.lean"
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text(_OK_CANDIDATE)
+        scratch = Path(working_dir) / ".lea" / "tmp" / "run" / "agent"
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "Cand.lean").write_text(_OK_CANDIDATE)
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": str(proof)})
+        yield FileChanged(str(proof))
+        yield ToolCalled("lean_check", {"path": str(proof)})
+        yield CheckResult(str(proof), "ok", None)   # coordinator produced a clean proof
+        yield SubagentFinished(
+            result_id="pc-1", subagent_type="proof-candidate",
+            candidate_path=".lea/tmp/run/agent/Cand.lean", check_status="ok", check_detail=None,
+            stop_reason="completed", summary="also compiles", transcript=[],
+        )
+        yield Finished("completed", "Proved it.", 1, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    # only the coordinator's own proof — the child candidate is NOT promoted over it
+    detail = store.session_detail(session["id"])
+    assert [s["path"] for s in detail["code_steps"]] == ["Lea/Misc/Main.lean"]
 
 
 def test_autonomous_run_does_not_enable_subagents(tmp_path, monkeypatch):

@@ -1191,6 +1191,7 @@ def add_code_step(
     check_status: str | None = None,
     check_detail: str | None = None,
     artifact_kind: str | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Record a timeline step holding a file's full contents after a write.
 
@@ -1207,9 +1208,19 @@ def add_code_step(
     it's a *reason*, and it was only ever in this column because the old schema had
     nowhere else to put it. It rides in `data` instead; the file is still the
     agent's work regardless of what prompted the re-check.
+
+    `provenance` (item 25) is merged into the same `data` JSON — e.g.
+    `{"promoted_from": "<result_id>"}` links a promoted sub-agent candidate back to
+    the child run that produced it, so "which attempt won" stays answerable.
     """
     now = utc_now()
     reason = None if author in ("user", "agent", "environment") else author
+    data_obj: dict = {}
+    if reason:
+        data_obj["reason"] = reason
+    if provenance:
+        data_obj.update(provenance)
+    data_json = json.dumps(data_obj) if data_obj else None
     with write() as conn:
         blob_id = _put_blob(conn, content)
         cur = conn.execute(
@@ -1231,7 +1242,7 @@ def add_code_step(
                 check_status,
                 check_detail,
                 artifact_kind if check_status == "ok" else None,
-                json.dumps({"reason": reason}) if reason else None,
+                data_json,
                 now,
             ),
         )
