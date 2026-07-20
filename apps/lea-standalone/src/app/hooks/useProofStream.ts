@@ -334,6 +334,14 @@ export function useProofStream() {
       setApprovalBusy(false);
     });
 
+    source.addEventListener('subagent_finished', () => {
+      // A child sub-agent finished and the adapter has already persisted it as its own
+      // session (item 24). Refresh the list so the child lands in the store — the
+      // sidebar's Sub-agents block and the parent thread's spawn node both derive from
+      // it. No per-event payload handling needed: the session list is the source of truth.
+      useSessions.getState().refreshSessions().catch(() => {});
+    });
+
     source.addEventListener('run_error', (event) => {
       const data = (event as MessageEvent).data;
       if (!data) return;

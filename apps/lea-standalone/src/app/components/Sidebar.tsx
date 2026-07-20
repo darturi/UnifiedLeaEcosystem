@@ -35,9 +35,20 @@ export function Sidebar({
   const sessions = useSessions((s) => s.sessions);
   const selectedSessionId = useSessions((s) => s.selectedSessionId);
   // D36: the sidebar's Chats group is loose sessions only — in-project sessions
-  // live in the project window (reachable there or via search), not here.
-  const looseSessions = sessions.filter((s) => !s.project_id);
+  // live in the project window (reachable there or via search), not here. Item 24:
+  // and ROOTS only (`parent_id == null`) — sub-agent children never appear in the
+  // Chats list; they surface in the contextual Sub-agents block below, scoped to the
+  // tree root so it survives clicking into a candidate.
+  const looseSessions = sessions.filter((s) => !s.project_id && !s.parent_id);
   const groups = groupByDate(looseSessions);
+  // The Sub-agents block (item 24): scope to the tree ROOT of the selection, not the
+  // selection itself (`children(parent_id ?? id)`) — so clicking a candidate keeps the
+  // block (siblings + the way back) instead of vanishing (a candidate has no children).
+  const selectedSession = sessions.find((s) => s.id === selectedSessionId);
+  const treeRootId = selectedSession ? selectedSession.parent_id ?? selectedSession.id : undefined;
+  const treeRoot = treeRootId ? sessions.find((s) => s.id === treeRootId) : undefined;
+  const subagents = treeRootId ? sessions.filter((s) => s.parent_id === treeRootId) : [];
+  const subagentsRunning = subagents.filter((s) => dotClass(s, runningSessionId) === 'run').length;
   // F1: projects list + which one is open, from the projects store.
   const projects = useProjects((s) => s.projects);
   const selectedProjectId = useProjects((s) => s.selectedProjectId);
@@ -115,6 +126,39 @@ export function Sidebar({
             ))}
           </div>
         ))}
+
+        {treeRoot && subagents.length > 0 && (
+          <div className="sa-group">
+            <div className="group-label">
+              Sub-agents
+              <span className="sa-count">
+                {subagentsRunning ? `${subagentsRunning} running` : `${subagents.length} done`}
+              </span>
+            </div>
+            <button className="sa-parent" onClick={() => onSelectSession(treeRoot.id)}>
+              <span className="chev">◂</span>
+              <span className="ptitle">{treeRoot.title}</span>
+            </button>
+            {subagents.map((child) => {
+              const running = dotClass(child, runningSessionId) === 'run';
+              return (
+                <button
+                  key={child.id}
+                  className={`row ${selectedSessionId === child.id ? 'active' : ''}`}
+                  onClick={() => onSelectSession(child.id)}
+                >
+                  {running ? (
+                    <span className="sa-spin" />
+                  ) : (
+                    <span className={`dot ${dotClass(child, runningSessionId)}`} />
+                  )}
+                  <span className="rtitle">{child.title}</span>
+                  {child.role && <span className="role">{child.role.split('-')[0]}</span>}
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div className="sidebar-foot">

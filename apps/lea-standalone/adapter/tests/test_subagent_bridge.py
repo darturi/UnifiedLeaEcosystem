@@ -13,11 +13,20 @@ These pin the adapter side of sub-agents, without a live prover run:
 """
 
 from pathlib import Path
+from queue import Queue
 
-from lea.interface import SubagentFinished
+from lea.interface import AssistantTextDelta, Finished, SubagentFinished, TurnStarted
+from lea.providers import Usage
 
 from app import bridge, db, store
 from app.config import LeaConfig
+
+
+def _drain(q: Queue) -> list[dict]:
+    items = []
+    while not q.empty():
+        items.append(q.get_nowait())
+    return items
 
 
 def _fresh_db(tmp_path, monkeypatch):
@@ -136,3 +145,82 @@ def test_materialize_tolerates_missing_candidate(tmp_path, monkeypatch):
     detail = store.session_detail(child["id"])
     assert detail["code_steps"] == []          # unreadable candidate → no code step
     assert len(detail["messages"]) >= 1        # but the child still landed with its transcript
+
+
+# --- end-to-end through the real bridge loop ----------------------------------
+
+def test_run_lea_materializes_child_and_emits_sse(tmp_path, monkeypatch):
+    # Drive the real run_lea event loop with a fake prover that delegates to a child.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove sqrt2 irrational")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"],
+        task="Prove sqrt2 irrational", config=cfg, events=queue,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        # the child writes its candidate into its scratch under the run's working tree
+        scratch = Path(working_dir) / ".lea" / "tmp" / "run" / "agent"
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "Sqrt2.lean").write_text(_OK_CANDIDATE)
+        yield TurnStarted(1)
+        yield AssistantTextDelta("I'll delegate a candidate.")
+        yield SubagentFinished(
+            result_id="proof-candidate-xyz", subagent_type="proof-candidate",
+            candidate_path=".lea/tmp/run/agent/Sqrt2.lean", check_status="ok", check_detail=None,
+            stop_reason="completed", summary="parity approach compiles",
+            transcript=[{"role": "user", "content": "prove it"},
+                        {"role": "assistant", "content": "done, it compiles"}],
+        )
+        yield Finished("completed", "A candidate compiled.", 1, ctx.session_id,
+                       "gemini/test", Usage(input_tokens=5, output_tokens=3), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    # a child session was created under the coordinator, with its verdict-derived status
+    kids = store.list_child_sessions(session["id"])
+    assert len(kids) == 1
+    child = kids[0]
+    assert child["parent_id"] == session["id"] and child["role"] == "proof-candidate"
+    cdetail = store.session_detail(child["id"])
+    assert cdetail["code_steps"] and cdetail["code_steps"][0]["check_status"] == "ok"
+    assert any("done, it compiles" in m["content"] for m in cdetail["messages"])
+
+    # the SSE stream carried a subagent_finished event with the child id
+    events = _drain(queue)
+    subagent_events = [e for e in events if e["type"] == "subagent_finished"]
+    assert len(subagent_events) == 1
+    assert subagent_events[0]["payload"]["child_id"] == child["id"]
+    assert subagent_events[0]["payload"]["parent_id"] == session["id"]
+    assert subagent_events[0]["payload"]["check_status"] == "ok"
+
+
+def test_autonomous_run_does_not_enable_subagents(tmp_path, monkeypatch):
+    # Overleaf/autonomous runs stay single-agent — spawn_subagent is not added.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("auto")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    seen_tools = {}
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="auto",
+        config=cfg, events=Queue(), autonomous=True,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        seen_tools["tools"] = config.tools
+        yield Finished("completed", "done", 1, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+    # autonomous keeps the prover default (None) — no spawn_subagent forced on
+    assert seen_tools["tools"] is None
