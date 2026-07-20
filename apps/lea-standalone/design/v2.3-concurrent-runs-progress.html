@@ -123,13 +123,15 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:68%"></i></div>
-  <div class="counts"><b>14 / 22 built · 13 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:72%"></i></div>
+  <div class="counts"><b>15 / 22 built · 14 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
-    <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll
-    shipped. Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent
-    checks, adapter attribution e2e). Concurrency is on by default: four chats formalize at once.
-    <b>Everything through item 17 is green; only the subagent phase (18–22) remains.</b>
+    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7 started:</b> item 18 —
+    <code>spawn_subagent</code> + child activations, with two independent recursion guards and candidate-dir isolation
+    that reuses F3's write sandbox. Concurrency is on by default: four chats formalize at once.
+    <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
+    Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
+    adapter attribution e2e).
     <b>Phase 5 complete — items 13–15 verified in the running UI.</b> Manual testing surfaced three real, latent
     defects: <b>F1</b> — the approval card was never persisted, so it vanished on any reconnect/switch (fixed by writing
     <code>runs.pending_approval</code>); <b>F2</b> — a reattached stream got a dead "passive view" (only a terminal
@@ -137,8 +139,8 @@
     (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
-    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox suites. Next: <b>Phase 7 —
-    subagents (items 18–22), each still wants a short design pass.</b><br>
+    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites. Next: <b>item 19 —
+    declarative agent profiles (markdown + frontmatter) in <code>prover/lea/agents/</code>.</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1063,14 +1065,19 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
       injects declarative markdown, <code>events.py</code> is already a typed stream. Each item still wants a short
       design pass before it's buildable.</div>
 
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">18</span><span class="title"><code>spawn_subagent</code> tool + child activations</span>
-        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
-      <div class="scope">A parent tool call starts a child activation with its own message list, its own
-        <code>candidate_dir</code>, and a fresh context. Two independent recursion guards: a depth walk (<b>default
-        1</b> — children can't spawn) <b>and</b> <code>spawn_subagent</code> denied by default in the child's toolset.
-        Either alone would do; both means a bug in one isn't a fork bomb. Step and check caps are runaway guards, not
-        accounting. Tests: <code>test_subagent_depth_budget.py</code>.</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done (Option A — minimal built-in role).</b> <code>spawn_subagent</code> (new
+        <code>lea/subagents.py</code>) drives a nested <code>run_events</code> to completion and returns a distilled
+        result (candidate path + <code>lean_check</code> verdict + summary). The child gets a fresh context, a bounded
+        turn budget, no MCP, and its <code>working_dir</code> IS an isolated <code>.lea/tmp/&lt;run&gt;/&lt;agent&gt;</code>
+        scratch tree — so <b>F3's write sandbox makes "subagents never write the canonical file" (D76) enforced for
+        free</b>. <b>Two independent recursion guards:</b> (1) a depth walk on a new <code>runctx</code> depth var —
+        <code>spawn_subagent</code> refuses at <code>depth ≥ 1</code>; (2) the tool is registered
+        <code>opt_in=True</code>, so <code>build_toolset(None)</code> excludes it — every existing run is byte-identical
+        (subagents land dark) AND a child's own <code>tools=None</code> toolset can never contain it. Either alone
+        suffices. <code>test_subagent_depth_budget.py</code>: 24 checks (stubbed child, deterministic) — all green.</div>
     </div>
     <div class="todo">
       <div class="top"><span class="id sub">19</span><span class="title">Declarative agent profiles (markdown + frontmatter)</span>

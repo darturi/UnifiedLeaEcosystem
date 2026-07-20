@@ -30,11 +30,18 @@ class Tool:
 
     `schema` is the JSON object sent to the model (name/description/input_schema).
     `handler` takes the raw arguments dict and returns a string result.
+
+    `opt_in` (item 18) marks a tool that the unfiltered (`selected is None`)
+    toolset must NOT include — a config has to name it explicitly. `spawn_subagent`
+    is opt-in: it stays off every existing run (which pass `tools=None`) so
+    subagents land dark, and a subagent's own `tools=None` toolset can never
+    contain it — the second recursion guard, for free.
     """
 
     name: str
     schema: dict
     handler: Handler
+    opt_in: bool = False
 
 
 # name -> Tool, plus registration order so an unfiltered toolset is deterministic
@@ -63,16 +70,17 @@ def unregister(name: str) -> None:
         _ORDER.remove(name)
 
 
-def tool(*, name: str, description: str, input_schema: dict):
+def tool(*, name: str, description: str, input_schema: dict, opt_in: bool = False):
     """Decorator: register a `dict[args] -> str` function as a Tool.
 
     The function becomes the handler; the schema is assembled from the arguments.
+    `opt_in=True` keeps the tool out of the default (`selected is None`) toolset.
     """
 
     schema = {"name": name, "description": description, "input_schema": input_schema}
 
     def decorator(fn: Handler) -> Handler:
-        register(Tool(name=name, schema=schema, handler=fn))
+        register(Tool(name=name, schema=schema, handler=fn, opt_in=opt_in))
         return fn
 
     return decorator
@@ -94,11 +102,13 @@ def import_tool_modules(modules: list[str]) -> None:
 def build_toolset(selected: list[str] | None) -> tuple[list[dict], dict[str, Handler]]:
     """Resolve a config selection into what the loop needs: (schemas, handlers).
 
-    `selected is None` → every registered tool, in registration order (the
-    default; reproduces today's behavior). A list → exactly those tools, in that
-    order (so the list both filters and orders). An unknown name raises ToolError.
+    `selected is None` → every registered tool EXCEPT opt-in ones (item 18), in
+    registration order (the default; reproduces today's behavior — the built-ins
+    are all non-opt-in). A list → exactly those tools, in that order (so the list
+    both filters and orders), opt-in tools included when named explicitly. An
+    unknown name raises ToolError.
     """
-    names = list(_ORDER) if selected is None else selected
+    names = [n for n in _ORDER if not REGISTRY[n].opt_in] if selected is None else selected
     schemas: list[dict] = []
     handlers: dict[str, Handler] = {}
     for name in names:

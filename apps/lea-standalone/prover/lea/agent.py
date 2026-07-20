@@ -423,6 +423,7 @@ def run_events(
     working_dir: str | None = None,
     should_stop=None,
     gate=None,
+    depth: int = 0,
 ):
     """Core loop as a generator: yields typed events, never prints.
 
@@ -465,7 +466,10 @@ def run_events(
     # ContextVars stay set through every tool call delegated to the inner loop.
     run_key = session_id or uuid.uuid4().hex[:12]
     try:
-        with run_context(working_dir=working_dir, run_key=run_key):
+        # `depth` (item 18) records this activation's nesting; `config` is stashed so
+        # spawn_subagent can derive a child config. Both ride the ContextVars through
+        # every tool call the inner loop delegates.
+        with run_context(working_dir=working_dir, run_key=run_key, depth=depth, config=config):
             yield from _run_events_inner(
                 config, messages, namespace=namespace, session_id=session_id,
                 working_dir=working_dir, should_stop=should_stop, gate=gate,
