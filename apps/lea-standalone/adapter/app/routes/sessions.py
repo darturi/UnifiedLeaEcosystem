@@ -1,11 +1,12 @@
 """Session + stats endpoints.
 
-`session_detail` is also where the canvas read path lives: the DB stores each
-code_step as a git *pointer* (commit_sha + path; git owns the content, C1/D7), so
-on reload we **hydrate** every step with its proof text via `GitStore.snapshot`
-(`git show <sha>:<path>`). The live SSE stream attaches `code` as steps happen;
-this gives a reopened session the same content. The store stays git-free — the
-route is the composition layer over DB + git.
+The canvas read path used to live here: the DB stored each code_step as a git
+*pointer* (commit_sha + path), so on reload the route **hydrated** every step by
+shelling out to `git show <sha>:<path>`. As of v2.3 SQL owns the content (C1/D7
+inverted) and `store.session_detail` returns each step's bytes directly, so there
+is no hydrate step and no composition over a second store — a read that can't
+half-succeed. A failed hydrate used to degrade to `code: ""`, i.e. a proof
+silently rendering as an empty canvas.
 """
 
 from __future__ import annotations
@@ -109,7 +110,6 @@ def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Session not found")
-    _hydrate_code(session_id, detail.get("code_steps") or [])
     return detail
 
 
@@ -119,7 +119,10 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     as a first-class run-less step (P2 / D9). The edit lands on disk
     (filesystem-canonical, D3), is committed `author=user`, and becomes a
     code_step with `run_id=NULL`. An optional `note` rides as a linked `edit_note`
-    message (D11). A no-op save (no actual change) creates no step."""
+    message (D11). A no-op save (no actual change) creates no step.
+
+    The edit is stored, not committed: the step holds the file's bytes (D7 inverted,
+    v2.3)."""
     config = load_config()
     if config.lea_root is None:
         raise HTTPException(status_code=422, detail="lea_root is not configured")
@@ -143,24 +146,29 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="path escapes the session directory") from exc
 
-    before = gs.head(repo_key)
-    abs_path.parent.mkdir(parents=True, exist_ok=True)
-    abs_path.write_text(request.content)
-    sha = gs.commit_write(repo_key, turn=None, author="user", tool="edit")
-    if sha == before:
+    # A no-op save (auto-save fires on a debounce, not on a change) creates no step.
+    # This used to ask git whether the commit moved HEAD; now it compares the bytes
+    # directly against the stored step — the same question, without a second store
+    # having to agree. `before` is the stored content, not the file on disk: the disk
+    # is about to be overwritten either way, and the step is what history shows.
+    latest = store.latest_code_step_for_path(session_id, request.path)
+    if latest and not latest.get("content_lost") and latest["code"] == request.content:
         return {"unchanged": True, "code_step": None, "note": None}
 
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    abs_path.write_text(request.content)
+
     # Coalesce rapid auto-saves into one 'your edit' timeline step (D62) — see
-    # store.upsert_user_code_step. Git still records every commit.
-    step = store.upsert_user_code_step(session_id, request.path, commit_sha=sha)
+    # store.upsert_user_code_step.
+    step = store.upsert_user_code_step(session_id, request.path, content=request.content)
     # A human edit changes the proof, so any prior SafeVerify verdict is stale.
     store.set_session_safe_verify(session_id, None, None)
     note_message = None
     if request.note and request.note.strip():
         note_message = store.add_message(
-            session_id, "user", request.note.strip(), None, kind="edit_note", commit_sha=sha,
+            session_id, "user", request.note.strip(), None, kind="edit_note",
         )
-    return {"unchanged": False, "code_step": {**step, "code": request.content}, "note": note_message}
+    return {"unchanged": False, "code_step": step, "note": note_message}
 
 
 @router.post("/api/sessions/{session_id}/lean-check")
@@ -171,8 +179,9 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
 
     When `request.author` is set (e.g. `"cascade"`), the verdict is recorded as
     a *new* code_step instead of back-filling the latest one -- the file on
-    disk hasn't changed, so the new step points at the same commit_sha as the
-    latest step; it exists to give the re-check its own timeline entry
+    disk hasn't changed, so the new step holds the same content as the latest
+    step (one blob, by content address); it exists to give the re-check its own
+    timeline entry
     (who/why/when), not new content. See the `PathRequest.author` docstring.
 
     A `"cascade"` check always runs immediately after a `POST .../rebuild` of
@@ -199,7 +208,10 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
             session_id,
             None,
             rel,
-            commit_sha=step["commit_sha"],
+            # The file is unchanged, so this is the same content — and because blobs
+            # are content-addressed, the re-check's step shares the existing blob
+            # rather than duplicating the proof.
+            content=step["code"],
             author=request.author,
             summary=request.summary,
             check_status=result.status,
@@ -360,23 +372,3 @@ def _latest_proof_path(session_id: str) -> str | None:
     return steps[-1]["path"] if steps else None
 
 
-def _hydrate_code(session_id: str, code_steps: list[dict]) -> None:
-    """Fill each pointer-only code_step with its content from git (in place)."""
-    config = load_config()
-    lea_root = config.lea_root
-    if lea_root is None:
-        return
-    resolved = projects.resolve_git(session_id, lea_root / "workspace" / "proofs")
-    if resolved is None:
-        return
-    gs, repo_key = resolved
-    for step in code_steps:
-        sha, path = step.get("commit_sha"), step.get("path")
-        if not sha or not path:
-            step["code"] = ""
-            continue
-        try:
-            step["code"] = gs.snapshot(repo_key, sha, path)
-        except Exception:  # noqa: BLE001 — a missing repo/blob shouldn't 500 the read
-            logger.debug("Could not hydrate code for %s @ %s:%s", session_id, sha, path, exc_info=True)
-            step["code"] = ""

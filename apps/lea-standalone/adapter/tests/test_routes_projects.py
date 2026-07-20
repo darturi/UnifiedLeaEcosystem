@@ -304,7 +304,7 @@ def test_graph_route_derives_node_status(tmp_path, monkeypatch):
     (repo / "helper.lean").write_text("import Mathlib\nnamespace Lea.Analysis\nlemma helper : True := trivial\nend Lea.Analysis\n")
     projects_route.put_blueprint(pid, DocUpdate(content="## helper\n- kind: lemma\n- lean: `Lea.Analysis.helper`\n\nA helper.\n"))
     sess = store.create_session("w", project_id=pid)["id"]
-    store.add_code_step(sess, None, "helper.lean", commit_sha="a" * 40, check_status="ok")
+    store.add_code_step(sess, None, "helper.lean", content="proof-a", check_status="ok")
 
     result = projects_route.get_graph(pid)
     node = result["nodes"][0]

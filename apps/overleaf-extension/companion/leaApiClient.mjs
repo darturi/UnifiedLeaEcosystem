@@ -504,14 +504,31 @@ function waitBeforeRetry(ms, signal) {
   });
 }
 
-// Read one run's { status, result_kind, result_detail } off the session detail.
-// Best-effort: null when the adapter or the row can't be reached.
+// Read one run's { id, status, result_kind, result_detail } — the cheap poll the
+// busy-wait / stream-drop retry loop makes every ~3s. Hits the dedicated
+// GET /api/runs/{run_id} (v2.3 item 16), which reads a single run row instead of
+// the full session detail (messages + code_steps + status_events + usage) the old
+// path paid on every tick — a self-inflicted DB-contention source under concurrency.
+// A 404 for that route on an older adapter falls back to the session-detail scan so
+// a companion pointed at a pre-item-16 backend still works. Best-effort: null when
+// the adapter or the row can't be reached.
 async function fetchApiRunRow({ fetchImpl, baseUrl, apiKey, sessionId, runId }) {
-  if (!sessionId) return null;
-  const detail = await fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId });
-  if (!detail.ok || !detail.body) return null;
-  const runs = Array.isArray(detail.body.runs) ? detail.body.runs : [];
-  return runs.find((r) => r && r.id === runId) || null;
+  if (!runId) return null;
+  const res = await fetchJson(fetchImpl, `${baseUrl}/api/runs/${encodeURIComponent(runId)}`, {
+    method: "GET",
+    headers: buildHeaders(apiKey),
+  });
+  if (res.ok && res.body) return res.body;
+  // 404 here is ambiguous: an unknown run id (nothing to fall back to), OR an old
+  // adapter that lacks the route. Only try the legacy scan when we have a session
+  // to scan; a bare unknown-run 404 stays null.
+  if (res.status === 404 && sessionId) {
+    const detail = await fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId });
+    if (!detail.ok || !detail.body) return null;
+    const runs = Array.isArray(detail.body.runs) ? detail.body.runs : [];
+    return runs.find((r) => r && r.id === runId) || null;
+  }
+  return null;
 }
 
 // High-level: start a run and drive it to completion, returning the shape the

@@ -1,13 +1,19 @@
-"""D2: the sessions route hydrates code_steps from git on reload.
+"""D2: the sessions route returns code straight from the DB (v2.3).
 
-The DB stores each code_step as a pointer (commit_sha + path); git owns the proof
-text (C1/D7). The live SSE stream attaches `code` as steps happen, but a reopened
-session reads from the DB — so the route must hydrate each step via
-`GitStore.snapshot`. These tests pin that, and that the store itself stays
-git-free (pointer-only).
+This file used to pin the opposite: "the DB stores each code_step as a pointer
+(commit_sha + path); git owns the proof text (C1/D7) … so the route must hydrate
+each step via `GitStore.snapshot`". SQL now owns the content, so `session_detail`
+returns each step's bytes and there is no hydrate step to get wrong.
+
+That deleted a whole failure class rather than moving it. Hydration could
+half-fail — a missing repo, a bad pointer, a `git show` returning non-zero — and it
+degraded to `code: ""`, i.e. a real proof rendering as an empty canvas with no
+error. `test_code_survives_without_the_repo` is the direct inversion of the old
+`test_hydration_is_graceful_on_a_bad_pointer`.
 """
 
 import asyncio
+import shutil
 
 import pytest
 from fastapi import HTTPException
@@ -20,53 +26,58 @@ from app.routes import sessions as sessions_route
 from app.routes.sessions import FileWriteRequest, PathRequest
 
 
-def _seed_session_with_commit(tmp_path):
+PROOF = "import Mathlib\n\ntheorem t : True := by trivial\n"
+
+
+def _seed_session_with_code(tmp_path):
+    """A session with one agent step. The file lands on disk (still
+    filesystem-canonical, D3 — the prover compiles from disk) and its bytes are the
+    step's content."""
     gs = GitStore(tmp_path / "workspace" / "proofs")
     session = store.create_session("S")
     repo = gs.init_session(session["id"])
     proof = repo / "Lea" / "Misc" / "p.lean"
     proof.parent.mkdir(parents=True, exist_ok=True)
-    proof.write_text("import Mathlib\n\ntheorem t : True := by trivial\n")
-    sha = gs.commit_write(session["id"], turn=1, author="agent", tool="write_file")
+    proof.write_text(PROOF)
     run = store.create_run(session["id"], "m", None, 3)
     store.add_code_step(session["id"], run["id"], "Lea/Misc/p.lean",
-                        commit_sha=sha, author="agent", turn=1, check_status="ok")
-    return session, sha
+                        content=PROOF, author="agent", turn=1, check_status="ok")
+    return session, PROOF
 
 
-def test_session_detail_hydrates_code_from_git(tmp_path, monkeypatch):
+def test_session_detail_returns_code_from_the_db(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, sha = _seed_session_with_commit(tmp_path)
+    session, code = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config",
                         lambda: LeaConfig(model="m", max_turns=3, lea_root=tmp_path))
 
     detail = sessions_route.session_detail(session["id"])
 
-    step = detail["code_steps"][0]
-    assert "theorem t : True" in step["code"]   # hydrated from git
-    assert step["commit_sha"] == sha
-
-    # the store stays git-free: the raw DB row is a pointer with no content
+    assert detail["code_steps"][0]["code"] == code
+    # the route is no longer a composition layer over DB + git — the store answers
+    # the whole question, so there is nothing left for the route to fill in
     raw = store.session_detail(session["id"])["code_steps"][0]
-    assert "code" not in raw
+    assert raw["code"] == code
 
 
-def test_hydration_is_graceful_on_a_bad_pointer(tmp_path, monkeypatch):
+def test_code_survives_without_the_repo(tmp_path, monkeypatch):
+    """The inversion of the old `test_hydration_is_graceful_on_a_bad_pointer`.
+
+    That test wiped the repo and asserted the read degraded to `code: ""` — the best
+    a pointer store can do, and a silent one: a proof renders as an empty canvas with
+    no error. Now the content is IN the row, so wiping git costs nothing. This is the
+    property the whole migration is for."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session = store.create_session("S")
-    GitStore(tmp_path / "workspace" / "proofs").init_session(session["id"])
-    run = store.create_run(session["id"], "m", None, 3)
-    # a pointer whose blob doesn't exist (e.g. repo wiped) must not 500 the read
-    store.add_code_step(session["id"], run["id"], "Lea/Misc/missing.lean",
-                        commit_sha="0" * 40, author="agent", turn=1)
+    session, code = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config",
                         lambda: LeaConfig(model="m", max_turns=3, lea_root=tmp_path))
 
-    detail = sessions_route.session_detail(session["id"])
+    shutil.rmtree(tmp_path / "workspace" / "proofs")
 
-    assert detail["code_steps"][0]["code"] == ""
+    detail = sessions_route.session_detail(session["id"])
+    assert detail["code_steps"][0]["code"] == code, "content must not depend on git"
 
 
 def _config_for(tmp_path):
@@ -76,7 +87,7 @@ def _config_for(tmp_path):
 def test_lean_check_backfills_verdict_onto_the_step(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)  # seeds a step with check_status="ok"
+    session, _ = _seed_session_with_code(tmp_path)  # seeds a step with check_status="ok"
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_check",
                         lambda p, cold=False: CheckResult(p, "error", "p.lean:2:0: error: boom"))
@@ -94,10 +105,11 @@ def test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfillin
     """docs/FEATURE-overleaf-lean-pane-manual-edit.md: a cascade re-check of a
     dependent file (triggered by an edit elsewhere in the project) gets its own
     code_step, distinct from the step the original write produced -- the file
-    on disk didn't change, so the new step reuses the existing commit_sha."""
+    on disk didn't change, so the new step holds the same content (and, blobs being
+    content-addressed, literally the same blob)."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, sha = _seed_session_with_commit(tmp_path)  # seeds one step, check_status="ok"
+    session, code = _seed_session_with_code(tmp_path)  # seeds one step, check_status="ok"
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_check",
                         lambda p, cold=False: CheckResult(p, "error", "p.lean:3:0: error: unknown identifier"))
@@ -108,14 +120,16 @@ def test_lean_check_with_author_records_a_new_cascade_step_instead_of_backfillin
     )
 
     assert result["status"] == "error"
-    assert result["code_step"]["author"] == "cascade"
-    assert result["code_step"]["commit_sha"] == sha  # no new content, same commit
+    # 'cascade' is a reason, not an author: the file is still the agent's work
+    assert result["code_step"]["author"] == "agent"
+    assert result["code_step"]["code"] == code  # no new content
 
     steps = store.session_detail(session["id"])["code_steps"]
     assert len(steps) == 2  # the original write's step, plus the new cascade step
     assert steps[0]["check_status"] == "ok"       # original step is untouched
-    assert steps[-1]["author"] == "cascade"
     assert steps[-1]["check_status"] == "error"   # the new step carries the fresh verdict
+    # same bytes on both steps, stored once
+    assert steps[0]["code"] == steps[-1]["code"] == code
     assert steps[-1]["summary"] == "Re-checked after edit to compactness_criterion"
 
 
@@ -131,7 +145,7 @@ def test_lean_check_with_cascade_author_uses_the_warm_path_not_cold(tmp_path, mo
     docs/FEATURE-overleaf-lean-pane-manual-edit.md ('Cascade verification')."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)
+    session, _ = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     calls = []
 
@@ -158,7 +172,7 @@ def test_lean_check_without_author_still_backfills_as_before(tmp_path, monkeypat
     byte-for-byte the original back-fill-only behavior."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)
+    session, _ = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_check", lambda p, cold=False: CheckResult(p, "ok", None))
 
@@ -172,7 +186,7 @@ def test_lean_check_without_author_still_backfills_as_before(tmp_path, monkeypat
 def test_verify_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)
+    session, _ = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_verify", lambda p: VerifyResult("ok", None))
 
@@ -189,7 +203,7 @@ def test_rebuild_returns_the_verdict_for_the_default_file(tmp_path, monkeypatch)
     module's current .olean, not a stale one. Route-level: just verify wiring."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)
+    session, _ = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_rebuild", lambda p: CheckResult(p, "ok", None))
 
@@ -204,7 +218,7 @@ def test_rebuild_surfaces_a_real_compile_failure(tmp_path, monkeypatch):
     from 'nothing downstream can be verified right now'."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)
+    session, _ = _seed_session_with_code(tmp_path)
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
     monkeypatch.setattr(sessions_route, "interface_rebuild",
                         lambda p: CheckResult(p, "error", "p.lean:2:0: error: boom"))
@@ -254,9 +268,11 @@ def test_write_file_creates_user_step_and_edit_note(tmp_path, monkeypatch):
     # the edit landed on disk (filesystem-canonical) and is committed
     repo = GitStore(tmp_path / "workspace" / "proofs").session_repo(session["id"])
     assert (repo / "Lea" / "Misc" / "Mine.lean").read_text() == code
-    # the note is a linked edit_note message (D11)
+    # the note is a linked edit_note message (D11). It used to carry the edit's
+    # commit_sha; there is no commit now, and the link that mattered was always
+    # positional — the note sits right after the step it explains.
     assert result["note"]["kind"] == "edit_note"
-    assert result["note"]["commit_sha"] == step["commit_sha"]
+    assert result["note"]["seq"] > step["seq"]
     # it shows up in the session timeline as a user step
     assert store.session_detail(session["id"])["code_steps"][-1]["author"] == "user"
 
@@ -295,7 +311,7 @@ def test_write_file_coalesces_successive_user_edits(tmp_path, monkeypatch):
     steps = store.session_detail(session["id"])["code_steps"]
     assert len(steps) == 1
     assert steps[-1]["author"] == "user"
-    assert steps[-1]["commit_sha"] == r2["code_step"]["commit_sha"]  # points at latest
+    assert steps[-1]["code"] == "theorem p : True := by\n  trivial\n"  # holds the latest bytes
 
 
 def test_user_edit_after_agent_step_starts_a_new_step(tmp_path, monkeypatch):
@@ -303,7 +319,7 @@ def test_user_edit_after_agent_step_starts_a_new_step(tmp_path, monkeypatch):
     # agent step opens a fresh step (only successive *user* edits coalesce).
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)  # agent step for Lea/Misc/p.lean + a run
+    session, _ = _seed_session_with_code(tmp_path)  # agent step for Lea/Misc/p.lean + a run
     # end the run so the modal lock doesn't block the user write
     run = store.session_detail(session["id"])["runs"][0]
     store.update_run(run["id"], "ok")
@@ -355,7 +371,7 @@ def test_export_session_returns_a_zip_of_its_files(tmp_path, monkeypatch):
 
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
-    session, _ = _seed_session_with_commit(tmp_path)  # writes Lea/Misc/p.lean
+    session, _ = _seed_session_with_code(tmp_path)  # writes Lea/Misc/p.lean
     monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
 
     response = sessions_route.export_session(session["id"])

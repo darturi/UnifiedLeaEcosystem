@@ -7,10 +7,12 @@ so existing callers (CLI, eval) keep working unchanged.
 """
 
 import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import LeaConfig
+from .runctx import run_context
 from .prompt import load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import safeverify
@@ -456,11 +458,18 @@ def run_events(
         from .mcp import MCPManager
         mcp_manager = MCPManager(config.mcp_servers)
         mcp_manager.start()
+    # Establish the per-activation run context (item 8) for the whole event
+    # stream: `working_dir` so filesystem tools (bash) act in this run's tree
+    # instead of the process-global cwd, and `run_key` (session id) for the
+    # lock/scratch keys later items build on. It wraps the `yield from`, so the
+    # ContextVars stay set through every tool call delegated to the inner loop.
+    run_key = session_id or uuid.uuid4().hex[:12]
     try:
-        yield from _run_events_inner(
-            config, messages, namespace=namespace, session_id=session_id,
-            working_dir=working_dir, should_stop=should_stop, gate=gate,
-        )
+        with run_context(working_dir=working_dir, run_key=run_key):
+            yield from _run_events_inner(
+                config, messages, namespace=namespace, session_id=session_id,
+                working_dir=working_dir, should_stop=should_stop, gate=gate,
+            )
     finally:
         if mcp_manager is not None:
             mcp_manager.stop()

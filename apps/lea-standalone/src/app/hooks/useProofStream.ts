@@ -13,6 +13,24 @@ import { useSessions } from '../stores/sessions';
 import { sortCodeSteps } from '../lib/timeline.mjs';
 import { mainFileIndex } from '../lib/canvasFiles.mjs';
 
+// SSE reattach backoff (v2.3 item 14). A browser EventSource cannot read an HTTP
+// status — a 409 (server at capacity / a run driven elsewhere) surfaces only as
+// `onerror`, identical to a dropped connection. Without a delay+cap the reattach
+// loop becomes an unthrottled request storm the moment the server can 409, which
+// is exactly the blocker for raising LEA_MAX_CONCURRENT_RUNS. Exponential backoff
+// with jitter (1s→2s→4s…, capped at 15s) over a bounded number of attempts mirrors
+// the Overleaf companion's already-proven retry loop.
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 15000;
+const RECONNECT_MAX_ATTEMPTS = 20;
+
+// Decorrelated-ish jitter: full exponential value minus up to 25%, so a fleet of
+// tabs that all dropped at once don't resynchronize onto the same retry tick.
+function reconnectDelay(attempt: number): number {
+  const exp = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** (attempt - 1));
+  return exp * 0.75 + Math.random() * exp * 0.25;
+}
+
 /**
  * useProofStream — owns the run EventSource lifecycle (v2.0.1 R2).
  *
@@ -33,11 +51,30 @@ export function useProofStream() {
   // into the thread at the point it actually happened, before the step it gates.
   const lastSeqRef = useRef(0);
   const approvalCounterRef = useRef(0);
+  // Item 14 backoff state: consecutive failed reattach attempts, keyed by run so a
+  // session switch to a different run starts backoff fresh (rather than inheriting
+  // the previous run's count) while consecutive failures for the SAME run keep
+  // growing. Reset on a successful open. Plus the pending backoff timer, so a
+  // session switch can cancel an in-flight reconnect.
+  const reconnectRef = useRef<{ runId: string; count: number }>({ runId: '', count: 0 });
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Close the stream when App unmounts.
-  useEffect(() => () => eventSourceRef.current?.close(), []);
+  useEffect(() => () => {
+    if (reconnectTimerRef.current !== null) clearTimeout(reconnectTimerRef.current);
+    eventSourceRef.current?.close();
+  }, []);
 
   const closeStream = () => {
+    // Cancel any pending backoff so a switched-away run can't reconnect underneath
+    // the newly-opened session. Attempt count is left to reset on a real open (or
+    // a fresh user-initiated attach that opens), so it survives across reattach
+    // cycles and the backoff actually grows.
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    useProofSession.getState().setReconnecting(undefined);
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
   };
@@ -136,12 +173,61 @@ export function useProofStream() {
     }
   };
 
+  // Item 14: reconnect a dropped/erroring run stream with capped exponential
+  // backoff instead of hammering. Re-fetches the session detail (the persisted
+  // source of truth) and lets applyDetail reattach if the run is still live;
+  // settles quietly if it finished while we were away; gives up with an error
+  // banner past the attempt cap. Reads setters via getState() to stay stale-free.
+  const scheduleReconnect = (runId: string, sessionId: string) => {
+    const { setReconnecting, setError, setIsRunning, setCurrentRunId } =
+      useProofSession.getState();
+    const prev = reconnectRef.current;
+    const attempt = prev.runId === runId ? prev.count + 1 : 1;
+    reconnectRef.current = { runId, count: attempt };
+    if (attempt > RECONNECT_MAX_ATTEMPTS) {
+      reconnectRef.current = { runId: '', count: 0 };
+      setReconnecting(undefined);
+      setIsRunning(false);
+      setCurrentRunId(undefined);
+      setError('Lost connection to the Lea backend.');
+      return;
+    }
+    setReconnecting(`Reconnecting to the live run… (attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS})`);
+    reconnectTimerRef.current = setTimeout(() => {
+      reconnectTimerRef.current = null;
+      getSession(sessionId)
+        .then((detail) => {
+          const active = detail.active_run;
+          if (active && (active.status === 'running' || active.status === 'pending')) {
+            // Still live → applyDetail reattaches; the new stream's onopen resets
+            // the backoff. Attempt count is intentionally left to grow until then,
+            // so a run held off by a 409 keeps backing off across cycles.
+            applyDetail(detail);
+          } else {
+            // Finished (or vanished) while we were away → settle cleanly.
+            reconnectRef.current = { runId: '', count: 0 };
+            setReconnecting(undefined);
+            applyDetail(detail);
+            useSessions.getState().refreshSessions().catch(() => {});
+          }
+        })
+        .catch(() => scheduleReconnect(runId, sessionId));
+    }, reconnectDelay(attempt));
+  };
+
   const attachStream = (runId: string, sessionId: string) => {
     closeStream();
     const source = new EventSource(`/api/runs/${runId}/events`);
     eventSourceRef.current = source;
     const liveId = `live-${runId}`;
     let sawDone = false;
+
+    // A real open means any prior backoff succeeded: reset it and drop the
+    // reconnecting chip, so a later drop starts fresh from the base delay.
+    source.onopen = () => {
+      reconnectRef.current = { runId, count: 0 };
+      useProofSession.getState().setReconnecting(undefined);
+    };
     const {
       setMessages,
       setCodeSteps,
@@ -280,25 +366,24 @@ export function useProofStream() {
         .catch((err) => setError(err instanceof Error ? err.message : String(err)));
     });
 
-    source.onerror = async () => {
-      if (eventSourceRef.current !== source || source.readyState === EventSource.CLOSED) return;
+    source.onerror = () => {
+      // Ignore errors from a stream we've already replaced/closed, and the benign
+      // error that follows a normal `done` close.
+      if (eventSourceRef.current !== source) return;
       if (sawDone) {
         source.close();
         eventSourceRef.current = null;
         return;
       }
+      // Both a transient drop (readyState CONNECTING, which the browser would
+      // retry immediately and uncapped) and a hard close / 409 (readyState CLOSED,
+      // which it would not retry at all) funnel through our own backoff: close the
+      // native source and schedule a capped, jittered reattempt. isRunning stays
+      // true — the run is still live server-side; the reconnecting chip is the
+      // honest signal while we wait.
       source.close();
       eventSourceRef.current = null;
-      setIsRunning(false);
-      setCurrentRunId(undefined);
-      try {
-        const detail = await getSession(sessionId);
-        applyDetail(detail);
-        await useSessions.getState().refreshSessions();
-        if (detail.active_run) setError('Lost connection to the Lea backend.');
-      } catch {
-        setError('Lost connection to the Lea backend.');
-      }
+      scheduleReconnect(runId, sessionId);
     };
   };
 

@@ -105,18 +105,29 @@ class GitStore:
         return self._git(repo, "rev-parse", "HEAD").strip()
 
     def commit_write(self, session_id: str, *, turn, author: str = "agent", tool: str) -> str:
-        """Commit the current state of the session repo and return the new SHA.
+        """DEPRECATED — dead as of v2.3; scheduled for deletion with the contract step.
 
-        Called after the agent's `write_file`/`edit_file` lands a file (D8: commit
-        on *every* write — including failed/non-compiling states; git doesn't care
-        whether the Lean compiles). `turn`/`author`/`tool` are passed through to the
-        caller's `code_steps` DB insert, which is the query surface for them — they
-        are NOT baked into git as machine-readable fields (that would duplicate the
-        DB). The commit subject is a human-readable label for `git log`; the only
-        real git metadata is the `Co-authored-by: Lea` attribution trailer.
+        No application code calls this any more: SQL owns proof content, so a write
+        stores its bytes (`store.add_code_step`) instead of committing and keeping a
+        sha. Only `test_gitstore.py` still exercises it. **Do not reintroduce it as a
+        write path.**
 
-        An identical write (nothing staged) makes no commit and returns the current
-        HEAD — an unchanged file is not a new state.
+        It is kept only until the contract revision drops the old tables, because the
+        rows it produced are still readable until then. The reason it should not come
+        back is below.
+
+        Commits the current state of the session repo and returns the new SHA. An
+        identical write (nothing staged) makes no commit and returns the current HEAD.
+
+        **That early return is the bug that motivated the migration.** The caller
+        stored the returned sha as a pointer to the file it had just written — but
+        when nothing was staged, the sha returned is whatever HEAD happens to be,
+        an *unrelated* commit. Nothing verified that the sha's tree contained the
+        path, so the pointer was wrong the moment it was written. One row in the real
+        database says `RealLeAbsSelf.lean @ 51b6adf`, where 51b6adf is a commit
+        subject "edit .lea/memory.md" whose tree does not contain that file — the one
+        code step 0004's backfill could not recover. No amount of locking would have
+        caught it: it was never a race, it was a pointer nobody checked.
         """
         repo = self.session_repo(session_id)
         # Build the subject first; commit_all formats files generically, but the
