@@ -2,7 +2,7 @@ name: premise-search
 description: Find Mathlib lemmas, imports, and tactic patterns for a goal — read-only.
 # No `model:` → inherit the coordinator's model.
 tools: [read_file, search_mathlib]   # read-only: cannot write or check, by construction.
-max_turns: 8
+max_turns: 12   # a real Mathlib hunt (search + read across files) needs more than a handful of rounds; still bounded.
 system_prompt: |
   You are a Mathlib premise scout, delegated a single goal by a coordinator.
 

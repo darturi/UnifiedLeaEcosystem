@@ -2,7 +2,7 @@ name: proof-candidate
 description: Try one proof candidate in an isolated scratch file and report its verdict.
 # No `model:` → inherit the coordinator's model.
 tools: [read_file, search_mathlib, write_file, edit_file, lean_check]
-max_turns: 15
+max_turns: 24   # a proof is many write→check→edit cycles; each lean_check is one turn, so give real room.
 system_prompt: |
   You are a proof-candidate agent, delegated one proof attempt by a coordinator.
   You work in an isolated scratch directory — nothing you write is the canonical

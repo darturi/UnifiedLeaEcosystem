@@ -83,7 +83,7 @@ def test_load_premise_search_is_read_only():
     p = load_profile("premise-search")
     check("premise-search omits model → inherits", p.model is None)
     check("premise-search is scoped read-only", p.tools == ["read_file", "search_mathlib"])
-    check("premise-search caps turns", p.max_turns == 8)
+    check("premise-search caps turns", p.max_turns == 12)
     check("premise-search carries a prompt head", bool(p.system_prompt.strip()))
     # The scoped list resolves through the real toolset builder to exactly those tools
     # — no write/lean_check leaks in, by construction.

@@ -128,6 +128,51 @@ def _text_only_history(messages: list, limit: int = 8) -> list[dict]:
     return out[-limit:]
 
 
+_MAX_TURNS_SUMMARY_INSTRUCTION = (
+    "You have reached your turn budget without finishing. You have NO tools now — do not "
+    "attempt any more actions. Write a concise final report for whoever delegated this to "
+    "you:\n"
+    "  - what you found or accomplished, concretely: lemma names with signatures, file "
+    "paths, the closest working proof state, or the exact error still blocking progress;\n"
+    "  - the single most promising next step.\n"
+    "This report is your entire deliverable — the turns you spent are only worth something "
+    "if you hand back what you learned. Make it useful evidence, not an apology."
+)
+
+
+def _summarize_on_max_turns(model: str, system: str, messages: list, config: LeaConfig
+                            ) -> tuple[str, Usage, float]:
+    """One final, tool-less turn when the budget is exhausted (mirrors opencode's
+    summarize-on-cap): ask the model to hand back its findings + best next step, so a
+    capped run returns useful evidence instead of a discarded "max turns" error — which
+    matters most for a delegated sub-agent, whose summary IS its deliverable to the
+    coordinator.
+
+    Built on the same clean, tool-stripped history the classifiers use (provider-safe:
+    no dangling tool_use, proper alternation), with a generous window so the whole run is
+    in view. Returns (summary_text, usage, cost)."""
+    history = _text_only_history(messages, limit=60)
+    # Deliver the instruction as the final user turn — merged into a trailing user message
+    # rather than appended after it, so we never emit two consecutive user turns (which
+    # some providers reject).
+    if history and history[-1].get("role") == "user":
+        history[-1] = {"role": "user",
+                       "content": f"{history[-1]['content']}\n\n{_MAX_TURNS_SUMMARY_INSTRUCTION}"}
+    else:
+        history.append({"role": "user", "content": _MAX_TURNS_SUMMARY_INSTRUCTION})
+    text = ""
+    usage = Usage()
+    cost = 0.0
+    for event in stream(model, system, history, [], config.model_kwargs, streaming=config.stream):
+        if isinstance(event, TextDelta):
+            text += event.text
+        elif isinstance(event, Done):
+            usage.input_tokens += event.usage.input_tokens
+            usage.output_tokens += event.usage.output_tokens
+            cost += event.cost
+    return text.strip(), usage, cost
+
+
 def _classify_intent(model: str, messages: list, config: LeaConfig) -> tuple[str, Usage, float]:
     """Ask the model whether the latest turn is FORMALIZE or ASSISTANT.
 
@@ -609,7 +654,28 @@ def _run_events_inner(
 
         turn += 1
         if config.max_turns and turn > config.max_turns:
-            yield Finished("max_turns", "Error: max turns reached without completing the proof.",
+            # Budget exhausted. Don't discard the work with a canned error — spend one
+            # final tool-less turn asking the model to summarize its findings + best next
+            # step, and return THAT as the result. For a delegated sub-agent this is the
+            # difference between handing the coordinator useful evidence and handing it
+            # nothing. Defensive: a failure in the summary call degrades to a plain notice
+            # rather than turning a completed run into an error.
+            try:
+                summary, s_usage, s_cost = _summarize_on_max_turns(model, system, messages, config)
+            except Exception:  # noqa: BLE001 — a terminal-path best effort, never fatal
+                summary, s_usage, s_cost = "", Usage(), 0.0
+            total_usage.input_tokens += s_usage.input_tokens
+            total_usage.output_tokens += s_usage.output_tokens
+            total_cost += s_cost
+            if s_usage.input_tokens or s_usage.output_tokens or s_cost:
+                yield UsageUpdated(s_usage.input_tokens, s_usage.output_tokens, s_cost)
+            if summary:
+                # Surface it live + fold it into the transcript, so both the UI and the
+                # materialized sub-agent view carry the findings as the final message.
+                yield AssistantTextDelta(summary)
+                messages.append({"role": "assistant", "content": summary})
+            final_text = summary or "Reached the turn budget without completing the task."
+            yield Finished("max_turns", final_text,
                            turn - 1, session_id, model, total_usage, total_cost, transcript(turn - 1))
             return
 
