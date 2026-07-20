@@ -361,10 +361,21 @@ def _text_from_content(content: Any) -> str:
 
 
 def _subagent_child_title(ev: SubagentFinished) -> str:
-    """A short, human title for the child session row — its own final summary's first
-    line, falling back to its role."""
+    """A short, human title for the child session row.
+
+    Prefer the delegated TASK — the description line the coordinator passed, which is the
+    first line of the child's first user message. It's stable and meaningful even when the
+    child errors or hits max turns (whose `summary` is an error nudge, not a description).
+    Fall back to a non-error summary, then the role."""
+    for msg in ev.transcript or []:
+        if msg.get("role") == "user":
+            task = _text_from_content(msg.get("content")).strip()
+            first = task.splitlines()[0].strip() if task else ""
+            if first:
+                return first[:80]
+            break
     summary = (ev.summary or "").strip()
-    if summary:
+    if summary and not summary.lower().startswith("error"):
         first = summary.splitlines()[0].strip()
         if first:
             return first[:80]

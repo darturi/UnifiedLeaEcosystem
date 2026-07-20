@@ -94,6 +94,19 @@ def test_text_from_content_handles_string_and_blocks():
     assert bridge._text_from_content([{"type": "tool_call", "name": "x"}]) == ""
 
 
+def test_child_title_prefers_task_over_error_summary():
+    # A max-turns / errored child's summary is an error nudge — the title must come from
+    # the delegated task instead (regression from the first live spawn).
+    ev = _finished(
+        summary="Error: max turns reached without completing the proof",
+        transcript=[
+            {"role": "user", "content": "Search block imprimitivity lemmas\n\nYou are a scout."},
+            {"role": "assistant", "content": "searching Mathlib…"},
+        ],
+    )
+    assert bridge._subagent_child_title(ev) == "Search block imprimitivity lemmas"
+
+
 # --- materialization ----------------------------------------------------------
 
 def test_materialize_creates_child_with_tree_fields(tmp_path, monkeypatch):
@@ -106,7 +119,8 @@ def test_materialize_creates_child_with_tree_fields(tmp_path, monkeypatch):
     assert child["parent_id"] == parent["id"]
     assert child["role"] == "proof-candidate"
     assert child["spawned_at_turn"] == 4
-    assert child["title"] == "parity / infinite descent works"
+    # title comes from the delegated task (first user message), not the summary
+    assert child["title"] == "Prove it via infinite descent."
 
 
 def test_materialize_replays_transcript_as_child_messages(tmp_path, monkeypatch):
