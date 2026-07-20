@@ -378,33 +378,23 @@ test("companion end-to-end: a failing run surfaces as failed, not as a hang", as
   assert.equal(info.status, "failed");
 });
 
-test("status engines agree on the scripted scenarios (PLAN 4.4 dual-engine diff)", async () => {
+test("the ledger engine answers the scripted scenarios, including the settled retry-restore semantic (PLAN 4.4)", async () => {
   const targets = [
     { targetKind: "theorem", targetLabel: "int_e2e_true", targetText: "True is true." },
     { targetKind: "theorem", targetLabel: "int_push_true", targetText: "True is true." },
-    { targetKind: "theorem", targetLabel: "int_e2e_fails", targetText: "True is true. [stub:fail]" }
+    { targetKind: "theorem", targetLabel: "int_e2e_fails", targetText: "True is true. [stub:fail]" },
+    { targetKind: "theorem", targetLabel: "int_retry_true", targetText: "True is true." }
   ];
-  const statusesWith = async (engine) => {
-    // The engine toggle is read per call from the companion's env, so one
-    // live stack can answer as both engines back to back.
-    if (engine) companion.leaState.env.LEA_STATUS_ENGINE = engine;
-    else delete companion.leaState.env.LEA_STATUS_ENGINE;
-    const res = await postJson(`${companionBaseUrl}/statuses`, { overleafProjectId: "itest-doc", targets });
-    assert.equal(res.status, 200);
-    return Object.fromEntries(Object.entries(res.body.statuses).map(([key, info]) => [key, info.status]));
-  };
-
-  try {
-    const legacy = await statusesWith(null);
-    const ledger = await statusesWith("ledger");
-    // The retried-then-restored target (int_retry_true) is deliberately NOT
-    // diffed: after a restore, legacy reports the newest (failed) run while
-    // ledger reports the restored file's validity — a semantic question to
-    // settle before ledger becomes the default.
-    assert.deepEqual(ledger, legacy, "engines disagree on a scripted scenario");
-    assert.equal(ledger["theorem:int_e2e_true"], "formalized");
-    assert.equal(ledger["theorem:int_e2e_fails"], "failed");
-  } finally {
-    delete companion.leaState.env.LEA_STATUS_ENGINE;
-  }
+  const res = await postJson(`${companionBaseUrl}/statuses`, { overleafProjectId: "itest-doc", targets });
+  assert.equal(res.status, 200);
+  const statuses = Object.fromEntries(Object.entries(res.body.statuses).map(([key, info]) => [key, info.status]));
+  assert.equal(statuses["theorem:int_e2e_true"], "formalized");
+  assert.equal(statuses["theorem:int_push_true"], "formalized");
+  assert.equal(statuses["theorem:int_e2e_fails"], "failed");
+  // The settled semantic (4.4's one recorded engine divergence, decided when
+  // the ledger became the only engine): after a failed retry restores the
+  // previous verified proof, status reports the restored file's validity —
+  // file truth — not the failed run. The failed attempt stays reachable via
+  // the job history / session link; dependents may `uses=` this target again.
+  assert.equal(statuses["theorem:int_retry_true"], "formalized");
 });

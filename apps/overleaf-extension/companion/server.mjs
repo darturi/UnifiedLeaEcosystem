@@ -1590,8 +1590,8 @@ export async function handleLeanPaneEditSave(payload, state) {
   // marker's label=... forever -- that's correct, it's the doc-side anchor.
   // But `declarationName` is a *cache* of "what Lean symbol does this
   // session's file currently define," taken at formalize time. Everything
-  // that reads it (buildJobResponse, getLatestMappedJobStatus,
-  // readLeanPaneArtifactFromSession's "does the latest step still contain
+  // that reads it (buildJobResponse, the ledger engine's declaration
+  // candidates, readLeanPaneArtifactFromSession's "does the latest step still contain
   // this name" filter) must see the name that's actually in the file now, or
   // the item's displayed artifact silently falls back to the last code_step
   // matching the OLD name: a stale, pre-rename snapshot. Updated on EVERY job
@@ -3427,7 +3427,7 @@ function buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabe
 }
 
 async function findReusableStubForFormalization({ state, leaRepoPath, target, jobs }) {
-  const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
+  const status = getEquivalentTheoremStatus(await getTheoremStatus({
     state,
     leaRepoPath,
     overleafProjectId: target.overleafProjectId,
@@ -3641,12 +3641,16 @@ async function cleanupPreviousRunArtifacts({ state = null, leaRepoPath, target, 
     previousJob.recordedProofPath
   ].filter(Boolean));
 
-  const entries = await readProjectTheoremEntries(target.projectMarkdownPath);
-  const entriesToRemove = entries.filter((entry) => (
-    candidateNames.has(entry.name) || candidateProofPaths.has(entry.proofPath)
-  ));
-  for (const entry of entriesToRemove) {
-    candidateProofPaths.add(entry.proofPath);
+  // The adapter's ledger — not the registry markdown, which is a write-only
+  // view for machines (4.3) — names the recorded file for each declaration
+  // candidate; those files are what a retry must retire. Best-effort: an
+  // unreachable adapter leaves the job-recorded path as the only candidate,
+  // same as a declaration the index never saw.
+  const ledger = await fetchTargetStatusFromAdapter({ state, target, declarations: [...candidateNames] });
+  for (const row of Object.values(ledger || {})) {
+    if (row?.recorded && row.path) {
+      candidateProofPaths.add(ledgerProofPath(target, row.path));
+    }
   }
 
   // Back up what is about to be deleted (AUDIT H2): this cleanup runs BEFORE
@@ -3709,7 +3713,8 @@ async function cleanupPreviousRunArtifacts({ state = null, leaRepoPath, target, 
 
   const removedSections = await removeProjectTheoremEntries({
     projectMarkdownPath: target.projectMarkdownPath,
-    entriesToRemove
+    candidateNames,
+    candidateProofPaths
   });
 
   return {
@@ -3819,15 +3824,18 @@ async function removeLeaProofFile({ leaRepoPath, proofPath }) {
   }
 }
 
-async function removeProjectTheoremEntries({ projectMarkdownPath, entriesToRemove }) {
-  if (entriesToRemove.length === 0 || !existsSync(projectMarkdownPath)) {
+// View maintenance for a retire: splice out this view's own sections whose
+// entry names or recorded paths match what is being retired. Reading the
+// markers here is the writer keeping its own view consistent — never a
+// truth source (the ledger is).
+async function removeProjectTheoremEntries({ projectMarkdownPath, candidateNames, candidateProofPaths }) {
+  if ((candidateNames.size === 0 && candidateProofPaths.size === 0) || !existsSync(projectMarkdownPath)) {
     return [];
   }
 
   const markdown = await fs.readFile(projectMarkdownPath, "utf8");
-  const keysToRemove = new Set(entriesToRemove.map(markerKey));
   const sections = findProjectTheoremSections(markdown)
-    .filter((section) => keysToRemove.has(markerKey(section.entry)));
+    .filter((section) => candidateNames.has(section.entry.name) || candidateProofPaths.has(section.entry.proofPath));
   if (sections.length === 0) {
     return [];
   }
@@ -3918,13 +3926,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
 // proof on disk even though the run genuinely formalized the theorem; trusting
 // the adapter is what keeps the Overleaf tag truthful.
 //
-// `artifactError` is set when the run succeeded but the companion recorded
-// multiple candidate proofs and could not disambiguate which one belongs to this
-// theorem — distinct from the deferred-recording case (no candidates at all),
-// where we trust the adapter.
-//
 // Returns: { jobStatus, finalStatus, effectiveStatus, leanCheck, error }.
-export async function resolveProofOutcome({ job, localStatus, exit, artifactError = null }) {
+export async function resolveProofOutcome({ job, localStatus, exit }) {
   const local = localStatus && localStatus.status ? localStatus : { status: "unformalized" };
   const resultKind = String(exit.resultKind || exit.doneStatus || "").toLowerCase();
 
@@ -3963,11 +3966,11 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
   // this branch it falls straight into the generic "!exit.ok" case below and
   // becomes indistinguishable from an actual compile failure.
   //
-  // `local.status` used to almost never be "formalized" here: the
-  // project-markdown index identifyLeaArtifact diffs against is populated by
-  // the agent's own in-run tool calls, and it appears to skip that call when
-  // it isn't confident enough to self-report "proved". applyProofOutcomeToJob
-  // now runs an independent recovery in that case -- checking the file the
+  // `local.status` used to almost never be "formalized" here: the adapter's
+  // artifact index only has a row when the run finalizer could attribute a
+  // checked file to the run, and needs_review runs tend to skip the
+  // confident self-reporting that produces one. applyProofOutcomeToJob
+  // runs an independent recovery in that case -- checking the file the
   // session actually wrote and running lean_check itself, rather than
   // trusting whether the agent bothered to self-register. Promotion to
   // `formalized` (the same outcome a clean "proved" run gets below) requires
@@ -4023,19 +4026,6 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
     };
   }
 
-  // Run succeeded, but we recorded multiple candidate proofs and cannot safely
-  // attribute the verified proof to this theorem. Record as failed and surface
-  // the ambiguity rather than guessing.
-  if (artifactError) {
-    return {
-      jobStatus: "failed",
-      finalStatus: local.status || "unformalized",
-      effectiveStatus: local,
-      leanCheck: null,
-      error: artifactError
-    };
-  }
-
   // exit.ok and no leftover sorry: the adapter passed its own final verification,
   // so the theorem IS formalized. Run a local lean check for diagnostics only
   // when we happened to locate the proof file — a missing or failing local
@@ -4063,9 +4053,8 @@ export async function resolveProofOutcome({ job, localStatus, exit, artifactErro
 // source readLeanPaneArtifactFromSession already trusts for pane artifacts,
 // and authoritative even when the agent picked a different file name than
 // the label -- then require it to be sorry-free AND genuinely compile before
-// promoting, rather than trusting whether the agent bothered to
-// self-register a project-markdown entry (identifyLeaArtifact's only source
-// of evidence, and the thing needs_review runs tend to skip).
+// promoting, rather than trusting whether the adapter's artifact index got
+// a row for the run (the thing needs_review runs tend to skip).
 //
 // NOT derived from `target`: buildLeaTarget's `relativePath`/`absolutePath`
 // point at the project MARKDOWN file (the doc-side anchor), not any proof
@@ -4152,7 +4141,7 @@ export async function recoverFormalizedStatusFromTargetPath({ state, job, target
 // `resolveProofOutcome`. This is the single place a run's terminal job status is
 // decided, so the badge, the job record, and the polling resolver can never
 // disagree about whether a theorem was formalized.
-async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses }) {
+async function applyProofOutcomeToJob({ state, job, target, exit, resolvedUses }) {
   const uses = Array.isArray(resolvedUses) ? resolvedUses : (job.targetUses || []);
 
   // needs_review is a completed, checked-artifact outcome (see
@@ -4161,48 +4150,36 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
   // proof isn't discarded sight-unseen just because the prover wasn't fully
   // confident in it.
   const exitResultKind = String(exit.resultKind || exit.doneStatus || "").toLowerCase();
-  // 4.2: the adapter's structured index is the primary identification source;
-  // the registry-markdown diff survives as the fallback for adapters that
-  // predate the index (and for transport failures).
+  // The adapter's structured index (4.1/4.2) is the ONLY identification
+  // source; the registry-markdown diff fallback and its ambiguity path were
+  // deleted after the bake period (4.3). No row / no index → the session
+  // recovery below, exactly as before.
   let artifact = null;
   if (exit.ok || exitResultKind === "needs_review") {
     artifact = await identifyArtifactFromAdapter({ state, job, target });
-    if (!artifact) {
-      artifact = await identifyLeaArtifact({
-        leaRepoPath: state.settings.leaRepoPath,
-        target,
-        beforeMarkers,
-        job
-      });
-      if (artifact?.ok) {
-        await appendLog(job.logPath, `[backend] Artifact resolved from the markdown-diff fallback: ${artifact.entry.name}.\n`);
-      }
-    }
   }
 
   if (artifact?.ok) {
     job.declarationName = artifact.entry.name;
     job.recordedProofPath = artifact.entry.proofPath;
     job.moduleName = artifact.entry.moduleName || null;
-    if (artifact.source === "adapter") {
-      // Until 4.3 demotes the registry markdown to a generated view, the
-      // markdown-dependent readers (uses= resolution, project status) still
-      // need an entry — and the agent may not have self-registered one. Only
-      // fill a MISSING entry; an existing one may carry the agent's richer
-      // prose and must not be clobbered.
-      const markdown = await fs.readFile(target.projectMarkdownPath, "utf8").catch(() => "");
-      if (!findProjectTheoremEntry(markdown, artifact.entry.name)) {
-        await upsertProjectTheoremEntry({
-          projectMarkdownPath: target.projectMarkdownPath,
-          projectId: target.projectSlug,
-          theoremName: artifact.entry.name,
-          proofPath: artifact.entry.proofPath,
-          moduleName: artifact.entry.moduleName,
-          signature: "",
-          description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
-          solvingProcess: "Recorded from the adapter's structured artifact index (the agent did not self-register a markdown entry)."
-        });
-      }
+    // The registry markdown is a write-only view for machines (4.3): the
+    // AGENT still reads it (the prompt contract is unchanged), so keep the
+    // view complete when the agent didn't self-register an entry. Only fill
+    // a MISSING entry; an existing one may carry the agent's richer prose
+    // and must not be clobbered.
+    const markdown = await fs.readFile(target.projectMarkdownPath, "utf8").catch(() => "");
+    if (!findProjectTheoremEntry(markdown, artifact.entry.name)) {
+      await upsertProjectTheoremEntry({
+        projectMarkdownPath: target.projectMarkdownPath,
+        projectId: target.projectSlug,
+        theoremName: artifact.entry.name,
+        proofPath: artifact.entry.proofPath,
+        moduleName: artifact.entry.moduleName,
+        signature: "",
+        description: `Formalized from Overleaf theorem ${target.targetLabel}.`,
+        solvingProcess: "Recorded from the adapter's structured artifact index (the agent did not self-register a markdown entry)."
+      });
     }
   }
   recordJobUsage(job, exit);
@@ -4213,26 +4190,15 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
       target,
       entry: artifact.entry
     })
-    : artifact?.error
-      ? {
-        status: "unformalized",
-        theoremLabel: target.targetLabel,
-        declarationName: target.declarationName,
-        relativePath: target.relativePath,
-        absolutePath: target.absolutePath,
-        projectId: target.projectId,
-        projectSlug: target.projectSlug,
-        projectMarkdownPath: target.projectMarkdownPath
-      }
-      : await getTheoremStatus({
-        state,
-        leaRepoPath: state.settings.leaRepoPath,
-        overleafProjectId: target.overleafProjectId,
-        projectName: target.projectName,
-        projectNamespace: target.projectNamespace,
-        theoremLabel: target.targetLabel,
-        jobs: {}
-      });
+    : await getTheoremStatus({
+      state,
+      leaRepoPath: state.settings.leaRepoPath,
+      overleafProjectId: target.overleafProjectId,
+      projectName: target.projectName,
+      projectNamespace: target.projectNamespace,
+      theoremLabel: target.targetLabel,
+      jobs: {}
+    });
   const localStatus = (
     status.status === "unformalized" &&
     job.declarationName &&
@@ -4249,22 +4215,19 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     })
     : status;
 
-  // Recovery when markdown-diffing (identifyLeaArtifact, above) found nothing
-  // because the agent skipped self-registering its result -- which happens
-  // both on needs_review runs (not confident enough to self-report) and on
-  // fully verified runs (it simply never wrote the markdown entry). Locate
-  // the file the session actually wrote instead -- if it's there, sorry-free,
-  // and genuinely compiles, there's real evidence to record the same way a
-  // located artifact normally would be (job fields + the project markdown
-  // entry the agent itself didn't write). Without this, a verified run left a
-  // job with NO recordedProofPath and a markdown with NO entry: the target
-  // then had no file-linked evidence at all, so a later manual edit that put
-  // a `sorry` back could never demote the cached "formalized" verdict.
-  // `artifact.error` (ambiguous candidates) is excluded: that run is recorded
-  // as failed rather than guessed at, and must not upsert markdown either.
+  // Recovery when the adapter index (identifyArtifactFromAdapter, above) had
+  // no row for this run -- an unreachable adapter, or an agent that wrote no
+  // file the finalizer could attribute. Locate the file the session actually
+  // wrote instead -- if it's there, sorry-free, and genuinely compiles,
+  // there's real evidence to record the same way a located artifact normally
+  // would be (job fields + the project markdown entry the agent itself
+  // didn't write). Without this, a verified run left a job with NO
+  // recordedProofPath: the target then had no file-linked evidence at all,
+  // so a later manual edit that put a `sorry` back could never demote the
+  // cached "formalized" verdict.
   let effectiveLocalStatus = localStatus;
   if (
-    (exitResultKind === "needs_review" || (exit.ok && !artifact?.error)) &&
+    (exitResultKind === "needs_review" || exit.ok) &&
     localStatus.status === "unformalized"
   ) {
     const recovered = await recoverFormalizedStatusFromTargetPath({ state, job, target });
@@ -4291,13 +4254,12 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
     }
   }
 
-  const outcome = await resolveProofOutcome({ job, localStatus: effectiveLocalStatus, exit, artifactError: artifact?.error || null });
+  const outcome = await resolveProofOutcome({ job, localStatus: effectiveLocalStatus, exit });
   // The other unregistered-artifact shape: the artifact was never located via
-  // markdown or the session, but the direct file probe (getLeaDirectProofStatus,
-  // via the localStatus chain above) already pinpointed the recorded file at
-  // the project's conventional proof path. Persist the same three job fields
-  // + markdown entry a located artifact records, so the target doesn't end up
-  // with a terminal verdict and no file link.
+  // the index or the session, but the localStatus chain above (the ledger
+  // engine's evidence) already pinpointed the recorded file. Persist the same
+  // three job fields + markdown entry a located artifact records, so the
+  // target doesn't end up with a terminal verdict and no file link.
   if (
     outcome.jobStatus === "formalized" &&
     !artifact?.ok &&
@@ -4363,7 +4325,6 @@ async function applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit,
 }
 
 async function runLeaJob({ state, job, target, targetText, targetContext = "", resolvedUses = [] }) {
-  const beforeMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
   const prompt = buildLeaPrompt({
     targetKind: target.targetKind,
     projectSlug: target.projectSlug,
@@ -4385,7 +4346,7 @@ async function runLeaJob({ state, job, target, targetText, targetContext = "", r
     return;
   }
 
-  await applyProofOutcomeToJob({ state, job, target, beforeMarkers, exit, resolvedUses });
+  await applyProofOutcomeToJob({ state, job, target, exit, resolvedUses });
 
   // Self-repair Phase 1: a re-formalize is an agent-driven change to an
   // already-recorded declaration -- classify it against the pre-run snapshot
@@ -5040,65 +5001,6 @@ async function findImportedStubbedTheoremUses({ proofPath, resolvedUses = [] }) 
     }));
 }
 
-async function findImportedCurrentlyStubbedTheoremUses({
-  state,
-  leaRepoPath,
-  overleafProjectId,
-  proofPath,
-  resolvedUses = [],
-  jobs = {}
-}) {
-  const candidateUses = resolvedUses
-    .map((use) => ({
-      targetKind: normalizeTargetKind(use?.targetKind) || "theorem",
-      targetLabel: String(use?.targetLabel || "").trim(),
-      moduleName: use?.moduleName || null
-    }))
-    .filter((use) => use.targetLabel && use.moduleName);
-  if (!proofPath || candidateUses.length === 0) {
-    return [];
-  }
-
-  let content = "";
-  try {
-    content = await fs.readFile(proofPath, "utf8");
-  } catch {
-    return [];
-  }
-
-  const imports = parseLeanImports(content);
-  const importedUses = candidateUses.filter((use) => imports.has(use.moduleName));
-  if (importedUses.length === 0) {
-    return [];
-  }
-
-  const stubbedUses = [];
-  for (const use of importedUses) {
-    const status = getEquivalentTheoremStatus(await getCurrentTheoremProofStatus({
-      state,
-      leaRepoPath,
-      overleafProjectId,
-      targetKind: use.targetKind,
-      theoremLabel: use.targetLabel,
-      jobs
-    }));
-    if (status?.status !== "sorry_stub") {
-      continue;
-    }
-
-    stubbedUses.push({
-      targetKind: use.targetKind,
-      targetLabel: use.targetLabel,
-      declarationName: status.declarationName,
-      moduleName: status.moduleName || use.moduleName,
-      relativePath: status.recordedProofPath || status.relativePath || "",
-      absolutePath: status.absolutePath || ""
-    });
-  }
-
-  return stubbedUses;
-}
-
 async function getTargetStatus({
   state,
   leaRepoPath,
@@ -5131,8 +5033,8 @@ async function getTargetStatus({
 // formalized before this proof stands on its own.
 //
 // It MERGES with (rather than replaces) the job-recorded direct-uses scan
-// (findImportedCurrentlyStubbedTheoremUses): that scan carries the
-// formalize-time targetKind/labels for direct `uses=` links, but it is
+// (findImportedStubbedTheoremUses, taken at finalize time): that scan carries
+// the formalize-time targetKind/labels for direct `uses=` links, but it is
 // direct-only and depends on jobs.json surviving (start-dev.sh clears it by
 // default) -- which is why a downstream item could silently lose its warning
 // entirely after a restart, and why anything two hops from a stub never got
@@ -5406,21 +5308,11 @@ async function resolveTargetUseStatus({
   return getTargetStatus({ state, leaRepoPath, overleafProjectId, projectName, projectNamespace, targetKind: "theorem", targetLabel, jobs });
 }
 
-// Engine dispatch (PLAN-system-hardening 4.4): `ledger` is the two-source
-// merge — the companion's job overlay over the adapter's per-declaration
-// ledger evidence. `legacy` (the default for this release) is the original
-// five-source recomputation below. The toggle is read per call so the
-// integration harness can diff both engines on one live stack.
-function statusEngine(state) {
-  return String(state?.env?.LEA_STATUS_ENGINE || "legacy").toLowerCase() === "ledger" ? "ledger" : "legacy";
-}
-
-async function getTheoremStatus(args) {
-  if (statusEngine(args.state) === "ledger") {
-    return getTheoremStatusLedger(args);
-  }
-  return getTheoremStatusLegacy(args);
-}
+// The ledger engine is the ONLY status engine (PLAN-system-hardening 4.4,
+// default flipped after the 4.2/4.4 bake). The legacy five-source
+// recomputation — markdown parsing, direct-FS regex probes, stale-verdict
+// override chains — is deleted; the LEA_STATUS_ENGINE toggle is ignored
+// (a startup warning points anyone still setting it here).
 
 // The project namespace for path mapping: the target's own when resolved,
 // else derived from the slug the same way the adapter provisions it (D24) —
@@ -5481,9 +5373,16 @@ async function fetchTargetStatusFromAdapter({ state, target, declarations }) {
 //   ledger  — file truth the adapter owns: does the recorded file exist,
 //             does it still lean on sorry, what was its newest real check
 //             verdict (agent run, manual edit, and cascade re-check alike).
-// The legacy engine's markdown parsing, direct-FS regex probes, and
-// stale-verdict override chains have no equivalent here — that is the point.
-async function getTheoremStatusLedger({
+//
+// Settled semantic (4.4's one recorded divergence from the deleted legacy
+// engine): after a failed retry restores the previous verified proof, status
+// reports the RESTORED FILE's validity ("formalized"), not the failed run.
+// File truth wins once no job is active — the restore exists precisely so
+// dependents keep compiling, and `uses=` resolution must be allowed to build
+// on the proof that is really on disk. The failed attempt stays reachable
+// through the session link below (the newest session-linked job) and the job
+// history; it just doesn't masquerade as the state of the artifact.
+async function getTheoremStatus({
   state,
   leaRepoPath,
   overleafProjectId = "unknown",
@@ -5509,6 +5408,15 @@ async function getTheoremStatusLedger({
   const ledger = await fetchTargetStatusFromAdapter({ state, target, declarations: candidates });
   const evidence = candidates.map((name) => ledger?.[name]).find((entry) => entry?.recorded) || null;
 
+  // Edit-broken knowledge the ADAPTER cannot have: the cascade's import-graph
+  // propagation overrules a spuriously-passing rebuild of a transitive
+  // dependent (stale-.olean artifact — see cascadeVerify.mjs) and records the
+  // real verdict only on the companion's job. The ledger's "ok" for that file
+  // is the very verdict that was overruled, so the overlay wins here. Cleared
+  // the same way it is set: the recovery cascade writes "ok" back once the
+  // dependent genuinely rebuilds.
+  const editBroken = linkedJob?.lastEditCheckStatus === "error";
+
   if (evidence && evidence.exists) {
     const entry = {
       name: evidence.declaration_name,
@@ -5517,17 +5425,18 @@ async function getTheoremStatusLedger({
     };
     const base = ledgerStatusBase({ leaRepoPath, target, entry });
     const leanStatement = extractLeanStatement(evidence.content || "", entry.name);
-    if (evidence.has_sorry) {
-      return withLeaSession({ status: "sorry_stub", ...base, leanStatement });
-    }
-    if (evidence.check_status === "error") {
-      // The recorded file's newest real verdict is a compile error (manual
-      // edit or cascade re-check) — the ledger twin of the legacy
-      // lastEditCheckStatus override.
+    if (evidence.check_status === "error" || editBroken) {
+      // The newest real verdict is a compile error (manual edit or cascade
+      // re-check). Checked ahead of has_sorry: a stub broken by an upstream
+      // change must surface as broken — with its repair offer — not as a
+      // plain stub (the legacy engine's override had the same precedence).
       if (linkedJob) {
         return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
       }
       return { status: "failed", ...base, effectiveStatus: "unformalized", message: evidence.check_detail || "This item no longer compiles." };
+    }
+    if (evidence.has_sorry) {
+      return withLeaSession({ status: "sorry_stub", ...base, leanStatement });
     }
     const status = {
       status: "formalized",
@@ -5536,6 +5445,12 @@ async function getTheoremStatusLedger({
       leanStatement
     };
     return withLeaSession(await attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status }));
+  }
+
+  if (editBroken) {
+    // No file evidence, but the overlay knows the item's newest real compile
+    // failed (manual edit / cascade on a pre-index artifact).
+    return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
   }
 
   // No usable file evidence: the overlay's newest terminal run decides. An
@@ -5586,230 +5501,9 @@ async function getTheoremStatusLedger({
   };
 }
 
-async function getTheoremStatusLegacy({
-  state,
-  leaRepoPath,
-  overleafProjectId = "unknown",
-  projectName = "",
-  projectNamespace = "",
-  targetKind = "theorem",
-  theoremLabel,
-  jobs = {}
-}) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
-  const linkedJob = findLatestJobWithLeaSession(jobs, target.jobKey);
-  const withLeaSession = (status) => addLeaSessionLink(status, linkedJob);
-  const activeJob = findActiveJob(jobs, target.jobKey);
-
-  // Valid-before-valid race: while the companion still has a live job, status
-  // must remain in_progress even if the run has already written a valid Lean
-  // file that local evidence can see. Manual edit/save is locked on this same
-  // activeJob, and the Lea UI derives "thinking" from the adapter's active run,
-  // so letting file evidence win here made the pane say "valid" too early.
-  if (activeJob) {
-    return buildJobResponse({ job: activeJob, status: "in_progress", target });
-  }
-
-  // A manual edit (or a cascade re-check triggered by editing something this
-  // target imports) may have broken a target that would otherwise still read
-  // as "formalized" below -- mappedStatus/directProofStatus only re-derive
-  // "formalized" from a `sorry`/`admit` regex over the CURRENT file content,
-  // not a real compile. lastEditCheckStatus carries the actual `lean_check`
-  // verdict recorded by handleLeanPaneEditSave (docs/FEATURE-overleaf-lean-pane-manual-edit.md).
-  // Checked first, ahead of every other status source, so a fresh compiler
-  // result always wins over a stale regex re-derivation of an old job's
-  // outcome -- and cleared (lastEditCheckStatus "ok") once an edit compiles
-  // again, so the normal chain resumes deciding status as before.
-  //
-  // Scope note: this only covers getTheoremStatus (the pane's per-item status
-  // source). getCurrentTheoremProofStatus, used by `uses=` dependency
-  // resolution at formalize time, does not yet honor this override -- left
-  // as-is for this fix, which is scoped to the pane status chip.
-  if (linkedJob?.lastEditCheckStatus === "error") {
-    return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
-  }
-
-  const { projectStatus, directProofStatus, mappedStatus } = await getCurrentTheoremProofStatuses({
-    state,
-    leaRepoPath,
-    target,
-    jobs,
-    includeStubbedTheoremUses: true
-  });
-  const failedJob = findLatestJob(jobs, target.jobKey, "failed");
-  const formalizedJob = findLatestJob(jobs, target.jobKey, "formalized");
-  const repairedJob = findLatestJob(jobs, target.jobKey, "repaired");
-  const disprovedJob = findLatestJob(jobs, target.jobKey, "disproved");
-  const needsReviewJob = findLatestJob(jobs, target.jobKey, "needs_review");
-
-  // Authoritative outcome: a finished job the finalizer recorded with a
-  // terminal status is trusted even when project-markdown recording is
-  // deferred and no local file evidence (mapped/project/direct) could be
-  // found. The NEWEST terminal job wins, decided by ONE selection rather
-  // than pairwise recency guards per branch -- the pairwise version had to
-  // enumerate every other status in every guard, and adding `needs_review`
-  // exposed exactly that failure mode: the formalized branch's guards
-  // predated it, so an older `formalized` job kept shadowing a newer
-  // `needs_review` re-run (and the disproved branch had the same omission).
-  // Ties resolve in favor of the more definitive status, in the list order
-  // below -- matching the old `>=` guards' behavior.
-  // A verified repair (`repaired`, rebuild-checked in runLeaRepairJob) is as
-  // terminal as `formalized` -- and after an item is repaired it is the job
-  // carrying the item's CURRENT declarationName (the rename bookkeeping
-  // writes to the newest session-linked job). Leaving it out of this list
-  // made status fall back to the older formalize job, whose stale
-  // declarationName then steered the pane's artifact lookup onto a
-  // pre-rename snapshot.
-  const terminalCandidates = [
-    { job: formalizedJob, status: "formalized" },
-    { job: repairedJob, status: "formalized" },
-    { job: needsReviewJob, status: "needs_review" },
-    { job: disprovedJob, status: "disproved" },
-    { job: failedJob, status: "failed" }
-  ].filter((candidate) => candidate.job);
-  let newestTerminal = null;
-  for (const candidate of terminalCandidates) {
-    if (!newestTerminal || jobRecency(candidate.job) > jobRecency(newestTerminal.job)) {
-      newestTerminal = candidate;
-    }
-  }
-
-  // `failed` falls through to the dedicated failedJob branch below, which
-  // enriches with equivalent-status + log tail; the other terminal statuses
-  // render directly from the job record.
-  if (newestTerminal && newestTerminal.status !== "failed") {
-    // Fresh file evidence beats the job's cached verdict when they disagree
-    // about the same artifact. A job's `formalized` was true when the run
-    // finished, but a manual edit can put a `sorry` back into the file
-    // afterwards -- and `sorry` COMPILES (a warning, not an error), so
-    // neither the edit's own lean-check verdict (status "ok", so the
-    // lastEditCheckStatus override above stays quiet) nor a cascade will
-    // ever flag it. The mapped/project/direct statuses re-derive from the
-    // file on disk right now; if any of them says this target's recorded
-    // artifact is currently a sorry stub, showing the stale job verdict as
-    // "valid" is wrong -- surface the stub status (pane chip
-    // "stub-generated") instead.
-    if (["formalized", "needs_review"].includes(newestTerminal.status)) {
-      const stubEvidence = [mappedStatus, projectStatus, directProofStatus]
-        .find((candidate) => candidate?.status === "sorry_stub") || null;
-      if (stubEvidence) {
-        return withLeaSession(stubEvidence);
-      }
-    }
-    if (newestTerminal.status === "formalized") {
-      const currentEvidence = [mappedStatus, projectStatus, directProofStatus]
-        .find((candidate) => candidate?.status === "formalized") || null;
-      if (currentEvidence) {
-        return withLeaSession(currentEvidence);
-      }
-    }
-    return withLeaSession(buildJobResponse({ job: newestTerminal.job, status: newestTerminal.status, target }));
-  }
-
-  if (failedJob) {
-    const directPath = String(directProofStatus?.recordedProofPath || directProofStatus?.relativePath || "");
-    const legacyDirectPath = path.join("workspace", "proofs", `${directProofStatus?.declarationName || theoremLabel}.lean`);
-    if (directProofStatus?.status === "formalized" && directPath === legacyDirectPath) {
-      return withLeaSession(directProofStatus);
-    }
-    return withLeaSession(buildFailedTheoremStatus({
-      failedJob,
-      target,
-      equivalentStatus: mappedStatus || projectStatus || directProofStatus,
-      logTail: await readLogTail(failedJob.logPath)
-    }));
-  }
-
-  if (mappedStatus?.status === "formalized") {
-    return withLeaSession(mappedStatus);
-  }
-
-  if (projectStatus?.status === "formalized") {
-    return withLeaSession(projectStatus);
-  }
-
-  if (directProofStatus?.status === "formalized") {
-    return withLeaSession(directProofStatus);
-  }
-
-  if (mappedStatus) {
-    return withLeaSession(mappedStatus);
-  }
-
-  if (projectStatus) {
-    return withLeaSession(projectStatus);
-  }
-  if (directProofStatus) {
-    return withLeaSession(directProofStatus);
-  }
-
-  return {
-    status: "unformalized",
-    targetKind,
-    targetLabel: theoremLabel,
-    targetKey: targetKey({ targetKind, targetLabel: theoremLabel }),
-    declarationName: theoremLabel,
-    relativePath: target.relativePath,
-    absolutePath: target.absolutePath,
-    projectId: target.projectId,
-    projectSlug: target.projectSlug,
-    projectMarkdownPath: target.projectMarkdownPath
-  };
-}
-
-async function getCurrentTheoremProofStatuses({
-  state,
-  leaRepoPath,
-  target,
-  jobs = {},
-  includeStubbedTheoremUses = false
-}) {
-  const projectStatus = await getLeaProjectTheoremStatus({ leaRepoPath, target });
-  const directProofStatus = await getLeaDirectProofStatus({ state, leaRepoPath, target });
-  const mappedStatus = await getLatestMappedJobStatus({
-    state,
-    leaRepoPath,
-    target,
-    jobs,
-    includeStubbedTheoremUses
-  });
-  return { projectStatus, directProofStatus, mappedStatus };
-}
-
-async function getCurrentTheoremProofStatus({
-  state,
-  leaRepoPath,
-  overleafProjectId = "unknown",
-  projectName = "",
-  projectNamespace = "",
-  targetKind = "theorem",
-  theoremLabel,
-  jobs = {}
-}) {
-  const target = buildLeaTarget({ leaRepoPath, overleafProjectId, targetKind, targetLabel: theoremLabel, projectName, projectNamespace });
-  const { mappedStatus, projectStatus, directProofStatus } = await getCurrentTheoremProofStatuses({
-    state,
-    leaRepoPath,
-    target,
-    jobs
-  });
-  return mappedStatus || projectStatus || directProofStatus || {
-    status: "unformalized",
-    targetKind,
-    targetLabel: theoremLabel,
-    targetKey: targetKey({ targetKind, targetLabel: theoremLabel }),
-    declarationName: theoremLabel,
-    relativePath: target.relativePath,
-    absolutePath: target.absolutePath,
-    projectId: target.projectId,
-    projectSlug: target.projectSlug,
-    projectMarkdownPath: target.projectMarkdownPath
-  };
-}
-
 // The status shape for a target whose latest recorded lean_check verdict
-// (from a manual edit or a cascade re-check, see the lastEditCheckStatus
-// comment in getTheoremStatus) came back non-"ok". Deliberately built the
+// (from a manual edit or a cascade re-check — the ledger's check_status
+// "error" evidence in getTheoremStatus) came back non-"ok". Deliberately built the
 // same way buildFailedTheoremStatus is: status "failed" so mapLeanPaneStatus
 // maps it to the pane's existing "invalid" chip with zero new rendering
 // logic, and `message` carries the real compiler diagnostic where the pane
@@ -5861,23 +5555,10 @@ function getEquivalentTheoremStatus(status) {
   };
 }
 
-async function getLeaProjectTheoremStatus({ leaRepoPath, target }) {
-  if (!leaRepoPath || !path.isAbsolute(leaRepoPath)) {
-    return null;
-  }
-  if (!existsSync(target.projectMarkdownPath)) {
-    return null;
-  }
-
-  const markdown = await fs.readFile(target.projectMarkdownPath, "utf8");
-  const entry = findProjectTheoremEntry(markdown, target.declarationName || target.theoremLabel);
-  if (!entry) {
-    return null;
-  }
-
-  return getLeaProofStatusFromEntry({ leaRepoPath, target, entry });
-}
-
+// File-derived status for a KNOWN entry ({name, proofPath, moduleName}). This
+// is a run-finalizer/recovery probe — the finalizer just wrote (or located)
+// the file and needs its current sorry/compile shape — NOT a status-engine
+// evidence source; getTheoremStatus asks the adapter's ledger instead.
 async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: entry.proofPath });
   const responseBase = {
@@ -5919,122 +5600,6 @@ async function getLeaProofStatusFromEntry({ leaRepoPath, target, entry }) {
   };
 }
 
-// File-derived status straight from where a proof for this target would live
-// on disk, needing NO job record or project-markdown entry to exist. That
-// independence is the point: a verified run whose artifact was never
-// self-registered (identifyLeaArtifact found no new markdown entry) leaves a
-// job with no recordedProofPath and a markdown with no entry -- and then
-// mapped/project status both come up empty, so without this probe
-// getTheoremStatus has NO file evidence at all and a stale job verdict
-// ("formalized") can never be contradicted by the sorry that is actually in
-// the file right now. The namespaced per-project path is where every modern
-// run records its file (D24); the flat workspace/proofs/<name>.lean is the
-// legacy layout, kept as a fallback.
-async function getLeaDirectProofStatus({ state, leaRepoPath, target }) {
-  const declarationName = target.declarationName || target.theoremLabel;
-  const stepPath = `${declarationName}.lean`;
-  const namespace = target.projectNamespace || await resolveProjectNamespace({
-    state: state || {},
-    overleafProjectId: target.overleafProjectId,
-    projectSlug: target.projectSlug
-  });
-  const candidates = [
-    {
-      proofPath: proofPathFromProjectStep({ namespace, stepPath }),
-      moduleName: moduleNameFromProjectStep({ namespace, stepPath })
-    },
-    { proofPath: path.join("workspace", "proofs", stepPath), moduleName: null }
-  ];
-
-  for (const candidate of candidates) {
-    const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath: candidate.proofPath });
-    if (!absolutePath || !existsSync(absolutePath)) {
-      continue;
-    }
-    const content = await fs.readFile(absolutePath, "utf8");
-    if (!containsDeclaration(content, declarationName)) {
-      continue;
-    }
-
-    const responseBase = {
-      targetKind: target.targetKind,
-      targetLabel: target.targetLabel,
-      targetKey: targetKey(target),
-      declarationName,
-      relativePath: candidate.proofPath,
-      absolutePath,
-      projectId: target.projectId,
-      projectSlug: target.projectSlug,
-      projectMarkdownPath: target.projectMarkdownPath,
-      recordedProofPath: candidate.proofPath,
-      moduleName: candidate.moduleName
-    };
-
-    if (containsSorryMarker(content)) {
-      return {
-        status: "sorry_stub",
-        ...responseBase,
-        leanStatement: extractLeanStatement(content, declarationName)
-      };
-    }
-
-    return {
-      status: "formalized",
-      ...responseBase,
-      resultKind: target.targetKind === "definition" ? "defined" : "proved",
-      leanStatement: extractLeanStatement(content, declarationName)
-    };
-  }
-
-  return null;
-}
-
-async function getLatestMappedJobStatus({
-  state,
-  leaRepoPath,
-  target,
-  jobs,
-  includeStubbedTheoremUses = false
-}) {
-  const mappedJob = jobsByRecencyDesc(jobs, (job) => (
-    job.jobKey === target.jobKey &&
-    ["formalized", "sorry_stub"].includes(job.status) &&
-    job.declarationName &&
-    job.recordedProofPath
-  ))[0] || null;
-
-  if (!mappedJob) {
-    return null;
-  }
-
-  const status = await getLeaProofStatusFromEntry({
-    leaRepoPath,
-    target,
-    entry: {
-      name: mappedJob.declarationName,
-      proofPath: mappedJob.recordedProofPath,
-      moduleName: mappedJob.moduleName || null
-    }
-  });
-  addLeaSessionLink(status, mappedJob);
-  if (!includeStubbedTheoremUses) {
-    return status;
-  }
-  const stubbedTheoremUses = status.status === "formalized"
-    ? await findImportedCurrentlyStubbedTheoremUses({
-      state,
-      leaRepoPath,
-      overleafProjectId: target.projectId,
-      proofPath: status.absolutePath,
-      resolvedUses: Array.isArray(mappedJob.targetUses) && mappedJob.targetUses.length > 0
-        ? mappedJob.targetUses
-        : mappedJob.stubbedTheoremUses || [],
-      jobs
-    })
-    : [];
-  return addStubbedTheoremUses(status, stubbedTheoremUses);
-}
-
 function addLeaSessionLink(status, job) {
   // Prefer the adapter session id (set on run start, what the Lea UI lists and
   // deep-links by) and fall back to the recorder session id. The recorder CLI is
@@ -6063,14 +5628,13 @@ function findProjectTheoremEntry(markdown, theoremLabel) {
   return null;
 }
 
-// Primary artifact identification (PLAN-system-hardening 4.2): ask the
-// adapter's structured index (written by its run finalizer from the run's own
-// FileChanged set, 4.1) which declaration this run produced — instead of
-// reverse-engineering it from registry-markdown diffs. Returns the same
-// { ok, entry } shape identifyLeaArtifact yields, tagged source: "adapter";
-// null means "index unavailable or no row" → the caller falls back to the
-// markdown diff. Best-effort by design: any transport/shape problem is a
-// silent fallback, never a failed job.
+// The only artifact identification source (PLAN-system-hardening 4.2, sole
+// since 4.3 deleted the registry-markdown diff fallback): ask the adapter's
+// structured index (written by its run finalizer from the run's own
+// FileChanged set, 4.1) which declaration this run produced. Returns
+// { ok, entry, source: "adapter" }; null means "index unavailable or no
+// row" → the caller falls through to the session-based recovery. Best-effort
+// by design: any transport/shape problem is a silent null, never a failed job.
 async function identifyArtifactFromAdapter({ state, job, target }) {
   if (!job.apiRunId || !target.projectSlug) return null;
   let baseUrl;
@@ -6111,63 +5675,6 @@ async function identifyArtifactFromAdapter({ state, job, target }) {
   };
   await appendLog(job.logPath, `[backend] Artifact resolved from the adapter index: ${entry.name} at ${entry.proofPath}.\n`);
   return { ok: true, entry, source: "adapter" };
-}
-
-async function identifyLeaArtifact({ leaRepoPath, target, beforeMarkers, job }) {
-  const afterMarkers = await readProjectTheoremEntries(target.projectMarkdownPath);
-  if (afterMarkers.length === 0) {
-    return null;
-  }
-
-  const beforeKeys = new Set(beforeMarkers.map(markerKey));
-  const newMarkers = afterMarkers.filter((entry) => !beforeKeys.has(markerKey(entry)));
-  const newResult = selectLeaArtifactCandidate({
-    candidates: newMarkers,
-    job,
-    ambiguousMessage: "Lea recorded multiple new theorem entries; could not uniquely identify Lea output."
-  });
-  if (newResult) {
-    return newResult;
-  }
-
-  const changedMarkers = [];
-  const beforeByName = new Map(beforeMarkers.map((entry) => [entry.name, entry]));
-  for (const entry of afterMarkers) {
-    const before = beforeByName.get(entry.name);
-    if (!before || markerKey(before) === markerKey(entry)) {
-      continue;
-    }
-    if (await proofFileTouchedAfter({ leaRepoPath, proofPath: entry.proofPath, isoTime: job.startedAt })) {
-      changedMarkers.push(entry);
-    }
-  }
-
-  return selectLeaArtifactCandidate({
-    candidates: changedMarkers,
-    job,
-    ambiguousMessage: "Lea changed multiple theorem entries; could not uniquely identify Lea output."
-  });
-}
-
-function selectLeaArtifactCandidate({ candidates, job, ambiguousMessage }) {
-  if (candidates.length === 0) {
-    return null;
-  }
-  if (candidates.length === 1) {
-    return { ok: true, entry: candidates[0] };
-  }
-
-  if (job.declarationNameHint) {
-    const hinted = candidates.filter((entry) => entry.name === job.declarationNameHint);
-    if (hinted.length === 1) {
-      return { ok: true, entry: hinted[0] };
-    }
-  }
-
-  return {
-    ok: false,
-    error: `${ambiguousMessage} Candidates: ${candidates.map((entry) => entry.name).join(", ")}.`
-  };
 }
 
 async function upsertProjectTheoremEntry({
@@ -6315,23 +5822,6 @@ function findSectionHeadingStart(markdown, markerStart) {
     return headingIndex;
   }
   return beforeMarker.startsWith("## Theorem:") ? 0 : markerStart;
-}
-
-function markerKey(entry) {
-  return `${entry.name}\u0000${entry.proofPath}\u0000${entry.moduleName || ""}`;
-}
-
-async function proofFileTouchedAfter({ leaRepoPath, proofPath, isoTime }) {
-  const absolutePath = buildLeaProofPath({ leaRepoPath, proofPath });
-  if (!absolutePath) {
-    return false;
-  }
-  try {
-    const stat = await fs.stat(absolutePath);
-    return stat.mtimeMs >= Date.parse(isoTime);
-  } catch {
-    return false;
-  }
 }
 
 function parseMarkerAttrs(text) {
@@ -6546,6 +6036,12 @@ if (isMain) {
   const dotenv = loadDotEnv();
   if (dotenv.loaded) {
     console.log(`Loaded root environment from ${dotenv.path}`);
+  }
+  if (process.env.LEA_STATUS_ENGINE) {
+    console.warn(
+      "[companion] LEA_STATUS_ENGINE is no longer read: the ledger engine is the only status engine " +
+      "(PLAN-system-hardening 4.4; the legacy engine was deleted after the bake period). Remove the variable."
+    );
   }
   const server = await createServer();
   server.listen(DEFAULT_PORT, DEFAULT_HOST, () => {
