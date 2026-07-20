@@ -15,6 +15,7 @@ Public API for custom tools:
         ...
 """
 
+import contextvars
 import importlib
 from dataclasses import dataclass
 from typing import Callable
@@ -44,27 +45,102 @@ class Tool:
     opt_in: bool = False
 
 
-# name -> Tool, plus registration order so an unfiltered toolset is deterministic
-# (and reproduces today's TOOLS_SCHEMA order for the built-ins).
+# The GLOBAL base layer: name -> Tool, plus registration order so an unfiltered
+# toolset is deterministic (and reproduces today's TOOLS_SCHEMA order for the
+# built-ins). Everything registered at *import time* — the six built-ins, user
+# `tool_modules` — lives here and is shared, immutable, and process-wide.
 REGISTRY: dict[str, Tool] = {}
 _ORDER: list[str] = []
 
+# The per-activation OVERLAY (item 27). Tools registered *during* a run and scoped
+# to it — today only MCP tools — go here instead of the global, so two concurrent
+# MCP-enabled activations can't corrupt each other's toolsets (the old failure:
+# activation A's `stop()` unregistered activation B's tools by name out of the one
+# shared dict). `build_toolset` reads global + the active overlay; the overlay is a
+# fresh dict per activation (agent.run_events pushes/pops it), dropped on exit — so a
+# run's dynamic tools simply cease to exist when it ends, no cross-run `unregister`.
+#
+# Overlay tools are a **dict** (insertion-ordered) so it doubles as membership + order
+# for overlay-only names. Default None = "no activation scope" (import time, the CLI,
+# standalone tests, the mcp unit test) → registration falls through to the global, so
+# every pre-item-27 path behaves byte-identically.
+_scope: contextvars.ContextVar[dict[str, Tool] | None] = contextvars.ContextVar(
+    "lea_registry_scope", default=None
+)
 
-def register(tool: Tool) -> Tool:
-    """Add a Tool to the registry. Raises ToolError on a duplicate name."""
-    if tool.name in REGISTRY:
+
+def push_scope():
+    """Open a fresh per-activation tool overlay; returns a reset token. Called once at
+    the top of `run_events` so a run's dynamic (MCP) tools land in an isolated layer."""
+    return _scope.set({})
+
+
+def pop_scope(token) -> None:
+    """Close the overlay opened by `push_scope`, dropping every tool registered into it."""
+    import contextlib
+    with contextlib.suppress(ValueError):
+        _scope.reset(token)
+
+
+def _active_scope() -> dict[str, Tool] | None:
+    return _scope.get()
+
+
+def get_tool(name: str) -> Tool | None:
+    """Resolve a name against the effective registry: the active overlay wins over the
+    global base (though a scoped registration can never shadow a global name — see
+    `register`), else the global."""
+    scope = _active_scope()
+    if scope is not None and name in scope:
+        return scope[name]
+    return REGISTRY.get(name)
+
+
+def is_registered(name: str) -> bool:
+    """True if `name` resolves in the effective registry (overlay or global)."""
+    return get_tool(name) is not None
+
+
+def _all_names() -> set[str]:
+    scope = _active_scope()
+    return set(REGISTRY) | (set(scope) if scope else set())
+
+
+def register(tool: Tool, *, scoped: bool = False) -> Tool:
+    """Add a Tool to the registry. Raises ToolError on a duplicate name (checked against
+    the *effective* registry, so a dynamic tool can't silently shadow a built-in).
+
+    `scoped=True` targets the active per-activation overlay when one is open (MCP tools,
+    so they're isolated per run and vanish on run exit); with no overlay open it falls
+    through to the global, preserving the pre-item-27 behavior for standalone MCP use.
+    Import-time registrations (`@tool`, `tool_modules`) leave `scoped=False` and always
+    land in the global — they're process-wide and import-cached, so scoping them would
+    make them vanish after the first run that imported them.
+    """
+    if is_registered(tool.name):
         raise ToolError(f"tool {tool.name!r} is already registered")
-    REGISTRY[tool.name] = tool
-    _ORDER.append(tool.name)
+    scope = _active_scope()
+    if scoped and scope is not None:
+        scope[tool.name] = tool
+    else:
+        REGISTRY[tool.name] = tool
+        _ORDER.append(tool.name)
     return tool
 
 
 def unregister(name: str) -> None:
-    """Remove a tool from the registry (no-op if absent).
+    """Remove a tool from the registry (no-op if absent). Removes from the active overlay
+    when the tool lives there (the MCP-during-a-run case), else from the global.
 
-    Used to tear down dynamically-registered tools (e.g. MCP tools when their
-    manager stops) so a later run can re-register them without a duplicate clash.
+    Used to tear down dynamically-registered tools (e.g. MCP tools when their manager
+    stops) so a later run can re-register them without a duplicate clash. With the item-27
+    overlay, popping the whole scope on run exit already does this — but MCP's explicit
+    `stop()` still calls here, and now it only ever touches *this* run's overlay.
     """
+    scope = _active_scope()
+    if scope is not None and name in scope:
+        del scope[name]
+        return
     REGISTRY.pop(name, None)
     if name in _ORDER:
         _ORDER.remove(name)
@@ -107,15 +183,26 @@ def build_toolset(selected: list[str] | None) -> tuple[list[dict], dict[str, Han
     are all non-opt-in). A list → exactly those tools, in that order (so the list
     both filters and orders), opt-in tools included when named explicitly. An
     unknown name raises ToolError.
+
+    Reads the *effective* registry (item 27): the global base plus this activation's
+    tool overlay, if one is open. The unfiltered order is the global registration order
+    followed by the overlay's insertion order, so a run's MCP tools append after the
+    built-ins deterministically.
     """
-    names = [n for n in _ORDER if not REGISTRY[n].opt_in] if selected is None else selected
+    if selected is None:
+        scope = _active_scope()
+        names = [n for n in _ORDER if not REGISTRY[n].opt_in]
+        if scope:
+            names += [n for n, t in scope.items() if not t.opt_in]
+    else:
+        names = selected
     schemas: list[dict] = []
     handlers: dict[str, Handler] = {}
     for name in names:
-        t = REGISTRY.get(name)
+        t = get_tool(name)
         if t is None:
             raise ToolError(
-                f"unknown tool {name!r}; registered tools: {', '.join(sorted(REGISTRY))}"
+                f"unknown tool {name!r}; registered tools: {', '.join(sorted(_all_names()))}"
             )
         schemas.append(t.schema)
         handlers[name] = t.handler

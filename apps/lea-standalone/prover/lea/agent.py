@@ -13,13 +13,13 @@ from pathlib import Path
 
 from .config import LeaConfig
 from .runctx import run_context
-from .prompt import compose_role_prompt, load_system_prompt
+from .prompt import compose_role_prompt, domain_cascade_hint, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import safeverify
 from . import subagents  # subagent-result collector (item 22); also registers spawn_subagent via tools
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
 from .tools import _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok
-from .registry import build_toolset, import_tool_modules
+from .registry import build_toolset, import_tool_modules, pop_scope, push_scope
 from .events import (
     TurnStarted,
     AssistantTextDelta,
@@ -252,6 +252,29 @@ def _classify_final_result(
     return kind, detail, usage, cost
 
 
+def _domain_cascade_for_check(args: dict, working_dir: str | None, surfaced: set[str]) -> str | None:
+    """The domain-scoped tactic hint (item 26) for the file a `lean_check` targeted, or None.
+
+    Reads the checked file's text — resolving a relative path against this activation's
+    `working_dir` first (two concurrent runs don't share a per-run cwd), then as given — and
+    asks `domain_cascade_hint` for the fragments whose domain is present and not yet surfaced.
+    Best-effort: any read failure yields None (a missing hint never breaks a check)."""
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    p = Path(path).expanduser()
+    candidates = [p] if p.is_absolute() else (
+        [Path(working_dir).expanduser() / p, p] if working_dir else [p]
+    )
+    for cand in candidates:
+        try:
+            text = cand.read_text()
+        except OSError:
+            continue
+        return domain_cascade_hint(text, surfaced)
+    return None
+
+
 def _meaning_events(tool_name: str, args: dict, result: str) -> list:
     """Map one finished tool call to the meaning-level events the adapter acts on
     (D17). Reuses the same classification as ProofVerificationState.note_tool_result
@@ -455,6 +478,11 @@ def run_events(
     before the inner loop resolves the toolset, and stops them when the event
     stream ends or is closed.
     """
+    # Open this activation's tool-registry overlay (item 27) BEFORE starting MCP, so the
+    # MCP tools register into *this run's* layer (on the caller thread) rather than the
+    # process-global registry — two concurrent MCP-enabled runs then can't corrupt each
+    # other's toolsets. Popped in the finally, dropping the run's dynamic tools with it.
+    registry_scope = push_scope()
     mcp_manager = None
     if config.mcp_servers:
         from .mcp import MCPManager
@@ -485,6 +513,7 @@ def run_events(
     finally:
         if mcp_manager is not None:
             mcp_manager.stop()
+        pop_scope(registry_scope)
 
 
 def _run_events_inner(
@@ -562,6 +591,10 @@ def _run_events_inner(
         if intent_usage.input_tokens or intent_usage.output_tokens or intent_cost:
             yield UsageUpdated(intent_usage.input_tokens, intent_usage.output_tokens, intent_cost)
         assistant_mode = decision == "ASSISTANT"
+
+    # Domains whose tactic cascade has already been surfaced this activation (item 26),
+    # so a domain hint rides a lean_check result once, not on every check.
+    surfaced_domains: set[str] = set()
 
     turn = 0
     while True:
@@ -757,6 +790,15 @@ def _run_events_inner(
                         result = f"Error: tool '{tc['name']}' raised {type(e).__name__}: {e}"
                 else:
                     result = f"Error: unknown tool '{tc['name']}'"
+
+                # Item 26: on a model-invoked lean_check, append the domain-scoped tactic
+                # cascade for the mathematics actually in the checked file — injected here
+                # at tool-use time so the cached prompt prefix is untouched, once per domain
+                # per run. Best-effort: an unreadable path just yields no hint.
+                if tc["name"] == "lean_check":
+                    hint = _domain_cascade_for_check(tc.get("args") or {}, working_dir, surfaced_domains)
+                    if hint:
+                        result = f"{result}\n\n{hint}"
 
             preview = result[:200] + "..." if len(result) > 200 else result
             yield ToolResulted(tc["name"], result, preview)

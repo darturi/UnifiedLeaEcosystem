@@ -34,7 +34,7 @@ from pathlib import Path
 from .errors import ToolError
 from .events import CheckResult, Finished, SubagentFinished
 from .profiles import AgentProfile, available_profiles, load_profile
-from .registry import REGISTRY, build_toolset, tool
+from .registry import build_toolset, get_tool, tool
 from .runctx import (
     current_config,
     current_depth,
@@ -123,9 +123,10 @@ def compose_child_tools(parent_config, declared: list[str] | None) -> list[str]:
     wanted = [s["name"] for s in build_toolset(None)[0]] if declared is None else list(declared)
     effective: list[str] = []
     for name in wanted:
-        if name not in REGISTRY:
+        t = get_tool(name)
+        if t is None:
             raise ToolError(f"agent profile names unknown tool {name!r}")
-        if REGISTRY[name].opt_in:
+        if t.opt_in:
             continue  # opt-in (spawn_subagent) is never granted to a child
         if name in parent_allowed:  # else: parent lacked it → tightened away (D79)
             effective.append(name)

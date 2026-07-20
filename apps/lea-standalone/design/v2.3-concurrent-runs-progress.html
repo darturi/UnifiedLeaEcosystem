@@ -123,15 +123,18 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:91%"></i></div>
-  <div class="counts"><b>19 / 22 built · 18 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:96%"></i></div>
+  <div class="counts"><b>22 / 22 built · 21 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
     <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7 subagent core complete (items 18–22):</b>
     <code>spawn_subagent</code> + child activations, declarative YAML role profiles, hard-rule-bracketed prompts,
     permissions that compose by tightening only, and a typed <code>SubagentResult</code> envelope + transcript +
-    <code>SubagentFinished</code> event. The one remaining piece is the <b>adapter wire-up</b> (give a coordinator
-    <code>spawn_subagent</code>, surface child steps + persist transcripts) — not buildable until subagents are enabled
-    in the UI. Concurrency is on by default: four chats formalize at once.
+    <code>SubagentFinished</code> event. <b>Phase 8 complete (items 25–27):</b> a pure compiler-decides
+    <code>collation.py</code> (rank + guarded <code>promote</code>), domain-scoped tactic cascades injected at
+    tool-use time, and a ContextVar-scoped tool registry that isolates concurrent MCP toolsets. The one remaining
+    piece is <b>item 24 — subagents in the UI</b> (its backend enablement — give a coordinator
+    <code>spawn_subagent</code>, surface child steps + persist transcripts, wire <code>collation</code> as the caller —
+    rides with it). Concurrency is on by default: four chats formalize at once.
     <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
     Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
     adapter attribution e2e).
@@ -143,8 +146,11 @@
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
     359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites (5 subagent modules).
-    Next: <b>the adapter wire-up — enable a coordinator to run <code>spawn_subagent</code>, surface child steps in the
-    UI, and persist subagent transcripts (the SubagentFinished branch in bridge.py).</b><br>
+    Next: <b>item 24 — subagents in the UI</b> (start from <code>mock-subagents-sidebar.html</code>: a child is a
+    read-only session with a provenance bar, contextual Sub-agents block scoped <code>children(parent_id ?? id)</code>),
+    which carries with it the backend enablement — a coordinator that runs <code>spawn_subagent</code>, the
+    <code>SubagentFinished</code> branch in <code>bridge.py</code> that persists transcripts, and <code>collation</code>
+    (item 25) wired as the caller that promotes the winner.<br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1210,31 +1216,53 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
     <div class="ghint">The parent has N candidates. Now make choosing between them principled, and make each child
       sharper than a generalist would be.</div>
 
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">25</span><span class="title">Parent collation: rank candidates, promote the winner</span>
-        <span class="tag be">adapter</span><span class="badge b-unplanned">Design pass</span></div>
+        <span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Only the coordinator promotes to the canonical path and to <code>code_steps</code>. Ranking is
         <b>not</b> a vote and <b>not</b> the model's opinion — it's the compiler: <code>lean_check</code> clean beats
         SafeVerify-rejected beats errors, ties broken by proof length / <code>sorry</code>-free. The candidate that
-        wins is the one Lean says wins.</div>
+        wins is the one Lean says wins.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Landed:</b> <code>adapter/app/collation.py</code> — a pure, total, deterministic order over candidates
+        (three tiers exactly as above; SafeVerify absent ranks as clean, so it degrades to <code>lean_check</code>-only
+        rather than mis-ranking). Two refusals encode the guardrails: <code>select_promotable</code> returns
+        <b>only</b> a clean candidate (never an error, never a SafeVerify-rejected cheat), and <code>promote()</code> —
+        the single crossing to proof-of-record — refuses a non-promotable winner. 21 tests. The live caller (a
+        coordinator run feeding <code>SubagentFinished</code> into this) lands with item 24's backend.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">26</span><span class="title">Domain-scoped tactic cascades via path triggers</span>
-        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Today <code>_TACTIC_CASCADE</code> is <b>one flat table for all of mathematics</b> — every
         run carries measure-theory tactics whether or not it's doing measure theory. Trigger extra cascade fragments
         on the imports/namespaces actually in play (<code>MeasureTheory</code> → <code>measurability</code>,
         <code>fun_prop</code>), injected <b>at tool-use time</b> so the cached prompt prefix is untouched. Each child
-        gets a sharper ladder and a shorter one.</div>
+        gets a sharper ladder and a shorter one.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Landed:</b> <code>_DOMAIN_CASCADES</code> in <code>prompt.py</code> (MeasureTheory · Topology · fderiv ·
+        Polynomial · BigOperators), keyed on a trigger token that matches both the import path and the opened
+        namespace. <code>domain_cascade_hint</code> scans the file the model just <code>lean_check</code>ed and appends
+        only the present domains' fragments to <b>that tool result</b> — never the system prompt, so the cached prefix
+        stays byte-identical — deduped to once-per-domain-per-run. 20 tests.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">27</span><span class="title">ContextVar-scoped tool registry</span>
-        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope"><code>registry.py:42-43</code> <code>REGISTRY</code>/<code>_ORDER</code> are process-global
         and mutated per activation by MCP (<code>mcp.py:146,150-153</code>) — two concurrent MCP-enabled activations
         corrupt each other's toolsets (A's <code>stop()</code> unregisters B's tools <b>by name</b>). <b>Dormant
         today</b> (the adapter never sets <code>mcp_servers</code>) — and live the moment children get their own
-        tools. <code>build_toolset</code> reads a ContextVar-scoped snapshot instead of the module global.</div>
+        tools. <code>build_toolset</code> reads a ContextVar-scoped snapshot instead of the module global.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Landed:</b> a per-activation overlay ContextVar (<code>push_scope</code>/<code>pop_scope</code> wrap the MCP
+        lifecycle in <code>run_events</code>); <code>build_toolset</code>/<code>get_tool</code> read global + overlay.
+        The subtlety that shaped the design: MCP registers from its <b>own background thread</b>, which doesn't share
+        the agent thread's ContextVar scope — so <code>MCPManager</code> now <b>discovers on the loop thread but
+        registers/unregisters on the caller thread</b> (<code>scoped=True</code>), where the overlay lives. Import-time
+        registrations stay global (so import-cached <code>tool_modules</code> don't vanish after run 1). The teardown
+        race is gone: a run's tools die with its overlay, and a threaded test proves A's teardown can't unregister B's
+        identically-named tool. 19 tests; existing registry + MCP suites pass unchanged.</div>
     </div>
   </div>
 

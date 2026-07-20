@@ -189,6 +189,74 @@ def compose_role_prompt(core: str, role_head: str | None) -> str:
     return f"{core}\n\n{role_head.strip()}\n\n{_SUBAGENT_RULES_FOOTER}"
 
 
+# ── Domain-scoped tactic cascades (item 26) ───────────────────────────────────
+# `_TACTIC_CASCADE` above is one flat ladder for *all* of mathematics — every run
+# carries measure-theory and topology tactics whether or not they're in play. This
+# table holds the domain-specific fragments, keyed by a trigger token that appears in
+# a file's imports / `open`s / qualified names. `domain_cascade_hint` scans the file
+# actually being checked and returns only the fragments whose domain is present — and
+# it is appended to the `lean_check` tool result at tool-use time (agent.py), NOT baked
+# into the system prompt, so the cached prompt prefix stays byte-identical and a run
+# only ever sees the ladders for the mathematics it's doing.
+#
+# Trigger tokens are chosen to match both the Mathlib import path (`Mathlib.MeasureTheory…`)
+# and the namespace a proof opens/qualifies (`MeasureTheory.…`), so either signal fires.
+_DOMAIN_CASCADES: dict[str, str] = {
+    "MeasureTheory": (
+        "`Measurable`/`AEMeasurable`/`AEStronglyMeasurable` goals: `measurability` → "
+        "`fun_prop` → component lemmas. Integrals: `MeasureTheory.integral_*` / "
+        "`setIntegral_*`; a.e. statements via `Filter.EventuallyEq` and `ae_of_all`. "
+        "`ENNReal`/`Set.indicator` arithmetic simplifies under `simp`, not `ring`."
+    ),
+    "Topology": (
+        "`Continuous`/`ContinuousAt`/`ContinuousOn` goals: `continuity` → `fun_prop` → "
+        "component lemmas. `IsOpen`/`IsClosed`/`IsCompact` via `isOpen_*`/`isCompact_*`; "
+        "limits as `Filter.Tendsto`, composed with `Filter.Tendsto.comp` and `tendsto_*`."
+    ),
+    "fderiv": (
+        "Derivative goals (`HasDerivAt`/`HasFDerivAt`/`Differentiable`): `fun_prop` → the "
+        "chain/product/quotient `HasDerivAt.*` lemmas → `deriv_*`/`fderiv_*` rewrites. "
+        "Prove `HasDerivAt` first, then read `deriv` off it, rather than computing `deriv` raw."
+    ),
+    "Polynomial": (
+        "`Polynomial` goals: `Polynomial.degree_*`/`natDegree_*` for degrees; `compute_degree` / "
+        "`compute_degree!` to discharge degree side-goals; evaluate with `Polynomial.eval_*` "
+        "under `simp`; `Monic`/roots via `Polynomial.Monic.*` and `Polynomial.roots`."
+    ),
+    "BigOperators": (
+        "Finite sums/products (`Finset.sum`/`∑`/`∏`): `Finset.sum_*` rewrites (`sum_congr`, "
+        "`sum_range_succ`, `sum_comm`); monotone bounds via `Finset.sum_le_sum` and `gcongr`; "
+        "reindex with `Finset.sum_bij`/`sum_nbij` before touching the summand."
+    ),
+}
+
+
+def domain_cascade_hint(file_text: str, already: set[str] | None = None) -> str | None:
+    """Domain-specific tactic fragments for the mathematics *present in* ``file_text`` — its
+    imports, `open`s, and qualified names — that have not already been surfaced.
+
+    Returns a compact block to append to a tool result, or ``None`` if no new domain fires.
+    When ``already`` is passed (the per-activation set the agent loop keeps), a domain is
+    surfaced **once per run** and its trigger is added to the set, so the same hint doesn't
+    repeat on every `lean_check`. Order follows `_DOMAIN_CASCADES` for a deterministic block.
+    """
+    if not file_text:
+        return None
+    seen = already if already is not None else set()
+    fired: list[tuple[str, str]] = []
+    for trigger, hint in _DOMAIN_CASCADES.items():
+        if trigger in seen:
+            continue
+        if trigger in file_text:
+            fired.append((trigger, hint))
+            seen.add(trigger)
+    if not fired:
+        return None
+    lines = ["## Domain tactics in play — try these before the generic ladder:"]
+    lines += [f"- **{trigger}**: {hint}" for trigger, hint in fired]
+    return "\n".join(lines)
+
+
 _SEARCH_BUDGET = """\
 ## Search budget (IMPORTANT)
 You have a HARD budget of 20 Mathlib searches (`search_mathlib` calls, or grep/find in Mathlib source) per problem across ALL turns. Count them yourself. After 20 searches, you MUST stop searching and commit to writing the proof from a `have`-based skeleton with `sorry` placeholders. Endless searching is a failure mode — a partial proof with intermediate lemmas beats no proof."""
