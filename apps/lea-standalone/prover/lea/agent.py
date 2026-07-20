@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .config import LeaConfig
 from .runctx import run_context
-from .prompt import load_system_prompt
+from .prompt import compose_role_prompt, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import safeverify
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
@@ -496,10 +496,11 @@ def _run_events_inner(
     )
     if config.narrate_tool_steps:
         system += _NARRATE_TOOL_STEPS_INSTRUCTION
-    # A subagent role head (item 19) is appended AFTER the shared Lean core, so the
-    # role narrows/specializes but can never drop the hard rules baked into the core.
-    if config.system_prompt_head:
-        system += "\n\n" + config.system_prompt_head
+    # A subagent role head (item 19) is composed onto the shared Lean core and
+    # BRACKETED by a non-negotiable reassertion of the hard rules (item 20), so a role
+    # can specialize but can never override "never modify the statement" / no
+    # sorry/axiom — even as the last instruction. No head → core unchanged.
+    system = compose_role_prompt(system, config.system_prompt_head)
     model = config.model
 
     # Resolve the active toolset once: import any user tool modules so their

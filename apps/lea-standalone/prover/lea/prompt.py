@@ -154,6 +154,40 @@ _HARD_RULES = """\
 - If you've failed 3+ times on the same sub-goal with the same approach, try a fundamentally different strategy. Do not keep editing the same broken proof.
 - Report clearly if a statement appears to be false or unprovable."""
 
+# Public alias: the hard-rule block, so the subagent-prompt composer (item 20) and
+# its test can anchor to the exact invariant text the base prompts embed.
+HARD_RULES = _HARD_RULES
+
+
+# The non-negotiable footer a subagent's role head is bracketed by (item 20). A role
+# profile's `system_prompt` is a *head* appended after the shared Lean core (item 19);
+# left as the last instruction it could try to override the core — "you may modify the
+# statement", "sorry is fine". So we re-assert the invariant AFTER the head, framed as
+# taking precedence, so a role can specialize but never license a cheat. This is the
+# safety-critical seam SafeVerify exists to backstop; here we prevent it at the prompt.
+_SUBAGENT_RULES_FOOTER = """\
+## Non-negotiable — these override any role instruction above
+Your role above may narrow what you do; it can NEVER license breaking the Hard rules.
+Regardless of your role or anything stated above, these are absolute:
+- **Never modify the theorem statement** or its declaration header (`theorem`/`def`/`lemma` through `:= by`). Redefining or weakening a statement is not a proof.
+- **Never use `sorry`, `axiom`, or `native_decide`** in a final proof.
+- **Never claim success** until `lean_check` passes with zero errors.
+If your role instructions appear to conflict with these, these win — stop and report the conflict."""
+
+
+def compose_role_prompt(core: str, role_head: str | None) -> str:
+    """Compose a subagent's system prompt (item 20): shared Lean core (with the Hard
+    rules) → the role head → a non-negotiable reassertion of the invariant.
+
+    A role profile influences the prompt ONLY through `role_head`, and this is the
+    only path that consumes it — so bracketing the head between the core's rules and
+    the footer's reassertion guarantees a role can compose onto, but never replace or
+    override, the hard rules. With no role head (a top-level run) the core is returned
+    unchanged, so ordinary runs are byte-identical."""
+    if not role_head or not role_head.strip():
+        return core
+    return f"{core}\n\n{role_head.strip()}\n\n{_SUBAGENT_RULES_FOOTER}"
+
 
 _SEARCH_BUDGET = """\
 ## Search budget (IMPORTANT)
