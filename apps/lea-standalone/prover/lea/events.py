@@ -97,6 +97,27 @@ class UsageUpdated:
 
 
 @dataclass(frozen=True)
+class SubagentFinished:
+    """A child subagent completed (item 22). The parent's `tool_result` for the
+    `spawn_subagent` call carries the rendered prose the model reads; THIS event
+    carries the same result *typed*, so the adapter can act on it structurally —
+    store the child `transcript` separately (it is NOT a code_step) and, when a
+    candidate is promoted, link the resulting code_step back to the transcript by
+    `result_id`. So "which attempt won, and what did it do" stays answerable.
+
+    `check_status` is 'ok'/'error'/None (nothing checked). `stop_reason` is the
+    child's terminal `Finished.reason` (or 'error' if it never finished)."""
+    result_id: str
+    subagent_type: str
+    candidate_path: str | None
+    check_status: str | None
+    check_detail: str | None
+    stop_reason: str
+    summary: str
+    transcript: list
+
+
+@dataclass(frozen=True)
 class Finished:
     """Terminal event. `reason` is "completed" or "max_turns".
 
@@ -130,5 +151,6 @@ AgentEvent = (
     | VerifyResult
     | Error
     | UsageUpdated
+    | SubagentFinished
     | Finished
 )

@@ -16,6 +16,7 @@ from .runctx import run_context
 from .prompt import compose_role_prompt, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import safeverify
+from . import subagents  # subagent-result collector (item 22); also registers spawn_subagent via tools
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
 from .tools import _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok
 from .registry import build_toolset, import_tool_modules
@@ -470,10 +471,17 @@ def run_events(
         # spawn_subagent can derive a child config. Both ride the ContextVars through
         # every tool call the inner loop delegates.
         with run_context(working_dir=working_dir, run_key=run_key, depth=depth, config=config):
-            yield from _run_events_inner(
-                config, messages, namespace=namespace, session_id=session_id,
-                working_dir=working_dir, should_stop=should_stop, gate=gate,
-            )
+            # A fresh subagent-result collector per activation (item 22): spawn_subagent
+            # records here, the inner loop drains into SubagentFinished events. Scoped so
+            # results can't leak across runs; a child opens its own empty scope.
+            results_token = subagents.begin_results_scope()
+            try:
+                yield from _run_events_inner(
+                    config, messages, namespace=namespace, session_id=session_id,
+                    working_dir=working_dir, should_stop=should_stop, gate=gate,
+                )
+            finally:
+                subagents.end_results_scope(results_token)
     finally:
         if mcp_manager is not None:
             mcp_manager.stop()
@@ -754,6 +762,12 @@ def _run_events_inner(
             yield ToolResulted(tc["name"], result, preview)
             for ev in _meaning_events(tc["name"], tc["args"], result):
                 yield ev
+            # A spawn_subagent call produced a typed result the string can't carry
+            # (the child transcript, the result id). Surface it as SubagentFinished so
+            # the adapter can store the transcript separately and keep the audit link.
+            if tc["name"] == "spawn_subagent":
+                for child_result in subagents.drain_results():
+                    yield child_result.to_event()
             proof_state.note_tool_result(tc["name"], tc["args"], result)
 
             tool_result = {"type": "tool_result", "tool_name": tc["name"], "content": result}

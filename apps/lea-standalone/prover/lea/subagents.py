@@ -24,12 +24,15 @@ item 22; item 18 returns a compact human/LLM-readable block.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .errors import ToolError
-from .events import CheckResult, Finished
+from .events import CheckResult, Finished, SubagentFinished
 from .profiles import AgentProfile, available_profiles, load_profile
 from .registry import REGISTRY, build_toolset, tool
 from .runctx import (
@@ -206,32 +209,113 @@ def _run_child(child_config, child_messages, *, working_dir: str, run_key: str, 
     return last_check, finished
 
 
-def _render_result(
+@dataclass(frozen=True)
+class SubagentResult:
+    """The TYPED result of one child run (item 22). `render()` is the prose the parent
+    model reads in its tool_result; `to_event()` is the structured `SubagentFinished`
+    the adapter persists. The `transcript` is the child's full message list — kept here
+    so it can be stored SEPARATELY (never as a code_step), and `result_id` is the audit
+    handle that links a promoted candidate back to the run that produced it."""
+
+    result_id: str
+    subagent_type: str
+    depth: int
+    candidate_path: str | None      # relative to the parent's working dir when possible
+    check_status: str | None        # 'ok' | 'error' | None (nothing checked)
+    check_detail: str | None
+    stop_reason: str                # child's Finished.reason, or 'error'
+    summary: str                    # child's final text
+    transcript: list = field(default_factory=list, repr=False)
+
+    def render(self) -> str:
+        """Compact, explicit prose for the parent — evidence, not a verdict of record;
+        the parent re-checks any candidate it promotes."""
+        lines = [f"[subagent:{self.subagent_type} depth={self.depth} id={self.result_id}] "
+                 f"finished ({self.stop_reason})."]
+        if self.check_status is not None:
+            verdict = self.check_status
+            if self.check_status == "error" and self.check_detail:
+                verdict = f"error — {self.check_detail}"
+            lines.append(f"candidate: {self.candidate_path}")
+            lines.append(f"lean_check: {verdict}")
+            lines.append("(read the candidate file to promote it; re-check after you write it.)")
+        else:
+            lines.append("candidate: (none written / checked)")
+        if self.summary:
+            lines.append(f"result: {self.summary}")
+        return "\n".join(lines)
+
+    def to_event(self) -> SubagentFinished:
+        return SubagentFinished(
+            result_id=self.result_id,
+            subagent_type=self.subagent_type,
+            candidate_path=self.candidate_path,
+            check_status=self.check_status,
+            check_detail=self.check_detail,
+            stop_reason=self.stop_reason,
+            summary=self.summary,
+            transcript=self.transcript,
+        )
+
+
+def _build_result(
+    result_id: str,
     subagent_type: str,
     depth: int,
     last_check: CheckResult | None,
     finished: Finished | None,
     base_working_dir: str | None,
-) -> str:
-    """The distilled result the parent reads back. Compact and explicit: the parent
-    re-checks any candidate it promotes, so this is evidence, not a verdict of record."""
-    reason = finished.reason if finished else "error"
-    lines = [f"[subagent:{subagent_type} depth={depth}] finished ({reason})."]
+) -> SubagentResult:
+    """Distill a child run into the typed envelope."""
+    return SubagentResult(
+        result_id=result_id,
+        subagent_type=subagent_type,
+        depth=depth,
+        candidate_path=_relativize(last_check.path, base_working_dir) if last_check else None,
+        check_status=last_check.status if last_check else None,
+        check_detail=last_check.detail if last_check else None,
+        stop_reason=finished.reason if finished else "error",
+        summary=finished.text if finished else "",
+        transcript=list(finished.transcript.get("messages", [])) if finished else [],
+    )
 
-    if last_check is not None:
-        rel = _relativize(last_check.path, base_working_dir)
-        verdict = last_check.status
-        if last_check.status == "error" and last_check.detail:
-            verdict = f"error — {last_check.detail}"
-        lines.append(f"candidate: {rel}")
-        lines.append(f"lean_check: {verdict}")
-        lines.append("(read the candidate file to promote it; re-check after you write it.)")
-    else:
-        lines.append("candidate: (none written / checked)")
 
-    if finished and finished.text:
-        lines.append(f"result: {finished.text}")
-    return "\n".join(lines)
+# --- per-activation result collector -------------------------------------------
+# spawn_subagent records each child's typed result here; the agent loop drains it
+# right after the tool call and yields a SubagentFinished event (mirroring how a
+# lean_check call yields CheckResult). Scoped per activation so results can't leak
+# across runs; a child activation opens its own (empty) scope, so recording after
+# _run_child returns lands in the PARENT's collector, where the parent loop drains it.
+_results: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "lea_subagent_results", default=None
+)
+
+
+def begin_results_scope():
+    """Open a fresh collector for this activation; returns a reset token."""
+    return _results.set([])
+
+
+def end_results_scope(token) -> None:
+    with contextlib.suppress(ValueError):
+        _results.reset(token)
+
+
+def _record_result(result: SubagentResult) -> None:
+    collector = _results.get()
+    if collector is not None:
+        collector.append(result)
+
+
+def drain_results() -> list[SubagentResult]:
+    """Return and clear the results recorded since the last drain (the parent loop
+    calls this right after a spawn_subagent tool call)."""
+    collector = _results.get()
+    if not collector:
+        return []
+    out = list(collector)
+    collector.clear()
+    return out
 
 
 @tool(name="spawn_subagent", description=_SPAWN_SCHEMA["description"],
@@ -285,4 +369,10 @@ def spawn_subagent(args: dict) -> str:
     except Exception as exc:  # noqa: BLE001 — a child failure is a tool result, never a parent crash
         return f"Error: subagent '{subagent_type}' failed: {type(exc).__name__}: {exc}"
 
-    return _render_result(subagent_type, depth + 1, last_check, finished, parent_wd)
+    # `agent_id` is the result id: unique per spawn, and the audit handle a promoted
+    # candidate links back to. Record the typed result (with the child transcript) for
+    # the parent loop to drain into a SubagentFinished event; return the prose render
+    # as the tool_result the model reads.
+    result = _build_result(agent_id, subagent_type, depth + 1, last_check, finished, parent_wd)
+    _record_result(result)
+    return result.render()

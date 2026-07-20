@@ -123,13 +123,15 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:86%"></i></div>
-  <div class="counts"><b>18 / 22 built · 17 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:91%"></i></div>
+  <div class="counts"><b>19 / 22 built · 18 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
-    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7:</b> items 18–21 done — <code>spawn_subagent</code>
-    + child activations, declarative YAML role profiles, hard-rule-bracketed prompts, and permissions that compose by
-    tightening only (child toolset ⊆ parent). <b>Only item 22 (typed result envelope + transcript) left.</b>
-    Concurrency is on by default: four chats formalize at once.
+    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7 subagent core complete (items 18–22):</b>
+    <code>spawn_subagent</code> + child activations, declarative YAML role profiles, hard-rule-bracketed prompts,
+    permissions that compose by tightening only, and a typed <code>SubagentResult</code> envelope + transcript +
+    <code>SubagentFinished</code> event. The one remaining piece is the <b>adapter wire-up</b> (give a coordinator
+    <code>spawn_subagent</code>, surface child steps + persist transcripts) — not buildable until subagents are enabled
+    in the UI. Concurrency is on by default: four chats formalize at once.
     <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
     Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
     adapter attribution e2e).
@@ -140,8 +142,9 @@
     (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
-    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites. Next: <b>item 22 —
-    typed result envelope + transcript storage (a child returns a struct, not prose; result id = audit link).</b><br>
+    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites (5 subagent modules).
+    Next: <b>the adapter wire-up — enable a coordinator to run <code>spawn_subagent</code>, surface child steps in the
+    UI, and persist subagent transcripts (the SubagentFinished branch in bridge.py).</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1130,14 +1133,25 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         parent×declared <b>matrix</b> asserting <code>effective ⊆ parent</code> ∧ no-spawn, and an end-to-end
         write-less-coordinator → write-wanting-role escalation refusal. 80 prover + 23 adapter-bridge tests green.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">22</span><span class="title">Typed result envelope + transcript storage</span>
-        <span class="tag be">adapter</span><span class="badge b-unplanned">Design pass</span></div>
-      <div class="scope">A child returns a <b>typed</b> result (candidate path, check verdict, what it tried, why it
-        stopped), not free prose the parent has to re-parse. The result id doubles as a resume handle and as the audit
-        link from a promoted <code>code_step</code> back to the transcript that produced it — so "which attempt
-        actually won, and what did it do" stays answerable. Transcripts are stored separately; they are <b>not</b>
-        <code>code_steps</code>.</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Prover core ✓</span></div>
+      <div class="scope"><b>Done (prover core).</b> A child now returns a <b>typed</b> <code>SubagentResult</code>
+        (<code>subagents.py</code>): <code>result_id</code> · candidate path · <code>lean_check</code> verdict · stop
+        reason · summary · the child <b>transcript</b>. <code>render()</code> is the prose the parent model reads;
+        <code>to_event()</code> is a new <code>SubagentFinished</code> typed event. A per-activation collector records each
+        result on spawn; the agent loop drains it right after the <code>spawn_subagent</code> call and yields the event
+        (mirroring how <code>lean_check</code> yields <code>CheckResult</code>). The <b>transcript rides in the struct,
+        never in the prose</b> — data, not display — so it can be stored separately (never a <code>code_step</code>), and
+        <code>result_id</code> is the audit handle a promoted candidate links back to. <code>result_id</code> is unique
+        per spawn; an errored child still yields a typed envelope (status None, reason <code>error</code>).
+        <code>test_subagent_result_envelope.py</code>: 22 checks — all green.
+        <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
+        <b>Remaining (adapter wire-up, when subagents are enabled in the UI):</b> a <code>SubagentFinished</code> branch
+        in <code>bridge.py</code> that persists the transcript to its own table and links the promoted
+        <code>code_step</code> by <code>result_id</code>. Not buildable until a coordinator actually runs
+        <code>spawn_subagent</code> (the adapter still starts runs with <code>tools=None</code>); the prover emits the
+        typed event today, and the bridge safely ignores it until then.</div>
     </div>
     <div class="todo is-dropped">
       <div class="top"><span class="id sub">23</span><span class="title"><s>Candidate snapshots via a <b>shadow GIT_DIR</b></s></span>
