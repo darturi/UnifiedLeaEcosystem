@@ -123,9 +123,11 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:59%"></i></div>
-  <div class="counts"><b>12 / 22 built · 11 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:63%"></i></div>
+  <div class="counts"><b>13 / 22 built · 12 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
+    <b>Item 16 done — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll shipped
+    (356 adapter tests + 15 companion tests green).</b> Concurrency is now on by default: four chats formalize at once.
     <b>Phase 5 complete — items 13–15 verified in the running UI.</b> Manual testing surfaced three real, latent
     defects: <b>F1</b> — the approval card was never persisted, so it vanished on any reconnect/switch (fixed by writing
     <code>runs.pending_approval</code>); <b>F2</b> — a reattached stream got a dead "passive view" (only a terminal
@@ -133,7 +135,8 @@
     (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
-    354 adapter tests green + the prover write-sandbox suite. Next: <b>Phase 6 (flip the cap, items 16–17).</b><br>
+    354 adapter tests green + the prover write-sandbox suite. Next: <b>item 17 — the verdict-integrity e2e +
+    the dispatch unit test.</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1016,13 +1019,19 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
     <div class="ghint">One line of behavior change plus tests — everything it depends on has already shipped and been
       running in production at cap=1. <b>Four chats formalize at once.</b></div>
 
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id">16</span><span class="title"><code>LEA_MAX_CONCURRENT_RUNS=4</code> + cheap run-row endpoint</span>
-        <span class="tag be">adapter</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope">Default the cap to 4. Add <code>GET /api/runs/{run_id}</code> and point the companion's
-        <code>fetchApiRunRow</code> (<code>leaApiClient.mjs:509</code>) at it — it currently pays a <b>full session
-        detail</b> (messages + code_steps + status_events + usage) on <b>every 3s retry</b>. ~10-line companion
-        change, and it removes a self-inflicted DB-contention source.</div>
+        <span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done.</b> The registry default flipped <code>1 → 4</code> (<code>runregistry.py</code>
+        <code>_env_capacity</code>); pin <code>LEA_MAX_CONCURRENT_RUNS=1</code> to fall back to the old single-slot
+        behavior byte-for-byte. Added <code>GET /api/runs/{run_id}</code> → a new <code>store.get_run_status</code> that
+        selects <b>only</b> <code>id/status/result_kind/result_detail</code> (not <code>get_run</code>'s
+        <code>select *</code> with the <code>transcript</code> blob, and emphatically not <code>session_detail</code>).
+        The companion's <code>fetchApiRunRow</code> now hits it every ~3s instead of paying a <b>full session detail</b>
+        (messages + code_steps + status_events + usage) per tick — a self-inflicted DB-contention source removed; a 404
+        for the route on an older adapter still falls back to the session scan. Tests: <code>test_runregistry.py</code>
+        (default-is-4 + fall-back-to-1), <code>test_routes_runs.py</code> (cheap-columns + 404), and the five companion
+        retry-loop tests re-pointed at the new endpoint — all green.</div>
     </div>
     <div class="todo">
       <div class="top"><span class="id">17</span><span class="title">Verdict-integrity e2e + the dispatch unit test</span>

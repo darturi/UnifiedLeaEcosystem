@@ -965,6 +965,22 @@ def get_run(run_id: str) -> dict | None:
     return _normalize_run(row_to_dict(row)) if row else None
 
 
+def get_run_status(run_id: str) -> dict | None:
+    """The cheap run-row read (v2.3 item 16): just the four outcome columns a
+    poller needs — id + lifecycle status + terminal kind/detail. Deliberately
+    NOT ``get_run`` (which pulls ``select *``, including the potentially large
+    ``transcript`` blob) and emphatically not ``session_detail`` (messages +
+    code_steps + status_events + usage). The Overleaf companion hits this every
+    ~3s while waiting for a slot or after a dropped stream; paying a full session
+    detail there was a self-inflicted DB-contention source under concurrency."""
+    with connect() as conn:
+        row = conn.execute(
+            "select id, status, result_kind, result_detail from runs where id = ?",
+            (run_id,),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
 def set_run_transcript(run_id: str, messages: list) -> None:
     """Persist the faithful prover conversation at this run's end (D16/multi-turn).
 

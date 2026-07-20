@@ -128,6 +128,40 @@ def test_create_run_ignores_an_invalid_slug(tmp_path, monkeypatch):
     assert store.list_projects() == []
 
 
+def test_get_run_row_returns_the_cheap_outcome_columns(tmp_path, monkeypatch):
+    """GET /api/runs/{run_id} (item 16) returns just id + status + result_kind +
+    result_detail — the outcome a poller needs, not a full session detail. The row
+    tracks the run's lifecycle: `running` before, terminal kind/detail after."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _patch_config(monkeypatch, tmp_path)
+
+    started = runs_route.create_run(RunRequest(message="prove it", autonomous=True))
+    run_id = started["run_id"]
+
+    row = runs_route.get_run_row(run_id)
+    assert row["id"] == run_id
+    assert row["status"] in {"pending", "running"}
+    # Exactly the cheap columns — no messages/code_steps/usage bleed through.
+    assert set(row.keys()) == {"id", "status", "result_kind", "result_detail"}
+
+    store.update_run(run_id, "proved", result_kind="proved", result_detail="qed")
+    row = runs_route.get_run_row(run_id)
+    assert row["status"] == "proved"
+    assert row["result_kind"] == "proved"
+    assert row["result_detail"] == "qed"
+
+
+def test_get_run_row_404s_on_an_unknown_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    try:
+        runs_route.get_run_row("no-such-run")
+        assert False, "expected a 404 for an unknown run id"
+    except Exception as exc:  # HTTPException
+        assert getattr(exc, "status_code", None) == 404
+
+
 def _drain_done_status(response):
     async def collect():
         frames = []

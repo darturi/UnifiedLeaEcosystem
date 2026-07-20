@@ -249,6 +249,10 @@ test("runApiProofJob: 409 on stream attach while the run is still pending → wa
       }
       return sseResponse([frame("done", { status: "proved" })]);
     }
+    // The busy-wait now polls the cheap run-row endpoint (item 16), not session detail.
+    if (url.endsWith("/api/runs/run-q")) {
+      return jsonResponse({ id: "run-q", status: "pending", result_kind: null, result_detail: null });
+    }
     if (url.includes("/api/sessions/sess-q")) {
       return jsonResponse({ runs: [{ id: "run-q", status: "pending", input_tokens: 5, output_tokens: 3, cost_usd: 0.001 }] });
     }
@@ -281,6 +285,10 @@ test("runApiProofJob: 409 but the run row is already terminal → adopts that ou
     if (url.includes("/api/runs/run-t/events")) {
       eventsCalls += 1;
       return jsonResponse({ detail: "Run has already completed" }, false, 409);
+    }
+    // Cheap run-row poll (item 16) returns the already-terminal outcome directly.
+    if (url.endsWith("/api/runs/run-t")) {
+      return jsonResponse({ id: "run-t", status: "failed", result_kind: "failed", result_detail: "Interrupted before the run started." });
     }
     if (url.includes("/api/sessions/sess-t")) {
       return jsonResponse({ runs: [{ id: "run-t", status: "failed", result_kind: "failed", result_detail: "Interrupted before the run started." }] });
@@ -316,6 +324,9 @@ test("runApiProofJob: still queued at the deadline → times out and interrupts 
     }
     if (url.includes("/api/runs/run-w/events")) {
       return jsonResponse({ detail: "Another Lea run is already active." }, false, 409);
+    }
+    if (url.endsWith("/api/runs/run-w")) {
+      return jsonResponse({ id: "run-w", status: "pending", result_kind: null, result_detail: null });
     }
     if (url.includes("/api/sessions/sess-w")) {
       return jsonResponse({ runs: [{ id: "run-w", status: "pending" }] });
@@ -383,8 +394,12 @@ test("runApiProofJob: stream drops with no done frame, run row is terminal → a
       // A stream that yields a progress frame then ends — never a `done`.
       return sseResponse([frame("status", { status: "tool_call", turn: 1 })]);
     }
+    // The cheap run-row poll (item 16) sees the run finished while we were detached.
+    if (url.endsWith("/api/runs/run-d")) {
+      return jsonResponse({ id: "run-d", status: "proved", result_kind: "proved", result_detail: null });
+    }
     if (url.includes("/api/sessions/sess-d")) {
-      // The run actually finished proving while we were detached.
+      // Usage read-back after the run resolved.
       return jsonResponse({ runs: [{ id: "run-d", status: "proved", result_kind: "proved", input_tokens: 10, output_tokens: 4, cost_usd: 0.002 }] });
     }
     throw new Error(`unexpected fetch ${url}`);
@@ -419,8 +434,12 @@ test("runApiProofJob: stream drops and the adapter is unreachable → gives up a
       // Open itself fails — a dropped/unreachable stream with no HTTP status.
       throw new Error("socket hang up");
     }
-    if (url.includes("/api/sessions/sess-u")) {
+    if (url.endsWith("/api/runs/run-u")) {
       // Run-row read also fails: the adapter is genuinely unreachable.
+      throw new Error("ECONNREFUSED");
+    }
+    if (url.includes("/api/sessions/sess-u")) {
+      // Usage read-back path is unreachable too.
       throw new Error("ECONNREFUSED");
     }
     throw new Error(`unexpected fetch ${url}`);

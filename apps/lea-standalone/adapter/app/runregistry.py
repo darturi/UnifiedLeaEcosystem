@@ -10,9 +10,12 @@ Here the check *is* the claim: one lock guards two maps and one decision functio
 ``try_admit()``, called at the endpoint **before** the thread is spawned. A caller
 that is admitted holds a slot until it calls ``release()``.
 
-Capacity is ``LEA_MAX_CONCURRENT_RUNS`` (**default 1**). At 1 this behaves exactly
-like the single-slot lock it replaces — externally a no-op — so concurrency lands
-dark and is turned on by raising the knob.
+Capacity is ``LEA_MAX_CONCURRENT_RUNS`` (**default 4** as of v2.3 Phase 6). Every
+seam concurrency needs — the admission registry, per-run brokers, run-scoped
+filesystem context, the rejoinable stream — shipped and baked at cap 1, so the
+default is now the first user-visible concurrency: four chats formalize at once.
+Pin ``LEA_MAX_CONCURRENT_RUNS=1`` to fall back to the single-slot lock this
+replaced (byte-for-byte the old behavior); raise it for a bigger host.
 
 Two maps, not one:
 
@@ -52,8 +55,8 @@ SESSION_BUSY = "session_busy"
 AT_CAPACITY = "at_capacity"
 
 
-def _env_capacity(default: int = 1) -> int:
-    """Read ``LEA_MAX_CONCURRENT_RUNS`` (default 1). A missing/blank/invalid value
+def _env_capacity(default: int = 4) -> int:
+    """Read ``LEA_MAX_CONCURRENT_RUNS`` (default 4). A missing/blank/invalid value
     or anything < 1 falls back to the default rather than wedging admission at 0."""
     raw = os.environ.get("LEA_MAX_CONCURRENT_RUNS", "").strip()
     if not raw:

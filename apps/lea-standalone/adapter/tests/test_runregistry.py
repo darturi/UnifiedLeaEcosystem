@@ -209,15 +209,25 @@ def test_env_knob_sets_default_capacity(monkeypatch):
 
 
 def test_env_knob_invalid_or_below_one_falls_back_to_default(monkeypatch):
+    # Default is 4 as of v2.3 Phase 6; an unusable value must not wedge admission.
     monkeypatch.setenv("LEA_MAX_CONCURRENT_RUNS", "0")
-    assert RunRegistry().capacity == 1
+    assert RunRegistry().capacity == 4
     monkeypatch.setenv("LEA_MAX_CONCURRENT_RUNS", "not-a-number")
-    assert RunRegistry().capacity == 1
+    assert RunRegistry().capacity == 4
     monkeypatch.delenv("LEA_MAX_CONCURRENT_RUNS", raising=False)
+    assert RunRegistry().capacity == 4
+
+
+def test_default_capacity_is_four(monkeypatch):
+    """Phase 6 flips the shipped default from single-slot to four concurrent runs.
+    Pinning the knob to 1 restores the old single-slot behavior exactly."""
+    monkeypatch.delenv("LEA_MAX_CONCURRENT_RUNS", raising=False)
+    assert RunRegistry().capacity == 4
+    monkeypatch.setenv("LEA_MAX_CONCURRENT_RUNS", "1")
     assert RunRegistry().capacity == 1
 
 
 def test_process_singleton_exists_and_is_a_registry():
-    """The endpoint + bridge share one registry; default deployment is single-slot."""
+    """The endpoint + bridge share one registry."""
     assert isinstance(process_registry, RunRegistry)
     assert process_registry is runregistry.registry

@@ -173,6 +173,19 @@ def create_run(request: RunRequest) -> dict:
     }
 
 
+@router.get("/api/runs/{run_id}")
+def get_run_row(run_id: str) -> dict:
+    """The cheap run-row poll (v2.3 item 16). Returns just this run's outcome —
+    id, lifecycle status, and terminal kind/detail — so a client waiting out a
+    slot (the Overleaf companion, every ~3s) can decide retry-vs-resolve without
+    paying a full session detail (messages + code_steps + status_events + usage)
+    on every tick. 404 if the run id is unknown."""
+    row = store.get_run_status(run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return row
+
+
 @router.post("/api/runs/{run_id}/approvals/{approval_id}")
 def resolve_approval(run_id: str, approval_id: str, request: ApprovalDecisionRequest) -> dict:
     """Answer a per-tool approval (D19): the human's allow / deny / always_session
