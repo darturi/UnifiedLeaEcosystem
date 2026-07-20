@@ -123,12 +123,13 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:72%"></i></div>
-  <div class="counts"><b>15 / 22 built · 14 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:77%"></i></div>
+  <div class="counts"><b>16 / 22 built · 15 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
-    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7 started:</b> item 18 —
-    <code>spawn_subagent</code> + child activations, with two independent recursion guards and candidate-dir isolation
-    that reuses F3's write sandbox. Concurrency is on by default: four chats formalize at once.
+    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7:</b> item 18 — <code>spawn_subagent</code> +
+    child activations (two recursion guards, candidate-dir isolation reusing F3's sandbox); item 19 — declarative
+    role profiles as pure YAML (<code>premise-search</code>, <code>proof-candidate</code>), each scoping its own
+    toolset and prompt head. Concurrency is on by default: four chats formalize at once.
     <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
     Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
     adapter attribution e2e).
@@ -139,8 +140,8 @@
     (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
-    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites. Next: <b>item 19 —
-    declarative agent profiles (markdown + frontmatter) in <code>prover/lea/agents/</code>.</b><br>
+    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites. Next: <b>item 20 —
+    make the role head provably compose onto the Lean core (hard rules can't be dropped), + the volatile tail.</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1079,15 +1080,23 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         (subagents land dark) AND a child's own <code>tools=None</code> toolset can never contain it. Either alone
         suffices. <code>test_subagent_depth_budget.py</code>: 24 checks (stubbed child, deterministic) — all green.</div>
     </div>
-    <div class="todo">
-      <div class="top"><span class="id sub">19</span><span class="title">Declarative agent profiles (markdown + frontmatter)</span>
-        <span class="tag prover">prover</span><span class="badge b-unplanned">Design pass</span></div>
-      <div class="scope">One file per role in <code>prover/lea/agents/</code>: YAML frontmatter (<code>model</code>,
-        <code>tools</code>, <code>permission_mode</code>, caps) + a markdown body that <i>is</i> the role's prompt.
-        <code>tools:</code> maps straight onto the existing <code>build_toolset(selected)</code> — the list both
-        filters <b>and</b> orders. Roles: coordinator · proof-candidate · mathlib-scout · error-triage · statement-check ·
-        refactor. Adding a role becomes writing a file, not writing code. Tests:
-        <code>test_subagent_profile_loading.py</code>.</div>
+    <div class="todo is-tested">
+      <div class="top"><span class="id sub">19</span><span class="title">Declarative agent profiles (pure YAML)</span>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done.</b> One file per role in <code>prover/lea/agents/&lt;name&gt;.yaml</code>: config keys
+        (<code>model</code>, <code>tools</code>, <code>max_turns</code>, <code>description</code>) + an explicit
+        <code>system_prompt: |</code> block. <b>Design change from the plan:</b> pure YAML with a named prompt key,
+        <b>not</b> markdown + <code>---</code> frontmatter — the prompt is prose full of Lean syntax that a <code>|</code>
+        literal block holds verbatim, an explicit key reads clearer, and it matches mini-swe-agent's config style + Lea's
+        minimalism (over borrowing a big harness's frontmatter). <code>tools:</code> maps straight onto
+        <code>build_toolset(selected)</code> — a <code>[read_file, search_mathlib]</code> role literally cannot write.
+        The prompt is a <b>head</b> (<code>LeaConfig.system_prompt_head</code>) appended <i>after</i> the shared Lean
+        core, so a role composes onto — never replaces — the hard rules (item 20 hardens this). New
+        <code>lea/profiles.py</code> loader validates loudly (unknown key / missing prompt / bad tools / name≠filename /
+        unknown role all refuse). Starter roles: <code>premise-search</code> (read-only) · <code>proof-candidate</code>
+        (scratch writes + <code>lean_check</code>); adding a role is writing a file. <code>spawn_subagent(subagent_type=…)</code>
+        resolves it or refuses an unknown one (never a silent full-toolset downgrade).
+        <code>test_subagent_profile_loading.py</code>: 32 checks — all green.</div>
     </div>
     <div class="todo">
       <div class="top"><span class="id sub">20</span><span class="title">Prompts <i>compose</i> the Lean core — never replace it</span>

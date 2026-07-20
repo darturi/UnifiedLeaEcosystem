@@ -496,6 +496,10 @@ def _run_events_inner(
     )
     if config.narrate_tool_steps:
         system += _NARRATE_TOOL_STEPS_INSTRUCTION
+    # A subagent role head (item 19) is appended AFTER the shared Lean core, so the
+    # role narrows/specializes but can never drop the hard rules baked into the core.
+    if config.system_prompt_head:
+        system += "\n\n" + config.system_prompt_head
     model = config.model
 
     # Resolve the active toolset once: import any user tool modules so their

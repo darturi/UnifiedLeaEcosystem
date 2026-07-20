@@ -28,7 +28,9 @@ import dataclasses
 import uuid
 from pathlib import Path
 
+from .errors import ToolError
 from .events import CheckResult, Finished
+from .profiles import AgentProfile, available_profiles, load_profile
 from .registry import tool
 from .runctx import (
     current_config,
@@ -73,9 +75,10 @@ _SPAWN_SCHEMA = {
             "subagent_type": {
                 "type": "string",
                 "description": (
-                    "Optional role hint. Declarative role profiles arrive in a later "
-                    "step; for now every subagent runs the same scoped generalist "
-                    "toolset (read/search/write-in-scratch/lean_check)."
+                    "Which role to run: one of the defined roles in lea/agents/ "
+                    "(e.g. 'premise-search' — read-only Mathlib scout; 'proof-candidate' "
+                    "— tries a candidate in a scratch file), or omit for a generalist "
+                    "with the full scoped toolset. An unknown role is refused."
                 ),
             },
         },
@@ -90,6 +93,34 @@ def _bounded_child_turns(parent_max_turns: int | None) -> int:
     if parent_max_turns is None:
         return DEFAULT_CHILD_MAX_TURNS
     return max(1, min(parent_max_turns, DEFAULT_CHILD_MAX_TURNS))
+
+
+def _child_config(parent_config, profile: AgentProfile | None):
+    """Build the child's :class:`LeaConfig` from the parent + an optional role profile
+    (item 19). A profile supplies model / scoped tools / turn cap / prompt head; each
+    ``None`` field inherits the parent's. No profile → the generalist (item 18): the
+    default toolset (``tools=None`` → no ``spawn_subagent``), no role head. Either way
+    MCP is dropped (children stay light) and the turn budget is bounded."""
+    if profile is None:
+        return dataclasses.replace(
+            parent_config,
+            tools=None,
+            mcp_servers={},
+            max_turns=_bounded_child_turns(parent_config.max_turns),
+            system_prompt_head=None,
+        )
+    # An explicit profile cap is honored as declared; only an inherited/unlimited cap
+    # is clamped to the runaway ceiling.
+    max_turns = profile.max_turns if profile.max_turns is not None \
+        else _bounded_child_turns(parent_config.max_turns)
+    return dataclasses.replace(
+        parent_config,
+        model=profile.model or parent_config.model,
+        tools=profile.tools,  # None → generalist toolset; a list → scoped (filters+orders)
+        mcp_servers={},
+        max_turns=max_turns,
+        system_prompt_head=profile.system_prompt,
+    )
 
 
 def _candidate_dir_for(base_working_dir: str | None, run_key: str, agent_id: str) -> Path:
@@ -192,23 +223,23 @@ def spawn_subagent(args: dict) -> str:
         # a crash.
         return "Error: spawn_subagent can only run inside an activation."
 
+    # Resolve the role (item 19): 'generalist' (the default) keeps item 18's built-in
+    # behavior; any other type must name a profile in lea/agents/ or is refused —
+    # never silently downgraded to a full-toolset generalist.
+    profile: AgentProfile | None = None
+    if subagent_type != "generalist":
+        try:
+            profile = load_profile(subagent_type)
+        except ToolError as exc:
+            return f"Error: {exc}"
+
     parent_wd = current_working_dir()
     run_key = current_run_key() or uuid.uuid4().hex[:12]
     agent_id = f"{subagent_type}-{uuid.uuid4().hex[:8]}"
     candidate_dir = _candidate_dir_for(parent_wd, run_key, agent_id)
     candidate_dir.mkdir(parents=True, exist_ok=True)
 
-    # The child config: same model/provider (inherit), but a scoped generalist
-    # toolset (tools=None → all non-opt-in tools, so NO spawn_subagent), no MCP
-    # servers (children stay light), and a bounded turn budget. prompt_variant is
-    # inherited so the child keeps the shared Lean core + hard rules — item 20
-    # refines this into a composed per-role prompt.
-    child_config = dataclasses.replace(
-        parent_config,
-        tools=None,
-        mcp_servers={},
-        max_turns=_bounded_child_turns(parent_config.max_turns),
-    )
+    child_config = _child_config(parent_config, profile)
     task = f"{description}\n\n{prompt}" if description else prompt
     child_messages = [{"role": "user", "content": task}]
 
