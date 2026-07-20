@@ -23,6 +23,7 @@ import {
 } from '../lib/proofDisplay.mjs';
 import { useProofSession } from '../stores/proofSession';
 import { useModel } from '../stores/model';
+import { useSessions } from '../stores/sessions';
 
 type MergedNode =
   | { kind: 'message'; key: string; runId: string | null; seqKey: number; message: ChatMessage }
@@ -34,6 +35,7 @@ export function ChatThread({
   sidebarCollapsed,
   onExpandSidebar,
   session,
+  onSelectSession,
   onSelectStep,
   onDecide,
   draft,
@@ -48,6 +50,7 @@ export function ChatThread({
   sidebarCollapsed?: boolean;
   onExpandSidebar?: () => void;
   session?: SessionSummary;
+  onSelectSession?: (id: string) => void;
   onSelectStep: (codeIndex: number) => void;
   onDecide: (decision: ApprovalDecision) => void;
   draft: string;
@@ -122,6 +125,19 @@ export function ChatThread({
   const currentRunId = useProofSession((s) => s.currentRunId);
   const approvals = useProofSession((s) => s.approvals);
   const approvalBusy = useProofSession((s) => s.approvalBusy);
+  // Sub-agents (item 24): this session's children (the spawn node lists them) and, if
+  // THIS session is a child, its parent (the provenance bar replaces the composer). Both
+  // derive from the session list — the child rows arrive there via the subagent_finished
+  // stream event / a reload.
+  const allSessions = useSessions((s) => s.sessions);
+  const isChild = Boolean(session?.parent_id);
+  const childSessions = useMemo(
+    () => (session ? allSessions.filter((s) => s.parent_id === session.id) : []),
+    [allSessions, session],
+  );
+  const parentSession = session?.parent_id
+    ? allSessions.find((s) => s.id === session.parent_id)
+    : undefined;
   // R1c-2a: the timeline is derived here from store messages + codeSteps.
   const { items } = useMemo<{ items: TimelineItem[] }>(
     () => (buildTimeline as any)({ messages, codeSteps }) as { items: TimelineItem[] },
@@ -435,6 +451,32 @@ export function ChatThread({
             </div>
           )}
 
+          {/* Sub-agents (item 24): the spawn_subagent node — answers "when & why" the
+              coordinator delegated. Lists this session's children with the compiler's
+              verdict; clicking one opens it (read-only). The sidebar block answers
+              "where are they now"; both select the same child. */}
+          {!isChild && childSessions.length > 0 && (
+            <details className="spawn" open>
+              <summary>
+                <span className="tool">spawn_subagent</span> × {childSessions.length}
+                <span className="act">{childSessions.length} candidate{childSessions.length === 1 ? '' : 's'}</span>
+              </summary>
+              <div className="kids">
+                {childSessions.map((child) => {
+                  const badge = subagentBadge(child);
+                  return (
+                    <button className="kid" key={child.id} onClick={() => onSelectSession?.(child.id)}>
+                      <span className={`dot ${badge.dot}`} />
+                      <span className="rtitle">{child.title}</span>
+                      {child.role && <span className="role">{child.role.split('-')[0]}</span>}
+                      <span className={`verdict ${badge.cls}`}>{badge.text}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </details>
+          )}
+
           {reconnecting && (
             <div className="reconnect-chip">
               <span className="reconnect-spinner" />
@@ -445,6 +487,30 @@ export function ChatThread({
         </div>
       </div>
 
+      {isChild ? (
+        /* A child is a session, not a chat (item 24): read-only, so the composer is
+           replaced by a provenance bar. The child's interlocutor is the coordinator,
+           which is blocked awaiting the typed result — typing here would inject the
+           user into a delegation the parent thinks it owns. */
+        <div className="prov">
+          <span className="lock">🔒</span>
+          <span>
+            Delegated by <b>{parentSession?.title ?? 'coordinator'}</b>
+            {session?.spawned_at_turn != null && <> · turn {session.spawned_at_turn}</>}
+            {session?.role && (
+              <>
+                {' · '}
+                <span className="role">{session.role}</span>
+              </>
+            )}
+          </span>
+          {parentSession && (
+            <button className="up" onClick={() => onSelectSession?.(parentSession.id)}>
+              Back to parent
+            </button>
+          )}
+        </div>
+      ) : (
       <div className="composer">
         {keyMissing && (
           <div className="key-nudge">
@@ -549,6 +615,7 @@ export function ChatThread({
           </div>
         </div>
       </div>
+      )}
     </main>
   );
 }
@@ -765,4 +832,23 @@ function stepTitle(step: CodeStep): string {
 
 function formatTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+// The compiler's verdict on a sub-agent's candidate (item 24), for the spawn node's
+// dot + badge. The ranking that actually picks a winner is the adapter's job (item 25);
+// here we just report each child's own lean_check status.
+function subagentBadge(child: SessionSummary): { dot: string; cls: string; text: string } {
+  const ok =
+    child.latest_check_status === 'ok' ||
+    child.status === 'ok' ||
+    child.status === 'proved' ||
+    child.status === 'defined';
+  if (ok) return { dot: 'ok', cls: 'ok', text: 'compiles' };
+  if (child.status === 'error' || child.latest_check_status === 'error') {
+    return { dot: 'fail', cls: 'err', text: 'errors' };
+  }
+  if ((child.active_run_count ?? 0) > 0 || child.status === 'running') {
+    return { dot: 'run', cls: 'run', text: 'exploring…' };
+  }
+  return { dot: 'idle', cls: 'run', text: 'no candidate' };
 }

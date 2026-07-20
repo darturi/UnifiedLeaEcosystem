@@ -45,18 +45,20 @@ from lea.interface import (
     Error,
     FileChanged,
     Finished,
+    SubagentFinished,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
     TurnStarted,
     UsageUpdated,
+    check as _lean_check_file,
     run_events,
 )
 
 from .artifacts import classify_lean_artifact
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import projects, runbroker, runregistry, skills_catalog, store, uploads
+from . import collation, projects, runbroker, runregistry, skills_catalog, store, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
@@ -332,6 +334,164 @@ class _UsageByTurn:
         return [self._rows[k] for k in sorted(self._rows)]
 
 
+def _with_subagents(cfg: LeaConfig) -> LeaConfig:
+    """Return `cfg` with `spawn_subagent` added to the coordinator's toolset (item 24).
+
+    `spawn_subagent` is registered `opt_in=True` in the prover, so an unfiltered toolset
+    (`tools=None`) never contains it. The coordinator gets its normal default toolset —
+    whatever `build_toolset(None)` resolves — PLUS spawn_subagent, named explicitly, so
+    the model can delegate. Resolving the default at call time (not hard-coding the six
+    built-ins) keeps this correct if the default set ever changes."""
+    from lea.registry import build_toolset
+
+    default_tools = [schema["name"] for schema in build_toolset(None)[0]]
+    return replace(cfg, tools=[*default_tools, "spawn_subagent"])
+
+
+def _text_from_content(content: Any) -> str:
+    """Flatten a transcript message's `content` (a string, or a list of provider blocks)
+    into plain text — the assistant prose, dropping tool-call/tool-result plumbing — so a
+    child's exploration replays as ordinary chat in its read-only view."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
+        return "\n".join(p for p in parts if p.strip())
+    return ""
+
+
+def _subagent_child_title(ev: SubagentFinished) -> str:
+    """A short, human title for the child session row.
+
+    Prefer the delegated TASK — the description line the coordinator passed, which is the
+    first line of the child's first user message. It's stable and meaningful even when the
+    child errors or hits max turns (whose `summary` is an error nudge, not a description).
+    Fall back to a non-error summary, then the role."""
+    for msg in ev.transcript or []:
+        if msg.get("role") == "user":
+            task = _text_from_content(msg.get("content")).strip()
+            first = task.splitlines()[0].strip() if task else ""
+            if first:
+                return first[:80]
+            break
+    summary = (ev.summary or "").strip()
+    if summary and not summary.lower().startswith("error"):
+        first = summary.splitlines()[0].strip()
+        if first:
+            return first[:80]
+    return ev.subagent_type or "sub-agent"
+
+
+def _materialize_subagent(
+    ev: SubagentFinished,
+    *,
+    parent_session_id: str,
+    project_id: str | None,
+    turn: int,
+    repo: Path,
+) -> dict:
+    """Persist a finished sub-agent as a CHILD session (item 24), returning its row.
+
+    A child is a real session parented to the coordinator: its transcript is replayed
+    into its own `timeline` (so it renders read-only through the ordinary session view),
+    and its candidate file — read back from the child's scratch dir under the run's
+    working tree — is stored as a code_step, so the child's *derived* status IS its
+    lean_check verdict. The child transcript is NOT written onto the parent's timeline
+    (it is the child's, not a coordinator code_step)."""
+    child = store.create_session(
+        _subagent_child_title(ev),
+        project_id=project_id,
+        parent_id=parent_session_id,
+        role=ev.subagent_type,
+        spawned_at_turn=turn,
+    )
+    child_id = child["id"]
+    for msg in ev.transcript or []:
+        text = _text_from_content(msg.get("content"))
+        if text.strip():
+            role = "user" if msg.get("role") == "user" else "assistant"
+            store.add_message(child_id, role, text)
+    if ev.candidate_path:
+        cand = Path(ev.candidate_path)
+        if not cand.is_absolute():
+            cand = repo / cand
+        try:
+            content = cand.read_text()
+        except OSError:
+            content = None
+        if content is not None:
+            store.add_code_step(
+                child_id, None, cand.name, content=content, author="agent", turn=turn,
+                summary=(ev.summary or None),
+                check_status=ev.check_status, check_detail=ev.check_detail,
+                artifact_kind=_classify(content) if ev.check_status == "ok" else None,
+            )
+    return child
+
+
+def _promote_winner(
+    subagent_results: list[SubagentFinished],
+    *,
+    session_id: str,
+    run_id: str,
+    repo: Path,
+    namespace: str | None,
+    turn: int,
+    events,
+) -> dict | None:
+    """Deterministic collation (item 25): promote the best *compiling* sub-agent candidate
+    as the coordinator's proof, and record it as a code_step — the compiler decides, not
+    the model. Returns the promoted step, or None if nothing was promoted.
+
+    The ranking is `collation`'s (lean_check clean > SafeVerify-rejected > error, ties by
+    sorry-free / shorter). Only a clean candidate is promotable. Two safety rails make this
+    safe to run automatically:
+
+      * the caller only invokes this when the coordinator produced NO clean proof itself
+        (so a promotion fills a gap, never clobbers the coordinator's own answer);
+      * the winner is **re-verified at the canonical path** before it's recorded — the
+        child's lean_check ran in its scratch dir, so we don't trust that verdict at a new
+        location; if it doesn't re-verify clean, nothing is promoted (the coordinator's
+        result stands) rather than recording an unchecked "ok".
+    """
+    if not subagent_results:
+        return None
+    candidates = [collation.candidate_from_event(ev, base_dir=repo) for ev in subagent_results]
+    winner = collation.select_promotable(candidates)
+    if winner is None or not winner.candidate_path:
+        return None
+    # The session's canonical proofs dir: its namespace path (loose → Lea/Misc).
+    ns_path = (namespace or "Lea.Misc").replace(".", "/")
+    canonical = repo / ns_path / Path(winner.candidate_path).name
+    try:
+        collation.promote(winner, canonical)
+    except ValueError:
+        return None
+    # Re-verify at the NEW path — the child checked a different location.
+    verdict = _lean_check_file(str(canonical))
+    if verdict.status != "ok":
+        logger.warning(
+            "sub-agent candidate %s did not re-verify at %s (%s); not promoting",
+            winner.result_id, canonical, verdict.detail,
+        )
+        return None
+    rel = _relativize(str(canonical), repo)
+    step = store.add_code_step(
+        session_id, run_id, rel, content=winner.text or "", author="agent", turn=turn,
+        summary=f"Promoted the winning sub-agent candidate ({winner.result_id}).",
+        check_status="ok", check_detail=None,
+        artifact_kind=_classify(winner.text or ""),
+        provenance={"promoted_from": winner.result_id},
+    )
+    emit(events, "code_step", step)
+    emit(events, "status", {
+        "status": "promoted",
+        "message": f"Promoted the winning sub-agent candidate ({winner.result_id}).",
+        "turn": turn,
+    })
+    return step
+
+
 def run_lea(context: RunnerContext) -> None:
     """Run one Lea activation, streaming normalized SSE events onto the queue.
 
@@ -346,6 +506,15 @@ def run_lea(context: RunnerContext) -> None:
         # wait for confirmation. LeaConfig is frozen, so build a copy. The gate is
         # disabled separately below.
         cfg = replace(cfg, prompt_variant="default")
+    else:
+        # Interactive coordinator (item 24): make `spawn_subagent` available so the
+        # model can delegate parallel exploration to child sub-agents. The tool is
+        # opt-in in the prover registry (off by default, so it never leaks into an
+        # unfiltered toolset); the coordinator gets its normal default toolset PLUS
+        # spawn_subagent, named explicitly. The model decides when to spawn; children
+        # can't recurse (prover depth + toolset guards). Autonomous/Overleaf runs stay
+        # single-agent for now.
+        cfg = _with_subagents(cfg)
     session_id = context.session_id
     run_id = context.run_id
 
@@ -379,6 +548,13 @@ def run_lea(context: RunnerContext) -> None:
     last_write_path: str | None = None
     checked_artifact_kind = "unknown"
     usage = _UsageByTurn()
+    # Finished sub-agents (item 24), in the order they completed — surfaced as child
+    # sessions and kept for the collation pass (item 25) on the coordinator's Finished.
+    subagent_results: list[SubagentFinished] = []
+    # Whether the coordinator ITSELF produced a clean (non-scratch) proof this run. If it
+    # did, the collation pass leaves it alone; if it didn't, the best compiling child
+    # candidate is promoted to fill the gap (item 25).
+    produced_clean = False
     last_persisted: str | None = None
     # Declared before the try so the finally's `done` event always has them, even if
     # setup throws before the run reaches its Finished handler.
@@ -526,6 +702,8 @@ def run_lea(context: RunnerContext) -> None:
                     step_id_by_path[rel] = step["id"]
                     if ev.status == "ok":
                         checked_artifact_kind = step.get("artifact_kind")
+                        if "scratch" not in rel.lower():
+                            produced_clean = True
                     emit(events, "code_step", step)
                 else:
                     artifact_kind = None
@@ -537,6 +715,8 @@ def run_lea(context: RunnerContext) -> None:
                     if updated:
                         if ev.status == "ok":
                             checked_artifact_kind = updated.get("artifact_kind") or _classify(updated["code"])
+                            if "scratch" not in rel.lower():
+                                produced_clean = True
                         emit(events, "code_step", updated)
                 emit(events, "status", {
                     "status": "lean_check", "message": f"lean_check: {ev.status}",
@@ -566,11 +746,55 @@ def run_lea(context: RunnerContext) -> None:
                     })
                 last_write_path = None
 
+            elif isinstance(ev, SubagentFinished):
+                # A child sub-agent finished (item 24). Materialize it as a CHILD session
+                # parented to this coordinator — its exploration replayed into its own
+                # read-only timeline, its candidate stored as a code_step so the child's
+                # derived status IS its lean_check verdict — then tell the browser so the
+                # contextual Sub-agents block + the spawn node appear live. Keep the typed
+                # result for the collation pass on Finished.
+                subagent_results.append(ev)
+                child = _materialize_subagent(
+                    ev,
+                    parent_session_id=session_id,
+                    project_id=(project["id"] if project else None),
+                    turn=current_turn,
+                    repo=repo,
+                )
+                emit(events, "subagent_finished", {
+                    "child_id": child["id"],
+                    "parent_id": session_id,
+                    "run_id": run_id,
+                    "result_id": ev.result_id,
+                    "subagent_type": ev.subagent_type,
+                    "role": ev.subagent_type,
+                    "turn": current_turn,
+                    "title": child["title"],
+                    "check_status": ev.check_status,
+                    "check_detail": ev.check_detail,
+                    "stop_reason": ev.stop_reason,
+                    "summary": ev.summary,
+                    "candidate_path": ev.candidate_path,
+                })
+
             elif isinstance(ev, Error):
                 emit(events, "run_error", {"message": ev.message})
 
             elif isinstance(ev, Finished):
                 flush_narration()
+                # Deterministic collation (item 25): if the coordinator delegated but
+                # produced no clean proof of its own, promote the best compiling child
+                # candidate as the session's proof (re-verified at the canonical path).
+                # Runs BEFORE the artifact-result classification so the promoted verdict
+                # settles the session's outcome. Never clobbers a clean coordinator proof.
+                if not produced_clean and subagent_results:
+                    promoted = _promote_winner(
+                        subagent_results, session_id=session_id, run_id=run_id,
+                        repo=repo, namespace=namespace, turn=current_turn, events=events,
+                    )
+                    if promoted:
+                        checked_artifact_kind = promoted.get("artifact_kind") or checked_artifact_kind
+                        produced_clean = True
                 final_text = _final_text_for_result(ev)
                 persist_assistant(final_text)
                 final_status, result_kind = _completed_artifact_result(ev, checked_artifact_kind)

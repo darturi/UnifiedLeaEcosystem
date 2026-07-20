@@ -298,6 +298,38 @@ def test_max_turns():
     check("max_turns Finished turns", fin.turns == 1)
 
 
+def test_max_turns_hands_back_a_summary():
+    # On hitting the turn budget the run spends ONE tool-less turn to summarize its
+    # findings + next step, and returns THAT as the result — not a discarded "max turns"
+    # error. This is what makes a capped sub-agent scout still useful to the coordinator.
+    tmp = tempfile.TemporaryDirectory()
+    proof_path = str(Path(tmp.name) / "Work.lean")
+    n = {"real": 0}
+
+    def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        if not tools:  # the tool-less summary turn
+            yield TextDelta("FINDINGS: Finset.sum_le_sum applies; next, try gcongr.")
+            yield Done(Usage(9, 4), 0.001)
+            return
+        n["real"] += 1  # every real turn just calls a tool → never finishes on its own
+        yield ToolCall("read_file", {"path": proof_path})
+        yield _ToolMeta(f"c{n['real']}")
+        yield Done(Usage(20, 8), 0.002)
+
+    agent.stream = fake_stream
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
+    events = list(agent.run_events(cfg(max_turns=2, tools=["read_file"]), msgs("scout lemmas")))
+    fin = events[-1]
+    check("finished on max_turns", isinstance(fin, Finished) and fin.reason == "max_turns")
+    check("result is the SUMMARY, not an error",
+          "FINDINGS" in fin.text and "Error: max turns" not in fin.text)
+    check("only the budgeted tool turns ran (2), then the summary", n["real"] == 2)
+    check("summary streamed as assistant text",
+          any(isinstance(e, AssistantTextDelta) and "FINDINGS" in e.text for e in events))
+    check("summary folded into the returned transcript",
+          any("FINDINGS" in str(m.get("content")) for m in fin.transcript["messages"]))
+
+
 def test_should_stop_interrupts_before_first_turn():
     # Cooperative interrupt (D18): should_stop True from the start → a clean
     # terminal Finished("interrupted") with no turns run. (Real asserts so pytest
@@ -399,7 +431,9 @@ def test_failed_final_gate_respects_max_turns():
     events = list(agent.run_events(cfg(max_turns=2), msgs("prove it")))
     fin = events[-1]
     check("failed final gate hits max_turns next", isinstance(fin, Finished) and fin.reason == "max_turns")
-    check("no extra model turn beyond max_turns", calls["n"] == 2)
+    # The gate loop stops at max_turns (2 model turns); then exactly ONE tool-less summary
+    # turn runs on the max_turns branch (item: summarize-on-cap). No runaway beyond that.
+    check("gate loop stops at max_turns, plus one summary turn", calls["n"] == 3)
     check("failed final gate checked once with max_turns", calls["checks"] == [proof_path])
 
 
@@ -620,6 +654,7 @@ def main():
     print("agent (run_events + run) tests:")
     test_run_events_sequence()
     test_max_turns()
+    test_max_turns_hands_back_a_summary()
     test_narrate_tool_steps_instruction()
     test_narrate_tool_steps_forces_text_before_silent_tool_call()
     test_final_gate_failed_check_resumes_loop()

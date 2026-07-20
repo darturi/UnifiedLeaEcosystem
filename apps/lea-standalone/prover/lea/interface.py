@@ -23,6 +23,7 @@ from .events import (
     Error,
     FileChanged,
     Finished,
+    SubagentFinished,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
@@ -50,6 +51,7 @@ __all__ = [
     "CheckResult",
     "VerifyResult",
     "Error",
+    "SubagentFinished",
     "Finished",
 ]
 

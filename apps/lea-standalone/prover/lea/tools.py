@@ -528,3 +528,9 @@ from .registry import Tool, register  # noqa: E402
 
 for _schema in TOOLS_SCHEMA:
     register(Tool(name=_schema["name"], schema=_schema, handler=TOOL_HANDLERS[_schema["name"]]))
+
+# Register the opt-in `spawn_subagent` tool (item 18). Imported here so it lands in
+# the registry alongside the built-ins whenever tools are loaded, but it is
+# `opt_in=True`, so build_toolset(None) never includes it — existing runs are
+# byte-identical, and a subagent's own default toolset can't contain it.
+from . import subagents as _subagents  # noqa: E402,F401

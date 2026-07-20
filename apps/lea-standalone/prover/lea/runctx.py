@@ -1,6 +1,6 @@
 """Per-activation run context (item 8, v2.3 concurrency).
 
-Three ``ContextVar``s scoping one Lea activation's filesystem identity:
+``ContextVar``s scoping one Lea activation's identity and nesting:
 
   * ``working_dir`` — the directory an activation reads/writes proofs in. Tools
     that touch the filesystem (today ``bash``) read it here instead of inheriting
@@ -10,6 +10,15 @@ Three ``ContextVar``s scoping one Lea activation's filesystem identity:
   * ``candidate_dir`` — the isolated dir a *subagent* writes to before its parent
     promotes it (item 11). ``None`` until that lands; carried now so the seam
     exists.
+  * ``depth``       — activation nesting depth (item 18). 0 for a top-level run;
+    a subagent spawned by ``spawn_subagent`` runs at ``parent depth + 1``. The
+    spawn tool refuses at ``depth >= max_depth`` (default 1), so a child cannot
+    spawn — one of the two independent recursion guards (the other: ``spawn_subagent``
+    is absent from a child's toolset).
+  * ``config``      — the active activation's :class:`LeaConfig` (item 18), so a
+    tool that starts a *child* activation (``spawn_subagent``) can derive the
+    child's config (same model/provider, scoped tools) without the handler — which
+    only receives ``args`` — being handed it explicitly.
 
 **Why ContextVars, not thread-locals or an argument threaded everywhere.** They
 are per-thread *and* per-async-task, and a child task/thread launched via
@@ -34,6 +43,10 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # avoid a runtime import cycle; only needed for the type hint
+    from .config import LeaConfig
 
 _working_dir: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "lea_working_dir", default=None
@@ -43,6 +56,10 @@ _run_key: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 _candidate_dir: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "lea_candidate_dir", default=None
+)
+_depth: contextvars.ContextVar[int] = contextvars.ContextVar("lea_depth", default=0)
+_config: contextvars.ContextVar["LeaConfig | None"] = contextvars.ContextVar(
+    "lea_config", default=None
 )
 
 
@@ -61,12 +78,26 @@ def current_candidate_dir() -> str | None:
     return _candidate_dir.get()
 
 
+def current_depth() -> int:
+    """The active activation's nesting depth (item 18): 0 top-level, +1 per
+    subagent. ``0`` outside any run context."""
+    return _depth.get()
+
+
+def current_config() -> "LeaConfig | None":
+    """The active activation's :class:`LeaConfig` (item 18), or ``None`` outside a
+    run context. ``spawn_subagent`` reads it to derive the child's config."""
+    return _config.get()
+
+
 @contextlib.contextmanager
 def run_context(
     *,
     working_dir: str | None = None,
     run_key: str | None = None,
     candidate_dir: str | None = None,
+    depth: int = 0,
+    config: "LeaConfig | None" = None,
 ):
     """Establish the run context for the duration of the ``with`` block.
 
@@ -78,6 +109,8 @@ def run_context(
         _working_dir.set(working_dir),
         _run_key.set(run_key),
         _candidate_dir.set(candidate_dir),
+        _depth.set(depth),
+        _config.set(config),
     )
     try:
         yield
@@ -85,7 +118,11 @@ def run_context(
         # Reset in reverse; each reset runs in the same context .set() ran in
         # (the activation drives its generator on one thread), so no cross-context
         # reset. Guarded so a teardown surprise can't mask the real exception.
-        wd, rk, cd = tokens
+        wd, rk, cd, dp, cf = tokens
+        with contextlib.suppress(ValueError):
+            _config.reset(cf)
+        with contextlib.suppress(ValueError):
+            _depth.reset(dp)
         with contextlib.suppress(ValueError):
             _candidate_dir.reset(cd)
         with contextlib.suppress(ValueError):

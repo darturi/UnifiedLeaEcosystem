@@ -39,6 +39,9 @@ class LeaConfig:
     tool_modules: list[str] = field(default_factory=list)  # modules to import so custom tools register
     skills: list[str] = field(default_factory=list)  # skill markdown injected into the system prompt
     mcp_servers: dict = field(default_factory=dict)  # name → server spec (stdio or remote)
+    # A subagent role's prompt head (item 19): appended AFTER the shared Lean core so
+    # a role composes onto — never replaces — the hard rules. None for a top-level run.
+    system_prompt_head: str | None = None
 
     # --- deployment / UI (the adapter reads these; the loop ignores them) ---
     lea_root: Path | None = None      # where proof files + per-session git repos live

@@ -13,12 +13,13 @@ from pathlib import Path
 
 from .config import LeaConfig
 from .runctx import run_context
-from .prompt import load_system_prompt
+from .prompt import compose_role_prompt, domain_cascade_hint, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import safeverify
+from . import subagents  # subagent-result collector (item 22); also registers spawn_subagent via tools
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
 from .tools import _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok
-from .registry import build_toolset, import_tool_modules
+from .registry import build_toolset, import_tool_modules, pop_scope, push_scope
 from .events import (
     TurnStarted,
     AssistantTextDelta,
@@ -125,6 +126,51 @@ def _text_only_history(messages: list, limit: int = 8) -> list[dict]:
         else:
             out.append({"role": "user", "content": text})
     return out[-limit:]
+
+
+_MAX_TURNS_SUMMARY_INSTRUCTION = (
+    "You have reached your turn budget without finishing. You have NO tools now — do not "
+    "attempt any more actions. Write a concise final report for whoever delegated this to "
+    "you:\n"
+    "  - what you found or accomplished, concretely: lemma names with signatures, file "
+    "paths, the closest working proof state, or the exact error still blocking progress;\n"
+    "  - the single most promising next step.\n"
+    "This report is your entire deliverable — the turns you spent are only worth something "
+    "if you hand back what you learned. Make it useful evidence, not an apology."
+)
+
+
+def _summarize_on_max_turns(model: str, system: str, messages: list, config: LeaConfig
+                            ) -> tuple[str, Usage, float]:
+    """One final, tool-less turn when the budget is exhausted (mirrors opencode's
+    summarize-on-cap): ask the model to hand back its findings + best next step, so a
+    capped run returns useful evidence instead of a discarded "max turns" error — which
+    matters most for a delegated sub-agent, whose summary IS its deliverable to the
+    coordinator.
+
+    Built on the same clean, tool-stripped history the classifiers use (provider-safe:
+    no dangling tool_use, proper alternation), with a generous window so the whole run is
+    in view. Returns (summary_text, usage, cost)."""
+    history = _text_only_history(messages, limit=60)
+    # Deliver the instruction as the final user turn — merged into a trailing user message
+    # rather than appended after it, so we never emit two consecutive user turns (which
+    # some providers reject).
+    if history and history[-1].get("role") == "user":
+        history[-1] = {"role": "user",
+                       "content": f"{history[-1]['content']}\n\n{_MAX_TURNS_SUMMARY_INSTRUCTION}"}
+    else:
+        history.append({"role": "user", "content": _MAX_TURNS_SUMMARY_INSTRUCTION})
+    text = ""
+    usage = Usage()
+    cost = 0.0
+    for event in stream(model, system, history, [], config.model_kwargs, streaming=config.stream):
+        if isinstance(event, TextDelta):
+            text += event.text
+        elif isinstance(event, Done):
+            usage.input_tokens += event.usage.input_tokens
+            usage.output_tokens += event.usage.output_tokens
+            cost += event.cost
+    return text.strip(), usage, cost
 
 
 def _classify_intent(model: str, messages: list, config: LeaConfig) -> tuple[str, Usage, float]:
@@ -249,6 +295,29 @@ def _classify_final_result(
     kind = _parse_result_kind(text)
     detail = text.strip() or None
     return kind, detail, usage, cost
+
+
+def _domain_cascade_for_check(args: dict, working_dir: str | None, surfaced: set[str]) -> str | None:
+    """The domain-scoped tactic hint (item 26) for the file a `lean_check` targeted, or None.
+
+    Reads the checked file's text — resolving a relative path against this activation's
+    `working_dir` first (two concurrent runs don't share a per-run cwd), then as given — and
+    asks `domain_cascade_hint` for the fragments whose domain is present and not yet surfaced.
+    Best-effort: any read failure yields None (a missing hint never breaks a check)."""
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    p = Path(path).expanduser()
+    candidates = [p] if p.is_absolute() else (
+        [Path(working_dir).expanduser() / p, p] if working_dir else [p]
+    )
+    for cand in candidates:
+        try:
+            text = cand.read_text()
+        except OSError:
+            continue
+        return domain_cascade_hint(text, surfaced)
+    return None
 
 
 def _meaning_events(tool_name: str, args: dict, result: str) -> list:
@@ -423,6 +492,7 @@ def run_events(
     working_dir: str | None = None,
     should_stop=None,
     gate=None,
+    depth: int = 0,
 ):
     """Core loop as a generator: yields typed events, never prints.
 
@@ -453,6 +523,11 @@ def run_events(
     before the inner loop resolves the toolset, and stops them when the event
     stream ends or is closed.
     """
+    # Open this activation's tool-registry overlay (item 27) BEFORE starting MCP, so the
+    # MCP tools register into *this run's* layer (on the caller thread) rather than the
+    # process-global registry — two concurrent MCP-enabled runs then can't corrupt each
+    # other's toolsets. Popped in the finally, dropping the run's dynamic tools with it.
+    registry_scope = push_scope()
     mcp_manager = None
     if config.mcp_servers:
         from .mcp import MCPManager
@@ -465,14 +540,25 @@ def run_events(
     # ContextVars stay set through every tool call delegated to the inner loop.
     run_key = session_id or uuid.uuid4().hex[:12]
     try:
-        with run_context(working_dir=working_dir, run_key=run_key):
-            yield from _run_events_inner(
-                config, messages, namespace=namespace, session_id=session_id,
-                working_dir=working_dir, should_stop=should_stop, gate=gate,
-            )
+        # `depth` (item 18) records this activation's nesting; `config` is stashed so
+        # spawn_subagent can derive a child config. Both ride the ContextVars through
+        # every tool call the inner loop delegates.
+        with run_context(working_dir=working_dir, run_key=run_key, depth=depth, config=config):
+            # A fresh subagent-result collector per activation (item 22): spawn_subagent
+            # records here, the inner loop drains into SubagentFinished events. Scoped so
+            # results can't leak across runs; a child opens its own empty scope.
+            results_token = subagents.begin_results_scope()
+            try:
+                yield from _run_events_inner(
+                    config, messages, namespace=namespace, session_id=session_id,
+                    working_dir=working_dir, should_stop=should_stop, gate=gate,
+                )
+            finally:
+                subagents.end_results_scope(results_token)
     finally:
         if mcp_manager is not None:
             mcp_manager.stop()
+        pop_scope(registry_scope)
 
 
 def _run_events_inner(
@@ -492,6 +578,11 @@ def _run_events_inner(
     )
     if config.narrate_tool_steps:
         system += _NARRATE_TOOL_STEPS_INSTRUCTION
+    # A subagent role head (item 19) is composed onto the shared Lean core and
+    # BRACKETED by a non-negotiable reassertion of the hard rules (item 20), so a role
+    # can specialize but can never override "never modify the statement" / no
+    # sorry/axiom — even as the last instruction. No head → core unchanged.
+    system = compose_role_prompt(system, config.system_prompt_head)
     model = config.model
 
     # Resolve the active toolset once: import any user tool modules so their
@@ -546,6 +637,10 @@ def _run_events_inner(
             yield UsageUpdated(intent_usage.input_tokens, intent_usage.output_tokens, intent_cost)
         assistant_mode = decision == "ASSISTANT"
 
+    # Domains whose tactic cascade has already been surfaced this activation (item 26),
+    # so a domain hint rides a lean_check result once, not on every check.
+    surfaced_domains: set[str] = set()
+
     turn = 0
     while True:
         # Cooperative interrupt (D18): the human asked to stop. `turn` is the count
@@ -559,7 +654,28 @@ def _run_events_inner(
 
         turn += 1
         if config.max_turns and turn > config.max_turns:
-            yield Finished("max_turns", "Error: max turns reached without completing the proof.",
+            # Budget exhausted. Don't discard the work with a canned error — spend one
+            # final tool-less turn asking the model to summarize its findings + best next
+            # step, and return THAT as the result. For a delegated sub-agent this is the
+            # difference between handing the coordinator useful evidence and handing it
+            # nothing. Defensive: a failure in the summary call degrades to a plain notice
+            # rather than turning a completed run into an error.
+            try:
+                summary, s_usage, s_cost = _summarize_on_max_turns(model, system, messages, config)
+            except Exception:  # noqa: BLE001 — a terminal-path best effort, never fatal
+                summary, s_usage, s_cost = "", Usage(), 0.0
+            total_usage.input_tokens += s_usage.input_tokens
+            total_usage.output_tokens += s_usage.output_tokens
+            total_cost += s_cost
+            if s_usage.input_tokens or s_usage.output_tokens or s_cost:
+                yield UsageUpdated(s_usage.input_tokens, s_usage.output_tokens, s_cost)
+            if summary:
+                # Surface it live + fold it into the transcript, so both the UI and the
+                # materialized sub-agent view carry the findings as the final message.
+                yield AssistantTextDelta(summary)
+                messages.append({"role": "assistant", "content": summary})
+            final_text = summary or "Reached the turn budget without completing the task."
+            yield Finished("max_turns", final_text,
                            turn - 1, session_id, model, total_usage, total_cost, transcript(turn - 1))
             return
 
@@ -741,10 +857,25 @@ def _run_events_inner(
                 else:
                     result = f"Error: unknown tool '{tc['name']}'"
 
+                # Item 26: on a model-invoked lean_check, append the domain-scoped tactic
+                # cascade for the mathematics actually in the checked file — injected here
+                # at tool-use time so the cached prompt prefix is untouched, once per domain
+                # per run. Best-effort: an unreadable path just yields no hint.
+                if tc["name"] == "lean_check":
+                    hint = _domain_cascade_for_check(tc.get("args") or {}, working_dir, surfaced_domains)
+                    if hint:
+                        result = f"{result}\n\n{hint}"
+
             preview = result[:200] + "..." if len(result) > 200 else result
             yield ToolResulted(tc["name"], result, preview)
             for ev in _meaning_events(tc["name"], tc["args"], result):
                 yield ev
+            # A spawn_subagent call produced a typed result the string can't carry
+            # (the child transcript, the result id). Surface it as SubagentFinished so
+            # the adapter can store the transcript separately and keep the audit link.
+            if tc["name"] == "spawn_subagent":
+                for child_result in subagents.drain_results():
+                    yield child_result.to_event()
             proof_state.note_tool_result(tc["name"], tc["args"], result)
 
             tool_result = {"type": "tool_result", "tool_name": tc["name"], "content": result}

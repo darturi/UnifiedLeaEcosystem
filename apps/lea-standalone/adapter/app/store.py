@@ -24,19 +24,30 @@ def create_session(
     project_id: str | None = None,
     origin: str = "ui",
     origin_url: str | None = None,
+    parent_id: str | None = None,
+    role: str | None = None,
+    spawned_at_turn: int | None = None,
 ) -> dict:
     """Create a session. `origin` records providence ('ui' | 'overleaf'); for an
     Overleaf-spawned session `origin_url` is the canonical Overleaf document URL so
     the UI can open/focus the source document. Both default to the interactive-UI
-    case so the existing path is unchanged."""
+    case so the existing path is unchanged.
+
+    `parent_id`/`role`/`spawned_at_turn` (item 24) make this a sub-agent CHILD of the
+    coordinator that spawned it: a child is a real session excluded from the root list
+    (`parent_id is null`), tagged with its `role` (subagent_type) and the coordinator
+    `turn` it was delegated on. All three default to None, so a root session is
+    unchanged."""
     now = utc_now()
     session_id = str(uuid4())
     origin_value = (origin or "ui").strip() or "ui"
     with connect() as conn:
         conn.execute(
-            "insert into sessions (id, project_id, title, origin, origin_url, created_at, updated_at) "
-            "values (?, ?, ?, ?, ?, ?, ?)",
-            (session_id, project_id, title[:120] or "Untitled theorem", origin_value, origin_url, now, now),
+            "insert into sessions "
+            "(id, project_id, title, origin, origin_url, parent_id, role, spawned_at_turn, created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, project_id, title[:120] or "Untitled theorem", origin_value, origin_url,
+             parent_id, role, spawned_at_turn, now, now),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
     return row_to_dict(row)
@@ -64,14 +75,27 @@ def list_sessions() -> list[dict]:
 
 
 def list_loose_sessions() -> list[dict]:
-    """Loose sessions only (`project_id IS NULL`) — the sidebar Chats group (D30).
-    In-project sessions are reached through the project window / search, not here."""
+    """Loose sessions (`project_id IS NULL`) — the sidebar Chats group (D30). This
+    INCLUDES sub-agent children (item 24): the tree is shipped whole and the frontend
+    does the `roots = parent_id is null` / `childrenOf(id)` split (matching the design
+    mock), because the contextual Sub-agents block needs the children in-store to
+    render. In-project sessions are reached through the project window / search."""
     return _list_sessions("s.project_id is null")
 
 
 def list_project_sessions(project_id: str) -> list[dict]:
-    """Sessions belonging to one project — the project window's session list (D30)."""
+    """Sessions belonging to one project — the project window's session list (D30).
+    Includes children for the same reason as `list_loose_sessions`; the frontend splits
+    roots from children."""
     return _list_sessions("s.project_id = ?", (project_id,))
+
+
+def list_child_sessions(parent_id: str) -> list[dict]:
+    """A coordinator's sub-agent children (item 24), newest first — a targeted read for
+    callers that want just one coordinator's children (the frontend derives them from
+    the full list, but the bridge/tests use this). Each carries its derived
+    status/role/spawned_at_turn like any session row."""
+    return _list_sessions("s.parent_id = ?", (parent_id,))
 
 
 # Fields the search endpoint returns per hit — the session plus its project tag. A
@@ -1167,6 +1191,7 @@ def add_code_step(
     check_status: str | None = None,
     check_detail: str | None = None,
     artifact_kind: str | None = None,
+    provenance: dict | None = None,
 ) -> dict:
     """Record a timeline step holding a file's full contents after a write.
 
@@ -1183,9 +1208,19 @@ def add_code_step(
     it's a *reason*, and it was only ever in this column because the old schema had
     nowhere else to put it. It rides in `data` instead; the file is still the
     agent's work regardless of what prompted the re-check.
+
+    `provenance` (item 25) is merged into the same `data` JSON — e.g.
+    `{"promoted_from": "<result_id>"}` links a promoted sub-agent candidate back to
+    the child run that produced it, so "which attempt won" stays answerable.
     """
     now = utc_now()
     reason = None if author in ("user", "agent", "environment") else author
+    data_obj: dict = {}
+    if reason:
+        data_obj["reason"] = reason
+    if provenance:
+        data_obj.update(provenance)
+    data_json = json.dumps(data_obj) if data_obj else None
     with write() as conn:
         blob_id = _put_blob(conn, content)
         cur = conn.execute(
@@ -1207,7 +1242,7 @@ def add_code_step(
                 check_status,
                 check_detail,
                 artifact_kind if check_status == "ok" else None,
-                json.dumps({"reason": reason}) if reason else None,
+                data_json,
                 now,
             ),
         )

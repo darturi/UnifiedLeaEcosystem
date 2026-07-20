@@ -888,3 +888,64 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .pw-link { font: inherit; font-size: inherit; font-weight: 600; color: var(--accent); background: none;
   border: none; padding: 0; cursor: pointer; text-decoration: underline; }
 .pw-link:hover { filter: brightness(1.1); }
+
+/* ============================================================================
+   Sub-agents (v2.3 item 24) — lifted from design/mock-subagents-sidebar.html.
+   The sidebar block (.sa-*) reuses .proj-group/.group-label/.row for free; only
+   these rules are additive. The .spawn timeline node + .prov provenance bar + the
+   .verdict badges are the parent thread / child read-only chrome.
+   ============================================================================ */
+
+/* the contextual Sub-agents block in the sidebar */
+.sa-group { margin-bottom: 6px; border-top: 1px solid var(--line); margin-top: 6px; }
+.sa-group .group-label { color: var(--accent); }
+.sa-group .sa-count { margin-left: auto; font-size: 10.5px; font-weight: 600; color: var(--muted);
+  background: var(--line-2); border-radius: 20px; padding: 1px 7px; letter-spacing: 0; }
+/* the parent header row — the way back up the tree */
+.sa-parent { display: flex; align-items: center; gap: 7px; padding: 3px 10px 6px; font-size: 12px;
+  color: var(--muted); cursor: pointer; background: none; border: none; width: 100%; text-align: left;
+  font-family: inherit; }
+.sa-parent:hover { color: var(--ink-2); }
+.sa-parent .chev { font-size: 11px; }
+.sa-parent .ptitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* candidate rows sit slightly inset so the tree relationship reads */
+.sa-group .row { padding-left: 14px; }
+.sa-group .row .role { font-size: 10.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+.sa-spin { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--amber);
+  animation: sa-pulse 1.1s ease-in-out infinite; }
+@keyframes sa-pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+/* the spawn_subagent node in the chat timeline (collapsed by default) */
+.spawn { max-width: 720px; border: 1px solid var(--line); background: var(--panel-2); border-radius: 10px;
+  margin: 4px 0 10px; overflow: hidden; }
+.spawn summary { cursor: pointer; padding: 9px 12px; display: flex; align-items: center; gap: 9px;
+  list-style: none; font-size: 13px; }
+.spawn summary::-webkit-details-marker { display: none; }
+.spawn summary::before { content: "▸"; color: var(--muted); font-size: 10px; transition: transform .15s; }
+.spawn[open] summary::before { transform: rotate(90deg); }
+.spawn .tool { font: 600 12px ui-monospace, Menlo, monospace; color: var(--accent); }
+.spawn .act { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.spawn .kids { border-top: 1px solid var(--line); padding: 6px; }
+.spawn .kid { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px;
+  cursor: pointer; font-size: 13px; background: none; border: none; width: 100%; text-align: left;
+  font-family: inherit; }
+.spawn .kid:hover { background: var(--panel); }
+.spawn .kid .rtitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--ink-2); }
+.spawn .kid .role { font-size: 10.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+.spawn .kid .verdict { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
+
+/* verdict badges (shared by the spawn node) */
+.verdict.ok { color: var(--green); background: var(--green-soft); }
+.verdict.err { color: var(--red); background: var(--red-soft); }
+.verdict.run { color: var(--amber); background: var(--amber-soft); }
+
+/* provenance bar — what replaces the composer on a read-only child */
+.prov { border-top: 1px solid var(--line); background: var(--panel-2); padding: 12px 24px;
+  display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
+.prov .lock { color: var(--muted); }
+.prov b { color: var(--ink-2); font-weight: 550; }
+.prov .role { font-family: ui-monospace, Menlo, monospace; }
+.prov .up { margin-left: auto; border: 1px solid var(--line); background: var(--panel); border-radius: 8px;
+  padding: 5px 11px; cursor: pointer; color: var(--ink-2); font-family: inherit; font-size: 12.5px; }
+.prov .up:hover { background: var(--panel-2); }

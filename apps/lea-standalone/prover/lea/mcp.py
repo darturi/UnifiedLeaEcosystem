@@ -29,7 +29,7 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from .errors import McpError
-from .registry import REGISTRY, Tool, register, unregister
+from .registry import Tool, is_registered, register, unregister
 
 
 def _warn(msg: str) -> None:
@@ -54,6 +54,11 @@ class MCPManager:
     def __init__(self, servers: dict[str, dict]):
         self.servers = servers or {}
         self.tool_names: list[str] = []           # registry names we added (server__tool)
+        # Tools discovered on the MCP loop thread, registered later on the caller thread
+        # (item 27): {server, tool, description, input_schema}. Discovery and registration
+        # are split because registration must run where the per-activation registry overlay
+        # is visible — the agent thread — not the MCP background thread.
+        self._discovered: list[dict] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._sessions: dict[str, ClientSession] = {}
@@ -74,6 +79,10 @@ class MCPManager:
         self._loop_ready.wait()
         self._serve_future = asyncio.run_coroutine_threadsafe(self._serve(), self._loop)
         self._started.wait()
+        # Discovery (on the loop thread) is done; register on THIS (caller) thread so the
+        # tools land in the caller's per-activation registry overlay (item 27), not the
+        # loop thread's context where the overlay isn't visible.
+        self._register_discovered()
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -125,25 +134,43 @@ class MCPManager:
         await session.initialize()
         listed = await session.list_tools()
         self._sessions[name] = session
+        # DISCOVER only here (on the loop thread) — registration into the tool registry
+        # happens later on the caller thread (`_register_discovered`), where the
+        # per-activation overlay is visible.
         for t in listed.tools:
+            self._discovered.append({
+                "server": name,
+                "tool": t.name,
+                "description": t.description or "",
+                "input_schema": t.inputSchema or {"type": "object", "properties": {}},
+            })
+
+    def _register_discovered(self) -> None:
+        """Register every discovered MCP tool — on the CALLING (agent) thread, so each
+        lands in this run's registry overlay (item 27). Runs after `_serve` finished
+        discovery, so `self._discovered` is complete."""
+        for spec in self._discovered:
+            server, real = spec["server"], spec["tool"]
             # Expose the tool by its bare name (how models expect MCP tools, à la
             # Claude Desktop/Cursor). Only on a name clash do we prefix with
             # `<server>__` to disambiguate. The handler always calls the real MCP
             # tool name on the server, regardless of the registry display name.
-            tname = t.name
-            if tname in REGISTRY:
-                prefixed = f"{name}__{t.name}"
-                if prefixed in REGISTRY:
-                    _warn(f"tool {t.name!r} from server {name!r} clashes even after prefixing; skipping")
+            tname = real
+            if is_registered(tname):
+                prefixed = f"{server}__{real}"
+                if is_registered(prefixed):
+                    _warn(f"tool {real!r} from server {server!r} clashes even after prefixing; skipping")
                     continue
-                _warn(f"tool {t.name!r} from server {name!r} clashes; exposing it as {prefixed!r}")
+                _warn(f"tool {real!r} from server {server!r} clashes; exposing it as {prefixed!r}")
                 tname = prefixed
             schema = {
                 "name": tname,
-                "description": t.description or "",
-                "input_schema": t.inputSchema or {"type": "object", "properties": {}},
+                "description": spec["description"],
+                "input_schema": spec["input_schema"],
             }
-            register(Tool(name=tname, schema=schema, handler=self._make_handler(name, t.name)))
+            # scoped=True → this run's overlay when one is open, else the global (the
+            # standalone/unit-test path), so pre-item-27 direct MCPManager use is unchanged.
+            register(Tool(name=tname, schema=schema, handler=self._make_handler(server, real)), scoped=True)
             self.tool_names.append(tname)
 
     def stop(self) -> None:

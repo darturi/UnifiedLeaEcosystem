@@ -72,6 +72,15 @@ export interface SessionSummary {
   models: string[];
   latest_check_status?: 'ok' | 'error' | 'unchecked' | null;
   duration_seconds: number;
+  // ── Sub-agent tree (item 24) ────────────────────────────────────────────────
+  // A child sub-agent IS a session: `parent_id` is the coordinator that spawned it
+  // (null for an ordinary/root session), `role` its subagent_type, `spawned_at_turn`
+  // the coordinator turn it was delegated on. The list ships the whole tree; the
+  // sidebar shows roots (`parent_id == null`) and a contextual Sub-agents block scoped
+  // to `children(parent_id ?? id)`. A child renders read-only with a provenance bar.
+  parent_id?: string | null;
+  role?: string | null;
+  spawned_at_turn?: number | null;
 }
 
 // ── Projects (v2.1) ───────────────────────────────────────────────────────────
@@ -324,6 +333,25 @@ export interface RunStatusEventPayload {
   check_detail?: string | null;
 }
 export interface ApprovalResolvedEvent { approval_id: string; decision: ApprovalDecision }
+// A child sub-agent finished (item 24): the coordinator delegated a subtask and got a
+// distilled result back. The adapter has already persisted the child as a session; this
+// event tells the browser to pull it in live (so the Sub-agents block + spawn node appear
+// without a reload).
+export interface SubagentFinishedEvent {
+  child_id: string;
+  parent_id: string;
+  run_id?: string;
+  result_id: string;
+  subagent_type: string;
+  role: string;
+  turn?: number | null;
+  title: string;
+  check_status?: 'ok' | 'error' | null;
+  check_detail?: string | null;
+  stop_reason: string;
+  summary: string;
+  candidate_path?: string | null;
+}
 export interface RunErrorEvent { message: string }
 export interface DoneEvent {
   status: RunStatus;

@@ -443,6 +443,10 @@ export default function App() {
             sidebarCollapsed={sidebarCollapsed}
             onExpandSidebar={() => setSidebarCollapsed(false)}
             session={selectedSession}
+            onSelectSession={(id) => {
+              closeProject();
+              loadSession(id).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+            }}
             onSelectStep={selectStep}
             onDecide={handleDecide}
             onOpenSettings={() => setView('settings')}
