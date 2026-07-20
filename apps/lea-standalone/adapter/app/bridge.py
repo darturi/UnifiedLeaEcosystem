@@ -45,6 +45,7 @@ from lea.interface import (
     Error,
     FileChanged,
     Finished,
+    SubagentFinished,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
@@ -332,6 +333,90 @@ class _UsageByTurn:
         return [self._rows[k] for k in sorted(self._rows)]
 
 
+def _with_subagents(cfg: LeaConfig) -> LeaConfig:
+    """Return `cfg` with `spawn_subagent` added to the coordinator's toolset (item 24).
+
+    `spawn_subagent` is registered `opt_in=True` in the prover, so an unfiltered toolset
+    (`tools=None`) never contains it. The coordinator gets its normal default toolset —
+    whatever `build_toolset(None)` resolves — PLUS spawn_subagent, named explicitly, so
+    the model can delegate. Resolving the default at call time (not hard-coding the six
+    built-ins) keeps this correct if the default set ever changes."""
+    from lea.registry import build_toolset
+
+    default_tools = [schema["name"] for schema in build_toolset(None)[0]]
+    return replace(cfg, tools=[*default_tools, "spawn_subagent"])
+
+
+def _text_from_content(content: Any) -> str:
+    """Flatten a transcript message's `content` (a string, or a list of provider blocks)
+    into plain text — the assistant prose, dropping tool-call/tool-result plumbing — so a
+    child's exploration replays as ordinary chat in its read-only view."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b["text"] for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
+        return "\n".join(p for p in parts if p.strip())
+    return ""
+
+
+def _subagent_child_title(ev: SubagentFinished) -> str:
+    """A short, human title for the child session row — its own final summary's first
+    line, falling back to its role."""
+    summary = (ev.summary or "").strip()
+    if summary:
+        first = summary.splitlines()[0].strip()
+        if first:
+            return first[:80]
+    return ev.subagent_type or "sub-agent"
+
+
+def _materialize_subagent(
+    ev: SubagentFinished,
+    *,
+    parent_session_id: str,
+    project_id: str | None,
+    turn: int,
+    repo: Path,
+) -> dict:
+    """Persist a finished sub-agent as a CHILD session (item 24), returning its row.
+
+    A child is a real session parented to the coordinator: its transcript is replayed
+    into its own `timeline` (so it renders read-only through the ordinary session view),
+    and its candidate file — read back from the child's scratch dir under the run's
+    working tree — is stored as a code_step, so the child's *derived* status IS its
+    lean_check verdict. The child transcript is NOT written onto the parent's timeline
+    (it is the child's, not a coordinator code_step)."""
+    child = store.create_session(
+        _subagent_child_title(ev),
+        project_id=project_id,
+        parent_id=parent_session_id,
+        role=ev.subagent_type,
+        spawned_at_turn=turn,
+    )
+    child_id = child["id"]
+    for msg in ev.transcript or []:
+        text = _text_from_content(msg.get("content"))
+        if text.strip():
+            role = "user" if msg.get("role") == "user" else "assistant"
+            store.add_message(child_id, role, text)
+    if ev.candidate_path:
+        cand = Path(ev.candidate_path)
+        if not cand.is_absolute():
+            cand = repo / cand
+        try:
+            content = cand.read_text()
+        except OSError:
+            content = None
+        if content is not None:
+            store.add_code_step(
+                child_id, None, cand.name, content=content, author="agent", turn=turn,
+                summary=(ev.summary or None),
+                check_status=ev.check_status, check_detail=ev.check_detail,
+                artifact_kind=_classify(content) if ev.check_status == "ok" else None,
+            )
+    return child
+
+
 def run_lea(context: RunnerContext) -> None:
     """Run one Lea activation, streaming normalized SSE events onto the queue.
 
@@ -346,6 +431,15 @@ def run_lea(context: RunnerContext) -> None:
         # wait for confirmation. LeaConfig is frozen, so build a copy. The gate is
         # disabled separately below.
         cfg = replace(cfg, prompt_variant="default")
+    else:
+        # Interactive coordinator (item 24): make `spawn_subagent` available so the
+        # model can delegate parallel exploration to child sub-agents. The tool is
+        # opt-in in the prover registry (off by default, so it never leaks into an
+        # unfiltered toolset); the coordinator gets its normal default toolset PLUS
+        # spawn_subagent, named explicitly. The model decides when to spawn; children
+        # can't recurse (prover depth + toolset guards). Autonomous/Overleaf runs stay
+        # single-agent for now.
+        cfg = _with_subagents(cfg)
     session_id = context.session_id
     run_id = context.run_id
 
@@ -379,6 +473,9 @@ def run_lea(context: RunnerContext) -> None:
     last_write_path: str | None = None
     checked_artifact_kind = "unknown"
     usage = _UsageByTurn()
+    # Finished sub-agents (item 24), in the order they completed — surfaced as child
+    # sessions and kept for the collation pass (item 25) on the coordinator's Finished.
+    subagent_results: list[SubagentFinished] = []
     last_persisted: str | None = None
     # Declared before the try so the finally's `done` event always has them, even if
     # setup throws before the run reaches its Finished handler.
@@ -565,6 +662,37 @@ def run_lea(context: RunnerContext) -> None:
                         "project_id": project["id"], "path": asset_rel, "commit_sha": sha,
                     })
                 last_write_path = None
+
+            elif isinstance(ev, SubagentFinished):
+                # A child sub-agent finished (item 24). Materialize it as a CHILD session
+                # parented to this coordinator — its exploration replayed into its own
+                # read-only timeline, its candidate stored as a code_step so the child's
+                # derived status IS its lean_check verdict — then tell the browser so the
+                # contextual Sub-agents block + the spawn node appear live. Keep the typed
+                # result for the collation pass on Finished.
+                subagent_results.append(ev)
+                child = _materialize_subagent(
+                    ev,
+                    parent_session_id=session_id,
+                    project_id=(project["id"] if project else None),
+                    turn=current_turn,
+                    repo=repo,
+                )
+                emit(events, "subagent_finished", {
+                    "child_id": child["id"],
+                    "parent_id": session_id,
+                    "run_id": run_id,
+                    "result_id": ev.result_id,
+                    "subagent_type": ev.subagent_type,
+                    "role": ev.subagent_type,
+                    "turn": current_turn,
+                    "title": child["title"],
+                    "check_status": ev.check_status,
+                    "check_detail": ev.check_detail,
+                    "stop_reason": ev.stop_reason,
+                    "summary": ev.summary,
+                    "candidate_path": ev.candidate_path,
+                })
 
             elif isinstance(ev, Error):
                 emit(events, "run_error", {"message": ev.message})
