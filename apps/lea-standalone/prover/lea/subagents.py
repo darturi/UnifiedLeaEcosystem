@@ -31,7 +31,7 @@ from pathlib import Path
 from .errors import ToolError
 from .events import CheckResult, Finished
 from .profiles import AgentProfile, available_profiles, load_profile
-from .registry import tool
+from .registry import REGISTRY, build_toolset, tool
 from .runctx import (
     current_config,
     current_depth,
@@ -95,16 +95,50 @@ def _bounded_child_turns(parent_max_turns: int | None) -> int:
     return max(1, min(parent_max_turns, DEFAULT_CHILD_MAX_TURNS))
 
 
+def _parent_tool_names(parent_config) -> set[str]:
+    """The tools the parent activation can actually call — the ceiling a child can
+    never exceed (item 21). Resolved through the same ``build_toolset`` the loop uses,
+    so it is exactly the parent's real capability set, opt-in tools included when the
+    parent explicitly selected them (a coordinator's ``spawn_subagent``)."""
+    schemas, _ = build_toolset(parent_config.tools)
+    return {s["name"] for s in schemas}
+
+
+def compose_child_tools(parent_config, declared: list[str] | None) -> list[str]:
+    """A child's effective toolset = its declared toolset INTERSECTED with the parent's
+    (item 21, D79). Permissions compose by **tightening only**: a child can never call
+    a tool the parent lacked, so spawning is not a privilege-escalation path.
+
+    ``declared is None`` (the generalist) means the default toolset; either way every
+    opt-in tool (``spawn_subagent``) is stripped, so a child can never spawn — the same
+    guarantee as the depth walk, now also at the capability layer. Declared order is
+    preserved (``build_toolset`` treats the list as filter+order). An unknown tool name
+    is a profile typo and raises; a *known* tool the parent lacks is silently tightened
+    away — that is the D79 contract, not an error.
+    """
+    parent_allowed = _parent_tool_names(parent_config)
+    wanted = [s["name"] for s in build_toolset(None)[0]] if declared is None else list(declared)
+    effective: list[str] = []
+    for name in wanted:
+        if name not in REGISTRY:
+            raise ToolError(f"agent profile names unknown tool {name!r}")
+        if REGISTRY[name].opt_in:
+            continue  # opt-in (spawn_subagent) is never granted to a child
+        if name in parent_allowed:  # else: parent lacked it → tightened away (D79)
+            effective.append(name)
+    return effective
+
+
 def _child_config(parent_config, profile: AgentProfile | None):
-    """Build the child's :class:`LeaConfig` from the parent + an optional role profile
-    (item 19). A profile supplies model / scoped tools / turn cap / prompt head; each
-    ``None`` field inherits the parent's. No profile → the generalist (item 18): the
-    default toolset (``tools=None`` → no ``spawn_subagent``), no role head. Either way
-    MCP is dropped (children stay light) and the turn budget is bounded."""
+    """Build the child's :class:`LeaConfig` from the parent + an optional role profile.
+    A profile supplies model / scoped tools / turn cap / prompt head (item 19); each
+    ``None`` field inherits the parent's. The toolset is always composed against the
+    parent's (item 21) so a child ⊆ parent — no profile → the generalist default,
+    tightened to the parent. MCP is dropped (children stay light) and turns bounded."""
     if profile is None:
         return dataclasses.replace(
             parent_config,
-            tools=None,
+            tools=compose_child_tools(parent_config, None),
             mcp_servers={},
             max_turns=_bounded_child_turns(parent_config.max_turns),
             system_prompt_head=None,
@@ -116,7 +150,7 @@ def _child_config(parent_config, profile: AgentProfile | None):
     return dataclasses.replace(
         parent_config,
         model=profile.model or parent_config.model,
-        tools=profile.tools,  # None → generalist toolset; a list → scoped (filters+orders)
+        tools=compose_child_tools(parent_config, profile.tools),
         mcp_servers={},
         max_turns=max_turns,
         system_prompt_head=profile.system_prompt,

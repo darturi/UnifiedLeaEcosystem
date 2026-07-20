@@ -89,9 +89,13 @@ def test_coordinator_at_depth_0_spawns_a_child(monkeypatch):
         check("a depth-0 coordinator started exactly one child", len(calls) == 1)
         c = calls[0] if calls else {}
         check("the child runs at depth 1", c.get("depth") == 1)
-        # Guard 2, at the config level: the child's toolset is unscoped (None) → it
-        # resolves to the non-opt-in built-ins, which cannot include spawn_subagent.
-        check("the child's toolset is None (no spawn_subagent)", c.get("config").tools is None)
+        # Guard 2, at the config level: the child's toolset is the generalist default
+        # tightened to the parent's (item 21) — the built-ins, never spawn_subagent.
+        child_tools = c.get("config").tools if c.get("config") else None
+        check("the child's toolset excludes spawn_subagent", "spawn_subagent" not in (child_tools or []))
+        check("the child's toolset is the built-in default",
+              set(child_tools or []) == {"read_file", "write_file", "edit_file",
+                                         "lean_check", "bash", "search_mathlib"})
         check("the child drops MCP servers", c.get("config").mcp_servers == {})
         # Parent cap 30 is above the runaway ceiling, so the child is clamped to it.
         check("the child's turns are bounded to the ceiling",

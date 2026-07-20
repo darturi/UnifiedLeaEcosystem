@@ -137,7 +137,12 @@ def test_child_config_from_profile():
 
 def test_generalist_has_no_profile_and_keeps_item18_behavior():
     child = _child_config(_cfg(max_turns=30), None)
-    check("generalist toolset is the default (tools=None)", child.tools is None)
+    # item 21: the generalist toolset is now the built-in default tightened to the
+    # parent (parent here has tools=None → all built-ins), never None, never spawn.
+    check("generalist toolset excludes spawn_subagent", "spawn_subagent" not in child.tools)
+    check("generalist toolset is the built-in default",
+          set(child.tools) == {"read_file", "write_file", "edit_file",
+                               "lean_check", "bash", "search_mathlib"})
     check("generalist has no role head", child.system_prompt_head is None)
     check("generalist turns are bounded", child.max_turns == DEFAULT_CHILD_MAX_TURNS)
 

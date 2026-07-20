@@ -123,13 +123,13 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:82%"></i></div>
-  <div class="counts"><b>17 / 22 built · 16 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:86%"></i></div>
+  <div class="counts"><b>18 / 22 built · 17 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
-    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7:</b> item 18 — <code>spawn_subagent</code> +
-    child activations (two recursion guards, candidate-dir isolation reusing F3's sandbox); item 19 — declarative
-    role profiles as pure YAML; item 20 — a role prompt is <b>bracketed</b> by the hard rules (composes, never
-    replaces; an adversarial head can't drop the invariant). Concurrency is on by default: four chats formalize at once.
+    <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7:</b> items 18–21 done — <code>spawn_subagent</code>
+    + child activations, declarative YAML role profiles, hard-rule-bracketed prompts, and permissions that compose by
+    tightening only (child toolset ⊆ parent). <b>Only item 22 (typed result envelope + transcript) left.</b>
+    Concurrency is on by default: four chats formalize at once.
     <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
     Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
     adapter attribution e2e).
@@ -140,8 +140,8 @@
     (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
-    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites. Next: <b>item 21 —
-    permissions compose by tightening only (a child's caps = its own ∪ the parent's deny rules).</b><br>
+    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites. Next: <b>item 22 —
+    typed result envelope + transcript storage (a child returns a struct, not prose; result id = audit link).</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1115,12 +1115,20 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         cache-tiering optimization — moving volatile workspace/namespace to a tail for a stable core prefix — is a
         deferred perf follow-up; workspace/namespace already work inside the core.) No head → core byte-identical.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">21</span><span class="title">Permissions compose by tightening only</span>
-        <span class="tag be">adapter</span><span class="badge b-unplanned">Design pass</span></div>
-      <div class="scope">A child's effective permissions = its own declared caps <b>∪ the parent's deny rules</b> ∪
-        path rules. A child can never hold a permission its parent lacked — spawning is not a privilege-escalation
-        path. Tests: <code>test_subagent_permissions.py</code>.</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done.</b> A child's effective capability = its declared toolset <b>∩ the parent's</b>
+        (<code>compose_child_tools</code> in <code>subagents.py</code>) — permissions compose by <b>tightening only</b>,
+        so a child can never call a tool the parent lacked and spawning is not a privilege-escalation path. In Lea's
+        architecture the composable axis is the toolset: <b>absence from a toolset IS the deny rule</b> (no separate deny
+        structure to compose), and <b>path rules already tighten</b> — the child's scratch dir is a subdir of the
+        parent's, sandboxed by F3. Every opt-in tool (<code>spawn_subagent</code>) is stripped from a child even when the
+        parent holds it and the child asks — the capability-layer twin of the depth guard. <b>Note:</b> composition lives
+        in the prover (that's where children spawn; the adapter's D19 gate never reaches them), so this is a prover
+        change despite the "adapter" plan tag. <code>test_subagent_permissions.py</code>: 14 checks incl. a
+        parent×declared <b>matrix</b> asserting <code>effective ⊆ parent</code> ∧ no-spawn, and an end-to-end
+        write-less-coordinator → write-wanting-role escalation refusal. 80 prover + 23 adapter-bridge tests green.</div>
     </div>
     <div class="todo">
       <div class="top"><span class="id sub">22</span><span class="title">Typed result envelope + transcript storage</span>
