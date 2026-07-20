@@ -123,11 +123,13 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:63%"></i></div>
-  <div class="counts"><b>13 / 22 built · 12 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
+  <div class="bar"><i style="width:68%"></i></div>
+  <div class="counts"><b>14 / 22 built · 13 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
-    <b>Item 16 done — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll shipped
-    (356 adapter tests + 15 companion tests green).</b> Concurrency is now on by default: four chats formalize at once.
+    <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll
+    shipped. Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent
+    checks, adapter attribution e2e). Concurrency is on by default: four chats formalize at once.
+    <b>Everything through item 17 is green; only the subagent phase (18–22) remains.</b>
     <b>Phase 5 complete — items 13–15 verified in the running UI.</b> Manual testing surfaced three real, latent
     defects: <b>F1</b> — the approval card was never persisted, so it vanished on any reconnect/switch (fixed by writing
     <code>runs.pending_approval</code>); <b>F2</b> — a reattached stream got a dead "passive view" (only a terminal
@@ -135,8 +137,8 @@
     (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
     path typo escaped the workspace (confirmed from the run transcript), fixed by confining
     <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
-    354 adapter tests green + the prover write-sandbox suite. Next: <b>item 17 — the verdict-integrity e2e +
-    the dispatch unit test.</b><br>
+    359 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox suites. Next: <b>Phase 7 —
+    subagents (items 18–22), each still wants a short design pass.</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1033,18 +1035,23 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         (default-is-4 + fall-back-to-1), <code>test_routes_runs.py</code> (cheap-columns + 404), and the five companion
         retry-loop tests re-pointed at the new endpoint — all green.</div>
     </div>
-    <div class="todo">
+    <div class="todo is-tested">
       <div class="top"><span class="id">17</span><span class="title">Verdict-integrity e2e + the dispatch unit test</span>
-        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-queued">Queued</span></div>
-      <div class="scope"><b>Write <code>test_dispatch_unit.py</code> first</b> (deterministic, no Lean,
-        milliseconds): a fake transport emits frames in an <b>adversarial order</b> — B's diagnostics before A's, an
-        unrelated third URI, a <code>window/logMessage</code>, an interleaved <code>fileProgress</code> — while two
-        threads call <code>check()</code>. Assert each gets <b>its own</b> file's diagnostics. <i>On today's code
-        this test cannot even be written</i> (no seam). Then the acceptance test,
-        <code>test_concurrent_runs_e2e.py</code>: six concurrent runs, three provable + three false; assert
-        <b>exactly</b> the three provable ones end <code>proved</code> — any LSP/SafeVerify/git cross-talk shows up as
-        a mislabeled session. Regression: <code>npm test -w apps/overleaf-extension</code> must stay green
-        <b>without changes</b>.</div>
+        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done — three tests, layered by the seam each owns.</b> (1)
+        <code>tests/lsp/test_dispatch_unit.py</code> (deterministic, no Lean, ms) — landed with the daemon dispatch
+        rewrite: a fake transport emits frames in an <b>adversarial order</b> (B's diagnostics before A's, an unrelated
+        third URI, a <code>window/logMessage</code>, an interleaved <code>fileProgress</code>, and a server request
+        whose id <b>collides</b> with A's <code>waitForDiagnostics</code>) while two threads call <code>check()</code> —
+        each gets its own file's diagnostics; the id-collision is acked, not mis-read as a verdict. (2)
+        <code>tests/lsp/test_concurrent_checks.py</code> — the <b>real-Lean</b> version: 3 good + 3 bad checked at once
+        through the shared daemon, no cross-talk. (3) <b>New:</b>
+        <code>adapter/tests/test_concurrent_runs_e2e.py</code> — the adapter <b>attribution</b> layer the LSP tests
+        don't touch: six runs through the real bridge (per-session repos, concurrent DB writes, derived status), a
+        <code>threading.Barrier</code> forcing all six mid-run before any verdict commits, three provable + three false.
+        Asserts <b>exactly</b> the three provable sessions derive <code>proved</code>, each session's stored proof
+        carries its <b>own</b> marker and no other run's, and every <code>timeline</code> row holds a distinct position.
+        Regression: <code>npm test -w apps/overleaf-extension</code> stays green with no concurrency-driven changes.</div>
     </div>
   </div>
 
