@@ -155,15 +155,54 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
     return header + sliced
 
 
-def write_file(path: str, content: str) -> str:
+class _SandboxViolation(ValueError):
+    """A write path that escapes the run's working directory."""
+
+
+def _sandboxed_write_path(path: str) -> Path:
+    """Resolve a model-supplied write path and confine it to the run's working dir.
+
+    Two reasons this matters, both sharpened by the v2.3 concurrency/hosting work:
+      * **relative paths** must resolve against *this activation's* working_dir, not
+        the one process-global cwd two concurrent runs share (that cwd is nobody's
+        per-run identity);
+      * **any** resolved path — relative or absolute — must stay inside working_dir,
+        so a model path typo (seen in the wild: ``apps/lean-standalone`` for
+        ``apps/lea-standalone``), a hallucination, or a prompt-injected path can't
+        create/clobber files outside the session's workspace.
+
+    When no run context is set (standalone CLI / tests), the path is returned
+    unchanged so today's behavior is preserved — the confinement only engages once
+    an activation has declared its working_dir (agent.run_events → run_context)."""
+    wd = current_working_dir()
     p = Path(path).expanduser()
+    if wd is None:
+        return p
+    root = Path(wd).expanduser().resolve()
+    target = (p if p.is_absolute() else root / p).resolve()
+    if target != root and root not in target.parents:
+        raise _SandboxViolation(
+            f"path {path!r} resolves outside this run's workspace ({root}). "
+            "Write only within your session's proofs directory."
+        )
+    return target
+
+
+def write_file(path: str, content: str) -> str:
+    try:
+        p = _sandboxed_write_path(path)
+    except _SandboxViolation as exc:
+        return f"Error: {exc}"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
     return f"Wrote {len(content)} bytes to {p}"
 
 
 def edit_file(path: str, old_string: str, new_string: str) -> str:
-    p = Path(path).expanduser()
+    try:
+        p = _sandboxed_write_path(path)
+    except _SandboxViolation as exc:
+        return f"Error: {exc}"
     if not p.exists():
         return f"Error: {p} does not exist."
     text = p.read_text()

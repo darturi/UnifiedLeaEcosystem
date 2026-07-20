@@ -124,14 +124,16 @@
   </div>
 
   <div class="bar"><i style="width:59%"></i></div>
-  <div class="counts"><b>12 / 22 built · 11 / 22 tested · +2 discovered fixes (F1, F2), both tested</b> · 11 adapter/prover
+  <div class="counts"><b>12 / 22 built · 11 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
-    <b>Phase 5 complete — items 13–15 verified in the running UI.</b> Manual testing surfaced two real, latent
-    concurrency defects that the reconnect/switch churn exposed: <b>F1</b> — the approval card was never persisted, so
-    it vanished on any reconnect/switch (fixed by writing <code>runs.pending_approval</code>); <b>F2</b> — a reattached
-    stream got a dead "passive view" (only a terminal <code>done</code>), which had also made item 15 merely cosmetic,
-    fixed by a <b>rejoinable per-run event broker</b> (the correct long-term architecture, not a band-aid). Both land
-    with tests; 354 adapter tests green. Next: <b>Phase 6 (flip the cap, items 16–17).</b><br>
+    <b>Phase 5 complete — items 13–15 verified in the running UI.</b> Manual testing surfaced three real, latent
+    defects: <b>F1</b> — the approval card was never persisted, so it vanished on any reconnect/switch (fixed by writing
+    <code>runs.pending_approval</code>); <b>F2</b> — a reattached stream got a dead "passive view" (only a terminal
+    <code>done</code>), which had also made item 15 merely cosmetic, fixed by a <b>rejoinable per-run event broker</b>
+    (the correct long-term architecture, not a band-aid); <b>F3</b> — the write tools had no path sandbox, so a model
+    path typo escaped the workspace (confirmed from the run transcript), fixed by confining
+    <code>write_file</code>/<code>edit_file</code> to the run's <code>working_dir</code>. All three land with tests;
+    354 adapter tests green + the prover write-sandbox suite. Next: <b>Phase 6 (flip the cap, items 16–17).</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -988,6 +990,23 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         client changes</b>. Old passive view kept only as a rare-race fallback. Tests: <code>test_runbroker.py</code>
         (seq/cursor/close/thread-safety) + endpoint tests that a reattach <i>replays</i> buffered events and that
         <code>Last-Event-ID</code> resume doesn't double.</div>
+    </div>
+    <div class="todo is-tested">
+      <div class="top"><span class="id fe">F3</span><span class="title">Sandbox the write tools to the run's workspace</span>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓ · found in testing · security/robustness</span></div>
+      <div class="scope"><b>Symptom:</b> a proof landed under <code>apps/lean-standalone/…</code> (one char off from
+        <code>lea-standalone</code>). <b>Cause (confirmed from the run transcript):</b> o4-mini emitted a
+        <code>write_file</code> with a <b>typo'd absolute path</b> — pattern-completing the <code>lean/</code> earlier in
+        the repo path — and <code>write_file</code>/<code>edit_file</code> had <b>no path sandbox</b>: they
+        <code>mkdir -p</code>'d and wrote to <i>any</i> path the model gave (relative paths even resolved against the
+        one process-global cwd two concurrent runs share). A model typo, hallucination, or a <b>prompt-injected</b>
+        path could thus create/clobber files outside the session's workspace — a real risk once runs are concurrent
+        and web-hosted. Single-run slip, not cross-run contamination (the session id was in the typo path).
+        <b>Fix:</b> <code>_sandboxed_write_path</code> confines both write tools to the activation's
+        <code>working_dir</code> (already wired via <code>run_context</code> at <code>agent.run_events</code>) —
+        relative paths resolve against it, and any escaping path (absolute typo, <code>..</code>) is rejected with an
+        error and nothing is written; no run context (standalone/tests) preserves today's behavior. Test
+        <code>tests/tools/test_write_sandbox.py</code> (13 checks). Stray dir removed.</div>
     </div>
   </div>
 
