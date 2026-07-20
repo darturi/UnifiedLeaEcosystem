@@ -135,8 +135,9 @@
     piece landed as <b>item 24 — subagents in the UI</b> (backend + frontend): interactive coordinators can spawn,
     each child is surfaced as a read-only child session with a provenance bar, and the sidebar's Sub-agents block +
     the <code>spawn_subagent</code> timeline node show the tree. Concurrency is on by default: four chats formalize at
-    once. <b>Remaining follow-ups</b> (not v2.3-blocking): wire <code>collation</code>'s deterministic auto-promote as
-    the live caller (item 25's library is done + tested), and a live UI run to confirm end-to-end.
+    once. <b>Collation is wired live</b> (item 25): when the coordinator delegates but produces no clean proof itself,
+    the best compiling child candidate is promoted deterministically — re-verified at the canonical path, provenance
+    linked. <b>Remaining</b> (not v2.3-blocking): a live UI run to confirm end-to-end.
     <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
     Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
     adapter attribution e2e).
@@ -151,8 +152,8 @@
     <b>Item 24 shipped — subagents in the UI</b> (backend + frontend): a child is a read-only child session with a
     provenance bar, the contextual Sub-agents block is scoped <code>children(parent_id ?? id)</code>, and the
     <code>spawn_subagent</code> timeline node shows the tree. Follow-ups (not v2.3-blocking): wire
-    <code>collation</code> (item 25) as the deterministic auto-promote caller, and a live UI run to confirm
-    end-to-end.<br>
+    <code>collation</code> (item 25) is now wired live as the deterministic auto-promote caller. Remaining: a live UI
+    run to confirm end-to-end.<br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1196,15 +1197,14 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         the contextual Sub-agents block (<code>children(parent_id ?? id)</code>); the collapsible
         <code>spawn_subagent</code> node with per-candidate verdicts; the read-only provenance bar replacing the
         composer on a child. <code>.sa-group</code>/<code>.spawn</code>/<code>.prov</code> lifted verbatim.
-        394 adapter + 45 frontend tests, tsc clean.
+        Plus <b>collation wired live (item 25)</b>: on the coordinator's Finished, if it produced no clean proof
+        itself, the best compiling child candidate is promoted to the canonical path — re-verified there (the child
+        checked a different location) and provenance-linked (<code>promoted_from</code>), never clobbering a clean
+        coordinator proof. 398 adapter + 45 frontend tests, tsc clean.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
-        <b>One piece deferred:</b> the <b>collation auto-promote</b> (item 25's live caller) — candidates are
-        accumulated, but wiring the deterministic promote-the-winner needs canonical-path resolution +
-        re-verification so it can't clobber the coordinator's own proof; a separate careful slice. Today the
-        coordinator writes the winning proof itself from the rendered spawn results. Also pending: a <b>live UI
-        run</b> (a real model spawning children) to confirm end-to-end, and children currently appear at finish
-        (settled), not streaming live — the prover runs children synchronously inside the parent, so live child
-        dots would need child-progress streaming.
+        <b>Pending:</b> a <b>live UI run</b> (a real model spawning children) to confirm end-to-end. Note children
+        currently appear at finish (settled), not streaming live — the prover runs children synchronously inside the
+        parent, so live child dots would need child-progress streaming.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Design surface: <code>mock-subagents-sidebar.html</code> — clickable, edit it as ideas
         land.</b> Tokens and the sidebar rules are copied <i>verbatim</i> from <code>src/styles/lea-v2.css</code>, so
@@ -1252,8 +1252,10 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         (three tiers exactly as above; SafeVerify absent ranks as clean, so it degrades to <code>lean_check</code>-only
         rather than mis-ranking). Two refusals encode the guardrails: <code>select_promotable</code> returns
         <b>only</b> a clean candidate (never an error, never a SafeVerify-rejected cheat), and <code>promote()</code> —
-        the single crossing to proof-of-record — refuses a non-promotable winner. 21 tests. The live caller (a
-        coordinator run feeding <code>SubagentFinished</code> into this) lands with item 24's backend.</div>
+        the single crossing to proof-of-record — refuses a non-promotable winner. 21 tests. <b>Wired live</b> in the
+        bridge (<code>_promote_winner</code> on the coordinator's Finished): re-verifies the winner at the canonical
+        path, records it with <code>promoted_from</code> provenance, and only when the coordinator produced no clean
+        proof of its own — so it fills a gap, never clobbers.</div>
     </div>
     <div class="todo is-tested">
       <div class="top"><span class="id sub">26</span><span class="title">Domain-scoped tactic cascades via path triggers</span>
