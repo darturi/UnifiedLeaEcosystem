@@ -123,7 +123,7 @@
     <code>code</code> for <i>this</i> session's path against disk), so a peer's write can no longer masquerade as the human's edit.
   </div>
 
-  <div class="bar"><i style="width:99%"></i></div>
+  <div class="bar"><i style="width:100%"></i></div>
   <div class="counts"><b>22 / 22 built · 22 / 22 tested · +3 discovered fixes (F1, F2, F3), all tested</b> · 11 adapter/prover
     + 4 frontend + 7 subagent across 9 phases ·
     <b>Phases 1–6 shipped to <code>main</code> (PR #27).</b> <b>Phase 7 subagent core complete (items 18–22):</b>
@@ -137,7 +137,8 @@
     the <code>spawn_subagent</code> timeline node show the tree. Concurrency is on by default: four chats formalize at
     once. <b>Collation is wired live</b> (item 25): when the coordinator delegates but produces no clean proof itself,
     the best compiling child candidate is promoted deterministically — re-verified at the canonical path, provenance
-    linked. <b>Remaining</b> (not v2.3-blocking): a live UI run to confirm end-to-end.
+    linked. <b>Verified in the running UI</b>: a real coordinator spawned children that materialized as read-only child
+    sessions; a capped scout now hands back a summary instead of discarding its work.
     <b>Phase 6 complete.</b> Item 16 — cap default flipped 1→4 and the cheap <code>GET /api/runs/{run_id}</code> poll.
     Item 17 — verdict-integrity locked by three layered tests (deterministic dispatch, real-Lean concurrent checks,
     adapter attribution e2e).
@@ -151,9 +152,8 @@
     394 adapter tests green + the prover dispatch/concurrent-checks/write-sandbox/subagent suites.
     <b>Item 24 shipped — subagents in the UI</b> (backend + frontend): a child is a read-only child session with a
     provenance bar, the contextual Sub-agents block is scoped <code>children(parent_id ?? id)</code>, and the
-    <code>spawn_subagent</code> timeline node shows the tree. Follow-ups (not v2.3-blocking): wire
-    <code>collation</code> (item 25) is now wired live as the deterministic auto-promote caller. Remaining: a live UI
-    run to confirm end-to-end.<br>
+    <code>spawn_subagent</code> timeline node shows the tree, and <code>collation</code> (item 25) is wired live as the
+    deterministic auto-promote caller. <b>Verified end-to-end in the running UI.</b><br>
     <b>Phase 4 closed empty.</b> The whole "guard the shared files" phase dissolved under analysis: files are owned by
     SQL (no data loss), LSP/SafeVerify are internally safe (items 5/7), and the one global resource (the Lake olean dir)
     is never written in the run loop. Item 12 (resource locks) dropped — no race. Item 11 path-leases dropped —
@@ -1184,7 +1184,7 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
     </div>
     <div class="todo is-tested">
       <div class="top"><span class="id fe">24</span><span class="title">Sub-agents in the UI — <a href="mock-subagents-sidebar.html" style="color:var(--accent)">live mock ↗</a></span>
-        <span class="tag fe">frontend</span><span class="badge b-tested">Built ✓ · pending live UI check</span></div>
+        <span class="tag fe">frontend</span><span class="badge b-tested">Tested ✓ in UI</span></div>
       <div class="scope">
         <b>Landed — backend + frontend, straight from the mock.</b> The prover already emitted
         <code>SubagentFinished</code> + had <code>spawn_subagent</code>; the adapter was unaware. Now:
@@ -1202,9 +1202,12 @@ index (session_id, id) · partial index where after_blob_id is not null</pre>
         checked a different location) and provenance-linked (<code>promoted_from</code>), never clobbering a clean
         coordinator proof. 398 adapter + 45 frontend tests, tsc clean.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
-        <b>Pending:</b> a <b>live UI run</b> (a real model spawning children) to confirm end-to-end. Note children
-        currently appear at finish (settled), not streaming live — the prover runs children synchronously inside the
-        parent, so live child dots would need child-progress streaming.
+        <b>Verified in the running UI</b> — a real coordinator spawned children, they materialized as read-only child
+        sessions in the sidebar + spawn node. Two things that surfaced and were fixed live: a max-turns child was titled
+        from its error nudge (now titled from the delegated task), and a capped sub-agent discarded its work (now spends
+        one tool-less turn to hand back a summary — mirroring opencode's summarize-on-cap; caps also raised 8→12 / 15→24).
+        Known limitation (by design, not a bug): children appear at finish (settled), not streaming live — the prover
+        runs children synchronously inside the parent turn, so live child dots would need child-progress streaming.
         <hr style="border:none;border-top:1px solid var(--line);margin:9px 0">
         <b>Design surface: <code>mock-subagents-sidebar.html</code> — clickable, edit it as ideas
         land.</b> Tokens and the sidebar rules are copied <i>verbatim</i> from <code>src/styles/lea-v2.css</code>, so
