@@ -315,7 +315,18 @@ export function useProofStream() {
     source.addEventListener('approval_requested', (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as PendingApproval;
       approvalCounterRef.current += 1;
-      const seq = lastSeqRef.current + 0.5 + approvalCounterRef.current * 1e-4;
+      // The gate must sort BELOW everything currently rendered — it's the pending next
+      // action. `lastSeqRef` alone lags: the gate fires on write_file *before* this turn's
+      // assistant text / resulting code_step are persisted, so those land at higher DB
+      // seqs and the gate (stamped only against the previous frontier) would render ABOVE
+      // the last write box. Stamp against the true max seq across all known content.
+      const state = useProofSession.getState();
+      const maxKnown = Math.max(
+        lastSeqRef.current,
+        ...state.messages.map((m) => (typeof m.seq === 'number' ? m.seq : 0)),
+        ...state.codeSteps.map((c) => (typeof c.seq === 'number' ? c.seq : 0)),
+      );
+      const seq = maxKnown + 0.5 + approvalCounterRef.current * 1e-4;
       setApprovals((prev) =>
         prev.some((a) => a.approval_id === payload.approval_id)
           ? prev

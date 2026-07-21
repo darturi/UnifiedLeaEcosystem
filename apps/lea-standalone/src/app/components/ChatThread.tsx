@@ -28,7 +28,33 @@ import { useSessions } from '../stores/sessions';
 type MergedNode =
   | { kind: 'message'; key: string; runId: string | null; seqKey: number; message: ChatMessage }
   | { kind: 'code'; key: string; runId: string | null; seqKey: number; step: CodeStep; codeIndex: number }
-  | { kind: 'approval'; key: string; runId: string | null; seqKey: number; approval: ApprovalRecord };
+  | { kind: 'approval'; key: string; runId: string | null; seqKey: number; approval: ApprovalRecord }
+  | { kind: 'spawn'; key: string; runId: string | null; seqKey: number; child: SessionSummary };
+
+// A run's nodes with consecutive spawn nodes coalesced into one box, so N sub-agents
+// spawned back-to-back render as a single group at their shared point in the thread.
+type RenderUnit =
+  | { kind: 'single'; node: MergedNode }
+  | { kind: 'spawn-group'; key: string; children: SessionSummary[] };
+
+function coalesceUnits(nodes: MergedNode[]): RenderUnit[] {
+  const units: RenderUnit[] = [];
+  for (const n of nodes) {
+    if (n.kind === 'spawn') {
+      const last = units[units.length - 1];
+      if (last && last.kind === 'spawn-group') last.children.push(n.child);
+      else units.push({ kind: 'spawn-group', key: n.key, children: [n.child] });
+    } else {
+      units.push({ kind: 'single', node: n });
+    }
+  }
+  return units;
+}
+
+function parseTime(iso?: string | null): number {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isNaN(t) ? 0 : t;
+}
 
 export function ChatThread({
   title,
@@ -195,24 +221,34 @@ export function ChatThread({
   // message — so it lands once and stays (M16).
   const runGroups = useMemo(() => {
     const nodes: MergedNode[] = [];
+    // Timeline anchors (created_at ↔ seqKey), ordered by seqKey — used to slot each
+    // sub-agent spawn into the thread at the point it was spawned (bug-fix: interleave
+    // rather than lump every child into one box at the end). seqKey and created_at are
+    // both monotonic in insertion order, so mapping a child's created_at to the seqKey of
+    // the last timeline row that predates it places the spawn box right after its origin.
+    const anchors: { seqKey: number; createdAt: number; runId: string | null }[] = [];
     for (const it of items) {
       if (it.kind === 'message') {
+        const seqKey = it.message.seq ?? Number.MAX_SAFE_INTEGER;
         nodes.push({
           kind: 'message',
           key: it.key,
           runId: it.message.run_id ?? null,
-          seqKey: it.message.seq ?? Number.MAX_SAFE_INTEGER,
+          seqKey,
           message: it.message,
         });
+        anchors.push({ seqKey, createdAt: parseTime(it.message.created_at), runId: it.message.run_id ?? null });
       } else {
+        const seqKey = it.step.seq ?? Number.MAX_SAFE_INTEGER;
         nodes.push({
           kind: 'code',
           key: it.key,
           runId: it.step.run_id ?? null,
-          seqKey: it.step.seq ?? Number.MAX_SAFE_INTEGER,
+          seqKey,
           step: it.step,
           codeIndex: it.codeIndex,
         });
+        anchors.push({ seqKey, createdAt: parseTime(it.step.created_at), runId: it.step.run_id ?? null });
       }
     }
     for (const a of approvals) {
@@ -224,6 +260,32 @@ export function ChatThread({
         approval: a,
       });
     }
+    // Interleave the coordinator's children as spawn nodes. Anchor by created_at: the
+    // greatest timeline row that predates the child, inheriting that row's runId so the
+    // box groups with the run it belongs to. A child whose time can't be placed (or that
+    // predates everything) sinks to the end rather than jumping to the top.
+    anchors.sort((x, y) => x.seqKey - y.seqKey);
+    const anchorFor = (createdAt: number): { seqKey: number; runId: string | null } => {
+      let best: { seqKey: number; runId: string | null } | null = null;
+      for (const a of anchors) {
+        if (a.createdAt <= createdAt) best = { seqKey: a.seqKey, runId: a.runId };
+        else break;
+      }
+      return best ?? { seqKey: Number.MAX_SAFE_INTEGER, runId: null };
+    };
+    childSessions.forEach((child, i) => {
+      const t = parseTime(child.created_at);
+      const anchor = t ? anchorFor(t) : { seqKey: Number.MAX_SAFE_INTEGER, runId: null };
+      nodes.push({
+        kind: 'spawn',
+        key: `sa:${child.id}`,
+        runId: anchor.runId,
+        // +0.25 so the spawn sits just after its anchor row; +i·ε keeps sibling spawns
+        // stably ordered by creation among themselves.
+        seqKey: anchor.seqKey + 0.25 + i * 1e-4,
+        child,
+      });
+    });
     nodes.sort((x, y) => x.seqKey - y.seqKey || x.key.localeCompare(y.key));
     const groups: { runId: string | null; nodes: MergedNode[] }[] = [];
     for (const node of nodes) {
@@ -232,7 +294,7 @@ export function ChatThread({
       else groups.push({ runId: node.runId, nodes: [node] });
     }
     return groups;
-  }, [items, approvals]);
+  }, [items, approvals, childSessions]);
 
   const latestProofStatus = useMemo(
     () => deriveCodeStepProofStatus(latestCodeStep(codeSteps)),
@@ -301,6 +363,8 @@ export function ChatThread({
   };
 
   const renderNode = (node: MergedNode) => {
+    // Spawn nodes are rendered by coalesceUnits → <SpawnGroup>, never here.
+    if (node.kind === 'spawn') return null;
     if (node.kind === 'approval') {
       return (
         <ApprovalCard
@@ -426,7 +490,17 @@ export function ChatThread({
             const completion = deriveRunCompletionStatus(status, codeStepList, resultKind);
             return (
               <Fragment key={group.runId ?? `g${gi}`}>
-                {group.nodes.map(renderNode)}
+                {coalesceUnits(group.nodes).map((unit) =>
+                  unit.kind === 'spawn-group' ? (
+                    <SpawnGroup
+                      key={unit.key}
+                      children={unit.children}
+                      onSelectSession={onSelectSession}
+                    />
+                  ) : (
+                    renderNode(unit.node)
+                  ),
+                )}
                 {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
                 {finished && completion === 'defined' && <DefinedCard steps={steps} session={session} />}
                 {finished && completion === 'disproved' && <DisprovedCard steps={steps} session={session} />}
@@ -449,32 +523,6 @@ export function ChatThread({
                 <i />
               </span>
             </div>
-          )}
-
-          {/* Sub-agents (item 24): the spawn_subagent node — answers "when & why" the
-              coordinator delegated. Lists this session's children with the compiler's
-              verdict; clicking one opens it (read-only). The sidebar block answers
-              "where are they now"; both select the same child. */}
-          {!isChild && childSessions.length > 0 && (
-            <details className="spawn" open>
-              <summary>
-                <span className="tool">spawn_subagent</span> × {childSessions.length}
-                <span className="act">{childSessions.length} candidate{childSessions.length === 1 ? '' : 's'}</span>
-              </summary>
-              <div className="kids">
-                {childSessions.map((child) => {
-                  const badge = subagentBadge(child);
-                  return (
-                    <button className="kid" key={child.id} onClick={() => onSelectSession?.(child.id)}>
-                      <span className={`dot ${badge.dot}`} />
-                      <span className="rtitle">{child.title}</span>
-                      {child.role && <span className="role">{child.role.split('-')[0]}</span>}
-                      <span className={`verdict ${badge.cls}`}>{badge.text}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </details>
           )}
 
           {reconnecting && (
@@ -618,6 +666,77 @@ export function ChatThread({
       )}
     </main>
   );
+}
+
+// The spawn_subagent node in the chat timeline, interleaved at the point the
+// coordinator delegated (bug-fix). Groups the children spawned together; each child row
+// shows a one-line preview of its final output and expands in place to the whole thing
+// (or opens the full read-only child session).
+function SpawnGroup({
+  children,
+  onSelectSession,
+}: {
+  children: SessionSummary[];
+  onSelectSession?: (id: string) => void;
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  return (
+    <details className="spawn" open>
+      <summary>
+        <span className="tool">spawn_subagent</span> × {children.length}
+        <span className="act">
+          {children.length} candidate{children.length === 1 ? '' : 's'}
+        </span>
+      </summary>
+      <div className="kids">
+        {children.map((child) => {
+          const badge = subagentBadge(child);
+          const isOpen = expanded.has(child.id);
+          const preview = firstLine(child.final_summary);
+          return (
+            <div className={`kid ${isOpen ? 'open' : ''}`} key={child.id}>
+              <button className="kid-head" onClick={() => toggle(child.id)}>
+                <span className={`caret ${isOpen ? 'open' : ''}`}>▸</span>
+                <span className={`dot ${badge.dot}`} />
+                <span className="rtitle">{child.title}</span>
+                {child.role && <span className="role">{child.role.split('-')[0]}</span>}
+                <span className={`verdict ${badge.cls}`}>{badge.text}</span>
+              </button>
+              {!isOpen && preview && <div className="kid-preview">{preview}</div>}
+              {isOpen && (
+                <div className="kid-body">
+                  {child.final_summary ? (
+                    <MarkdownMessage content={child.final_summary} />
+                  ) : (
+                    <p className="kid-empty">This sub-agent produced no final output.</p>
+                  )}
+                  <button className="kid-open" onClick={() => onSelectSession?.(child.id)}>
+                    Open full session →
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+// First non-empty line of a child's final output, trimmed for the collapsed preview.
+function firstLine(text?: string | null): string {
+  if (!text) return '';
+  for (const line of text.split('\n')) {
+    const t = line.replace(/^[#>*\-\s]+/, '').trim();
+    if (t) return t.length > 140 ? `${t.slice(0, 140)}…` : t;
+  }
+  return '';
 }
 
 function ToolChip({ event }: { event: StatusEvent }) {

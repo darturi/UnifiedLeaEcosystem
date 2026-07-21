@@ -81,6 +81,9 @@ export interface SessionSummary {
   parent_id?: string | null;
   role?: string | null;
   spawned_at_turn?: number | null;
+  // A child's final output (its last agent message) — populated only for children, so
+  // the coordinator's spawn box can show a collapsed preview with expand/collapse.
+  final_summary?: string | null;
 }
 
 // ── Projects (v2.1) ───────────────────────────────────────────────────────────

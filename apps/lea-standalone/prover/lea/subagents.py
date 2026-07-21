@@ -72,7 +72,12 @@ _SPAWN_SCHEMA = {
                 "type": "string",
                 "description": (
                     "The full task for the subagent, self-contained: it starts with a "
-                    "fresh context and sees only this prompt, not your conversation."
+                    "fresh context and sees only this prompt, not your conversation. "
+                    "State the GOAL — the exact lemma/statement to prove or the specific "
+                    "thing to find — NOT a file path to write. The subagent writes its "
+                    "candidate in its own isolated scratch directory; you collate the "
+                    "result and commit the canonical file yourself. Do not tell it where "
+                    "to write (any path you give is ignored / redirected into its scratch)."
                 ),
             },
             "subagent_type": {

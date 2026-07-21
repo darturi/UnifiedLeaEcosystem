@@ -85,3 +85,18 @@ def test_unfiltered_list_sessions_includes_children(tmp_path, monkeypatch):
     child = store.create_session("candidate", parent_id=parent["id"], role="proof-candidate")
     all_ids = {s["id"] for s in store.list_sessions()}
     assert {parent["id"], child["id"]} <= all_ids  # stats/search see the whole tree
+
+
+def test_child_final_summary_is_its_last_agent_message(tmp_path, monkeypatch):
+    # The spawn box shows a child's final output without a second fetch: `final_summary`
+    # is the child's last AGENT message, populated only for children (a root gets None so
+    # a normal list row never carries a big prose blob).
+    _fresh_db(tmp_path, monkeypatch)
+    parent = store.create_session("coordinator")
+    child = store.create_session("candidate", parent_id=parent["id"], role="proof-candidate")
+    store.add_message(child["id"], "user", "prove the lemma")
+    store.add_message(child["id"], "assistant", "first attempt notes")
+    store.add_message(child["id"], "assistant", "FINAL: candidate compiles cleanly")
+    rows = {s["id"]: s for s in store.list_sessions()}
+    assert rows[child["id"]]["final_summary"] == "FINAL: candidate compiles cleanly"
+    assert rows[parent["id"]].get("final_summary") is None  # roots carry no blob

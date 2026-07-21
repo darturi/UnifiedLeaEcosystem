@@ -7,7 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from .runctx import current_working_dir
+from .runctx import current_depth, current_working_dir
 
 # Item 6 / D74 — bound the two fallbacks that each load their OWN full Mathlib
 # in a fresh subprocess. The warm daemon (lsp_daemon.py) is a single process and
@@ -181,6 +181,16 @@ def _sandboxed_write_path(path: str) -> Path:
     root = Path(wd).expanduser().resolve()
     target = (p if p.is_absolute() else root / p).resolve()
     if target != root and root not in target.parents:
+        # A SUBAGENT (depth > 0) works in an isolated scratch dir, and its candidate is
+        # collated by the coordinator re-reading it — so a path the coordinator named in
+        # the delegated task that points outside the scratch tree is *redirected into it*
+        # (by basename), not rejected. The child physically cannot escape its scratch dir
+        # this way (the rebase stays under `root`), and it can now fulfil "write the file
+        # at <canonical path>" without knowing it's sandboxed. The MAIN agent (depth 0)
+        # keeps the hard F3 rejection: its working_dir IS the real session workspace, so an
+        # out-of-bounds path there is a typo/hallucination/injection to refuse, not redirect.
+        if current_depth() > 0:
+            return root / Path(path).name
         raise _SandboxViolation(
             f"path {path!r} resolves outside this run's workspace ({root}). "
             "Write only within your session's proofs directory."

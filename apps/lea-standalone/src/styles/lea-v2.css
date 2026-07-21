@@ -926,14 +926,30 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .spawn .tool { font: 600 12px ui-monospace, Menlo, monospace; color: var(--accent); }
 .spawn .act { margin-left: auto; font-size: 11.5px; color: var(--muted); }
 .spawn .kids { border-top: 1px solid var(--line); padding: 6px; }
-.spawn .kid { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px;
+.spawn .kid { border-radius: 8px; }
+.spawn .kid.open { background: var(--panel); }
+.spawn .kid-head { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px;
   cursor: pointer; font-size: 13px; background: none; border: none; width: 100%; text-align: left;
   font-family: inherit; }
-.spawn .kid:hover { background: var(--panel); }
-.spawn .kid .rtitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.spawn .kid-head:hover { background: var(--panel); }
+.spawn .kid-head .caret { color: var(--muted); font-size: 10px; transition: transform .15s;
+  flex: 0 0 auto; }
+.spawn .kid-head .caret.open { transform: rotate(90deg); }
+.spawn .kid-head .rtitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--ink-2); }
-.spawn .kid .role { font-size: 10.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
-.spawn .kid .verdict { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
+.spawn .kid-head .role { font-size: 10.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+.spawn .kid-head .verdict { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
+/* collapsed one-line preview of the child's final output */
+.spawn .kid-preview { padding: 0 9px 7px 30px; font-size: 12px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* expanded full output, in place */
+.spawn .kid-body { padding: 2px 12px 10px 30px; font-size: 13px; color: var(--ink-2);
+  border-top: 1px solid var(--line); margin: 0 6px; }
+.spawn .kid-body > :first-child { margin-top: 8px; }
+.spawn .kid-empty { color: var(--muted); font-style: italic; }
+.spawn .kid-open { margin-top: 6px; font-size: 12px; color: var(--accent); background: none;
+  border: none; cursor: pointer; padding: 2px 0; font-family: inherit; }
+.spawn .kid-open:hover { text-decoration: underline; }
 
 /* verdict badges (shared by the spawn node) */
 .verdict.ok { color: var(--green); background: var(--green-soft); }

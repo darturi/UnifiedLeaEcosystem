@@ -194,6 +194,20 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                     from runs r3
                     where r3.session_id = s.id and r3.status in ('pending', 'running')
                 ) as active_run_count,
+                -- Sub-agents (bug-fix): a CHILD's final output — its last agent message —
+                -- so the coordinator's spawn box can show a collapsed preview + expand
+                -- without a second fetch. Gated on parent_id so a normal session's list
+                -- row never carries a big prose blob it doesn't use.
+                (
+                    case when s.parent_id is not null then (
+                        select tm.content
+                        from timeline tm
+                        where tm.session_id = s.id and tm.kind = 'message'
+                          and tm.author = 'agent'
+                        order by tm.id desc
+                        limit 1
+                    ) end
+                ) as final_summary,
                 max(0, cast((julianday(s.updated_at) - julianday(s.created_at)) * 86400 as integer)) as duration_seconds
             from sessions s
             left join runs r on r.session_id = s.id
