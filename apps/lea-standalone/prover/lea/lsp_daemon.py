@@ -235,6 +235,54 @@ class LeanDaemon:
         self.broken = True
         self._fail_all_waiters()
 
+    def close_documents_under(self, dir_path: str) -> int:
+        """`didClose` every open document whose file lives under ``dir_path``,
+        drop its per-uri state, and return how many were closed.
+
+        Lean spawns one ``lean --worker`` per *open* document and holds it until
+        the document is closed. This daemon otherwise never closes a document, so
+        every unique file it checks leaks a worker for the server's lifetime.
+        Sub-agents make that acute: each ``proof-candidate`` child checks a
+        candidate at a unique scratch path, leaking one worker per child (B1 —
+        ~118 workers, GBs resident, in a single session). Called when the run that
+        owns ``dir_path`` finishes (a sub-agent returning), this reaps those
+        workers at the one moment nothing will re-check those files: the parent
+        collates via the filesystem into its own canonical file, never the scratch
+        path.
+
+        Uris are stored resolved (``lean_check`` does ``Path(path).resolve()``
+        before handing us the path), so the prefix is resolved to match — no
+        symlink (`/var`→`/private/var`) misses. A uri mid-check (still in
+        ``_uri_queues``) is left for its own check to close; a finished child has
+        none. Best-effort: a dead pipe just means the server is already gone.
+        """
+        if self.broken:
+            return 0
+        try:
+            prefix = Path(dir_path).resolve().as_uri().rstrip("/") + "/"
+        except Exception:
+            return 0
+        with self._state_lock:
+            victims = [u for u in self.opened
+                       if u.startswith(prefix) and u not in self._uri_queues]
+        closed = 0
+        for uri in victims:
+            try:
+                self._transport.send({
+                    "jsonrpc": "2.0", "method": "textDocument/didClose",
+                    "params": {"textDocument": {"uri": uri}},
+                })
+                closed += 1
+            except Exception:
+                self.broken = True
+                break
+        if victims:
+            with self._state_lock:
+                for uri in victims:
+                    self.opened.discard(uri)
+                    self._uri_locks.pop(uri, None)
+        return closed
+
     # ---- the check ----
     def check(self, file_path: str, content: str) -> str:
         """Open or update `file_path` with `content`; return its diagnostics.
@@ -525,6 +573,26 @@ def mark_stale(lake_root: str) -> None:
         d = _daemons.get(lake_root)
         if d is not None:
             d.stale = True
+
+
+def close_documents_under(dir_path: str) -> int:
+    """Close (didClose) every open LSP document under ``dir_path`` across all live
+    daemons, reaping the per-document ``lean --worker`` Lean keeps per open file.
+
+    Call when a run that owns a scratch tree finishes — notably a sub-agent
+    returning (B1); its candidate files are never checked again. Best-effort and
+    safe: a no-op when the LSP path is disabled (no daemons started) or nothing
+    under ``dir_path`` is open. Returns the number of documents closed.
+    """
+    with _lock:
+        daemons = list(_daemons.values())
+    total = 0
+    for d in daemons:
+        try:
+            total += d.close_documents_under(dir_path)
+        except Exception:
+            pass
+    return total
 
 
 @atexit.register

@@ -109,8 +109,8 @@
     <b>absent from the UI entirely</b> until it finished.
   </div>
 
-  <div class="bar"><i style="width:16%"></i></div>
-  <div class="counts">4 landed on <code>fix/subagent-workflow</code> (pending commit) · 17 queued across B–G · <b>21 total</b>
+  <div class="bar"><i style="width:17%"></i></div>
+  <div class="counts">4 landed on <code>fix/subagent-workflow</code> (all verified, pending commit) · 19 queued across B–G · <b>23 total</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -194,22 +194,23 @@
         Green: write-sandbox + profile-load suites.</div>
     </div>
 
-    <div class="todo is-prog">
+    <div class="todo is-tested">
       <div class="top"><span class="id fe">A2</span><span class="title">Sub-agent boxes interleaved by time + per-child expand/collapse</span>
-        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="badge b-prog">Built</span></div>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">Children were lumped into one box at the end (<code>spawned_at_turn</code> is a per-run counter —
         useless as an anchor). Now interleaved by <code>created_at</code>, adjacent spawns coalesced, each child
         <b>expandable in place</b> to its final output (surfaced as a gated <code>final_summary</code> on the session
-        list). <code>tsc</code> + frontend/adapter suites green. <span class="p1">superseded by D1</span> — real
-        visibility needs render-on-spawn, not just reorder-on-finish.</div>
+        list). <code>tsc</code> + frontend/adapter suites green. Verified in the running UI. <span class="p1">extended by D1</span> —
+        which adds live render-on-spawn on top of this reorder-on-finish.</div>
     </div>
 
-    <div class="todo is-prog">
+    <div class="todo is-tested">
       <div class="top"><span class="id fe">A3</span><span class="title">Permission gate no longer renders above the last write box</span>
-        <span class="tag fe">frontend</span><span class="badge b-prog">Built</span></div>
+        <span class="tag fe">frontend</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope">The pending approval was stamped <code>seq = lastSeqRef + 0.5</code>, which lagged — this turn's
         assistant text + resulting write got higher DB seqs, so the gate sorted <i>above</i> them. Now stamped against
-        the <b>true max seq</b> across all known messages + code steps, so the gate always sits below rendered content.</div>
+        the <b>true max seq</b> across all known messages + code steps, so the gate always sits below rendered content.
+        Verified in the running UI.</div>
     </div>
 
     <div class="todo is-done">
@@ -297,7 +298,8 @@
   <!-- ─────────────────────────────  PHASE D  ───────────────────────────── -->
   <div class="group">
     <h2>Phase D · Visibility &amp; control</h2>
-    <p class="ghint">You are the creator and you're flying blind. A child must be seeable, stoppable, steerable.</p>
+    <p class="ghint">You are the creator and you're flying blind. A child must be seeable, stoppable, steerable — and you
+      should be able to pick which model each role runs, from the composer.</p>
 
     <div class="todo is-planned">
       <div class="top"><span class="id fe">D1</span><span class="title">Render a sub-agent the moment it's spawned (running state)</span>
@@ -322,6 +324,30 @@
       <div class="scope"><b>Resolved:</b> not blind live-injection (dual-principal — the coordinator owns the
         delegation and would be steered by input it never saw). Do <b>stop → amend → re-spawn</b>, or inject as an
         event the coordinator <i>also</i> sees. Depends on D1/E1.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id fe">D4</span><span class="title"><code>/model</code> — set the coordinator model from the composer</span>
+        <span class="tag fe">frontend</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">Type <code>/model</code> in the composer to pop the existing Spotlight <b>model-picker card</b> above
+        the input (search/select), then run with that coordinator model. Near-pure reuse: <code>ModelPicker.tsx</code> +
+        <code>stores/model.ts</code> <code>setModel</code> (already persists to the same settings config a run reads) —
+        it sets the same active model the chat-head chip does. The only new piece is a <b>composer slash-command
+        parser</b>, <i>shared with</i> <code>/compact</code> (G3): parse <code>/&lt;cmd&gt;</code> at the input and
+        dispatch to a small command registry. Frontend-only.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">D5</span><span class="title"><code>/sub-agent-model</code> — set the sub-agent model from the composer</span>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">Same picker card, second target — but this one needs a <b>new runtime channel</b>. Today a child's
+        model comes only from its profile YAML <code>model:</code> (static) or it <b>inherits the coordinator</b>
+        (<code>_child_config</code>: <code>profile.model or parent.model</code>) — there is <b>no sub-agent model in the
+        UI/store at all</b>. Add a persisted <code>sub_agent_model</code> setting (store + settings) that the adapter
+        threads into the child config to <b>override</b> profile/inherit. This is the live-UI counterpart of the
+        heterogeneous split we do for benchmarking by hand (coordinator = GPT, children = self-hosted Deepseek on vLLM,
+        set via the YAML <code>model:</code> line) — it promotes that from a file edit to a picker. Reuses D4's parser +
+        card; the real work is the override plumb through <code>bridge</code>/<code>_child_config</code>.</div>
     </div>
   </div>
 

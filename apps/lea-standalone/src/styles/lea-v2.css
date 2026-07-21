@@ -1,16 +1,20 @@
-/* LeaUI warm-paper design system.
+/* LeaUI minimal black-and-white design system.
+   Chrome is monochrome; color appears only where it carries meaning (proof status).
    Plain, self-contained CSS that the React components emit class names against. */
 
 :root {
-  --bg: #f5f4ef; --panel: #ffffff; --panel-2: #faf9f6;
-  --ink: #1f1e1d; --ink-2: #3d3c39; --muted: #8a8983;
-  --line: #e9e7e0; --line-2: #efedE7;
-  --accent: #c96442; --accent-soft: #f3e3db;
-  --green: #4f8a5b; --green-soft: #e6f0e7;
-  --red: #c0564a; --red-soft: #f6e3e0;
-  --amber: #b8842a; --amber-soft: #f6ecd8;
-  --code-bg: #fbfaf7; --radius: 12px;
-  --kw: #9a3e8f; --fn: #2f6f9f; --str: #4f8a5b; --num: #b8842a; --com: #a9a79f; --type: #c96442;
+  /* UI / brand — near-white base, near-black as the single accent (monochrome) */
+  --bg: #fafafb; --panel: #ffffff; --panel-2: #f5f5f7;
+  --ink: #18181b; --ink-2: #3f3f46; --muted: #8b8b93;
+  --line: #ebebee; --line-2: #f3f3f5;
+  --accent: #1c1c20; --accent-soft: #ededf0;
+  /* semantic status — the only chroma in the UI */
+  --green: #2f8f5b; --green-soft: #e7f4ec;
+  --red: #d14343; --red-soft: #fbe9e9;
+  --amber: #c0872e; --amber-soft: #f8efd9;
+  --code-bg: #f8f8fa; --radius: 12px;
+  /* syntax highlighting — its own block; kept colored for proof readability */
+  --kw: #7c3aed; --fn: #2563a8; --str: #2f8f5b; --num: #b5730f; --com: #9aa0a6; --type: #0d9488;
 }
 .lea-app * { box-sizing: border-box; }
 .lea-app, .lea-app input, .lea-app textarea, .lea-app button {
@@ -109,9 +113,9 @@
 .origin-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
   padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink-2); white-space: nowrap; line-height: 1.6; }
-.origin-badge.origin-overleaf { color: #c96442; border-color: var(--accent-soft);
+.origin-badge.origin-overleaf { color: #1c1c20; border-color: var(--accent-soft);
   background: var(--accent-soft); cursor: pointer; }
-.origin-badge.origin-overleaf:hover:not(:disabled) { background: #eccdbf; }
+.origin-badge.origin-overleaf:hover:not(:disabled) { background: #e2e2e6; }
 .origin-badge.origin-overleaf:disabled { cursor: default; }
 .origin-badge.origin-ui { color: #8a8983; }
 .origin-badge .origin-badge-glyph { flex: none; }

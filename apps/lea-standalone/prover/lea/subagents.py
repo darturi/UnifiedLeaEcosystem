@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import lsp_daemon
 from .errors import ToolError
 from .events import CheckResult, Finished, SubagentFinished
 from .profiles import AgentProfile, available_profiles, load_profile
@@ -374,6 +375,16 @@ def spawn_subagent(args: dict) -> str:
         )
     except Exception as exc:  # noqa: BLE001 — a child failure is a tool result, never a parent crash
         return f"Error: subagent '{subagent_type}' failed: {type(exc).__name__}: {exc}"
+    finally:
+        # B1: reap the child's LSP file-workers now. Its scratch candidates are
+        # never checked again (we collate via the filesystem into the parent's
+        # own canonical file), so didClose every document under the child's
+        # scratch tree instead of leaking one `lean --worker` per unique path.
+        # Best-effort — a no-op when LSP is disabled or nothing was checked.
+        try:
+            lsp_daemon.close_documents_under(str(candidate_dir))
+        except Exception:
+            pass
 
     # `agent_id` is the result id: unique per spawn, and the audit handle a promoted
     # candidate links back to. Record the typed result (with the child transcript) for
