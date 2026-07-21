@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="refresh" content="8" />
+<title>LeaUI v2.3.1 — Sub-agents: Visibility, Control & Parallelism</title>
+<style>
+  :root {
+    --bg: #f5f4ef; --panel: #fffefb; --ink: #2a2724; --muted: #8a847c;
+    --line: #e6e2da; --accent: #c96442; --green: #4f8a5b; --red: #c0564a;
+    --amber: #b8842a; --blue: #4a6fa5; --violet: #7a5a9a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: 32px 0 80px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+  header { margin-bottom: 8px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .intro { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 16px; margin: 18px 0 8px; font-size: 13px; color: #4a463f; }
+  .intro b { color: var(--ink); }
+  .danger { background: #fbeeec; border: 1px solid #ecc9c2; border-left: 3px solid var(--red);
+    border-radius: 10px; padding: 12px 16px; margin: 14px 0 8px; font-size: 12.5px; color: #6a3a32; }
+  .danger h3 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--red); }
+  .danger b { color: var(--ink); }
+  .gaps { background: #fbf4e6; border: 1px solid #ecdcbb; border-left: 3px solid var(--amber);
+    border-radius: 10px; padding: 12px 16px; margin: 14px 0 26px; font-size: 12.5px; color: #5a4a2a; }
+  .gaps h3 { margin: 0 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--amber); }
+  .gaps b { color: var(--ink); }
+  .gaps .fix { color: #7a6a44; }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 18px 0 6px; }
+  .bar > i { display: block; height: 100%; background: var(--green); }
+  .counts { color: var(--muted); font-size: 12.5px; margin-bottom: 26px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 14px 0 28px; font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 9px; height: 9px; border-radius: 99px; display: inline-block; }
+  .d-queued { background: #cdc8be; } .d-planned { background: var(--amber); }
+  .d-prog { background: var(--blue); } .d-tested { background: #7aa37f; } .d-done { background: var(--green); }
+  .d-unplanned { background: #b79ad0; }
+
+  .group { margin-bottom: 30px; }
+  .group > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);
+    margin: 0 0 4px; font-weight: 600; }
+  .group > .ghint { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+
+  .todo { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 13px 15px; margin-bottom: 9px; }
+  .todo.is-planned { border-color: var(--amber); box-shadow: 0 0 0 1px rgba(184,132,42,.15); }
+  .todo.is-tested { border-color: var(--green); box-shadow: 0 0 0 1px rgba(79,138,91,.15); }
+  .todo.is-dropped { opacity: .62; background: var(--bg); }
+  .todo.is-dropped .title s { text-decoration-thickness: 1px; }
+  .todo.is-done { opacity: .62; }
+  .todo .top { display: flex; align-items: center; gap: 10px; }
+  .id { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px; min-width: 30px;
+    text-align: center; }
+  .id.fe { color: var(--accent); border-color: #e7cabd; background: #fbf1ec; }
+  .id.sub { color: var(--violet); border-color: #d8c8e6; background: #f5eef9; }
+  .title { font-weight: 550; flex: 1; }
+  .tag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+    padding: 1px 7px; border-radius: 99px; }
+  .tag.be { background: #eef0ec; color: #6a7d63; }
+  .tag.fe { background: #fbf1ec; color: var(--accent); }
+  .tag.prover { background: #eceef4; color: #5a6a8a; }
+  .badge { font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 99px; white-space: nowrap; }
+  .b-queued { background: #efece6; color: #8a847c; }
+  .b-planned { background: #f7ecd6; color: var(--amber); }
+  .b-prog { background: #e4ecf6; color: var(--blue); }
+  .b-tested { background: #e2efe4; color: #5a8a62; }
+  .b-done { background: #dcefe1; color: var(--green); }
+  .b-unplanned { background: #efe7f3; color: #7a5a9a; }
+  .b-dropped { background: #ecebe8; color: #8a847c; text-decoration: none; }
+  .scope { color: var(--muted); font-size: 13px; margin: 6px 0 0 0; }
+  .haz { display: inline-block; font: 600 10.5px ui-monospace, monospace; color: var(--red);
+    background: #fbeeec; border: 1px solid #ecc9c2; border-radius: 5px; padding: 0 5px; margin-right: 4px; }
+  .p1 { display: inline-block; font: 600 10.5px ui-monospace, monospace; color: var(--blue);
+    background: #eaf0f8; border: 1px solid #cfdcee; border-radius: 5px; padding: 0 5px; margin-right: 4px; }
+  code { background: #f0ede6; border-radius: 4px; padding: 1px 5px; font: 12px ui-monospace, monospace; }
+  footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 40px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>LeaUI v2.3.1 — Sub-agents: Visibility, Control &amp; Parallelism</h1>
+    <div class="sub">Live progress · pain points surfaced testing v2.3 sub-agents on a real project
+      (Burnside Prime Degree Theorem) · follows <code>v2.3-concurrent-runs-progress.html</code></div>
+  </header>
+
+  <div class="intro">
+    v2.3 shipped sub-agents end-to-end (spawn → collate → UI, PR #28). Driving a <b>hard project proof</b> through them
+    exposed a cluster of gaps that don't show on toy problems: a running child is <b>invisible</b>, can't be
+    <b>stopped</b> or <b>steered</b>, leaks <b>Lean workers</b>, <b>re-discovers the environment</b> every time, and —
+    the headline — runs <b>strictly sequentially</b> even though the isolation-safety groundwork for parallelism is
+    already done. v2.3.1 closes these. <b>The through-line:</b> promote children from in-process blocking calls to
+    <b>first-class runs</b>, and use the project <b>Memory</b> as the one channel that crosses the isolation boundary.
+  </div>
+
+  <div class="danger">
+    <h3>What one live Burnside run exposed</h3>
+    <b>~18M tokens</b> on the coordinator alone (a <b>131:1</b> input:output ratio — context re-sent every turn) ·
+    <b>~118 leaked <code>lean --worker</code></b> processes never reaped · a proof-candidate spending its whole
+    150-turn budget writing <b>throwaway <code>explore_*</code>/<code>test_*</code> files</b> (each a cold import
+    elaboration) · children <b>re-discovering the same Mathlib import layout ~10×</b> · and the currently-running child
+    <b>absent from the UI entirely</b> until it finished.
+  </div>
+
+  <div class="bar"><i style="width:16%"></i></div>
+  <div class="counts">4 landed on <code>fix/subagent-workflow</code> (pending commit) · 17 queued across B–G · <b>21 total</b>
+    &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
+
+  <div class="legend">
+    <span><i class="dot d-unplanned"></i> Needs a design pass</span>
+    <span><i class="dot d-queued"></i> Queued</span>
+    <span><i class="dot d-planned"></i> Planned (next)</span>
+    <span><i class="dot d-prog"></i> Built (not yet confirmed)</span>
+    <span><i class="dot d-tested"></i> Tested ✓</span>
+    <span style="margin-left:auto"><span class="tag be">adapter</span> &nbsp; <span class="tag prover">prover</span>
+      &nbsp; <span class="tag fe">frontend</span></span>
+  </div>
+
+  <div class="gaps">
+    <h3>Design calls resolved this session</h3>
+    <b>Two axes, not one.</b> <i>Isolation</i> (whose context absorbs the work) ≠ <i>speed</i> (serial vs concurrent).
+    Sub-agents own the isolation axis; parallelism is a separate knob. <span class="fix">So <b>parallel tools ≠
+    sub-agents</b>: a tool result returns into the caller's context, so parallelizing tools fills the 15M-token context
+    <i>faster</i>, not slower. A sub-agent is <b>"a tool call whose intermediate work never returns to you — only the
+    answer does."</b></span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Isolation-safety is done; execution-concurrency is not.</b> <span class="fix">The ContextVar per-activation
+    scopes (v2.3 items 21/27) make concurrent children <i>safe</i> — the hard part. What's missing is threaded
+    execution: <code>spawn_subagent</code> still drains its child <i>inline</i>. So parallelism is a real execution
+    change, not a loop tweak.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Memory is the channel across the isolation boundary.</b> <span class="fix">A child correctly sheds the
+    coordinator's dead-ends, but also sheds its useful environment knowledge. <code>.lea/memory.md</code> already exists
+    (curated, persists across runs via git) — the right conduit. Push distilled facts in, not the raw 15M scrollback.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Steer = NOT blind live-inject.</b> <span class="fix">Injecting into a running child the coordinator owns is a
+    dual-principal trap. Instead: <b>stop → amend → re-spawn</b>, or inject as an event the coordinator <i>also</i>
+    sees (needs first-class runs).</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Concurrent search = parallel tool calls, NOT sub-sub-agents.</b> <span class="fix">A search child fires
+    Loogle + semantic + grep in one turn, run concurrently (E3). Per-tool nested sub-agents are the wrong tool — a
+    single query has nothing to isolate, so wrapping it in an activation costs <i>more</i> tokens, and it hits the
+    depth-1 guard anyway. Nested delegation stays architecturally supported (raise <code>max_depth</code>) but
+    <b>deferred</b> — not needed now.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Minimal role roster: 1 supervisor + 2 leaf roles.</b> <span class="fix">Differentiate on the only real
+    boundaries — <i>read/write</i> × <i>know/do</i>: <b>scout</b> (<code>premise-search</code>, read-only) and
+    <b>prover</b> (<code>proof-candidate</code>, read-write). Decompose/sketch = the <b>supervisor's</b> job (not a
+    role); disprove = <b>prover</b> with a negated goal. Anything sharing a toolset <i>and</i> objective is a prompt
+    variation, not a new role. Don't proliferate.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Three layers of token defense</b> (each attacks a different bloat source): <span class="fix"><b>isolation</b>
+    (sub-agents — dead-ends never enter the coordinator's context) + <b>Memory</b> (Phase C — facts persist across
+    runs) + <b>compaction</b> (Phase G — the transcript is pruned + summarized within a run). They compose: a
+    compaction summary feeds Memory.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Dependency order:</b> <span class="fix">reap workers (B1) + daemon concurrency (B3) →
+    visible/first-class runs (D1/E1) → threaded parallel execution (E2).</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Handback contract (source-confirmed).</b> <span class="fix">The child authors its own distilled result; the
+    parent receives a structured <code>outputs</code> dict + content (OpenHands <code>AgentDelegateObservation</code>) /
+    the child's final response (SDK <code>get_agent_final_response</code>) — <b>not the transcript</b>. Lea's
+    <code>SubagentFinished</code> already matches; the one gap (child metrics reading as 0) is fixed by E1.</span>
+    <hr style="border:none;border-top:1px solid #ecdcbb;margin:11px 0">
+    <b>Reference implementations — read from source (cloned locally), not docs.</b> <span class="fix">
+    <b>OpenHands app</b> <code>~/Desktop/code/OpenHands</code> — condenser suite
+    <code>openhands/memory/condenser/impl/</code> (10 strategies incl. <code>llm_summarizing</code>,
+    <code>observation_masking</code>, <code>pipeline</code>) + delegation handback
+    <code>openhands/events/observation/delegate.py</code>. <b>Agent SDK</b>
+    <code>~/Desktop/code/software-agent-sdk</code> — threaded delegation
+    <code>openhands-tools/openhands/tools/delegate/impl.py</code>. Cited per-item below.</span>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE A  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase A · Landed in live-testing <span style="text-transform:none;font-weight:400">(on <code>fix/subagent-workflow</code>, pending commit)</span></h2>
+    <p class="ghint">The first round of testing bugs, already fixed and tested — awaiting your go-ahead to commit.</p>
+
+    <div class="todo is-tested">
+      <div class="top"><span class="id sub">A1</span><span class="title">proof-candidate wrote nothing → child write-sandbox redirect + prompt</span>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">The coordinator handed the child an absolute canonical path <i>outside</i> its scratch sandbox,
+        and the child researched its whole budget without writing. Fix: a subagent (<code>depth&gt;0</code>) now
+        <b>redirects an out-of-sandbox write into its scratch dir</b> by basename (the main agent keeps the hard F3
+        rejection); the <code>proof-candidate</code> prompt writes a candidate on turn 1 and treats any path as a cwd
+        filename; the <code>spawn_subagent</code> description tells the coordinator to delegate a <b>goal, not a path</b>.
+        Green: write-sandbox + profile-load suites.</div>
+    </div>
+
+    <div class="todo is-prog">
+      <div class="top"><span class="id fe">A2</span><span class="title">Sub-agent boxes interleaved by time + per-child expand/collapse</span>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="badge b-prog">Built</span></div>
+      <div class="scope">Children were lumped into one box at the end (<code>spawned_at_turn</code> is a per-run counter —
+        useless as an anchor). Now interleaved by <code>created_at</code>, adjacent spawns coalesced, each child
+        <b>expandable in place</b> to its final output (surfaced as a gated <code>final_summary</code> on the session
+        list). <code>tsc</code> + frontend/adapter suites green. <span class="p1">superseded by D1</span> — real
+        visibility needs render-on-spawn, not just reorder-on-finish.</div>
+    </div>
+
+    <div class="todo is-prog">
+      <div class="top"><span class="id fe">A3</span><span class="title">Permission gate no longer renders above the last write box</span>
+        <span class="tag fe">frontend</span><span class="badge b-prog">Built</span></div>
+      <div class="scope">The pending approval was stamped <code>seq = lastSeqRef + 0.5</code>, which lagged — this turn's
+        assistant text + resulting write got higher DB seqs, so the gate sorted <i>above</i> them. Now stamped against
+        the <b>true max seq</b> across all known messages + code steps, so the gate always sits below rendered content.</div>
+    </div>
+
+    <div class="todo is-done">
+      <div class="top"><span class="id sub">A4</span><span class="title">proof-candidate turn cap 24 → 150</span>
+        <span class="tag prover">prover</span><span class="badge b-done">Done</span></div>
+      <div class="scope">A real proof is many write→check→edit cycles. <b>Revisit under B2/C</b>: the bigger budget
+        amplified the explore-file sprawl — more turns to grind means more throwaway files unless B2 lands.</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE B  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase B · Resource &amp; correctness <span style="text-transform:none;font-weight:400">(do first — parallelism multiplies these)</span></h2>
+    <p class="ghint">Bugs that are annoying at N=1 and catastrophic at N=many. These gate the headline.</p>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">B1</span><span class="title">Reap leaked <code>lean --worker</code> processes</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><span class="haz">P0</span> A live run left <b>~118 idle <code>lean --worker</code></b>
+        processes. Each new-file <code>lean_check</code> spawns a worker that is never killed; each holds Mathlib state
+        (hundreds of MB+). It's the real perf killer today, and it <b>multiplies once children run in parallel</b>. Reap
+        per-check / on child teardown; audit <code>lsp_daemon</code> worker lifecycle. <b>Precedent:</b> the SDK's
+        <code>DelegateExecutor.close()</code> explicitly <code>conversation.close()</code>s every sub-agent on teardown
+        (<code>delegate/impl.py</code>) — child cleanup is a first-class step there, not an afterthought.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">B2</span><span class="title">One <code>candidate.lean</code>, edited in place — no scratch/explore files</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><span class="haz">P0</span> proof-candidate scatters <code>candidate.lean</code>,
+        <code>find_def.lean</code>, <code>explore_action4.lean</code>, <code>test_fintype.lean</code>… Every <b>new</b>
+        file forces a full <b>cold elaboration</b> of the heavy Mathlib imports — the daemon's ~0.2s fast path only
+        helps <i>in-place edits of an already-open file</i>. Harden the prompt to a single <code>candidate.lean</code>
+        edited in place; forbid scratch/explore files. Directly fixes the slow-<code>lean_check</code> complaint.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">B3</span><span class="title">LSP daemon: concurrent checks from multiple children</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><span class="p1">prereq for E2</span> Two children compiling at once hit the same per-root
+        daemon. Verify/harden concurrent <code>lean_check</code> (extend <code>test_concurrent_checks</code>) so parallel
+        children don't serialize or corrupt at the daemon layer. Compose with B1 (concurrency ⇒ more workers).</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE C  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase C · Cross-agent context <span style="text-transform:none;font-weight:400">(the Memory channel)</span></h2>
+    <p class="ghint">Stop every child re-deriving what the coordinator already learned. The mechanism exists — wire it.</p>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">C1</span><span class="title">Coordinator actually writes durable facts to <code>.lea/memory.md</code></span>
+        <span class="tag prover">prover</span><span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><b>Write gap.</b> The project Memory doc exists and the prompt says "maintaining this is part
+        of your job," yet after ~90 turns of discovery it's still the <b>empty 3-line default</b>. Sharpen and un-bury
+        the instruction; nudge the coordinator to record the import map, verified lemma locations, and dead ends.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">C2</span><span class="title">Propagate the compact Memory into every child's context</span>
+        <span class="tag prover">prover</span><span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><b>Read gap.</b> Children are spawned in-process with <i>just their task</i> and bypass the
+        bridge's project-context injection, so they never see <code>.lea/memory.md</code>. Inject the compact Memory
+        into each child's starting context (<code>_child_config</code>/<code>spawn_subagent</code>). <b>Subsumes the
+        environment re-discovery</b> — no more each child re-finding "Subgroup lives under <code>Algebra/Group/Subgroup</code>."</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id be">C3</span><span class="title">Seed the environment brief at project init</span>
+        <span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">Pre-populate <code>.lea/memory.md</code> (or a skill) with this Mathlib version's import
+        conventions + key module locations, so the map exists <i>before</i> any agent runs. Optional once C1/C2 flow,
+        but removes the cold-start on a fresh project.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">C4</span><span class="title">Coordinator collates via <code>read_file</code>, not <code>bash ls</code></span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">The coordinator spelunks child scratch dirs with <code>bash ls</code> (tripping the approval
+        gate) instead of <code>read_file</code> on the candidate path the sub-agent result already hands it — and
+        re-verifies in its 15M-token context. Point it at the candidate path directly; cut the gate friction.</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE D  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase D · Visibility &amp; control</h2>
+    <p class="ghint">You are the creator and you're flying blind. A child must be seeable, stoppable, steerable.</p>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id fe">D1</span><span class="title">Render a sub-agent the moment it's spawned (running state)</span>
+        <span class="tag be">adapter</span><span class="tag fe">frontend</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><span class="haz">P0</span> A child is materialized only on <code>SubagentFinished</code>, so
+        a <b>running child is invisible</b> and the list shows only finished ones — they all look done. Emit a
+        <b>spawn-started</b> event, materialize the child as <code>running</code> at spawn, update on finish; live
+        running/done indicator. Without this, N concurrent children (E2) is strictly worse than one.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">D2</span><span class="title">Stop a single running sub-agent</span>
+        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><span class="p1">needs D1/E1</span> Children run with <code>should_stop=None</code>
+        (autonomous). Thread a <b>per-child stop signal</b> so a user can kill a runaway child without cancelling the
+        whole coordinator run; it returns partial findings gracefully (like summarize-on-cap).</div>
+    </div>
+
+    <div class="todo is-unplanned">
+      <div class="top"><span class="id sub">D3</span><span class="title">Steer a sub-agent — stop→amend→re-spawn (not blind inject)</span>
+        <span class="tag be">adapter</span><span class="tag fe">frontend</span><span class="badge b-unplanned">Design</span></div>
+      <div class="scope"><b>Resolved:</b> not blind live-injection (dual-principal — the coordinator owns the
+        delegation and would be steered by input it never saw). Do <b>stop → amend → re-spawn</b>, or inject as an
+        event the coordinator <i>also</i> sees. Depends on D1/E1.</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE E  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase E · Parallel execution <span style="text-transform:none;font-weight:400">(the headline)</span></h2>
+    <p class="ghint">Formalize independent sub-lemmas at once. The isolation-safety is paid for; the execution isn't.</p>
+
+    <div class="todo is-unplanned">
+      <div class="top"><span class="id sub">E1</span><span class="title">First-class child runs on the RunBroker</span>
+        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-unplanned">Design</span></div>
+      <div class="scope"><span class="haz">P0</span> Promote children from in-process blocking drains to <b>real runs
+        with their own SSE stream + stop hook</b>. The umbrella that makes D1/D2/D3/E2 natural instead of four separate
+        patches. The adapter already has the broker; the prover emits child <b>start/progress/stop</b> events instead of
+        <i>absorbing</i> them. <b>Also fixes child-usage tracking</b> (why sub-agent tokens read as 0): the SDK syncs
+        each child's metrics into the parent — <code>parent_stats.usage_to_metrics["delegate:{id}"] =
+        sub.get_combined_metrics()</code>, <i>replace</i> not add to avoid double-count on re-delegation
+        (<code>delegate/impl.py</code>). A first-class child run gets its own usage row, giving us the same rollup.</div>
+    </div>
+
+    <div class="todo is-unplanned">
+      <div class="top"><span class="id sub">E2</span><span class="title">Threaded parallel children (<code>copy_context</code> per child)</span>
+        <span class="tag prover">prover</span><span class="badge b-unplanned">Design</span></div>
+      <div class="scope"><span class="haz">P0</span> <b>The actual pain.</b> Isolation-safety (ContextVar scopes,
+        items 21/27) makes concurrent children safe, but execution is synchronous: <code>spawn_subagent</code> drains
+        its child inline. Run each child on its own thread via <code>contextvars.copy_context().run(...)</code> (its own
+        scope); barrier-join multiple spawns in a turn. LLM + <code>lean_check</code> are blocking I/O, so threads truly
+        overlap. <b>Source-validated</b> — the SDK's <code>DelegateExecutor</code>
+        (<code>openhands-tools/.../delegate/impl.py</code>) does exactly this: a <code>threading.Thread</code> per task,
+        <code>start()</code> all then <code>join()</code> (barrier), a <code>max_children=5</code> cap, two-phase
+        <code>spawn</code>/<code>delegate</code>, and per-child exceptions isolated into an <code>errors</code> map so a
+        failed child never kills its siblings. Needs B1/B3 + D1/E1.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">E3</span><span class="title">Parallelize the serial tool loop (independent tools)</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">The loop runs a turn's tool calls in a serial <code>for tc in tool_calls</code>. Run
+        <i>independent</i> tools (and spawns) concurrently for latency. Orthogonal to isolation — a smaller, separate
+        win; keep write→check pairs serial. <b>Chosen mechanism for concurrent multi-modal search (F1):</b> a search
+        child fires Loogle + semantic + grep in one turn — <b>flat parallel calls, not sub-sub-agents</b>.</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE F  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase F · Search coverage &amp; tooling</h2>
+    <p class="ghint">Grep can't search by type or meaning — the real reason the scout flails. Broaden the tools; the
+      token win is <b>coverage</b> (right lemma in one shot), not parallelism.</p>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">F1</span><span class="title">Multi-modal search tools in <code>premise-search</code> (Loogle + semantic)</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope"><code>search_mathlib</code> is <code>grep -r</code> over local Mathlib — <b>text/name only</b>; it
+        cannot search by type or meaning (why the scout grepped <code>Subgroup.Basic</code>, found nothing, and
+        spelunked). Add <b>Loogle</b> (type/shape/constants search) + <b>LeanSearch/Moogle</b> (semantic NL→lemma)
+        alongside grep, for multi-modal coverage. Fired <b>concurrently as parallel tool calls</b> (E3) inside the one
+        search child — <i>not</i> sub-sub-agents. <b>Network caveat:</b> these are HTTP APIs (same egress concern as a
+        cloud coordinator) — plan the <b>local-Loogle</b> path (build the Loogle executable once against the pinned
+        Mathlib) for air-gapped/HPC. Token win is coverage: the right lemma in one shot, fewer flailing turns.</div>
+    </div>
+  </div>
+
+  <!-- ─────────────────────────────  PHASE G  ───────────────────────────── -->
+  <div class="group">
+    <h2>Phase G · Context management <span style="text-transform:none;font-weight:400">(the token defense)</span></h2>
+    <p class="ghint">One live run cost ~18M tokens (131:1 input:output) because the transcript re-sends every turn.
+      Compaction + a leaner coordinator turn O(N²) into bounded. Third layer alongside isolation + Memory.</p>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">G1</span><span class="title">Context compaction (condenser: prune → summarize)</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">Adopt OpenHands' condenser suite (cloned:
+        <code>openhands/memory/condenser/impl/</code>), adapted for Lean — <b>not invented</b>. Their <b>Phase-1 prune is
+        the <code>observation_masking</code> condenser</b>, <b>Phase-2 is <code>llm_summarizing</code></b>, composed by
+        the <b><code>pipeline</code></b> condenser (so "prune → summarize" is <i>their</i> pattern).
+        <code>LLMSummarizingCondenser</code> params: <code>max_size</code> (event budget), <code>keep_first=1</code>
+        (the head — for us the <b>theorem goal</b>), <code>max_event_length=10_000</code> (truncate one oversized event —
+        a giant Lean error); it keeps a <b>rolling summary event</b> folding prior-summary + newly-forgotten.
+        <b>For us:</b> prune drops superseded <code>lean_check</code> error dumps + old
+        <code>read_file</code>/<code>search_mathlib</code> outputs (the 131:1 token sink, zero LLM cost). Its summary
+        prompt already tracks <code>CODE_STATE</code>/<code>TESTS</code>/<code>CHANGES</code> — map TESTS→<code>lean_check</code>
+        errors, add LEMMAS_FOUND/DEAD_ENDS. Trigger ~75% (opencode). Applies to coordinator <i>and</i> children; reuses
+        our <code>_summarize_on_max_turns</code>/<code>_text_only_history</code>. OpenHands reports ~50% cost cut. Feeds Memory (C).</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">G2</span><span class="title">Orchestrator-first coordinator (delegate proving, don't grind)</span>
+        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">The coordinator both delegates <i>and</i> grinds proofs itself (it wrote <code>Burnside.lean</code>
+        ~30× in its own context) — the structural cause of the 15M-token coordinator. Retune it to
+        <b>plan → delegate → collate → promote → maintain memory</b>, pushing the write→check→error grind into
+        <code>prover</code> children. A role-boundary fix, not a new agent — and the highest-leverage token lever.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id fe">G3</span><span class="title"><code>/compact</code> — user-triggered manual compaction</span>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">A slash command (like Claude Code's <code>/compact</code>) so the user can compact <b>on demand</b>,
+        not only at the automatic threshold (G1) — before a long follow-up, or when they watch the context bloating.
+        <b>Same condenser under the hood</b> (<code>pipeline([observation_masking, llm_summarizing])</code>); the command
+        just fires it now instead of waiting. Frontend: a <code>/compact</code> command in the composer; adapter: an
+        endpoint that runs the condenser on the active session, persists the condensed state, and streams a "freed ~N
+        tokens" note. G1 is the <i>auto</i> trigger, G3 the <i>manual</i> one — one mechanism, two entry points.</div>
+    </div>
+  </div>
+
+  <footer>
+    v2.3.1 · sub-agents visibility, control &amp; parallelism · surfaced in live testing of the Burnside Prime Degree
+    run · this page auto-refreshes every 8s
+  </footer>
+</div>
+</body>
+</html>
