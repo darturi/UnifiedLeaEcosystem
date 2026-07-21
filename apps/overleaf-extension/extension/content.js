@@ -838,6 +838,9 @@
     const repairBatchPanel = renderLeanPaneRepairBatchPanel();
     if (repairBatchPanel) leanPaneBody.appendChild(repairBatchPanel);
 
+    const batchActions = renderLeanPaneBatchActions(items);
+    if (batchActions) leanPaneBody.appendChild(batchActions);
+
     if (items.length > 0) {
       const treeElement = document.createElement("div");
       treeElement.className = "ol-lean-project-tree";
@@ -1354,28 +1357,96 @@
     renderLeanPaneManifest(lastLeanPaneManifest);
   }
 
+  // Stop a running batch: the companion halts further items and interrupts the
+  // one mid-run. The snapshot comes back `stopping` (then `canceled` once it
+  // settles); keep polling so the panel reflects the final stopped state.
+  async function cancelRepairBatch() {
+    const batchId = leanPaneRepairBatch?.batchId;
+    if (!batchId) return;
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/repair/all/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batchId })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok) leanPaneRepairBatch = payload;
+      startRepairBatchPolling({ immediate: true });
+    } catch (error) {
+      leanPaneRepairError = { itemKey: "batch", message: normalizeErrorMessage(error) };
+    }
+    renderLeanPaneManifest(lastLeanPaneManifest);
+  }
+
+  // Project-level "Stub all" / "Formalize all" launchers, above the item tree.
+  // Only one batch surface exists at a time: while a batch panel is showing
+  // (running, paused, or awaiting dismiss) the launchers stay hidden so a
+  // second batch can't clobber the first. Each button is present only when it
+  // has eligible work (un-stubbed theorems / not-yet-proven items).
+  function renderLeanPaneBatchActions(items) {
+    if (leanPaneRepairBatch) return null;
+    const stubbable = leanPaneView.stubbableItems(items);
+    const formalizable = leanPaneView.formalizableItems(items);
+    if (stubbable.length === 0 && formalizable.length === 0) return null;
+    const row = document.createElement("div");
+    row.className = "ol-lean-project-batch-actions";
+    if (stubbable.length > 0) {
+      const stubAll = document.createElement("button");
+      stubAll.type = "button";
+      stubAll.className = "ol-lean-secondary-button ol-lean-stub-all-button";
+      stubAll.textContent = `Stub all (${stubbable.length})`;
+      stubAll.title = "Generate a Lean sorry-stub for every un-stubbed theorem in the project.";
+      stubAll.addEventListener("click", () => { stubAllTheorems(); });
+      row.appendChild(stubAll);
+    }
+    if (formalizable.length > 0) {
+      const formalizeAll = document.createElement("button");
+      formalizeAll.type = "button";
+      formalizeAll.className = "ol-lean-primary-button ol-lean-formalize-all-button";
+      formalizeAll.textContent = `Formalize all (${formalizable.length})`;
+      formalizeAll.title = "Run Lea to formalize every theorem and definition that has no verified proof yet.";
+      formalizeAll.addEventListener("click", () => { formalizeAllItems(); });
+      row.appendChild(formalizeAll);
+    }
+    return row;
+  }
+
   // Live batch progress at the top of the pane: one line per item
   // (formatRepairOutcome), plus continue/dismiss controls when the batch
   // paused on a failure or the spend cap.
   function renderLeanPaneRepairBatchPanel() {
     const batch = leanPaneRepairBatch;
     if (!batch || !Array.isArray(batch.items) || batch.items.length === 0) return null;
+    const operation = batch.operation || "repair";
+    const noun = operation === "stub" ? "Stub" : operation === "formalize" ? "Formalize" : "Repair";
+    const doneVerb = operation === "stub" ? "stubbed" : operation === "formalize" ? "formalized" : "repaired";
+    const doneStates = operation === "stub"
+      ? ["stubbed"]
+      : operation === "formalize"
+        ? ["formalized", "disproved"]
+        : ["repaired", "needs_review"];
+    const runningVerb = operation === "stub" ? "Stubbing" : operation === "formalize" ? "Formalizing" : "Repairing";
     const panel = document.createElement("div");
     panel.className = "ol-lean-project-repair-batch";
     const heading = document.createElement("p");
-    const doneCount = batch.items.filter((entry) => ["repaired", "needs_review"].includes(entry.state)).length;
-    heading.textContent = batch.done
-      ? `Repair batch finished: ${doneCount}/${batch.items.length} repaired.`
-      : batch.pausedOn
-        ? batch.pausedOn.reason === "max_spend"
-          ? "Repair batch paused: the max spend limit was reached."
-          : `Repair batch paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
-        : `Repairing ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
+    const doneCount = batch.items.filter((entry) => doneStates.includes(entry.state)).length;
+    heading.textContent = batch.canceled
+      ? `${noun} all stopped: ${doneCount}/${batch.items.length} ${doneVerb} before stopping.`
+      : batch.stopping
+        ? "Stopping..."
+        : batch.done
+          ? `${noun} all finished: ${doneCount}/${batch.items.length} ${doneVerb}.`
+          : batch.pausedOn
+            ? batch.pausedOn.reason === "max_spend"
+              ? `${noun} all paused: the max spend limit was reached.`
+              : `${noun} all paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
+            : `${runningVerb} ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
     panel.appendChild(heading);
     for (const entry of batch.items) {
       const line = document.createElement("p");
       line.className = "ol-lean-project-repair-batch-item";
-      line.textContent = leanPaneView.formatRepairOutcome(entry);
+      line.textContent = leanPaneView.formatRepairOutcome(entry, operation);
       panel.appendChild(line);
     }
     if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
@@ -1386,6 +1457,17 @@
     }
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-detail-actions";
+    // Stop is available while the batch is actively working (not paused, not
+    // finished, not already stopping): it halts further items and interrupts
+    // the one mid-run.
+    if (!batch.done && !batch.pausedOn && !batch.stopping) {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "ol-lean-secondary-button ol-lean-stop-batch-button";
+      stop.textContent = "Stop";
+      stop.addEventListener("click", () => { cancelRepairBatch(); });
+      controls.appendChild(stop);
+    }
     if (batch.pausedOn) {
       const cont = document.createElement("button");
       cont.type = "button";
@@ -3045,6 +3127,66 @@
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
     return payload;
+  }
+
+  // Build the full per-item payload /stub and /formalize expect (the same shape
+  // the single-item formalize() sends), for every item a batch will run over.
+  async function buildBatchTargetPayloads(items) {
+    const overleafProjectId = extractOverleafProjectId();
+    const projectName = lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []);
+    const projectNamespace = lastProjectIdentity?.namespace || "";
+    return Promise.all(items.map(async (item) => {
+      const target = leanPaneView.paneItemToFormalizeTarget(item);
+      return {
+        overleafProjectId,
+        targetKind: target.targetKind,
+        targetLabel: target.targetLabel,
+        targetText: target.targetText,
+        targetUses: target.targetUses || [],
+        targetContext: target.targetContext || "",
+        projectName,
+        projectNamespace,
+        sourceHash: await sha256(normalizeTargetText(target.targetText))
+      };
+    }));
+  }
+
+  // "Stub all" / "Formalize all": the batch versions of the per-item buttons.
+  // They gather the eligible items from the live manifest, flush the .tex
+  // mirror (statement translation reads local notation), POST the full target
+  // set to the companion, then drive the SAME batch panel + polling the repair
+  // batch uses -- one shared progress surface, distinguished by `operation`.
+  async function runTargetBatch({ endpoint, items, errorKey }) {
+    leanPaneRepairError = null;
+    if (items.length === 0) return;
+    try {
+      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const baseUrl = await chatCompanionBaseUrl();
+      const payloads = await buildBatchTargetPayloads(items);
+      const response = await fetch(`${baseUrl}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overleafProjectId: extractOverleafProjectId(), items: payloads })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
+      leanPaneRepairBatch = payload;
+      startRepairBatchPolling();
+    } catch (error) {
+      leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
+    }
+    renderLeanPaneManifest(lastLeanPaneManifest);
+    scheduleLeanPaneRefresh();
+  }
+
+  function stubAllTheorems() {
+    const items = leanPaneView.stubbableItems(lastLeanPaneManifest?.items || []);
+    return runTargetBatch({ endpoint: "/stub/all", items, errorKey: "batch" });
+  }
+
+  function formalizeAllItems() {
+    const items = leanPaneView.formalizableItems(lastLeanPaneManifest?.items || []);
+    return runTargetBatch({ endpoint: "/formalize/all", items, errorKey: "batch" });
   }
 
   async function refreshSingleStatus(target) {

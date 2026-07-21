@@ -960,6 +960,16 @@ body.ol-lean-pane-resizing {
   line-height: 1.5;
 }
 
+/* Project-level "Stub all" / "Formalize all" launcher row, above the item
+   tree. Mirrors the detail-action row's flex layout. */
+.ol-lean-project-batch-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+}
+
 .ol-lean-project-repair-batch {
   margin: 10px 0;
   padding: 8px 10px;

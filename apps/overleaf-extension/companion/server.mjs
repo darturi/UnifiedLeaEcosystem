@@ -2173,7 +2173,12 @@ function repairBatchSnapshot(batch) {
   return {
     ok: true,
     batchId: batch.batchId,
+    operation: batch.operation || "repair",
     done: batch.done,
+    canceled: Boolean(batch.canceled),
+    // Cancel requested but the loop hasn't settled yet (the current item is
+    // still being interrupted) -- the panel shows "Stopping...".
+    stopping: Boolean(batch.cancelRequested) && !batch.done,
     running: batch.running,
     pausedOn: batch.pausedOn,
     items: batch.items.map(({ targetKind, targetLabel, state: itemState, reason, runJobId }) => ({
@@ -2228,6 +2233,7 @@ export async function handleLeanPaneRepairAll(payload, state) {
   repairBatchCounter += 1;
   const batch = {
     batchId: `repair-batch-${Date.now()}-${repairBatchCounter}`,
+    operation: "repair",
     overleafProjectId,
     createdAt: new Date().toISOString(),
     items: ordered,
@@ -2255,11 +2261,296 @@ export async function handleLeanPaneRepairAllContinue(payload, state) {
   if (batch.running) return { statusCode: 200, body: repairBatchSnapshot(batch) };
   if (batch.done) return { statusCode: 200, body: repairBatchSnapshot(batch) };
   batch.pausedOn = null;
-  runRepairBatch(state, batch).catch((error) => {
+  resumeBatch(state, batch).catch((error) => {
     batch.pausedOn = { targetLabel: null, reason: "batch_error", detail: error instanceof Error ? error.message : String(error) };
     batch.running = false;
   });
   return { statusCode: 200, body: repairBatchSnapshot(batch) };
+}
+
+// Resume a paused/continued batch on its own runner. Repair batches walk the
+// import graph (runRepairBatch); stub/formalize batches dispatch the matching
+// per-target handler (runTargetBatch). One dispatcher so the shared continue
+// endpoint (/lean-pane/repair/all/continue) resumes any operation.
+function resumeBatch(state, batch) {
+  return batch.operation === "repair"
+    ? runRepairBatch(state, batch)
+    : runTargetBatch(state, batch);
+}
+
+// Stop a batch mid-flight (any operation). Sets the cancel flag both runners
+// poll between items, and interrupts the item currently mid-run so "Stop"
+// halts promptly rather than only after the current theorem finishes. An
+// actively-looping batch settles itself in its own `finally`; a paused/idle
+// one (no live loop to observe the flag) is settled here.
+export async function handleBatchCancel(payload, state) {
+  const batch = state.repairBatches?.[String(payload?.batchId || "")];
+  if (!batch) return errorResponse(404, "unknown_batch", "No such batch (batches do not survive a companion restart).");
+  if (batch.done) return { statusCode: 200, body: repairBatchSnapshot(batch) };
+  batch.cancelRequested = true;
+  batch.pausedOn = null;
+  await interruptBatchActiveRun(state, batch);
+  if (!batch.running) {
+    finalizeCanceledBatch(batch);
+    publishEvent(state, "repair-batch-updated", {
+      overleafProjectId: batch.overleafProjectId,
+      batchId: batch.batchId
+    });
+  }
+  return { statusCode: 200, body: repairBatchSnapshot(batch) };
+}
+
+// Best-effort interrupt of the batch's currently-running item. Every run type
+// (formalize/stub/repair) records job.apiRunId at run start via the shared
+// runLeaProofJobForJob driver, so the running entry's job carries the id the
+// adapter needs to abort. A failure here is non-fatal: the loop still stops on
+// the cancel flag, just after the current item finishes on its own.
+async function interruptBatchActiveRun(state, batch) {
+  const running = batch.items.find((entry) => entry.state === "running");
+  const job = running?.runJobId ? state.jobs?.[running.runJobId] : null;
+  if (!job?.apiRunId) return;
+  let baseUrl;
+  try {
+    baseUrl = chatBaseUrls(state).baseUrl;
+  } catch {
+    return;
+  }
+  try {
+    await interruptApiRun({
+      fetchImpl: state.fetchImpl || fetch,
+      baseUrl,
+      apiKey: state.env?.LEA_API_KEY,
+      runId: job.apiRunId
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+// Terminal bookkeeping for a canceled batch: whatever hadn't settled becomes
+// "canceled", and the batch reads as done (dismissible, no longer polled).
+function finalizeCanceledBatch(batch) {
+  for (const entry of batch.items) {
+    if (entry.state === "pending" || entry.state === "running") {
+      entry.state = "canceled";
+      entry.reason = entry.reason || "canceled";
+    }
+  }
+  batch.canceled = true;
+  batch.pausedOn = null;
+  batch.done = true;
+}
+
+// --- Batch stub / formalize -------------------------------------------------
+// "Stub all" / "Formalize all" are the batch versions of POST /stub and
+// POST /formalize: the same sequential, spend-cap-aware, dependency-ordered
+// dispatch the repair batch pioneered, over a set of FULL target payloads
+// (unlike repair, which addresses already-recorded artifacts by label). The
+// batch record is shared with the repair path -- same snapshot, pruning,
+// continue endpoint, and repair-batch-updated event -- distinguished by
+// `operation`.
+
+// Order a set of targets so a target's dependencies (its `targetUses`) run
+// first, reusing the repair topo-sorter with labels standing in for modules
+// and the batch-local uses graph standing in for the project import graph.
+export function orderTargetsByUses(entries) {
+  const usesByLabel = new Map(
+    entries.map((entry) => [entry.targetLabel, (entry.payload.targetUses || []).map((u) => String(u || "").trim()).filter(Boolean)])
+  );
+  const asModules = entries.map((entry) => ({ ...entry, moduleName: entry.targetLabel }));
+  const { ordered } = topologicalRepairOrder(asModules, usesByLabel);
+  return { ordered, usesByLabel };
+}
+
+async function startTargetBatch(payload, state, operation) {
+  const overleafProjectId = String(payload?.overleafProjectId || "");
+  if (!overleafProjectId.trim()) {
+    return errorResponse(400, "missing_project_id", "overleafProjectId is required.");
+  }
+  const rawItems = Array.isArray(payload?.items) ? payload.items : [];
+  if (rawItems.length === 0) {
+    return errorResponse(400, "missing_items", "items is required and must be non-empty.");
+  }
+  const entries = [];
+  for (const raw of rawItems) {
+    const validation = validateTargetPayload({ ...raw, overleafProjectId });
+    if (!validation.ok) return errorResponse(400, validation.error, validation.message);
+    if (operation === "stub" && validation.targetKind !== "theorem") {
+      return errorResponse(400, "unsupported_stub_target", "Stub generation is only supported for theorem targets.");
+    }
+    entries.push({
+      targetKind: validation.targetKind,
+      targetLabel: validation.targetLabel,
+      // The full payload each per-item handler re-validates; carried on the
+      // in-memory batch only, never surfaced by repairBatchSnapshot.
+      payload: { ...raw, overleafProjectId },
+      state: "pending",
+      reason: null,
+      runJobId: null
+    });
+  }
+
+  // Same preflight trio as every run-starting handler.
+  await syncSharedSettingsFromAdapter(state);
+  const leaValidation = validateLeaRuntime(state, { requireApiKey: true });
+  if (!leaValidation.ok) return errorResponse(400, leaValidation.error, leaValidation.message);
+  if (await spendLimitReached(state)) return errorResponse(402, "max_spend_reached", MAX_SPEND_BLOCK_MESSAGE);
+
+  const { ordered, usesByLabel } = orderTargetsByUses(entries);
+
+  repairBatchCounter += 1;
+  const batch = {
+    batchId: `${operation}-batch-${Date.now()}-${repairBatchCounter}`,
+    operation,
+    overleafProjectId,
+    createdAt: new Date().toISOString(),
+    items: ordered,
+    usesByLabel,
+    pausedOn: null,
+    running: false,
+    done: false
+  };
+  state.repairBatches ||= {};
+  pruneRepairBatches(state.repairBatches);
+  state.repairBatches[batch.batchId] = batch;
+
+  runTargetBatch(state, batch).catch((error) => {
+    batch.pausedOn = { targetLabel: null, reason: "batch_error", detail: error instanceof Error ? error.message : String(error) };
+    batch.running = false;
+  });
+
+  return { statusCode: 200, body: repairBatchSnapshot(batch) };
+}
+
+export async function handleStubAll(payload, state) {
+  return startTargetBatch(payload, state, "stub");
+}
+
+export async function handleFormalizeAll(payload, state) {
+  return startTargetBatch(payload, state, "formalize");
+}
+
+// Poll a launched job to its terminal state. /formalize returns as soon as the
+// run starts (the driver finishes in the background), so the batch awaits the
+// job object -- `finishedAt` is set on every terminal path, including the
+// handler's own failure catch -- before moving to the next dependency-ordered
+// item. The deadline is a safety net; the run's own timeout settles it first.
+async function awaitJobSettled(state, jobId, { pollMs = 400, maxMs } = {}) {
+  const budget = maxMs
+    || (((state.settings?.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS) * 1000) + 60000);
+  const deadline = Date.now() + budget;
+  for (;;) {
+    const job = state.jobs?.[jobId];
+    if (!job) return null;
+    if (job.finishedAt) return job;
+    if (Date.now() > deadline) return job;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+async function runStubBatchItem(state, entry) {
+  const result = await handleStub(entry.payload, state);
+  const body = result?.body || {};
+  if (result?.statusCode === 402 || body.error === "max_spend_reached") return { paused: true };
+  if (result?.statusCode === 200 && body.status === "sorry_stub") {
+    return { ok: true, state: "stubbed", jobId: body.jobId || null };
+  }
+  return { ok: false, reason: body.error || body.message || "stub_failed", jobId: body.jobId || null };
+}
+
+async function runFormalizeBatchItem(state, entry) {
+  const result = await handleFormalize(entry.payload, state);
+  const body = result?.body || {};
+  if (result?.statusCode === 402 || body.error === "max_spend_reached") return { paused: true };
+  if (result?.statusCode !== 200 || !body.jobId) {
+    return { ok: false, reason: body.error || body.message || "formalize_start_failed", jobId: body.jobId || null };
+  }
+  const finalJob = await awaitJobSettled(state, body.jobId);
+  const status = String(finalJob?.status || "").toLowerCase();
+  if (status === "formalized" || finalJob?.finalStatus === "formalized") {
+    return { ok: true, state: "formalized", jobId: body.jobId };
+  }
+  if (status === "disproved") return { ok: true, state: "disproved", jobId: body.jobId };
+  return { ok: false, reason: finalJob?.error || finalJob?.resultDetail || "formalize_failed", jobId: body.jobId };
+}
+
+async function runTargetBatch(state, batch) {
+  if (batch.running) return;
+  batch.running = true;
+  const publishBatch = () => publishEvent(state, "repair-batch-updated", {
+    overleafProjectId: batch.overleafProjectId,
+    batchId: batch.batchId
+  });
+  publishBatch();
+  try {
+    for (const entry of batch.items) {
+      if (batch.cancelRequested || batch.pausedOn) break;
+      if (entry.state !== "pending") continue;
+      if (await spendLimitReached(state)) {
+        batch.pausedOn = { targetLabel: entry.targetLabel, reason: "max_spend" };
+        break;
+      }
+
+      entry.state = "running";
+      publishBatch();
+      const outcome = batch.operation === "stub"
+        ? await runStubBatchItem(state, entry)
+        : await runFormalizeBatchItem(state, entry);
+
+      // Stopped mid-run: the run was interrupted by handleBatchCancel. Record
+      // the current item as canceled and let the `finally` settle the rest.
+      if (batch.cancelRequested) {
+        entry.state = "canceled";
+        entry.runJobId = outcome.jobId || entry.runJobId || null;
+        break;
+      }
+
+      // A cap reached mid-run pauses (resumable) rather than failing the item.
+      if (outcome.paused) {
+        entry.state = "pending";
+        batch.pausedOn = { targetLabel: entry.targetLabel, reason: "max_spend" };
+        break;
+      }
+      if (outcome.ok) {
+        entry.state = outcome.state;
+        entry.runJobId = outcome.jobId || null;
+        publishBatch();
+        continue;
+      }
+
+      entry.state = "failed";
+      entry.reason = outcome.reason || "run_failed";
+      entry.runJobId = outcome.jobId || null;
+
+      // Formalization carries dependency semantics: items that (transitively)
+      // USE this failed one can't formalize against it, so skip them and pause
+      // for the user's continue/stop decision on the independent remainder.
+      // Stubbing is a pure per-statement translation with no such coupling --
+      // one failure never blocks the rest, so the loop just continues.
+      if (batch.operation === "formalize") {
+        for (const other of batch.items) {
+          if (other.state !== "pending") continue;
+          if (importsReach(other.targetLabel, entry.targetLabel, batch.usesByLabel)) {
+            other.state = "skipped";
+            other.reason = `depends_on_failed:${entry.targetLabel}`;
+          }
+        }
+        if (batch.items.some((other) => other.state === "pending")) {
+          batch.pausedOn = { targetLabel: entry.targetLabel, reason: "run_failed" };
+        }
+        break;
+      }
+      publishBatch();
+    }
+  } finally {
+    batch.running = false;
+    if (batch.cancelRequested) {
+      finalizeCanceledBatch(batch);
+    } else {
+      batch.done = batch.items.every((entry) => entry.state !== "pending" && entry.state !== "running") && !batch.pausedOn;
+    }
+    publishBatch();
+  }
 }
 
 export async function handleLeanPaneRepairStatus(payload, state) {
@@ -2294,7 +2585,7 @@ async function runRepairBatch(state, batch) {
   publishBatch();
   try {
     for (const entry of batch.items) {
-      if (batch.pausedOn) break;
+      if (batch.cancelRequested || batch.pausedOn) break;
       if (entry.state !== "pending") continue;
       // A cap reached mid-batch pauses (resumable once raised) rather than
       // failing the item.
@@ -2325,6 +2616,13 @@ async function runRepairBatch(state, batch) {
       publishBatch();
       await started.runPromise;
 
+      // Stopped mid-run: the run was interrupted by handleBatchCancel. Record
+      // the current item as canceled and let the `finally` settle the rest.
+      if (batch.cancelRequested) {
+        entry.state = "canceled";
+        break;
+      }
+
       const finalJob = state.jobs[started.job.jobId] || started.job;
       if (finalJob.finalStatus === "repaired") {
         entry.state = finalJob.lastRepair?.state === "needs_review" ? "needs_review" : "repaired";
@@ -2350,7 +2648,11 @@ async function runRepairBatch(state, batch) {
     }
   } finally {
     batch.running = false;
-    batch.done = batch.items.every((entry) => entry.state !== "pending" && entry.state !== "running") && !batch.pausedOn;
+    if (batch.cancelRequested) {
+      finalizeCanceledBatch(batch);
+    } else {
+      batch.done = batch.items.every((entry) => entry.state !== "pending" && entry.state !== "running") && !batch.pausedOn;
+    }
     publishBatch();
   }
 }
@@ -2942,6 +3244,12 @@ async function routeRequest(request, response, state) {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/lean-pane/repair/all/cancel") {
+    const result = await handleBatchCancel(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/lean-pane/repair/status") {
     const result = await handleLeanPaneRepairStatus(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
@@ -2954,8 +3262,20 @@ async function routeRequest(request, response, state) {
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/formalize/all") {
+    const result = await handleFormalizeAll(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/stub") {
     const result = await handleStub(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/stub/all") {
+    const result = await handleStubAll(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }
