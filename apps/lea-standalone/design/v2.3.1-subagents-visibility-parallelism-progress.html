@@ -54,6 +54,7 @@
   .todo.is-dropped { opacity: .62; background: var(--bg); }
   .todo.is-dropped .title s { text-decoration-thickness: 1px; }
   .todo.is-done { opacity: .62; }
+  .todo.is-skipped { opacity: .6; }
   .todo .top { display: flex; align-items: center; gap: 10px; }
   .id { font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
     background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 1px 7px; min-width: 30px;
@@ -74,6 +75,7 @@
   .b-done { background: #dcefe1; color: var(--green); }
   .b-unplanned { background: #efe7f3; color: #7a5a9a; }
   .b-dropped { background: #ecebe8; color: #8a847c; text-decoration: none; }
+  .b-skipped { background: #eef0f4; color: #6a7d8a; }
   .scope { color: var(--muted); font-size: 13px; margin: 6px 0 0 0; }
   .haz { display: inline-block; font: 600 10.5px ui-monospace, monospace; color: var(--red);
     background: #fbeeec; border: 1px solid #ecc9c2; border-radius: 5px; padding: 0 5px; margin-right: 4px; }
@@ -109,8 +111,8 @@
     <b>absent from the UI entirely</b> until it finished.
   </div>
 
-  <div class="bar"><i style="width:30%"></i></div>
-  <div class="counts">6 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 verified, B1 built) · 1 dropped (B2) · 16 queued across C–G · <b>23 total</b> &nbsp;·&nbsp; <b>Phase B complete</b>
+  <div class="bar"><i style="width:35%"></i></div>
+  <div class="counts">7 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 verified, B1 built, C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 12 queued across D–G · <b>23 total</b> &nbsp;·&nbsp; <b>Phase B complete</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -273,39 +275,50 @@
   <!-- ─────────────────────────────  PHASE C  ───────────────────────────── -->
   <div class="group">
     <h2>Phase C · Cross-agent context <span style="text-transform:none;font-weight:400">(the Memory channel)</span></h2>
-    <p class="ghint">Stop every child re-deriving what the coordinator already learned. The mechanism exists — wire it.</p>
+    <p class="ghint"><b>⏸ Skipped for now</b> — deferred, not dropped: valid work, parked until cross-agent reuse
+      actually bites (revisit around/after E). Constraints to honor when we pick it up: <b>coordinator is the sole
+      writer</b> to <code>.lea/memory.md</code> (children report facts in their result envelope; direct child writes
+      recreate the parallel-writer race E2 introduces), and record <b>obstacles, not conclusions</b> (a child's "X
+      failed" is evidence of that attempt, not proof the approach is dead — else Memory accrues false negatives). Core
+      payload = a lean symbol→module+signature index (built by the cheap <code>premise-search</code> scout), not file
+      bodies, so it doesn't become its own context cost. <b>(C4 pulled out and done</b> — it was a self-contained
+      prompt fix, not part of the Memory-channel wiring; C1–C3 remain parked.)</p>
 
-    <div class="todo is-planned">
+    <div class="todo is-skipped">
       <div class="top"><span class="id sub">C1</span><span class="title">Coordinator actually writes durable facts to <code>.lea/memory.md</code></span>
-        <span class="tag prover">prover</span><span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+        <span class="tag prover">prover</span><span class="tag be">adapter</span><span class="badge b-skipped">Skipped</span></div>
       <div class="scope"><b>Write gap.</b> The project Memory doc exists and the prompt says "maintaining this is part
         of your job," yet after ~90 turns of discovery it's still the <b>empty 3-line default</b>. Sharpen and un-bury
         the instruction; nudge the coordinator to record the import map, verified lemma locations, and dead ends.</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-skipped">
       <div class="top"><span class="id sub">C2</span><span class="title">Propagate the compact Memory into every child's context</span>
-        <span class="tag prover">prover</span><span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+        <span class="tag prover">prover</span><span class="tag be">adapter</span><span class="badge b-skipped">Skipped</span></div>
       <div class="scope"><b>Read gap.</b> Children are spawned in-process with <i>just their task</i> and bypass the
         bridge's project-context injection, so they never see <code>.lea/memory.md</code>. Inject the compact Memory
         into each child's starting context (<code>_child_config</code>/<code>spawn_subagent</code>). <b>Subsumes the
         environment re-discovery</b> — no more each child re-finding "Subgroup lives under <code>Algebra/Group/Subgroup</code>."</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-skipped">
       <div class="top"><span class="id be">C3</span><span class="title">Seed the environment brief at project init</span>
-        <span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
+        <span class="tag be">adapter</span><span class="badge b-skipped">Skipped</span></div>
       <div class="scope">Pre-populate <code>.lea/memory.md</code> (or a skill) with this Mathlib version's import
         conventions + key module locations, so the map exists <i>before</i> any agent runs. Optional once C1/C2 flow,
         but removes the cold-start on a fresh project.</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-done">
       <div class="top"><span class="id sub">C4</span><span class="title">Coordinator collates via <code>read_file</code>, not <code>bash ls</code></span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">The coordinator spelunks child scratch dirs with <code>bash ls</code> (tripping the approval
-        gate) instead of <code>read_file</code> on the candidate path the sub-agent result already hands it — and
-        re-verifies in its 15M-token context. Point it at the candidate path directly; cut the gate friction.</div>
+        <span class="tag prover">prover</span><span class="badge b-done">Done</span></div>
+      <div class="scope"><b>Done — prompt fix</b> (pulled out of the C skip; self-contained). The result envelope already
+        hands the coordinator the candidate <b>path + <code>lean_check</code> verdict</b>, but a live run ignored it,
+        spelunked with <code>bash ls</code> (tripping the approval gate), then redundantly re-verified the isolated
+        candidate. Sharpened <code>lea.md</code> step 3: <code>read_file</code> the provided path (never
+        <code>bash ls</code>); <b>don't re-check the candidate standalone</b> (the child's verdict is evidence); your
+        <b>one <code>lean_check</code> is on the assembled file</b> — validating the merge (imports, namespace
+        collisions, shadowing) and catching any cheat in the real context. Strictly <i>less</i> work than before.</div>
     </div>
   </div>
 
