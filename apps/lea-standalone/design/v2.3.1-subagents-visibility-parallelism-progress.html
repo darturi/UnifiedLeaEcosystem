@@ -109,8 +109,8 @@
     <b>absent from the UI entirely</b> until it finished.
   </div>
 
-  <div class="bar"><i style="width:17%"></i></div>
-  <div class="counts">4 landed on <code>fix/subagent-workflow</code> (all verified, pending commit) · 19 queued across B–G · <b>23 total</b>
+  <div class="bar"><i style="width:30%"></i></div>
+  <div class="counts">6 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 verified, B1 built) · 1 dropped (B2) · 16 queued across C–G · <b>23 total</b> &nbsp;·&nbsp; <b>Phase B complete</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -226,33 +226,47 @@
     <h2>Phase B · Resource &amp; correctness <span style="text-transform:none;font-weight:400">(do first — parallelism multiplies these)</span></h2>
     <p class="ghint">Bugs that are annoying at N=1 and catastrophic at N=many. These gate the headline.</p>
 
-    <div class="todo is-planned">
+    <div class="todo is-prog">
       <div class="top"><span class="id sub">B1</span><span class="title">Reap leaked <code>lean --worker</code> processes</span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+        <span class="tag prover">prover</span><span class="badge b-prog">Built</span></div>
       <div class="scope"><span class="haz">P0</span> A live run left <b>~118 idle <code>lean --worker</code></b>
-        processes. Each new-file <code>lean_check</code> spawns a worker that is never killed; each holds Mathlib state
-        (hundreds of MB+). It's the real perf killer today, and it <b>multiplies once children run in parallel</b>. Reap
-        per-check / on child teardown; audit <code>lsp_daemon</code> worker lifecycle. <b>Precedent:</b> the SDK's
-        <code>DelegateExecutor.close()</code> explicitly <code>conversation.close()</code>s every sub-agent on teardown
-        (<code>delegate/impl.py</code>) — child cleanup is a first-class step there, not an afterthought.</div>
+        processes: <code>lean --server</code> keeps one worker per <i>open</i> document and the daemon never sent
+        <code>didClose</code>, so every unique sub-agent scratch file leaked one (hundreds of MB–GB each) — enough to
+        swap the machine. <b>Fixed:</b> <code>LeanDaemon.close_documents_under()</code> + a module fan-out;
+        <code>spawn_subagent</code> <code>didClose</code>s the child's whole scratch tree in a <code>finally</code> when
+        the child returns (those candidates are never re-checked — the parent collates via the filesystem). Skips
+        in-flight uris; matches on resolved paths. 14 unit tests; sub-agents suite 30/30. Committed <code>66080c8</code>.
+        <span class="p1">deferred → TODO.md</span>: the top-level/coordinator case (same leak at ~1/N the rate;
+        LRU-cap backstop). <b>To reach Tested:</b> a live sub-agent burst confirming the worker count stays bounded.</div>
     </div>
 
-    <div class="todo is-planned">
-      <div class="top"><span class="id sub">B2</span><span class="title">One <code>candidate.lean</code>, edited in place — no scratch/explore files</span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope"><span class="haz">P0</span> proof-candidate scatters <code>candidate.lean</code>,
-        <code>find_def.lean</code>, <code>explore_action4.lean</code>, <code>test_fintype.lean</code>… Every <b>new</b>
-        file forces a full <b>cold elaboration</b> of the heavy Mathlib imports — the daemon's ~0.2s fast path only
-        helps <i>in-place edits of an already-open file</i>. Harden the prompt to a single <code>candidate.lean</code>
-        edited in place; forbid scratch/explore files. Directly fixes the slow-<code>lean_check</code> complaint.</div>
+    <div class="todo is-dropped">
+      <div class="top"><span class="id sub">B2</span><span class="title"><s>One <code>candidate.lean</code>, edited in place — no scratch/explore files</s></span>
+        <span class="tag prover">prover</span><span class="badge b-dropped">Dropped</span></div>
+      <div class="scope"><b>Closed — not a real issue.</b> The premise was that scattering scratch files
+        (<code>find_def.lean</code>, <code>explore_action4.lean</code>…) is a bug, since each <b>new</b> file cold-loads
+        Mathlib (~15–30s) while only in-place edits hit the daemon's ~0.2s path. But that conflated <b>wasteful churn</b>
+        (opening a new file to tweak the same proof) with <b>legitimate multi-file exploration</b> — which is a feature,
+        and which a "one file only" rule would fight (the coordinator→sub-lemma→assemble flow <i>wants</i> multiple
+        files). And <b>B1 already removed the teeth</b>: extra files are now merely slower, not fatal (no more
+        leaked-worker swap storm). The latency residue is best handled by <i>incentives</i> — iterate in place, import
+        narrowly, probe via <code>search_mathlib</code>/<code>premise-search</code> instead of throwaway compiles — not a
+        restriction. Nothing to build.</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">B3</span><span class="title">LSP daemon: concurrent checks from multiple children</span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope"><span class="p1">prereq for E2</span> Two children compiling at once hit the same per-root
-        daemon. Verify/harden concurrent <code>lean_check</code> (extend <code>test_concurrent_checks</code>) so parallel
-        children don't serialize or corrupt at the daemon layer. Compose with B1 (concurrency ⇒ more workers).</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><span class="p1">prereq for E2</span> <b>Verified — no code change needed.</b> The daemon is
+        already concurrent by design (one reader thread demuxes responses by request id + notifications by uri; distinct
+        docs run in parallel, only same-uri checks serialize). Extended <code>test_concurrent_checks</code> with a
+        multi-child scenario: <b>4 concurrent documents sharing the basename <code>candidate.lean</code> and identical
+        content</b> — the worst case for the same-stem/same-content race — every verdict correctly attributed to its own
+        file, no serialization to timeout, <b>no cross-talk</b> (16 checks). Also proves the B1 interaction:
+        <code>close_documents_under</code> reaping a finished child <b>while 3 siblings are mid-check</b> drops exactly
+        that child's uri and disturbs no sibling. <b>Real-Lean guard green</b> — the daemon layer B3 owns is tested on
+        the actual toolchain. (The full <code>spawn_subagent</code> parallel-child <i>pipeline</i> rides along when E2
+        lands — that's E2's validation, not B3's.)</div>
     </div>
   </div>
 
