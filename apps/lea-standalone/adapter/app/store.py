@@ -835,13 +835,13 @@ def update_run(
 
 
 def fail_stale_active_runs() -> int:
-    """Crash recovery, called once at startup: any run still `pending`/`running`
-    in the DB has no live runner thread (they died with the previous process), so
-    mark it failed. Without this, a run created but never driven — e.g. its client
-    gave up while queued for the single-run slot — sits `pending` forever and the
-    derived session status (D14) shows an eternal 'thinking'. Returns the count."""
+    """Crash recovery, called once at startup: a run still `running` in the DB
+    has no live worker after a restart, so mark it failed. `pending` runs are
+    NOT reaped anymore (Phase 2): they are honest queue entries that
+    bridge.recover_runs_at_startup re-enqueues, so queued work survives a
+    restart instead of being stranded. Returns the count reaped."""
     now = utc_now()
-    detail = "Run did not finish: the adapter restarted (or the run was never started) before it completed."
+    detail = "Run did not finish: the adapter restarted before it completed."
     with connect() as conn:
         cursor = conn.execute(
             """
@@ -850,7 +850,7 @@ def fail_stale_active_runs() -> int:
                 result_kind = coalesce(result_kind, 'failed'),
                 result_detail = coalesce(result_detail, ?),
                 updated_at = ?
-            where status in ('pending', 'running')
+            where status = 'running'
             """,
             (detail, now),
         )
@@ -1003,6 +1003,118 @@ def get_run_status(run_id: str) -> dict | None:
             (run_id,),
         ).fetchone()
     return row_to_dict(row) if row else None
+
+
+def list_runs_by_status(status: str) -> list[dict]:
+    """Runs with a status in stable FIFO order, used for startup recovery."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from runs where status = ? order by created_at asc, id asc",
+            (status,),
+        ).fetchall()
+    return [_normalize_run(row_to_dict(row)) for row in rows]
+
+
+# --- Structured artifact index (PLAN-system-hardening 4.1) -------------------
+# One row per (scope, declaration): "declaration X currently lives at path Y".
+# Written by the run finalizer; read by the Overleaf companion instead of
+# reverse-engineering artifacts from registry-markdown diffs.
+
+def upsert_artifact(
+    *,
+    project_id: str | None,
+    session_id: str | None,
+    run_id: str | None,
+    declaration_name: str,
+    kind: str | None,
+    path: str,
+    module_name: str | None,
+) -> dict:
+    scope = project_id or session_id
+    if not scope:
+        raise ValueError("an artifact needs a project or a session scope")
+    now = utc_now()
+    # Concurrent runs can finish in the same project, so serialize the
+    # read-then-upsert and keep one stable row id per (scope, declaration).
+    with write() as conn:
+        existing = conn.execute(
+            "select id from artifacts where scope = ? and declaration_name = ?",
+            (scope, declaration_name),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "update artifacts set project_id = ?, session_id = ?, run_id = ?,"
+                " kind = ?, path = ?, module_name = ?, updated_at = ? where id = ?",
+                (project_id, session_id, run_id, kind, path, module_name, now, existing["id"]),
+            )
+            artifact_id = existing["id"]
+        else:
+            artifact_id = str(uuid4())
+            conn.execute(
+                "insert into artifacts (id, scope, project_id, session_id, run_id,"
+                " declaration_name, kind, path, module_name, created_at, updated_at)"
+                " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (artifact_id, scope, project_id, session_id, run_id,
+                 declaration_name, kind, path, module_name, now, now),
+            )
+        row = conn.execute("select * from artifacts where id = ?", (artifact_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def latest_check_for_project_path(project_id: str, path: str) -> dict | None:
+    """The newest recorded check verdict for a repo-relative path across ALL of
+    a project's sessions (they share one repo, D24). One of the ledger facts
+    the target-status endpoint serves (PLAN 4.4): agent runs, manual edits,
+    and cascade re-checks all land in the unified timeline."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select t.check_status, t.check_detail, t.author, t.data, t.created_at
+            from timeline t
+            join sessions s on s.id = t.session_id
+            where s.project_id = ? and t.kind = 'code' and t.path = ?
+              and t.check_status is not null
+            order by t.created_at desc, t.id desc
+            limit 1
+            """,
+            (project_id, path),
+        ).fetchone()
+    if not row:
+        return None
+    result = row_to_dict(row)
+    if result.get("data"):
+        try:
+            result["author"] = json.loads(result["data"]).get("reason") or result["author"]
+        except (TypeError, ValueError):
+            pass
+    result.pop("data", None)
+    return result
+
+
+def list_artifacts_for_scope(scope: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from artifacts where scope = ? order by declaration_name asc",
+            (scope,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def queue_position(run_id: str) -> int | None:
+    """How many pending runs precede this pending run (0 = next up). None when
+    the run is not pending. Derived, never stored — invariant 2."""
+    with connect() as conn:
+        row = conn.execute(
+            "select created_at, id, status from runs where id = ?", (run_id,)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            return None
+        ahead = conn.execute(
+            "select count(*) as n from runs where status = 'pending'"
+            " and (created_at < ? or (created_at = ? and id < ?))",
+            (row["created_at"], row["created_at"], row["id"]),
+        ).fetchone()
+    return int(ahead["n"])
 
 
 def set_run_transcript(run_id: str, messages: list) -> None:
@@ -1452,8 +1564,14 @@ def session_detail(session_id: str) -> dict | None:
         ).fetchone()
         # Per-run outcomes (id + status), so the UI can place the "Proved"
         # milestone after the run that completed — live and on reload (M16).
+        # Usage columns ride along for the Overleaf companion, whose
+        # fetchApiRunUsage reads this run's tokens/cost off the persisted row
+        # (they were missing here, so every companion job recorded $0 — caught
+        # by the Phase 1 integration harness, PLAN-system-hardening).
         runs = conn.execute(
-            "select id, status, result_kind, result_detail from runs where session_id = ? order by created_at asc, id asc",
+            "select id, status, result_kind, result_detail,"
+            " input_tokens, output_tokens, cost_usd"
+            " from runs where session_id = ? order by created_at asc, id asc",
             (session_id,),
         ).fetchall()
         project = None

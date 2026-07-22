@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import difflib
 import logging
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Queue
-from threading import Event
+from threading import Event, Lock, Thread
 from typing import Any
 
 from uuid import uuid4
@@ -55,20 +56,18 @@ from lea.interface import (
     run_events,
 )
 
-from .artifacts import classify_lean_artifact
-from .config import LeaConfig
+from .artifacts import classify_lean_artifact, extract_declaration_name
+from .config import LeaConfig, load_config
 from .gitstore import GitStore, GitStoreError
 from . import collation, projects, runbroker, runregistry, skills_catalog, store, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
-# Admission — which run may start and whether there's room — now lives in
-# `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim,
-# decided at the SSE endpoint *before* this module's run thread is spawned. That
-# replaces the old split where the endpoint peeked an `_active_run_id` scalar while
-# the real claim happened later here (an `active_run_lock.acquire` inside the thread)
-# — a TOCTOU where two attaches both peeked None and both spawned. run_lea no longer
-# holds a single-slot lock or a scalar; it releases its admitted slot in the finally.
+# Admission — which run may start and whether there's room — lives in
+# `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim.
+# The FIFO dispatcher claims the slot before spawning the run thread, avoiding
+# the old endpoint-peek/thread-claim TOCTOU. ``run_lea`` releases that slot in
+# its ``finally`` on every exit.
 
 # Per-run cooperative stop flags (D18). The run registers its Event when it starts
 # and the interrupt endpoint sets it; the agent checks it at each turn boundary and
@@ -82,6 +81,130 @@ def request_stop(run_id: str) -> None:
     _stop_events.setdefault(run_id, Event()).set()
 
 
+# --- Capacity-aware FIFO dispatcher (integrates v2.3 + hardening Phase 2) -----
+# POST /api/runs enqueues immediately and GET /events only observes. A single
+# dispatcher preserves FIFO admission order, while the v2.3 registry still allows
+# up to LEA_MAX_CONCURRENT_RUNS admitted drivers at once. Each admitted run gets
+# the existing rejoinable RunBroker, so reconnect/cursor semantics and concurrent
+# sub-agent work remain intact. This replaces gen_repair's single-run event hub;
+# the broker is the one event source for both interactive and Overleaf clients.
+_run_queue: "Queue[str]" = Queue()
+_worker_guard = Lock()
+_worker_thread: Thread | None = None
+
+
+def _resolve_task(run: dict[str, Any]) -> str | None:
+    session = store.session_detail(run["session_id"])
+    if not session or not session.get("messages"):
+        return None
+    return next(
+        (m["content"] for m in reversed(session["messages"])
+         if m["run_id"] == run["id"] and m["role"] == "user"),
+        None,
+    )
+
+
+def _worker_loop() -> None:
+    while True:
+        run_id = _run_queue.get()
+        try:
+            while True:
+                run = store.get_run(run_id)
+                if not run or run["status"] != "pending":
+                    if run:
+                        publish_terminal_from_row(run_id)
+                        runbroker.drop(run_id)
+                    break
+
+                task = _resolve_task(run)
+                if task is None:
+                    store.update_run(run_id, "failed", result_kind="failed",
+                                     result_detail="Run task not found.")
+                    publish_terminal_from_row(run_id)
+                    runbroker.drop(run_id)
+                    break
+
+                admission = runregistry.registry.try_admit(run_id, run["session_id"])
+                if admission.outcome == runregistry.ADMITTED:
+                    broker = runbroker.get(run_id) or runbroker.create(run_id)
+                    context = RunnerContext(
+                        session_id=run["session_id"],
+                        run_id=run_id,
+                        task=task,
+                        config=load_config(),
+                        events=broker,
+                        autonomous=bool(run.get("autonomous")),
+                    )
+                    try:
+                        Thread(target=run_lea, args=(context,), daemon=True,
+                               name=f"lea-run-{run_id[:8]}").start()
+                    except BaseException:
+                        runregistry.registry.release(run_id)
+                        store.update_run(run_id, "failed", result_kind="failed",
+                                         result_detail="Could not start the run worker.")
+                        publish_terminal_from_row(run_id)
+                        runbroker.drop(run_id)
+                        raise
+                    break
+
+                if admission.outcome == runregistry.ALREADY_ACTIVE:
+                    # A duplicate enqueue/recovery entry; the admitted driver owns it.
+                    break
+                if admission.outcome == runregistry.SESSION_BUSY and admission.incumbent_run_id:
+                    # Preserve main's per-session supersede behavior without letting
+                    # two turns mutate the same session concurrently.
+                    request_stop(admission.incumbent_run_id)
+                # AT_CAPACITY and SESSION_BUSY both retain this run's FIFO place.
+                time.sleep(0.1)
+        except Exception:  # noqa: BLE001 — the worker must survive any single run
+            logger.exception("Run worker failed while driving run %s", run_id)
+            try:
+                current = store.get_run(run_id)
+                if current and current["status"] in {"pending", "running"}:
+                    store.update_run(run_id, "failed")
+            except Exception:
+                logger.exception("Failed to mark run %s failed", run_id)
+            publish_terminal_from_row(run_id)
+            runbroker.drop(run_id)
+
+
+def enqueue_run(run_id: str) -> None:
+    """FIFO-enqueue a created run for capacity-aware background admission."""
+    global _worker_thread
+    if runbroker.get(run_id) is None:
+        runbroker.create(run_id)
+    with _worker_guard:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = Thread(target=_worker_loop, daemon=True, name="lea-run-dispatcher")
+            _worker_thread.start()
+    _run_queue.put(run_id)
+
+
+def recover_runs_at_startup() -> None:
+    """Re-enqueue pending rows after stale running rows are reaped on startup."""
+    for run in store.list_runs_by_status("pending"):
+        enqueue_run(run["id"])
+
+
+def publish_terminal_from_row(run_id: str) -> None:
+    """Publish a terminal frame for a run finalized without ``run_lea``.
+
+    Late observers can synthesize the same frame from the persisted row after
+    the broker is dropped; observers already attached to this broker receive it
+    live, which prevents an interrupted queued run from hanging.
+    """
+    run = store.get_run(run_id)
+    broker = runbroker.get(run_id)
+    if not run or broker is None:
+        return
+    payload: dict[str, Any] = {"status": run["status"]}
+    if run.get("result_kind"):
+        payload["result_kind"] = run["result_kind"]
+    if run.get("result_detail"):
+        payload["result_detail"] = run["result_detail"]
+    broker.put({"type": "done", "payload": payload})
+
+
 # --- Per-tool approval gate (D19) ------------------------------------------
 # Impactful tools prompt the human for allow/deny/always-session before running;
 # read-only tools + lean_check are auto-allowed (never gated). "Always allow this
@@ -90,10 +213,11 @@ def request_stop(run_id: str) -> None:
 # hook (A8); the adapter owns the policy + the human relay.
 GATED_TOOLS = {"bash", "write_file", "edit_file"}
 _APPROVAL_DECISIONS = {"allow", "deny", "always_session"}
+APPROVAL_DECISION_TIMEOUT_SECONDS = 900
 
 _session_allowlists: dict[str, set[str]] = {}
-# One in-flight approval per active run (one run at a time): run_id -> the pending
-# decision rendezvous between the run thread (waiting) and the endpoint (resolving).
+# One in-flight approval per active run: run_id -> the pending decision rendezvous
+# between that run thread (waiting) and the endpoint (resolving).
 _pending_approvals: dict[str, dict[str, Any]] = {}
 
 
@@ -125,11 +249,6 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
     `always_session` allowlist entry, emits `approval_resolved`, and returns
     `allow | deny | always_session`. Anything unexpected → `deny` (safe default)."""
     approval_id = uuid4().hex
-    _pending_approvals[run_id] = {"approval_id": approval_id, "event": Event(), "decision": None}
-    emit(events, "approval_requested", {
-        "approval_id": approval_id, "run_id": run_id, "session_id": session_id,
-        "tool_name": ev.tool_name, "args": ev.args,
-    })
     # Persist the pending approval onto the run row so it survives a stream drop,
     # a reconnect, or a session switch: `session_detail` re-surfaces
     # `active_run.pending_approval` and the UI rebuilds the same card. Without this
@@ -140,9 +259,27 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
     store.set_run_pending_approval(run_id, {
         "approval_id": approval_id, "tool_name": ev.tool_name, "args": ev.args,
     })
+    # Only expose the in-memory rendezvous after the durable reconnect state is
+    # present; then publish the event. A resolver can never observe the card before
+    # its decision target exists, and a reconnect can never observe the target
+    # before the persisted card exists.
+    _pending_approvals[run_id] = {
+        "approval_id": approval_id, "event": Event(), "decision": None,
+    }
+    emit(events, "approval_requested", {
+        "approval_id": approval_id, "run_id": run_id, "session_id": session_id,
+        "tool_name": ev.tool_name, "args": ev.args,
+    })
     pending = _pending_approvals[run_id]
+    # A run parked forever on an unanswered approval consumes one bounded
+    # concurrency slot indefinitely. Time out to the safe `deny` so queued work
+    # can continue even if its original observer disappeared.
+    waited = 0.0
     while not pending["event"].wait(timeout=0.5):
         if stop_event.is_set():
+            break
+        waited += 0.5
+        if waited >= APPROVAL_DECISION_TIMEOUT_SECONDS:
             break
     _pending_approvals.pop(run_id, None)
 
@@ -191,6 +328,19 @@ _FINISH_STATUS = {
 }
 
 _COMPLETED_RESULTS = {"proved", "disproved", "needs_review"}
+
+# Shown as result_detail when the bridge's own spend-cap stop ended the run, so
+# clients can tell a cap stop (result_kind="max_spend") from a user cancel. The
+# persisted run *status* stays "cancelled" — the status vocabulary is unchanged.
+_MAX_SPEND_DETAIL = "Max spend limit reached; the run was stopped at a turn boundary."
+
+# Usage is persisted only when a run finishes. While several admitted runs are
+# live, their in-flight cost would otherwise be invisible to each other's global
+# cap checks. This process-local overlay makes the check persisted-global plus
+# every active run's observed ``UsageUpdated`` total.
+_live_spend_lock = Lock()
+_live_run_costs: dict[str, float] = {}
+
 
 def _finished_status(ev: Finished) -> str:
     if ev.reason == "completed":
@@ -292,11 +442,57 @@ def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | N
     return "\n".join(parts)
 
 
+def _artifact_module_name(namespace: str | None, rel: str) -> str | None:
+    """Lean module for a repo-relative .lean path in a project repo (whose root
+    IS the namespace): `Lea.Project1` + `chapter/decl.lean` → `Lea.Project1.chapter.decl`.
+    None for loose sessions (no stable namespace) and non-.lean files."""
+    if not namespace or not rel.endswith(".lean"):
+        return None
+    return f"{namespace}.{rel[:-len('.lean')].replace('/', '.')}"
+
+
+def _record_run_artifacts(session_id, run_id, project, namespace, steps_by_path) -> None:
+    """Write the structured artifact index rows for this run's checked files
+    (PLAN-system-hardening 4.1). Only files whose latest step verdict is ok
+    are recorded — a broken write is not an artifact. Best-effort by design:
+    the index is a convenience the companion falls back gracefully without,
+    so failures log rather than fail the run."""
+    for rel, step_id in steps_by_path.items():
+        try:
+            step = store.latest_code_step_for_path(session_id, rel)
+            if (
+                not step
+                or step.get("id") != str(step_id)
+                or step.get("check_status") != "ok"
+            ):
+                continue
+            # SQL owns proof content on main (timeline -> artifact_blobs), so use
+            # the exact bytes carried by this run's checked code step. Reading a
+            # git commit_sha here would resurrect the stale dual-store design.
+            code = step.get("code") or ""
+            declaration = extract_declaration_name(code)
+            if not declaration:
+                continue
+            store.upsert_artifact(
+                project_id=project["id"] if project else None,
+                session_id=session_id,
+                run_id=run_id,
+                declaration_name=declaration,
+                kind=step.get("artifact_kind") or classify_lean_artifact(code),
+                path=rel,
+                module_name=_artifact_module_name(namespace, rel),
+            )
+        except Exception:
+            logger.exception("Could not record artifact row for %s in run %s", rel, run_id)
+
+
 def _relativize(path: str, repo: Path) -> str:
-    """A code_step's path is relative to the session repo (so `git show <sha>:<path>`
-    resolves). The agent writes absolute paths under the per-session workspace
-    (the prompt is pointed there), so this normally just strips the repo prefix;
-    a path outside the repo (drift) falls back to its basename."""
+    """Return a code step's path relative to the session workspace.
+
+    The agent writes absolute paths under that workspace (the prompt is pointed
+    there), so this normally just strips the prefix; a path outside it (drift)
+    falls back to its basename.
+    """
     p = Path(path)
     try:
         return str(p.resolve().relative_to(repo.resolve()))
@@ -518,9 +714,9 @@ def run_lea(context: RunnerContext) -> None:
     session_id = context.session_id
     run_id = context.run_id
 
-    # Admission (which run may start, and whether there's room) already happened at
-    # the endpoint (runregistry.try_admit) before this thread was spawned. run_lea no
-    # longer acquires a slot — it owns the one it was admitted into and releases it in
+    # Admission (which run may start, and whether there's room) already happened in
+    # the dispatcher before this thread was spawned. run_lea no longer acquires a
+    # slot — it owns the one it was admitted into and releases it in
     # the finally. Crucially the whole body, INCLUDING the setup that used to sit
     # outside the try, now runs inside one guarded region: a throw in setup releases
     # the slot instead of leaking it forever (v2.3 items 4/9).
@@ -561,6 +757,36 @@ def run_lea(context: RunnerContext) -> None:
     final_status = "failed"
     final_result_kind: str | None = None
     final_result_detail: str | None = None
+
+    # Mid-run spend enforcement (PLAN-system-hardening 0.1): the cap used to be
+    # checked only at POST /api/runs, so one run could overshoot it by its entire
+    # cost. The active-cost overlay above keeps concurrent, not-yet-persisted run
+    # spend visible. The agent halts at the next turn boundary, so one turn may
+    # overshoot but a run can no longer run away.
+    max_spend_usd = cfg.max_spend_usd
+    spend_capped = False
+    with _live_spend_lock:
+        _live_run_costs[run_id] = 0.0
+
+    def check_spend_cap() -> None:
+        nonlocal spend_capped
+        if spend_capped or max_spend_usd is None:
+            return
+        try:
+            persisted = float(store.usage_stats()["global"]["cost_usd"])
+        except Exception:
+            logger.exception("Could not read persisted spend; skipping this cap check")
+            return
+        with _live_spend_lock:
+            live = sum(_live_run_costs.values())
+        if persisted + live >= float(max_spend_usd):
+            spend_capped = True
+            stop_event.set()
+            emit(events, "status", {
+                "status": "max_spend",
+                "message": "Max spend limit reached — stopping this run.",
+                "turn": current_turn,
+            })
 
     def persist_assistant(text: str) -> None:
         nonlocal last_persisted
@@ -656,6 +882,7 @@ def run_lea(context: RunnerContext) -> None:
             elif isinstance(ev, TurnStarted):
                 flush_narration()
                 current_turn = ev.turn
+                check_spend_cap()
 
             elif isinstance(ev, ToolCalled):
                 intent = flush_narration()
@@ -725,6 +952,11 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, UsageUpdated):
                 usage.add(current_turn, ev.input_tokens, ev.output_tokens, ev.cost)
+                with _live_spend_lock:
+                    _live_run_costs[run_id] = (
+                        _live_run_costs.get(run_id, 0.0) + float(ev.cost or 0.0)
+                    )
+                check_spend_cap()
 
             elif isinstance(ev, ToolResulted):
                 # A project asset write (D33): a non-.lean write_file/edit_file in a
@@ -794,22 +1026,34 @@ def run_lea(context: RunnerContext) -> None:
                     )
                     if promoted:
                         checked_artifact_kind = promoted.get("artifact_kind") or checked_artifact_kind
+                        step_id_by_path[promoted["path"]] = promoted["id"]
                         produced_clean = True
                 final_text = _final_text_for_result(ev)
                 persist_assistant(final_text)
                 final_status, result_kind = _completed_artifact_result(ev, checked_artifact_kind)
                 final_result_kind = result_kind
                 final_result_detail = None if result_kind == "defined" else ev.result_detail
+                if spend_capped and ev.reason != "completed":
+                    # Our own cap-triggered stop, not a user cancel: label it. A
+                    # run that completed anyway (finished the proof in the same
+                    # turn the cap tripped) keeps its real result.
+                    final_result_kind = "max_spend"
+                    final_result_detail = _MAX_SPEND_DETAIL
                 store.update_run(
                     run_id, final_status, final_text=final_text,
                     input_tokens=ev.usage.input_tokens, output_tokens=ev.usage.output_tokens,
                     cost_usd=ev.cost,
-                    result_kind=result_kind, result_detail=final_result_detail,
+                    result_kind=final_result_kind, result_detail=final_result_detail,
                 )
                 store.replace_run_usage_breakdown(run_id, usage.rows())
                 # Persist the faithful conversation for the next activation to replay
                 # (multi-turn, D16). Only here, on Finished — an errored run stores none.
                 store.set_run_transcript(run_id, ev.transcript.get("messages", []))
+                # Structured artifact index (4.1): record which declarations this
+                # run's checked files hold, keyed to the run's own FileChanged set.
+                _record_run_artifacts(
+                    session_id, run_id, project, namespace, dict(step_id_by_path)
+                )
 
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)
@@ -824,7 +1068,9 @@ def run_lea(context: RunnerContext) -> None:
         skills_catalog.cleanup(skills_tempdir)
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
-        # Release the admission slot (paired with the endpoint's try_admit). Idempotent,
+        with _live_spend_lock:
+            _live_run_costs.pop(run_id, None)
+        # Release the admission slot (paired with the dispatcher's try_admit). Idempotent,
         # so a run that reaches here unadmitted — e.g. a direct unit-test call to
         # run_lea, which never goes through the endpoint — is a harmless no-op.
         runregistry.registry.release(run_id)
@@ -834,8 +1080,8 @@ def run_lea(context: RunnerContext) -> None:
         if final_result_detail:
             done_payload["result_detail"] = final_result_detail
         emit(events, "done", done_payload)
-        # The run has ended: retire its broker so no new connection attaches to a
-        # finished stream (a late reconnect is caught by the endpoint's terminal-status
-        # 409). Subscribers still draining hold their own reference and exit on `done`.
-        # Idempotent, so a direct unit-test call to run_lea (no broker) is a no-op.
+        # The run has ended: retire its broker. Subscribers already draining hold
+        # their own reference and exit on `done`; a late observer gets a synthesized
+        # terminal event from the persisted run row. Idempotent, so a direct unit-test
+        # call to run_lea (no broker) is a no-op.
         runbroker.drop(run_id)

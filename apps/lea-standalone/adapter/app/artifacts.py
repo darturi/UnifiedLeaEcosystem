@@ -43,3 +43,51 @@ def classify_lean_artifact(code: str | None) -> str:
 def _scrub_comments_and_strings(code: str) -> str:
     without_comments = _LINE_COMMENT_RE.sub(" ", _BLOCK_COMMENT_RE.sub(" ", code))
     return _STRING_RE.sub('""', without_comments)
+
+
+_NAMED_DECL_RE = re.compile(
+    r"(?m)^\s*(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+|partial\s+)*"
+    r"(?:theorem|lemma|def|abbrev|structure|class|inductive|coinductive|instance|opaque)\s+"
+    r"([A-Za-z_][A-Za-z0-9_']*)"
+)
+
+
+def extract_declaration_name(code: str | None) -> str | None:
+    """The first top-level declaration's name, or None.
+
+    Recorded proof files are one-declaration-per-file by convention, so "first
+    declaration" is "the declaration". Used by the run finalizer to write the
+    structured artifact index (PLAN-system-hardening 4.1) — the durable answer
+    to "which declaration lives in which file" that clients previously had to
+    reverse-engineer from filesystem diffs."""
+    if not code:
+        return None
+    scrubbed = _scrub_comments_and_strings(code)
+    match = _NAMED_DECL_RE.search(scrubbed)
+    return match.group(1) if match else None
+
+
+_SORRY_MARKER_RE = re.compile(r"\b(sorry|admit)\b")
+
+
+def contains_sorry_marker(code: str | None) -> bool:
+    """True when the code still leans on sorry/admit — comments and strings
+    scrubbed first, so prose like `-- no sorry here` doesn't count. The
+    ledger-side twin of the companion's containsSorryMarker (PLAN 4.4): status
+    verdicts move adapter-side, so the scan lives here too."""
+    if not code:
+        return False
+    return bool(_SORRY_MARKER_RE.search(_scrub_comments_and_strings(code)))
+
+
+def declaration_present(code: str | None, name: str) -> bool:
+    """Whether a top-level declaration with this exact name exists in the code
+    (comments/strings scrubbed)."""
+    if not code or not name:
+        return False
+    pattern = re.compile(
+        r"(?m)^\s*(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+|partial\s+)*"
+        r"(?:theorem|lemma|def|abbrev|structure|class|inductive|coinductive|instance|opaque)\s+"
+        + re.escape(name) + r"(?![A-Za-z0-9_'])"
+    )
+    return bool(pattern.search(_scrub_comments_and_strings(code)))

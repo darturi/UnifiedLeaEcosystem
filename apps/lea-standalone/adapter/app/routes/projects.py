@@ -21,6 +21,7 @@ from lea.interface import check as interface_check
 from ..config import load_config, github_token
 from ..gitstore import GitStore, GitStoreError
 from .. import blueprint as blueprint_doc
+from .. import blueprint_seed
 from .. import filesystem as fs_service
 from .. import graph as graph_service
 from .. import projects as project_service
@@ -75,6 +76,10 @@ class MirrorFile(BaseModel):
 class MirrorRequest(BaseModel):
     files: list[MirrorFile]
     source: str = "overleaf"
+    # "reconcile" (default) treats the payload as the full truth set — absent
+    # files are deleted. "upsert" writes only the provided files (the active-
+    # buffer tier of the tex mirror, PLAN-system-hardening 3.2).
+    mode: str = "reconcile"
 
 
 class RemoteUpdate(BaseModel):
@@ -219,11 +224,16 @@ def put_memory(project_id: str, request: DocUpdate) -> dict:
 # parsed graph (nodes + derived status) is a separate `/graph` endpoint in T2.
 
 
-@router.get("/api/projects/{project_id}/blueprint")
-def get_blueprint(project_id: str) -> dict:
-    project = _require_project(project_id)
+def _blueprint_payload(project: dict) -> dict:
+    """Raw blueprint markdown + the parser's advisory warnings — shared by the
+    by-id and by-slug GET routes."""
     content = project_service.read_doc(project, _proofs_root(), "blueprint.md")
     return {"content": content, "warnings": blueprint_doc.validate(content)}
+
+
+@router.get("/api/projects/{project_id}/blueprint")
+def get_blueprint(project_id: str) -> dict:
+    return _blueprint_payload(_require_project(project_id))
 
 
 @router.put("/api/projects/{project_id}/blueprint")
@@ -239,6 +249,17 @@ def get_graph(project_id: str) -> dict:
     # attribution (D28/D29). Cheap — reuses stored verdicts, never recompiles.
     project = _require_project(project_id)
     return graph_service.build_graph(project, _proofs_root())
+
+
+@router.post("/api/projects/{project_id}/blueprint/generate")
+def generate_blueprint(project_id: str) -> dict:
+    # Populate the blueprint from formalized artifacts (additive, idempotent).
+    # Writes + commits .lea/blueprint.md; returns {added, skipped, warnings, graph}.
+    # Backfill first (like the other artifact-reading routes) so a pre-index project's
+    # proofs are in the table before we read it — otherwise it would generate nothing.
+    project = _require_project(project_id)
+    _ensure_artifacts_backfilled(project)
+    return blueprint_seed.generate(project, _proofs_root())
 
 
 # ── Filesystem: tree / read / edit / export the project repo (U1/U2, D34) ─────────
@@ -446,6 +467,197 @@ def get_share_status_by_slug(slug: str) -> dict:
     }
 
 
+# ── Blueprint / graph by slug: the Overleaf companion's read-only view ────────────
+# The companion resolves the project by the slug it derives from the Overleaf
+# document, so the blueprint viewer in the Lean pane reads through these. Same
+# derivation as the by-id routes (`_blueprint_payload` / `build_graph`); like every
+# other by-slug route they NEVER create a project — an unknown slug is a plain 404.
+
+
+@router.get("/api/projects/by-slug/{slug}/blueprint")
+def get_blueprint_by_slug(slug: str) -> dict:
+    return _blueprint_payload(_require_project_by_slug(slug))
+
+
+@router.get("/api/projects/by-slug/{slug}/graph")
+def get_graph_by_slug(slug: str) -> dict:
+    return graph_service.build_graph(_require_project_by_slug(slug), _proofs_root())
+
+
+@router.post("/api/projects/by-slug/{slug}/blueprint/generate")
+def generate_blueprint_by_slug(slug: str) -> dict:
+    # The Overleaf "Generate from formalized theorems" button lands here (slug-resolved,
+    # never creates a project). Same additive synthesis as the by-id route, backfill included.
+    project = _require_project_by_slug(slug)
+    _ensure_artifacts_backfilled(project)
+    return blueprint_seed.generate(project, _proofs_root())
+
+
+def _ensure_artifacts_backfilled(project: dict) -> None:
+    """4.3: one-time import of a pre-index project's registry markdown into
+    the artifacts table, so the index answers for artifacts that predate 4.1
+    and the markdown becomes write-only for machines. No-op once any row
+    exists (run-recorded or previously backfilled)."""
+    from .. import registry_backfill
+
+    if store.list_artifacts_for_scope(project["id"]):
+        return
+    config = load_config()
+    if not config.lea_root:
+        return
+    registry = Path(config.lea_root) / "workspace" / "projects" / f"{project['slug']}.md"
+    registry_backfill.backfill_artifacts_from_registry(project, _proofs_root(), registry)
+
+
+@router.get("/api/projects/by-slug/{slug}/artifacts")
+def project_artifacts_by_slug(slug: str) -> dict:
+    """Structured artifact index (PLAN-system-hardening 4.1): which declaration
+    lives in which file, as recorded by the run finalizer. The Overleaf
+    companion reads this instead of reverse-engineering artifacts from
+    registry-markdown diffs. Like every by-slug route, never creates a
+    project — an unknown slug is a 404 ("nothing recorded yet")."""
+    project = _require_project_by_slug(slug)
+    _ensure_artifacts_backfilled(project)
+    return {
+        "project_id": project["id"],
+        "slug": project["slug"],
+        "artifacts": store.list_artifacts_for_scope(project["id"]),
+    }
+
+
+# Cap on the file content echoed back by target-status: recorded proofs are a
+# few KB; anything bigger is truncated for display (verdict fields are computed
+# from the full content either way).
+_TARGET_STATUS_CONTENT_CAP = 64 * 1024
+
+
+@router.get("/api/projects/by-slug/{slug}/target-status")
+def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
+    """Ledger-side target evidence (PLAN-system-hardening 4.4): for each named
+    declaration, what the adapter's own records say — the artifact row, whether
+    the recorded file exists and still holds the declaration, whether it leans
+    on sorry/admit, and the newest recorded check verdict (agent run, manual
+    edit, or cascade re-check alike). This is one of the two sources the
+    companion's ledger status engine merges; the other is its own job overlay.
+    `content` rides along (capped) purely for display extraction client-side —
+    the verdict fields here are authoritative."""
+    from .. import artifacts as artifacts_service
+
+    project = _require_project_by_slug(slug)
+    _ensure_artifacts_backfilled(project)
+    names = [name for name in (part.strip() for part in declarations.split(",")) if name]
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    rows = {row["declaration_name"]: row for row in store.list_artifacts_for_scope(project["id"])}
+
+    targets = []
+    for name in names:
+        row = rows.get(name)
+        if not row:
+            targets.append({"declaration_name": name, "recorded": False})
+            continue
+        absolute = repo / row["path"]
+        exists = absolute.is_file()
+        content = ""
+        if exists:
+            try:
+                content = absolute.read_text()
+            except OSError:
+                exists = False
+        check = store.latest_check_for_project_path(project["id"], row["path"])
+        targets.append({
+            "declaration_name": name,
+            "recorded": True,
+            "path": row["path"],
+            "module_name": row["module_name"],
+            "kind": row["kind"],
+            "exists": exists,
+            "declaration_present": artifacts_service.declaration_present(content, name) if exists else False,
+            "has_sorry": artifacts_service.contains_sorry_marker(content) if exists else None,
+            "check_status": check["check_status"] if check else None,
+            "check_detail": check["check_detail"] if check else None,
+            "check_author": check["author"] if check else None,
+            "content": content[:_TARGET_STATUS_CONTENT_CAP] if exists else None,
+        })
+    return {"project_id": project["id"], "slug": project["slug"], "targets": targets}
+
+
+class ArtifactRetireRequest(BaseModel):
+    path: str  # repo-relative, same convention as the artifact rows
+
+
+class ArtifactRestoreRequest(BaseModel):
+    path: str
+    retire_commit: str
+
+
+def _resolve_repo_file(project: dict, rel: str) -> tuple[Path, Path, str]:
+    """(repo, absolute, normalized-rel) for a repo-relative path, rejecting
+    anything that escapes the project repo."""
+    repo = project_service.project_repo_dir(project, _proofs_root())
+    candidate = Path(str(rel or ""))
+    if candidate.is_absolute():
+        raise HTTPException(status_code=422, detail="path must be repo-relative")
+    absolute = (repo / candidate).resolve()
+    if not absolute.is_relative_to(repo.resolve()):
+        raise HTTPException(status_code=422, detail="path escapes the project repo")
+    return repo, absolute, absolute.relative_to(repo.resolve()).as_posix()
+
+
+@router.post("/api/projects/by-slug/{slug}/artifacts/retire")
+def retire_project_artifact_by_slug(slug: str, request: ArtifactRetireRequest) -> dict:
+    """Single-writer retirement (PLAN-system-hardening 4.5): a retry deletes the
+    previous proof file through the adapter, then records that filesystem change
+    in the project repo. Proof bytes remain SQL-owned; /artifacts/restore uses the
+    latest verified timeline snapshot and falls back to the retire commit's parent
+    for legacy/manual files that have no timeline row."""
+    project = _require_project_by_slug(slug)
+    repo, absolute, rel = _resolve_repo_file(project, request.path)
+    if not absolute.is_file():
+        raise HTTPException(status_code=404, detail="No recorded file at that path")
+    absolute.unlink()
+    try:
+        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry")
+    except GitStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"retire_commit": sha, "path": rel}
+
+
+@router.post("/api/projects/by-slug/{slug}/artifacts/restore")
+def restore_project_artifact_by_slug(slug: str, request: ArtifactRestoreRequest) -> dict:
+    """Undo a retirement after a retry that produced no verified replacement:
+    restore the latest verified SQL snapshot, with the retire commit's parent as
+    a compatibility fallback. Conservative like the companion's old stash-restore:
+    never overwrite a file the failed run left at the path."""
+    project = _require_project_by_slug(slug)
+    repo, absolute, rel = _resolve_repo_file(project, request.path)
+    if absolute.exists():
+        return {"restored": False, "reason": "occupied", "path": rel}
+    content = next(
+        (
+            step["code"]
+            for step in store.code_steps_for_project_path(project["id"], rel)
+            if step.get("check_status") == "ok" and not step.get("content_lost")
+        ),
+        None,
+    )
+    if content is None:
+        gs = GitStore(repo.parent)
+        try:
+            content = gs.snapshot(repo.name, f"{request.retire_commit}^", rel)
+        except GitStoreError:
+            raise HTTPException(
+                status_code=404,
+                detail="No verified snapshot or file in the retire commit's parent",
+            )
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    absolute.write_text(content)
+    try:
+        sha = GitStore(repo.parent).commit_all(repo, f"restore {rel} after unverified retry")
+    except GitStoreError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"restored": True, "commit": sha, "path": rel}
+
+
 @router.get("/api/projects/by-slug/{slug}/export")
 def export_project_by_slug(slug: str) -> Response:
     return _export_project_response(_require_project_by_slug(slug))
@@ -494,8 +706,9 @@ def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: Bac
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     incoming = [{"path": f.path, "content": f.content} for f in request.files]
+    mode = "upsert" if request.mode == "upsert" else "reconcile"
     try:
-        summary = uploads.sync_overleaf_tex(project, proofs_root, incoming, commit=False)
+        summary = uploads.sync_overleaf_tex(project, proofs_root, incoming, commit=False, mode=mode)
     except uploads.UploadError as exc:
         raise HTTPException(status_code=_UPLOAD_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
     if summary.get("changed"):

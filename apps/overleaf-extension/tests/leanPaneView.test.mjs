@@ -30,6 +30,8 @@ import {
   reconcileDependentsImpact,
   shouldRefetchLeanPaneFiles,
   stillBrokenDependents,
+  stubbableItems,
+  formalizableItems,
   summarizePaneProgress,
   treeAncestorIdsForFile
 } from "../extension/leanPaneView.mjs";
@@ -603,6 +605,46 @@ test("formatRepairOutcome covers every batch item state", () => {
     /skipped -- depends on failed repair of b\./
   );
   assert.match(formatRepairOutcome({ targetLabel: "c", state: "skipped", reason: "already_fixed" }), /already compiles/);
+});
+
+test("formatRepairOutcome is operation-aware for stub and formalize batches", () => {
+  // Running verb + terminal vocabulary track the batch operation.
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "running" }, "stub"), "t: stubbing...");
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "running" }, "formalize"), "t: formalizing...");
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "stubbed" }, "stub"), "t: stub created.");
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "formalized" }, "formalize"), "t: formalized and verified.");
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "disproved" }, "formalize"), "t: counterexample found.");
+  assert.match(formatRepairOutcome({ targetLabel: "t", state: "failed", reason: "no key" }, "stub"), /stub failed -- no key/);
+  assert.match(formatRepairOutcome({ targetLabel: "t", state: "failed" }, "formalize"), /formalization failed/);
+  assert.match(
+    formatRepairOutcome({ targetLabel: "c", state: "skipped", reason: "depends_on_failed:b" }, "formalize"),
+    /skipped -- depends on failed formalization of b\./
+  );
+  // A stopped batch marks its unsettled items canceled, in any operation.
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "canceled" }, "stub"), "t: stopped.");
+  assert.equal(formatRepairOutcome({ targetLabel: "t", state: "canceled" }, "formalize"), "t: stopped.");
+});
+
+test("stubbableItems / formalizableItems select via the per-item action predicates", () => {
+  const items = [
+    { targetLabel: "fresh_thm", status: "missing-stub", leanKind: "theorem", formalizable: true },
+    { targetLabel: "fresh_def", status: "missing-stub", leanKind: "def", formalizable: true },
+    { targetLabel: "stubbed_thm", status: "stub-generated", leanKind: "theorem", formalizable: true },
+    { targetLabel: "broken_thm", status: "invalid", leanKind: "theorem", formalizable: true },
+    { targetLabel: "done_thm", status: "valid", leanKind: "theorem", formalizable: true },
+    { targetLabel: "running_thm", status: "missing-stub", leanKind: "theorem", formalizable: true, inProgress: true },
+    { targetLabel: "unmarked", status: "missing-stub", leanKind: "theorem", formalizable: false }
+  ];
+  // Stub: un-stubbed THEOREMS only -- no definitions, no already-stubbed, none
+  // in progress, none without a valid marker.
+  assert.deepEqual(stubbableItems(items).map((i) => i.targetLabel), ["fresh_thm"]);
+  // Formalize: everything not yet verified -- fresh items (incl. definitions),
+  // sorry-stubs to complete, and broken items to re-formalize; never a valid
+  // proof, an in-progress run, or an unmarked item.
+  assert.deepEqual(
+    formalizableItems(items).map((i) => i.targetLabel),
+    ["fresh_thm", "fresh_def", "stubbed_thm", "broken_thm"]
+  );
 });
 
 // --- Stale-offer reconciliation (docs/PLAN-self-repair-stale-offers.md) ----

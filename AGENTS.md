@@ -76,8 +76,8 @@ npm run start:adapter         # start ONLY the shared FastAPI backend (:8001)
 npm run dev:ui                # adapter (:8001) + Vite (:5173) — the standalone UI
 npm run dev:overleaf          # Overleaf companion (:31245); expects the adapter running
 
-./start-dev.sh                # start the whole stack (UI + overleaf); clears session data first
-./start-dev.sh --keep-data    # ...without wiping previous sessions/proofs/logs
+./start-dev.sh                # start the whole stack (UI + overleaf); keeps previous session data
+./start-dev.sh --fresh        # ...clearing previous sessions/proofs/logs first
 
 npm run doctor                # health-check both apps
 npm run reset:local           # clear local run state (proofs, logs, SQLite); keeps Lea deps

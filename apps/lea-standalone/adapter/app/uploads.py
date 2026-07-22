@@ -335,6 +335,7 @@ def sync_overleaf_tex(
     files: list[dict],
     *,
     commit: bool = True,
+    mode: str = "reconcile",
 ) -> dict:
     """Reconcile the project's mirrored ``.lea/files/overleaf/**`` against the incoming
     ``.tex`` set: upsert changed files, index new rows (``kind="overleaf"``), drop rows
@@ -346,7 +347,12 @@ def sync_overleaf_tex(
     Short-circuits to a no-op only when the ``.tex`` are byte-identical to disk AND the
     subtree is already clean (nothing to prune, ``.gitignore`` present). When
     ``commit=False`` the git commit is deferred to the caller; the returned ``changed``
-    flag says whether a commit is needed. Returns a summary dict."""
+    flag says whether a commit is needed. Returns a summary dict.
+
+    ``mode="upsert"`` (PLAN-system-hardening 3.2) writes/updates only the incoming
+    files and deletes **nothing** — the active-buffer tier of the tex mirror sends
+    just the file being edited, so absence must not mean removal. Full reconcile
+    (the default) remains the truth-sync used on activation and periodic refresh."""
     # Normalize + validate incoming (last write wins on a normalized-path clash).
     incoming: dict[str, str] = {}
     for f in files or []:
@@ -357,16 +363,25 @@ def sync_overleaf_tex(
             raise UploadError(f"{rel} is too large (cap {MAX_UPLOAD_BYTES // (1024 * 1024)} MB).", code="too_large")
         incoming[rel] = content
 
+    reconcile = mode != "upsert"
     base = overleaf_dir(project, proofs_root)
     desired_abs = {base / rel for rel in incoming}
-    stray = [p for p in _subtree_files(base) if p not in desired_abs]
+    stray = [p for p in _subtree_files(base) if p not in desired_abs] if reconcile else []
 
-    # Fast path: .tex unchanged AND nothing to prune AND the .gitignore is in place.
-    if (
-        _mirror_signature(incoming) == _mirror_signature(_current_mirror(project, proofs_root))
-        and not stray
-        and _gitignore_ok(base)
-    ):
+    # Fast path: incoming unchanged on disk (and, for reconcile, nothing to
+    # prune and the .gitignore in place). Upsert compares only its own files.
+    if reconcile:
+        current_clean = (
+            _mirror_signature(incoming) == _mirror_signature(_current_mirror(project, proofs_root))
+            and not stray
+            and _gitignore_ok(base)
+        )
+    else:
+        current_clean = _gitignore_ok(base) and all(
+            (base / rel).is_file() and (base / rel).read_text() == content
+            for rel, content in incoming.items()
+        )
+    if current_clean:
         return {"written": 0, "updated": 0, "deleted": 0, "pruned": 0,
                 "unchanged": len(incoming), "changed": False, "committed": False}
 
@@ -399,23 +414,25 @@ def sync_overleaf_tex(
                 mime="text/x-tex", kind=OVERLEAF_KIND, extracted_path=None,
             )
 
-    # Prune everything in the subtree that isn't a desired .tex — build artifacts the
-    # agent produced by compiling, plus any .tex removed from Overleaf. (.gitignore kept.)
+    # Reconcile only: prune everything in the subtree that isn't a desired .tex —
+    # build artifacts the agent produced by compiling, plus any .tex removed from
+    # Overleaf (.gitignore kept) — and drop index rows for .tex no longer present.
+    # Upsert must never delete: absence just means "not the active buffer".
     pruned = 0
-    for p in _subtree_files(base):
-        if p not in desired_abs:
-            try:
-                p.unlink()
-                pruned += 1
-            except OSError:
-                pass
-    _prune_empty_dirs(base)
+    if reconcile:
+        for p in _subtree_files(base):
+            if p not in desired_abs:
+                try:
+                    p.unlink()
+                    pruned += 1
+                except OSError:
+                    pass
+        _prune_empty_dirs(base)
 
-    # Drop index rows for .tex no longer present.
-    for stored_rel, row in existing.items():
-        if stored_rel not in desired_stored:
-            store.delete_project_file(row["id"])
-            deleted += 1
+        for stored_rel, row in existing.items():
+            if stored_rel not in desired_stored:
+                store.delete_project_file(row["id"])
+                deleted += 1
 
     changed = bool(written or updated or deleted or pruned or gitignore_written)
     committed = False

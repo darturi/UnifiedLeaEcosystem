@@ -27,7 +27,7 @@ from lea.interface import (
 )
 from lea.providers import Usage
 
-from app import bridge, db, projects, runregistry, store
+from app import bridge, db, projects, runbroker, runregistry, store
 from app.config import LeaConfig
 from app.runregistry import RunRegistry
 
@@ -39,12 +39,12 @@ def _drain(q: Queue) -> list[dict]:
     return items
 
 
-def _context(tmp_path, monkeypatch, task="Prove True"):
+def _context(tmp_path, monkeypatch, task="Prove True", max_spend_usd=None):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
     session = store.create_session(task)
     run = store.create_run(session["id"], "gemini/test", None, 3)
-    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path, max_spend_usd=max_spend_usd)
     queue: Queue = Queue()
     ctx = bridge.RunnerContext(
         session_id=session["id"], run_id=run["id"], task=task, config=config, events=queue,
@@ -768,3 +768,267 @@ def test_setup_failure_still_releases_the_slot(tmp_path, monkeypatch):
     assert "run_error" in types
     # And the slot is genuinely free for the next run.
     assert reg.try_admit("next", "next-sess").outcome == runregistry.ADMITTED
+
+
+def test_mid_run_spend_cap_requests_stop_and_labels_result(tmp_path, monkeypatch):
+    # PLAN-system-hardening 0.1: a UsageUpdated that crosses the cap sets the
+    # cooperative stop flag mid-run; the interrupted finish is labelled
+    # result_kind="max_spend" (status stays "cancelled" — vocabulary unchanged).
+    ctx, queue = _context(tmp_path, monkeypatch, max_spend_usd=0.02)
+
+    def capped(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        yield TurnStarted(1)
+        yield AssistantTextDelta("Working on it.")
+        yield UsageUpdated(10, 5, 0.03)
+        # The cost event above crossed the cap — the bridge must have set the
+        # stop flag by the time the agent reaches its next boundary check.
+        assert should_stop()
+        yield Finished("interrupted", "stopped", 1, session_id, "gemini/test",
+                       Usage(input_tokens=10, output_tokens=5), 0.03, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", capped)
+    bridge.run_lea(ctx)
+
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "cancelled"
+    assert run["result_kind"] == "max_spend"
+
+    items = _drain(queue)
+    cap_status = [i for i in items if i["type"] == "status" and i["payload"].get("status") == "max_spend"]
+    assert cap_status, "a max_spend status event should be streamed when the cap trips"
+    done = items[-1]
+    assert done["type"] == "done"
+    assert done["payload"]["status"] == "cancelled"
+    assert done["payload"]["result_kind"] == "max_spend"
+    assert "spend" in done["payload"]["result_detail"].lower()
+
+
+def test_spend_cap_baseline_includes_prior_runs(tmp_path, monkeypatch):
+    # The cap is global (all-time), not per-run: prior persisted spend counts,
+    # so a run whose own cost is small still trips a nearly-exhausted cap.
+    ctx, queue = _context(tmp_path, monkeypatch, max_spend_usd=0.10)
+    prior_run = store.create_run(ctx.session_id, "gemini/test", None, 3)
+    store.update_run(prior_run["id"], "proved", input_tokens=100, output_tokens=50, cost_usd=0.095)
+
+    def capped(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        yield TurnStarted(1)
+        yield UsageUpdated(10, 5, 0.01)
+        assert should_stop()
+        yield Finished("interrupted", "stopped", 1, session_id, "gemini/test",
+                       Usage(input_tokens=10, output_tokens=5), 0.01, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", capped)
+    bridge.run_lea(ctx)
+    assert store.get_run(ctx.run_id)["result_kind"] == "max_spend"
+
+
+def test_spend_cap_untripped_run_is_untouched(tmp_path, monkeypatch):
+    # A configured cap that is never reached must not alter the outcome.
+    ctx, queue = _context(tmp_path, monkeypatch, max_spend_usd=100.0)
+
+    def script(proof_path):
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": proof_path})
+        yield FileChanged(proof_path)
+        yield UsageUpdated(10, 5, 0.01)
+        yield ToolCalled("lean_check", {"path": proof_path})
+        yield CheckResult(proof_path, "ok", None)
+        yield Finished("completed", "Done.", 1, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=10, output_tokens=5), 0.01, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", _fake_run_events(script))
+    bridge.run_lea(ctx)
+
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "proved"
+    assert run["result_kind"] != "max_spend"
+    items = _drain(queue)
+    assert not [i for i in items if i["type"] == "status" and i["payload"].get("status") == "max_spend"]
+    assert items[-1]["payload"]["status"] == "proved"
+
+
+def _wait_for(predicate, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_enqueued_runs_execute_fifo(tmp_path, monkeypatch):
+    """At capacity one, background admission preserves FIFO execution order."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=1))
+    runbroker._brokers.clear()
+    executed = []
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        executed.append(messages[-1]["content"])
+        yield TurnStarted(1)
+        yield Finished("completed", "done", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+
+    run_ids = []
+    for label in ("first", "second", "third"):
+        session = store.create_session(label)
+        run = store.create_run(session["id"], "gemini/test", None, 3)
+        store.add_message(session["id"], "user", label, run["id"])
+        run_ids.append(run["id"])
+    for run_id in run_ids:
+        bridge.enqueue_run(run_id)
+
+    assert _wait_for(lambda: all(
+        store.get_run(rid)["status"] not in {"pending", "running"} for rid in run_ids
+    )), "all queued runs reach a terminal status"
+    assert executed == ["first", "second", "third"], "FIFO order preserved"
+    for run_id in run_ids:
+        assert store.get_run(run_id)["status"] == "proved"
+
+
+def test_finished_broker_buffer_ends_in_done(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        yield TurnStarted(1)
+        yield AssistantTextDelta("thinking…")
+        yield Finished("completed", "done", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    session = store.create_session("replay me")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", "replay me", run["id"])
+    broker = runbroker.create(run["id"])
+    bridge.enqueue_run(run["id"])
+    assert _wait_for(lambda: broker.closed)
+
+    replay = broker.events_after(0)
+    types = [item["type"] for item in replay]
+    assert "assistant_delta" in types
+    assert types[-1] == "done"
+    assert replay[-1]["payload"]["status"] == "proved"
+
+
+def test_interrupted_queued_run_is_skipped_and_broker_sealed(tmp_path, monkeypatch):
+    """A run interrupted while still queued must be skipped by the worker and
+    its hub stream sealed with the terminal frame, so attached observers don't
+    wait forever."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(bridge, "run_events", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("a dequeued-but-finalized run must never execute")
+    ))
+
+    session = store.create_session("skip me")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", "skip me", run["id"])
+    # Finalize BEFORE enqueueing so the worker sees a non-pending run.
+    store.update_run(run["id"], "failed", result_kind="failed",
+                     result_detail="Interrupted before the run started.")
+    broker = runbroker.create(run["id"])
+    bridge.enqueue_run(run["id"])
+
+    assert _wait_for(lambda: broker.closed), "the dispatcher seals the skipped run's broker"
+    replay = broker.events_after(0)
+    assert replay[-1]["type"] == "done"
+    assert replay[-1]["payload"]["status"] == "failed"
+
+
+def test_run_records_structured_artifact_rows(tmp_path, monkeypatch):
+    """PLAN-system-hardening 4.1: the finalizer writes one artifact row per
+    checked file — declaration parsed server-side, kind from the step, module
+    from the project namespace."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    proofs_root = tmp_path / "workspace" / "proofs"
+    project = projects.provision_project("Epsilon", proofs_root)
+    session = store.create_session("prove foo", project_id=project["id"])
+    run = store.create_run(session["id"], "gemini/test", None, 3, project_id=project["id"])
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="prove foo", config=config, events=queue,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+        proof = Path(working_dir) / "chapter" / "foo_theorem.lean"
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text("import Mathlib\n\ntheorem foo_theorem : True := by trivial\n")
+        broken = Path(working_dir) / "broken.lean"
+        broken.write_text("theorem broken_one : False := by trivial\n")
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": str(proof)})
+        yield FileChanged(str(proof))
+        yield CheckResult(str(proof), "ok", None)
+        yield ToolCalled("write_file", {"path": str(broken)})
+        yield FileChanged(str(broken))
+        yield CheckResult(str(broken), "error", "type mismatch")
+        yield Finished("completed", "Proved.", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    rows = store.list_artifacts_for_scope(project["id"])
+    assert len(rows) == 1, "only checked-ok files become artifact rows"
+    row = rows[0]
+    assert row["declaration_name"] == "foo_theorem"
+    assert row["kind"] == "proof"
+    assert row["path"] == "chapter/foo_theorem.lean"
+    assert row["module_name"] == "Lea.Epsilon.chapter.foo_theorem"
+    assert row["run_id"] == run["id"]
+
+
+def test_reformalize_updates_the_artifact_row_in_place(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    proofs_root = tmp_path / "workspace" / "proofs"
+    project = projects.provision_project("Epsilon", proofs_root)
+    session = store.create_session("prove foo", project_id=project["id"])
+
+    def make_run(path_name):
+        run = store.create_run(session["id"], "gemini/test", None, 3, project_id=project["id"])
+        config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+        ctx = bridge.RunnerContext(
+            session_id=session["id"], run_id=run["id"], task="prove foo",
+            config=config, events=Queue(),
+        )
+
+        def fake(config, messages, *, namespace=None, session_id=None, working_dir=None, should_stop=None, gate=None):
+            proof = Path(working_dir) / path_name
+            proof.write_text("import Mathlib\n\ntheorem same_decl : True := by trivial\n")
+            yield TurnStarted(1)
+            yield ToolCalled("write_file", {"path": str(proof)})
+            yield FileChanged(str(proof))
+            yield CheckResult(str(proof), "ok", None)
+            yield Finished("completed", "Proved.", 1, session_id, "gemini/test",
+                           Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+        monkeypatch.setattr(bridge, "run_events", fake)
+        bridge.run_lea(ctx)
+        return run
+
+    make_run("first_home.lean")
+    second = make_run("second_home.lean")
+
+    rows = store.list_artifacts_for_scope(project["id"])
+    assert len(rows) == 1, "same declaration re-recorded updates in place"
+    assert rows[0]["path"] == "second_home.lean"
+    assert rows[0]["run_id"] == second["id"]
