@@ -36,8 +36,9 @@ def test_kind_and_author_are_separate_constrained_columns(tmp_path, monkeypatch)
         sql = conn.execute("select sql from sqlite_master where name='timeline'").fetchone()[0]
     assert {"kind", "author"} <= cols
     assert "commit_sha" not in cols, "the note no longer points into a second store"
-    # both are CHECKed enums now, not free text that drifts
-    assert "kind in ('message', 'code', 'edit_note')" in sql
+    # both are CHECKed enums now, not free text that drifts ('compaction' added in 0006
+    # for the durable G1/G3 context-compaction marker)
+    assert "kind in ('message', 'code', 'edit_note', 'compaction')" in sql
     assert "author in ('user', 'agent', 'environment')" in sql
 
 

@@ -11,6 +11,8 @@ import { ProjectsHub } from './components/ProjectsHub';
 import { NewProjectDialog } from './components/NewProjectDialog';
 import { SearchOverlay } from './components/SearchOverlay';
 import { sortCodeSteps } from './lib/timeline.mjs';
+import { parseSlashCommand } from './lib/slashCommands.js';
+import { runSlashCommand } from './lib/slashCommandRunner';
 import { pickInitialSession, stripSessionParam } from './sessionDeepLink.mjs';
 import { useProofSession } from './stores/proofSession';
 import { useSessions } from './stores/sessions';
@@ -285,6 +287,27 @@ export default function App() {
     setError(undefined);
     setEditedPath(undefined);
     setApprovals((prev) => prev.filter((a) => a.decision));
+
+    // Slash command? Dispatch through the command framework instead of starting a run.
+    // 'action' commands (e.g. /compact) do their work and return; 'prompt' commands fall
+    // through to a normal run with their expanded template.
+    const parsed = parseSlashCommand(content);
+    if (parsed) {
+      setDraft('');
+      try {
+        const dispatch = await runSlashCommand(parsed.name, {
+          sessionId: selectedSessionId,
+          args: parsed.args,
+        });
+        if (!dispatch.handled) {
+          setError(`Unknown command: /${parsed.name}`);
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : `Failed to run /${parsed.name}.`);
+      }
+      return;
+    }
+
     try {
       const run = await createRun(content, selectedSessionId);
       setSelectedSessionId(run.session_id);

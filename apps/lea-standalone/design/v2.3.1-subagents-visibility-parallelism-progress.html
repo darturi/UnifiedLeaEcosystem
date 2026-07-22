@@ -111,8 +111,8 @@
     <b>absent from the UI entirely</b> until it finished.
   </div>
 
-  <div class="bar"><i style="width:64%"></i></div>
-  <div class="counts">14 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 + D1 + D2 + D6 + D7 + E1 + E2 + E3 verified · B1 built · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 7 queued across D–G · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E complete ✓ · Sub-agents page + Projects hub live</b>
+  <div class="bar"><i style="width:76%"></i></div>
+  <div class="counts">17 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 + D1 + D2 + D6 + D7 + E1 + E2 + E3 + G1 + G2 + G3 verified · B1 built · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 4 queued (D3–D5, F1) · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E + Phase G complete ✓ · slash-command framework + /compact live · Sub-agents page + Projects hub live</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -501,10 +501,22 @@
     <p class="ghint">One live run cost ~18M tokens (131:1 input:output) because the transcript re-sends every turn.
       Compaction + a leaner coordinator turn O(N²) into bounded. Third layer alongside isolation + Memory.</p>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">G1</span><span class="title">Context compaction (condenser: prune → summarize)</span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">Adopt OpenHands' condenser suite (cloned:
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Landed</b> — new <code>lea/condenser.py</code> runs at each turn boundary once the
+        prior turn's <i>real</i> input tokens cross <code>context_token_limit × compaction_threshold</code>
+        (200k×0.75=150k default; 0 disables). <b>Prune</b> (deterministic, no LLM) masks superseded
+        <code>lean_check</code>/<code>read_file</code>/<code>search_mathlib</code> results outside a recent window with a
+        short placeholder — copy-on-write, shape-preserving (the <code>tool_result</code> + id survive, so no orphaned
+        <code>role:"tool"</code>). <b>Summarize</b> fires only if pruning didn't get back under the trigger: folds the
+        older <i>middle</i> into one <code>GOAL/PROOF_STATE/TRIED/ERRORS/LEMMAS/NEXT</code> summary, keeping the leading
+        goal + recent turns verbatim (tail always starts at an assistant message → no split pairs). New
+        <code>Compacted</code> event → adapter <code>context_compacted</code> SSE → a muted "🗜 Context compacted" marker in
+        the thread. Config knobs on <code>LeaConfig</code>; on by default (defends the 15M-token coordinator). Tests:
+        <code>tests/condenser/test_condenser.py</code> (30 checks incl. the loop-level Compacted emit) + adapter
+        <code>test_run_lea_surfaces_context_compaction</code>. <span style="opacity:.7">Original plan below.</span><br><br>
+        Adopt OpenHands' condenser suite (cloned:
         <code>openhands/memory/condenser/impl/</code>), adapted for Lean — <b>not invented</b>. Their <b>Phase-1 prune is
         the <code>observation_masking</code> condenser</b>, <b>Phase-2 is <code>llm_summarizing</code></b>, composed by
         the <b><code>pipeline</code></b> condenser (so "prune → summarize" is <i>their</i> pattern).
@@ -518,24 +530,35 @@
         our <code>_summarize_on_max_turns</code>/<code>_text_only_history</code>. OpenHands reports ~50% cost cut. Feeds Memory (C).</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">G2</span><span class="title">Orchestrator-first coordinator (delegate proving, don't grind)</span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">The coordinator both delegates <i>and</i> grinds proofs itself (it wrote <code>Burnside.lean</code>
-        ~30× in its own context) — the structural cause of the 15M-token coordinator. Retune it to
-        <b>plan → delegate → collate → promote → maintain memory</b>, pushing the write→check→error grind into
-        <code>prover</code> children. A role-boundary fix, not a new agent — and the highest-leverage token lever.</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Verified in new sessions</b> — the coordinator now <b>plans → delegates → collates → promotes</b>
+        instead of grinding the write→check→error loop in its own context; it only writes Lean itself when a sub-agent
+        hits a problem it must step in for. That closes the structural cause of the 15M-token coordinator (it used to
+        rewrite <code>Burnside.lean</code> ~30× inline). A role-boundary fix, not a new agent — and the highest-leverage
+        token lever, composing with G1 (compaction) and isolation.</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id fe">G3</span><span class="title"><code>/compact</code> — user-triggered manual compaction</span>
-        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">A slash command (like Claude Code's <code>/compact</code>) so the user can compact <b>on demand</b>,
-        not only at the automatic threshold (G1) — before a long follow-up, or when they watch the context bloating.
-        <b>Same condenser under the hood</b> (<code>pipeline([observation_masking, llm_summarizing])</code>); the command
-        just fires it now instead of waiting. Frontend: a <code>/compact</code> command in the composer; adapter: an
-        endpoint that runs the condenser on the active session, persists the condensed state, and streams a "freed ~N
-        tokens" note. G1 is the <i>auto</i> trigger, G3 the <i>manual</i> one — one mechanism, two entry points.</div>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Landed as a general slash-command framework</b>, not a one-off (per OpenCode / Claude Code /
+        OpenHands-microagent precedent): a command = <b>metadata + workflow</b> in a registry, dispatched by the leading
+        <code>/name</code>. <code>lib/slashCommands.js</code> (pure parser + registry, unit-tested) + <code>lib/slashCommandRunner.ts</code>
+        (impure handlers) + a composer autocomplete menu. Two kinds — <code>action</code> (runs code, e.g.
+        <code>/compact</code>) and <code>prompt</code> (expands a <code>$ARGUMENTS</code> template into a run — the seam for
+        future <code>/model</code> D4/D5, <code>/clear</code>, file-defined workflows). <code>/compact</code> is the first
+        action command: adapter <code>POST /api/sessions/{id}/compact</code> runs the SAME condenser (force mode) on the
+        session's stored transcript — the base the next activation replays — prunes + folds, persists it back, and returns
+        the token delta + a Claude-Code-style <b>"still referenced" file list</b>. UI shows an expandable
+        <b>"🗜 Compacted — freed ~N tokens"</b> card with what survived. <b>Durable</b> (fixed a vanish-on-refresh bug):
+        both G1 and G3 markers are persisted as a <code>kind='compaction'</code> timeline message (new Alembic rev
+        <code>0006</code> widened the kind CHECK) whose JSON content the thread renders inline — so live and reload can't
+        disagree, one render path, no ephemeral client state. Tests: <code>slashCommands.test.mjs</code>, adapter
+        <code>test_routes_sessions</code> (prune-persist + durable-marker + no-op + 409) + <code>test_subagent_bridge</code>
+        (auto marker persisted + on reload), <code>referenced_files</code> unit. G1 is the <i>auto</i> trigger, G3 the
+        <i>manual</i> one — one condenser, two entry points.</div>
     </div>
   </div>
 

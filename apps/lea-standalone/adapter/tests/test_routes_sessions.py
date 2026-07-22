@@ -426,3 +426,74 @@ def test_write_file_rejects_path_escape(tmp_path, monkeypatch):
         sessions_route.write_file_session(
             session["id"], FileWriteRequest(path="../../escape.lean", content="x"))
     assert exc.value.status_code == 400
+
+
+# --- G3: manual /compact endpoint -------------------------------------------
+
+def _big_transcript(n_pairs=6, body=4000):
+    """A finished-run transcript with `n_pairs` assistant(lean_check)+result pairs whose
+    results are large + prunable. More than the default keep-recent-results window (so
+    pruning actually masks some), but few enough turns that the summary stage no-ops —
+    the endpoint prunes deterministically with no model call."""
+    msgs = [{"role": "user", "content": "Prove that 2 + 2 = 4."}]
+    for i in range(n_pairs):
+        cid = f"c{i}"
+        msgs.append({"role": "assistant", "content": [
+            {"type": "text", "text": f"Attempt {i}."},
+            {"type": "tool_call", "name": "lean_check", "args": {"path": "P.lean"}, "id": cid}]})
+        msgs.append({"role": "user", "content": [
+            {"type": "tool_result", "tool_name": "lean_check",
+             "tool_use_id": cid, "tool_call_id": cid, "content": f"error {i}: " + "x" * body}]})
+    return msgs
+
+
+def test_compact_prunes_the_stored_transcript(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("S")
+    run = store.create_run(session["id"], "m", None, None)
+    store.update_run(run["id"], "completed")
+    store.set_run_transcript(run["id"], _big_transcript())
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    result = sessions_route.compact_session(session["id"])
+    assert result["changed"] is True
+    assert result["pruned"] >= 1
+    assert result["freed_tokens"] > 0
+    assert result["before_tokens"] > result["after_tokens"]
+    # The Claude-Code-style "still referenced" list: the file the kept lean_check calls touch.
+    assert "P.lean" in result["referenced_files"]
+    # The condensed transcript was persisted back onto the same run: superseded
+    # lean_check output now carries the placeholder instead of the 4k-char dump.
+    latest = store.latest_transcript_run_for_session(session["id"])
+    assert latest["run_id"] == run["id"]
+    dumped = str(latest["messages"])
+    assert "pruned to save context" in dumped
+    # The marker is a DURABLE timeline message (kind='compaction'), so it survives a reload
+    # — the bug where the box vanished on refresh. session_detail must carry it.
+    assert result["message"] is not None and result["message"]["kind"] == "compaction"
+    markers = [m for m in store.session_detail(session["id"])["messages"]
+               if m.get("kind") == "compaction"]
+    assert len(markers) == 1
+
+
+def test_compact_is_a_noop_with_no_finished_run(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("S")  # no run, no transcript
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    result = sessions_route.compact_session(session["id"])
+    assert result["changed"] is False and result["pruned"] == 0 and result["freed_tokens"] == 0
+
+
+def test_compact_refuses_while_a_run_is_active(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("S")
+    store.create_run(session["id"], "m", None, None)  # left 'running' → active
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.compact_session(session["id"])
+    assert exc.value.status_code == 409

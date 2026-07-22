@@ -30,6 +30,7 @@ interrupt is D7; diff-on-divergence context is D6.
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -42,6 +43,7 @@ from uuid import uuid4
 from lea.interface import (
     AssistantTextDelta,
     CheckResult,
+    Compacted,
     Error,
     FileChanged,
     Finished,
@@ -507,6 +509,23 @@ def _forward_to_child_broker(broker, inner, started: dict) -> None:
                                 "check_detail": inner.detail})
 
 
+def _subagent_error(ev: SubagentFinished) -> str | None:
+    """The human error message when a child FAILED TO RUN (raised before returning a
+    result — an API/config error, a crash), else None. This is the failure that was
+    hiding behind the coordinator's paraphrase: the child has no candidate and no
+    transcript, so nothing surfaced it. NOTE: a child whose *candidate* merely has Lean
+    errors is NOT this — that is a normal outcome already shown as a red 'errors' badge;
+    here we mean the child could not produce a result at all (`stop_reason == 'error'`)."""
+    if ev.stop_reason != "error":
+        return None
+    # `_error_result` (prover) sets summary = "error — <exception>"; that carries the real
+    # cause (e.g. the LiteLLM auth/config error). Fall back to check_detail, then a notice.
+    msg = (ev.summary or "").strip()
+    if not msg:
+        msg = (ev.check_detail or "").strip()
+    return msg or "The sub-agent failed before returning a result."
+
+
 def _populate_subagent(
     child_id: str,
     child_run_id: str | None,
@@ -527,6 +546,11 @@ def _populate_subagent(
         if text.strip():
             role = "user" if msg.get("role") == "user" else "assistant"
             store.add_message(child_id, role, text)
+    # A child that FAILED TO RUN has no transcript — persist the error as its message so
+    # the failure is visible in the child's own session (and its final_summary), not lost.
+    err = _subagent_error(ev)
+    if err:
+        store.add_message(child_id, "assistant", err)
     if ev.candidate_path:
         cand = Path(ev.candidate_path)
         if not cand.is_absolute():
@@ -882,6 +906,27 @@ def run_lea(context: RunnerContext) -> None:
             elif isinstance(ev, UsageUpdated):
                 usage.add(current_turn, ev.input_tokens, ev.output_tokens, ev.cost)
 
+            elif isinstance(ev, Compacted):
+                # G1: the context condenser ran this turn — the coordinator's model-facing
+                # history was pruned (and maybe summarized) to stay bounded on a long run.
+                # Persist it as a durable `compaction` timeline message (same channel the
+                # manual /compact marker rides) so the thread shows a "context compacted"
+                # marker live AND on reload — live and reload can't disagree. It's a marker,
+                # not proof content: the code_step record is untouched.
+                flush_narration()
+                _payload = json.dumps({
+                    "manual": False,
+                    "changed": True,
+                    "pruned": ev.pruned,
+                    "summarized": bool(ev.summarized),
+                    "before_tokens": ev.before_tokens,
+                    "after_tokens": ev.after_tokens,
+                    "freed_tokens": max(0, ev.before_tokens - ev.after_tokens),
+                    "referenced_files": [],
+                })
+                emit(events, "message",
+                     store.add_message(session_id, "assistant", _payload, run_id, kind="compaction"))
+
             elif isinstance(ev, ToolResulted):
                 # A project asset write (D33): a non-.lean write_file/edit_file in a
                 # project (e.g. .lea/blueprint.md). The prover emits FileChanged only
@@ -1006,6 +1051,9 @@ def run_lea(context: RunnerContext) -> None:
                     "stop_reason": ev.stop_reason,
                     "summary": ev.summary,
                     "candidate_path": ev.candidate_path,
+                    # The failure to surface (E1): non-null when the child could not run at
+                    # all — the UI shows it as a red "failed" child instead of hiding it.
+                    "error": _subagent_error(ev),
                 })
 
             elif isinstance(ev, Error):

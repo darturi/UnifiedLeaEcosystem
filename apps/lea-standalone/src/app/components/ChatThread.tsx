@@ -15,13 +15,14 @@ import { MarkdownMessage } from './MarkdownMessage';
 import { ModelPicker } from './ModelPicker';
 import { OriginBadge } from './OriginBadge';
 import { buildTimeline } from '../lib/timeline.mjs';
+import { matchSlashCommands } from '../lib/slashCommands.js';
 import {
   deriveCodeStepProofStatus,
   deriveRunCompletionStatus,
   hasSorryLikeCheckDetail,
   latestCodeStep,
 } from '../lib/proofDisplay.mjs';
-import { useProofSession } from '../stores/proofSession';
+import { useProofSession, type CompactionPayload } from '../stores/proofSession';
 import { useModel } from '../stores/model';
 import { useSessions } from '../stores/sessions';
 
@@ -378,6 +379,9 @@ export function ChatThread({
     }
     if (node.kind === 'message') {
       const m = node.message;
+      if (m.kind === 'compaction') {
+        return <CompactionMarker key={node.key} content={m.content} />;
+      }
       if (m.role === 'user') {
         return (
           <div className="msg" key={node.key}>
@@ -636,6 +640,34 @@ export function ChatThread({
             </div>
           </div>
         )}
+        {(() => {
+          // Slash-command autocomplete (G3 framework): while the draft is a command being
+          // typed (`/` + name, before any space), list matching commands from the registry.
+          // Clicking one fills the draft; Enter still runs it via the normal submit path.
+          const q = draft.trim();
+          const typing = q.startsWith('/') && !q.includes(' ');
+          const matches = typing ? matchSlashCommands(q) : [];
+          if (!matches.length) return null;
+          return (
+            <div className="slash-menu">
+              {matches.map((c) => (
+                <button
+                  key={c.name}
+                  type="button"
+                  className="slash-item"
+                  onClick={() => {
+                    onDraftChange(`/${c.name}`);
+                    textareaRef.current?.focus();
+                  }}
+                >
+                  <span className="slash-name">/{c.name}</span>
+                  <span className="slash-desc">{c.description}</span>
+                </button>
+              ))}
+              <div className="slash-hint">↵ to run</div>
+            </div>
+          );
+        })()}
         <div className="composer-inner">
           <textarea
             ref={textareaRef}
@@ -683,6 +715,9 @@ function SpawnGroup({
   const [stopping, setStopping] = useState<Set<string>>(new Set());
   // E1: ephemeral live state per running child, fed by `subagent_progress` SSE.
   const progress = useProofSession((s) => s.subagentProgress);
+  // Sub-agents that could not run (API/config error, crash) → the real error message,
+  // surfaced as a red "failed" child instead of hidden behind the coordinator.
+  const errors = useProofSession((s) => s.subagentErrors);
   const toggle = (id: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -703,19 +738,24 @@ function SpawnGroup({
       </summary>
       <div className="kids">
         {children.map((child) => {
-          const badge = subagentBadge(child);
+          const error = errors[child.id];
+          // A failed child (couldn't run) is a red "failed" — surfaced, not hidden.
+          const badge = error ? { dot: 'fail', cls: 'err', text: 'failed' } : subagentBadge(child);
           const isOpen = expanded.has(child.id);
-          const running = badge.dot === 'run';
+          const running = !error && badge.dot === 'run';
           const live = progress[child.id];
           // While running, the live feed IS the preview: the current tool, else the
-          // streaming narration, else the plain 'exploring…'. On finish the durable
-          // final summary takes over.
+          // streaming narration, else the plain 'exploring…'. A failed child shows its
+          // error; else the durable final summary.
           const liveLine = running
             ? (live?.tool ? `running ${live.tool}…` : firstLine(live?.text) || 'exploring…')
             : '';
-          const preview = running ? liveLine : firstLine(child.final_summary);
+          const preview = running ? liveLine : error ? firstLine(error) : firstLine(child.final_summary);
           return (
-            <div className={`kid ${isOpen ? 'open' : ''} ${running ? 'running' : ''}`} key={child.id}>
+            <div
+              className={`kid ${isOpen ? 'open' : ''} ${running ? 'running' : ''} ${error ? 'errored' : ''}`}
+              key={child.id}
+            >
               <button className="kid-head" onClick={() => toggle(child.id)}>
                 <span className={`caret ${isOpen ? 'open' : ''}`}>▸</span>
                 <span className={`dot ${badge.dot}`} />
@@ -736,10 +776,17 @@ function SpawnGroup({
                 )}
                 <span className={`verdict ${badge.cls}`}>{badge.text}</span>
               </button>
-              {!isOpen && preview && <div className="kid-preview">{preview}</div>}
+              {!isOpen && preview && (
+                <div className={`kid-preview ${error ? 'err' : ''}`}>{preview}</div>
+              )}
               {isOpen && (
                 <div className="kid-body">
-                  {child.final_summary ? (
+                  {error ? (
+                    <div className="kid-error">
+                      <div className="kid-error-title">This sub-agent could not run</div>
+                      <pre className="kid-error-msg">{error}</pre>
+                    </div>
+                  ) : child.final_summary ? (
                     <MarkdownMessage content={child.final_summary} />
                   ) : (
                     <p className="kid-empty">This sub-agent produced no final output.</p>
@@ -765,6 +812,95 @@ function firstLine(text?: string | null): string {
     if (t) return t.length > 140 ? `${t.slice(0, 140)}…` : t;
   }
   return '';
+}
+
+// A context-compaction marker (G1/G3), rendered inline from a `kind='compaction'` timeline
+// message. Manual (/compact) → an expandable Claude-Code-style card with the freed tokens
+// + the files still in the model's view; automatic (G1) → a quiet centered one-liner. Both
+// are durable (they ride the message channel), so they survive a reload.
+function CompactionMarker({ content }: { content: string }) {
+  let c: CompactionPayload | null = null;
+  try {
+    c = JSON.parse(content) as CompactionPayload;
+  } catch {
+    c = null;
+  }
+  if (!c) return null;
+  // In-flight: the /compact request hasn't returned yet. Show a spinner so the user knows
+  // work is happening (the call can take seconds when it summarizes).
+  if (c.pending) {
+    return (
+      <div className="compact-note">
+        <span className="reconnect-spinner" />
+        Compacting context…
+      </div>
+    );
+  }
+  const didWork = c.pruned > 0 || c.summarized;
+  const parts: string[] = [];
+  if (c.pruned > 0) parts.push(`pruned ${c.pruned} stale output${c.pruned === 1 ? '' : 's'}`);
+  if (c.summarized) parts.push('summarized earlier work');
+  const files = c.referenced_files || [];
+  const before = c.before_tokens || 0;
+  const after = c.after_tokens || 0;
+  const freed = before - after;
+
+  if (!c.manual) {
+    return (
+      <div className="compact-note">
+        <span className="compact-icon">🗜</span>
+        {didWork ? (
+          <>
+            Context compacted — {parts.join(', ')}
+            {before > 0 && after > 0 && after < before ? (
+              <span className="compact-delta">
+                {' '}~{formatTokens(before)} → {formatTokens(after)} tokens
+              </span>
+            ) : null}
+          </>
+        ) : (
+          'Context already compact'
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <details className="compact-card" open>
+      <summary>
+        <span className="compact-icon">🗜</span>
+        {didWork ? (
+          <>
+            Compacted{freed > 0 ? <> — freed ~{formatTokens(freed)} tokens</> : null}
+          </>
+        ) : (
+          'Already compact — nothing to free'
+        )}
+        {didWork && (files.length > 0 || c.summarized) ? (
+          <span className="compact-more">details</span>
+        ) : null}
+      </summary>
+      {didWork ? (
+        <div className="compact-body">
+          {parts.length ? <div className="compact-line">{parts.join(', ')}</div> : null}
+          {before > 0 && after > 0 ? (
+            <div className="compact-line compact-delta">
+              ~{formatTokens(before)} → {formatTokens(after)} tokens
+            </div>
+          ) : null}
+          {files.length > 0 ? (
+            <ul className="compact-files">
+              {files.map((f) => (
+                <li key={f}>
+                  <code>{f}</code>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+    </details>
+  );
 }
 
 function ToolChip({ event }: { event: StatusEvent }) {

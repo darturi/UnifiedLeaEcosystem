@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import LeaConfig
+from . import condenser
 from .runctx import run_context
 from .prompt import compose_role_prompt, domain_cascade_hint, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
@@ -31,6 +32,7 @@ from .events import (
     FileChanged,
     CheckResult,
     UsageUpdated,
+    Compacted,
     SubagentStarted,
     Finished,
 )
@@ -653,6 +655,9 @@ def _run_events_inner(
     surfaced_domains: set[str] = set()
 
     turn = 0
+    # The real input-token count from the previous turn's provider `Done` — the compaction
+    # trigger signal (G1). 0 on the first turn (nothing sent yet → nothing to compact).
+    last_input_tokens = 0
     while True:
         # Cooperative interrupt (D18): the human asked to stop. `turn` is the count
         # of completed turns, so the last step's write is already committed and the
@@ -662,6 +667,30 @@ def _run_events_inner(
             yield Finished("interrupted", "Run interrupted by the user.",
                            turn, session_id, model, total_usage, total_cost, transcript(turn))
             return
+
+        # Context compaction (G1): before spending another turn, if the last turn's real
+        # input size crossed the trigger, condense the model-facing history — prune
+        # superseded tool outputs, then summarize the older middle only if that's not
+        # enough. Keeps the coordinator's context bounded on a long run without losing the
+        # goal or the recent state. The condenser is copy-on-write; `messages` is rebound to
+        # the condensed history the next `stream` call sends. Only the model context shrinks —
+        # the durable record the adapter keeps is built from the event stream, not from here.
+        if condenser.should_compact(last_input_tokens, config):
+            result = condenser.condense(messages, config, model=model,
+                                        last_input_tokens=last_input_tokens)
+            if result.changed:
+                messages = result.messages
+                total_usage.input_tokens += result.usage.input_tokens
+                total_usage.output_tokens += result.usage.output_tokens
+                total_cost += result.cost
+                if result.usage.input_tokens or result.usage.output_tokens or result.cost:
+                    yield UsageUpdated(result.usage.input_tokens, result.usage.output_tokens,
+                                       result.cost)
+                yield Compacted(result.before_tokens, result.after_tokens,
+                                result.pruned, result.summarized)
+                # Reflect the condensed size so we don't immediately re-trigger next turn on
+                # the stale pre-compaction count; the next real `Done` refreshes it anyway.
+                last_input_tokens = result.after_tokens
 
         turn += 1
         # D6: a per-run cost cap ends the run the same clean way the turn cap does. Checked
@@ -749,6 +778,8 @@ def _run_events_inner(
                 total_usage.input_tokens += event.usage.input_tokens
                 total_usage.output_tokens += event.usage.output_tokens
                 total_cost += event.cost
+                # The real context size of this turn — the G1 compaction trigger for next turn.
+                last_input_tokens = event.usage.input_tokens
                 yield UsageUpdated(event.usage.input_tokens, event.usage.output_tokens, event.cost)
 
         if current_text:

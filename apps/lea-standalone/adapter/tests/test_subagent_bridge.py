@@ -18,6 +18,7 @@ from queue import Queue
 from lea.interface import (
     AssistantTextDelta,
     CheckResult,
+    Compacted,
     FileChanged,
     Finished,
     SubagentFinished,
@@ -310,6 +311,65 @@ def test_run_lea_retires_a_child_that_started_but_never_finished(tmp_path, monke
     kids = store.list_child_sessions(session["id"])
     assert len(kids) == 1
     assert kids[0]["active_run_count"] == 0       # orphan run retired, not eternally 'running'
+
+
+# --- sub-agent FAILURE surfacing ----------------------------------------------
+
+def _errored(summary="error — litellm.AuthenticationError: azure_ai key not configured"):
+    return SubagentFinished(
+        result_id="pc-err", subagent_type="proof-candidate",
+        candidate_path=None, check_status=None, check_detail=None,
+        stop_reason="error", summary=summary, transcript=[],
+    )
+
+
+def test_subagent_error_only_for_a_child_that_could_not_run():
+    # stop_reason 'error' (the child raised) → surface the real message…
+    assert "AuthenticationError" in (bridge._subagent_error(_errored()) or "")
+    # …but a child whose CANDIDATE merely has Lean errors is a normal outcome, not this.
+    assert bridge._subagent_error(_finished(check_status="error", check_detail="unknown id")) is None
+    assert bridge._subagent_error(_finished()) is None   # a clean child
+
+
+def test_run_lea_surfaces_a_failed_child(tmp_path, monkeypatch):
+    # A child that could not run: its run is marked failed, its error is persisted as the
+    # child's message (so its own session shows it), and the subagent_finished SSE carries
+    # the error so the spawn card can render a red "failed" child.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove it")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="Prove it", config=cfg, events=queue,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        yield TurnStarted(1)
+        yield SubagentStarted(result_id="pc-err", subagent_type="proof-candidate", description="prove L1")
+        yield _errored()
+        yield Finished("completed", "I'll search directly instead.", 1, ctx.session_id,
+                       "gemini/test", Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    _ok_recheck(monkeypatch)
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    kids = store.list_child_sessions(session["id"])
+    assert len(kids) == 1
+    child = kids[0]
+    # the child's own session carries the error (not empty), and its run is failed
+    detail = store.session_detail(child["id"])
+    assert any("AuthenticationError" in m["content"] for m in detail["messages"])
+    child_run = next(r for r in detail["runs"])
+    assert child_run["status"] == "error"
+    # the SSE carries the error for the spawn card
+    events = _drain(queue)
+    fin = [e for e in events if e["type"] == "subagent_finished"]
+    assert len(fin) == 1
+    assert "AuthenticationError" in (fin[0]["payload"]["error"] or "")
 
 
 # --- E1: live child streaming + per-child stop --------------------------------
@@ -685,3 +745,45 @@ def test_autonomous_run_does_not_enable_subagents(tmp_path, monkeypatch):
     bridge.run_lea(ctx)
     # autonomous keeps the prover default (None) — no spawn_subagent forced on
     assert seen_tools["tools"] is None
+
+
+def test_run_lea_persists_context_compaction_as_a_durable_marker(tmp_path, monkeypatch):
+    # G1: a Compacted event from the prover is persisted as a durable `compaction`
+    # timeline message (not an ephemeral SSE) — so the marker survives a reload, and the
+    # live stream carries the SAME row. Its JSON content holds the before/after size +
+    # prune/summary counts.
+    import json as _json
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove something long")
+    run = store.create_run(session["id"], "gemini/test", None, None)
+    cfg = LeaConfig(model="gemini/test", max_turns=None, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"],
+        task="Prove something long", config=cfg, events=queue,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        yield TurnStarted(1)
+        yield Compacted(before_tokens=152_000, after_tokens=41_000, pruned=5, summarized=1)
+        yield Finished("completed", "done", 2, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=5, output_tokens=3), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    # Live: emitted on the `message` channel with kind='compaction'.
+    events = _drain(queue)
+    live = [e for e in events if e["type"] == "message"
+            and (e["payload"] or {}).get("kind") == "compaction"]
+    assert len(live) == 1
+    p = _json.loads(live[0]["payload"]["content"])
+    assert p["before_tokens"] == 152_000 and p["after_tokens"] == 41_000
+    assert p["pruned"] == 5 and p["summarized"] is True and p["manual"] is False
+
+    # Durable: it's a real timeline message, so a reload (session_detail) still has it.
+    detail = store.session_detail(session["id"])
+    markers = [m for m in detail["messages"] if m.get("kind") == "compaction"]
+    assert len(markers) == 1

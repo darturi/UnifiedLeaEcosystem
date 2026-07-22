@@ -1057,6 +1057,28 @@ def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = 
     return json.loads(row["transcript"])
 
 
+def latest_transcript_run_for_session(session_id: str) -> dict | None:
+    """The run that holds the session's latest transcript — id, model, and messages.
+
+    The manual `/compact` path (G3) needs the run_id (to overwrite the condensed
+    transcript back onto the SAME row that seeds the next activation) and the model
+    (to run the summary call with the session's own model). Returns None when the
+    session has no Finished run yet (nothing to compact)."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select id, model, transcript from runs
+            where session_id = ? and transcript is not null
+            order by created_at desc, id desc
+            limit 1
+            """,
+            (session_id,),
+        ).fetchone()
+    if not row or row["transcript"] is None:
+        return None
+    return {"run_id": row["id"], "model": row["model"], "messages": json.loads(row["transcript"])}
+
+
 # ---------------------------------------------------------------------------
 # timeline (C4) — one table, one counter
 #
@@ -1122,7 +1144,7 @@ def _message_from_row(row) -> dict:
         "run_id": d["run_id"],
         "role": "user" if d["author"] == "user" else "assistant",
         "content": d["content"],
-        "kind": "edit_note" if d["kind"] == "edit_note" else "assistant",
+        "kind": d["kind"] if d["kind"] in ("edit_note", "compaction") else "assistant",
         "seq": d["id"],
         "created_at": d["created_at"],
     }
@@ -1182,7 +1204,7 @@ def add_message(
             (
                 session_id,
                 run_id,
-                "edit_note" if kind == "edit_note" else "message",
+                kind if kind in ("edit_note", "compaction") else "message",
                 "user" if role == "user" else "agent",
                 content,
                 utc_now(),

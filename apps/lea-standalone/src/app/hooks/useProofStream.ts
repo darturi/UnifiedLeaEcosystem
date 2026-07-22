@@ -97,7 +97,12 @@ export function useProofStream() {
       setSafeVerify,
       setVerifySurface,
       setGoalSurface,
+      setSubagentProgress,
+      setSubagentErrors,
     } = useProofSession.getState();
+    // Fresh session context → drop any sub-agent live/error state from the previous one.
+    setSubagentProgress({});
+    setSubagentErrors({});
     useSessions.getState().setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
@@ -390,7 +395,8 @@ export function useProofStream() {
       const data = (event as MessageEvent).data;
       if (data) {
         try {
-          const childId = (JSON.parse(data) as { child_id?: string }).child_id;
+          const p = JSON.parse(data) as { child_id?: string; error?: string | null };
+          const childId = p.child_id;
           if (childId) {
             useProofSession.getState().setSubagentProgress((prev) => {
               if (!(childId in prev)) return prev;
@@ -398,6 +404,11 @@ export function useProofStream() {
               delete next[childId];
               return next;
             });
+            // A child that couldn't run reports an `error` — record it so the spawn card
+            // shows a red "failed" child with the real message, not a bland "no candidate".
+            if (p.error) {
+              useProofSession.getState().setSubagentErrors((prev) => ({ ...prev, [childId]: p.error as string }));
+            }
           }
         } catch {
           /* ignore a malformed payload — the refresh below still runs */

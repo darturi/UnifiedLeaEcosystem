@@ -23,6 +23,22 @@ export interface SubagentLive {
   check?: string;     // its latest lean_check verdict ('ok' | 'error')
   turn?: number;      // its current turn
 }
+// The context-compaction (G1/G3) payload carried in a `kind='compaction'` timeline
+// message's `content` (JSON). Durable — it rides the message channel, so a compaction
+// marker survives a reload like any message. `manual` distinguishes user `/compact` (G3)
+// from the automatic threshold (G1); `summarized` a prune-only pass from a folded one.
+export interface CompactionPayload {
+  manual?: boolean;
+  changed?: boolean;
+  pending?: boolean; // true → the /compact request is in flight (renders a "Compacting…" card)
+  pruned: number;
+  summarized: boolean;
+  before_tokens: number;
+  after_tokens: number;
+  freed_tokens: number;
+  referenced_files?: string[];
+}
+
 const apply = <T,>(update: Updater<T>, current: T): T =>
   typeof update === 'function' ? (update as (c: T) => T)(current) : update;
 
@@ -113,6 +129,12 @@ interface ProofSessionState {
   // when the child finishes (its durable transcript then takes over).
   subagentProgress: Record<string, SubagentLive>;
   setSubagentProgress: (update: Updater<Record<string, SubagentLive>>) => void;
+
+  // Sub-agent FAILURES: child session id -> the error message, for children that could
+  // not run at all (API/config error, crash). Surfaced as a red "failed" child instead
+  // of being hidden behind the coordinator's fallback narration.
+  subagentErrors: Record<string, string>;
+  setSubagentErrors: (update: Updater<Record<string, string>>) => void;
 }
 
 export const useProofSession = create<ProofSessionState>((set) => ({
@@ -163,4 +185,8 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   subagentProgress: {},
   setSubagentProgress: (update) =>
     set((s) => ({ subagentProgress: apply(update, s.subagentProgress) })),
+
+  subagentErrors: {},
+  setSubagentErrors: (update) =>
+    set((s) => ({ subagentErrors: apply(update, s.subagentErrors) })),
 }));

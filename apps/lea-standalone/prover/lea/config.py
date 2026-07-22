@@ -53,6 +53,20 @@ class LeaConfig:
     # defaults at spawn — so a role is retuned WITHOUT mutating the vendored profile.
     subagent_overrides: dict = field(default_factory=dict)
 
+    # --- context compaction (G1) ---
+    # The condenser bounds the model-facing context on a long run. `context_token_limit`
+    # is the model's usable window; compaction triggers once a turn's real input tokens
+    # cross `compaction_threshold` of it (200_000 × 0.75 = 150k by default — high enough
+    # that normal runs never hit it). Set `context_token_limit` to 0 to disable entirely.
+    # The condenser prunes superseded tool outputs first (cheap, no LLM) and only
+    # summarizes the older middle if that isn't enough — always keeping the leading goal
+    # plus `compaction_keep_recent_turns` most-recent turns verbatim, and the last
+    # `compaction_keep_recent_results` tool results unmasked.
+    context_token_limit: int = 200_000
+    compaction_threshold: float = 0.75
+    compaction_keep_recent_turns: int = 6
+    compaction_keep_recent_results: int = 4
+
     # --- deployment / UI (the adapter reads these; the loop ignores them) ---
     lea_root: Path | None = None      # where proof files + per-session git repos live
     max_spend_usd: float | None = None  # UI billing guard checked by the adapter

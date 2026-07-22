@@ -97,6 +97,22 @@ class UsageUpdated:
 
 
 @dataclass(frozen=True)
+class Compacted:
+    """The context condenser ran (G1). On a long run it reduced the model-facing message
+    history to keep the context bounded — pruning superseded tool outputs and, if that was
+    not enough, folding the older middle into a summary. `before_tokens`/`after_tokens` are
+    the estimated input-token size around the compaction; `pruned` is how many superseded
+    tool results were masked; `summarized` is 1 if the middle was folded, else 0.
+    Informational — the UI can show a 'context compacted' marker; nothing downstream
+    depends on it, and the coordinator's model context (not `messages` provenance in the
+    DB) is what changed."""
+    before_tokens: int
+    after_tokens: int
+    pruned: int
+    summarized: int
+
+
+@dataclass(frozen=True)
 class SubagentStarted:
     """A child subagent was just spawned and is about to run (D1). Emitted BEFORE the
     child blocks the coordinator's tool call, so a running child is visible instead of
@@ -181,6 +197,7 @@ AgentEvent = (
     | VerifyResult
     | Error
     | UsageUpdated
+    | Compacted
     | SubagentStarted
     | SubagentProgress
     | SubagentFinished
