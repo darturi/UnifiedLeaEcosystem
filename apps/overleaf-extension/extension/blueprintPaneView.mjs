@@ -24,6 +24,9 @@ import {
   statusLabel,
   truncate,
 } from "./blueprintLayout.mjs";
+// Reuse the Lean pane's tokenizer so decl names + signatures in the node detail read
+// the same (same colours/classes) as Lean code elsewhere in the pane.
+import { highlightLeanLine } from "./leanPaneView.mjs";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -152,6 +155,26 @@ function buildLegend() {
   return ul;
 }
 
+// A Lean-highlighted `<code>` element built from the same tokenizer + token classes
+// the Lean pane uses, so decl names / signatures match its formatting.
+function leanCode(text, className) {
+  const code = el("code", className || null);
+  for (const token of highlightLeanLine(String(text ?? ""))) {
+    const span = document.createElement("span");
+    if (token.cls) span.className = `ol-lean-project-lean-${token.cls}`;
+    span.textContent = token.text;
+    code.appendChild(span);
+  }
+  return code;
+}
+
+// A generated node's statement is a Lean signature (highlight it as Lean); a
+// hand-authored or fallback statement is prose (leave it plain). The synthesizer's
+// "Formalized as `X`." fallback is prose too.
+function isLeanStatement(node) {
+  return Boolean(node.lean) && Boolean(node.statement) && !node.statement.startsWith("Formalized as ");
+}
+
 // Detail for the selected node. No "worked on by" sessions — see module header.
 function buildDetail(node) {
   const detail = el("div", "bp-detail");
@@ -164,7 +187,7 @@ function buildDetail(node) {
   const meta = el("div", "bp-detail-meta", node.kind ?? "node");
   if (node.lean) {
     meta.append(" · ");
-    meta.appendChild(el("code", null, node.lean));
+    meta.appendChild(leanCode(node.lean));
   }
   detail.appendChild(meta);
 
@@ -179,7 +202,13 @@ function buildDetail(node) {
     detail.appendChild(audit);
   }
 
-  if (node.statement) detail.appendChild(el("p", "bp-detail-stmt", node.statement));
+  if (node.statement) {
+    detail.appendChild(
+      isLeanStatement(node)
+        ? leanCode(node.statement, "bp-detail-lean")
+        : el("p", "bp-detail-stmt", node.statement),
+    );
+  }
 
   return detail;
 }
