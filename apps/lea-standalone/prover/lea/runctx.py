@@ -61,6 +61,13 @@ _depth: contextvars.ContextVar[int] = contextvars.ContextVar("lea_depth", defaul
 _config: contextvars.ContextVar["LeaConfig | None"] = contextvars.ContextVar(
     "lea_config", default=None
 )
+# The active activation's cooperative-stop predicate (D18). Carried here so a tool that
+# starts a *child* activation (spawn_subagent) can compose it INTO the child's own stop
+# — a coordinator stop then also halts a running child (E1/D2), instead of the child
+# blocking the coordinator's stop until it finishes on its own.
+_should_stop: contextvars.ContextVar["object | None"] = contextvars.ContextVar(
+    "lea_should_stop", default=None
+)
 
 
 def current_working_dir() -> str | None:
@@ -90,6 +97,12 @@ def current_config() -> "LeaConfig | None":
     return _config.get()
 
 
+def current_should_stop():
+    """The active activation's cooperative-stop predicate (D18), or ``None``.
+    ``spawn_subagent`` composes it into a child's stop so a coordinator stop cascades."""
+    return _should_stop.get()
+
+
 @contextlib.contextmanager
 def run_context(
     *,
@@ -98,6 +111,7 @@ def run_context(
     candidate_dir: str | None = None,
     depth: int = 0,
     config: "LeaConfig | None" = None,
+    should_stop=None,
 ):
     """Establish the run context for the duration of the ``with`` block.
 
@@ -111,6 +125,7 @@ def run_context(
         _candidate_dir.set(candidate_dir),
         _depth.set(depth),
         _config.set(config),
+        _should_stop.set(should_stop),
     )
     try:
         yield
@@ -118,7 +133,9 @@ def run_context(
         # Reset in reverse; each reset runs in the same context .set() ran in
         # (the activation drives its generator on one thread), so no cross-context
         # reset. Guarded so a teardown surprise can't mask the real exception.
-        wd, rk, cd, dp, cf = tokens
+        wd, rk, cd, dp, cf, ss = tokens
+        with contextlib.suppress(ValueError):
+            _should_stop.reset(ss)
         with contextlib.suppress(ValueError):
             _config.reset(cf)
         with contextlib.suppress(ValueError):

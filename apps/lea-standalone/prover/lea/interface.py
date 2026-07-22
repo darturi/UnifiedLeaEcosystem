@@ -24,6 +24,8 @@ from .events import (
     FileChanged,
     Finished,
     SubagentFinished,
+    SubagentProgress,
+    SubagentStarted,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
@@ -31,6 +33,7 @@ from .events import (
     UsageUpdated,
     VerifyResult,
 )
+from .subagents import request_child_stop
 from .tools import lean_check, lean_check_cold, rebuild_module, _lean_check_has_error, _first_error_line
 
 __all__ = [
@@ -51,8 +54,12 @@ __all__ = [
     "CheckResult",
     "VerifyResult",
     "Error",
+    "SubagentStarted",
+    "SubagentProgress",
     "SubagentFinished",
     "Finished",
+    # per-child cooperative stop (D2)
+    "request_child_stop",
 ]
 
 
