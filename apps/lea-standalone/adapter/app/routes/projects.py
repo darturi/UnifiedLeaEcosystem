@@ -255,7 +255,11 @@ def get_graph(project_id: str) -> dict:
 def generate_blueprint(project_id: str) -> dict:
     # Populate the blueprint from formalized artifacts (additive, idempotent).
     # Writes + commits .lea/blueprint.md; returns {added, skipped, warnings, graph}.
-    return blueprint_seed.generate(_require_project(project_id), _proofs_root())
+    # Backfill first (like the other artifact-reading routes) so a pre-index project's
+    # proofs are in the table before we read it — otherwise it would generate nothing.
+    project = _require_project(project_id)
+    _ensure_artifacts_backfilled(project)
+    return blueprint_seed.generate(project, _proofs_root())
 
 
 # ── Filesystem: tree / read / edit / export the project repo (U1/U2, D34) ─────────
@@ -483,8 +487,10 @@ def get_graph_by_slug(slug: str) -> dict:
 @router.post("/api/projects/by-slug/{slug}/blueprint/generate")
 def generate_blueprint_by_slug(slug: str) -> dict:
     # The Overleaf "Generate from formalized theorems" button lands here (slug-resolved,
-    # never creates a project). Same additive synthesis as the by-id route.
-    return blueprint_seed.generate(_require_project_by_slug(slug), _proofs_root())
+    # never creates a project). Same additive synthesis as the by-id route, backfill included.
+    project = _require_project_by_slug(slug)
+    _ensure_artifacts_backfilled(project)
+    return blueprint_seed.generate(project, _proofs_root())
 
 
 def _ensure_artifacts_backfilled(project: dict) -> None:

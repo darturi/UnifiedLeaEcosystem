@@ -1007,10 +1007,12 @@
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = null;
     // Blueprint view has its own (Items-independent) fetch + render — no file
-    // archive, manifest, or in-progress poll. The header refresh button and the
-    // edit-driven background refresh both land here.
+    // archive, manifest, or in-progress poll. The blueprint is derived from
+    // .lea/blueprint.md + Lean state, NOT the .tex buffer, so edit-/poll-driven
+    // background refreshes can't change it — skip them. Explicit refreshes (the
+    // header ↻ and initial open, both non-background) still re-fetch.
     if (leanPaneMainView === "blueprint") {
-      await renderLeanPaneBlueprint({ background });
+      if (!background) await renderLeanPaneBlueprint({});
       return;
     }
     await ensureLeanPaneView();

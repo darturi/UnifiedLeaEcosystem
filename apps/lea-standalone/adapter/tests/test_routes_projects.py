@@ -676,6 +676,55 @@ def test_generate_blueprint_synthesizes_nodes_edges_and_is_idempotent(tmp_path, 
     assert len(again["graph"]["nodes"]) == 2
 
 
+def test_generate_blueprint_backfills_pre_index_artifacts(tmp_path, monkeypatch):
+    """A project whose proofs predate the artifacts index (registry markdown only, no
+    artifact rows) must still generate nodes — the route backfills before reading."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Legacy"))
+    pid = project["id"]
+    repo = proofs / "Lea" / "Legacy"
+    (repo / "old.lean").write_text(
+        "import Mathlib\nnamespace Lea.Legacy\nlemma old : True := trivial\nend Lea.Legacy\n"
+    )
+
+    # No artifact rows exist; instead the proof lives in the legacy registry markdown
+    # (HTML-comment markers) that _ensure_artifacts_backfilled imports from.
+    assert store.list_artifacts_for_scope(pid) == []
+    registry = tmp_path / "workspace" / "projects" / f"{project['slug']}.md"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        '# Legacy\n\n<!-- lea:theorem name="Lea.Legacy.old" '
+        'proof="workspace/proofs/Lea/Legacy/old.lean" module="Lea.Legacy.Old" -->\n'
+    )
+
+    result = projects_route.generate_blueprint(pid)
+    assert result["added"] == 1, "backfill should surface the registry proof before generating"
+    assert result["graph"]["nodes"][0]["key"] == "old"
+
+
+def test_generate_blueprint_closes_dangling_fence_before_appending(tmp_path, monkeypatch):
+    """An unclosed ``` fence in blueprint.md must not swallow the appended nodes — the
+    node stays a real section, so a second run is still idempotent."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Fence"))
+    pid = project["id"]
+    repo = proofs / "Lea" / "Fence"
+    session = store.create_session("prove", project_id=pid)["id"]
+    (repo / "t.lean").write_text(
+        "import Mathlib\nnamespace Lea.Fence\nlemma t : True := trivial\nend Lea.Fence\n"
+    )
+    _record_artifact(pid, session, "Lea.Fence.t", "proof", "t.lean")
+
+    # A blueprint that ends inside an open fence (odd number of ``` lines).
+    projects_route.put_blueprint(pid, DocUpdate(content="# Blueprint\n\n```\nunterminated example\n"))
+
+    first = projects_route.generate_blueprint(pid)
+    assert first["added"] == 1 and first["graph"]["nodes"][0]["key"] == "t"
+    # Idempotent despite the dangling fence: the node was written outside it.
+    second = projects_route.generate_blueprint(pid)
+    assert second["added"] == 0 and len(second["graph"]["nodes"]) == 1
+
+
 def test_generate_blueprint_by_slug_and_404(tmp_path, monkeypatch):
     proofs = _setup(tmp_path, monkeypatch)
     project = projects_route.create_project(ProjectCreate(title="Doc One"))

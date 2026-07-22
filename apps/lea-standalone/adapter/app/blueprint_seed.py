@@ -178,7 +178,13 @@ def generate(project: dict, proofs_root) -> dict:
 
     if candidates:
         blocks = "\n\n".join(_render_block(c) for c in candidates)
-        new_text = f"{existing_text.rstrip()}\n\n{blocks}\n"
+        # If the existing content ends inside an unclosed ``` fence (an odd number of
+        # fence lines), close it first — otherwise the appended `## ` sections land
+        # inside the fence, parse as inert, and get re-added on every run (breaking the
+        # idempotency guarantee). Balanced fences (the normal case) add nothing.
+        fences = sum(1 for line in existing_text.splitlines() if blueprint._FENCE_RE.match(line))
+        closer = "```\n\n" if fences % 2 == 1 else ""
+        new_text = f"{existing_text.rstrip()}\n\n{closer}{blocks}\n"
         project_service.write_doc(project, proofs_root, "blueprint.md", new_text)
 
     return {
