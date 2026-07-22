@@ -111,8 +111,8 @@
     <b>absent from the UI entirely</b> until it finished.
   </div>
 
-  <div class="bar"><i style="width:55%"></i></div>
-  <div class="counts">12 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 + D1 + D2 + E1 + E2 + E3 verified · B1 built · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 9 queued across D–G · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E complete ✓ — parallel children stream + stop</b>
+  <div class="bar"><i style="width:64%"></i></div>
+  <div class="counts">14 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 + D1 + D2 + D6 + D7 + E1 + E2 + E3 verified · B1 built · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 7 queued across D–G · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E complete ✓ · Sub-agents page + Projects hub live</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -393,28 +393,33 @@
         the full per-role settings; this command is the composer shortcut into the same override layer.)</div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">D6</span><span class="title">Sub-agents page — view/edit every role's settings (like Skills)</span>
-        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">A dedicated <b>Sub-agents</b> view (new <code>view</code>, mirrors <code>SkillFactory</code>): every
-        role (<code>proof-candidate</code>, <code>premise-search</code>) as a card showing <b>model, max-turns, max-cost,
-        system prompt, tool subset</b> — editable in place. Edits persist as <b>per-profile overrides</b> in the adapter
-        (<i>not</i> by mutating the vendored <code>lea/agents/*.yaml</code>), merged over the profile at spawn — the same
-        persist→sync pattern the model setting uses. This override layer is the home for <b>D5</b> (the
-        <code>/sub-agent-model</code> command becomes a shortcut into it) and the storage seam the future <b>custom
-        sub-agents</b> reuse (see <code>TODO.md</code>). <span class="haz">max-cost is net-new</span> — a field <i>plus</i>
-        teaching the child loop to stop when accumulated cost crosses it.</div>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done</b> — a dedicated <b>Sub-agents</b> view (<code>SubagentFactory</code>, mirrors
+        <code>SkillFactory</code>): each role (<code>proof-candidate</code>, <code>premise-search</code>) with editable
+        <b>model, max-turns, max-cost, system prompt</b> (tool subset shown read-only). Edits persist as <b>per-role
+        overrides</b> — a JSON sidecar in the adapter (<code>subagent_overrides.py</code>, <i>only the diff-from-default</i>
+        stored, so untouched defaults keep flowing; reset clears), <i>never</i> mutating <code>lea/agents/*.yaml</code>.
+        The adapter threads them onto <code>LeaConfig.subagent_overrides</code>; the prover's <code>_child_config</code>
+        merges them over the role at spawn (tools still compose ⊆ parent). <span class="haz">max-cost was net-new</span> —
+        a real <code>max_cost_usd</code> field the child loop now honours (summarize-on-cap, like max-turns). This override
+        layer is the seam <b>D5</b> and future <b>custom sub-agents</b> reuse. Endpoints <code>GET/PUT
+        /api/sub-agents/profiles</code>. Tests: prover <code>test_subagent_overrides</code> (merge + cost cap), adapter
+        <code>test_routes_subagents</code> (diff-store, reset, 404). Model field is the searchable
+        <code>ModelPicker</code> (full catalog) with clear-to-inherit.
+        <span class="p1">✓ live-tested: edited a role's model/limits/prompt, applied to the next spawn</span></div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id fe">D7</span><span class="title">Projects hub + sidebar shows only the 3 latest</span>
-        <span class="tag fe">frontend</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">General-UI declutter that rode in with this frontend pass. The sidebar's flat project list doesn't
-        scale — cap it to the <b>3 most-recently-updated</b> (latest on top) and make the <b>Projects</b> header open a
-        dedicated <b>Projects hub</b>: a new <code>view</code> showing every project as a <b>card</b> (Claude-web style) →
-        click → the existing <code>openProjectWindow</code>. Frontend-only: reuses the <code>view</code>-switch pattern
-        (<code>ProjectWindow</code>/<code>SkillFactory</code>) + the <code>projects</code> store; the sidebar change is
-        sort-by-updated + <code>slice(0,3)</code> + a clickable header.</div>
+        <span class="tag fe">frontend</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><b>Done</b> — the sidebar caps its project list to the <b>3 most-recently-updated</b> (sort-by-updated
+        + <code>slice(0,3)</code>), with a <b>See all N</b> row and a clickable <b>Projects</b> header that opens a new
+        <b>Projects hub</b> (<code>ProjectsHub</code>): a card grid of every project (Claude-web style) → click → the
+        existing <code>openProjectWindow</code>. Frontend-only, reusing the <code>view</code>-switch pattern +
+        <code>projects</code> store (refresh-on-mount for fresh <code>updated_at</code>).
+        <span class="p1">✓ live-tested: hub card-grid opens projects; New-project dialog works in-hub</span></div>
     </div>
   </div>
 

@@ -6,6 +6,8 @@ import { StatsPage } from './components/StatsPage';
 import { SettingsPage } from './components/SettingsPage';
 import { ProjectWindow } from './components/ProjectWindow';
 import { SkillFactory } from './components/SkillFactory';
+import { SubagentFactory } from './components/SubagentFactory';
+import { ProjectsHub } from './components/ProjectsHub';
 import { NewProjectDialog } from './components/NewProjectDialog';
 import { SearchOverlay } from './components/SearchOverlay';
 import { sortCodeSteps } from './lib/timeline.mjs';
@@ -362,6 +364,17 @@ export default function App() {
     />
   );
 
+  // The new-project dialog must be mountable from any view that can trigger it (the main
+  // shell AND the Projects hub) — otherwise `setNewProjectOpen(true)` from the hub sets
+  // state with nothing rendered to show it. Shared like `searchOverlay`.
+  const newProjectDialog = (
+    <NewProjectDialog
+      open={newProjectOpen}
+      onClose={() => setNewProjectOpen(false)}
+      onCreate={handleCreateProject}
+    />
+  );
+
   if (view === 'project' && currentProject)
     return (
       <>
@@ -379,6 +392,25 @@ export default function App() {
       <>
         {searchOverlay}
         <SkillFactory onBack={() => setView('main')} />
+      </>
+    );
+  if (view === 'subagents')
+    return (
+      <>
+        {searchOverlay}
+        <SubagentFactory onBack={() => setView('main')} />
+      </>
+    );
+  if (view === 'projects-hub')
+    return (
+      <>
+        {searchOverlay}
+        {newProjectDialog}
+        <ProjectsHub
+          onBack={() => setView('main')}
+          onOpenProject={openProjectWindow}
+          onNewProject={() => setNewProjectOpen(true)}
+        />
       </>
     );
   if (view === 'stats')
@@ -405,11 +437,7 @@ export default function App() {
   return (
     <div className="lea-app">
       {searchOverlay}
-      <NewProjectDialog
-        open={newProjectOpen}
-        onClose={() => setNewProjectOpen(false)}
-        onCreate={handleCreateProject}
-      />
+      {newProjectDialog}
       <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         <Sidebar
           runningSessionId={isRunning ? selectedSessionId : undefined}
@@ -423,9 +451,17 @@ export default function App() {
           }}
           onSelectProject={openProjectWindow}
           onNewProject={() => setNewProjectOpen(true)}
+          onOpenProjectsHub={() => {
+            closeProject();
+            setView('projects-hub');
+          }}
           onOpenSkills={() => {
             closeProject();
             setView('skills');
+          }}
+          onOpenSubagents={() => {
+            closeProject();
+            setView('subagents');
           }}
           onOpenSearch={() => setSearchOpen(true)}
           onOpenSettings={() => setView('settings')}

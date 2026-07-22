@@ -142,6 +142,26 @@ export interface Skill {
   updated_at: string;
 }
 
+// ── Sub-agents (D6) ───────────────────────────────────────────────────────────
+// A built-in role's tunable settings. `model: null` → inherit the coordinator's model;
+// `max_turns: null` → the role's runaway ceiling; `max_cost: null` → uncapped spend.
+export interface SubagentSettings {
+  model: string | null;
+  max_turns: number | null;
+  max_cost: number | null;
+  system_prompt: string;
+  tools: string[];
+}
+// A role with its vendored `default`, the stored `override` (only the diff-from-default),
+// and the `effective` settings actually used at spawn (default merged with override).
+export interface SubagentProfile {
+  name: string;
+  description?: string | null;
+  default: SubagentSettings;
+  override: Partial<SubagentSettings>;
+  effective: SubagentSettings;
+}
+
 // ── Blueprint & derived graph (v2.1 Slice 5, D28/D29) ─────────────────────────
 // The blueprint is `.lea/blueprint.md` (markdown-canonical); the graph is parsed +
 // derived on read. Status is derived from live Lean state, never stored.

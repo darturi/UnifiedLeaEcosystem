@@ -17,6 +17,8 @@ import type {
   ProjectFile,
   ProjectGraph,
   Skill,
+  SubagentProfile,
+  SubagentSettings,
   BlueprintWarning,
   TreeEntry,
   SearchResult,
@@ -339,6 +341,33 @@ export async function pushProject(
     method: 'POST',
   });
   if (!response.ok) throw new Error(await detailMessage(response, 'Push to GitHub failed.'));
+  return response.json();
+}
+
+// ── Sub-agents (D6) ───────────────────────────────────────────────────────────
+// View/edit each built-in role's settings over /api/sub-agents. Edits persist as
+// per-role overrides (not by mutating the vendored YAML) and are merged at spawn.
+export async function listSubagentProfiles(): Promise<SubagentProfile[]> {
+  const response = await fetch('/api/sub-agents/profiles');
+  if (!response.ok)
+    throw new Error(await detailMessage(response, `Failed to load sub-agents: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.profiles) ? data.profiles : [];
+}
+
+// PUT the effective settings the user edited; the backend stores only the diff-from-
+// default (so an untouched default keeps flowing through; sending defaults resets it).
+export async function updateSubagentProfile(
+  name: string,
+  settings: Partial<SubagentSettings>,
+): Promise<SubagentProfile> {
+  const response = await fetch(`/api/sub-agents/profiles/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok)
+    throw new Error(await detailMessage(response, `Failed to save sub-agent: ${response.statusText}`));
   return response.json();
 }
 
