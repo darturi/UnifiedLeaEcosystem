@@ -27,18 +27,22 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import dataclasses
+import queue as _queue
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import lsp_daemon
 from .errors import ToolError
-from .events import CheckResult, Finished, SubagentFinished
+from .events import CheckResult, Finished, SubagentFinished, SubagentProgress
 from .profiles import AgentProfile, available_profiles, load_profile
 from .registry import build_toolset, get_tool, tool
 from .runctx import (
     current_config,
     current_depth,
     current_run_key,
+    current_should_stop,
     current_working_dir,
 )
 
@@ -46,6 +50,12 @@ from .runctx import (
 # depth-1 subagent may not. Kept here (not a config knob yet) so item 18 pins the
 # safe default; a future item can thread it through config with a design pass.
 DEFAULT_MAX_DEPTH = 1
+
+# E2: how many children may run at once. A hard cap on concurrent `lean --worker`
+# processes (each loads Mathlib into RAM) so a model that spawns many at once can't
+# drive the box into swap — the same laptop-safety concern B1/B3 guard. Children beyond
+# the cap queue and start as slots free.
+DEFAULT_MAX_CONCURRENT_CHILDREN = 5
 
 # A runaway guard on a child that never converges — NOT accounting. A child with no
 # turn budget of its own (parent unlimited) still can't loop forever.
@@ -72,7 +82,12 @@ _SPAWN_SCHEMA = {
                 "type": "string",
                 "description": (
                     "The full task for the subagent, self-contained: it starts with a "
-                    "fresh context and sees only this prompt, not your conversation."
+                    "fresh context and sees only this prompt, not your conversation. "
+                    "State the GOAL — the exact lemma/statement to prove or the specific "
+                    "thing to find — NOT a file path to write. The subagent writes its "
+                    "candidate in its own isolated scratch directory; you collate the "
+                    "result and commit the canonical file yourself. Do not tell it where "
+                    "to write (any path you give is ignored / redirected into its scratch)."
                 ),
             },
             "subagent_type": {
@@ -146,18 +161,35 @@ def _child_config(parent_config, profile: AgentProfile | None):
             mcp_servers={},
             max_turns=_bounded_child_turns(parent_config.max_turns),
             system_prompt_head=None,
+            max_cost_usd=None,
         )
-    # An explicit profile cap is honored as declared; only an inherited/unlimited cap
-    # is clamped to the runaway ceiling.
-    max_turns = profile.max_turns if profile.max_turns is not None \
-        else _bounded_child_turns(parent_config.max_turns)
+    # D6: merge the user's per-role override (from the Sub-agents page) OVER the role's
+    # YAML defaults — model / max_turns / max_cost / system_prompt / tools. The override
+    # retunes THIS spawn only; the vendored profile is never mutated. Tools still compose
+    # against the parent (item 21), so an override can only TIGHTEN, never escalate.
+    try:
+        override = dict((parent_config.subagent_overrides or {}).get(profile.name) or {})
+    except Exception:  # noqa: BLE001 — a malformed override must not crash the spawn path
+        override = {}
+
+    # An explicit cap (override or profile) is honored as declared; only an
+    # inherited/unlimited cap is clamped to the runaway ceiling.
+    if override.get("max_turns") is not None:
+        max_turns = override["max_turns"]
+    elif profile.max_turns is not None:
+        max_turns = profile.max_turns
+    else:
+        max_turns = _bounded_child_turns(parent_config.max_turns)
+
+    declared_tools = override["tools"] if override.get("tools") else profile.tools
     return dataclasses.replace(
         parent_config,
-        model=profile.model or parent_config.model,
-        tools=compose_child_tools(parent_config, profile.tools),
+        model=override.get("model") or profile.model or parent_config.model,
+        tools=compose_child_tools(parent_config, declared_tools),
         mcp_servers={},
         max_turns=max_turns,
-        system_prompt_head=profile.system_prompt,
+        system_prompt_head=override.get("system_prompt") or profile.system_prompt,
+        max_cost_usd=override.get("max_cost"),
     )
 
 
@@ -182,11 +214,17 @@ def _relativize(path: str, base: str | None) -> str:
         return path
 
 
-def _run_child(child_config, child_messages, *, working_dir: str, run_key: str, depth: int):
-    """Drive a child `run_events` to completion, absorbing its live events (item 18
-    keeps the child's steps out of the parent's context — the whole point of a
-    throwaway subagent). Returns ``(last_check, finished)``: the final `CheckResult`
-    seen (or None) and the terminal `Finished` (or None if the child errored out)."""
+def _run_child(child_config, child_messages, *, working_dir: str, run_key: str,
+               depth: int, should_stop=None):
+    """Drive a child `run_events`, YIELDING each of its events (E1) while capturing the
+    two the parent needs. A generator: it yields the child's raw `AgentEvent`s (the
+    caller wraps them as `SubagentProgress` for the UI) and, via ``return``, hands back
+    ``(last_check, finished)`` — the final `CheckResult` seen (or None) and the terminal
+    `Finished` (or None if the child errored out). ``should_stop`` is the child's
+    cooperative-stop predicate (D2): a per-child flag composed with the coordinator's.
+
+    Item 18 still holds: the coordinator loop yields these up for the UI but never puts
+    them in the model's `messages` — only the distilled result becomes the tool_result."""
     # Lazy import breaks the tools -> subagents -> agent import cycle: agent.py imports
     # tools (which imports this module), so this module cannot import agent at load.
     from .agent import run_events
@@ -199,14 +237,14 @@ def _run_child(child_config, child_messages, *, working_dir: str, run_key: str, 
         session_id=run_key,
         working_dir=working_dir,
         depth=depth,
-        # A child is autonomous: no human approval gate, no external stop hook.
-        should_stop=None,
-        gate=None,
+        should_stop=should_stop,
+        gate=None,            # a child never pauses for human approval
     ):
         if isinstance(ev, CheckResult):
             last_check = ev
         elif isinstance(ev, Finished):
             finished = ev
+        yield ev
     return last_check, finished
 
 
@@ -281,6 +319,23 @@ def _build_result(
     )
 
 
+def _error_result(plan: "SpawnPlan", detail: str) -> SubagentResult:
+    """The typed result for a child that RAISED before finishing (D1). Recorded so a
+    started child always gets a `SubagentFinished` — otherwise the adapter's running row
+    would never resolve. No candidate, no transcript; the error is the summary."""
+    return SubagentResult(
+        result_id=plan.result_id,
+        subagent_type=plan.subagent_type,
+        depth=plan.child_depth,
+        candidate_path=None,
+        check_status=None,
+        check_detail=None,
+        stop_reason="error",
+        summary=f"error — {detail}",
+        transcript=[],
+    )
+
+
 # --- per-activation result collector -------------------------------------------
 # spawn_subagent records each child's typed result here; the agent loop drains it
 # right after the tool call and yields a SubagentFinished event (mirroring how a
@@ -319,9 +374,28 @@ def drain_results() -> list[SubagentResult]:
     return out
 
 
-@tool(name="spawn_subagent", description=_SPAWN_SCHEMA["description"],
-      input_schema=_SPAWN_SCHEMA["input_schema"], opt_in=True)
-def spawn_subagent(args: dict) -> str:
+@dataclass(frozen=True)
+class SpawnPlan:
+    """Everything resolved for a spawn BEFORE the child runs (D1). `prepare_spawn`
+    builds it (validate → role → id → scratch dir → child config); `run_prepared`
+    consumes it. Splitting the two lets the coordinator loop emit `SubagentStarted`
+    between them, so a running child is visible instead of appearing only on finish."""
+    result_id: str
+    subagent_type: str
+    child_depth: int
+    description: str          # the task-title line, for the running row's label
+    child_config: object
+    child_messages: list
+    candidate_dir: Path
+    parent_wd: str | None
+
+
+def prepare_spawn(args: dict) -> "SpawnPlan | str":
+    """Resolve a spawn WITHOUT running the child. Returns a :class:`SpawnPlan` on
+    success, or an error string (the `tool_result` the model reads) when the call is
+    refused — missing prompt, depth-cap breach, no live activation, or an unknown role.
+    On an error string the coordinator loop emits NO `SubagentStarted` (nothing runs),
+    so a refused spawn never leaves a phantom running child."""
     description = (args.get("description") or "").strip()
     prompt = (args.get("prompt") or "").strip()
     subagent_type = (args.get("subagent_type") or "generalist").strip() or "generalist"
@@ -358,22 +432,210 @@ def spawn_subagent(args: dict) -> str:
     candidate_dir = _candidate_dir_for(parent_wd, run_key, agent_id)
     candidate_dir.mkdir(parents=True, exist_ok=True)
 
+    # D2: register a per-child stop flag now, keyed by the child's id, so an interrupt
+    # endpoint can find and set it the instant SubagentStarted surfaces the child —
+    # even though the child itself only starts running in run_prepared_events. Cleared
+    # there in a finally.
+    _child_stops[agent_id] = threading.Event()
+
     child_config = _child_config(parent_config, profile)
     task = f"{description}\n\n{prompt}" if description else prompt
     child_messages = [{"role": "user", "content": task}]
+    # The running row's label: the same first line `_subagent_child_title` would pick
+    # from the child's first user message (bridge.py), but available now — before the
+    # child has produced any transcript.
+    title_hint = description or (task.splitlines()[0].strip() if task else subagent_type)
 
+    return SpawnPlan(
+        result_id=agent_id,
+        subagent_type=subagent_type,
+        child_depth=depth + 1,
+        description=title_hint,
+        child_config=child_config,
+        child_messages=child_messages,
+        candidate_dir=candidate_dir,
+        parent_wd=parent_wd,
+    )
+
+
+# --- per-child cooperative stop (D2) -------------------------------------------
+# Keyed by the child's result_id. prepare_spawn registers an Event; run_prepared_events
+# clears it in a finally. `request_child_stop` (called in-process by the adapter's
+# interrupt endpoint) sets it; the child's should_stop polls it — so a user can kill one
+# runaway child without cancelling the whole coordinator run. Process-global (not a
+# ContextVar): the endpoint runs on a DIFFERENT thread from the child's, and a
+# threading.Event is the thread-safe hand-off between them.
+_child_stops: dict[str, threading.Event] = {}
+
+
+def request_child_stop(result_id: str) -> bool:
+    """Ask a single running child to stop cleanly (D2). Returns True if a live child by
+    that id was found and flagged, False if it is unknown/already gone. The child returns
+    its partial findings at its next turn boundary (the same clean stop as a coordinator
+    interrupt), so the coordinator still gets a usable `SubagentFinished`."""
+    ev = _child_stops.get(result_id)
+    if ev is None:
+        return False
+    ev.set()
+    return True
+
+
+def _compose_child_stop(result_id: str):
+    """The child's stop predicate: its OWN per-child flag OR the coordinator's stop
+    (D18, read from the run context). Either fires a clean child stop — so `Stop` on the
+    coordinator also halts a running child instead of waiting it out."""
+    flag = _child_stops.get(result_id)
+    parent_stop = current_should_stop()
+
+    def _stop() -> bool:
+        if flag is not None and flag.is_set():
+            return True
+        return bool(parent_stop and parent_stop())
+    return _stop
+
+
+def run_prepared_events(plan: "SpawnPlan"):
+    """Run a prepared child, YIELDING its events (E1) and recording its typed result.
+    A generator: it yields the child's own `AgentEvent`s wrapped as `SubagentProgress`
+    (the UI renders a live child), and via ``return`` hands back the prose render — the
+    `spawn_subagent` tool_result the model reads. ALWAYS records a result — even on a
+    raise — so every `SubagentStarted` gets a matching `SubagentFinished` (a running row
+    never lingers). The child's stop predicate (its per-child flag ∨ the coordinator's)
+    lets a user kill just this child (D2)."""
+    last_check: CheckResult | None = None
+    finished: Finished | None = None
+    child = _run_child(
+        plan.child_config, plan.child_messages,
+        working_dir=str(plan.candidate_dir), run_key=plan.result_id,
+        depth=plan.child_depth, should_stop=_compose_child_stop(plan.result_id),
+    )
     try:
-        last_check, finished = _run_child(
-            child_config, child_messages,
-            working_dir=str(candidate_dir), run_key=agent_id, depth=depth + 1,
-        )
+        # `yield from` streams the child's raw events (which we wrap) and captures the
+        # generator's return value — (last_check, finished).
+        while True:
+            try:
+                ev = next(child)
+            except StopIteration as stop:
+                last_check, finished = stop.value if stop.value is not None else (None, None)
+                break
+            yield SubagentProgress(plan.result_id, ev)
     except Exception as exc:  # noqa: BLE001 — a child failure is a tool result, never a parent crash
-        return f"Error: subagent '{subagent_type}' failed: {type(exc).__name__}: {exc}"
+        # Record an error result too (D1), so the started child still finishes; the
+        # tool_result the model reads stays the same explicit failure string.
+        detail = f"{type(exc).__name__}: {exc}"
+        _record_result(_error_result(plan, detail))
+        return f"Error: subagent '{plan.subagent_type}' failed: {detail}"
+    finally:
+        # D2: drop the per-child stop flag now the child is done (registered in
+        # prepare_spawn). Best-effort.
+        _child_stops.pop(plan.result_id, None)
+        # B1: reap the child's LSP file-workers now. Its scratch candidates are never
+        # checked again (we collate via the filesystem into the parent's own canonical
+        # file), so didClose every document under the child's scratch tree instead of
+        # leaking one `lean --worker` per unique path. Best-effort.
+        try:
+            lsp_daemon.close_documents_under(str(plan.candidate_dir))
+        except Exception:
+            pass
 
-    # `agent_id` is the result id: unique per spawn, and the audit handle a promoted
-    # candidate links back to. Record the typed result (with the child transcript) for
-    # the parent loop to drain into a SubagentFinished event; return the prose render
-    # as the tool_result the model reads.
-    result = _build_result(agent_id, subagent_type, depth + 1, last_check, finished, parent_wd)
+    # `result_id` is the audit handle a promoted candidate links back to. Record the
+    # typed result (with the child transcript) for the parent loop to drain into a
+    # SubagentFinished event; return the prose render as the tool_result the model reads.
+    result = _build_result(
+        plan.result_id, plan.subagent_type, plan.child_depth,
+        last_check, finished, plan.parent_wd,
+    )
     _record_result(result)
     return result.render()
+
+
+def run_prepared(plan: "SpawnPlan") -> str:
+    """Non-streaming driver for direct/test callers (the registered `spawn_subagent`
+    wrapper): exhaust `run_prepared_events`, discard the progress events, and return its
+    render string. The coordinator loop instead `yield from`s the generator so the UI
+    gets live progress; both share the one implementation (and its always-record and
+    cleanup guarantees)."""
+    gen = run_prepared_events(plan)
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+    finally:
+        gen.close()
+
+
+def run_children_concurrently(plans, *, max_children: int = DEFAULT_MAX_CONCURRENT_CHILDREN):
+    """Run N prepared children CONCURRENTLY (E2), each on its own thread with an isolated
+    COPY of the current context, merging all their live events up as they arrive.
+
+    A generator: it yields every child's `SubagentProgress` (interleaved across children,
+    in real arrival order) and, via ``return``, hands back ``{result_id: render_string}``
+    — the coordinator maps each render back to its `spawn_subagent` tool call. The LLM
+    call and `lean_check` are blocking I/O, so the GIL is released and the children truly
+    overlap; a semaphore caps how many run at once (`max_children`) so a burst of spawns
+    can't melt the box with parallel `lean --worker`s (the B1/B3 concern). Each child's
+    context is a `contextvars.copy_context()`, so the per-run scopes (working_dir,
+    should_stop, the result collector) are inherited but never trample each other, and a
+    per-child exception is isolated into that child's render — a failing child never kills
+    a sibling.
+
+    Isolation-safety (distinct scratch dirs per child, per-uri LSP locking) is already
+    paid for (items 21/27, B3); this only adds the execution overlap."""
+    plans = list(plans)
+    if not plans:
+        return {}
+    q: "_queue.Queue" = _queue.Queue()
+    sem = threading.Semaphore(max(1, max_children))
+    renders: dict[str, str] = {}
+    threads = []
+
+    def worker(plan, ctx):
+        def run():
+            render = None
+            with sem:  # cap concurrent children; the rest queue here as threads
+                try:
+                    gen = run_prepared_events(plan)
+                    try:
+                        while True:
+                            q.put(("event", next(gen)))
+                    except StopIteration as stop:
+                        render = stop.value
+                except Exception as exc:  # noqa: BLE001 — isolate; never kill a sibling
+                    render = (f"Error: subagent '{plan.subagent_type}' failed: "
+                              f"{type(exc).__name__}: {exc}")
+            q.put(("done", plan.result_id, render))
+        # copy_context so this child inherits the coordinator's run context (working_dir,
+        # should_stop, the shared result collector) yet gets its OWN mutable scope for the
+        # child's run_events — concurrent children can't corrupt each other's ContextVars.
+        ctx.run(run)
+
+    for plan in plans:
+        t = threading.Thread(target=worker, args=(plan, contextvars.copy_context()), daemon=True)
+        t.start()
+        threads.append(t)
+
+    pending = len(plans)
+    while pending > 0:
+        kind, *rest = q.get()
+        if kind == "event":
+            yield rest[0]
+        else:
+            result_id, render = rest
+            renders[result_id] = render
+            pending -= 1
+    for t in threads:
+        t.join()
+    return renders
+
+
+@tool(name="spawn_subagent", description=_SPAWN_SCHEMA["description"],
+      input_schema=_SPAWN_SCHEMA["input_schema"], opt_in=True)
+def spawn_subagent(args: dict) -> str:
+    """Thin wrapper preserving the registered-tool contract for direct/test callers.
+    The coordinator loop (agent.py) instead calls `prepare_spawn` then streams via
+    `run_prepared_events`, so it can emit `SubagentStarted` + live progress (D1/E1)."""
+    plan = prepare_spawn(args)
+    if isinstance(plan, str):
+        return plan
+    return run_prepared(plan)

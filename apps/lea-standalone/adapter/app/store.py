@@ -194,6 +194,20 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                     from runs r3
                     where r3.session_id = s.id and r3.status in ('pending', 'running')
                 ) as active_run_count,
+                -- Sub-agents (bug-fix): a CHILD's final output — its last agent message —
+                -- so the coordinator's spawn box can show a collapsed preview + expand
+                -- without a second fetch. Gated on parent_id so a normal session's list
+                -- row never carries a big prose blob it doesn't use.
+                (
+                    case when s.parent_id is not null then (
+                        select tm.content
+                        from timeline tm
+                        where tm.session_id = s.id and tm.kind = 'message'
+                          and tm.author = 'agent'
+                        order by tm.id desc
+                        limit 1
+                    ) end
+                ) as final_summary,
                 max(0, cast((julianday(s.updated_at) - julianday(s.created_at)) * 86400 as integer)) as duration_seconds
             from sessions s
             left join runs r on r.session_id = s.id
@@ -1043,6 +1057,28 @@ def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = 
     return json.loads(row["transcript"])
 
 
+def latest_transcript_run_for_session(session_id: str) -> dict | None:
+    """The run that holds the session's latest transcript — id, model, and messages.
+
+    The manual `/compact` path (G3) needs the run_id (to overwrite the condensed
+    transcript back onto the SAME row that seeds the next activation) and the model
+    (to run the summary call with the session's own model). Returns None when the
+    session has no Finished run yet (nothing to compact)."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select id, model, transcript from runs
+            where session_id = ? and transcript is not null
+            order by created_at desc, id desc
+            limit 1
+            """,
+            (session_id,),
+        ).fetchone()
+    if not row or row["transcript"] is None:
+        return None
+    return {"run_id": row["id"], "model": row["model"], "messages": json.loads(row["transcript"])}
+
+
 # ---------------------------------------------------------------------------
 # timeline (C4) — one table, one counter
 #
@@ -1108,7 +1144,7 @@ def _message_from_row(row) -> dict:
         "run_id": d["run_id"],
         "role": "user" if d["author"] == "user" else "assistant",
         "content": d["content"],
-        "kind": "edit_note" if d["kind"] == "edit_note" else "assistant",
+        "kind": d["kind"] if d["kind"] in ("edit_note", "compaction") else "assistant",
         "seq": d["id"],
         "created_at": d["created_at"],
     }
@@ -1168,7 +1204,7 @@ def add_message(
             (
                 session_id,
                 run_id,
-                "edit_note" if kind == "edit_note" else "message",
+                kind if kind in ("edit_note", "compaction") else "message",
                 "user" if role == "user" else "agent",
                 content,
                 utc_now(),

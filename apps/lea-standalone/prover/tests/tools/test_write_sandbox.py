@@ -87,6 +87,34 @@ def test_edit_file_is_confined_too() -> None:
         check("the out-of-workspace file is untouched", outside.read_text() == "secret := 1")
 
 
+def test_child_redirects_out_of_sandbox_absolute_path_into_scratch() -> None:
+    # A subagent (depth > 0) works in an isolated scratch dir. When the coordinator's
+    # task names an absolute canonical path OUTSIDE that dir, the write is REDIRECTED
+    # into the scratch dir (by basename) rather than rejected — the coordinator collates
+    # the candidate by re-reading it, so the child must be able to write *something*.
+    with tempfile.TemporaryDirectory() as d:
+        scratch = Path(d).resolve() / "session" / ".lea" / "tmp" / "run" / "agent"
+        scratch.mkdir(parents=True)
+        canonical = Path(d).resolve() / "session" / "Lea" / "Misc" / "BurnsideAux.lean"
+        with run_context(working_dir=str(scratch), depth=1):
+            out = tools.write_file(str(canonical), "theorem c : True := trivial")
+        landed = scratch / "BurnsideAux.lean"
+        check("child write to a canonical path lands in its scratch dir", landed.exists())
+        check("child write is NOT written to the canonical path", not canonical.exists())
+        check("child write reports success (not an error)", not out.startswith("Error:"))
+        check("success message names the redirected scratch path", str(landed) in out)
+
+
+def test_child_relative_path_still_lands_in_scratch() -> None:
+    # The normal path: a child writing a relative filename lands in its working dir.
+    with tempfile.TemporaryDirectory() as d:
+        scratch = Path(d).resolve() / "agent"
+        scratch.mkdir()
+        with run_context(working_dir=str(scratch), depth=1):
+            tools.write_file("candidate.lean", "ok")
+        check("child relative write lands in scratch", (scratch / "candidate.lean").exists())
+
+
 def test_no_context_preserves_todays_behavior() -> None:
     # Standalone CLI / unit calls set no run context → no confinement, path as-is.
     with tempfile.TemporaryDirectory() as d:
@@ -103,6 +131,8 @@ def main() -> None:
     test_absolute_path_typo_escaping_working_dir_is_rejected()
     test_dotdot_traversal_is_rejected()
     test_edit_file_is_confined_too()
+    test_child_redirects_out_of_sandbox_absolute_path_into_scratch()
+    test_child_relative_path_still_lands_in_scratch()
     test_no_context_preserves_todays_behavior()
     print()
     if _FAILURES:

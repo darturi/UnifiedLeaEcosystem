@@ -42,6 +42,30 @@ class LeaConfig:
     # A subagent role's prompt head (item 19): appended AFTER the shared Lean core so
     # a role composes onto — never replaces — the hard rules. None for a top-level run.
     system_prompt_head: str | None = None
+    # A per-run COST cap (D6): the loop ends cleanly (summarize-on-cap) once accumulated
+    # spend crosses this. None → uncapped. Distinct from `max_spend_usd` (the cumulative
+    # app-wide billing guard the adapter enforces): this is a single-run ceiling the loop
+    # itself honours — used to give a sub-agent role its own `max_cost`.
+    max_cost_usd: float | None = None
+    # Per-role sub-agent overrides (D6): {profile_name: {model?, max_turns?, max_cost?,
+    # system_prompt?, tools?}}. The coordinator carries the user's edits from the
+    # Sub-agents page; `_child_config` merges the matching entry over a role's YAML
+    # defaults at spawn — so a role is retuned WITHOUT mutating the vendored profile.
+    subagent_overrides: dict = field(default_factory=dict)
+
+    # --- context compaction (G1) ---
+    # The condenser bounds the model-facing context on a long run. `context_token_limit`
+    # is the model's usable window; compaction triggers once a turn's real input tokens
+    # cross `compaction_threshold` of it (200_000 × 0.75 = 150k by default — high enough
+    # that normal runs never hit it). Set `context_token_limit` to 0 to disable entirely.
+    # The condenser prunes superseded tool outputs first (cheap, no LLM) and only
+    # summarizes the older middle if that isn't enough — always keeping the leading goal
+    # plus `compaction_keep_recent_turns` most-recent turns verbatim, and the last
+    # `compaction_keep_recent_results` tool results unmasked.
+    context_token_limit: int = 200_000
+    compaction_threshold: float = 0.75
+    compaction_keep_recent_turns: int = 6
+    compaction_keep_recent_results: int = 4
 
     # --- deployment / UI (the adapter reads these; the loop ignores them) ---
     lea_root: Path | None = None      # where proof files + per-session git repos live

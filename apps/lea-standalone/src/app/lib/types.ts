@@ -81,6 +81,9 @@ export interface SessionSummary {
   parent_id?: string | null;
   role?: string | null;
   spawned_at_turn?: number | null;
+  // A child's final output (its last agent message) — populated only for children, so
+  // the coordinator's spawn box can show a collapsed preview with expand/collapse.
+  final_summary?: string | null;
 }
 
 // ── Projects (v2.1) ───────────────────────────────────────────────────────────
@@ -137,6 +140,26 @@ export interface Skill {
   source_ref?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// ── Sub-agents (D6) ───────────────────────────────────────────────────────────
+// A built-in role's tunable settings. `model: null` → inherit the coordinator's model;
+// `max_turns: null` → the role's runaway ceiling; `max_cost: null` → uncapped spend.
+export interface SubagentSettings {
+  model: string | null;
+  max_turns: number | null;
+  max_cost: number | null;
+  system_prompt: string;
+  tools: string[];
+}
+// A role with its vendored `default`, the stored `override` (only the diff-from-default),
+// and the `effective` settings actually used at spawn (default merged with override).
+export interface SubagentProfile {
+  name: string;
+  description?: string | null;
+  default: SubagentSettings;
+  override: Partial<SubagentSettings>;
+  effective: SubagentSettings;
 }
 
 // ── Blueprint & derived graph (v2.1 Slice 5, D28/D29) ─────────────────────────

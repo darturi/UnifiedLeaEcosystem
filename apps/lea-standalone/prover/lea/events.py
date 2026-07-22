@@ -97,6 +97,52 @@ class UsageUpdated:
 
 
 @dataclass(frozen=True)
+class Compacted:
+    """The context condenser ran (G1). On a long run it reduced the model-facing message
+    history to keep the context bounded — pruning superseded tool outputs and, if that was
+    not enough, folding the older middle into a summary. `before_tokens`/`after_tokens` are
+    the estimated input-token size around the compaction; `pruned` is how many superseded
+    tool results were masked; `summarized` is 1 if the middle was folded, else 0.
+    Informational — the UI can show a 'context compacted' marker; nothing downstream
+    depends on it, and the coordinator's model context (not `messages` provenance in the
+    DB) is what changed."""
+    before_tokens: int
+    after_tokens: int
+    pruned: int
+    summarized: int
+
+
+@dataclass(frozen=True)
+class SubagentStarted:
+    """A child subagent was just spawned and is about to run (D1). Emitted BEFORE the
+    child blocks the coordinator's tool call, so a running child is visible instead of
+    materializing only on completion. The `result_id` matches the eventual
+    `SubagentFinished.result_id`, so the adapter can update the same child row on finish
+    rather than creating a second one. `description` is the short task title the
+    coordinator delegated (the child's first-message first line), for the running row's
+    label before any transcript exists."""
+    result_id: str
+    subagent_type: str
+    description: str
+
+
+@dataclass(frozen=True)
+class SubagentProgress:
+    """One of a running child's OWN events, surfaced live to the UI (E1) instead of
+    being absorbed silently until the child finishes. `result_id` names the child (it
+    matches its `SubagentStarted`/`SubagentFinished`); `event` is the child's inner
+    `AgentEvent` (a `TurnStarted`, `AssistantTextDelta`, `ToolCalled`, `CheckResult`, …).
+
+    Crucially this does NOT put the child's steps into the COORDINATOR's model context
+    (item 18): the coordinator loop yields these up for the adapter/UI but never appends
+    them to its `messages` — the model still sees only the distilled `SubagentFinished`
+    result in its tool_result. So the token-isolation guarantee holds; only the UI gains
+    visibility."""
+    result_id: str
+    event: object          # the child's inner AgentEvent
+
+
+@dataclass(frozen=True)
 class SubagentFinished:
     """A child subagent completed (item 22). The parent's `tool_result` for the
     `spawn_subagent` call carries the rendered prose the model reads; THIS event
@@ -151,6 +197,9 @@ AgentEvent = (
     | VerifyResult
     | Error
     | UsageUpdated
+    | Compacted
+    | SubagentStarted
+    | SubagentProgress
     | SubagentFinished
     | Finished
 )

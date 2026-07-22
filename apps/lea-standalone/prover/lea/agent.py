@@ -6,12 +6,15 @@ the default stdout renderer and returns the final text (and optional transcript)
 so existing callers (CLI, eval) keep working unchanged.
 """
 
+import contextvars
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import LeaConfig
+from . import condenser
 from .runctx import run_context
 from .prompt import compose_role_prompt, domain_cascade_hint, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
@@ -29,8 +32,17 @@ from .events import (
     FileChanged,
     CheckResult,
     UsageUpdated,
+    Compacted,
+    SubagentStarted,
     Finished,
 )
+
+# E3: read-only tools with no side effects and no ordering constraints — safe to run
+# CONCURRENTLY when a turn issues several at once (e.g. F1's multi-modal search fires
+# Loogle + semantic + grep together). Anything that writes, checks, or shells out
+# (write_file/edit_file/lean_check/bash) stays serial and in order — a write→check pair
+# must never be reordered. `spawn_subagent` has its own concurrency path (E2).
+_PARALLEL_SAFE_TOOLS = frozenset({"read_file", "search_mathlib"})
 
 
 _NARRATE_TOOL_STEPS_INSTRUCTION = """
@@ -543,7 +555,8 @@ def run_events(
         # `depth` (item 18) records this activation's nesting; `config` is stashed so
         # spawn_subagent can derive a child config. Both ride the ContextVars through
         # every tool call the inner loop delegates.
-        with run_context(working_dir=working_dir, run_key=run_key, depth=depth, config=config):
+        with run_context(working_dir=working_dir, run_key=run_key, depth=depth, config=config,
+                         should_stop=should_stop):
             # A fresh subagent-result collector per activation (item 22): spawn_subagent
             # records here, the inner loop drains into SubagentFinished events. Scoped so
             # results can't leak across runs; a child opens its own empty scope.
@@ -642,6 +655,9 @@ def _run_events_inner(
     surfaced_domains: set[str] = set()
 
     turn = 0
+    # The real input-token count from the previous turn's provider `Done` — the compaction
+    # trigger signal (G1). 0 on the first turn (nothing sent yet → nothing to compact).
+    last_input_tokens = 0
     while True:
         # Cooperative interrupt (D18): the human asked to stop. `turn` is the count
         # of completed turns, so the last step's write is already committed and the
@@ -652,8 +668,36 @@ def _run_events_inner(
                            turn, session_id, model, total_usage, total_cost, transcript(turn))
             return
 
+        # Context compaction (G1): before spending another turn, if the last turn's real
+        # input size crossed the trigger, condense the model-facing history — prune
+        # superseded tool outputs, then summarize the older middle only if that's not
+        # enough. Keeps the coordinator's context bounded on a long run without losing the
+        # goal or the recent state. The condenser is copy-on-write; `messages` is rebound to
+        # the condensed history the next `stream` call sends. Only the model context shrinks —
+        # the durable record the adapter keeps is built from the event stream, not from here.
+        if condenser.should_compact(last_input_tokens, config):
+            result = condenser.condense(messages, config, model=model,
+                                        last_input_tokens=last_input_tokens)
+            if result.changed:
+                messages = result.messages
+                total_usage.input_tokens += result.usage.input_tokens
+                total_usage.output_tokens += result.usage.output_tokens
+                total_cost += result.cost
+                if result.usage.input_tokens or result.usage.output_tokens or result.cost:
+                    yield UsageUpdated(result.usage.input_tokens, result.usage.output_tokens,
+                                       result.cost)
+                yield Compacted(result.before_tokens, result.after_tokens,
+                                result.pruned, result.summarized)
+                # Reflect the condensed size so we don't immediately re-trigger next turn on
+                # the stale pre-compaction count; the next real `Done` refreshes it anyway.
+                last_input_tokens = result.after_tokens
+
         turn += 1
-        if config.max_turns and turn > config.max_turns:
+        # D6: a per-run cost cap ends the run the same clean way the turn cap does. Checked
+        # at the turn boundary against the spend so far (a sub-agent's `max_cost` override
+        # flows here via `max_cost_usd`); None → uncapped, so top-level runs are unaffected.
+        cost_capped = config.max_cost_usd is not None and total_cost >= config.max_cost_usd
+        if (config.max_turns and turn > config.max_turns) or cost_capped:
             # Budget exhausted. Don't discard the work with a canned error — spend one
             # final tool-less turn asking the model to summarize its findings + best next
             # step, and return THAT as the result. For a delegated sub-agent this is the
@@ -674,7 +718,10 @@ def _run_events_inner(
                 # materialized sub-agent view carry the findings as the final message.
                 yield AssistantTextDelta(summary)
                 messages.append({"role": "assistant", "content": summary})
-            final_text = summary or "Reached the turn budget without completing the task."
+            final_text = summary or (
+                "Reached the cost budget without completing the task." if cost_capped
+                else "Reached the turn budget without completing the task."
+            )
             yield Finished("max_turns", final_text,
                            turn - 1, session_id, model, total_usage, total_cost, transcript(turn - 1))
             return
@@ -731,6 +778,8 @@ def _run_events_inner(
                 total_usage.input_tokens += event.usage.input_tokens
                 total_usage.output_tokens += event.usage.output_tokens
                 total_cost += event.cost
+                # The real context size of this turn — the G1 compaction trigger for next turn.
+                last_input_tokens = event.usage.input_tokens
                 yield UsageUpdated(event.usage.input_tokens, event.usage.output_tokens, event.cost)
 
         if current_text:
@@ -828,60 +877,113 @@ def _run_events_inner(
                            result_kind=result_kind, result_detail=result_detail)
             return
 
-        tool_results = []
-        for tc in tool_calls:
-            # Per-tool gate (D19): pause for human approval before an impactful tool.
-            # The adapter owns which tools are gated and the session allowlist, so a
-            # not-yet-allowed gated tool yields a two-way ToolApprovalRequested; deny
-            # (or anything not explicitly allowed) skips it with a tool-error so the
-            # model picks another step rather than the run dying.
+        def _exec_tool(tc):
+            """Run one NON-spawn tool and return its result string. Pure (no yields), so
+            it can run inline or on an E3 worker thread."""
+            handler = tool_handlers.get(tc["name"])
+            if handler:
+                try:
+                    r = handler(tc["args"])
+                except Exception as e:  # noqa: BLE001 — a tool error is a result, not a crash
+                    r = f"Error: tool '{tc['name']}' raised {type(e).__name__}: {e}"
+            else:
+                r = f"Error: unknown tool '{tc['name']}'"
+            # Item 26: on a model-invoked lean_check, append the domain-scoped tactic
+            # cascade for the mathematics in the checked file — once per domain per run.
+            if tc["name"] == "lean_check":
+                hint = _domain_cascade_for_check(tc.get("args") or {}, working_dir, surfaced_domains)
+                if hint:
+                    r = f"{r}\n\n{hint}"
+            return r
+
+        # Results by tool-call index, reassembled in the original order below so the
+        # provider matches each tool_result to its call. A turn's spawns run CONCURRENTLY
+        # (E2) and its independent read-only tools may too (E3); everything else stays
+        # serial and in order.
+        results_by_idx: dict[int, str] = {}
+        spawn_specs = []      # (idx, tc, plan) — approved spawns with a real plan
+        serial_calls = []     # (idx, tc) — approved non-spawn tools to execute
+
+        # Phase 1 — gate every call (D19; a two-way approval must run on the generator),
+        # prepare + announce spawns, and bucket the rest for execution.
+        for idx, tc in enumerate(tool_calls):
             approved = True
             if gate is not None and gate(tc["name"], tc["args"]):
                 decision = yield ToolApprovalRequested(tc["name"], tc["args"])
                 approved = decision in ("allow", "always_session")
-
             if not approved:
-                result = (
+                results_by_idx[idx] = (
                     f"The user declined to run this {tc['name']} call. Treat this as a redirect, "
                     "not a failure. Do NOT silently retry or jump to a different step. In your next "
                     "message, explain to the user what you were about to do and why, then ask how "
                     "they'd like to proceed — and wait for their reply before acting."
                 )
-            else:
-                handler = tool_handlers.get(tc["name"])
-                if handler:
-                    try:
-                        result = handler(tc["args"])
-                    except Exception as e:
-                        result = f"Error: tool '{tc['name']}' raised {type(e).__name__}: {e}"
+            elif tc["name"] == "spawn_subagent":
+                try:
+                    plan = subagents.prepare_spawn(tc["args"])
+                except Exception as e:  # noqa: BLE001
+                    results_by_idx[idx] = f"Error: tool 'spawn_subagent' raised {type(e).__name__}: {e}"
+                    continue
+                if isinstance(plan, str):
+                    results_by_idx[idx] = plan  # refused → no child, no started event
                 else:
-                    result = f"Error: unknown tool '{tc['name']}'"
+                    # D1: announce every spawn as running BEFORE launching, so the UI shows
+                    # the whole batch live from the outset.
+                    yield SubagentStarted(plan.result_id, plan.subagent_type, plan.description)
+                    spawn_specs.append((idx, tc, plan))
+            else:
+                serial_calls.append((idx, tc))
 
-                # Item 26: on a model-invoked lean_check, append the domain-scoped tactic
-                # cascade for the mathematics actually in the checked file — injected here
-                # at tool-use time so the cached prompt prefix is untouched, once per domain
-                # per run. Best-effort: an unreadable path just yields no hint.
-                if tc["name"] == "lean_check":
-                    hint = _domain_cascade_for_check(tc.get("args") or {}, working_dir, surfaced_domains)
-                    if hint:
-                        result = f"{result}\n\n{hint}"
+        # Phase 2 — non-spawn tools. E3: if a turn issues several INDEPENDENT read-only
+        # tools, run them concurrently (a real win for F1's multi-modal search); otherwise
+        # execute inline in order (any writer/checker/bash — a write→check pair must not
+        # be reordered).
+        if len(serial_calls) > 1 and all(tc["name"] in _PARALLEL_SAFE_TOOLS for _i, tc in serial_calls):
+            out: dict[int, str] = {}
+            threads = []
+            for _i, _tc in serial_calls:
+                def _work(i=_i, t=_tc, ctx=contextvars.copy_context()):
+                    out[i] = ctx.run(_exec_tool, t)
+                th = threading.Thread(target=_work, daemon=True)
+                th.start()
+                threads.append(th)
+            for th in threads:
+                th.join()
+            results_by_idx.update(out)
+        else:
+            for idx, tc in serial_calls:
+                results_by_idx[idx] = _exec_tool(tc)
 
+        # Phase 3 — E2: run this turn's spawns concurrently, streaming all their live
+        # events up as they arrive (the coordinator's model context stays isolated —
+        # these SubagentProgress events never enter `messages`; only the render does).
+        if spawn_specs:
+            renders = yield from subagents.run_children_concurrently([p for _i, _tc, p in spawn_specs])
+            for idx, _tc, plan in spawn_specs:
+                results_by_idx[idx] = renders.get(plan.result_id) or (
+                    f"Error: subagent '{plan.subagent_type}' produced no result."
+                )
+
+        # Phase 4 — emit each tool's downstream events + assemble tool_results IN ORDER.
+        tool_results = []
+        for idx, tc in enumerate(tool_calls):
+            result = results_by_idx.get(idx, f"Error: tool '{tc['name']}' produced no result")
             preview = result[:200] + "..." if len(result) > 200 else result
             yield ToolResulted(tc["name"], result, preview)
             for ev in _meaning_events(tc["name"], tc["args"], result):
                 yield ev
-            # A spawn_subagent call produced a typed result the string can't carry
-            # (the child transcript, the result id). Surface it as SubagentFinished so
-            # the adapter can store the transcript separately and keep the audit link.
-            if tc["name"] == "spawn_subagent":
-                for child_result in subagents.drain_results():
-                    yield child_result.to_event()
             proof_state.note_tool_result(tc["name"], tc["args"], result)
-
             tool_result = {"type": "tool_result", "tool_name": tc["name"], "content": result}
             if tc["id"]:
                 tool_result["tool_use_id"] = tc["id"]
                 tool_result["tool_call_id"] = tc["id"]
             tool_results.append(tool_result)
+
+        # Each spawn produced a typed result the tool_result string can't carry (the child
+        # transcript, the result id). Drain them AFTER the batch and surface each as a
+        # SubagentFinished so the adapter stores the transcript + keeps the audit link.
+        if spawn_specs:
+            for child_result in subagents.drain_results():
+                yield child_result.to_event()
 
         messages.append({"role": "user", "content": tool_results})

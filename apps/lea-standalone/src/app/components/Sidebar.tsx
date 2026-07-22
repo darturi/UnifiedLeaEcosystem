@@ -1,4 +1,5 @@
-import { BarChart3, PanelLeftClose, Plus, Sparkles } from 'lucide-react';
+import { useMemo } from 'react';
+import { BarChart3, Bot, PanelLeftClose, Plus, Sparkles } from 'lucide-react';
 import type { SessionSummary } from '../lib/api';
 import { useSessions } from '../stores/sessions';
 import { useProjects } from '../stores/projects';
@@ -13,7 +14,9 @@ export function Sidebar({
   onNewSession,
   onSelectProject,
   onNewProject,
+  onOpenProjectsHub,
   onOpenSkills,
+  onOpenSubagents,
   onOpenSearch,
   onOpenSettings,
   onOpenStats,
@@ -25,7 +28,9 @@ export function Sidebar({
   onNewSession: () => void;
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
+  onOpenProjectsHub: () => void;
   onOpenSkills: () => void;
+  onOpenSubagents: () => void;
   onOpenSearch: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
@@ -52,6 +57,13 @@ export function Sidebar({
   // F1: projects list + which one is open, from the projects store.
   const projects = useProjects((s) => s.projects);
   const selectedProjectId = useProjects((s) => s.selectedProjectId);
+  // D7: the flat project list doesn't scale — the sidebar shows only the 3
+  // most-recently-updated (latest on top); the rest live in the Projects hub, opened
+  // by clicking the "Projects" header. Same sort idiom the Chats group uses.
+  const topProjects = useMemo(
+    () => [...projects].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)).slice(0, 3),
+    [projects],
+  );
 
   return (
     <aside className="sidebar">
@@ -73,7 +85,13 @@ export function Sidebar({
       <div className="sb-scroll">
         <div className="proj-group">
           <div className="group-label proj-head">
-            Projects
+            <button
+              className="proj-head-btn"
+              onClick={onOpenProjectsHub}
+              title="Open the Projects hub"
+            >
+              Projects
+            </button>
             <button className="proj-add" onClick={onNewProject} title="New project" aria-label="New project">
               <Plus size={13} />
             </button>
@@ -81,19 +99,26 @@ export function Sidebar({
           {projects.length === 0 ? (
             <div className="proj-empty">No projects yet.</div>
           ) : (
-            projects.map((project) => (
-              <button
-                key={project.id}
-                className={`row ${selectedProjectId === project.id ? 'active' : ''}`}
-                onClick={() => onSelectProject(project.id)}
-              >
-                <span className="picon">∑</span>
-                <span className="rtitle">{project.title}</span>
-                {typeof project.session_count === 'number' && project.session_count > 0 && (
-                  <span className="count">{project.session_count}</span>
-                )}
-              </button>
-            ))
+            <>
+              {topProjects.map((project) => (
+                <button
+                  key={project.id}
+                  className={`row ${selectedProjectId === project.id ? 'active' : ''}`}
+                  onClick={() => onSelectProject(project.id)}
+                >
+                  <span className="picon">∑</span>
+                  <span className="rtitle">{project.title}</span>
+                  {typeof project.session_count === 'number' && project.session_count > 0 && (
+                    <span className="count">{project.session_count}</span>
+                  )}
+                </button>
+              ))}
+              {projects.length > topProjects.length && (
+                <button className="proj-seeall" onClick={onOpenProjectsHub}>
+                  See all {projects.length} projects →
+                </button>
+              )}
+            </>
           )}
         </div>
 
@@ -102,6 +127,10 @@ export function Sidebar({
           <button className="row" onClick={onOpenSkills}>
             <span className="picon"><Sparkles size={13} /></span>
             <span className="rtitle">Skills</span>
+          </button>
+          <button className="row" onClick={onOpenSubagents}>
+            <span className="picon"><Bot size={13} /></span>
+            <span className="rtitle">Sub-agents</span>
           </button>
         </div>
 

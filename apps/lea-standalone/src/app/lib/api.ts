@@ -17,6 +17,8 @@ import type {
   ProjectFile,
   ProjectGraph,
   Skill,
+  SubagentProfile,
+  SubagentSettings,
   BlueprintWarning,
   TreeEntry,
   SearchResult,
@@ -87,6 +89,41 @@ export async function interruptRun(runId: string): Promise<void> {
   if (!response.ok && response.status !== 409) {
     throw new Error(await detailMessage(response, `Failed to interrupt run: ${response.statusText}`));
   }
+}
+
+// Stop a single running child sub-agent (D2), addressed by its child SESSION id —
+// without cancelling the coordinator run. A 404 means it already finished (nothing to
+// stop), which we treat as success.
+export async function interruptSubagent(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/sub-agents/${encodeURIComponent(sessionId)}/interrupt`, { method: 'POST' });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(await detailMessage(response, `Failed to stop sub-agent: ${response.statusText}`));
+  }
+}
+
+// Manual context compaction (G3): the `/compact` slash command fires the same condenser
+// G1 runs automatically. Returns the token delta so the composer can note "freed ~N".
+export interface CompactionResult {
+  changed: boolean;
+  pruned: number;
+  summarized: boolean;
+  before_tokens: number;
+  after_tokens: number;
+  freed_tokens: number;
+  referenced_files: string[]; // files still in the model's view after compaction
+  // The durable timeline marker (kind='compaction'), present only when something changed;
+  // null on a no-op. Its `content` is the JSON payload the thread renders as the card.
+  message: ChatMessage | null;
+}
+
+export async function compactSession(sessionId: string): Promise<CompactionResult> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/compact`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, `Failed to compact: ${response.statusText}`));
+  }
+  return response.json();
 }
 
 // ── Projects (v2.1) ────────────────────────────────────────────────────────────
@@ -329,6 +366,33 @@ export async function pushProject(
     method: 'POST',
   });
   if (!response.ok) throw new Error(await detailMessage(response, 'Push to GitHub failed.'));
+  return response.json();
+}
+
+// ── Sub-agents (D6) ───────────────────────────────────────────────────────────
+// View/edit each built-in role's settings over /api/sub-agents. Edits persist as
+// per-role overrides (not by mutating the vendored YAML) and are merged at spawn.
+export async function listSubagentProfiles(): Promise<SubagentProfile[]> {
+  const response = await fetch('/api/sub-agents/profiles');
+  if (!response.ok)
+    throw new Error(await detailMessage(response, `Failed to load sub-agents: ${response.statusText}`));
+  const data = await response.json();
+  return Array.isArray(data.profiles) ? data.profiles : [];
+}
+
+// PUT the effective settings the user edited; the backend stores only the diff-from-
+// default (so an untouched default keeps flowing through; sending defaults resets it).
+export async function updateSubagentProfile(
+  name: string,
+  settings: Partial<SubagentSettings>,
+): Promise<SubagentProfile> {
+  const response = await fetch(`/api/sub-agents/profiles/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok)
+    throw new Error(await detailMessage(response, `Failed to save sub-agent: ${response.statusText}`));
   return response.json();
 }
 

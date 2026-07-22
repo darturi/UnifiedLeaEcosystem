@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, PanelLeftOpen } from 'lucide-react';
-import { sessionExportUrl } from '../lib/api';
+import { sessionExportUrl, interruptSubagent } from '../lib/api';
 import type {
   ApprovalDecision,
   ApprovalRecord,
@@ -15,20 +15,47 @@ import { MarkdownMessage } from './MarkdownMessage';
 import { ModelPicker } from './ModelPicker';
 import { OriginBadge } from './OriginBadge';
 import { buildTimeline } from '../lib/timeline.mjs';
+import { matchSlashCommands } from '../lib/slashCommands.js';
 import {
   deriveCodeStepProofStatus,
   deriveRunCompletionStatus,
   hasSorryLikeCheckDetail,
   latestCodeStep,
 } from '../lib/proofDisplay.mjs';
-import { useProofSession } from '../stores/proofSession';
+import { useProofSession, type CompactionPayload } from '../stores/proofSession';
 import { useModel } from '../stores/model';
 import { useSessions } from '../stores/sessions';
 
 type MergedNode =
   | { kind: 'message'; key: string; runId: string | null; seqKey: number; message: ChatMessage }
   | { kind: 'code'; key: string; runId: string | null; seqKey: number; step: CodeStep; codeIndex: number }
-  | { kind: 'approval'; key: string; runId: string | null; seqKey: number; approval: ApprovalRecord };
+  | { kind: 'approval'; key: string; runId: string | null; seqKey: number; approval: ApprovalRecord }
+  | { kind: 'spawn'; key: string; runId: string | null; seqKey: number; child: SessionSummary };
+
+// A run's nodes with consecutive spawn nodes coalesced into one box, so N sub-agents
+// spawned back-to-back render as a single group at their shared point in the thread.
+type RenderUnit =
+  | { kind: 'single'; node: MergedNode }
+  | { kind: 'spawn-group'; key: string; children: SessionSummary[] };
+
+function coalesceUnits(nodes: MergedNode[]): RenderUnit[] {
+  const units: RenderUnit[] = [];
+  for (const n of nodes) {
+    if (n.kind === 'spawn') {
+      const last = units[units.length - 1];
+      if (last && last.kind === 'spawn-group') last.children.push(n.child);
+      else units.push({ kind: 'spawn-group', key: n.key, children: [n.child] });
+    } else {
+      units.push({ kind: 'single', node: n });
+    }
+  }
+  return units;
+}
+
+function parseTime(iso?: string | null): number {
+  const t = iso ? Date.parse(iso) : NaN;
+  return Number.isNaN(t) ? 0 : t;
+}
 
 export function ChatThread({
   title,
@@ -195,24 +222,34 @@ export function ChatThread({
   // message — so it lands once and stays (M16).
   const runGroups = useMemo(() => {
     const nodes: MergedNode[] = [];
+    // Timeline anchors (created_at ↔ seqKey), ordered by seqKey — used to slot each
+    // sub-agent spawn into the thread at the point it was spawned (bug-fix: interleave
+    // rather than lump every child into one box at the end). seqKey and created_at are
+    // both monotonic in insertion order, so mapping a child's created_at to the seqKey of
+    // the last timeline row that predates it places the spawn box right after its origin.
+    const anchors: { seqKey: number; createdAt: number; runId: string | null }[] = [];
     for (const it of items) {
       if (it.kind === 'message') {
+        const seqKey = it.message.seq ?? Number.MAX_SAFE_INTEGER;
         nodes.push({
           kind: 'message',
           key: it.key,
           runId: it.message.run_id ?? null,
-          seqKey: it.message.seq ?? Number.MAX_SAFE_INTEGER,
+          seqKey,
           message: it.message,
         });
+        anchors.push({ seqKey, createdAt: parseTime(it.message.created_at), runId: it.message.run_id ?? null });
       } else {
+        const seqKey = it.step.seq ?? Number.MAX_SAFE_INTEGER;
         nodes.push({
           kind: 'code',
           key: it.key,
           runId: it.step.run_id ?? null,
-          seqKey: it.step.seq ?? Number.MAX_SAFE_INTEGER,
+          seqKey,
           step: it.step,
           codeIndex: it.codeIndex,
         });
+        anchors.push({ seqKey, createdAt: parseTime(it.step.created_at), runId: it.step.run_id ?? null });
       }
     }
     for (const a of approvals) {
@@ -224,6 +261,32 @@ export function ChatThread({
         approval: a,
       });
     }
+    // Interleave the coordinator's children as spawn nodes. Anchor by created_at: the
+    // greatest timeline row that predates the child, inheriting that row's runId so the
+    // box groups with the run it belongs to. A child whose time can't be placed (or that
+    // predates everything) sinks to the end rather than jumping to the top.
+    anchors.sort((x, y) => x.seqKey - y.seqKey);
+    const anchorFor = (createdAt: number): { seqKey: number; runId: string | null } => {
+      let best: { seqKey: number; runId: string | null } | null = null;
+      for (const a of anchors) {
+        if (a.createdAt <= createdAt) best = { seqKey: a.seqKey, runId: a.runId };
+        else break;
+      }
+      return best ?? { seqKey: Number.MAX_SAFE_INTEGER, runId: null };
+    };
+    childSessions.forEach((child, i) => {
+      const t = parseTime(child.created_at);
+      const anchor = t ? anchorFor(t) : { seqKey: Number.MAX_SAFE_INTEGER, runId: null };
+      nodes.push({
+        kind: 'spawn',
+        key: `sa:${child.id}`,
+        runId: anchor.runId,
+        // +0.25 so the spawn sits just after its anchor row; +i·ε keeps sibling spawns
+        // stably ordered by creation among themselves.
+        seqKey: anchor.seqKey + 0.25 + i * 1e-4,
+        child,
+      });
+    });
     nodes.sort((x, y) => x.seqKey - y.seqKey || x.key.localeCompare(y.key));
     const groups: { runId: string | null; nodes: MergedNode[] }[] = [];
     for (const node of nodes) {
@@ -232,7 +295,7 @@ export function ChatThread({
       else groups.push({ runId: node.runId, nodes: [node] });
     }
     return groups;
-  }, [items, approvals]);
+  }, [items, approvals, childSessions]);
 
   const latestProofStatus = useMemo(
     () => deriveCodeStepProofStatus(latestCodeStep(codeSteps)),
@@ -301,6 +364,8 @@ export function ChatThread({
   };
 
   const renderNode = (node: MergedNode) => {
+    // Spawn nodes are rendered by coalesceUnits → <SpawnGroup>, never here.
+    if (node.kind === 'spawn') return null;
     if (node.kind === 'approval') {
       return (
         <ApprovalCard
@@ -314,6 +379,9 @@ export function ChatThread({
     }
     if (node.kind === 'message') {
       const m = node.message;
+      if (m.kind === 'compaction') {
+        return <CompactionMarker key={node.key} content={m.content} />;
+      }
       if (m.role === 'user') {
         return (
           <div className="msg" key={node.key}>
@@ -426,7 +494,17 @@ export function ChatThread({
             const completion = deriveRunCompletionStatus(status, codeStepList, resultKind);
             return (
               <Fragment key={group.runId ?? `g${gi}`}>
-                {group.nodes.map(renderNode)}
+                {coalesceUnits(group.nodes).map((unit) =>
+                  unit.kind === 'spawn-group' ? (
+                    <SpawnGroup
+                      key={unit.key}
+                      children={unit.children}
+                      onSelectSession={onSelectSession}
+                    />
+                  ) : (
+                    renderNode(unit.node)
+                  ),
+                )}
                 {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
                 {finished && completion === 'defined' && <DefinedCard steps={steps} session={session} />}
                 {finished && completion === 'disproved' && <DisprovedCard steps={steps} session={session} />}
@@ -449,32 +527,6 @@ export function ChatThread({
                 <i />
               </span>
             </div>
-          )}
-
-          {/* Sub-agents (item 24): the spawn_subagent node — answers "when & why" the
-              coordinator delegated. Lists this session's children with the compiler's
-              verdict; clicking one opens it (read-only). The sidebar block answers
-              "where are they now"; both select the same child. */}
-          {!isChild && childSessions.length > 0 && (
-            <details className="spawn" open>
-              <summary>
-                <span className="tool">spawn_subagent</span> × {childSessions.length}
-                <span className="act">{childSessions.length} candidate{childSessions.length === 1 ? '' : 's'}</span>
-              </summary>
-              <div className="kids">
-                {childSessions.map((child) => {
-                  const badge = subagentBadge(child);
-                  return (
-                    <button className="kid" key={child.id} onClick={() => onSelectSession?.(child.id)}>
-                      <span className={`dot ${badge.dot}`} />
-                      <span className="rtitle">{child.title}</span>
-                      {child.role && <span className="role">{child.role.split('-')[0]}</span>}
-                      <span className={`verdict ${badge.cls}`}>{badge.text}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </details>
           )}
 
           {reconnecting && (
@@ -588,6 +640,34 @@ export function ChatThread({
             </div>
           </div>
         )}
+        {(() => {
+          // Slash-command autocomplete (G3 framework): while the draft is a command being
+          // typed (`/` + name, before any space), list matching commands from the registry.
+          // Clicking one fills the draft; Enter still runs it via the normal submit path.
+          const q = draft.trim();
+          const typing = q.startsWith('/') && !q.includes(' ');
+          const matches = typing ? matchSlashCommands(q) : [];
+          if (!matches.length) return null;
+          return (
+            <div className="slash-menu">
+              {matches.map((c) => (
+                <button
+                  key={c.name}
+                  type="button"
+                  className="slash-item"
+                  onClick={() => {
+                    onDraftChange(`/${c.name}`);
+                    textareaRef.current?.focus();
+                  }}
+                >
+                  <span className="slash-name">/{c.name}</span>
+                  <span className="slash-desc">{c.description}</span>
+                </button>
+              ))}
+              <div className="slash-hint">↵ to run</div>
+            </div>
+          );
+        })()}
         <div className="composer-inner">
           <textarea
             ref={textareaRef}
@@ -617,6 +697,209 @@ export function ChatThread({
       </div>
       )}
     </main>
+  );
+}
+
+// The spawn_subagent node in the chat timeline, interleaved at the point the
+// coordinator delegated (bug-fix). Groups the children spawned together; each child row
+// shows a one-line preview of its final output and expands in place to the whole thing
+// (or opens the full read-only child session).
+function SpawnGroup({
+  children,
+  onSelectSession,
+}: {
+  children: SessionSummary[];
+  onSelectSession?: (id: string) => void;
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [stopping, setStopping] = useState<Set<string>>(new Set());
+  // E1: ephemeral live state per running child, fed by `subagent_progress` SSE.
+  const progress = useProofSession((s) => s.subagentProgress);
+  // Sub-agents that could not run (API/config error, crash) → the real error message,
+  // surfaced as a red "failed" child instead of hidden behind the coordinator.
+  const errors = useProofSession((s) => s.subagentErrors);
+  const toggle = (id: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  const stop = (id: string) => {
+    setStopping((prev) => new Set(prev).add(id));
+    interruptSubagent(id).catch(() => {}); // 404 (already done) is fine; the row will settle on finish
+  };
+  return (
+    <details className="spawn" open>
+      <summary>
+        <span className="tool">spawn_subagent</span> × {children.length}
+        <span className="act">
+          {children.length} candidate{children.length === 1 ? '' : 's'}
+        </span>
+      </summary>
+      <div className="kids">
+        {children.map((child) => {
+          const error = errors[child.id];
+          // A failed child (couldn't run) is a red "failed" — surfaced, not hidden.
+          const badge = error ? { dot: 'fail', cls: 'err', text: 'failed' } : subagentBadge(child);
+          const isOpen = expanded.has(child.id);
+          const running = !error && badge.dot === 'run';
+          const live = progress[child.id];
+          // While running, the live feed IS the preview: the current tool, else the
+          // streaming narration, else the plain 'exploring…'. A failed child shows its
+          // error; else the durable final summary.
+          const liveLine = running
+            ? (live?.tool ? `running ${live.tool}…` : firstLine(live?.text) || 'exploring…')
+            : '';
+          const preview = running ? liveLine : error ? firstLine(error) : firstLine(child.final_summary);
+          return (
+            <div
+              className={`kid ${isOpen ? 'open' : ''} ${running ? 'running' : ''} ${error ? 'errored' : ''}`}
+              key={child.id}
+            >
+              <button className="kid-head" onClick={() => toggle(child.id)}>
+                <span className={`caret ${isOpen ? 'open' : ''}`}>▸</span>
+                <span className={`dot ${badge.dot}`} />
+                <span className="rtitle">{child.title}</span>
+                {child.role && <span className="role">{child.role.split('-')[0]}</span>}
+                {running && (
+                  <button
+                    className="kid-stop"
+                    disabled={stopping.has(child.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      stop(child.id);
+                    }}
+                    title="Stop this sub-agent (the coordinator keeps running)"
+                  >
+                    {stopping.has(child.id) ? 'stopping…' : 'Stop'}
+                  </button>
+                )}
+                <span className={`verdict ${badge.cls}`}>{badge.text}</span>
+              </button>
+              {!isOpen && preview && (
+                <div className={`kid-preview ${error ? 'err' : ''}`}>{preview}</div>
+              )}
+              {isOpen && (
+                <div className="kid-body">
+                  {error ? (
+                    <div className="kid-error">
+                      <div className="kid-error-title">This sub-agent could not run</div>
+                      <pre className="kid-error-msg">{error}</pre>
+                    </div>
+                  ) : child.final_summary ? (
+                    <MarkdownMessage content={child.final_summary} />
+                  ) : (
+                    <p className="kid-empty">This sub-agent produced no final output.</p>
+                  )}
+                  <button className="kid-open" onClick={() => onSelectSession?.(child.id)}>
+                    Open full session →
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+// First non-empty line of a child's final output, trimmed for the collapsed preview.
+function firstLine(text?: string | null): string {
+  if (!text) return '';
+  for (const line of text.split('\n')) {
+    const t = line.replace(/^[#>*\-\s]+/, '').trim();
+    if (t) return t.length > 140 ? `${t.slice(0, 140)}…` : t;
+  }
+  return '';
+}
+
+// A context-compaction marker (G1/G3), rendered inline from a `kind='compaction'` timeline
+// message. Manual (/compact) → an expandable Claude-Code-style card with the freed tokens
+// + the files still in the model's view; automatic (G1) → a quiet centered one-liner. Both
+// are durable (they ride the message channel), so they survive a reload.
+function CompactionMarker({ content }: { content: string }) {
+  let c: CompactionPayload | null = null;
+  try {
+    c = JSON.parse(content) as CompactionPayload;
+  } catch {
+    c = null;
+  }
+  if (!c) return null;
+  // In-flight: the /compact request hasn't returned yet. Show a spinner so the user knows
+  // work is happening (the call can take seconds when it summarizes).
+  if (c.pending) {
+    return (
+      <div className="compact-note">
+        <span className="reconnect-spinner" />
+        Compacting context…
+      </div>
+    );
+  }
+  const didWork = c.pruned > 0 || c.summarized;
+  const parts: string[] = [];
+  if (c.pruned > 0) parts.push(`pruned ${c.pruned} stale output${c.pruned === 1 ? '' : 's'}`);
+  if (c.summarized) parts.push('summarized earlier work');
+  const files = c.referenced_files || [];
+  const before = c.before_tokens || 0;
+  const after = c.after_tokens || 0;
+  const freed = before - after;
+
+  if (!c.manual) {
+    return (
+      <div className="compact-note">
+        <span className="compact-icon">🗜</span>
+        {didWork ? (
+          <>
+            Context compacted — {parts.join(', ')}
+            {before > 0 && after > 0 && after < before ? (
+              <span className="compact-delta">
+                {' '}~{formatTokens(before)} → {formatTokens(after)} tokens
+              </span>
+            ) : null}
+          </>
+        ) : (
+          'Context already compact'
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <details className="compact-card" open>
+      <summary>
+        <span className="compact-icon">🗜</span>
+        {didWork ? (
+          <>
+            Compacted{freed > 0 ? <> — freed ~{formatTokens(freed)} tokens</> : null}
+          </>
+        ) : (
+          'Already compact — nothing to free'
+        )}
+        {didWork && (files.length > 0 || c.summarized) ? (
+          <span className="compact-more">details</span>
+        ) : null}
+      </summary>
+      {didWork ? (
+        <div className="compact-body">
+          {parts.length ? <div className="compact-line">{parts.join(', ')}</div> : null}
+          {before > 0 && after > 0 ? (
+            <div className="compact-line compact-delta">
+              ~{formatTokens(before)} → {formatTokens(after)} tokens
+            </div>
+          ) : null}
+          {files.length > 0 ? (
+            <ul className="compact-files">
+              {files.map((f) => (
+                <li key={f}>
+                  <code>{f}</code>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+    </details>
   );
 }
 

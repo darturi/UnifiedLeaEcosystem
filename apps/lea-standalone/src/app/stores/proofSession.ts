@@ -11,6 +11,34 @@ import type {
 // React-style setter signature: accept a value or an updater fn, so existing
 // `setX((cur) => ...)` call sites migrate from useState unchanged.
 type Updater<T> = T | ((current: T) => T);
+
+// Ephemeral live state for ONE running sub-agent (E1), keyed by its child session id.
+// The child's steps stream in as `subagent_progress` events for VISIBILITY only — they
+// are NOT the durable record (the full transcript replays into the child session on
+// finish); this is what the coordinator's spawn box shows while the child works, then is
+// cleared when the child finishes.
+export interface SubagentLive {
+  text: string;       // the child's assistant narration for the current turn (accumulates)
+  tool?: string;      // the tool it is currently running, if any
+  check?: string;     // its latest lean_check verdict ('ok' | 'error')
+  turn?: number;      // its current turn
+}
+// The context-compaction (G1/G3) payload carried in a `kind='compaction'` timeline
+// message's `content` (JSON). Durable — it rides the message channel, so a compaction
+// marker survives a reload like any message. `manual` distinguishes user `/compact` (G3)
+// from the automatic threshold (G1); `summarized` a prune-only pass from a folded one.
+export interface CompactionPayload {
+  manual?: boolean;
+  changed?: boolean;
+  pending?: boolean; // true → the /compact request is in flight (renders a "Compacting…" card)
+  pruned: number;
+  summarized: boolean;
+  before_tokens: number;
+  after_tokens: number;
+  freed_tokens: number;
+  referenced_files?: string[];
+}
+
 const apply = <T,>(update: Updater<T>, current: T): T =>
   typeof update === 'function' ? (update as (c: T) => T)(current) : update;
 
@@ -95,6 +123,18 @@ interface ProofSessionState {
   setApprovals: (update: Updater<ApprovalRecord[]>) => void;
   approvalBusy: boolean;
   setApprovalBusy: (approvalBusy: boolean) => void;
+
+  // Live sub-agent progress (E1): child session id -> its ephemeral live state. Fed by
+  // `subagent_progress` SSE, rendered on a running child's spawn-node row, and cleared
+  // when the child finishes (its durable transcript then takes over).
+  subagentProgress: Record<string, SubagentLive>;
+  setSubagentProgress: (update: Updater<Record<string, SubagentLive>>) => void;
+
+  // Sub-agent FAILURES: child session id -> the error message, for children that could
+  // not run at all (API/config error, crash). Surfaced as a red "failed" child instead
+  // of being hidden behind the coordinator's fallback narration.
+  subagentErrors: Record<string, string>;
+  setSubagentErrors: (update: Updater<Record<string, string>>) => void;
 }
 
 export const useProofSession = create<ProofSessionState>((set) => ({
@@ -141,4 +181,12 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   setApprovals: (update) => set((s) => ({ approvals: apply(update, s.approvals) })),
   approvalBusy: false,
   setApprovalBusy: (approvalBusy) => set({ approvalBusy }),
+
+  subagentProgress: {},
+  setSubagentProgress: (update) =>
+    set((s) => ({ subagentProgress: apply(update, s.subagentProgress) })),
+
+  subagentErrors: {},
+  setSubagentErrors: (update) =>
+    set((s) => ({ subagentErrors: apply(update, s.subagentErrors) })),
 }));

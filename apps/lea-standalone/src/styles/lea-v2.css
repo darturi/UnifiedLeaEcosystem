@@ -1,16 +1,20 @@
-/* LeaUI warm-paper design system.
+/* LeaUI minimal black-and-white design system.
+   Chrome is monochrome; color appears only where it carries meaning (proof status).
    Plain, self-contained CSS that the React components emit class names against. */
 
 :root {
-  --bg: #f5f4ef; --panel: #ffffff; --panel-2: #faf9f6;
-  --ink: #1f1e1d; --ink-2: #3d3c39; --muted: #8a8983;
-  --line: #e9e7e0; --line-2: #efedE7;
-  --accent: #c96442; --accent-soft: #f3e3db;
-  --green: #4f8a5b; --green-soft: #e6f0e7;
-  --red: #c0564a; --red-soft: #f6e3e0;
-  --amber: #b8842a; --amber-soft: #f6ecd8;
-  --code-bg: #fbfaf7; --radius: 12px;
-  --kw: #9a3e8f; --fn: #2f6f9f; --str: #4f8a5b; --num: #b8842a; --com: #a9a79f; --type: #c96442;
+  /* UI / brand — near-white base, near-black as the single accent (monochrome) */
+  --bg: #fafafb; --panel: #ffffff; --panel-2: #f5f5f7;
+  --ink: #18181b; --ink-2: #3f3f46; --muted: #8b8b93;
+  --line: #ebebee; --line-2: #f3f3f5;
+  --accent: #1c1c20; --accent-soft: #ededf0;
+  /* semantic status — the only chroma in the UI */
+  --green: #2f8f5b; --green-soft: #e7f4ec;
+  --red: #d14343; --red-soft: #fbe9e9;
+  --amber: #c0872e; --amber-soft: #f8efd9;
+  --code-bg: #f8f8fa; --radius: 12px;
+  /* syntax highlighting — its own block; kept colored for proof readability */
+  --kw: #7c3aed; --fn: #2563a8; --str: #2f8f5b; --num: #b5730f; --com: #9aa0a6; --type: #0d9488;
 }
 .lea-app * { box-sizing: border-box; }
 .lea-app, .lea-app input, .lea-app textarea, .lea-app button {
@@ -109,9 +113,9 @@
 .origin-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
   padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink-2); white-space: nowrap; line-height: 1.6; }
-.origin-badge.origin-overleaf { color: #c96442; border-color: var(--accent-soft);
+.origin-badge.origin-overleaf { color: #1c1c20; border-color: var(--accent-soft);
   background: var(--accent-soft); cursor: pointer; }
-.origin-badge.origin-overleaf:hover:not(:disabled) { background: #eccdbf; }
+.origin-badge.origin-overleaf:hover:not(:disabled) { background: #e2e2e6; }
 .origin-badge.origin-overleaf:disabled { cursor: default; }
 .origin-badge.origin-ui { color: #8a8983; }
 .origin-badge .origin-badge-glyph { flex: none; }
@@ -209,6 +213,13 @@
   background: var(--panel); overflow: hidden; }
 .composer .verify-box.ok { border-color: #bfe0c6; background: #eef7f0; }
 .composer .verify-box.bad { border-color: #eccdbf; background: var(--accent-soft); }
+/* Slash-command autocomplete menu (G3 framework) — sits above the composer input. */
+.composer .slash-menu { max-width: 720px; margin: 0 auto 8px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); box-shadow: 0 6px 20px rgba(0,0,0,.08); overflow: hidden; }
+.composer .slash-item { display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left; border: none; background: none; padding: 8px 13px; cursor: pointer; font-size: 13px; }
+.composer .slash-item:hover { background: var(--accent-soft); }
+.composer .slash-name { font-family: var(--mono, ui-monospace, monospace); font-weight: 600; color: var(--ink); min-width: 88px; }
+.composer .slash-desc { color: var(--muted); font-size: 12.5px; }
+.composer .slash-hint { padding: 5px 13px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11.5px; }
 .composer .verify-box.goal { border-color: #cdd8ea; background: #eef2f8; }
 .composer .verify-box.goal .verify-box-title { color: var(--blue, #4a6fa5); }
 .composer .verify-box-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px 7px 12px; }
@@ -249,6 +260,22 @@
 .reconnect-chip { max-width: 720px; margin: 0 auto 14px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--amber-soft); background: var(--amber-soft); color: var(--amber); border-radius: 10px; padding: 8px 13px; font-size: 12.5px; }
 .reconnect-spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--amber-soft); border-top-color: var(--amber); animation: reconnect-spin 0.7s linear infinite; }
 @keyframes reconnect-spin { to { transform: rotate(360deg); } }
+/* Context-compaction (G1) marker — a muted, centered notice that the condenser ran. */
+.compact-note { max-width: 720px; margin: 0 auto 14px; display: flex; align-items: center; gap: 7px; justify-content: center; color: var(--muted); font-size: 12px; text-align: center; }
+.compact-icon { opacity: 0.8; }
+.compact-delta { opacity: 0.8; font-variant-numeric: tabular-nums; }
+/* Manual /compact (G3) — a Claude-Code-style expandable "Compacted" card. */
+.compact-card { max-width: 720px; margin: 0 auto 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); font-size: 12.5px; overflow: hidden; }
+.compact-card > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 7px; padding: 9px 13px; color: var(--ink-2); font-weight: 550; }
+.compact-card > summary::-webkit-details-marker { display: none; }
+.compact-card .compact-more { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 11.5px; }
+.compact-card[open] .compact-more::after { content: ' ▾'; }
+.compact-card:not([open]) .compact-more::after { content: ' ▸'; }
+.compact-body { padding: 0 13px 11px 30px; color: var(--muted); }
+.compact-line { margin-bottom: 4px; }
+.compact-files { margin: 4px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.compact-files li { color: var(--ink-2); }
+.compact-files code { font-size: 12px; background: rgba(0,0,0,.045); padding: 1px 5px; border-radius: 4px; }
 
 /* ---------- Canvas (right) ---------- */
 .canvas { background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
@@ -440,6 +467,8 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .pw-crumb-sep { color: var(--line); }
 .pw-crumb { color: var(--ink); font-weight: 550; }
 .pw-hero { padding: 26px 28px 14px; max-width: 900px; }
+.pw-crumbs { color: var(--muted); font-size: 12.5px; }
+.pw-sub { color: var(--muted); font-size: 13px; margin: 8px 0 0; max-width: 640px; line-height: 1.5; }
 .pw-title { font-size: 24px; font-weight: 650; letter-spacing: -.01em; color: var(--ink);
   display: flex; align-items: center; gap: 10px; margin: 0; }
 .pw-sigma { color: var(--accent); }
@@ -926,14 +955,38 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .spawn .tool { font: 600 12px ui-monospace, Menlo, monospace; color: var(--accent); }
 .spawn .act { margin-left: auto; font-size: 11.5px; color: var(--muted); }
 .spawn .kids { border-top: 1px solid var(--line); padding: 6px; }
-.spawn .kid { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px;
+.spawn .kid { border-radius: 8px; }
+.spawn .kid.open { background: var(--panel); }
+.spawn .kid-head { display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px;
   cursor: pointer; font-size: 13px; background: none; border: none; width: 100%; text-align: left;
   font-family: inherit; }
-.spawn .kid:hover { background: var(--panel); }
-.spawn .kid .rtitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.spawn .kid-head:hover { background: var(--panel); }
+.spawn .kid-head .caret { color: var(--muted); font-size: 10px; transition: transform .15s;
+  flex: 0 0 auto; }
+.spawn .kid-head .caret.open { transform: rotate(90deg); }
+.spawn .kid-head .rtitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   color: var(--ink-2); }
-.spawn .kid .role { font-size: 10.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
-.spawn .kid .verdict { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
+.spawn .kid-head .role { font-size: 10.5px; color: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+.spawn .kid-head .verdict { font-size: 11px; padding: 1px 8px; border-radius: 20px; font-weight: 600; }
+/* collapsed one-line preview of the child's final output */
+.spawn .kid-preview { padding: 0 9px 7px 30px; font-size: 12px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* expanded full output, in place */
+.spawn .kid-body { padding: 2px 12px 10px 30px; font-size: 13px; color: var(--ink-2);
+  border-top: 1px solid var(--line); margin: 0 6px; }
+.spawn .kid-body > :first-child { margin-top: 8px; }
+.spawn .kid-empty { color: var(--muted); font-style: italic; }
+.spawn .kid-open { margin-top: 6px; font-size: 12px; color: var(--accent); background: none;
+  border: none; cursor: pointer; padding: 2px 0; font-family: inherit; }
+.spawn .kid-open:hover { text-decoration: underline; }
+/* E1: a running child streams a live preview; its 'Stop' kills just this child (D2) */
+.spawn .kid.running .kid-preview { color: var(--ink-2); }
+.spawn .kid-stop { font-size: 10.5px; font-weight: 600; color: var(--red); background: var(--red-soft);
+  border: none; border-radius: 20px; padding: 1px 9px; cursor: pointer; font-family: inherit;
+  flex: 0 0 auto; opacity: 0; transition: opacity .12s; }
+.spawn .kid.running:hover .kid-stop, .spawn .kid-stop:focus-visible { opacity: 1; }
+.spawn .kid-stop:hover { filter: brightness(.96); }
+.spawn .kid-stop:disabled { color: var(--muted); background: var(--panel-2); cursor: default; opacity: 1; }
 
 /* verdict badges (shared by the spawn node) */
 .verdict.ok { color: var(--green); background: var(--green-soft); }
@@ -949,3 +1002,89 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .prov .up { margin-left: auto; border: 1px solid var(--line); background: var(--panel); border-radius: 8px;
   padding: 5px 11px; cursor: pointer; color: var(--ink-2); font-family: inherit; font-size: 12.5px; }
 .prov .up:hover { background: var(--panel-2); }
+
+/* ─────────────────────  Sidebar: Projects header + See-all (D7)  ───────────── */
+.proj-head-btn { background: none; border: none; font: inherit; color: inherit; cursor: pointer;
+  padding: 0; letter-spacing: inherit; text-transform: inherit; }
+.proj-head-btn:hover { color: var(--ink-2); text-decoration: underline; }
+.proj-seeall { display: block; width: 100%; text-align: left; background: none; border: none;
+  cursor: pointer; font-family: inherit; font-size: 12px; color: var(--muted); padding: 4px 10px 2px; }
+.proj-seeall:hover { color: var(--accent); }
+
+/* ─────────────────────────────  Projects hub (D7)  ─────────────────────────── */
+.project-window.ph .pw-hero.ph-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.ph-new { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 550;
+  color: var(--panel); background: var(--accent); border: none; border-radius: 8px; padding: 8px 14px;
+  cursor: pointer; font-family: inherit; white-space: nowrap; }
+.ph-new:hover { filter: brightness(1.15); }
+.ph-empty { max-width: 900px; margin: 8px 28px; color: var(--muted); font-size: 13px;
+  border: 1px dashed var(--line); border-radius: 12px; padding: 28px; text-align: center; }
+.ph-grid { max-width: 900px; margin: 10px 28px 60px; display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+.ph-card { text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 15px 16px; cursor: pointer; font-family: inherit; display: flex; flex-direction: column;
+  gap: 8px; min-height: 118px; transition: border-color .12s, box-shadow .12s; }
+.ph-card:hover { border-color: var(--accent-soft); box-shadow: 0 2px 10px rgba(0,0,0,.05); }
+.ph-card-top { display: flex; align-items: center; justify-content: space-between; }
+.ph-card-icon { font-size: 17px; color: var(--accent); }
+.ph-card-count { font-size: 11px; color: var(--muted); background: var(--panel-2); border-radius: 20px; padding: 2px 8px; }
+.ph-card-title { font-size: 14.5px; font-weight: 600; color: var(--ink); line-height: 1.25;
+  overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.ph-card-desc { font-size: 12.5px; color: var(--ink-2); line-height: 1.4; flex: 1;
+  overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.ph-card-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; }
+.ph-card-ns { font: 11px ui-monospace, Menlo, monospace; color: var(--accent); background: var(--accent-soft);
+  border-radius: 6px; padding: 1px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 65%; }
+.ph-card-when { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* ────────────────────────────  Sub-agents page (D6)  ───────────────────────── */
+.sa-tag { font-size: 10px; font-weight: 600; color: var(--accent); background: var(--accent-soft);
+  border-radius: 20px; padding: 1px 8px; }
+.sa-detail { display: flex; flex-direction: column; gap: 4px; }
+.sa-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.sa-head-l { display: flex; align-items: center; gap: 9px; color: var(--ink); }
+.sa-name { font: 600 15px ui-monospace, Menlo, monospace; color: var(--ink); }
+.sa-reset { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--muted);
+  background: none; border: 1px solid var(--line); border-radius: 8px; padding: 4px 9px; cursor: pointer; font-family: inherit; }
+.sa-reset:hover:not(:disabled) { color: var(--ink-2); border-color: var(--line-2); }
+.sa-reset:disabled { opacity: .5; cursor: default; }
+.sa-desc { font-size: 13px; color: var(--muted); margin: 2px 0 12px; line-height: 1.5; }
+.sa-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; margin-bottom: 16px; }
+@media (max-width: 720px) { .sa-grid { grid-template-columns: 1fr; } }
+.sa-field { display: flex; flex-direction: column; gap: 5px; }
+.sa-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2); text-transform: uppercase; letter-spacing: .03em; }
+.sa-input { font: 13px inherit; color: var(--ink); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 10px; font-family: inherit; }
+.sa-input:focus { outline: none; border-color: var(--accent-soft); background: var(--panel); }
+.sa-hint { font-size: 11px; color: var(--muted); line-height: 1.4; }
+.sa-tools { display: flex; flex-wrap: wrap; gap: 5px; padding: 2px 0; }
+.sa-tool { font: 11px ui-monospace, Menlo, monospace; color: var(--ink-2); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; }
+.sa-prompt-field { margin-bottom: 14px; }
+.sa-prompt { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink);
+  background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+  min-height: 240px; resize: vertical; line-height: 1.55; font-family: ui-monospace, Menlo, monospace; }
+.sa-prompt:focus { outline: none; border-color: var(--accent-soft); }
+.sa-actions { display: flex; align-items: center; gap: 12px; }
+.sa-save { font-size: 13px; font-weight: 600; color: var(--panel); background: var(--accent);
+  border: none; border-radius: 8px; padding: 9px 18px; cursor: pointer; font-family: inherit; }
+.sa-save:hover:not(:disabled) { filter: brightness(1.15); }
+.sa-save:disabled { opacity: .45; cursor: default; }
+.sa-saved-note { font-size: 12px; color: var(--green); }
+
+/* Sub-agents model field: reuse the chat-head ModelPicker chip + a clear-to-inherit (D6/D5) */
+.sa-model-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sa-model-row .model-trigger { position: static; }
+.sa-inherit { display: inline-flex; align-items: center; justify-content: center; color: var(--muted);
+  background: none; border: 1px solid var(--line); border-radius: 50%; width: 22px; height: 22px;
+  padding: 0; cursor: pointer; flex: 0 0 auto; }
+.sa-inherit:hover { color: var(--red); border-color: var(--red-soft); background: var(--red-soft); }
+
+/* Sub-agent FAILURE surfaced in the spawn card (not hidden behind the coordinator) */
+.spawn .kid.errored { background: var(--red-soft); }
+.spawn .kid-preview.err { color: var(--red); }
+.spawn .kid-error { margin: 8px 0 4px; }
+.spawn .kid-error-title { font-size: 12.5px; font-weight: 600; color: var(--red); margin-bottom: 6px; }
+.spawn .kid-error-msg { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2);
+  background: var(--red-soft); border: 1px solid var(--red-soft); border-radius: 8px; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto; margin: 0; line-height: 1.5; }

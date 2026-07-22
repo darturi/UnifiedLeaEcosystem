@@ -15,11 +15,15 @@ export function ModelPicker({
   catalog,
   featured,
   onChange,
+  placeholder = 'Select model',
 }: {
   value: string;
   catalog: ModelCatalogEntry[];
   featured: ModelOption[];
   onChange: (value: string) => void;
+  // Button label when no model is set (e.g. "Inherit coordinator's model" on the
+  // Sub-agents page, where an empty value means inherit).
+  placeholder?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -76,7 +80,7 @@ export function ModelPicker({
   return (
     <>
       <button className="chip model model-trigger" onClick={() => setOpen(true)} title="Change model">
-        {value || 'Select model'} <span className="caret">▾</span>
+        {value || placeholder} <span className="caret">▾</span>
       </button>
 
       {open && (

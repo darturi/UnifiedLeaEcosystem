@@ -21,6 +21,7 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
+from lea import condenser
 from lea.interface import check as interface_check, rebuild as interface_rebuild, verify as interface_verify
 
 from ..artifacts import classify_lean_artifact
@@ -111,6 +112,55 @@ def session_detail(session_id: str) -> dict:
     if not detail:
         raise HTTPException(status_code=404, detail="Session not found")
     return detail
+
+
+@router.post("/api/sessions/{session_id}/compact")
+def compact_session(session_id: str) -> dict:
+    """Manual context compaction (G3) — the user-triggered twin of G1's automatic
+    condenser (`/compact` slash command). Runs the SAME condenser on the session's
+    stored transcript (the base the next activation replays): prunes superseded tool
+    outputs and force-folds the older middle into a summary, then persists the condensed
+    transcript back onto its run so the next follow-up starts lighter. Returns the token
+    delta for the composer's 'freed ~N tokens' note. A no-op (nothing finished yet, or
+    already compact) is reported as `changed: false`, not an error."""
+    # Compact between turns, never mid-run: an active run owns its own in-memory messages,
+    # so rewriting the stored base underneath it would race.
+    if store.has_active_run(session_id):
+        raise HTTPException(status_code=409, detail="A run is active — compact after it finishes.")
+    latest = store.latest_transcript_run_for_session(session_id)
+    if not latest or not latest.get("messages"):
+        return {"manual": True, "changed": False, "pruned": 0, "summarized": False,
+                "before_tokens": 0, "after_tokens": 0, "freed_tokens": 0,
+                "referenced_files": [], "message": None}
+
+    config = load_config()
+    messages = latest["messages"]
+    model = latest.get("model") or config.model
+    before = condenser.estimate_tokens(messages)
+    result = condenser.condense(messages, config, model=model,
+                                last_input_tokens=before, force=True)
+    payload = {
+        "manual": True,
+        "changed": result.changed,
+        "pruned": result.pruned,
+        "summarized": bool(result.summarized),
+        "before_tokens": result.before_tokens,
+        "after_tokens": result.after_tokens,
+        "freed_tokens": max(0, result.before_tokens - result.after_tokens),
+        # What the model still has in view after compaction — the Claude-Code-style
+        # "still referenced" list the /compact surface shows.
+        "referenced_files": condenser.referenced_files(result.messages),
+    }
+    message = None
+    if result.changed:
+        store.set_run_transcript(latest["run_id"], result.messages)
+        # Persist the marker as a durable timeline message (kind='compaction', content =
+        # this JSON payload) so it survives a reload — the same channel edit_notes ride.
+        # A no-op (nothing to free) is NOT persisted: the transient client notice is
+        # correct, since nothing about the session actually changed.
+        message = store.add_message(
+            session_id, "assistant", json.dumps(payload), latest["run_id"], kind="compaction")
+    return {**payload, "message": message}
 
 
 @router.post("/api/sessions/{session_id}/file")
