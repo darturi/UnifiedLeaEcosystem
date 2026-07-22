@@ -21,6 +21,8 @@ from lea.interface import (
     FileChanged,
     Finished,
     SubagentFinished,
+    SubagentProgress,
+    SubagentStarted,
     ToolCalled,
     TurnStarted,
 )
@@ -172,6 +174,319 @@ def test_materialize_tolerates_missing_candidate(tmp_path, monkeypatch):
     detail = store.session_detail(child["id"])
     assert detail["code_steps"] == []          # unreadable candidate → no code step
     assert len(detail["messages"]) >= 1        # but the child still landed with its transcript
+
+
+# --- D1: spawn-started visibility ---------------------------------------------
+
+def _started(result_id="proof-candidate-abc123", subagent_type="proof-candidate",
+             description="Prove it via infinite descent"):
+    return SubagentStarted(result_id=result_id, subagent_type=subagent_type,
+                           description=description)
+
+
+def test_start_subagent_creates_a_running_child(tmp_path, monkeypatch):
+    # D1: at spawn, the child is a RUNNING session — parented, with an active run row so
+    # its derived status is 'running' BEFORE any transcript or candidate exists.
+    _fresh_db(tmp_path, monkeypatch)
+    parent = store.create_session("Prove sqrt2 irrational")
+    cfg = LeaConfig(model="gemini/test", max_turns=3)
+    child, child_run_id = bridge._start_subagent(
+        _started(), parent_session_id=parent["id"], project_id=None, turn=2, cfg=cfg,
+    )
+    assert child["parent_id"] == parent["id"]
+    assert child["role"] == "proof-candidate"
+    assert child["spawned_at_turn"] == 2
+    assert child["title"] == "Prove it via infinite descent"  # from the delegated task
+    kids = store.list_child_sessions(parent["id"])
+    assert len(kids) == 1
+    # no code yet + an active run → derived status 'running' (the 'exploring…' badge)
+    assert kids[0]["status"] == "running"
+    assert kids[0]["active_run_count"] == 1
+    assert bool(child_run_id)
+
+
+def test_finalize_started_fills_the_same_child_and_retires_the_run(tmp_path, monkeypatch):
+    # The started child is FILLED IN — not duplicated — and its run retires so its
+    # derived status flips from 'running' to the candidate's verdict.
+    _fresh_db(tmp_path, monkeypatch)
+    parent = store.create_session("root")
+    cfg = LeaConfig(model="gemini/test", max_turns=3)
+    child, child_run_id = bridge._start_subagent(
+        _started(), parent_session_id=parent["id"], project_id=None, turn=1, cfg=cfg,
+    )
+    scratch = tmp_path / ".lea" / "tmp" / "run" / "agent"
+    scratch.mkdir(parents=True)
+    (scratch / "Sqrt2.lean").write_text(_OK_CANDIDATE)
+    ev = _finished(candidate_path=".lea/tmp/run/agent/Sqrt2.lean", check_status="ok",
+                   transcript=[{"role": "user", "content": "prove it"},
+                               {"role": "assistant", "content": "done, it compiles"}])
+    bridge._finalize_started_subagent(child["id"], child_run_id, ev, turn=1, repo=tmp_path)
+
+    kids = store.list_child_sessions(parent["id"])
+    assert len(kids) == 1                       # SAME child, not a second one
+    assert kids[0]["active_run_count"] == 0     # run retired
+    detail = store.session_detail(child["id"])
+    assert detail["status"] in ("ok", "proved", "defined")   # verdict now rules
+    assert len(detail["code_steps"]) == 1 and detail["code_steps"][0]["check_status"] == "ok"
+    assert any("done, it compiles" in m["content"] for m in detail["messages"])
+
+
+def test_run_lea_started_then_finished_is_one_child(tmp_path, monkeypatch):
+    # The full loop: SubagentStarted materializes a running child; SubagentFinished
+    # (same result_id) fills THAT child in — exactly one child, and the SSE stream
+    # carries both a subagent_started and a subagent_finished for it.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove sqrt2 irrational")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"],
+        task="Prove sqrt2 irrational", config=cfg, events=queue,
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        scratch = Path(working_dir) / ".lea" / "tmp" / "run" / "agent"
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "Sqrt2.lean").write_text(_OK_CANDIDATE)
+        yield TurnStarted(1)
+        yield SubagentStarted(result_id="pc-42", subagent_type="proof-candidate",
+                              description="Prove sqrt2 irrational via descent")
+        yield SubagentFinished(
+            result_id="pc-42", subagent_type="proof-candidate",
+            candidate_path=".lea/tmp/run/agent/Sqrt2.lean", check_status="ok", check_detail=None,
+            stop_reason="completed", summary="descent compiles",
+            transcript=[{"role": "user", "content": "prove it"},
+                        {"role": "assistant", "content": "done, it compiles"}],
+        )
+        yield Finished("completed", "A candidate compiled.", 1, ctx.session_id,
+                       "gemini/test", Usage(input_tokens=5, output_tokens=3), 0.0, {})
+
+    _ok_recheck(monkeypatch)
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    kids = store.list_child_sessions(session["id"])
+    assert len(kids) == 1                        # started + finished collapsed to ONE child
+    assert kids[0]["active_run_count"] == 0      # child run retired on finish
+    cdetail = store.session_detail(kids[0]["id"])
+    assert cdetail["code_steps"] and cdetail["code_steps"][0]["check_status"] == "ok"
+
+    events = _drain(queue)
+    started_evs = [e for e in events if e["type"] == "subagent_started"]
+    finished_evs = [e for e in events if e["type"] == "subagent_finished"]
+    assert len(started_evs) == 1 and len(finished_evs) == 1
+    assert started_evs[0]["payload"]["child_id"] == kids[0]["id"]
+    assert started_evs[0]["payload"]["result_id"] == "pc-42"
+    assert finished_evs[0]["payload"]["child_id"] == kids[0]["id"]
+
+
+def test_run_lea_retires_a_child_that_started_but_never_finished(tmp_path, monkeypatch):
+    # If the coordinator ends between a child's start and finish (interrupt/crash), the
+    # child run must not linger 'running' forever — the finally retires it.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("root")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="root", config=cfg, events=Queue(),
+    )
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        yield TurnStarted(1)
+        yield SubagentStarted(result_id="pc-orphan", subagent_type="proof-candidate",
+                              description="a child that never returns")
+        # coordinator finishes WITHOUT the child's SubagentFinished
+        yield Finished("completed", "done", 1, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    kids = store.list_child_sessions(session["id"])
+    assert len(kids) == 1
+    assert kids[0]["active_run_count"] == 0       # orphan run retired, not eternally 'running'
+
+
+# --- E1: live child streaming + per-child stop --------------------------------
+
+def test_subagent_progress_payload_compacts_inner_events():
+    p = bridge._subagent_progress_payload("cid", "rid", AssistantTextDelta("hi"))
+    assert p == {"child_id": "cid", "result_id": "rid", "kind": "text", "text": "hi"}
+    assert bridge._subagent_progress_payload("cid", "rid", ToolCalled("lean_check", {}))["kind"] == "tool"
+    assert bridge._subagent_progress_payload("cid", "rid", CheckResult("f", "ok", None))["kind"] == "check"
+    assert bridge._subagent_progress_payload("cid", "rid", TurnStarted(3))["turn"] == 3
+    # a FileChanged has nothing to show live → dropped
+    assert bridge._subagent_progress_payload("cid", "rid", FileChanged("x.lean")) is None
+
+
+def test_run_lea_streams_child_progress_and_registers_stop(tmp_path, monkeypatch):
+    # A child that emits its OWN events (E1): the bridge streams each as a
+    # subagent_progress SSE, registers the child for stop while running, and clears it
+    # on finish.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove it")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="Prove it", config=cfg, events=queue,
+    )
+    seen_registered = {}
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        scratch = Path(working_dir) / ".lea" / "tmp" / "run" / "agent"
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "C.lean").write_text(_OK_CANDIDATE)
+        yield TurnStarted(1)
+        yield SubagentStarted(result_id="pc-9", subagent_type="proof-candidate",
+                              description="prove a lemma")
+        # while the child runs, its session must be addressable for a stop
+        yield SubagentProgress("pc-9", AssistantTextDelta("thinking"))
+        yield SubagentProgress("pc-9", ToolCalled("lean_check", {"path": "C.lean"}))
+        yield SubagentProgress("pc-9", CheckResult(str(scratch / "C.lean"), "ok", None))
+        # snapshot the stop registry mid-child
+        seen_registered["during"] = dict(bridge._child_session_to_result)
+        yield SubagentFinished(
+            result_id="pc-9", subagent_type="proof-candidate",
+            candidate_path=".lea/tmp/run/agent/C.lean", check_status="ok", check_detail=None,
+            stop_reason="completed", summary="done", transcript=[{"role": "user", "content": "go"}],
+        )
+        yield Finished("completed", "done", 1, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    _ok_recheck(monkeypatch)
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    events = _drain(queue)
+    progress = [e for e in events if e["type"] == "subagent_progress"]
+    kinds = [e["payload"]["kind"] for e in progress]
+    assert "text" in kinds and "tool" in kinds and "check" in kinds
+    assert all(e["payload"]["result_id"] == "pc-9" for e in progress)
+    # the child was registered for stop while running...
+    kids = store.list_child_sessions(session["id"])
+    assert len(kids) == 1
+    assert seen_registered["during"].get(kids[0]["id"]) == "pc-9"
+    # ...and cleared once it finished + the run ended
+    assert kids[0]["id"] not in bridge._child_session_to_result
+
+
+def test_forward_to_child_broker_translates_events():
+    # E1 first-class: a child's inner events are re-emitted onto its own run broker in the
+    # normal SSE vocab, so its session view renders them with the same listeners as any run.
+    from app import runbroker
+    b = runbroker.RunBroker("child-x")
+    started = {"child_id": "cs-1", "run_id": "child-x"}
+    bridge._forward_to_child_broker(b, AssistantTextDelta("hi from child"), started)
+    bridge._forward_to_child_broker(b, ToolCalled("lean_check", {"path": "C.lean"}), started)
+    bridge._forward_to_child_broker(b, CheckResult("C.lean", "ok", None), started)
+    items = [(e["type"], e["payload"]) for e in b.events_after(0)]
+    assert any(t == "assistant_delta" and p.get("text") == "hi from child" for t, p in items)
+    assert any(t == "status" and p.get("status") == "tool_call" for t, p in items)
+    assert any(t == "status" and p.get("status") == "lean_check" and p.get("check_status") == "ok"
+               for t, p in items)
+
+
+def test_child_narration_commits_a_message_per_turn():
+    # The readability fix: each turn's narration is COMMITTED as a discrete message (on the
+    # next turn / a tool call), so turns don't run together into one blob.
+    from app import runbroker
+    b = runbroker.RunBroker("child-y")
+    started = {"child_id": "cs-2", "run_id": "child-y"}
+    # turn 1 narration, then a tool call flushes it as a message
+    bridge._forward_to_child_broker(b, AssistantTextDelta("First I examine the files."), started)
+    bridge._forward_to_child_broker(b, ToolCalled("read_file", {}), started)
+    # turn 2 narration, then a new turn flushes it as a SECOND message
+    bridge._forward_to_child_broker(b, AssistantTextDelta("Now I write the proof."), started)
+    bridge._forward_to_child_broker(b, TurnStarted(2), started)
+    msgs = [p for t, p in ((e["type"], e["payload"]) for e in b.events_after(0)) if t == "message"]
+    assert len(msgs) == 2, "each turn committed its own message"
+    assert msgs[0]["content"] == "First I examine the files."
+    assert msgs[1]["content"] == "Now I write the proof."
+    assert msgs[0]["id"] != msgs[1]["id"]           # distinct ids so the frontend keeps both
+    assert all(m["role"] == "assistant" and m["session_id"] == "cs-2" for m in msgs)
+
+
+def test_run_lea_gives_child_a_first_class_broker_stream(tmp_path, monkeypatch):
+    # The child's OWN run stream: a broker keyed by its run_id is created at spawn, fed the
+    # child's forwarded events live, then closed (done) + dropped on finish — so a
+    # sub-agent's session view attaches to /api/runs/<child_run_id>/events and streams live.
+    import sqlite3
+    from app import runbroker
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Prove it")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    cfg = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"], task="Prove it", config=cfg, events=Queue(),
+    )
+    captured = {}
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        scratch = Path(working_dir) / ".lea" / "tmp" / "run" / "agent"
+        scratch.mkdir(parents=True, exist_ok=True)
+        (scratch / "C.lean").write_text(_OK_CANDIDATE)
+        yield TurnStarted(1)
+        yield SubagentStarted(result_id="pc-1", subagent_type="proof-candidate", description="prove L1")
+        yield SubagentProgress("pc-1", AssistantTextDelta("child is thinking"))
+        yield SubagentProgress("pc-1", ToolCalled("lean_check", {"path": "C.lean"}))
+        # mid-run: the child's broker exists and holds the forwarded events
+        with sqlite3.connect(str(db.DB_PATH)) as conn:
+            row = conn.execute(
+                "select r.id from runs r join sessions s on s.id = r.session_id where s.parent_id = ?",
+                (session["id"],),
+            ).fetchone()
+        crid = row[0] if row else None
+        b = runbroker.get(crid) if crid else None
+        captured["run_id"] = crid
+        captured["events"] = [(e["type"], e["payload"]) for e in b.events_after(0)] if b else None
+        yield SubagentFinished(
+            result_id="pc-1", subagent_type="proof-candidate",
+            candidate_path=".lea/tmp/run/agent/C.lean", check_status="ok", check_detail=None,
+            stop_reason="completed", summary="done", transcript=[{"role": "user", "content": "go"}],
+        )
+        yield Finished("completed", "done", 1, ctx.session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {})
+
+    _ok_recheck(monkeypatch)
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(ctx)
+
+    assert captured["run_id"], "a child run was created"
+    assert captured["events"] is not None, "the child's broker existed while it ran"
+    types = captured["events"]
+    assert any(t == "assistant_delta" and p.get("text") == "child is thinking" for t, p in types)
+    assert any(t == "status" and p.get("status") == "tool_call" for t, p in types)
+    # after finish the broker is closed + dropped (no leak, no phantom stream)
+    assert runbroker.get(captured["run_id"]) is None
+
+
+def test_request_subagent_stop_translates_session_to_child(monkeypatch):
+    calls = {}
+
+    def _fake_stop(rid):
+        calls["rid"] = rid
+        return True
+
+    monkeypatch.setattr(bridge, "request_child_stop", _fake_stop)
+    bridge._child_session_to_result.clear()
+    # unknown session → False, no translation
+    assert bridge.request_subagent_stop("nope") is False
+    assert "rid" not in calls
+    # a mapped child session → forwards its result_id to the prover
+    bridge._child_session_to_result["sess-1"] = "pc-42"
+    assert bridge.request_subagent_stop("sess-1") is True
+    assert calls["rid"] == "pc-42"
+    bridge._child_session_to_result.clear()
 
 
 # --- end-to-end through the real bridge loop ----------------------------------

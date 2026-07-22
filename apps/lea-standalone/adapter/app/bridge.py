@@ -46,12 +46,15 @@ from lea.interface import (
     FileChanged,
     Finished,
     SubagentFinished,
+    SubagentProgress,
+    SubagentStarted,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
     TurnStarted,
     UsageUpdated,
     check as _lean_check_file,
+    request_child_stop,
     run_events,
 )
 
@@ -80,6 +83,25 @@ _stop_events: dict[str, Event] = {}
 def request_stop(run_id: str) -> None:
     """Flag a run for a clean cooperative stop (the interrupt endpoint calls this)."""
     _stop_events.setdefault(run_id, Event()).set()
+
+
+# D2: live sub-agent children, mapping the child's SESSION id -> its prover `result_id`,
+# so the stop endpoint can translate a UI action on a child session into a per-child
+# stop. Populated when a child spawns (SubagentStarted) and cleared when it finishes /
+# the coordinator run ends. Process-global (the endpoint runs on a different thread than
+# the run), matching `_stop_events`.
+_child_session_to_result: dict[str, str] = {}
+
+
+def request_subagent_stop(child_session_id: str) -> bool:
+    """Ask a single running child sub-agent to stop cleanly (D2), addressed by its child
+    SESSION id (what the UI holds). Returns True if a live child was found and flagged.
+    The child returns its partial findings at its next turn boundary; the coordinator run
+    keeps going — this kills one runaway child, not the whole run."""
+    result_id = _child_session_to_result.get(child_session_id)
+    if result_id is None:
+        return False
+    return request_child_stop(result_id)
 
 
 # --- Per-tool approval gate (D19) ------------------------------------------
@@ -382,30 +404,116 @@ def _subagent_child_title(ev: SubagentFinished) -> str:
     return ev.subagent_type or "sub-agent"
 
 
-def _materialize_subagent(
-    ev: SubagentFinished,
+def _start_subagent(
+    ev: SubagentStarted,
     *,
     parent_session_id: str,
     project_id: str | None,
     turn: int,
-    repo: Path,
-) -> dict:
-    """Persist a finished sub-agent as a CHILD session (item 24), returning its row.
+    cfg: LeaConfig,
+) -> tuple[dict, str]:
+    """D1: the moment a child spawns, create it as a RUNNING child session — a real
+    session parented to the coordinator, with a running run row so its *derived* status
+    is 'running' (no code yet + an active run → 'running', per `_derive_session_status`).
+    So the sidebar's Sub-agents block and the parent's spawn node show a live child the
+    instant it starts, instead of nothing until it finishes. `SubagentFinished` (same
+    `result_id`) fills the transcript + candidate in and retires the run.
 
-    A child is a real session parented to the coordinator: its transcript is replayed
-    into its own `timeline` (so it renders read-only through the ordinary session view),
-    and its candidate file — read back from the child's scratch dir under the run's
-    working tree — is stored as a code_step, so the child's *derived* status IS its
-    lean_check verdict. The child transcript is NOT written onto the parent's timeline
-    (it is the child's, not a coordinator code_step)."""
+    Returns `(child_row, child_run_id)`. The child run row is also the first small step
+    toward E1 (children as first-class runs) — a child now owns a `runs` row it can be
+    tracked and, later, stopped through."""
+    title = (ev.description or "").strip() or (ev.subagent_type or "sub-agent")
     child = store.create_session(
-        _subagent_child_title(ev),
+        title[:80],
         project_id=project_id,
         parent_id=parent_session_id,
         role=ev.subagent_type,
         spawned_at_turn=turn,
     )
-    child_id = child["id"]
+    child_run = store.create_run(child["id"], cfg.model, None, cfg.max_turns, project_id=project_id)
+    store.update_run(child_run["id"], "running")
+    return child, child_run["id"]
+
+
+def _subagent_progress_payload(child_id: str, result_id: str, inner) -> dict | None:
+    """Compact a child's inner `AgentEvent` (E1) into a live `subagent_progress` SSE for
+    the browser. The child's steps are streamed for VISIBILITY only — they are not
+    persisted here (the authoritative transcript still replays into the child session on
+    finish); this is the live feed the coordinator's spawn box renders as the child works.
+    Returns None for events with nothing to show live."""
+    base = {"child_id": child_id, "result_id": result_id}
+    if isinstance(inner, AssistantTextDelta):
+        return {**base, "kind": "text", "text": inner.text}
+    if isinstance(inner, TurnStarted):
+        return {**base, "kind": "turn", "turn": inner.turn}
+    if isinstance(inner, ToolCalled):
+        return {**base, "kind": "tool", "tool": inner.name}
+    if isinstance(inner, CheckResult):
+        return {**base, "kind": "check", "status": inner.status}
+    if isinstance(inner, Finished):
+        return {**base, "kind": "finished", "reason": inner.reason}
+    return None
+
+
+def _flush_child_narration(broker, started: dict) -> None:
+    """Commit the child's buffered narration as ONE assistant message on its broker, then
+    clear the buffer. Mirrors the coordinator's `flush_narration`: a `message` whose
+    content overlaps the live bubble REPLACES it (frontend), so each turn's narration lands
+    as its own message instead of every turn concatenating into one run-together blob."""
+    buf = started.get("narration") or []
+    text = "".join(buf).strip()
+    started["narration"] = []
+    if not text:
+        return
+    n = started.get("msg_seq", 0) + 1
+    started["msg_seq"] = n
+    emit(broker, "message", {
+        "id": f"sa-{started['run_id']}-{n}",
+        "session_id": started["child_id"],
+        "run_id": started["run_id"],
+        "role": "assistant",
+        "content": text,
+        "created_at": store.utc_now(),
+    })
+
+
+def _forward_to_child_broker(broker, inner, started: dict) -> None:
+    """Re-emit a child's inner `AgentEvent` onto its OWN run broker (E1 first-class) in the
+    same SSE vocab `run_lea` uses for the coordinator, so the child's session view — which
+    attaches to `/api/runs/<child_run_id>/events` like any run — renders it live with the
+    exact same listeners. Narration streams as a live bubble and is COMMITTED to a discrete
+    message on each turn/tool boundary (so turns don't run together). Ephemeral live view
+    only; the durable transcript still replays into the child session on finish."""
+    if isinstance(inner, AssistantTextDelta):
+        started.setdefault("narration", []).append(inner.text)
+        emit(broker, "assistant_delta", {"text": inner.text})
+    elif isinstance(inner, TurnStarted):
+        # A new turn began → the previous turn's narration is complete; commit it.
+        _flush_child_narration(broker, started)
+    elif isinstance(inner, ToolCalled):
+        # The model finished narrating and is acting → commit, then show the tool step.
+        _flush_child_narration(broker, started)
+        emit(broker, "status", {"status": "tool_call", "message": f"Running {inner.name}", "turn": None})
+    elif isinstance(inner, CheckResult):
+        emit(broker, "status", {"status": "lean_check", "check_status": inner.status,
+                                "check_detail": inner.detail})
+
+
+def _populate_subagent(
+    child_id: str,
+    child_run_id: str | None,
+    ev: SubagentFinished,
+    *,
+    turn: int,
+    repo: Path,
+) -> None:
+    """Fill a child session with the finished run's transcript + candidate (item 24).
+
+    The transcript replays into the child's own `timeline` (so it renders read-only
+    through the ordinary session view); the candidate file — read back from the child's
+    scratch dir under the run's working tree — is stored as a code_step, so the child's
+    *derived* status IS its lean_check verdict. The child transcript is NOT written onto
+    the parent's timeline (it is the child's, not a coordinator code_step)."""
     for msg in ev.transcript or []:
         text = _text_from_content(msg.get("content"))
         if text.strip():
@@ -421,11 +529,47 @@ def _materialize_subagent(
             content = None
         if content is not None:
             store.add_code_step(
-                child_id, None, cand.name, content=content, author="agent", turn=turn,
+                child_id, child_run_id, cand.name, content=content, author="agent", turn=turn,
                 summary=(ev.summary or None),
                 check_status=ev.check_status, check_detail=ev.check_detail,
                 artifact_kind=_classify(content) if ev.check_status == "ok" else None,
             )
+
+
+def _finalize_started_subagent(
+    child_id: str,
+    child_run_id: str,
+    ev: SubagentFinished,
+    *,
+    turn: int,
+    repo: Path,
+) -> None:
+    """D1 finish path: fill in a child created by `_start_subagent` and RETIRE its run
+    row so its derived status flips from 'running' to the candidate's verdict."""
+    _populate_subagent(child_id, child_run_id, ev, turn=turn, repo=repo)
+    store.update_run(child_run_id, "error" if ev.stop_reason == "error" else "completed")
+
+
+def _materialize_subagent(
+    ev: SubagentFinished,
+    *,
+    parent_session_id: str,
+    project_id: str | None,
+    turn: int,
+    repo: Path,
+) -> dict:
+    """Fallback for a `SubagentFinished` with no prior `SubagentStarted` (an older prover,
+    or a dropped start event): create the child from the finished run in one shot, as
+    before D1. No run row — it is already finished, so its status derives from the
+    candidate's verdict directly."""
+    child = store.create_session(
+        _subagent_child_title(ev),
+        project_id=project_id,
+        parent_id=parent_session_id,
+        role=ev.subagent_type,
+        spawned_at_turn=turn,
+    )
+    _populate_subagent(child["id"], None, ev, turn=turn, repo=repo)
     return child
 
 
@@ -551,6 +695,10 @@ def run_lea(context: RunnerContext) -> None:
     # Finished sub-agents (item 24), in the order they completed — surfaced as child
     # sessions and kept for the collation pass (item 25) on the coordinator's Finished.
     subagent_results: list[SubagentFinished] = []
+    # D1: children materialized at spawn (SubagentStarted), keyed by result_id, so the
+    # matching SubagentFinished updates the SAME running child row instead of creating a
+    # second. Value: the child session id, its run row id, and its start title.
+    subagent_children: dict[str, dict] = {}
     # Whether the coordinator ITSELF produced a clean (non-scratch) proof this run. If it
     # did, the collation pass leaves it alone; if it didn't, the best compiling child
     # candidate is promoted to fill the gap (item 25).
@@ -746,22 +894,32 @@ def run_lea(context: RunnerContext) -> None:
                     })
                 last_write_path = None
 
-            elif isinstance(ev, SubagentFinished):
-                # A child sub-agent finished (item 24). Materialize it as a CHILD session
-                # parented to this coordinator — its exploration replayed into its own
-                # read-only timeline, its candidate stored as a code_step so the child's
-                # derived status IS its lean_check verdict — then tell the browser so the
-                # contextual Sub-agents block + the spawn node appear live. Keep the typed
-                # result for the collation pass on Finished.
-                subagent_results.append(ev)
-                child = _materialize_subagent(
+            elif isinstance(ev, SubagentStarted):
+                # D1: a child was just spawned and is about to run (this blocks the
+                # coordinator's tool call for the child's whole life). Materialize it as
+                # a RUNNING child session NOW — a running run row makes its derived status
+                # 'running', so the sidebar's Sub-agents block and the parent's spawn node
+                # show a live 'exploring…' child instead of nothing until it finishes. The
+                # matching SubagentFinished (same result_id) fills it in and retires the run.
+                child, child_run_id = _start_subagent(
                     ev,
                     parent_session_id=session_id,
                     project_id=(project["id"] if project else None),
                     turn=current_turn,
-                    repo=repo,
+                    cfg=cfg,
                 )
-                emit(events, "subagent_finished", {
+                subagent_children[ev.result_id] = {
+                    "child_id": child["id"], "run_id": child_run_id, "title": child["title"],
+                }
+                # E1 first-class child run: give the child run its OWN broker, keyed by its
+                # run_id. The child's session view attaches to /api/runs/<child_run_id>/events
+                # like any run; the events endpoint recognises a child and just TAILS this
+                # broker (never admits/drives it — the coordinator drives it inline). So a
+                # sub-agent's own session streams live, with no bespoke endpoint.
+                runbroker.create(child_run_id)
+                # D2: let the stop endpoint address this child by its session id.
+                _child_session_to_result[child["id"]] = ev.result_id
+                emit(events, "subagent_started", {
                     "child_id": child["id"],
                     "parent_id": session_id,
                     "run_id": run_id,
@@ -770,6 +928,71 @@ def run_lea(context: RunnerContext) -> None:
                     "role": ev.subagent_type,
                     "turn": current_turn,
                     "title": child["title"],
+                })
+
+            elif isinstance(ev, SubagentProgress):
+                # E1: a running child emitted one of its own events. Stream it to the
+                # browser live (VISIBILITY only — not persisted; the authoritative
+                # transcript still replays on finish) so the coordinator's spawn box shows
+                # the child working in real time instead of a frozen 'exploring…'. Ignore
+                # progress for a child we never saw start (defensive).
+                started = subagent_children.get(ev.result_id)
+                if started:
+                    # (a) the coordinator's spawn box (a compact live line per child)
+                    payload = _subagent_progress_payload(started["child_id"], ev.result_id, ev.event)
+                    if payload:
+                        emit(events, "subagent_progress", payload)
+                    # (b) the child's OWN run stream (E1 first-class): re-emit the inner
+                    # event in the normal SSE vocab onto the child's broker, so the child's
+                    # session view renders it live with the same listeners as any run.
+                    child_broker = runbroker.get(started["run_id"])
+                    if child_broker is not None:
+                        _forward_to_child_broker(child_broker, ev.event, started)
+
+            elif isinstance(ev, SubagentFinished):
+                # A child sub-agent finished (item 24). If it was materialized at spawn
+                # (D1), FILL IN the same running child row and retire its run; otherwise
+                # (older prover / dropped start event) create it now from the finished
+                # result. Either way its transcript lands in its own read-only timeline and
+                # its candidate becomes a code_step, so the child's derived status IS its
+                # lean_check verdict. Keep the typed result for the collation pass on Finished.
+                subagent_results.append(ev)
+                started = subagent_children.pop(ev.result_id, None)
+                if started:
+                    _child_session_to_result.pop(started["child_id"], None)  # D2: child done
+                    _finalize_started_subagent(
+                        started["child_id"], started["run_id"], ev,
+                        turn=current_turn, repo=repo,
+                    )
+                    # E1 first-class: close the child's own run stream — flush any trailing
+                    # narration, then a `done` so any attached child-session view settles +
+                    # reloads the durable transcript, then drop the broker. Idempotent if
+                    # nothing ever attached.
+                    child_broker = runbroker.get(started["run_id"])
+                    if child_broker is not None:
+                        _flush_child_narration(child_broker, started)
+                        emit(child_broker, "done",
+                             {"status": "error" if ev.check_status == "error" else "proved"})
+                    runbroker.drop(started["run_id"])
+                    child_id, child_title = started["child_id"], started["title"]
+                else:
+                    child = _materialize_subagent(
+                        ev,
+                        parent_session_id=session_id,
+                        project_id=(project["id"] if project else None),
+                        turn=current_turn,
+                        repo=repo,
+                    )
+                    child_id, child_title = child["id"], child["title"]
+                emit(events, "subagent_finished", {
+                    "child_id": child_id,
+                    "parent_id": session_id,
+                    "run_id": run_id,
+                    "result_id": ev.result_id,
+                    "subagent_type": ev.subagent_type,
+                    "role": ev.subagent_type,
+                    "turn": current_turn,
+                    "title": child_title,
                     "check_status": ev.check_status,
                     "check_detail": ev.check_detail,
                     "stop_reason": ev.stop_reason,
@@ -822,6 +1045,22 @@ def run_lea(context: RunnerContext) -> None:
         final_status = "failed"
     finally:
         skills_catalog.cleanup(skills_tempdir)
+        # D1: retire any child whose SubagentStarted never saw its SubagentFinished —
+        # the coordinator was interrupted or crashed mid-child. Left 'running', its run
+        # row would count as an active run forever (an eternal 'exploring…' child); mark
+        # it failed so the child's derived status settles. Best-effort.
+        for _rid, started in subagent_children.items():
+            try:
+                store.update_run(started["run_id"], "failed")
+            except Exception:
+                logger.exception("Failed to retire orphan sub-agent run %s", started.get("run_id"))
+            _child_session_to_result.pop(started["child_id"], None)  # D2: drop stop handle
+            # E1: settle + drop any orphaned child stream so an attached view doesn't hang.
+            orphan_broker = runbroker.get(started["run_id"])
+            if orphan_broker is not None:
+                emit(orphan_broker, "done", {"status": "failed"})
+            runbroker.drop(started["run_id"])
+        subagent_children.clear()
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
         # Release the admission slot (paired with the endpoint's try_admit). Idempotent,

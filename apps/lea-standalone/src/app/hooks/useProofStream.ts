@@ -345,11 +345,64 @@ export function useProofStream() {
       setApprovalBusy(false);
     });
 
-    source.addEventListener('subagent_finished', () => {
+    source.addEventListener('subagent_started', () => {
+      // D1: a child sub-agent was just spawned and the adapter has persisted it as a
+      // RUNNING child session (a running run row → derived status 'running'). Refresh so
+      // it lands in the store: the sidebar's Sub-agents block and the parent thread's
+      // spawn node render it live as 'exploring…' instead of nothing until it finishes.
+      // Same session-list-is-the-source-of-truth path as subagent_finished.
+      useSessions.getState().refreshSessions().catch(() => {});
+    });
+
+    source.addEventListener('subagent_progress', (event) => {
+      // E1: a running child emitted one of its own steps. Fold it into that child's
+      // ephemeral live state (rendered on its spawn-node row) so the user watches it
+      // work — text streams, the current tool + latest check show. Visibility only; the
+      // durable transcript still lands on finish.
+      const data = (event as MessageEvent).data;
+      if (!data) return;
+      let p: { child_id?: string; kind?: string; text?: string; tool?: string; status?: string; turn?: number };
+      try {
+        p = JSON.parse(data);
+      } catch {
+        return;
+      }
+      const childId = p.child_id;
+      if (!childId) return;
+      useProofSession.getState().setSubagentProgress((prev) => {
+        const cur = prev[childId] || { text: '' };
+        let next = cur;
+        if (p.kind === 'text') next = { ...cur, text: cur.text + (p.text || '') };
+        else if (p.kind === 'turn') next = { ...cur, text: '', turn: p.turn, tool: undefined };
+        else if (p.kind === 'tool') next = { ...cur, tool: p.tool };
+        else if (p.kind === 'check') next = { ...cur, check: p.status, tool: undefined };
+        else return prev;
+        return { ...prev, [childId]: next };
+      });
+    });
+
+    source.addEventListener('subagent_finished', (event) => {
       // A child sub-agent finished and the adapter has already persisted it as its own
       // session (item 24). Refresh the list so the child lands in the store — the
       // sidebar's Sub-agents block and the parent thread's spawn node both derive from
-      // it. No per-event payload handling needed: the session list is the source of truth.
+      // it. The session list is the source of truth; also drop the child's ephemeral live
+      // state now the durable transcript takes over (E1).
+      const data = (event as MessageEvent).data;
+      if (data) {
+        try {
+          const childId = (JSON.parse(data) as { child_id?: string }).child_id;
+          if (childId) {
+            useProofSession.getState().setSubagentProgress((prev) => {
+              if (!(childId in prev)) return prev;
+              const next = { ...prev };
+              delete next[childId];
+              return next;
+            });
+          }
+        } catch {
+          /* ignore a malformed payload — the refresh below still runs */
+        }
+      }
       useSessions.getState().refreshSessions().catch(() => {});
     });
 

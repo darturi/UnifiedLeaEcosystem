@@ -89,6 +89,16 @@ export async function interruptRun(runId: string): Promise<void> {
   }
 }
 
+// Stop a single running child sub-agent (D2), addressed by its child SESSION id —
+// without cancelling the coordinator run. A 404 means it already finished (nothing to
+// stop), which we treat as success.
+export async function interruptSubagent(sessionId: string): Promise<void> {
+  const response = await fetch(`/api/sub-agents/${encodeURIComponent(sessionId)}/interrupt`, { method: 'POST' });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(await detailMessage(response, `Failed to stop sub-agent: ${response.statusText}`));
+  }
+}
+
 // ── Projects (v2.1) ────────────────────────────────────────────────────────────
 export async function listProjects(): Promise<Project[]> {
   const response = await fetch('/api/projects');

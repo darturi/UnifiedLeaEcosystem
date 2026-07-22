@@ -954,6 +954,14 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .spawn .kid-open { margin-top: 6px; font-size: 12px; color: var(--accent); background: none;
   border: none; cursor: pointer; padding: 2px 0; font-family: inherit; }
 .spawn .kid-open:hover { text-decoration: underline; }
+/* E1: a running child streams a live preview; its 'Stop' kills just this child (D2) */
+.spawn .kid.running .kid-preview { color: var(--ink-2); }
+.spawn .kid-stop { font-size: 10.5px; font-weight: 600; color: var(--red); background: var(--red-soft);
+  border: none; border-radius: 20px; padding: 1px 9px; cursor: pointer; font-family: inherit;
+  flex: 0 0 auto; opacity: 0; transition: opacity .12s; }
+.spawn .kid.running:hover .kid-stop, .spawn .kid-stop:focus-visible { opacity: 1; }
+.spawn .kid-stop:hover { filter: brightness(.96); }
+.spawn .kid-stop:disabled { color: var(--muted); background: var(--panel-2); cursor: default; opacity: 1; }
 
 /* verdict badges (shared by the spawn node) */
 .verdict.ok { color: var(--green); background: var(--green-soft); }

@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Download, PanelLeftOpen } from 'lucide-react';
-import { sessionExportUrl } from '../lib/api';
+import { sessionExportUrl, interruptSubagent } from '../lib/api';
 import type {
   ApprovalDecision,
   ApprovalRecord,
@@ -680,12 +680,19 @@ function SpawnGroup({
   onSelectSession?: (id: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [stopping, setStopping] = useState<Set<string>>(new Set());
+  // E1: ephemeral live state per running child, fed by `subagent_progress` SSE.
+  const progress = useProofSession((s) => s.subagentProgress);
   const toggle = (id: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
+  const stop = (id: string) => {
+    setStopping((prev) => new Set(prev).add(id));
+    interruptSubagent(id).catch(() => {}); // 404 (already done) is fine; the row will settle on finish
+  };
   return (
     <details className="spawn" open>
       <summary>
@@ -698,14 +705,35 @@ function SpawnGroup({
         {children.map((child) => {
           const badge = subagentBadge(child);
           const isOpen = expanded.has(child.id);
-          const preview = firstLine(child.final_summary);
+          const running = badge.dot === 'run';
+          const live = progress[child.id];
+          // While running, the live feed IS the preview: the current tool, else the
+          // streaming narration, else the plain 'exploring…'. On finish the durable
+          // final summary takes over.
+          const liveLine = running
+            ? (live?.tool ? `running ${live.tool}…` : firstLine(live?.text) || 'exploring…')
+            : '';
+          const preview = running ? liveLine : firstLine(child.final_summary);
           return (
-            <div className={`kid ${isOpen ? 'open' : ''}`} key={child.id}>
+            <div className={`kid ${isOpen ? 'open' : ''} ${running ? 'running' : ''}`} key={child.id}>
               <button className="kid-head" onClick={() => toggle(child.id)}>
                 <span className={`caret ${isOpen ? 'open' : ''}`}>▸</span>
                 <span className={`dot ${badge.dot}`} />
                 <span className="rtitle">{child.title}</span>
                 {child.role && <span className="role">{child.role.split('-')[0]}</span>}
+                {running && (
+                  <button
+                    className="kid-stop"
+                    disabled={stopping.has(child.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      stop(child.id);
+                    }}
+                    title="Stop this sub-agent (the coordinator keeps running)"
+                  >
+                    {stopping.has(child.id) ? 'stopping…' : 'Stop'}
+                  </button>
+                )}
                 <span className={`verdict ${badge.cls}`}>{badge.text}</span>
               </button>
               {!isOpen && preview && <div className="kid-preview">{preview}</div>}

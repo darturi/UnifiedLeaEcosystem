@@ -111,8 +111,8 @@
     <b>absent from the UI entirely</b> until it finished.
   </div>
 
-  <div class="bar"><i style="width:35%"></i></div>
-  <div class="counts">7 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 verified, B1 built, C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 12 queued across D–G · <b>23 total</b> &nbsp;·&nbsp; <b>Phase B complete</b>
+  <div class="bar"><i style="width:55%"></i></div>
+  <div class="counts">12 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 + D1 + D2 + E1 + E2 + E3 verified · B1 built · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 9 queued across D–G · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E complete ✓ — parallel children stream + stop</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -328,21 +328,36 @@
     <p class="ghint">You are the creator and you're flying blind. A child must be seeable, stoppable, steerable — and you
       should be able to pick which model each role runs, from the composer.</p>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id fe">D1</span><span class="title">Render a sub-agent the moment it's spawned (running state)</span>
-        <span class="tag be">adapter</span><span class="tag fe">frontend</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope"><span class="haz">P0</span> A child is materialized only on <code>SubagentFinished</code>, so
-        a <b>running child is invisible</b> and the list shows only finished ones — they all look done. Emit a
-        <b>spawn-started</b> event, materialize the child as <code>running</code> at spawn, update on finish; live
-        running/done indicator. Without this, N concurrent children (E2) is strictly worse than one.</div>
+        <span class="tag be">adapter</span><span class="tag fe">frontend</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><span class="haz">P0</span> A child was materialized only on <code>SubagentFinished</code>, so
+        a <b>running child was invisible</b> and the list showed only finished ones — they all looked done.
+        <b>Done:</b> split the blocking <code>spawn_subagent</code> into <code>prepare_spawn</code> (validate → id →
+        scratch) + <code>run_prepared</code> (the blocking child run), so the loop emits a new <code>SubagentStarted</code>
+        event <i>between</i> them; the adapter materializes the child as a <b>running</b> child session at spawn — a
+        running <code>runs</code> row makes its <i>derived</i> status <code>running</code>, so the sidebar's Sub-agents
+        block + the parent's spawn node show a live <b>“exploring…”</b> child (the badge path already existed). The
+        matching <code>SubagentFinished</code> (same <code>result_id</code>) fills the <i>same</i> row in and retires the
+        run — no duplicate child. Also fixed a latent bug: a child that <i>raised</i> emitted no finish event at all
+        (now always records one, so a running row can never linger); the loop's <code>finally</code> retires any child
+        orphaned by a coordinator interrupt. Tests: prover <code>test_subagent_started</code> (prepare/run split +
+        Started-strictly-before-Finished through the real loop), adapter <code>test_subagent_bridge</code> (running child
+        at spawn, one-child collapse, orphan retire). This is also the first small step toward <b>E1</b> — a child now
+        owns a <code>runs</code> row. <span class="p1">✓ live-tested: “exploring…” child appears at spawn</span></div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">D2</span><span class="title">Stop a single running sub-agent</span>
-        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope"><span class="p1">needs D1/E1</span> Children run with <code>should_stop=None</code>
-        (autonomous). Thread a <b>per-child stop signal</b> so a user can kill a runaway child without cancelling the
-        whole coordinator run; it returns partial findings gracefully (like summarize-on-cap).</div>
+        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><span class="p1">✓ live-tested: stopping one child works; the coordinator runs on</span> Landed as the stop half of <b>E1</b>. Children ran with <code>should_stop=None</code>; now each
+        has a <b>per-child stop flag</b> (registry keyed by <code>result_id</code>) composed with the coordinator's stop,
+        so its <code>run_events</code> ends cleanly at the next turn boundary and returns partial findings — <i>and</i> a
+        coordinator Stop now cascades into a running child instead of hanging on it. <code>POST
+        /api/sub-agents/&lt;session_id&gt;/interrupt</code> translates a child session → <code>result_id</code> →
+        <code>request_child_stop</code>; a <b>Stop</b> button appears on each running child row (hover), killing just that
+        child while the coordinator runs on. Tests: prover <code>test_subagent_streaming</code> (stop fires, coordinator
+        cascade, flag cleanup), adapter (session→child translation). <span class="p1">awaiting combined live-test</span></div>
     </div>
 
     <div class="todo is-unplanned">
@@ -374,7 +389,32 @@
         threads into the child config to <b>override</b> profile/inherit. This is the live-UI counterpart of the
         heterogeneous split we do for benchmarking by hand (coordinator = GPT, children = self-hosted Deepseek on vLLM,
         set via the YAML <code>model:</code> line) — it promotes that from a file edit to a picker. Reuses D4's parser +
-        card; the real work is the override plumb through <code>bridge</code>/<code>_child_config</code>.</div>
+        card; the real work is the override plumb through <code>bridge</code>/<code>_child_config</code>. (<b>D6</b> hosts
+        the full per-role settings; this command is the composer shortcut into the same override layer.)</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id sub">D6</span><span class="title">Sub-agents page — view/edit every role's settings (like Skills)</span>
+        <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">A dedicated <b>Sub-agents</b> view (new <code>view</code>, mirrors <code>SkillFactory</code>): every
+        role (<code>proof-candidate</code>, <code>premise-search</code>) as a card showing <b>model, max-turns, max-cost,
+        system prompt, tool subset</b> — editable in place. Edits persist as <b>per-profile overrides</b> in the adapter
+        (<i>not</i> by mutating the vendored <code>lea/agents/*.yaml</code>), merged over the profile at spawn — the same
+        persist→sync pattern the model setting uses. This override layer is the home for <b>D5</b> (the
+        <code>/sub-agent-model</code> command becomes a shortcut into it) and the storage seam the future <b>custom
+        sub-agents</b> reuse (see <code>TODO.md</code>). <span class="haz">max-cost is net-new</span> — a field <i>plus</i>
+        teaching the child loop to stop when accumulated cost crosses it.</div>
+    </div>
+
+    <div class="todo is-planned">
+      <div class="top"><span class="id fe">D7</span><span class="title">Projects hub + sidebar shows only the 3 latest</span>
+        <span class="tag fe">frontend</span><span class="badge b-planned">Planned</span></div>
+      <div class="scope">General-UI declutter that rode in with this frontend pass. The sidebar's flat project list doesn't
+        scale — cap it to the <b>3 most-recently-updated</b> (latest on top) and make the <b>Projects</b> header open a
+        dedicated <b>Projects hub</b>: a new <code>view</code> showing every project as a <b>card</b> (Claude-web style) →
+        click → the existing <code>openProjectWindow</code>. Frontend-only: reuses the <code>view</code>-switch pattern
+        (<code>ProjectWindow</code>/<code>SkillFactory</code>) + the <code>projects</code> store; the sidebar change is
+        sort-by-updated + <code>slice(0,3)</code> + a clickable header.</div>
     </div>
   </div>
 
@@ -383,39 +423,51 @@
     <h2>Phase E · Parallel execution <span style="text-transform:none;font-weight:400">(the headline)</span></h2>
     <p class="ghint">Formalize independent sub-lemmas at once. The isolation-safety is paid for; the execution isn't.</p>
 
-    <div class="todo is-unplanned">
-      <div class="top"><span class="id sub">E1</span><span class="title">First-class child runs on the RunBroker</span>
-        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-unplanned">Design</span></div>
-      <div class="scope"><span class="haz">P0</span> Promote children from in-process blocking drains to <b>real runs
-        with their own SSE stream + stop hook</b>. The umbrella that makes D1/D2/D3/E2 natural instead of four separate
-        patches. The adapter already has the broker; the prover emits child <b>start/progress/stop</b> events instead of
-        <i>absorbing</i> them. <b>Also fixes child-usage tracking</b> (why sub-agent tokens read as 0): the SDK syncs
-        each child's metrics into the parent — <code>parent_stats.usage_to_metrics["delegate:{id}"] =
-        sub.get_combined_metrics()</code>, <i>replace</i> not add to avoid double-count on re-delegation
-        (<code>delegate/impl.py</code>). A first-class child run gets its own usage row, giving us the same rollup.</div>
+    <div class="todo is-tested">
+      <div class="top"><span class="id sub">E1</span><span class="title">Children stream their own events (start / progress / stop)</span>
+        <span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><span class="haz">P0</span> The child was <i>absorbed</i> — invisible until it finished.
+        <b>Done:</b> <code>spawn_subagent</code> no longer drains silently — <code>run_prepared_events</code> is a generator
+        that yields each child event wrapped as <code>SubagentProgress</code>, and the coordinator loop <code>yield from</code>s
+        them up; the adapter streams each as a <code>subagent_progress</code> SSE and the spawn box renders the child's
+        <b>live narration / current tool / check</b> as it works. <b>Item 18 preserved</b>: progress events never enter the
+        coordinator's model <code>messages</code> — only the distilled render does. Plus the <b>stop hook</b> (= D2). The
+        durable transcript still replays on finish (untouched). <b>Also done — the child is now a first-class RunBroker
+        run:</b> its OWN session view attaches to <code>/api/runs/&lt;child_run_id&gt;/events</code> (the events endpoint
+        recognises a child and just <i>tails</i> its broker — never admits/drives it), so a sub-agent's own session streams
+        live too, with narration committed as one message per turn/tool boundary. <i>Deferred (TODO.md):</i> forwarding the
+        child's <b>canvas file-writes</b> as live <code>code_step</code>s (today the child canvas fills on finish), and the
+        <b>usage-row rollup</b> (sub-agent tokens still read ~0). Tests: prover <code>test_subagent_streaming</code>,
+        adapter progress/stop + first-class-broker stream + per-turn message commit.
+        <span class="p1">✓ live-tested: child streams in the spawn card AND its own session</span></div>
     </div>
 
-    <div class="todo is-unplanned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">E2</span><span class="title">Threaded parallel children (<code>copy_context</code> per child)</span>
-        <span class="tag prover">prover</span><span class="badge b-unplanned">Design</span></div>
-      <div class="scope"><span class="haz">P0</span> <b>The actual pain.</b> Isolation-safety (ContextVar scopes,
-        items 21/27) makes concurrent children safe, but execution is synchronous: <code>spawn_subagent</code> drains
-        its child inline. Run each child on its own thread via <code>contextvars.copy_context().run(...)</code> (its own
-        scope); barrier-join multiple spawns in a turn. LLM + <code>lean_check</code> are blocking I/O, so threads truly
-        overlap. <b>Source-validated</b> — the SDK's <code>DelegateExecutor</code>
-        (<code>openhands-tools/.../delegate/impl.py</code>) does exactly this: a <code>threading.Thread</code> per task,
-        <code>start()</code> all then <code>join()</code> (barrier), a <code>max_children=5</code> cap, two-phase
-        <code>spawn</code>/<code>delegate</code>, and per-child exceptions isolated into an <code>errors</code> map so a
-        failed child never kills its siblings. Needs B1/B3 + D1/E1.</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope"><span class="haz">P0</span> <b>The headline.</b> A turn's spawns no longer run one-at-a-time.
+        <code>run_children_concurrently</code> launches each child on a <code>threading.Thread</code> with its OWN
+        <code>contextvars.copy_context()</code> (inherited working_dir/should_stop/result-collector, isolated scopes),
+        merges all their live events up through one queue, barrier-joins, and returns <code>{result_id: render}</code>.
+        LLM + <code>lean_check</code> are blocking I/O so children truly overlap (proven by a <code>threading.Barrier</code>
+        test — they'd deadlock if serialized). A <code>max_children=5</code> semaphore caps concurrent <code>lean --worker</code>s
+        (the B1/B3 laptop-safety guard); a raising child is isolated into its own error render — never kills a sibling.
+        Isolation-safety (items 21/27, B3) was already paid for. Tests: <code>test_subagent_parallel</code> (real overlap,
+        cap serializes, failure isolation, two-spawns-in-one-turn through the real loop).
+        <span class="p1">✓ live-tested: multiple sub-agents run side-by-side, each streaming</span></div>
     </div>
 
-    <div class="todo is-planned">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">E3</span><span class="title">Parallelize the serial tool loop (independent tools)</span>
-        <span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">The loop runs a turn's tool calls in a serial <code>for tc in tool_calls</code>. Run
-        <i>independent</i> tools (and spawns) concurrently for latency. Orthogonal to isolation — a smaller, separate
-        win; keep write→check pairs serial. <b>Chosen mechanism for concurrent multi-modal search (F1):</b> a search
-        child fires Loogle + semantic + grep in one turn — <b>flat parallel calls, not sub-sub-agents</b>.</div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
+      <div class="scope">The tool loop was a serial <code>for tc in tool_calls</code>. Now it partitions a turn: spawns go
+        to E2's concurrent path, and <b>independent read-only tools</b> (<code>read_file</code>, <code>search_mathlib</code>)
+        run concurrently on <code>copy_context</code> threads when a turn issues several — everything else stays serial and
+        in order (a <b>write→check pair is never reordered</b>). Results reassemble by call index so the provider matches
+        each. <b>The mechanism F1 needs</b> for concurrent multi-modal search (Loogle + semantic + grep in one turn); its
+        real payoff lands with F1. Tests: <code>test_subagent_parallel</code> (two read_files, correct + ordered).
+        <span class="p1">✓ live-tested: the coordinator spawned 2 sub-agents in one turn and they ran in parallel (the loop's
+        spawn-concurrency clause); the read-only-tool path shares the same threading primitive</span></div>
     </div>
   </div>
 

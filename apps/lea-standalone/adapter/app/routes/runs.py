@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from ..config import load_config, permission_tier
 from .. import bridge
-from ..bridge import RunnerContext, run_lea, request_stop
+from ..bridge import RunnerContext, run_lea, request_stop, request_subagent_stop
 from .. import projects
 from .. import runbroker
 from .. import runregistry
@@ -224,6 +224,17 @@ def interrupt_run(run_id: str) -> dict:
     return {"status": "interrupting"}
 
 
+@router.post("/api/sub-agents/{session_id}/interrupt")
+def interrupt_subagent(session_id: str) -> dict:
+    """Stop a single running child sub-agent (D2), addressed by its child SESSION id —
+    without cancelling the coordinator run that spawned it. The child returns its partial
+    findings at its next turn boundary and the coordinator carries on. A no-op (404) if
+    the child is not currently running in-process (nothing to signal)."""
+    if request_subagent_stop(session_id):
+        return {"status": "interrupting"}
+    raise HTTPException(status_code=404, detail="No running sub-agent for that session")
+
+
 async def _supersede_and_admit(run_id: str, session_id: str, incumbent_run_id: str):
     """Item 10 supersede: this is a NEW run for a session whose previous run still
     holds a slot. Ask that incumbent to stop (its approval wait + turn loop are
@@ -252,6 +263,21 @@ async def run_events(run_id: str, request: Request) -> StreamingResponse:
         raise HTTPException(status_code=409, detail="Run has already completed")
 
     session_id = run["session_id"]
+
+    # A CHILD sub-agent run (E1 first-class) is driven INLINE by its coordinator, not
+    # admitted as an independent run. So the events endpoint only TAILS it: subscribe to
+    # its broker (fed by the coordinator forwarding the child's events) — never admit,
+    # never spawn a driver, never require a task message. This is what lets a sub-agent's
+    # own session view stream live, exactly like any run. If its broker is already gone
+    # (finished between the status read and here), settle the client with a terminal done.
+    child_session = store.get_session(session_id)
+    if child_session and child_session.get("parent_id"):
+        broker = runbroker.get(run_id)
+        if broker is None:
+            return StreamingResponse(_passive_done(run_id), media_type="text/event-stream")
+        return StreamingResponse(
+            _subscribe(broker, _request_cursor(request)), media_type="text/event-stream"
+        )
 
     # Resolve the task BEFORE claiming a slot, so a 404 here can never leak an
     # admission (nothing between try_admit and the runner thread may raise).
