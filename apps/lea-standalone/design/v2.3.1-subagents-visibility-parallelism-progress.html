@@ -112,7 +112,7 @@
   </div>
 
   <div class="bar"><i style="width:76%"></i></div>
-  <div class="counts">17 landed on <code>fix/subagent-workflow</code> (A1–A4 + B3 + D1 + D2 + D6 + D7 + E1 + E2 + E3 + G1 + G2 + G3 verified · B1 built · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 4 queued (D3–D5, F1) · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E + Phase G complete ✓ · slash-command framework + /compact live · Sub-agents page + Projects hub live</b>
+  <div class="counts">17 landed on <code>fix/subagent-workflow</code> (A1–A4 + B1 + B3 + D1 + D2 + D6 + D7 + E1 + E2 + E3 + G1 + G2 + G3 verified · C4 done) · 1 dropped (B2) · 3 skipped (C1–C3) · 4 queued (D3–D5, F1) · <b>25 total</b> &nbsp;·&nbsp; <b>Phase E + Phase G complete ✓ · slash-command framework + /compact live · Sub-agents page + Projects hub live</b>
     &nbsp;·&nbsp; <span class="haz">P0</span> = unblocks the headline (parallel sub-lemmas)</div>
 
   <div class="legend">
@@ -228,9 +228,9 @@
     <h2>Phase B · Resource &amp; correctness <span style="text-transform:none;font-weight:400">(do first — parallelism multiplies these)</span></h2>
     <p class="ghint">Bugs that are annoying at N=1 and catastrophic at N=many. These gate the headline.</p>
 
-    <div class="todo is-prog">
+    <div class="todo is-tested">
       <div class="top"><span class="id sub">B1</span><span class="title">Reap leaked <code>lean --worker</code> processes</span>
-        <span class="tag prover">prover</span><span class="badge b-prog">Built</span></div>
+        <span class="tag prover">prover</span><span class="badge b-tested">Tested ✓</span></div>
       <div class="scope"><span class="haz">P0</span> A live run left <b>~118 idle <code>lean --worker</code></b>
         processes: <code>lean --server</code> keeps one worker per <i>open</i> document and the daemon never sent
         <code>didClose</code>, so every unique sub-agent scratch file leaked one (hundreds of MB–GB each) — enough to
@@ -239,7 +239,8 @@
         the child returns (those candidates are never re-checked — the parent collates via the filesystem). Skips
         in-flight uris; matches on resolved paths. 14 unit tests; sub-agents suite 30/30. Committed <code>66080c8</code>.
         <span class="p1">deferred → TODO.md</span>: the top-level/coordinator case (same leak at ~1/N the rate;
-        LRU-cap backstop). <b>To reach Tested:</b> a live sub-agent burst confirming the worker count stays bounded.</div>
+        LRU-cap backstop). <b>Confirmed live:</b> after repeated sub-agent sessions the idle-worker count holds at
+        <b>0</b> (was ~118) — the reaping keeps it bounded.</div>
     </div>
 
     <div class="todo is-dropped">
@@ -371,26 +372,32 @@
     <div class="todo is-planned">
       <div class="top"><span class="id fe">D4</span><span class="title"><code>/model</code> — set the coordinator model from the composer</span>
         <span class="tag fe">frontend</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">Type <code>/model</code> in the composer to pop the existing Spotlight <b>model-picker card</b> above
-        the input (search/select), then run with that coordinator model. Near-pure reuse: <code>ModelPicker.tsx</code> +
-        <code>stores/model.ts</code> <code>setModel</code> (already persists to the same settings config a run reads) —
-        it sets the same active model the chat-head chip does. The only new piece is a <b>composer slash-command
-        parser</b>, <i>shared with</i> <code>/compact</code> (G3): parse <code>/&lt;cmd&gt;</code> at the input and
-        dispatch to a small command registry. Frontend-only.</div>
+      <div class="scope"><span class="haz">⚠ Blocked — needs per-session model first</span> Model selection is
+        <b>global</b> today: the chat-head picker's <code>changeModel</code> writes the single
+        <code>settings.model</code> and <code>create_run</code> reads that one value — so <b>two parallel sessions can't
+        use different models</b> (session A on DeepSeek, session B on Claude is impossible), and <code>/model</code>
+        built on it would set the model everywhere. <b>Prerequisite (→ <code>TODO.md</code>):</b> make model a
+        <b>per-run</b> parameter — <code>RunRequest.model</code> + <code>replace(config, model=…)</code>; the picker sets a
+        <b>per-session</b> model the run carries (the <code>runs</code> row already stores it, and
+        <code>session_detail.primary_model</code> reads it back), with global <code>settings.model</code> kept as the
+        default seed for a new session. <i>Then</i> D4 is near-pure reuse: <code>/model</code> pops the
+        <code>ModelPicker</code> card and sets that per-session model, dispatched by the <b>slash-command framework</b>
+        (built for <code>/compact</code>, G3). The command is frontend-only; the per-session foundation is the real work.</div>
     </div>
 
     <div class="todo is-planned">
       <div class="top"><span class="id sub">D5</span><span class="title"><code>/sub-agent-model</code> — set the sub-agent model from the composer</span>
         <span class="tag fe">frontend</span><span class="tag be">adapter</span><span class="tag prover">prover</span><span class="badge b-planned">Planned</span></div>
-      <div class="scope">Same picker card, second target — but this one needs a <b>new runtime channel</b>. Today a child's
-        model comes only from its profile YAML <code>model:</code> (static) or it <b>inherits the coordinator</b>
-        (<code>_child_config</code>: <code>profile.model or parent.model</code>) — there is <b>no sub-agent model in the
-        UI/store at all</b>. Add a persisted <code>sub_agent_model</code> setting (store + settings) that the adapter
-        threads into the child config to <b>override</b> profile/inherit. This is the live-UI counterpart of the
-        heterogeneous split we do for benchmarking by hand (coordinator = GPT, children = self-hosted Deepseek on vLLM,
-        set via the YAML <code>model:</code> line) — it promotes that from a file edit to a picker. Reuses D4's parser +
-        card; the real work is the override plumb through <code>bridge</code>/<code>_child_config</code>. (<b>D6</b> hosts
-        the full per-role settings; this command is the composer shortcut into the same override layer.)</div>
+      <div class="scope"><span class="haz">⚠ Blocked — needs per-session model first (same as D4)</span> Same picker card,
+        second target. Today a child's model comes only from its profile YAML <code>model:</code> or it <b>inherits the
+        coordinator</b> (<code>_child_config</code>: <code>profile.model or parent.model</code>); the D6 override that can
+        set it is the <b>global</b> <code>subagent_overrides</code> sidecar — so it has the <b>same parallel-sessions
+        limitation</b> as D4. <b>Prerequisite (→ <code>TODO.md</code>):</b> a <code>/sub-agent-model</code> choice must be a
+        <b>per-run</b> override threaded into <i>that run's</i> <code>subagent_overrides</code> (not the global sidecar),
+        riding the same per-session model foundation D4 needs. This is the live-UI counterpart of the heterogeneous split
+        we do for benchmarking by hand (coordinator = GPT, children = self-hosted Deepseek on vLLM). Reuses D4's card +
+        the slash framework; the real work is the per-run override plumb through <code>bridge</code>/<code>_child_config</code>.
+        (<b>D6</b> hosts the full per-role settings; this command is the composer shortcut into the same override layer.)</div>
     </div>
 
     <div class="todo is-tested">
