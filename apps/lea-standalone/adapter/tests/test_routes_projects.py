@@ -738,6 +738,28 @@ def test_generate_blueprint_edge_derivation_ignores_comments_and_ambiguous_short
     assert all(u not in ("dup", "dup_2") for u in nodes["cites_dup"]["uses"])  # ambiguous short → skipped
 
 
+def test_generate_blueprint_preserves_multiline_signature(tmp_path, monkeypatch):
+    """A signature that spans multiple source lines keeps its line breaks in the node
+    statement (so the pane can render it like the Lean pane), not collapsed to one line."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Multi"))
+    pid = project["id"]
+    repo = proofs / "Lea" / "Multi"
+    session = store.create_session("prove", project_id=pid)["id"]
+    (repo / "wide.lean").write_text(
+        "import Mathlib\nnamespace Lea.Multi\n"
+        "theorem wide (x : Nat)\n    (hx : 0 < x) :\n    x + 0 = x := by\n  simp\nend Lea.Multi\n"
+    )
+    _record_artifact(pid, session, "Lea.Multi.wide", "proof", "wide.lean")
+
+    result = projects_route.generate_blueprint(pid)
+    stmt = result["graph"]["nodes"][0]["statement"]
+    assert "\n" in stmt, "multi-line signature must keep its line breaks"
+    lines = stmt.splitlines()
+    assert lines[0] == "(x : Nat)"
+    assert "x + 0 = x" in lines[-1]
+
+
 def test_generate_blueprint_closes_dangling_fence_before_appending(tmp_path, monkeypatch):
     """An unclosed ``` fence in blueprint.md must not swallow the appended nodes — the
     node stays a real section, so a second run is still idempotent."""

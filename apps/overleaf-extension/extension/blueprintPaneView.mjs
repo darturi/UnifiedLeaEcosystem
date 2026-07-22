@@ -156,15 +156,21 @@ function buildLegend() {
 }
 
 // A Lean-highlighted `<code>` element built from the same tokenizer + token classes
-// the Lean pane uses, so decl names / signatures match its formatting.
+// the Lean pane uses, so decl names / signatures match its formatting. Multi-line
+// text is highlighted line-by-line with explicit newlines between (like the pane's
+// renderLeanPaneCode), so source line breaks survive under the block's pre-wrap.
 function leanCode(text, className) {
   const code = el("code", className || null);
-  for (const token of highlightLeanLine(String(text ?? ""))) {
-    const span = document.createElement("span");
-    if (token.cls) span.className = `ol-lean-project-lean-${token.cls}`;
-    span.textContent = token.text;
-    code.appendChild(span);
-  }
+  const lines = String(text ?? "").split("\n");
+  lines.forEach((line, i) => {
+    for (const token of highlightLeanLine(line)) {
+      const span = document.createElement("span");
+      if (token.cls) span.className = `ol-lean-project-lean-${token.cls}`;
+      span.textContent = token.text;
+      code.appendChild(span);
+    }
+    if (i < lines.length - 1) code.appendChild(document.createTextNode("\n"));
+  });
   return code;
 }
 

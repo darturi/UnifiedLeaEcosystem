@@ -85,16 +85,24 @@ def _decl_span_and_keyword(text: str, short: str) -> tuple[str | None, str]:
 
 
 def _signature(span_text: str) -> str:
-    """Best-effort one-line statement: the decl header from after its name up to
-    ``:=`` (binders + type), collapsed and capped. ``""`` when nothing usable."""
+    """The decl header from after its name up to ``:=`` (binders + type), as the node's
+    statement. The source's own line breaks are **preserved** so a multi-line signature
+    reads the same here as in the Lean pane; only trailing per-line spaces, blank outer
+    lines, and the gap after the decl name are trimmed. Capped. ``""`` when unusable."""
     if not span_text:
         return ""
     head = span_text.split(":=", 1)[0]
-    head = " ".join(head.split())  # collapse whitespace/newlines
     decl = graph._DECL_RE.match(head)
     if decl:
-        head = head[decl.end():].strip()
-    return head[:_SIGNATURE_CAP].strip()
+        head = head[decl.end():]
+    lines = [line.rstrip() for line in head.splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if lines:
+        lines[0] = lines[0].lstrip()  # drop the space between the decl name and its binders
+    return "\n".join(lines)[:_SIGNATURE_CAP].rstrip()
 
 
 def _strip_lean_comments(text: str) -> str:
