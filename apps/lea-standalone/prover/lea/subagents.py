@@ -161,18 +161,35 @@ def _child_config(parent_config, profile: AgentProfile | None):
             mcp_servers={},
             max_turns=_bounded_child_turns(parent_config.max_turns),
             system_prompt_head=None,
+            max_cost_usd=None,
         )
-    # An explicit profile cap is honored as declared; only an inherited/unlimited cap
-    # is clamped to the runaway ceiling.
-    max_turns = profile.max_turns if profile.max_turns is not None \
-        else _bounded_child_turns(parent_config.max_turns)
+    # D6: merge the user's per-role override (from the Sub-agents page) OVER the role's
+    # YAML defaults — model / max_turns / max_cost / system_prompt / tools. The override
+    # retunes THIS spawn only; the vendored profile is never mutated. Tools still compose
+    # against the parent (item 21), so an override can only TIGHTEN, never escalate.
+    try:
+        override = dict((parent_config.subagent_overrides or {}).get(profile.name) or {})
+    except Exception:  # noqa: BLE001 — a malformed override must not crash the spawn path
+        override = {}
+
+    # An explicit cap (override or profile) is honored as declared; only an
+    # inherited/unlimited cap is clamped to the runaway ceiling.
+    if override.get("max_turns") is not None:
+        max_turns = override["max_turns"]
+    elif profile.max_turns is not None:
+        max_turns = profile.max_turns
+    else:
+        max_turns = _bounded_child_turns(parent_config.max_turns)
+
+    declared_tools = override["tools"] if override.get("tools") else profile.tools
     return dataclasses.replace(
         parent_config,
-        model=profile.model or parent_config.model,
-        tools=compose_child_tools(parent_config, profile.tools),
+        model=override.get("model") or profile.model or parent_config.model,
+        tools=compose_child_tools(parent_config, declared_tools),
         mcp_servers={},
         max_turns=max_turns,
-        system_prompt_head=profile.system_prompt,
+        system_prompt_head=override.get("system_prompt") or profile.system_prompt,
+        max_cost_usd=override.get("max_cost"),
     )
 
 

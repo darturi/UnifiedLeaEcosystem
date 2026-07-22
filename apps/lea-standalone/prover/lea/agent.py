@@ -664,7 +664,11 @@ def _run_events_inner(
             return
 
         turn += 1
-        if config.max_turns and turn > config.max_turns:
+        # D6: a per-run cost cap ends the run the same clean way the turn cap does. Checked
+        # at the turn boundary against the spend so far (a sub-agent's `max_cost` override
+        # flows here via `max_cost_usd`); None → uncapped, so top-level runs are unaffected.
+        cost_capped = config.max_cost_usd is not None and total_cost >= config.max_cost_usd
+        if (config.max_turns and turn > config.max_turns) or cost_capped:
             # Budget exhausted. Don't discard the work with a canned error — spend one
             # final tool-less turn asking the model to summarize its findings + best next
             # step, and return THAT as the result. For a delegated sub-agent this is the
@@ -685,7 +689,10 @@ def _run_events_inner(
                 # materialized sub-agent view carry the findings as the final message.
                 yield AssistantTextDelta(summary)
                 messages.append({"role": "assistant", "content": summary})
-            final_text = summary or "Reached the turn budget without completing the task."
+            final_text = summary or (
+                "Reached the cost budget without completing the task." if cost_capped
+                else "Reached the turn budget without completing the task."
+            )
             yield Finished("max_turns", final_text,
                            turn - 1, session_id, model, total_usage, total_cost, transcript(turn - 1))
             return

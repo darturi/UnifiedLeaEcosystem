@@ -61,7 +61,7 @@ from lea.interface import (
 from .artifacts import classify_lean_artifact
 from .config import LeaConfig
 from .gitstore import GitStore, GitStoreError
-from . import collation, projects, runbroker, runregistry, skills_catalog, store, uploads
+from . import collation, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 
@@ -367,7 +367,15 @@ def _with_subagents(cfg: LeaConfig) -> LeaConfig:
     from lea.registry import build_toolset
 
     default_tools = [schema["name"] for schema in build_toolset(None)[0]]
-    return replace(cfg, tools=[*default_tools, "spawn_subagent"])
+    # D6: carry the user's per-role sub-agent overrides (Sub-agents page) onto the run's
+    # config so the prover's `_child_config` merges them over each role's YAML defaults at
+    # spawn — model / max_turns / max_cost / system_prompt / tools, retuned without touching
+    # the vendored profile. Best-effort: a missing/corrupt overrides file → no overrides.
+    try:
+        overrides = subagent_overrides.load_overrides()
+    except Exception:
+        overrides = {}
+    return replace(cfg, tools=[*default_tools, "spawn_subagent"], subagent_overrides=overrides)
 
 
 def _text_from_content(content: Any) -> str:
