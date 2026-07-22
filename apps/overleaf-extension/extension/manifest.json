@@ -23,7 +23,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs", "leanPaneView.mjs", "editorHookWatchdog.mjs", "eventsClient.mjs"],
+      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs", "leanPaneView.mjs", "blueprintLayout.mjs", "blueprintPaneView.mjs", "editorHookWatchdog.mjs", "eventsClient.mjs"],
       "matches": ["https://www.overleaf.com/*"]
     }
   ],

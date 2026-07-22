@@ -1798,3 +1798,135 @@ body.ol-lean-pane-resizing {
 .ol-lean-editor-hook-warning button:focus-visible {
   background: rgba(184, 132, 42, 0.16);
 }
+
+/* ── Blueprint view (FEATURE-overleaf-blueprint-view) ─────────────────────────
+   The Lean pane's second top-level view: a read-only dependency graph. Class names
+   (bp-*) mirror the standalone's BlueprintGraph so the visual language matches;
+   colors map the standalone's palette onto the pane's --ol-* vars. Unlike the
+   standalone (a wide page, side-by-side), the pane is narrow, so the graph stacks:
+   canvas on top, legend + node detail below. */
+
+.ol-lean-pane-viewtabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--ol-line-2);
+}
+.ol-lean-pane-viewtab {
+  flex: 1;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ol-muted);
+  background: var(--ol-panel-2);
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius-sm);
+  cursor: pointer;
+}
+.ol-lean-pane-viewtab:hover { color: var(--ol-ink-2); }
+.ol-lean-pane-viewtab.is-active {
+  color: var(--ol-accent-ink);
+  background: var(--ol-accent-soft);
+  border-color: var(--ol-accent);
+}
+
+.ol-lean-blueprint-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.ol-lean-pane-action.is-primary {
+  color: #fff;
+  background: var(--ol-accent);
+  border-color: var(--ol-accent);
+  font-weight: 600;
+}
+.ol-lean-pane-action.is-primary:hover { background: var(--ol-accent-ink); border-color: var(--ol-accent-ink); }
+.ol-lean-pane-action:disabled { opacity: 0.6; cursor: default; }
+
+.ol-lean-blueprint-message {
+  border: 1px dashed var(--ol-line);
+  border-radius: var(--ol-radius);
+  padding: 24px 18px;
+  text-align: center;
+  color: var(--ol-ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.ol-lean-blueprint-message.is-error {
+  border-style: solid;
+  border-color: var(--ol-red);
+  color: var(--ol-red-ink);
+}
+.ol-lean-blueprint-message p { margin: 0; }
+
+/* Stacked layout for the narrow pane (overrides the standalone's two-column grid). */
+.ol-lean-project-pane-body .bp-graph {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.bp-graph-canvas {
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
+  background: var(--ol-panel-2);
+  overflow: auto;
+  max-height: 52vh;
+  padding: 10px;
+}
+.bp-graph-side { display: flex; flex-direction: column; gap: 12px; }
+
+/* SVG nodes — fill = status, shape (rect vs ellipse) = kind (set in the renderer). */
+.bp-node-g { cursor: pointer; }
+.bp-node { stroke-width: 1.5; transition: filter .1s ease; }
+.bp-node-g:hover .bp-node { filter: brightness(0.97); }
+.bp-node.is-selected { stroke-width: 3; }
+.bp-node.bp-planned { fill: #faf9f6; stroke: #d4cfc5; }
+.bp-node.bp-stated  { fill: #eaf0f7; stroke: #9fb6d4; }
+.bp-node.bp-ready   { fill: #e7f1ec; stroke: #6aab8a; }
+.bp-node.bp-proved  { fill: var(--ol-green-soft); stroke: var(--ol-green); }
+.bp-node.bp-proved.bp-unaudited { fill: #eef5f0; stroke: #9cc7ad; stroke-dasharray: 4 3; }
+.bp-node.bp-failed  { fill: var(--ol-red-soft); stroke: var(--ol-red); }
+.bp-node-key { text-anchor: middle; font-size: 12.5px; font-weight: 600; fill: var(--ol-ink); pointer-events: none; }
+.bp-node-kind { text-anchor: middle; font-size: 10px; fill: var(--ol-muted); pointer-events: none; }
+.bp-edge { fill: none; stroke: #cdc9c0; stroke-width: 1.5; }
+.bp-arrowhead { fill: #cdc9c0; }
+
+.bp-legend {
+  list-style: none; margin: 0; padding: 12px 14px;
+  border: 1px solid var(--ol-line); border-radius: var(--ol-radius-sm);
+  background: var(--ol-panel); display: flex; flex-direction: column; gap: 7px;
+  font-size: 12px; color: var(--ol-ink-2);
+}
+.bp-legend li { display: flex; align-items: center; gap: 8px; }
+.bp-swatch { width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid; flex: none; }
+.bp-swatch.bp-planned { background: #faf9f6; border-color: #d4cfc5; }
+.bp-swatch.bp-stated  { background: #eaf0f7; border-color: #9fb6d4; }
+.bp-swatch.bp-ready   { background: #e7f1ec; border-color: #6aab8a; }
+.bp-swatch.bp-proved  { background: var(--ol-green-soft); border-color: var(--ol-green); }
+.bp-swatch.bp-proved.bp-unaudited { background: #eef5f0; border-color: #9cc7ad; border-style: dashed; }
+.bp-swatch.bp-failed  { background: var(--ol-red-soft); border-color: var(--ol-red); }
+.bp-legend-shape { color: var(--ol-muted); }
+.bp-legend-note { color: var(--ol-muted); font-size: 11px; }
+.bp-shape-ellipse { width: 18px; height: 12px; border: 1.5px solid var(--ol-muted); border-radius: 50%; flex: none; }
+.bp-shape-box { width: 16px; height: 12px; border: 1.5px solid var(--ol-muted); border-radius: 3px; flex: none; }
+
+.bp-detail { border: 1px solid var(--ol-line); border-radius: var(--ol-radius-sm); background: var(--ol-panel); padding: 14px; }
+.bp-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.bp-detail-key { font-weight: 600; font-size: 13.5px; color: var(--ol-ink); word-break: break-word; }
+.bp-detail-status { font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 99px; border: 1px solid; white-space: nowrap; flex: none; }
+.bp-detail-status.bp-planned { color: var(--ol-muted); border-color: #d4cfc5; background: #faf9f6; }
+.bp-detail-status.bp-stated  { color: #3a5f8a; border-color: #9fb6d4; background: #eaf0f7; }
+.bp-detail-status.bp-ready   { color: #3f7d63; border-color: #6aab8a; background: #e7f1ec; }
+.bp-detail-status.bp-proved  { color: var(--ol-green); border-color: var(--ol-green); background: var(--ol-green-soft); }
+.bp-detail-status.bp-proved.bp-unaudited { color: #4a7d62; border-color: #9cc7ad; background: #eef5f0; }
+.bp-detail-status.bp-failed  { color: var(--ol-red); border-color: var(--ol-red); background: var(--ol-red-soft); }
+.bp-detail-audit { margin: 10px 0 0; font-size: 11.5px; line-height: 1.45; padding: 7px 9px; border-radius: 7px; }
+.bp-detail-audit.is-audited { color: #2f6f4f; background: var(--ol-green-soft); border: 1px solid #bfe0cd; }
+.bp-detail-audit.is-pending { color: #7a6a44; background: #fbf4e6; border: 1px solid #ecdcbb; }
+.bp-detail-meta { margin-top: 6px; font-size: 12px; color: var(--ol-muted); }
+.bp-detail-meta code { font-size: 11px; background: var(--ol-code-bg); padding: 1px 5px; border-radius: 4px; font-family: var(--ol-mono); }
+.bp-detail-stmt { margin: 10px 0 0; font-size: 13px; color: var(--ol-ink-2); line-height: 1.5; }
+.bp-detail-empty { font-size: 12.5px; color: var(--ol-muted); padding: 6px 0; line-height: 1.5; }

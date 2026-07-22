@@ -21,6 +21,7 @@ from lea.interface import check as interface_check
 from ..config import load_config, github_token
 from ..gitstore import GitStore, GitStoreError
 from .. import blueprint as blueprint_doc
+from .. import blueprint_seed
 from .. import filesystem as fs_service
 from .. import graph as graph_service
 from .. import projects as project_service
@@ -223,11 +224,16 @@ def put_memory(project_id: str, request: DocUpdate) -> dict:
 # parsed graph (nodes + derived status) is a separate `/graph` endpoint in T2.
 
 
-@router.get("/api/projects/{project_id}/blueprint")
-def get_blueprint(project_id: str) -> dict:
-    project = _require_project(project_id)
+def _blueprint_payload(project: dict) -> dict:
+    """Raw blueprint markdown + the parser's advisory warnings — shared by the
+    by-id and by-slug GET routes."""
     content = project_service.read_doc(project, _proofs_root(), "blueprint.md")
     return {"content": content, "warnings": blueprint_doc.validate(content)}
+
+
+@router.get("/api/projects/{project_id}/blueprint")
+def get_blueprint(project_id: str) -> dict:
+    return _blueprint_payload(_require_project(project_id))
 
 
 @router.put("/api/projects/{project_id}/blueprint")
@@ -243,6 +249,13 @@ def get_graph(project_id: str) -> dict:
     # attribution (D28/D29). Cheap — reuses stored verdicts, never recompiles.
     project = _require_project(project_id)
     return graph_service.build_graph(project, _proofs_root())
+
+
+@router.post("/api/projects/{project_id}/blueprint/generate")
+def generate_blueprint(project_id: str) -> dict:
+    # Populate the blueprint from formalized artifacts (additive, idempotent).
+    # Writes + commits .lea/blueprint.md; returns {added, skipped, warnings, graph}.
+    return blueprint_seed.generate(_require_project(project_id), _proofs_root())
 
 
 # ── Filesystem: tree / read / edit / export the project repo (U1/U2, D34) ─────────
@@ -448,6 +461,30 @@ def get_share_status_by_slug(slug: str) -> dict:
         "remote_url": project.get("remote_url"),
         "token_configured": bool(github_token()),
     }
+
+
+# ── Blueprint / graph by slug: the Overleaf companion's read-only view ────────────
+# The companion resolves the project by the slug it derives from the Overleaf
+# document, so the blueprint viewer in the Lean pane reads through these. Same
+# derivation as the by-id routes (`_blueprint_payload` / `build_graph`); like every
+# other by-slug route they NEVER create a project — an unknown slug is a plain 404.
+
+
+@router.get("/api/projects/by-slug/{slug}/blueprint")
+def get_blueprint_by_slug(slug: str) -> dict:
+    return _blueprint_payload(_require_project_by_slug(slug))
+
+
+@router.get("/api/projects/by-slug/{slug}/graph")
+def get_graph_by_slug(slug: str) -> dict:
+    return graph_service.build_graph(_require_project_by_slug(slug), _proofs_root())
+
+
+@router.post("/api/projects/by-slug/{slug}/blueprint/generate")
+def generate_blueprint_by_slug(slug: str) -> dict:
+    # The Overleaf "Generate from formalized theorems" button lands here (slug-resolved,
+    # never creates a project). Same additive synthesis as the by-id route.
+    return blueprint_seed.generate(_require_project_by_slug(slug), _proofs_root())
 
 
 def _ensure_artifacts_backfilled(project: dict) -> None:

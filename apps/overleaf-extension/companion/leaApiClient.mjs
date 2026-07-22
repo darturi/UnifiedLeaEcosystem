@@ -164,6 +164,37 @@ export function fetchProjectArtifactsBySlug({ fetchImpl, baseUrl, slug }) {
   });
 }
 
+// Blueprint dependency graph with live-derived status (FEATURE-overleaf-blueprint-view):
+// the parsed `.lea/blueprint.md` nodes + `uses` edges, each node enriched with its
+// status/verified/session attribution. The read-only viewer in the Lean pane reads this.
+export function fetchProjectGraphBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/graph`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+// Raw blueprint markdown + the parser's advisory warnings (dangling edges, missing
+// kind, ...). Optional companion of the graph; the viewer uses it only if it renders
+// the warnings banner.
+export function fetchProjectBlueprintBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/blueprint`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+// Populate the blueprint from the project's formalized artifacts (the "Generate from
+// formalized theorems" button). Additive + idempotent on the adapter side. Returns
+// { added, skipped, warnings, graph }.
+export function generateProjectBlueprintBySlug({ fetchImpl, baseUrl, slug }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/blueprint/generate`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: "{}",
+  });
+}
+
 // Ledger-side target evidence (PLAN-system-hardening 4.4): per-declaration
 // file existence / sorry scan / newest check verdict, straight from the
 // adapter's own records. One of the two sources the ledger status engine

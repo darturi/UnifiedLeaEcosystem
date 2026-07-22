@@ -23,6 +23,8 @@ import {
   handleProjectIdentityPreview,
   handleProjectIdentityUpdate,
   handleProjectExport,
+  handleProjectGraph,
+  handleProjectBlueprintGenerate,
   handleShareSetRemote,
   handleShareStatus,
   handleSharePush,
@@ -4416,6 +4418,76 @@ test("share status maps the adapter's by-slug payload and treats 404 as 'no proj
   const missing = await handleShareStatus({}, emptyState);
   assert.equal(missing.statusCode, 400);
   assert.equal(missing.body.error, "missing_project_id");
+});
+
+test("project graph passes the by-slug nodes/edges through and treats 404 as an empty graph", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const graph = {
+    nodes: [{ key: "helper", kind: "lemma", status: "proved", uses: [] }],
+    edges: [{ from: "helper", to: "base" }]
+  };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(calls, { "/graph": { status: 200, json: graph } })
+  });
+
+  const res = await handleProjectGraph({ overleafProjectId: "Doc 1" }, state);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body, { ok: true, exists: true, nodes: graph.nodes, edges: graph.edges });
+  assert.ok(calls.some((c) => c.url.includes(`/api/projects/by-slug/${slugProjectId("Doc 1")}/graph`)));
+
+  // 404 (never-formalized document) → a calm empty graph, so the pane shows its empty state.
+  const emptyState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], { "/graph": { status: 404, json: { detail: "No Lea project exists for this document yet." } } })
+  });
+  const empty = await handleProjectGraph({ overleafProjectId: "Doc 1" }, emptyState);
+  assert.equal(empty.statusCode, 200);
+  assert.deepEqual(empty.body, { ok: true, exists: false, nodes: [], edges: [] });
+
+  // A real adapter failure (not 404) surfaces as an error.
+  const brokenState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], { "/graph": { status: 502, json: { detail: "boom" } } })
+  });
+  const broken = await handleProjectGraph({ overleafProjectId: "Doc 1" }, brokenState);
+  assert.equal(broken.statusCode, 502);
+  assert.equal(broken.body.error, "graph_fetch_failed");
+
+  // Missing project id → 400 before any adapter call.
+  const noId = await handleProjectGraph({}, emptyState);
+  assert.equal(noId.statusCode, 400);
+  assert.equal(noId.body.error, "missing_project_id");
+});
+
+test("blueprint generate returns the added count + fresh graph, treating 404 as no-project", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapterBody = {
+    added: 2, skipped: 1, warnings: [],
+    graph: { nodes: [{ key: "a", kind: "lemma", status: "proved", uses: [] }], edges: [] },
+  };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch(calls, { "/blueprint/generate": { status: 200, json: adapterBody } }),
+  });
+
+  const res = await handleProjectBlueprintGenerate({ overleafProjectId: "Doc 1" }, state);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.added, 2);
+  assert.equal(res.body.skipped, 1);
+  assert.deepEqual(res.body.nodes, adapterBody.graph.nodes);
+  assert.ok(calls.some((c) => c.method === "POST" && c.url.includes(`/api/projects/by-slug/${slugProjectId("Doc 1")}/blueprint/generate`)));
+
+  // 404 → benign "no project yet", nothing generated.
+  const emptyState = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeShareFetch([], { "/blueprint/generate": { status: 404, json: { detail: "No Lea project exists for this document yet." } } }),
+  });
+  const empty = await handleProjectBlueprintGenerate({ overleafProjectId: "Doc 1" }, emptyState);
+  assert.equal(empty.statusCode, 200);
+  assert.deepEqual(empty.body, { ok: true, exists: false, added: 0, skipped: 0, nodes: [], edges: [] });
 });
 
 test("set remote forwards to the by-slug route and surfaces the adapter's detail on rejection", async () => {

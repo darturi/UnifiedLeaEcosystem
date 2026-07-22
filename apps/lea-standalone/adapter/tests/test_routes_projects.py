@@ -584,12 +584,117 @@ def test_by_slug_never_creates_a_project(tmp_path, monkeypatch):
         lambda: projects_route.export_project_by_slug("no-such-doc"),
         lambda: projects_route.set_project_remote_by_slug("no-such-doc", RemoteUpdate(remote_url="https://github.com/a/b")),
         lambda: projects_route.push_project_by_slug("no-such-doc"),
+        lambda: projects_route.get_blueprint_by_slug("no-such-doc"),
+        lambda: projects_route.get_graph_by_slug("no-such-doc"),
         lambda: projects_route.export_project_by_slug("Bad Slug!!"),  # malformed ≡ missing
     ):
         with pytest.raises(HTTPException) as exc:
             call()
         assert exc.value.status_code == 404
     assert store.list_projects() == []  # nothing was created as a side effect
+
+
+def test_blueprint_by_slug_matches_by_id_and_returns_warnings(tmp_path, monkeypatch):
+    """The companion's read-only blueprint fetch: same payload as the by-id route,
+    warnings included (a dangling `uses` edge)."""
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Doc One"))
+    pid, slug = project["id"], project["slug"]
+
+    bad = "## a\n- kind: lemma\n- uses: ghost\n\nstatement\n"
+    projects_route.put_blueprint(pid, DocUpdate(content=bad))
+
+    by_slug = projects_route.get_blueprint_by_slug(slug)
+    assert by_slug == projects_route.get_blueprint(pid)  # same derivation, slug-resolved
+    assert any("ghost" in w["message"] for w in by_slug["warnings"])
+
+
+def test_graph_by_slug_matches_by_id_and_derives_status(tmp_path, monkeypatch):
+    """GET graph-by-slug parses the blueprint and derives node status from the
+    stored verdict — identical to the by-id route for the same project."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid, slug = project["id"], project["slug"]
+    repo = proofs / "Lea" / "Analysis"
+
+    (repo / "helper.lean").write_text(
+        "import Mathlib\nnamespace Lea.Analysis\nlemma helper : True := trivial\nend Lea.Analysis\n"
+    )
+    projects_route.put_blueprint(
+        pid, DocUpdate(content="## helper\n- kind: lemma\n- lean: `Lea.Analysis.helper`\n\nA helper.\n")
+    )
+    sess = store.create_session("w", project_id=pid)["id"]
+    store.add_code_step(sess, None, "helper.lean", commit_sha="a" * 40, check_status="ok")
+
+    by_slug = projects_route.get_graph_by_slug(slug)
+    assert by_slug == projects_route.get_graph(pid)  # slug-resolved, same graph
+    node = by_slug["nodes"][0]
+    assert node["key"] == "helper"
+    assert node["status"] == "proved"
+    assert node["last_modified_by"] == sess
+
+
+def _record_artifact(project_id, session_id, name, kind, path):
+    run = store.create_run(session_id, "m", None, 3, project_id=project_id)
+    store.upsert_artifact(
+        project_id=project_id, session_id=session_id, run_id=run["id"],
+        declaration_name=name, kind=kind, path=path, module_name=None,
+    )
+
+
+def test_generate_blueprint_synthesizes_nodes_edges_and_is_idempotent(tmp_path, monkeypatch):
+    """Populate the blueprint from formalized artifacts: one node per recorded decl,
+    kind from the Lean keyword, `uses` edges from decl references — additive + idempotent."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    pid = project["id"]
+    repo = proofs / "Lea" / "Analysis"
+    session = store.create_session("prove", project_id=pid)["id"]
+
+    # A definition and a lemma that uses it, each recorded as an artifact.
+    (repo / "base.lean").write_text(
+        "import Mathlib\nnamespace Lea.Analysis\ndef base : Nat := 0\nend Lea.Analysis\n"
+    )
+    (repo / "uses_base.lean").write_text(
+        "import Mathlib\nnamespace Lea.Analysis\ntheorem uses_base : base = base := rfl\nend Lea.Analysis\n"
+    )
+    _record_artifact(pid, session, "Lea.Analysis.base", "definition", "base.lean")
+    _record_artifact(pid, session, "Lea.Analysis.uses_base", "proof", "uses_base.lean")
+
+    result = projects_route.generate_blueprint(pid)
+    assert result["added"] == 2 and result["skipped"] == 0
+
+    nodes = {n["key"]: n for n in result["graph"]["nodes"]}
+    assert nodes["base"]["kind"] == "definition"
+    assert nodes["uses_base"]["kind"] == "theorem"          # from the Lean keyword
+    assert "base" in nodes["uses_base"]["uses"]             # derived edge
+    assert {"from": "uses_base", "to": "base"} in result["graph"]["edges"]
+
+    # Idempotent: a second run adds nothing and preserves the existing nodes.
+    again = projects_route.generate_blueprint(pid)
+    assert again["added"] == 0 and again["skipped"] == 2
+    assert len(again["graph"]["nodes"]) == 2
+
+
+def test_generate_blueprint_by_slug_and_404(tmp_path, monkeypatch):
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Doc One"))
+    slug = project["slug"]
+    repo = proofs / "Lea" / "DocOne"
+    session = store.create_session("prove", project_id=project["id"])["id"]
+    (repo / "thm.lean").write_text(
+        "import Mathlib\nnamespace Lea.DocOne\nlemma thm : True := trivial\nend Lea.DocOne\n"
+    )
+    _record_artifact(project["id"], session, "Lea.DocOne.thm", "proof", "thm.lean")
+
+    result = projects_route.generate_blueprint_by_slug(slug)
+    assert result["added"] == 1
+    assert result["graph"]["nodes"][0]["key"] == "thm"
+    assert result["graph"]["nodes"][0]["kind"] == "lemma"
+
+    with pytest.raises(HTTPException) as exc:
+        projects_route.generate_blueprint_by_slug("no-such-doc")
+    assert exc.value.status_code == 404
 
 
 def test_artifacts_by_slug_returns_recorded_rows_and_404s_unknown(tmp_path, monkeypatch):

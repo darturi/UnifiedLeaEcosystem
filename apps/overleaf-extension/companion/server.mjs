@@ -59,6 +59,8 @@ import {
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
   fetchProjectArtifactsBySlug,
+  fetchProjectGraphBySlug,
+  generateProjectBlueprintBySlug,
   fetchProjectTargetStatusBySlug,
   restoreProjectArtifactBySlug,
   retireProjectArtifactBySlug,
@@ -710,6 +712,59 @@ export async function handleShareStatus(payload, state) {
       remoteUrl: result.body?.remote_url || null,
       tokenConfigured: Boolean(result.body?.token_configured)
     }
+  };
+}
+
+// Read-only blueprint graph for the Lean pane's Blueprint view
+// (FEATURE-overleaf-blueprint-view). Resolves the project by slug like the share
+// handlers; a 404 (no Lea project for this document yet) is a benign empty graph,
+// not an error, so the pane shows its empty state rather than a failure.
+export async function handleProjectGraph(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const result = await fetchProjectGraphBySlug(target);
+  if (!result.ok) {
+    if (result.status === 404) {
+      return { statusCode: 200, body: { ok: true, exists: false, nodes: [], edges: [] } };
+    }
+    return errorResponse(result.status || 502, "graph_fetch_failed", adapterDetail(result, "Could not reach the Lea adapter."));
+  }
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      exists: true,
+      nodes: Array.isArray(result.body?.nodes) ? result.body.nodes : [],
+      edges: Array.isArray(result.body?.edges) ? result.body.edges : []
+    }
+  };
+}
+
+// Populate the blueprint from formalized artifacts (the pane's "Generate from
+// formalized theorems" button). Resolves by slug like the graph handler; a 404 (no
+// project yet) is a benign "nothing to generate from" rather than an error.
+export async function handleProjectBlueprintGenerate(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const result = await generateProjectBlueprintBySlug(target);
+  if (!result.ok) {
+    if (result.status === 404) {
+      return { statusCode: 200, body: { ok: true, exists: false, added: 0, skipped: 0, nodes: [], edges: [] } };
+    }
+    return errorResponse(result.status || 502, "blueprint_generate_failed", adapterDetail(result, "Could not reach the Lea adapter."));
+  }
+  const graph = result.body?.graph || {};
+  return {
+    statusCode: 200,
+    body: {
+      ok: true,
+      exists: true,
+      added: Number(result.body?.added || 0),
+      skipped: Number(result.body?.skipped || 0),
+      warnings: Array.isArray(result.body?.warnings) ? result.body.warnings : [],
+      nodes: Array.isArray(graph.nodes) ? graph.nodes : [],
+      edges: Array.isArray(graph.edges) ? graph.edges : [],
+    },
   };
 }
 
@@ -3141,6 +3196,20 @@ async function routeRequest(request, response, state) {
     const result = await handleProjectIdentity({
       overleafProjectId: url.searchParams.get("overleafProjectId") || ""
     }, state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/project/graph") {
+    const result = await handleProjectGraph({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || ""
+    }, state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/project/blueprint/generate") {
+    const result = await handleProjectBlueprintGenerate(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
     return;
   }

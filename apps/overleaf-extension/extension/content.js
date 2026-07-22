@@ -101,6 +101,17 @@
   let leanPaneChatOptimistic = [];
   let leanPaneChatPollTimer = null;
   let leanPaneChatToken = 0;
+  // Blueprint view (FEATURE-overleaf-blueprint-view): the Lean pane has two top-level
+  // views over the same project — the document-driven "Items" tree (default) and the
+  // read-only "Blueprint" dependency graph. `leanPaneBlueprintView` is the lazily
+  // imported renderer; the graph + selection are cached so a node click re-renders
+  // without a refetch. All reset on pane open/close.
+  let leanPaneMainView = "items"; // "items" | "blueprint"
+  let leanPaneBlueprintView = null;
+  let leanPaneBlueprintToggle = null; // { items, blueprint } header buttons
+  let leanPaneBlueprintGraph = null; // last fetched { nodes, edges, exists }
+  let leanPaneBlueprintSelectedKey = null;
+  let leanPaneBlueprintGenerateBtn = null; // the "Generate…" button, for the in-flight disable
   // Consecutive transient poll failures (AUDIT M2): a thrown fetch used to stop
   // polling entirely, freezing the panel on "Lea is working…". We now retry
   // with backoff up to this cap before giving up and surfacing the error.
@@ -277,6 +288,10 @@
   function showLeanPane({ deferRefresh = false, preservePopover = false } = {}) {
     if (!preservePopover) closePopover();
     if (leanPane) return;
+    // Fresh pane always opens on the Items view with no blueprint selection.
+    leanPaneMainView = "items";
+    leanPaneBlueprintGraph = null;
+    leanPaneBlueprintSelectedKey = null;
     leanPane = document.createElement("aside");
     leanPane.className = "ol-lean-project-pane";
     leanPane.setAttribute("role", "complementary");
@@ -359,6 +374,8 @@
     header.appendChild(titleWrap);
     header.appendChild(controls);
 
+    const viewTabs = buildLeanPaneViewTabs();
+
     leanPaneStatus = document.createElement("p");
     leanPaneStatus.className = "ol-lean-project-pane-status";
     leanPaneBody = document.createElement("div");
@@ -366,6 +383,7 @@
 
     leanPane.appendChild(resizer);
     leanPane.appendChild(header);
+    leanPane.appendChild(viewTabs);
     leanPane.appendChild(leanPaneStatus);
     leanPane.appendChild(leanPaneBody);
     document.body.appendChild(leanPane);
@@ -397,6 +415,11 @@
     leanPaneProjectNamespace = null;
     leanPaneExpandedTreeNodeIds = new Set();
     leanPaneTreeDefaultsKey = "";
+    leanPaneMainView = "items";
+    leanPaneBlueprintToggle = null;
+    leanPaneBlueprintGraph = null;
+    leanPaneBlueprintSelectedKey = null;
+    leanPaneBlueprintGenerateBtn = null;
   }
 
   function hydrateLeanPaneWidthFromStorage() {
@@ -729,6 +752,243 @@
     return leanPaneView;
   }
 
+  // Lazily load the blueprint graph renderer (imports the shared, mirrored
+  // blueprintLayout.mjs). Only pulled in the first time the Blueprint tab is opened.
+  async function ensureBlueprintPaneView() {
+    if (leanPaneBlueprintView) return leanPaneBlueprintView;
+    leanPaneBlueprintView = await import(chrome.runtime.getURL("blueprintPaneView.mjs"));
+    return leanPaneBlueprintView;
+  }
+
+  // The Items | Blueprint segmented control in the pane header.
+  function buildLeanPaneViewTabs() {
+    const tabs = document.createElement("div");
+    tabs.className = "ol-lean-pane-viewtabs";
+    tabs.setAttribute("role", "tablist");
+    const make = (view, label) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ol-lean-pane-viewtab";
+      button.textContent = label;
+      button.setAttribute("role", "tab");
+      button.addEventListener("click", () => {
+        setLeanPaneMainView(view).catch(renderLeanPaneError);
+      });
+      return button;
+    };
+    const items = make("items", "Items");
+    const blueprint = make("blueprint", "Blueprint");
+    tabs.appendChild(items);
+    tabs.appendChild(blueprint);
+    leanPaneBlueprintToggle = { items, blueprint };
+    updateLeanPaneViewTabs();
+    return tabs;
+  }
+
+  function updateLeanPaneViewTabs() {
+    if (!leanPaneBlueprintToggle) return;
+    for (const [view, button] of Object.entries(leanPaneBlueprintToggle)) {
+      const active = leanPaneMainView === view;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", active ? "true" : "false");
+    }
+  }
+
+  // Switch the pane's top-level view. Items re-renders from the cached manifest when
+  // one exists (no refetch); Blueprint fetches + renders its graph.
+  async function setLeanPaneMainView(view) {
+    if (view === leanPaneMainView || !leanPane) return;
+    leanPaneMainView = view;
+    updateLeanPaneViewTabs();
+    if (view === "blueprint") {
+      closeLeanPaneChat();
+      closeActiveOverflowMenu();
+      await renderLeanPaneBlueprint({});
+      return;
+    }
+    // Back to Items: cheap re-render from cache, else a fresh refresh.
+    if (lastLeanPaneManifest) {
+      renderLeanPaneManifest(lastLeanPaneManifest);
+      scheduleLeanPanePollIfNeeded(lastLeanPaneManifest);
+    } else {
+      await refreshLeanPaneNow({ forceFetch: false });
+    }
+  }
+
+  // Fetch the project's blueprint graph from the companion and render it (or the
+  // appropriate empty/error state). Guards against a view switch mid-fetch.
+  async function renderLeanPaneBlueprint({ background = false } = {}) {
+    if (!leanPane || !leanPaneBody || !leanPaneStatus) return;
+    if (leanPaneMainView !== "blueprint") return;
+    await ensureBlueprintPaneView();
+    if (!background) {
+      leanPaneStatus.textContent = "Loading blueprint…";
+      leanPaneBody.replaceChildren();
+    }
+
+    const projectId = extractOverleafProjectId();
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    try {
+      const identity = await loadProjectIdentity({ baseUrl, projectId });
+      lastProjectIdentity = identity;
+      renderLeanPaneProjectIdentity(identity);
+    } catch {}
+
+    let payload;
+    try {
+      const response = await fetch(
+        `${baseUrl}/project/graph?overleafProjectId=${encodeURIComponent(projectId)}`,
+      );
+      payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      }
+    } catch (error) {
+      if (leanPaneMainView !== "blueprint" || !leanPaneBody) return;
+      leanPaneStatus.textContent = "Blueprint unavailable.";
+      leanPaneBody.replaceChildren(buildBlueprintToolbar(), buildBlueprintMessage(errorText(error), "error"));
+      return;
+    }
+
+    if (leanPaneMainView !== "blueprint") return; // toggled away mid-fetch
+    leanPaneBlueprintGraph = payload;
+    renderBlueprintBody(payload);
+  }
+
+  // Render the cached graph payload into the body: no-project / empty / populated.
+  // Always leads with the Refresh + Generate toolbar. Called on fetch and on every
+  // node-selection change (cheap, self-contained).
+  function renderBlueprintBody(payload) {
+    if (!leanPaneBody || !leanPaneStatus || leanPaneMainView !== "blueprint") return;
+    const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+    const edges = Array.isArray(payload?.edges) ? payload.edges : [];
+    const prevScrollTop = leanPaneBody.scrollTop;
+    leanPaneBody.replaceChildren(buildBlueprintToolbar());
+
+    if (payload && payload.exists === false) {
+      leanPaneStatus.textContent = "No Lea project yet.";
+      leanPaneBody.appendChild(
+        buildBlueprintMessage(
+          "No Lea project for this document yet — formalize a theorem to start one.",
+          "empty",
+        ),
+      );
+      return;
+    }
+    if (nodes.length === 0) {
+      leanPaneStatus.textContent = "Blueprint is empty.";
+      leanPaneBody.appendChild(
+        buildBlueprintMessage(
+          "No blueprint nodes yet. Click “Generate from formalized theorems” above to build a starter graph from what you've formalized — or add nodes in the Lea UI.",
+          "empty",
+        ),
+      );
+      return;
+    }
+
+    leanPaneStatus.textContent = `${nodes.length} blueprint node${nodes.length === 1 ? "" : "s"}.`;
+    const element = leanPaneBlueprintView.renderBlueprintView(
+      { nodes, edges },
+      {
+        selectedKey: leanPaneBlueprintSelectedKey,
+        onSelectNode: (key) => {
+          leanPaneBlueprintSelectedKey = key;
+          renderBlueprintBody(leanPaneBlueprintGraph);
+        },
+      },
+    );
+    leanPaneBody.appendChild(element);
+    leanPaneBody.scrollTop = prevScrollTop;
+  }
+
+  // The blueprint body's action row: Refresh (re-fetch the graph) + Generate
+  // (populate .lea/blueprint.md from formalized artifacts). Present in every state.
+  function buildBlueprintToolbar() {
+    const bar = document.createElement("div");
+    bar.className = "ol-lean-blueprint-toolbar";
+
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "ol-lean-pane-action";
+    refresh.textContent = "Refresh";
+    refresh.title = "Re-fetch the blueprint graph";
+    refresh.addEventListener("click", () => {
+      renderLeanPaneBlueprint({}).catch(renderLeanPaneError);
+    });
+
+    const generate = document.createElement("button");
+    generate.type = "button";
+    generate.className = "ol-lean-pane-action is-primary";
+    generate.textContent = "Generate from formalized theorems";
+    generate.title = "Add a blueprint node for each formalized theorem (safe to re-run)";
+    generate.addEventListener("click", () => {
+      generateBlueprint().catch(renderLeanPaneError);
+    });
+    leanPaneBlueprintGenerateBtn = generate;
+
+    bar.appendChild(refresh);
+    bar.appendChild(generate);
+    return bar;
+  }
+
+  // POST the generate request, then render the returned graph and report what changed.
+  async function generateBlueprint() {
+    if (!leanPane || !leanPaneBody || !leanPaneStatus || leanPaneMainView !== "blueprint") return;
+    if (leanPaneBlueprintGenerateBtn) {
+      leanPaneBlueprintGenerateBtn.disabled = true;
+      leanPaneBlueprintGenerateBtn.textContent = "Generating…";
+    }
+    leanPaneStatus.textContent = "Generating blueprint from formalized theorems…";
+
+    const projectId = extractOverleafProjectId();
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    let payload;
+    try {
+      const response = await fetch(`${baseUrl}/project/blueprint/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overleafProjectId: projectId }),
+      });
+      payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      }
+    } catch (error) {
+      if (leanPaneMainView !== "blueprint" || !leanPaneBody) return;
+      leanPaneStatus.textContent = "Blueprint unavailable.";
+      leanPaneBody.replaceChildren(buildBlueprintToolbar(), buildBlueprintMessage(errorText(error), "error"));
+      return;
+    }
+
+    if (leanPaneMainView !== "blueprint") return;
+    leanPaneBlueprintGraph = payload;
+    leanPaneBlueprintSelectedKey = null;
+    renderBlueprintBody(payload); // rebuilds the toolbar (button re-enabled) + graph
+
+    // Overlay a result message over the node count renderBlueprintBody just set.
+    if (payload.exists === false) {
+      leanPaneStatus.textContent = "No Lea project for this document yet.";
+    } else if (payload.added > 0) {
+      leanPaneStatus.textContent = `Added ${payload.added} node${payload.added === 1 ? "" : "s"} from formalized theorems.`;
+    } else if (Array.isArray(payload.nodes) && payload.nodes.length > 0) {
+      leanPaneStatus.textContent = "Blueprint already covers your formalized theorems.";
+    } else {
+      leanPaneStatus.textContent = "No formalized theorems to generate from yet.";
+    }
+  }
+
+  // A centered message block for the blueprint's empty / error states.
+  function buildBlueprintMessage(text, kind) {
+    const wrap = document.createElement("div");
+    wrap.className = `ol-lean-blueprint-message${kind ? ` is-${kind}` : ""}`;
+    const line = document.createElement("p");
+    line.textContent = text;
+    wrap.appendChild(line);
+    return wrap;
+  }
+
   // Edits to the open document re-render the pane from the cached file set with the
   // live buffer overlaid — a cheap, no-blink background refresh (no project download).
   function scheduleLeanPaneRefresh() {
@@ -746,6 +1006,13 @@
     leanPaneRefreshTimer = null;
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = null;
+    // Blueprint view has its own (Items-independent) fetch + render — no file
+    // archive, manifest, or in-progress poll. The header refresh button and the
+    // edit-driven background refresh both land here.
+    if (leanPaneMainView === "blueprint") {
+      await renderLeanPaneBlueprint({ background });
+      return;
+    }
     await ensureLeanPaneView();
     if (!background) {
       leanPaneStatus.textContent = "Loading project inventory...";
