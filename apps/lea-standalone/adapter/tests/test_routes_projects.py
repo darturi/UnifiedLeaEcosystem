@@ -702,6 +702,42 @@ def test_generate_blueprint_backfills_pre_index_artifacts(tmp_path, monkeypatch)
     assert result["graph"]["nodes"][0]["key"] == "old"
 
 
+def test_generate_blueprint_edge_derivation_ignores_comments_and_ambiguous_shorts(tmp_path, monkeypatch):
+    """Edges come from real references only: a name mentioned in a comment yields no
+    edge, and a short name shared by two decls is too ambiguous to edge (skipped)."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Edges"))
+    pid = project["id"]
+    repo = proofs / "Lea" / "Edges"
+    session = store.create_session("prove", project_id=pid)["id"]
+
+    (repo / "base.lean").write_text(
+        "import Mathlib\nnamespace Lea.Edges\nlemma base : True := trivial\nend Lea.Edges\n"
+    )
+    # References `base` only in a comment — must NOT create an edge.
+    (repo / "commented.lean").write_text(
+        "import Mathlib\nnamespace Lea.Edges\n-- like base but standalone\nlemma commented : True := trivial\nend Lea.Edges\n"
+    )
+    # Two decls share the short name `dup` (different namespaces) — ambiguous.
+    (repo / "dup_a.lean").write_text(
+        "import Mathlib\nnamespace Lea.Edges.A\nlemma dup : True := trivial\nend Lea.Edges.A\n"
+    )
+    (repo / "cites_dup.lean").write_text(
+        "import Mathlib\nnamespace Lea.Edges\ntheorem cites_dup : True := by have := dup; trivial\nend Lea.Edges\n"
+    )
+    for name, path in [
+        ("Lea.Edges.base", "base.lean"), ("Lea.Edges.commented", "commented.lean"),
+        ("Lea.Edges.A.dup", "dup_a.lean"), ("Lea.Edges.B.dup", "dup_a.lean"),
+        ("Lea.Edges.cites_dup", "cites_dup.lean"),
+    ]:
+        _record_artifact(pid, session, name, "proof", path)
+
+    result = projects_route.generate_blueprint(pid)
+    nodes = {n["key"]: n for n in result["graph"]["nodes"]}
+    assert nodes["commented"]["uses"] == []                       # comment ref → no edge
+    assert all(u not in ("dup", "dup_2") for u in nodes["cites_dup"]["uses"])  # ambiguous short → skipped
+
+
 def test_generate_blueprint_closes_dangling_fence_before_appending(tmp_path, monkeypatch):
     """An unclosed ``` fence in blueprint.md must not swallow the appended nodes — the
     node stays a real section, so a second run is still idempotent."""

@@ -174,16 +174,6 @@ export function fetchProjectGraphBySlug({ fetchImpl, baseUrl, slug }) {
   });
 }
 
-// Raw blueprint markdown + the parser's advisory warnings (dangling edges, missing
-// kind, ...). Optional companion of the graph; the viewer uses it only if it renders
-// the warnings banner.
-export function fetchProjectBlueprintBySlug({ fetchImpl, baseUrl, slug }) {
-  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/blueprint`, {
-    method: "GET",
-    headers: buildHeaders(null),
-  });
-}
-
 // Populate the blueprint from the project's formalized artifacts (the "Generate from
 // formalized theorems" button). Additive + idempotent on the adapter side. Returns
 // { added, skipped, warnings, graph }.

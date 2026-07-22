@@ -43,7 +43,9 @@ function el(tag, className, text) {
 }
 
 // The SVG canvas: edges first (so nodes paint on top), then one <g> per node.
-function buildSvg(graph, layout, selectedKey, onSelectNode) {
+// `shapeByKey` is filled with each node's shape element so selection can be toggled
+// in place (no full rebuild); a node click calls `onNodeClick(key)`.
+function buildSvg(graph, layout, selectedKey, onNodeClick, shapeByKey) {
   const svg = svgEl("svg", {
     width: layout.width,
     height: layout.height,
@@ -91,15 +93,13 @@ function buildSvg(graph, layout, selectedKey, onSelectNode) {
     const cls = `bp-node ${statusClass(n)}${selectedKey === key ? " is-selected" : ""}`;
 
     const g = svgEl("g", { class: "bp-node-g", transform: `translate(${placed.x},${placed.y})` });
-    g.addEventListener("click", () => onSelectNode(selectedKey === key ? null : key));
+    g.addEventListener("click", () => onNodeClick(key));
 
-    if (isDef) {
-      g.appendChild(svgEl("rect", { class: cls, width: NODE_W, height: NODE_H, rx: 7 }));
-    } else {
-      g.appendChild(
-        svgEl("ellipse", { class: cls, cx: NODE_W / 2, cy: NODE_H / 2, rx: NODE_W / 2, ry: NODE_H / 2 }),
-      );
-    }
+    const shape = isDef
+      ? svgEl("rect", { class: cls, width: NODE_W, height: NODE_H, rx: 7 })
+      : svgEl("ellipse", { class: cls, cx: NODE_W / 2, cy: NODE_H / 2, rx: NODE_W / 2, ry: NODE_H / 2 });
+    shapeByKey.set(key, shape);
+    g.appendChild(shape);
 
     const keyText = svgEl("text", { class: "bp-node-key", x: NODE_W / 2, y: NODE_H / 2 - 3 });
     keyText.textContent = truncate(n.key);
@@ -185,30 +185,46 @@ function buildDetail(node) {
 }
 
 // Render the populated graph into a fresh `.bp-graph` element (caller appends it).
-// `selectedKey` is the caller-owned selection; `onSelectNode(keyOrNull)` fires on a
-// node click so the caller can update selection state and re-render. Empty / loading
-// / error states are the caller's job (they never reach here).
+// Selection is handled *in place*: the SVG is built once, and a node click only
+// toggles the `is-selected` class on the two affected shapes and swaps the detail
+// panel — no relayout/rebuild. `selectedKey` seeds the initial selection;
+// `onSelectNode(keyOrNull)` fires on each change so the caller can persist it across
+// full refreshes. Empty / loading / error states are the caller's job.
 export function renderBlueprintView(graph, { selectedKey = null, onSelectNode = () => {} } = {}) {
   const layout = computeLayout(graph);
+  const nodeByKey = new Map(graph.nodes.map((n) => [n.key, n]));
 
   const root = el("div", "bp-graph");
 
+  let selected = nodeByKey.has(selectedKey) ? selectedKey : null;
+  const shapeByKey = new Map();
+
   const canvas = el("div", "bp-graph-canvas");
-  canvas.appendChild(buildSvg(graph, layout, selectedKey, onSelectNode));
+  canvas.appendChild(buildSvg(graph, layout, selected, onNodeClick, shapeByKey));
   root.appendChild(canvas);
 
   const side = el("div", "bp-graph-side");
   side.appendChild(buildLegend());
-
-  const selectedNode = selectedKey ? graph.nodes.find((n) => n.key === selectedKey) : null;
-  if (selectedNode) {
-    side.appendChild(buildDetail(selectedNode));
-  } else {
-    side.appendChild(
-      el("div", "bp-detail-empty", "Click a node to see its statement and status."),
-    );
-  }
+  const detailHost = el("div", "bp-detail-host");
+  side.appendChild(detailHost);
   root.appendChild(side);
 
+  function renderDetail() {
+    const node = selected ? nodeByKey.get(selected) : null;
+    detailHost.replaceChildren(
+      node ? buildDetail(node) : el("div", "bp-detail-empty", "Click a node to see its statement and status."),
+    );
+  }
+
+  function onNodeClick(key) {
+    const next = selected === key ? null : key;
+    shapeByKey.get(selected)?.classList.remove("is-selected");
+    shapeByKey.get(next)?.classList.add("is-selected");
+    selected = next;
+    renderDetail();
+    onSelectNode(selected);
+  }
+
+  renderDetail();
   return root;
 }

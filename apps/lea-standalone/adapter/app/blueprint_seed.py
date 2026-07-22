@@ -97,6 +97,39 @@ def _signature(span_text: str) -> str:
     return head[:_SIGNATURE_CAP].strip()
 
 
+def _strip_lean_comments(text: str) -> str:
+    """Remove Lean comments — ``--`` to end of line and (nesting) ``/- … -/`` blocks —
+    so decl references used for edge derivation aren't matched inside a comment. Best
+    effort: it doesn't model string literals (a decl name inside a string is rare in
+    proof terms and low-risk)."""
+    out: list[str] = []
+    i, n, depth = 0, len(text), 0
+    while i < n:
+        pair = text[i:i + 2]
+        if depth:
+            if pair == "/-":
+                depth += 1
+                i += 2
+            elif pair == "-/":
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+            continue
+        if pair == "/-":
+            depth += 1
+            i += 2
+        elif pair == "--":
+            nl = text.find("\n", i)
+            if nl == -1:
+                break
+            i = nl  # keep the newline so line structure survives
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def _kind_for(keyword: str | None, artifact_kind: str | None) -> str:
     """Blueprint kind from the Lean keyword, falling back to the artifact's kind."""
     if keyword and keyword in _KEYWORD_KIND:
@@ -157,23 +190,31 @@ def generate(project: dict, proofs_root) -> dict:
     # Derive `uses` edges: a candidate depends on any formalized decl (existing node
     # or sibling candidate) whose short name its own span references. Keyed by the
     # target node's blueprint key so the edge resolves in the graph.
-    short_to_key: dict[str, str] = {}
+    # A short name may map to several decls (same last component in different
+    # namespaces); such references are ambiguous, so we skip them rather than guess
+    # (better a missing edge than a wrong one). Unambiguous shorts (one owner) edge.
+    short_to_keys: dict[str, list[str]] = {}
     for node in existing_nodes:
         if node["lean"]:
-            short_to_key.setdefault(graph._short(node["lean"]), node["key"])
+            short_to_keys.setdefault(graph._short(node["lean"]), []).append(node["key"])
     for cand in candidates:
-        short_to_key.setdefault(cand["short"], cand["key"])
+        short_to_keys.setdefault(cand["short"], []).append(cand["key"])
 
     for cand in candidates:
         uses: list[str] = []
         seen: set[str] = set()
-        for other_short, other_key in short_to_key.items():
-            if other_key == cand["key"] or other_short == cand["short"]:
+        # Scan the comment-stripped span so a decl name mentioned only in a comment
+        # doesn't produce a phantom dependency.
+        scan = _strip_lean_comments(cand["span"])
+        for other_short, keys in short_to_keys.items():
+            if other_short == cand["short"] or len(keys) != 1:
                 continue
-            if re.search(rf"\b{re.escape(other_short)}\b", cand["span"]):
-                if other_key not in seen:
-                    seen.add(other_key)
-                    uses.append(other_key)
+            other_key = keys[0]
+            if other_key == cand["key"] or other_key in seen:
+                continue
+            if re.search(rf"\b{re.escape(other_short)}\b", scan):
+                seen.add(other_key)
+                uses.append(other_key)
         cand["uses"] = uses
 
     if candidates:

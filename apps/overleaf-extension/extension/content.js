@@ -892,9 +892,10 @@
       { nodes, edges },
       {
         selectedKey: leanPaneBlueprintSelectedKey,
+        // The renderer updates selection in place; we only persist it so the choice
+        // survives a full re-render (refresh / generate).
         onSelectNode: (key) => {
           leanPaneBlueprintSelectedKey = key;
-          renderBlueprintBody(leanPaneBlueprintGraph);
         },
       },
     );
