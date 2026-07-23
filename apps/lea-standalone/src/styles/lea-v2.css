@@ -102,14 +102,8 @@
 .chip.model.model-trigger .caret { color: var(--muted); }
 
 /* Session origin badge (providence): chat header + Stats. Mirrors the .chip look so
-   it sits naturally beside the status chips, with an Overleaf-accent clickable
-   variant and a muted Direct (UI) variant. Scoped vars are global, so the same
-   markup reads correctly in the warm-paper chat and the Stats page. */
-/* NOTE: text colors are literal warm-palette hex, NOT var(--accent)/var(--muted).
-   The Stats page wraps this in `.stats-scope`, which re-points the shadcn tokens
-   --accent (#f3e3db) and --muted (#efede7) to near-white fills — so the var()
-   forms render light-on-light (illegible) there. The literals match the :root warm
-   values (#c96442 accent, #8a8983 muted) and read correctly in both contexts. */
+   it sits naturally beside the status chips, with a neutral clickable Overleaf
+   variant and a muted Direct (UI) variant. */
 .origin-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
   padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); background: var(--panel);
   color: var(--ink-2); white-space: nowrap; line-height: 1.6; }
@@ -117,7 +111,7 @@
   background: var(--accent-soft); cursor: pointer; }
 .origin-badge.origin-overleaf:hover:not(:disabled) { background: #e2e2e6; }
 .origin-badge.origin-overleaf:disabled { cursor: default; }
-.origin-badge.origin-ui { color: #8a8983; }
+.origin-badge.origin-ui { color: #8b8b93; }
 .origin-badge .origin-badge-glyph { flex: none; }
 .origin-badge .origin-badge-out { flex: none; opacity: 0.7; }
 
@@ -224,7 +218,7 @@
 .composer .verify-box.goal .verify-box-title { color: var(--blue, #4a6fa5); }
 .composer .verify-box-head { display: flex; align-items: center; gap: 8px; padding: 7px 10px 7px 12px; }
 .composer .verify-box-title { font-size: 12.5px; font-weight: 600; color: var(--ink-2); }
-.composer .verify-box.ok .verify-box-title { color: var(--green, #4f8a5b); }
+.composer .verify-box.ok .verify-box-title { color: var(--green, #2f8f5b); }
 .composer .verify-box.bad .verify-box-title { color: var(--accent); }
 .composer .verify-box-spacer { flex: 1; }
 .composer .verify-box-icon { flex: none; width: 22px; height: 22px; display: grid; place-items: center;
@@ -306,8 +300,8 @@
 .live-editor-note.err { color: var(--accent); }
 /* Save-state dot: green when in sync, amber while editing, blue while saving. */
 .live-editor-status-dot { width: 8px; height: 8px; border-radius: 99px; flex: none; background: var(--muted); }
-.live-editor-status-dot.clean, .live-editor-status-dot.saved { background: var(--green, #4f8a5b); }
-.live-editor-status-dot.dirty { background: var(--amber, #b8842a); }
+.live-editor-status-dot.clean, .live-editor-status-dot.saved { background: var(--green, #2f8f5b); }
+.live-editor-status-dot.dirty { background: var(--amber, #c0872e); }
 .live-editor-status-dot.saving { background: var(--blue, #4a6fa5); animation: liveSavePulse 1s ease-in-out infinite; }
 .live-editor-status-dot.locked { background: var(--muted); }
 @keyframes liveSavePulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -391,34 +385,30 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .sv-fail .err-detail { max-height: 160px; overflow: auto; max-width: 100%; }
 .canvas-empty { flex: 1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
 
-/* ---------- Stats / Usage panel ----------
-   The StatsPage keeps its shadcn/Tailwind utility classes (bg-card, border-border,
-   text-muted-foreground, …). Rather than rewrite that markup, we re-point the
-   shadcn design tokens to the warm-paper palette *only inside this scope*, so the
-   panel inherits the chat panel's look while its layout is untouched. Literal hex
-   values mirror the :root warm vars above (note: shadcn's --muted is a fill, while
-   the warm --muted is a text color, so they are set independently here). */
+/* ---------- Stats / Settings panels ----------
+   These screens use shadcn/Tailwind utility classes, so re-point those semantic
+   tokens to the same monochrome Lea palette used by the rest of the product. */
 .stats-scope,
 .settings-scope {
-  --background: #f5f4ef;          /* --bg */
-  --foreground: #1f1e1d;          /* --ink */
+  --background: #fafafb;          /* --bg */
+  --foreground: #18181b;          /* --ink */
   --card: #ffffff;                /* --panel */
-  --card-foreground: #1f1e1d;     /* --ink */
+  --card-foreground: #18181b;     /* --ink */
   --popover: #ffffff;             /* --panel */
-  --popover-foreground: #1f1e1d;  /* --ink */
-  --primary: #c96442;             /* --accent */
+  --popover-foreground: #18181b;  /* --ink */
+  --primary: #1c1c20;             /* --accent */
   --primary-foreground: #ffffff;
-  --secondary: #faf9f6;           /* --panel-2 */
-  --secondary-foreground: #1f1e1d;
-  --muted: #efede7;               /* --line-2 (fill) */
-  --muted-foreground: #8a8983;    /* --muted (text) */
-  --accent: #f3e3db;              /* --accent-soft (selected/hover fill) */
-  --accent-foreground: #1f1e1d;   /* --ink */
-  --destructive: #c0564a;         /* --red */
+  --secondary: #f5f5f7;           /* --panel-2 */
+  --secondary-foreground: #18181b;
+  --muted: #f3f3f5;               /* --line-2 (fill) */
+  --muted-foreground: #8b8b93;    /* --muted (text) */
+  --accent: #ededf0;               /* --accent-soft (selected/hover fill) */
+  --accent-foreground: #18181b;   /* --ink */
+  --destructive: #d14343;         /* --red */
   --destructive-foreground: #ffffff;
-  --border: #e9e7e0;              /* --line */
+  --border: #ebebee;              /* --line */
   --input: transparent;
-  --ring: #c96442;                /* --accent */
+  --ring: #1c1c20;                /* --accent */
   --radius: 12px;
 }
 
@@ -641,7 +631,7 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .bp-node { stroke-width: 1.5; transition: filter .1s ease; }
 .bp-node-g:hover .bp-node { filter: brightness(0.97); }
 .bp-node.is-selected { stroke-width: 3; }
-.bp-node.bp-planned { fill: #faf9f6; stroke: #d4cfc5; }
+.bp-node.bp-planned { fill: var(--panel-2); stroke: var(--line); }
 .bp-node.bp-stated  { fill: #eaf0f7; stroke: #9fb6d4; }
 .bp-node.bp-ready   { fill: #e7f1ec; stroke: #6aab8a; }
 .bp-node.bp-proved  { fill: var(--green-soft); stroke: var(--green); }
@@ -651,15 +641,15 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .bp-node.bp-failed  { fill: var(--red-soft); stroke: var(--red); }
 .bp-node-key { text-anchor: middle; font-size: 12.5px; font-weight: 600; fill: var(--ink); pointer-events: none; }
 .bp-node-kind { text-anchor: middle; font-size: 10px; fill: var(--muted); pointer-events: none; }
-.bp-edge { fill: none; stroke: #cdc9c0; stroke-width: 1.5; }
-.bp-arrowhead { fill: #cdc9c0; }
+.bp-edge { fill: none; stroke: var(--line); stroke-width: 1.5; }
+.bp-arrowhead { fill: var(--line); }
 
 .bp-legend { list-style: none; margin: 0; padding: 12px 14px; border: 1px solid var(--line);
   border-radius: 10px; background: var(--panel); display: flex; flex-direction: column; gap: 7px;
   font-size: 12px; color: var(--ink-2); }
 .bp-legend li { display: flex; align-items: center; gap: 8px; }
 .bp-swatch { width: 14px; height: 14px; border-radius: 4px; border: 1.5px solid; flex: none; }
-.bp-swatch.bp-planned { background: #faf9f6; border-color: #d4cfc5; }
+.bp-swatch.bp-planned { background: var(--panel-2); border-color: var(--line); }
 .bp-swatch.bp-stated  { background: #eaf0f7; border-color: #9fb6d4; }
 .bp-swatch.bp-ready   { background: #e7f1ec; border-color: #6aab8a; }
 .bp-swatch.bp-proved  { background: var(--green-soft); border-color: var(--green); }
@@ -675,7 +665,7 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .bp-detail-key { font-weight: 600; font-size: 13.5px; color: var(--ink); word-break: break-word; }
 .bp-detail-status { font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 99px;
   border: 1px solid; white-space: nowrap; flex: none; }
-.bp-detail-status.bp-planned { color: var(--muted); border-color: #d4cfc5; background: #faf9f6; }
+.bp-detail-status.bp-planned { color: var(--muted); border-color: var(--line); background: var(--panel-2); }
 .bp-detail-status.bp-stated  { color: #3a5f8a; border-color: #9fb6d4; background: #eaf0f7; }
 .bp-detail-status.bp-ready   { color: #3f7d63; border-color: #6aab8a; background: #e7f1ec; }
 .bp-detail-status.bp-proved  { color: var(--green); border-color: var(--green); background: var(--green-soft); }

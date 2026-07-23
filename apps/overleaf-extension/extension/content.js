@@ -314,22 +314,36 @@
     const header = document.createElement("div");
     header.className = "ol-lean-project-pane-header";
     const titleWrap = document.createElement("div");
+    titleWrap.className = "ol-lean-project-pane-titlewrap";
     const paneLabel = document.createElement("span");
     paneLabel.className = "ol-lean-sr-only";
     paneLabel.textContent = "Lean pane";
     const kicker = document.createElement("p");
     kicker.className = "ol-lean-project-pane-kicker";
-    kicker.textContent = "Project preview";
+    kicker.textContent = "Lea project";
     const title = document.createElement("h2");
-    title.textContent = "Lean pane";
-    leanPaneProjectTitle = title;
-    leanPaneProjectNamespace = document.createElement("p");
-    leanPaneProjectNamespace.className = "ol-lean-project-pane-namespace";
-    leanPaneProjectNamespace.textContent = "Lean namespace: --";
+    const sigma = document.createElement("span");
+    sigma.className = "ol-lean-project-pane-sigma";
+    sigma.setAttribute("aria-hidden", "true");
+    sigma.textContent = "∑";
+    leanPaneProjectTitle = document.createElement("span");
+    leanPaneProjectTitle.textContent = "Lean pane";
+    title.appendChild(sigma);
+    title.appendChild(leanPaneProjectTitle);
+    const namespace = document.createElement("p");
+    namespace.className = "ol-lean-project-pane-namespace";
+    namespace.title = "Lean namespace";
+    const namespaceLabel = document.createElement("span");
+    namespaceLabel.className = "ol-lean-sr-only";
+    namespaceLabel.textContent = "Lean namespace: ";
+    leanPaneProjectNamespace = document.createElement("span");
+    leanPaneProjectNamespace.textContent = "Namespace unavailable";
+    namespace.appendChild(namespaceLabel);
+    namespace.appendChild(leanPaneProjectNamespace);
     titleWrap.appendChild(paneLabel);
     titleWrap.appendChild(kicker);
     titleWrap.appendChild(title);
-    titleWrap.appendChild(leanPaneProjectNamespace);
+    titleWrap.appendChild(namespace);
 
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-pane-controls";
@@ -1127,7 +1141,7 @@
     if (!leanPaneProjectTitle || !leanPaneProjectNamespace) return;
     const fallback = guessProjectName(lastLeanPaneFiles || []);
     leanPaneProjectTitle.textContent = identity?.projectName || fallback;
-    leanPaneProjectNamespace.textContent = `Lean namespace: ${identity?.namespace || "--"}`;
+    leanPaneProjectNamespace.textContent = identity?.namespace || "Namespace unavailable";
   }
 
   async function loadProjectIdentity({ baseUrl, projectId }) {
