@@ -317,6 +317,36 @@ export function useProofStream() {
       ]);
     });
 
+    // Server-side queue (Phase 2): a pending run's stream opens with its FIFO
+    // position. Surface it on the status timeline so waiting reads as an
+    // honest "queued behind N" instead of a bare spinner.
+    source.addEventListener('queued', (event) => {
+      let position: number | null = null;
+      try {
+        const payload = JSON.parse((event as MessageEvent).data || '{}') as { position?: number };
+        position = typeof payload.position === 'number' ? payload.position : null;
+      } catch {
+        /* position stays unknown */
+      }
+      setStatusEvents((current) => [
+        ...current,
+        {
+          id: `queued-${runId}`,
+          session_id: sessionId,
+          run_id: runId,
+          status: 'queued',
+          message:
+            position && position > 0
+              ? `Queued behind ${position} other ${position === 1 ? 'run' : 'runs'}…`
+              : 'Queued — starting shortly…',
+          turn: null,
+          check_status: null,
+          check_detail: null,
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    });
+
     source.addEventListener('approval_requested', (event) => {
       const payload = JSON.parse((event as MessageEvent).data) as PendingApproval;
       approvalCounterRef.current += 1;

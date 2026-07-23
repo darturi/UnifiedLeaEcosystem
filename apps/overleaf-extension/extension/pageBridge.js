@@ -75,6 +75,11 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
     );
 
     extensions.push(targetPlugin);
+    // Tell the content script the integration is alive (editor-hook watchdog,
+    // PLAN-system-hardening 0.4): Overleaf's UNSTABLE_ event fired AND the
+    // CodeMirror plugin is installed. Posted only after the push above so a
+    // partial hook (event fired, plugin rejected) still trips the watchdog.
+    window.postMessage({ type: "OL_LEAN_EDITOR_HOOKED" }, "*");
   });
 
   window.addEventListener("message", (event) => {

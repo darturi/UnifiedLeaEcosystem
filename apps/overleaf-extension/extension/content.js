@@ -9,6 +9,7 @@
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
   const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
+  const TEX_MIRROR_FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
   const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
@@ -23,6 +24,15 @@
   // (AUDIT M4).
   const STATUS_REFRESH_DEBOUNCE_MS = 250;
   const STATUS_REFRESH_IN_PROGRESS_MS = 3000;
+  // Push channel (PLAN-system-hardening 3.1): while the companion's /events
+  // stream is connected, the fast polls stretch to these slow reconciliation
+  // cadences — pushes drive updates, polls only catch missed events. When the
+  // stream drops, the schedulers fall back to the fast cadences above.
+  const STATUS_REFRESH_RECONCILE_MS = 30000;
+  const LEAN_PANE_POLL_RECONCILE_MS = 60000;
+  const LEAN_PANE_CHAT_POLL_RECONCILE_MS = 30000;
+  const REPAIR_BATCH_POLL_MS = 2000;
+  const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -46,6 +56,9 @@
   let texMirrorSyncedOnce = false;
   let texMirrorSyncTimer = null;
   let texMirrorSyncPromise = null;
+  // When the last zip-download full sync ran (PLAN 3.2): ordinary edits ship
+  // only the active buffer; the zip refresh happens on this cadence.
+  let lastTexMirrorFullSyncAt = 0;
   let latestStatuses = {};
   let badgeLayer = null;
   let settingsButton = null;
@@ -88,6 +101,17 @@
   let leanPaneChatOptimistic = [];
   let leanPaneChatPollTimer = null;
   let leanPaneChatToken = 0;
+  // Blueprint view (FEATURE-overleaf-blueprint-view): the Lean pane has two top-level
+  // views over the same project — the document-driven "Items" tree (default) and the
+  // read-only "Blueprint" dependency graph. `leanPaneBlueprintView` is the lazily
+  // imported renderer; the graph + selection are cached so a node click re-renders
+  // without a refetch. All reset on pane open/close.
+  let leanPaneMainView = "items"; // "items" | "blueprint"
+  let leanPaneBlueprintView = null;
+  let leanPaneBlueprintToggle = null; // { items, blueprint } header buttons
+  let leanPaneBlueprintGraph = null; // last fetched { nodes, edges, exists }
+  let leanPaneBlueprintSelectedKey = null;
+  let leanPaneBlueprintGenerateBtn = null; // the "Generate…" button, for the in-flight disable
   // Consecutive transient poll failures (AUDIT M2): a thrown fetch used to stop
   // polling entirely, freezing the panel on "Lea is working…". We now retry
   // with backoff up to this cap before giving up and surfacing the error.
@@ -119,9 +143,24 @@
   let dismissedCostCapNoticeKeys = new Set();
   let activeCostCapNoticeKeys = new Set();
   let costCapUsageLimitReached = false;
+  // Editor-hook watchdog (PLAN-system-hardening 0.4): warns when the editor is
+  // visible but the page bridge never hooked Overleaf's UNSTABLE_ editor event
+  // — i.e. Overleaf changed and the integration is silently dead.
+  let editorHookWatchdog = null;
+  let editorHookSignalSeen = false;
+  let editorHookWarningBanner = null;
+  // Push channel (PLAN 3.1): one EventSource on the companion's /events.
+  // pushConnected is consulted by every poll scheduler when picking a delay.
+  let eventsClient = null;
+  let pushConnected = false;
 
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
+    if (event.data?.type === "OL_LEAN_EDITOR_HOOKED") {
+      editorHookSignalSeen = true;
+      editorHookWatchdog?.editorHooked();
+      return;
+    }
     if (event.data?.type === "OL_LEAN_TARGET_CLICK") {
       rememberTarget(event.data.target);
       showTargetPopover(event.data.clientX, event.data.clientY, event.data.target);
@@ -158,6 +197,8 @@
   });
 
   injectPageBridge();
+  startEditorHookWatchdog();
+  startEventsClient();
   requestTargetsSoon();
   renderSettingsButton();
   renderLeanPaneButton();
@@ -247,6 +288,10 @@
   function showLeanPane({ deferRefresh = false, preservePopover = false } = {}) {
     if (!preservePopover) closePopover();
     if (leanPane) return;
+    // Fresh pane always opens on the Items view with no blueprint selection.
+    leanPaneMainView = "items";
+    leanPaneBlueprintGraph = null;
+    leanPaneBlueprintSelectedKey = null;
     leanPane = document.createElement("aside");
     leanPane.className = "ol-lean-project-pane";
     leanPane.setAttribute("role", "complementary");
@@ -329,6 +374,8 @@
     header.appendChild(titleWrap);
     header.appendChild(controls);
 
+    const viewTabs = buildLeanPaneViewTabs();
+
     leanPaneStatus = document.createElement("p");
     leanPaneStatus.className = "ol-lean-project-pane-status";
     leanPaneBody = document.createElement("div");
@@ -336,6 +383,7 @@
 
     leanPane.appendChild(resizer);
     leanPane.appendChild(header);
+    leanPane.appendChild(viewTabs);
     leanPane.appendChild(leanPaneStatus);
     leanPane.appendChild(leanPaneBody);
     document.body.appendChild(leanPane);
@@ -367,6 +415,11 @@
     leanPaneProjectNamespace = null;
     leanPaneExpandedTreeNodeIds = new Set();
     leanPaneTreeDefaultsKey = "";
+    leanPaneMainView = "items";
+    leanPaneBlueprintToggle = null;
+    leanPaneBlueprintGraph = null;
+    leanPaneBlueprintSelectedKey = null;
+    leanPaneBlueprintGenerateBtn = null;
   }
 
   function hydrateLeanPaneWidthFromStorage() {
@@ -699,6 +752,244 @@
     return leanPaneView;
   }
 
+  // Lazily load the blueprint graph renderer (imports the shared, mirrored
+  // blueprintLayout.mjs). Only pulled in the first time the Blueprint tab is opened.
+  async function ensureBlueprintPaneView() {
+    if (leanPaneBlueprintView) return leanPaneBlueprintView;
+    leanPaneBlueprintView = await import(chrome.runtime.getURL("blueprintPaneView.mjs"));
+    return leanPaneBlueprintView;
+  }
+
+  // The Items | Blueprint segmented control in the pane header.
+  function buildLeanPaneViewTabs() {
+    const tabs = document.createElement("div");
+    tabs.className = "ol-lean-pane-viewtabs";
+    tabs.setAttribute("role", "tablist");
+    const make = (view, label) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "ol-lean-pane-viewtab";
+      button.textContent = label;
+      button.setAttribute("role", "tab");
+      button.addEventListener("click", () => {
+        setLeanPaneMainView(view).catch(renderLeanPaneError);
+      });
+      return button;
+    };
+    const items = make("items", "Items");
+    const blueprint = make("blueprint", "Blueprint");
+    tabs.appendChild(items);
+    tabs.appendChild(blueprint);
+    leanPaneBlueprintToggle = { items, blueprint };
+    updateLeanPaneViewTabs();
+    return tabs;
+  }
+
+  function updateLeanPaneViewTabs() {
+    if (!leanPaneBlueprintToggle) return;
+    for (const [view, button] of Object.entries(leanPaneBlueprintToggle)) {
+      const active = leanPaneMainView === view;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", active ? "true" : "false");
+    }
+  }
+
+  // Switch the pane's top-level view. Items re-renders from the cached manifest when
+  // one exists (no refetch); Blueprint fetches + renders its graph.
+  async function setLeanPaneMainView(view) {
+    if (view === leanPaneMainView || !leanPane) return;
+    leanPaneMainView = view;
+    updateLeanPaneViewTabs();
+    if (view === "blueprint") {
+      closeLeanPaneChat();
+      closeActiveOverflowMenu();
+      await renderLeanPaneBlueprint({});
+      return;
+    }
+    // Back to Items: cheap re-render from cache, else a fresh refresh.
+    if (lastLeanPaneManifest) {
+      renderLeanPaneManifest(lastLeanPaneManifest);
+      scheduleLeanPanePollIfNeeded(lastLeanPaneManifest);
+    } else {
+      await refreshLeanPaneNow({ forceFetch: false });
+    }
+  }
+
+  // Fetch the project's blueprint graph from the companion and render it (or the
+  // appropriate empty/error state). Guards against a view switch mid-fetch.
+  async function renderLeanPaneBlueprint({ background = false } = {}) {
+    if (!leanPane || !leanPaneBody || !leanPaneStatus) return;
+    if (leanPaneMainView !== "blueprint") return;
+    await ensureBlueprintPaneView();
+    if (!background) {
+      leanPaneStatus.textContent = "Loading blueprint…";
+      leanPaneBody.replaceChildren();
+    }
+
+    const projectId = extractOverleafProjectId();
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    try {
+      const identity = await loadProjectIdentity({ baseUrl, projectId });
+      lastProjectIdentity = identity;
+      renderLeanPaneProjectIdentity(identity);
+    } catch {}
+
+    let payload;
+    try {
+      const response = await fetch(
+        `${baseUrl}/project/graph?overleafProjectId=${encodeURIComponent(projectId)}`,
+      );
+      payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      }
+    } catch (error) {
+      if (leanPaneMainView !== "blueprint" || !leanPaneBody) return;
+      leanPaneStatus.textContent = "Blueprint unavailable.";
+      leanPaneBody.replaceChildren(buildBlueprintToolbar(), buildBlueprintMessage(errorText(error), "error"));
+      return;
+    }
+
+    if (leanPaneMainView !== "blueprint") return; // toggled away mid-fetch
+    leanPaneBlueprintGraph = payload;
+    renderBlueprintBody(payload);
+  }
+
+  // Render the cached graph payload into the body: no-project / empty / populated.
+  // Always leads with the Refresh + Generate toolbar. Called on fetch and on every
+  // node-selection change (cheap, self-contained).
+  function renderBlueprintBody(payload) {
+    if (!leanPaneBody || !leanPaneStatus || leanPaneMainView !== "blueprint") return;
+    const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+    const edges = Array.isArray(payload?.edges) ? payload.edges : [];
+    const prevScrollTop = leanPaneBody.scrollTop;
+    leanPaneBody.replaceChildren(buildBlueprintToolbar());
+
+    if (payload && payload.exists === false) {
+      leanPaneStatus.textContent = "No Lea project yet.";
+      leanPaneBody.appendChild(
+        buildBlueprintMessage(
+          "No Lea project for this document yet — formalize a theorem to start one.",
+          "empty",
+        ),
+      );
+      return;
+    }
+    if (nodes.length === 0) {
+      leanPaneStatus.textContent = "Blueprint is empty.";
+      leanPaneBody.appendChild(
+        buildBlueprintMessage(
+          "No blueprint nodes yet. Click “Generate from formalized theorems” above to build a starter graph from what you've formalized — or add nodes in the Lea UI.",
+          "empty",
+        ),
+      );
+      return;
+    }
+
+    leanPaneStatus.textContent = `${nodes.length} blueprint node${nodes.length === 1 ? "" : "s"}.`;
+    const element = leanPaneBlueprintView.renderBlueprintView(
+      { nodes, edges },
+      {
+        selectedKey: leanPaneBlueprintSelectedKey,
+        // The renderer updates selection in place; we only persist it so the choice
+        // survives a full re-render (refresh / generate).
+        onSelectNode: (key) => {
+          leanPaneBlueprintSelectedKey = key;
+        },
+      },
+    );
+    leanPaneBody.appendChild(element);
+    leanPaneBody.scrollTop = prevScrollTop;
+  }
+
+  // The blueprint body's action row: Refresh (re-fetch the graph) + Generate
+  // (populate .lea/blueprint.md from formalized artifacts). Present in every state.
+  function buildBlueprintToolbar() {
+    const bar = document.createElement("div");
+    bar.className = "ol-lean-blueprint-toolbar";
+
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "ol-lean-pane-action";
+    refresh.textContent = "Refresh";
+    refresh.title = "Re-fetch the blueprint graph";
+    refresh.addEventListener("click", () => {
+      renderLeanPaneBlueprint({}).catch(renderLeanPaneError);
+    });
+
+    const generate = document.createElement("button");
+    generate.type = "button";
+    generate.className = "ol-lean-pane-action is-primary";
+    generate.textContent = "Generate from formalized theorems";
+    generate.title = "Add a blueprint node for each formalized theorem (safe to re-run)";
+    generate.addEventListener("click", () => {
+      generateBlueprint().catch(renderLeanPaneError);
+    });
+    leanPaneBlueprintGenerateBtn = generate;
+
+    bar.appendChild(refresh);
+    bar.appendChild(generate);
+    return bar;
+  }
+
+  // POST the generate request, then render the returned graph and report what changed.
+  async function generateBlueprint() {
+    if (!leanPane || !leanPaneBody || !leanPaneStatus || leanPaneMainView !== "blueprint") return;
+    if (leanPaneBlueprintGenerateBtn) {
+      leanPaneBlueprintGenerateBtn.disabled = true;
+      leanPaneBlueprintGenerateBtn.textContent = "Generating…";
+    }
+    leanPaneStatus.textContent = "Generating blueprint from formalized theorems…";
+
+    const projectId = extractOverleafProjectId();
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    let payload;
+    try {
+      const response = await fetch(`${baseUrl}/project/blueprint/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overleafProjectId: projectId }),
+      });
+      payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      }
+    } catch (error) {
+      if (leanPaneMainView !== "blueprint" || !leanPaneBody) return;
+      leanPaneStatus.textContent = "Blueprint unavailable.";
+      leanPaneBody.replaceChildren(buildBlueprintToolbar(), buildBlueprintMessage(errorText(error), "error"));
+      return;
+    }
+
+    if (leanPaneMainView !== "blueprint") return;
+    leanPaneBlueprintGraph = payload;
+    leanPaneBlueprintSelectedKey = null;
+    renderBlueprintBody(payload); // rebuilds the toolbar (button re-enabled) + graph
+
+    // Overlay a result message over the node count renderBlueprintBody just set.
+    if (payload.exists === false) {
+      leanPaneStatus.textContent = "No Lea project for this document yet.";
+    } else if (payload.added > 0) {
+      leanPaneStatus.textContent = `Added ${payload.added} node${payload.added === 1 ? "" : "s"} from formalized theorems.`;
+    } else if (Array.isArray(payload.nodes) && payload.nodes.length > 0) {
+      leanPaneStatus.textContent = "Blueprint already covers your formalized theorems.";
+    } else {
+      leanPaneStatus.textContent = "No formalized theorems to generate from yet.";
+    }
+  }
+
+  // A centered message block for the blueprint's empty / error states.
+  function buildBlueprintMessage(text, kind) {
+    const wrap = document.createElement("div");
+    wrap.className = `ol-lean-blueprint-message${kind ? ` is-${kind}` : ""}`;
+    const line = document.createElement("p");
+    line.textContent = text;
+    wrap.appendChild(line);
+    return wrap;
+  }
+
   // Edits to the open document re-render the pane from the cached file set with the
   // live buffer overlaid — a cheap, no-blink background refresh (no project download).
   function scheduleLeanPaneRefresh() {
@@ -716,6 +1007,15 @@
     leanPaneRefreshTimer = null;
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = null;
+    // Blueprint view has its own (Items-independent) fetch + render — no file
+    // archive, manifest, or in-progress poll. The blueprint is derived from
+    // .lea/blueprint.md + Lean state, NOT the .tex buffer, so edit-/poll-driven
+    // background refreshes can't change it — skip them. Explicit refreshes (the
+    // header ↻ and initial open, both non-background) still re-fetch.
+    if (leanPaneMainView === "blueprint") {
+      if (!background) await renderLeanPaneBlueprint({});
+      return;
+    }
     await ensureLeanPaneView();
     if (!background) {
       leanPaneStatus.textContent = "Loading project inventory...";
@@ -754,7 +1054,7 @@
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = setTimeout(() => {
       refreshLeanPaneNow({ background: true }).catch(renderLeanPaneError);
-    }, LEAN_PANE_POLL_DELAY_MS);
+    }, pushConnected ? LEAN_PANE_POLL_RECONCILE_MS : LEAN_PANE_POLL_DELAY_MS);
   }
 
   async function getLeanPaneProjectFiles({ projectId, forceFetch }) {
@@ -807,6 +1107,9 @@
 
     const repairBatchPanel = renderLeanPaneRepairBatchPanel();
     if (repairBatchPanel) leanPaneBody.appendChild(repairBatchPanel);
+
+    const batchActions = renderLeanPaneBatchActions(items);
+    if (batchActions) leanPaneBody.appendChild(batchActions);
 
     if (items.length > 0) {
       const treeElement = document.createElement("div");
@@ -1274,12 +1577,17 @@
     scheduleLeanPaneRefresh();
   }
 
-  function startRepairBatchPolling() {
+  function startRepairBatchPolling({ immediate = false } = {}) {
     if (leanPaneRepairBatchTimer) clearTimeout(leanPaneRepairBatchTimer);
+    const delayMs = immediate
+      ? 0
+      : (pushConnected ? REPAIR_BATCH_POLL_RECONCILE_MS : REPAIR_BATCH_POLL_MS);
     leanPaneRepairBatchTimer = setTimeout(async () => {
       leanPaneRepairBatchTimer = 0;
       const batchId = leanPaneRepairBatch?.batchId;
       if (!batchId) return;
+      // (delay above: instant when a push event announced a change, slow
+      // reconciliation while the stream is up, fast poll when it's down)
       try {
         const baseUrl = await chatCompanionBaseUrl();
         const response = await fetch(`${baseUrl}/lean-pane/repair/status`, {
@@ -1297,7 +1605,7 @@
       if (leanPaneRepairBatch && !leanPaneRepairBatch.done && !leanPaneRepairBatch.pausedOn) {
         startRepairBatchPolling();
       }
-    }, 2000);
+    }, delayMs);
   }
 
   async function continueRepairBatch() {
@@ -1319,28 +1627,96 @@
     renderLeanPaneManifest(lastLeanPaneManifest);
   }
 
+  // Stop a running batch: the companion halts further items and interrupts the
+  // one mid-run. The snapshot comes back `stopping` (then `canceled` once it
+  // settles); keep polling so the panel reflects the final stopped state.
+  async function cancelRepairBatch() {
+    const batchId = leanPaneRepairBatch?.batchId;
+    if (!batchId) return;
+    try {
+      const baseUrl = await chatCompanionBaseUrl();
+      const response = await fetch(`${baseUrl}/lean-pane/repair/all/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ batchId })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (response.ok) leanPaneRepairBatch = payload;
+      startRepairBatchPolling({ immediate: true });
+    } catch (error) {
+      leanPaneRepairError = { itemKey: "batch", message: normalizeErrorMessage(error) };
+    }
+    renderLeanPaneManifest(lastLeanPaneManifest);
+  }
+
+  // Project-level "Stub all" / "Formalize all" launchers, above the item tree.
+  // Only one batch surface exists at a time: while a batch panel is showing
+  // (running, paused, or awaiting dismiss) the launchers stay hidden so a
+  // second batch can't clobber the first. Each button is present only when it
+  // has eligible work (un-stubbed theorems / not-yet-proven items).
+  function renderLeanPaneBatchActions(items) {
+    if (leanPaneRepairBatch) return null;
+    const stubbable = leanPaneView.stubbableItems(items);
+    const formalizable = leanPaneView.formalizableItems(items);
+    if (stubbable.length === 0 && formalizable.length === 0) return null;
+    const row = document.createElement("div");
+    row.className = "ol-lean-project-batch-actions";
+    if (stubbable.length > 0) {
+      const stubAll = document.createElement("button");
+      stubAll.type = "button";
+      stubAll.className = "ol-lean-secondary-button ol-lean-stub-all-button";
+      stubAll.textContent = `Stub all (${stubbable.length})`;
+      stubAll.title = "Generate a Lean sorry-stub for every un-stubbed theorem in the project.";
+      stubAll.addEventListener("click", () => { stubAllTheorems(); });
+      row.appendChild(stubAll);
+    }
+    if (formalizable.length > 0) {
+      const formalizeAll = document.createElement("button");
+      formalizeAll.type = "button";
+      formalizeAll.className = "ol-lean-primary-button ol-lean-formalize-all-button";
+      formalizeAll.textContent = `Formalize all (${formalizable.length})`;
+      formalizeAll.title = "Run Lea to formalize every theorem and definition that has no verified proof yet.";
+      formalizeAll.addEventListener("click", () => { formalizeAllItems(); });
+      row.appendChild(formalizeAll);
+    }
+    return row;
+  }
+
   // Live batch progress at the top of the pane: one line per item
   // (formatRepairOutcome), plus continue/dismiss controls when the batch
   // paused on a failure or the spend cap.
   function renderLeanPaneRepairBatchPanel() {
     const batch = leanPaneRepairBatch;
     if (!batch || !Array.isArray(batch.items) || batch.items.length === 0) return null;
+    const operation = batch.operation || "repair";
+    const noun = operation === "stub" ? "Stub" : operation === "formalize" ? "Formalize" : "Repair";
+    const doneVerb = operation === "stub" ? "stubbed" : operation === "formalize" ? "formalized" : "repaired";
+    const doneStates = operation === "stub"
+      ? ["stubbed"]
+      : operation === "formalize"
+        ? ["formalized", "disproved"]
+        : ["repaired", "needs_review"];
+    const runningVerb = operation === "stub" ? "Stubbing" : operation === "formalize" ? "Formalizing" : "Repairing";
     const panel = document.createElement("div");
     panel.className = "ol-lean-project-repair-batch";
     const heading = document.createElement("p");
-    const doneCount = batch.items.filter((entry) => ["repaired", "needs_review"].includes(entry.state)).length;
-    heading.textContent = batch.done
-      ? `Repair batch finished: ${doneCount}/${batch.items.length} repaired.`
-      : batch.pausedOn
-        ? batch.pausedOn.reason === "max_spend"
-          ? "Repair batch paused: the max spend limit was reached."
-          : `Repair batch paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
-        : `Repairing ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
+    const doneCount = batch.items.filter((entry) => doneStates.includes(entry.state)).length;
+    heading.textContent = batch.canceled
+      ? `${noun} all stopped: ${doneCount}/${batch.items.length} ${doneVerb} before stopping.`
+      : batch.stopping
+        ? "Stopping..."
+        : batch.done
+          ? `${noun} all finished: ${doneCount}/${batch.items.length} ${doneVerb}.`
+          : batch.pausedOn
+            ? batch.pausedOn.reason === "max_spend"
+              ? `${noun} all paused: the max spend limit was reached.`
+              : `${noun} all paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
+            : `${runningVerb} ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
     panel.appendChild(heading);
     for (const entry of batch.items) {
       const line = document.createElement("p");
       line.className = "ol-lean-project-repair-batch-item";
-      line.textContent = leanPaneView.formatRepairOutcome(entry);
+      line.textContent = leanPaneView.formatRepairOutcome(entry, operation);
       panel.appendChild(line);
     }
     if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
@@ -1351,6 +1727,17 @@
     }
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-detail-actions";
+    // Stop is available while the batch is actively working (not paused, not
+    // finished, not already stopping): it halts further items and interrupts
+    // the one mid-run.
+    if (!batch.done && !batch.pausedOn && !batch.stopping) {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "ol-lean-secondary-button ol-lean-stop-batch-button";
+      stop.textContent = "Stop";
+      stop.addEventListener("click", () => { cancelRepairBatch(); });
+      controls.appendChild(stop);
+    }
     if (batch.pausedOn) {
       const cont = document.createElement("button");
       cont.type = "button";
@@ -2044,7 +2431,7 @@
     }
   }
 
-  function startChatPolling(delayMs = LEAN_PANE_POLL_DELAY_MS) {
+  function startChatPolling(delayMs = (pushConnected ? LEAN_PANE_CHAT_POLL_RECONCILE_MS : LEAN_PANE_POLL_DELAY_MS)) {
     clearTimeout(leanPaneChatPollTimer);
     leanPaneChatPollTimer = setTimeout(() => {
       // pollChatSession handles its own transient errors; the catch is a
@@ -3012,6 +3399,66 @@
     return payload;
   }
 
+  // Build the full per-item payload /stub and /formalize expect (the same shape
+  // the single-item formalize() sends), for every item a batch will run over.
+  async function buildBatchTargetPayloads(items) {
+    const overleafProjectId = extractOverleafProjectId();
+    const projectName = lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []);
+    const projectNamespace = lastProjectIdentity?.namespace || "";
+    return Promise.all(items.map(async (item) => {
+      const target = leanPaneView.paneItemToFormalizeTarget(item);
+      return {
+        overleafProjectId,
+        targetKind: target.targetKind,
+        targetLabel: target.targetLabel,
+        targetText: target.targetText,
+        targetUses: target.targetUses || [],
+        targetContext: target.targetContext || "",
+        projectName,
+        projectNamespace,
+        sourceHash: await sha256(normalizeTargetText(target.targetText))
+      };
+    }));
+  }
+
+  // "Stub all" / "Formalize all": the batch versions of the per-item buttons.
+  // They gather the eligible items from the live manifest, flush the .tex
+  // mirror (statement translation reads local notation), POST the full target
+  // set to the companion, then drive the SAME batch panel + polling the repair
+  // batch uses -- one shared progress surface, distinguished by `operation`.
+  async function runTargetBatch({ endpoint, items, errorKey }) {
+    leanPaneRepairError = null;
+    if (items.length === 0) return;
+    try {
+      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const baseUrl = await chatCompanionBaseUrl();
+      const payloads = await buildBatchTargetPayloads(items);
+      const response = await fetch(`${baseUrl}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ overleafProjectId: extractOverleafProjectId(), items: payloads })
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
+      leanPaneRepairBatch = payload;
+      startRepairBatchPolling();
+    } catch (error) {
+      leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
+    }
+    renderLeanPaneManifest(lastLeanPaneManifest);
+    scheduleLeanPaneRefresh();
+  }
+
+  function stubAllTheorems() {
+    const items = leanPaneView.stubbableItems(lastLeanPaneManifest?.items || []);
+    return runTargetBatch({ endpoint: "/stub/all", items, errorKey: "batch" });
+  }
+
+  function formalizeAllItems() {
+    const items = leanPaneView.formalizableItems(lastLeanPaneManifest?.items || []);
+    return runTargetBatch({ endpoint: "/formalize/all", items, errorKey: "batch" });
+  }
+
   async function refreshSingleStatus(target) {
     await refreshStatusesNow();
     return latestStatuses[targetKey(target)] || {
@@ -3060,7 +3507,7 @@
       if (target) updatePopoverStatus(activePopover, target);
     }
     if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
-      scheduleStatusRefresh(STATUS_REFRESH_IN_PROGRESS_MS);
+      scheduleStatusRefresh(pushConnected ? STATUS_REFRESH_RECONCILE_MS : STATUS_REFRESH_IN_PROGRESS_MS);
     }
   }
 
@@ -3108,14 +3555,52 @@
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
 
     texMirrorSyncPromise = (async () => {
-      // Re-download + unzip the project only when the content may have changed (an edit
-      // set the dirty flag, a new project, or no cached set yet); otherwise reuse the
-      // cached .tex set so an unchanged formalize skips the expensive zip fetch.
-      const needFetch = texMirrorDirty || !lastMirrorFiles || lastMirrorProjectId !== projectId;
+      // Two sync tiers (PLAN-system-hardening 3.2): the whole-project zip
+      // download used to run on every edit-pause once a project was activated
+      // — heavy for large projects and unkind to Overleaf's servers. Now an
+      // ordinary edit ships just the active editor buffer (mode "upsert" —
+      // the adapter writes it without treating absent files as deleted); the
+      // zip + full reconcile runs only on activation, when the active file
+      // isn't in the cached set (new/renamed doc), on a periodic refresh to
+      // pick up collaborator edits, and stays the base of the forced
+      // pre-formalize sync.
+      const activeRel = String(latestActiveTexPath || "").replace(/^\/+/, "");
+      const cacheUsable = Boolean(lastMirrorFiles) && lastMirrorProjectId === projectId;
+      const activeKnown = !activeRel || (cacheUsable && lastMirrorFiles.some((file) => file.path === activeRel));
+      const fullSyncDue =
+        !cacheUsable ||
+        !activeKnown ||
+        Date.now() - lastTexMirrorFullSyncAt > TEX_MIRROR_FULL_SYNC_INTERVAL_MS;
+
+      if (!force && !fullSyncDue && activeRel && typeof latestActiveTex === "string") {
+        const response = await fetch(`${baseUrl}/mirror-tex`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            overleafProjectId: projectId,
+            mode: "upsert",
+            files: [{ path: activeRel, content: latestActiveTex }]
+          })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+        }
+        lastMirrorFiles = lastMirrorFiles.map((file) =>
+          file.path === activeRel ? { ...file, content: latestActiveTex } : file
+        );
+        texMirrorDirty = false;
+        return payload;
+      }
+
+      // Full tier. Re-download + unzip only when the cached set can't serve
+      // (new project / unknown active file / periodic refresh); a forced
+      // pre-formalize sync with a healthy cache POSTs the cached set — the
+      // adapter is authoritative and no-ops cheaply on identical content, so
+      // divergence self-heals without a zip per formalize.
+      const needFetch = !cacheUsable || !activeKnown ||
+        Date.now() - lastTexMirrorFullSyncAt > TEX_MIRROR_FULL_SYNC_INTERVAL_MS;
       const files = needFetch ? await collectProjectTexFiles(projectId) : lastMirrorFiles;
-      // Always POST: the adapter is authoritative and no-ops cheaply on identical
-      // content, so a backend reset (or any client/server divergence) self-heals instead
-      // of being masked by a stale client-side "already synced" cache.
       const response = await fetch(`${baseUrl}/mirror-tex`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3129,6 +3614,7 @@
       lastMirrorProjectId = projectId;
       texMirrorSyncedOnce = true;
       texMirrorDirty = false;
+      if (needFetch) lastTexMirrorFullSyncAt = Date.now();
       return payload;
     })().finally(() => {
       texMirrorSyncPromise = null;
@@ -3984,6 +4470,127 @@
     const data = new TextEncoder().encode(text);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function startEventsClient() {
+    try {
+      const module = await import(chrome.runtime.getURL("eventsClient.mjs"));
+      // The companion URL comes from settings (async); cache it for the
+      // client's synchronous url() and refresh the cache on every reconnect
+      // attempt so a settings change is picked up without a page reload.
+      let companionUrlCache = DEFAULT_COMPANION_URL;
+      const refreshUrlCache = () => {
+        getSettings()
+          .then((settings) => {
+            companionUrlCache = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+          })
+          .catch(() => {});
+      };
+      refreshUrlCache();
+      eventsClient = module.createEventsClient({
+        url: () => {
+          refreshUrlCache();
+          const projectId = extractOverleafProjectId();
+          const query = projectId && projectId !== "unknown"
+            ? `?projectId=${encodeURIComponent(projectId)}`
+            : "";
+          return `${companionUrlCache}/events${query}`;
+        },
+        onEvent: handlePushEvent,
+        onConnectionChange: (connected) => {
+          pushConnected = connected;
+          if (connected) {
+            // Reconcile once on (re)connect: anything that changed while the
+            // stream was down is picked up now instead of on the slow poll.
+            scheduleStatusRefresh();
+            if (leanPane) scheduleLeanPaneRefresh();
+          }
+        },
+        // Bind EventSource + timers to the content-script scope: the module's
+        // own defaults resolve in the module realm, which under the test
+        // harness is Node's — real sockets and a real clock (same trap as
+        // editorHookWatchdog). `typeof` guard: no EventSource here means the
+        // push channel is unavailable and the polls stay primary.
+        EventSourceImpl: typeof EventSource === "undefined" ? null : EventSource,
+        setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
+        clearTimeoutImpl: (id) => clearTimeout(id)
+      });
+      eventsClient.start();
+    } catch {
+      // Push is an optimization; the poll fallback keeps everything working.
+    }
+  }
+
+  function handlePushEvent(type, data) {
+    if (type === "jobs-changed") {
+      scheduleStatusRefresh();
+      if (leanPane) scheduleLeanPaneRefresh();
+      return;
+    }
+    if (type === "chat-updated") {
+      // Only refetch when the chat panel is open — and if the event names a
+      // target, only when it's the one being viewed.
+      if (!leanPaneChatPanel || !leanPaneChatItem) return;
+      const eventKey = data && typeof data.targetKey === "string" ? data.targetKey : "";
+      if (eventKey && leanPaneChatTarget?.targetKey && eventKey !== leanPaneChatTarget.targetKey) return;
+      pollChatSession().catch(() => {});
+      return;
+    }
+    if (type === "repair-batch-updated") {
+      if (!leanPaneRepairBatch?.batchId) return;
+      if (data && data.batchId && data.batchId !== leanPaneRepairBatch.batchId) return;
+      startRepairBatchPolling({ immediate: true });
+    }
+  }
+
+  async function startEditorHookWatchdog() {
+    try {
+      const module = await import(chrome.runtime.getURL("editorHookWatchdog.mjs"));
+      editorHookWatchdog = module.createEditorHookWatchdog({
+        // querySelector guard: exotic embedding contexts (and the test
+        // harness's minimal document) may lack it — treat as "no editor".
+        isEditorPresent: () =>
+          typeof document.querySelector === "function" &&
+          Boolean(document.querySelector(".cm-editor, .cm-content")),
+        onWarn: renderEditorHookWarning,
+        onRecover: removeEditorHookWarning,
+        // Bind timers to the content-script scope: the module's own defaults
+        // resolve in the module realm, which under the test harness is the
+        // real Node clock rather than the page's (fake) one.
+        setTimeoutImpl: (fn, ms) => setTimeout(fn, ms),
+        clearTimeoutImpl: (id) => clearTimeout(id)
+      });
+      // The hook signal can beat the module import — honor it instead of arming.
+      if (editorHookSignalSeen) editorHookWatchdog.editorHooked();
+      else editorHookWatchdog.arm();
+    } catch {
+      // Best-effort: the watchdog must never break the page.
+    }
+  }
+
+  function renderEditorHookWarning() {
+    if (editorHookWarningBanner) return;
+    const banner = document.createElement("div");
+    banner.className = "ol-lean-editor-hook-warning";
+    const body = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = "Lea can't attach to the Overleaf editor";
+    const detail = document.createElement("span");
+    detail.textContent = "Overleaf may have changed its editor internals. Theorem badges and % lea: markers won't work until the extension is updated.";
+    body.append(title, detail);
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.setAttribute("aria-label", "Dismiss");
+    dismiss.textContent = "×";
+    dismiss.addEventListener("click", removeEditorHookWarning);
+    banner.append(body, dismiss);
+    (document.body || document.documentElement).appendChild(banner);
+    editorHookWarningBanner = banner;
+  }
+
+  function removeEditorHookWarning() {
+    editorHookWarningBanner?.remove();
+    editorHookWarningBanner = null;
   }
 
   function injectPageBridge() {

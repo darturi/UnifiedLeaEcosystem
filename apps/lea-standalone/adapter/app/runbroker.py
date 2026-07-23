@@ -22,9 +22,9 @@ Design notes
 ------------
 * **Buffer for the run's (bounded) lifetime.** Runs are minutes long; holding their
   events in memory is cheap for this local/single-tenant adapter. The broker is
-  dropped when the run ends (``bridge.run_lea``'s ``finally``); a late connection to
-  an already-finished run is caught by the endpoint's terminal-status 409 before it
-  ever looks for a broker.
+  dropped when the run ends (``bridge.run_lea``'s ``finally``); a late connection
+  to an already-finished run gets a synthesized terminal event from the persisted
+  run row.
 * **``put`` is Queue-compatible** (takes ``{"type", "payload"}``) so the runner's
   existing ``emit()`` writes to it unchanged.
 * **Cursor replay.** ``events_after(cursor)`` returns everything with ``seq >

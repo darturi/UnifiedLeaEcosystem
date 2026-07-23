@@ -13,6 +13,7 @@
     "dev:ui": "npm run dev -w apps/lea-standalone",
     "doctor": "npm run doctor -w apps/overleaf-extension && npm run doctor -w apps/lea-standalone",
     "reset:local": "node scripts/reset-local-state.mjs",
-    "test": "npm test -w apps/overleaf-extension && npm run test:frontend -w apps/lea-standalone"
+    "test": "npm test -w apps/overleaf-extension && npm run test:frontend -w apps/lea-standalone",
+    "test:integration": "node --test tests/integration/*.test.mjs"
   }
 }

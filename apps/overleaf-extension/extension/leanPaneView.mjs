@@ -682,18 +682,42 @@ export function formatBreakageAttribution(breakage) {
 }
 
 // One line per item for the batch progress / outcome list.
-export function formatRepairOutcome(entry) {
+// The eligible sets the project-level "Stub all" / "Formalize all" launchers
+// operate over. These delegate to the SAME per-item predicates the individual
+// buttons use (canStubPaneItem / canFormalizePaneItem) so a batch offers work
+// on exactly the items whose own buttons would offer it -- honoring
+// `formalizable` and skipping in-progress runs and already-valid work.
+export function stubbableItems(items) {
+  return (Array.isArray(items) ? items : []).filter(canStubPaneItem);
+}
+
+export function formalizableItems(items) {
+  return (Array.isArray(items) ? items : []).filter(canFormalizePaneItem);
+}
+
+// One line per batch item. Wording depends on the batch `operation` only for
+// the in-flight ("running") verb and the "already done" skip note; terminal
+// states carry their own vocabulary (stubbed / formalized / repaired).
+export function formatRepairOutcome(entry, operation = "repair") {
   if (!entry) return "";
   const label = entry.targetLabel || "";
+  const runningVerb = operation === "stub" ? "stubbing" : operation === "formalize" ? "formalizing" : "repairing";
   switch (entry.state) {
     case "pending": return `${label}: waiting.`;
-    case "running": return `${label}: repairing...`;
+    case "running": return `${label}: ${runningVerb}...`;
     case "repaired": return `${label}: repaired and verified.`;
+    case "stubbed": return `${label}: stub created.`;
+    case "formalized": return `${label}: formalized and verified.`;
+    case "disproved": return `${label}: counterexample found.`;
     case "needs_review": return `${label}: repaired, but the statement changed -- review required.`;
-    case "failed": return `${label}: repair failed${entry.reason ? ` -- ${entry.reason}` : "."}`;
+    case "canceled": return `${label}: stopped.`;
+    case "failed": {
+      const verb = operation === "stub" ? "stub failed" : operation === "formalize" ? "formalization failed" : "repair failed";
+      return `${label}: ${verb}${entry.reason ? ` -- ${entry.reason}` : "."}`;
+    }
     case "skipped":
       if (String(entry.reason || "").startsWith("depends_on_failed:")) {
-        return `${label}: skipped -- depends on failed repair of ${String(entry.reason).slice("depends_on_failed:".length)}.`;
+        return `${label}: skipped -- depends on failed ${operation === "formalize" ? "formalization" : "repair"} of ${String(entry.reason).slice("depends_on_failed:".length)}.`;
       }
       return `${label}: skipped${entry.reason === "already_fixed" ? " -- already compiles." : entry.reason ? ` (${entry.reason})` : "."}`;
     default: return `${label}: ${entry.state || "unknown"}.`;

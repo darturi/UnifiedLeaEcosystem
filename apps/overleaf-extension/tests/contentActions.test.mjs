@@ -1295,6 +1295,13 @@ class FakeElement {
           .split(/\s+/)
           .filter((className) => className && !remove.has(className))
           .join(" ");
+      },
+      toggle: (className, force) => {
+        const present = this.classList.contains(className);
+        const shouldAdd = force === undefined ? !present : Boolean(force);
+        if (shouldAdd) this.classList.add(className);
+        else this.classList.remove(className);
+        return shouldAdd;
       }
     };
     this.scrollTop = 0;

@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 
 from .db import init_db
 from .routes import projects, runs, search, sessions, settings, skills, subagents
-from . import store
+from . import bridge, store
 
 app = FastAPI(title="Lea Interface API")
 
@@ -29,9 +29,11 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
-    # No runner threads survive a restart, so any run row still marked active is
-    # an orphan whose derived session status would read 'thinking' forever.
+    # No worker survives a restart: reap orphaned 'running' rows (their derived
+    # session status would read 'thinking' forever), then re-enqueue the
+    # still-pending queue so a restart doesn't strand queued work (Phase 2).
     store.fail_stale_active_runs()
+    bridge.recover_runs_at_startup()
 
 
 @app.get("/api/health")
