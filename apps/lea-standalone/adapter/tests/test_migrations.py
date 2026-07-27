@@ -247,8 +247,17 @@ def test_concurrent_startup_migrates_exactly_once(tmp_path):
     `command.upgrade()` in one interpreter tear down each other's state (observed:
     `KeyError: 'config'` / `KeyError: 'script'`). Alembic simply isn't thread-safe
     that way — and it doesn't need to be, because the deployment shape is N worker
-    *processes*, each with its own interpreter, serializing on SQLite's write lock.
-    Testing it with threads would fail for a reason the real system never hits.
+    *processes*, each with its own interpreter. Testing it with threads would fail
+    for a reason the real system never hits.
+
+    What serializes them is `migrations._migration_lock`, NOT SQLite's write lock —
+    this docstring used to say the latter, and that was the bug (AUDIT-2026-07-24 X6):
+    Alembic plans the upgrade before it writes, so the database lock orders the writes
+    but not plan-then-apply. With the branch at `0005` and the merge at `0007`, two
+    workers could sit on different heads and the merge would fail. This test
+    reproduced it 4 times in 10 parallel runs before the fix, and 0 in 30 after —
+    which is also why the worker count is 8: the failure is a race, so the test is
+    only as good as the contention it creates.
     """
     db_path = tmp_path / "test.sqlite3"
     runner = tmp_path / "boot.py"
@@ -266,7 +275,7 @@ def test_concurrent_startup_migrates_exactly_once(tmp_path):
             [sys.executable, str(runner), str(db_path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        for _ in range(4)
+        for _ in range(8)
     ]
     results = [(p.wait(timeout=60), p.communicate()[1]) for p in procs]
 
@@ -276,3 +285,99 @@ def test_concurrent_startup_migrates_exactly_once(tmp_path):
     with sqlite3.connect(db_path) as conn:
         stamps = conn.execute("select count(*) from alembic_version").fetchone()[0]
     assert stamps == 1, f"alembic_version has {stamps} rows — migrated more than once"
+
+
+def test_migration_lock_is_mutually_exclusive_across_processes(tmp_path):
+    """The primitive itself: two processes are never inside the lock at once.
+
+    Tested directly rather than only through `init_db`, because the upgrade race it
+    prevents is probabilistic — a test that only exercises it end-to-end passes by
+    luck when the timing happens not to collide. Each worker records enter/exit
+    around a deliberate pause; if the lock is real, the log is perfectly nested.
+    """
+    db_path = tmp_path / "test.sqlite3"
+    log = tmp_path / "lock.log"
+    runner = tmp_path / "locker.py"
+    runner.write_text(
+        "import os, sys, time\n"
+        f"sys.path.insert(0, {str(ADAPTER_ROOT)!r})\n"
+        "from pathlib import Path\n"
+        "from app import db, migrations\n"
+        "db.DB_PATH = Path(sys.argv[1])\n"
+        "log = Path(sys.argv[2])\n"
+        "pid = os.getpid()\n"
+        "with migrations._migration_lock():\n"
+        "    with log.open('a') as fh:\n"
+        "        fh.write(f'enter {pid}\\n')\n"
+        "    time.sleep(0.25)\n"
+        "    with log.open('a') as fh:\n"
+        "        fh.write(f'exit {pid}\\n')\n"
+    )
+
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(runner), str(db_path), str(log)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(6)
+    ]
+    results = [(p.wait(timeout=60), p.communicate()[1]) for p in procs]
+    assert not [err for code, err in results if code != 0]
+
+    lines = log.read_text().split()
+    events = list(zip(lines[::2], lines[1::2]))
+    assert len(events) == 12, events
+
+    holder = None
+    for action, pid in events:
+        if action == "enter":
+            assert holder is None, f"{pid} entered while {holder} held the lock"
+            holder = pid
+        else:
+            assert holder == pid, f"{pid} exited but {holder} held the lock"
+            holder = None
+    assert holder is None
+
+
+def test_migration_lock_lives_beside_the_database_it_guards(tmp_path, monkeypatch):
+    """Resolved through `db.DB_PATH` at call time, so a test redirecting the database
+    cannot end up locking (or littering) beside the developer's real one."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "nested" / "test.sqlite3")
+
+    assert migrations._lock_path() == tmp_path / "nested" / "test.sqlite3.migrate.lock"
+
+    with migrations._migration_lock():
+        pass
+    assert migrations._lock_path().exists()
+
+
+def test_a_pending_migration_snapshots_once_across_concurrent_workers(tmp_path):
+    """The snapshot decision is inside the lock, so N workers racing a pending
+    migration take one backup between them, not one each."""
+    db_path = tmp_path / "test.sqlite3"
+    seed = sqlite3.connect(db_path)
+    seed.execute("create table legacy_rows (id integer primary key)")
+    seed.commit()
+    seed.close()
+
+    runner = tmp_path / "boot.py"
+    runner.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {str(ADAPTER_ROOT)!r})\n"
+        "from pathlib import Path\n"
+        "from app import db\n"
+        "db.DB_PATH = Path(sys.argv[1])\n"
+        "db.init_db()\n"
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(runner), str(db_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(6)
+    ]
+    results = [(p.wait(timeout=60), p.communicate()[1]) for p in procs]
+    assert not [err for code, err in results if code != 0], results
+
+    snapshots = list((tmp_path / "backups").glob("test-*.sqlite3"))
+    assert len(snapshots) == 1, [p.name for p in snapshots]
