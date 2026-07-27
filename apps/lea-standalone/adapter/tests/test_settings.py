@@ -2,6 +2,8 @@ import json
 from io import BytesIO
 import urllib.error
 
+import pytest
+
 from app import db
 from app import settings as settings_service
 
@@ -290,3 +292,110 @@ def test_update_settings_rejects_malformed_github_token(tmp_path, monkeypatch):
         assert exc.field == "github_token"
     else:
         raise AssertionError("Expected SettingsValidationError")
+
+
+# --- AUDIT-2026-07-24 C11: requirements are a property of the model -----------
+# `required_keys` came from litellm.validate_environment()["missing_keys"], which is
+# computed against os.environ. A key exported in the shell made the list come back
+# EMPTY, so the caller's "is it configured?" check had nothing to check and
+# `satisfied` was unconditionally True — a guard that passed every model, with an
+# answer that depended on the process it ran in.
+
+def _blank_config(tmp_path):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text("")
+    return config_path
+
+
+@pytest.mark.parametrize(
+    "model,expected",
+    [
+        ("gpt-5.5", "OPENAI_API_KEY"),
+        ("claude-opus-4-8", "ANTHROPIC_API_KEY"),
+        ("gemini/gemini-3.1-pro-preview", "GEMINI_API_KEY"),
+        ("mistral/mistral-large-latest", "MISTRAL_API_KEY"),
+    ],
+)
+def test_required_keys_do_not_change_when_the_key_is_in_the_environment(
+    tmp_path, monkeypatch, model, expected
+):
+    config_path = _blank_config(tmp_path)
+
+    monkeypatch.delenv(expected, raising=False)
+    without = settings_service.model_requirements(model, config_path)
+    monkeypatch.setenv(expected, "sk-exported-in-the-shell")
+    with_env = settings_service.model_requirements(model, config_path)
+
+    envs = [key["env"] for key in without["required_keys"]]
+    assert expected in envs
+    assert [key["env"] for key in with_env["required_keys"]] == envs
+
+
+def test_a_model_with_no_key_anywhere_is_not_satisfied(tmp_path, monkeypatch):
+    """The check has to actually refuse something — `satisfied` was unconditionally
+    True whenever the key happened to be exported, which is every developer machine."""
+    config_path = _blank_config(tmp_path)
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+
+    requirements = settings_service.model_requirements("mistral/mistral-large-latest", config_path)
+
+    assert requirements["provider"] == "mistral"
+    assert requirements["satisfied"] is False
+    assert requirements["required_keys"][0]["configured"] is False
+
+
+def test_an_exported_key_satisfies_without_erasing_the_requirement(tmp_path, monkeypatch):
+    """An exported key must MEET the requirement, not delete it — the run works, so
+    refusing it would be a false negative, but the key must still be reported."""
+    config_path = _blank_config(tmp_path)
+    monkeypatch.setenv("MISTRAL_API_KEY", "sk-exported")
+
+    requirements = settings_service.model_requirements("mistral/mistral-large-latest", config_path)
+
+    assert [key["env"] for key in requirements["required_keys"]] == ["MISTRAL_API_KEY"]
+    assert requirements["required_keys"][0]["configured"] is True
+    assert requirements["satisfied"] is True
+
+
+def test_a_saved_key_satisfies_with_a_clean_environment(tmp_path, monkeypatch):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('MISTRAL_API_KEY = "sk-saved-in-settings"\n')
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+
+    requirements = settings_service.model_requirements("mistral/mistral-large-latest", config_path)
+
+    assert requirements["required_keys"][0]["configured"] is True
+    assert requirements["satisfied"] is True
+
+
+def test_either_acceptable_key_satisfies_a_multi_key_provider(tmp_path, monkeypatch):
+    """Gemini takes GEMINI_API_KEY or GOOGLE_API_KEY; both must be reported, and
+    either alone must satisfy."""
+    config_path = _blank_config(tmp_path)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-exported")
+
+    requirements = settings_service.model_requirements(
+        "gemini/gemini-3.1-pro-preview", config_path
+    )
+
+    assert [key["env"] for key in requirements["required_keys"]] == [
+        "GEMINI_API_KEY", "GOOGLE_API_KEY",
+    ]
+    assert requirements["satisfied"] is True
+
+
+def test_credential_chain_providers_require_no_env_key(tmp_path, monkeypatch):
+    """Vertex/Bedrock/Ollama authenticate through a credential chain or not at all.
+    Demanding a `<PROVIDER>_API_KEY` for them would be a false rejection."""
+    config_path = _blank_config(tmp_path)
+
+    for model, provider in (
+        ("vertex_ai/gemini-2.0-flash", "vertex_ai"),
+        ("bedrock/anthropic.claude-v2", "bedrock"),
+        ("ollama/llama3", "ollama"),
+    ):
+        requirements = settings_service.model_requirements(model, config_path)
+        assert requirements["provider"] == provider, model
+        assert requirements["required_keys"] == [], model
+        assert requirements["satisfied"] is True, model

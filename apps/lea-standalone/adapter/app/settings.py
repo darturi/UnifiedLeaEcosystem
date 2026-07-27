@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import socket
 import urllib.error
@@ -153,34 +154,54 @@ def model_catalog() -> list[dict[str, str]]:
 
 
 def _required_env_keys(model: str) -> list[str]:
+    """The env vars that can authenticate `model` — any ONE of them satisfies it.
+
+    A provider LiteLLM recognises is authoritative, *including* when it needs no
+    single env var (Vertex/Bedrock/Ollama authenticate through a credential chain).
+    That empty answer is returned as-is rather than falling through to the family
+    heuristic, which would invent a requirement the provider doesn't have. The
+    heuristic is only for models LiteLLM can't place at all."""
     if models_catalog.is_available():
-        keys = models_catalog.requirements_for(model).get("required_keys") or []
-        if keys:
-            return list(keys)
+        requirements = models_catalog.requirements_for(model)
+        if requirements.get("provider"):
+            return [str(key) for key in (requirements.get("required_keys") or [])]
     family = _model_family(model)
     if family and family in FAMILY_ENV:
         return [FAMILY_ENV[family]]
     return []
 
 
+def _key_available(env: str, saved: set[str]) -> bool:
+    """Whether `env` can authenticate a run: saved in the config file, or already
+    present in the process environment.
+
+    Both count, because both work — `load_config` exports the saved keys into
+    `os.environ` and LiteLLM reads them from there, so a key exported in the user's
+    shell authenticates exactly as well as one typed into Settings. Counting only the
+    file would refuse a model that demonstrably runs.
+
+    Pairing this with the now environment-independent `required_keys` is what makes
+    the check coherent (AUDIT-2026-07-24 C11). Previously the *requirement* was
+    derived from the environment while *satisfaction* was judged against the file, so
+    an exported key erased the requirement instead of meeting it — and every model
+    passed."""
+    return env in saved or bool(os.environ.get(env))
+
+
 def model_requirements(model: str, path: Path | None = None) -> dict[str, Any]:
     """Which key(s) a model needs and whether they're configured — drives the
     dynamic API-key prompt in Settings."""
     required = _required_env_keys(model)
-    configured = set(configured_provider_keys(path).keys())
-    provider = None
-    if models_catalog.is_available():
-        provider = models_catalog.requirements_for(model).get("provider")
-    if not provider:
-        provider = _model_family(model)
+    saved = set(configured_provider_keys(path).keys())
+    provider = models_catalog.provider_for(model) or _model_family(model)
     return {
         "model": model,
         "provider": provider,
         "required_keys": [
-            {"env": env, "label": _key_label(env), "configured": env in configured}
+            {"env": env, "label": _key_label(env), "configured": _key_available(env, saved)}
             for env in required
         ],
-        "satisfied": (not required) or any(env in configured for env in required),
+        "satisfied": (not required) or any(_key_available(env, saved) for env in required),
     }
 
 
@@ -321,8 +342,10 @@ def _validate_selected_model_has_key(
     required = _required_env_keys(model)
     if not required:
         return
+    # Same "saved OR already exported" rule `model_requirements` applies, so Settings
+    # can't refuse to save a model that would in fact run (AUDIT-2026-07-24 C11).
     configured = _configured_env_keys_after(current_keys, updates)
-    if any(env in configured for env in required):
+    if any(_key_available(env, configured) for env in required):
         return
     env = required[0]
     raise SettingsValidationError(
