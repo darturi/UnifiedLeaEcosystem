@@ -953,7 +953,10 @@ def run_lea(context: RunnerContext) -> None:
         if spend_capped or max_spend_usd is None:
             return
         try:
-            persisted = float(store.usage_stats()["global"]["cost_usd"])
+            # A scalar aggregate over every run — NOT usage_stats()["global"], which
+            # summed a 100-session page and so under-reported the very total this cap
+            # is enforced against (AUDIT-2026-07-24 C1).
+            persisted = store.total_spend_usd()
         except Exception:
             logger.exception("Could not read persisted spend; skipping this cap check")
             return

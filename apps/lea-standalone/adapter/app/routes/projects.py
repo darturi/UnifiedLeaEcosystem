@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
@@ -86,8 +87,28 @@ class RemoteUpdate(BaseModel):
     remote_url: str
 
 
-# An https GitHub-style repo URL: host / owner / repo (repo may carry a `.git`).
-_GITHUB_REMOTE_RE = re.compile(r"^https://[\w.\-]+/[\w.\-]+/[\w.\-]+$")
+# An https GitHub repo URL: `github.com` / owner / repo (repo may carry a `.git`).
+#
+# The host is pinned deliberately (AUDIT-2026-07-24 S2). This pattern used to be
+# `https://[\w.\-]+/...` — any host — while the error message below promised
+# "a GitHub repo URL". `_push_project` hands the stored value to `push_to_github`,
+# which embeds the global GitHub token in it, so an unpinned host turned "set a
+# remote" into "mail my PAT to a server of the caller's choosing". Each path
+# segment must start with a word character or hyphen, so `..` can't appear as an
+# owner/repo either. `gitstore._inject_token` enforces the same host rule at the
+# credential boundary; this is the input-validation half.
+_GITHUB_REMOTE_RE = re.compile(r"^https://(?:www\.)?github\.com/[\w\-][\w.\-]*/[\w\-][\w.\-]*$")
+
+
+def _normalize_remote_url(remote_url: str) -> str:
+    return str(remote_url or "").strip().rstrip("/")
+
+
+def _is_web_remote(remote_url: str) -> bool:
+    """True for an http(s) remote — the only shape that can carry the token to a
+    server. Local paths and ssh remotes are never credential-bearing."""
+    return urlparse(str(remote_url or "")).scheme in ("http", "https")
+
 
 # Git's wording for "the remote has commits you don't" (a rejected, non-fast-forward push).
 _DIVERGED_MARKERS = ("non-fast-forward", "fetch first", "updates were rejected", "[rejected]")
@@ -339,7 +360,7 @@ def export_project(project_id: str) -> Response:
 def _set_remote_on(project: dict, remote_url: str) -> dict:
     """Validate + store a project's GitHub remote URL — shared by the by-id and
     by-slug routes (D34). The token stays global in Settings."""
-    url = remote_url.strip().rstrip("/")
+    url = _normalize_remote_url(remote_url)
     if not _GITHUB_REMOTE_RE.fullmatch(url):
         raise HTTPException(
             status_code=400,
@@ -358,6 +379,19 @@ def _push_project(project: dict) -> dict:
     token = github_token()
     if not token:
         raise HTTPException(status_code=400, detail="No GitHub token configured. Add one in Settings.")
+    # Re-check the host at the moment the credential would be used (AUDIT-2026-07-24 S2).
+    # `_set_remote_on` validates on the way in, but a row written before the host was
+    # pinned — or by anything else that touches `projects.remote_url` — must not become
+    # a token-delivery target on the way out. Only http(s) remotes can carry the token,
+    # so a local-path or ssh remote is left alone.
+    if _is_web_remote(remote_url) and not _GITHUB_REMOTE_RE.fullmatch(_normalize_remote_url(remote_url)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This project's remote is not a GitHub URL, so pushing it would send your "
+                "GitHub token to another server. Set an https://github.com/... remote first."
+            ),
+        )
     repo = project_service.project_repo_dir(project, _proofs_root())
     try:
         summary = GitStore(_proofs_root()).push_to_github(repo, remote_url, token)

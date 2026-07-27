@@ -485,7 +485,15 @@ def refresh_project_title_docs(project: dict, proofs_root: Path, title: str) -> 
 
 
 def _project_has_active_runs(project_id: str) -> bool:
-    return any(session.get("status") == "running" for session in store.list_project_sessions(project_id))
+    """Whether any run is live in this project — the interlock `migrate_project_namespace`
+    checks before rewriting and `shutil.move`-ing the whole repo.
+
+    This used to be `any(session["status"] == "running" ...)` over the session list,
+    which could never fire for a session that had already written a file: derived
+    session status is a working-copy verdict, not run lifecycle (D14). So the one
+    case the interlock exists for — an agent mid-run in an established session — was
+    exactly the case it missed (AUDIT-2026-07-24 C2)."""
+    return store.project_has_active_run(project_id)
 
 
 def migrate_project_namespace(

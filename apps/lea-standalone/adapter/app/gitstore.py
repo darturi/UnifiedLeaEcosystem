@@ -42,15 +42,34 @@ def commit_message(subject: str) -> str:
     return f"{subject}\n\n{CO_AUTHOR_TRAILER}"
 
 
+# The only hosts the GitHub token may be embedded in a URL for (AUDIT-2026-07-24 S2).
+# `_inject_token` puts the credential *in the URL*, which git sends on the very first
+# request — so this set IS the blast radius of the token, and it belongs here, at the
+# credential boundary, not only in whatever route happened to build the URL. Callers
+# construct these hosts themselves (`ghimport` clones github.com/gist.github.com; the
+# project push target is validated at the route), so nothing legitimate is excluded.
+GITHUB_CREDENTIAL_HOSTS = frozenset({"github.com", "www.github.com", "gist.github.com"})
+
+
 def _inject_token(remote_url: str, token: str) -> str:
-    """Embed the token into an https remote URL for a single push (D34).
+    """Embed the token into an https GitHub URL for a single push/clone (D34).
 
     `https://github.com/owner/repo(.git)` → `https://x-access-token:<token>@github.com/owner/repo`.
-    Only https/http URLs are rewritten; ssh/other schemes are returned unchanged
-    (the token can't help there). The result is used as a one-shot push target and
-    is never written to `.git/config`, so the token never lands on disk."""
+
+    The URL is returned **unchanged** — i.e. the token is not sent at all — unless it
+    is `https` *and* its host is in :data:`GITHUB_CREDENTIAL_HOSTS`. ssh/local-path
+    remotes were always left alone (the token can't help there); the host check is
+    the part that was missing (AUDIT-2026-07-24 S2): a remote pointing at any other
+    server turned "push this project" into handing that server the user's PAT, since
+    git offers URL credentials to the host before it knows whether the repo exists.
+    `http` is excluded too — the credential must not travel in cleartext.
+
+    The result is used as a one-shot push/clone target and is never written to
+    `.git/config`, so the token never lands on disk."""
     parsed = urlparse(remote_url)
-    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+    if parsed.scheme != "https" or not parsed.hostname:
+        return remote_url
+    if parsed.hostname.lower() not in GITHUB_CREDENTIAL_HOSTS:
         return remote_url
     netloc = f"x-access-token:{token}@{parsed.hostname}"
     if parsed.port:

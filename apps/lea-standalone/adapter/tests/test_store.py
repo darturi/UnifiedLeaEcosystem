@@ -637,3 +637,84 @@ def test_upsert_artifact_scopes_by_project_then_session(tmp_path, monkeypatch):
     assert rows[0]["kind"] == "definition"
     assert rows[0]["session_id"] == session_b["id"]
     assert updated["created_at"] != updated["updated_at"] or rows[0]["path"] == "new.lean"
+
+
+# --- AUDIT-2026-07-24 C1: global totals must not be a page of sessions ---------
+
+def _seed_sessions_with_spend(count, cost_each, tokens_each=10):
+    """`count` sessions, each with one finished run costing `cost_each`."""
+    for i in range(count):
+        session = store.create_session(f"S{i}")
+        run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+        store.add_message(session["id"], "user", "prove it", run["id"])
+        store.update_run(
+            run["id"], "proved",
+            input_tokens=tokens_each, output_tokens=tokens_each, cost_usd=cost_each,
+        )
+
+
+def test_global_usage_counts_every_session_past_the_list_page(tmp_path, monkeypatch):
+    """`usage_stats()["global"]` summed `list_sessions()`, which ends in `limit 100`.
+    So beyond 100 sessions the reported spend *fell* as older ones aged out of the
+    window — and `max_spend_usd` is enforced against that number."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _seed_sessions_with_spend(120, cost_each=1.0)
+
+    stats = store.usage_stats()
+
+    assert stats["global"]["session_count"] == 120
+    assert stats["global"]["message_count"] == 120
+    assert abs(stats["global"]["cost_usd"] - 120.0) < 1e-9
+    assert stats["global"]["total_tokens"] == 120 * 20
+    # The rendered session table is still a page — that part is intentional.
+    assert len(stats["sessions"]) == 100
+    # ...and the global block must agree with the daily/model rollups beside it,
+    # which were already full-table aggregates and so silently disagreed.
+    assert abs(sum(d["cost_usd"] for d in stats["daily"]) - stats["global"]["cost_usd"]) < 1e-9
+    assert abs(sum(m["cost_usd"] for m in stats["models"]) - stats["global"]["cost_usd"]) < 1e-9
+
+
+def test_total_spend_usd_sees_every_run(tmp_path, monkeypatch):
+    """The scalar the spend cap reads. Same bug, and the one that actually let a
+    capped workspace keep spending."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _seed_sessions_with_spend(150, cost_each=0.5)
+
+    assert abs(store.total_spend_usd() - 75.0) < 1e-9
+
+
+def test_spend_limit_is_reached_past_the_list_page(tmp_path, monkeypatch):
+    """The end-to-end consequence: with 150 sessions at $0.50 and a $100 cap, the
+    old path summed the newest 100 ($50) and reported 'under the limit' forever."""
+    from app import settings as settings_service
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    _seed_sessions_with_spend(150, cost_each=0.5)
+
+    assert settings_service.current_spend_usd() > 50.0
+    assert settings_service.spend_limit_reached(100.0) is False   # $75 < $100
+    assert settings_service.spend_limit_reached(70.0) is True     # $75 >= $70
+
+
+def test_origin_rollup_counts_every_session_and_agrees_with_global(tmp_path, monkeypatch):
+    """The rollup's contract is that it agrees with `global`. Both were folded from
+    the same truncated page, so they agreed while both were wrong."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    for i in range(60):
+        for origin in ("ui", "overleaf"):
+            session = store.create_session(f"{origin}-{i}", origin=origin)
+            run = store.create_run(session["id"], "gpt-4o", "openai", 3)
+            store.update_run(run["id"], "proved", input_tokens=5, output_tokens=5, cost_usd=0.25)
+
+    stats = store.usage_stats()
+    by_origin = {row["origin"]: row for row in stats["origins"]}
+
+    assert by_origin["ui"]["session_count"] == 60
+    assert by_origin["overleaf"]["session_count"] == 60
+    total = sum(row["cost_usd"] for row in stats["origins"])
+    assert abs(total - stats["global"]["cost_usd"]) < 1e-9
+    assert abs(total - 30.0) < 1e-9

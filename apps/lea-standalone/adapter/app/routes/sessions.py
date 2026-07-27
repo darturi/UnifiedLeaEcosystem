@@ -401,7 +401,20 @@ def _resolve_proof_path(session_id: str, path: str | None) -> tuple[str, str]:
     """(absolute on-disk path, repo-relative path) for the file to check/verify.
 
     Defaults to the session's latest code_step path. Filesystem-canonical (D3): the
-    on-disk file is what the agent, the user, and lean_check/SafeVerify all touch."""
+    on-disk file is what the agent, the user, and lean_check/SafeVerify all touch.
+
+    The path is **confined to the session's repo** (AUDIT-2026-07-24 S3). It used to
+    be a bare ``repo / rel`` join on a caller-supplied string, so
+    ``{"path": "../../../../etc/passwd"}`` escaped the session directory — and all
+    three callers act on whatever it resolves to: ``lean-check`` runs Lean over it
+    and returns the diagnostics (which quote source lines), ``rebuild`` runs
+    ``lake build`` against it, and ``verify`` runs SafeVerify. ``write_file_session``
+    has had this guard from the start; this is the same one, via the now-shared
+    ``filesystem.safe_abs``, which also keeps ``.git``/``.lake`` internals out of reach.
+
+    The returned relative path is normalized (resolved, POSIX) — the same form
+    ``bridge._relativize`` stores — so the code-step lookups keyed on it are
+    unaffected."""
     config = load_config()
     if config.lea_root is None:
         raise HTTPException(status_code=422, detail="lea_root is not configured")
@@ -413,7 +426,11 @@ def _resolve_proof_path(session_id: str, path: str | None) -> tuple[str, str]:
         raise HTTPException(status_code=404, detail="Session not found")
     gs, repo_key = resolved
     repo = gs.session_repo(repo_key)
-    return str(repo / rel), rel
+    try:
+        abs_path = fs_service.safe_abs(repo, rel)
+    except fs_service.FilesystemError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return str(abs_path), abs_path.relative_to(repo.resolve()).as_posix()
 
 
 def _latest_proof_path(session_id: str) -> str | None:

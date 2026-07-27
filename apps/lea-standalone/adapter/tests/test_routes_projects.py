@@ -434,6 +434,53 @@ def test_set_project_remote_valid_and_invalid(tmp_path, monkeypatch):
     assert ei.value.status_code == 400
 
 
+def test_set_project_remote_pins_the_github_host(tmp_path, monkeypatch):
+    """AUDIT-2026-07-24 S2: the pattern used to accept ANY host while the error
+    message promised a GitHub URL — and `push` embeds the user's PAT in whatever
+    was stored, so a foreign host was credential exfiltration, not a typo."""
+    _setup(tmp_path, monkeypatch)
+    pid = projects_route.create_project(ProjectCreate(title="Pin Me"))["id"]
+    from app.routes.projects import RemoteUpdate
+
+    for hostile in (
+        "https://evil.example.com/me/repo",         # the exfiltration target
+        "https://github.com.evil.example.com/a/b",  # suffix lookalike
+        "https://gitlab.com/me/repo",               # a real, wrong forge
+        "http://github.com/me/repo",                # cleartext
+        "https://github.com/../..",                 # traversal-ish path segments
+    ):
+        with pytest.raises(HTTPException) as ei:
+            projects_route.set_project_remote(pid, RemoteUpdate(remote_url=hostile))
+        assert ei.value.status_code == 400, hostile
+    assert store.get_project(pid)["remote_url"] is None
+
+    # The legitimate shapes still round-trip.
+    for good in ("https://github.com/me/repo", "https://www.github.com/me/repo.git"):
+        assert projects_route.set_project_remote(
+            pid, RemoteUpdate(remote_url=good)
+        )["remote_url"] == good
+
+
+def test_push_refuses_a_non_github_remote_stored_directly(tmp_path, monkeypatch):
+    """The row can hold a remote that predates the pinned host (or was written by
+    something other than the route). Re-check where the credential is actually
+    used, so an old row can't become a token-delivery target."""
+    _setup(tmp_path, monkeypatch)
+    pid = projects_route.create_project(ProjectCreate(title="Legacy Remote"))["id"]
+    store.update_project(pid, remote_url="https://evil.example.com/me/repo")
+    monkeypatch.setattr(projects_route, "github_token", lambda: "ghp_dummy")
+
+    def explode(*args, **kwargs):  # push must not be reached at all
+        raise AssertionError("push_to_github was called for a non-GitHub remote")
+
+    monkeypatch.setattr(projects_route.GitStore, "push_to_github", explode)
+
+    with pytest.raises(HTTPException) as ei:
+        projects_route.push_project(pid)
+    assert ei.value.status_code == 400
+    assert "github" in ei.value.detail.lower()
+
+
 def test_push_guards_no_remote_then_no_token(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     from app.routes.projects import RemoteUpdate

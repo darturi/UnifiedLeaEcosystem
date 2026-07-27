@@ -111,12 +111,11 @@ class ApiKeyUpdate:
 
 def settings_payload(path: Path | None = None) -> dict[str, Any]:
     config = load_config(path)
-    stats = store.usage_stats()
     return {
         "model": config.model,
         "max_turns": config.max_turns,
         "max_spend_usd": config.max_spend_usd,
-        "current_spend_usd": float(stats["global"]["cost_usd"]),
+        "current_spend_usd": current_spend_usd(),
         "api_keys": _api_keys_payload(configured_provider_keys(path)),
         "model_options": MODEL_OPTIONS,
         "permission_tier": config_permission_tier(path),
@@ -283,7 +282,10 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
 
 
 def current_spend_usd() -> float:
-    return float(store.usage_stats()["global"]["cost_usd"])
+    """Total persisted spend. Reads the dedicated scalar aggregate rather than
+    `usage_stats()["global"]`, which was a sum over a 100-row page and therefore
+    under-reported — see `store.total_spend_usd` (AUDIT-2026-07-24 C1)."""
+    return store.total_spend_usd()
 
 
 def spend_limit_reached(max_spend_usd: float | None, pending_cost_usd: float | None = None) -> bool:

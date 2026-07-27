@@ -229,3 +229,46 @@ def test_uncommitted_diff_empty_after_its_commit(tmp_path):
     store.commit_write("s1", turn=None, author="user", tool="edit_file")  # then commit
     assert captured != ""
     assert store.uncommitted_diff("s1") == ""
+
+
+# --- D34 / AUDIT-2026-07-24 S2: the token only ever goes to GitHub -------------
+
+def test_inject_token_embeds_the_credential_for_github(tmp_path):
+    from app.gitstore import _inject_token
+
+    assert _inject_token("https://github.com/me/repo", "ghp_secret") == (
+        "https://x-access-token:ghp_secret@github.com/me/repo"
+    )
+    # gist clones (ghimport's private-gist path) are the same credential domain
+    assert "x-access-token:ghp_secret@gist.github.com" in _inject_token(
+        "https://gist.github.com/abc123.git", "ghp_secret"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example.com/me/repo",          # the S2 exfiltration target
+        "https://github.com.evil.example.com/a/b",   # suffix-lookalike host
+        "https://raw.githubusercontent.com/a/b",     # GitHub-owned, but not a clone host
+        "http://github.com/me/repo",                 # cleartext: never send the token
+        "git@github.com:me/repo.git",                # ssh: URL credentials don't apply
+    ],
+)
+def test_inject_token_refuses_every_non_github_https_target(url):
+    """The token is embedded in the URL, which git sends on its FIRST request — so a
+    remote pointing anywhere else must come back untouched rather than authenticated."""
+    from app.gitstore import _inject_token
+
+    assert _inject_token(url, "ghp_secret") == url
+    assert "ghp_secret" not in _inject_token(url, "ghp_secret")
+
+
+def test_push_to_a_non_github_remote_sends_no_credential(tmp_path):
+    """End-to-end at the gitstore seam: pushing to a non-GitHub https remote fails
+    (nothing is listening), and the token appears nowhere in the attempted URL."""
+    store, repo = _init_with_file(tmp_path)
+    store.commit_write("s1", turn=1, tool="write_file")
+    with pytest.raises(GitStoreError) as ei:
+        store.push_to_github(repo, "https://127.0.0.1:9/steal/me", "ghp_secret")
+    assert "ghp_secret" not in str(ei.value)
