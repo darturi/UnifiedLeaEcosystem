@@ -914,22 +914,33 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     onto the current working step (the canvas's latest snapshot of that file)."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' and path = ? "
-            "order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.path = ? "
+            "order by t.id desc limit 1",
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
 
 
-def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
+def code_steps_for_project_path(
+    project_id: str, path: str, *, include_content: bool = True
+) -> list[dict]:
     """Every code step for a file across a project's sessions, newest first — the raw
     material for a blueprint node's status + session attribution (D29). Joins on the
     session's project_id so loose sessions never leak in. Ordered by `created_at`
     (cross-session recency; `id` only orders within one session), so the first row is
-    the latest verdict and the distinct session order is newest-touched-first."""
+    the latest verdict and the distinct session order is newest-touched-first.
+
+    `include_content=False` returns the rows with `code=""` and skips the blob join
+    entirely (AUDIT-2026-07-24 P3). The blueprint graph calls this once per node and
+    reads only `check_status`/`session_id`/`created_at`, so hydrating every historical
+    revision of every file — each formerly its own connection and its own full copy of
+    the proof — was work whose result was discarded."""
+    content_join = "left join artifact_blobs b on b.id = c.after_blob_id" if include_content else ""
+    content_column = "b.content as blob_content" if include_content else "'' as blob_content"
     with connect() as conn:
         rows = conn.execute(
-            "select c.* from timeline c join sessions s on s.id = c.session_id "
+            f"select c.*, {content_column} from timeline c "
+            f"join sessions s on s.id = c.session_id {content_join} "
             "where s.project_id = ? and c.kind = 'code' and c.path = ? "
             "order by c.created_at desc, c.id desc",
             (project_id, path),
@@ -963,8 +974,8 @@ def latest_agent_code_step(session_id: str) -> dict | None:
     'knew' (D12). Its content vs. the file's current content reveals human edits."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' and author = 'agent' "
-            "order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.author = 'agent' "
+            "order by t.id desc limit 1",
             (session_id,),
         ).fetchone()
     return _code_step_from_row(row) if row else None
@@ -978,8 +989,8 @@ def latest_agent_code_step_for_path(session_id: str, path: str) -> dict | None:
     other session's file as diverged too. Keying on the path is what scopes it."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' "
-            "and author = 'agent' and path = ? order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' "
+            "and t.author = 'agent' and t.path = ? order by t.id desc limit 1",
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
@@ -1262,17 +1273,34 @@ def _message_from_row(row) -> dict:
     }
 
 
+# Every read that turns timeline rows into code steps selects through this, so the
+# blob arrives WITH the row instead of costing a second query — and a whole extra
+# SQLite connection — per step (AUDIT-2026-07-24 P3). `session_detail` on a session
+# with 200 steps opened 200 connections; `graph.build_graph` did it per revision of
+# per file. Aliased to `blob_content` because `timeline.content` already exists (it
+# holds message text), so `b.content` would collide on the way out.
+TIMELINE_WITH_BLOB = (
+    "select t.*, b.content as blob_content from timeline t "
+    "left join artifact_blobs b on b.id = t.after_blob_id"
+)
+
+
 def _code_step_from_row(row, *, code: str | None = None) -> dict:
     """A timeline code row in the shape the API has always returned.
 
-    `code` is passed when the caller already has the bytes (it just wrote them);
-    otherwise it's read from the blob. A `content_lost` row yields `""` — the row
-    survives to say a step happened, which is more honest than deleting history
-    because its bytes are gone.
+    `code` is passed when the caller already has the bytes (it just wrote them).
+    Otherwise it comes from the row's joined `blob_content` when the query used
+    :data:`TIMELINE_WITH_BLOB`, and only failing that from a separate `blob_content()`
+    lookup — the fallback that used to be the only path. A `content_lost` row yields
+    `""`: the row survives to say a step happened, which is more honest than deleting
+    history because its bytes are gone.
     """
     d = row_to_dict(row)
     if code is None:
-        code = blob_content(d["after_blob_id"]) or ""
+        code = d.get("blob_content")
+        if code is None:
+            code = blob_content(d["after_blob_id"]) or ""
+    d.pop("blob_content", None)
     return {
         "id": str(d["id"]),
         "session_id": d["session_id"],
@@ -1482,7 +1510,7 @@ def set_code_step_check(
             "where id = ? and kind = 'code'",
             (check_status, check_detail, artifact_kind if check_status == "ok" else None, int(step_id)),
         )
-        row = conn.execute("select * from timeline where id = ?", (int(step_id),)).fetchone()
+        row = conn.execute(f"{TIMELINE_WITH_BLOB} where t.id = ?", (int(step_id),)).fetchone()
     return _code_step_from_row(row) if row else None
 
 
@@ -1599,8 +1627,12 @@ def session_detail(session_id: str) -> dict | None:
         # counter so the frontend could merge them by a single key; now they're the
         # same rows, split apart on the way out only because the API shape predates
         # the merge. `id` is the order — nothing can disagree about it.
+        # The blob rides along with the row (P3). This used to be a bare
+        # `select * from timeline`, and the code steps were built AFTER the connection
+        # closed — so every step then opened its own connection for its own blob. A
+        # session with 200 steps opened 200 connections to render one thread.
         rows = conn.execute(
-            "select * from timeline where session_id = ? order by id asc",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? order by t.id asc",
             (session_id,),
         ).fetchall()
         status_events = conn.execute(

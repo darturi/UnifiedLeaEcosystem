@@ -341,6 +341,62 @@ def emit(events: "runbroker.RunBroker | Queue[dict[str, Any]]",
     events.put({"type": event_type, "payload": payload})
 
 
+# How long a run may hold streamed text before publishing it, and the largest single
+# frame it will build. The interval matches the subscriber poll in
+# `routes/runs._subscribe` — text produced between two polls is delivered together no
+# matter how many frames it arrived in, so a finer granularity than this is invisible.
+_DELTA_FLUSH_SECONDS = 0.08
+_DELTA_FLUSH_CHARS = 512
+
+
+class _DeltaStream:
+    """Coalesce per-token ``assistant_delta`` frames into roughly one frame per poll.
+
+    The prover yields one ``AssistantTextDelta`` per token and the adapter published
+    one SSE frame for each. Nobody could see that granularity — the browser renders
+    whatever accumulated since its last 80 ms poll — but every frame cost a dict and a
+    list slot retained in the broker for the run's whole life, and made each poll walk
+    further (AUDIT-2026-07-24 P1). A long run buffered tens of thousands of frames to
+    deliver text a fraction of that size.
+
+    Frames are merged **before** publication, never after. An event already in the
+    broker carries a ``seq`` some subscriber may have consumed, so appending to it in
+    place would silently lose text for any client whose cursor is already past it —
+    which is why this batches upstream instead of compacting the buffer.
+
+    A slow stream is not delayed: the deadline is checked on arrival, so when tokens
+    come in slower than the interval each one flushes immediately.
+    """
+
+    def __init__(self, events: "runbroker.RunBroker | Queue[dict[str, Any]]") -> None:
+        self._events = events
+        self._parts: list[str] = []
+        self._length = 0
+        self._deadline: float | None = None
+
+    def add(self, text: str) -> None:
+        if not text:
+            return
+        self._parts.append(text)
+        self._length += len(text)
+        now = time.monotonic()
+        if self._deadline is None:
+            self._deadline = now + _DELTA_FLUSH_SECONDS
+        if self._length >= _DELTA_FLUSH_CHARS or now >= self._deadline:
+            self.flush()
+
+    def flush(self) -> None:
+        """Publish whatever is buffered. Must run before ANY other event is emitted, so
+        streamed text can never appear after the step it preceded."""
+        if not self._parts:
+            return
+        text = "".join(self._parts)
+        self._parts.clear()
+        self._length = 0
+        self._deadline = None
+        emit(self._events, "assistant_delta", {"text": text})
+
+
 # A run's final status. "proved" / "disproved" / "needs_review" are terminal
 # checked-artifact outcomes. "answered" is a chat / QA / sketch-pause turn that
 # finished cleanly but proved nothing, so the UI never marks a conversational turn
@@ -364,6 +420,50 @@ _MAX_SPEND_DETAIL = "Max spend limit reached; the run was stopped at a turn boun
 # every active run's observed ``UsageUpdated`` total.
 _live_spend_lock = Lock()
 _live_run_costs: dict[str, float] = {}
+
+
+# Persisted spend changes only when a run *finishes* (`update_run` writes its
+# cost_usd), but the cap is re-checked on every `UsageUpdated` and every turn — so the
+# unmemoized read meant several DB aggregates per second per active run, against the
+# same single-writer SQLite the runs are writing to (AUDIT-2026-07-24 P2). A short TTL
+# removes that without weakening the cap: the term that moves continuously *within* a
+# run is the in-memory `_live_run_costs` overlay, which is always exact, and the
+# staleness this admits is bounded by one other run finishing inside the window.
+_PERSISTED_SPEND_TTL_SECONDS = 2.0
+_persisted_spend_lock = Lock()
+# (database path, monotonic_at, usd). The path is part of the key because the total is
+# a property of ONE database: production never repoints `db.DB_PATH`, but tests do, and
+# a cache that ignored which database it measured would hand one test's total to the
+# next. Same hazard `backup.py` documents for the path it copies.
+_persisted_spend_cache: tuple[Path, float, float] | None = None
+
+
+def _persisted_spend_usd() -> float:
+    """Total spend on finished runs, cached for `_PERSISTED_SPEND_TTL_SECONDS`."""
+    global _persisted_spend_cache
+    from . import db
+
+    path, now = db.DB_PATH, time.monotonic()
+    with _persisted_spend_lock:
+        cached = _persisted_spend_cache
+        if (
+            cached is not None
+            and cached[0] == path
+            and now - cached[1] < _PERSISTED_SPEND_TTL_SECONDS
+        ):
+            return cached[2]
+    value = store.total_spend_usd()
+    with _persisted_spend_lock:
+        _persisted_spend_cache = (path, now, value)
+    return value
+
+
+def reset_persisted_spend_cache() -> None:
+    """Drop the cached total. For tests, and for any caller that has just persisted a
+    run's cost and wants the next check to see it immediately."""
+    global _persisted_spend_cache
+    with _persisted_spend_lock:
+        _persisted_spend_cache = None
 
 
 def _finished_status(ev: Finished) -> str:
@@ -661,11 +761,23 @@ def _subagent_progress_payload(child_id: str, result_id: str, inner) -> dict | N
     return None
 
 
+def _child_deltas(broker, started: dict) -> "_DeltaStream":
+    """The child's own text batcher, created on first use and kept on its `started`
+    record. A child streams tokens onto its own broker exactly like the coordinator
+    does, so it needs the same coalescing (P1)."""
+    stream = started.get("deltas")
+    if stream is None:
+        stream = _DeltaStream(broker)
+        started["deltas"] = stream
+    return stream
+
+
 def _flush_child_narration(broker, started: dict) -> None:
     """Commit the child's buffered narration as ONE assistant message on its broker, then
     clear the buffer. Mirrors the coordinator's `flush_narration`: a `message` whose
     content overlaps the live bubble REPLACES it (frontend), so each turn's narration lands
     as its own message instead of every turn concatenating into one run-together blob."""
+    _child_deltas(broker, started).flush()  # P1: publish trailing streamed text first
     buf = started.get("narration") or []
     text = "".join(buf).strip()
     started["narration"] = []
@@ -692,8 +804,12 @@ def _forward_to_child_broker(broker, inner, started: dict) -> None:
     only; the durable transcript still replays into the child session on finish."""
     if isinstance(inner, AssistantTextDelta):
         started.setdefault("narration", []).append(inner.text)
-        emit(broker, "assistant_delta", {"text": inner.text})
-    elif isinstance(inner, TurnStarted):
+        _child_deltas(broker, started).add(inner.text)
+        return
+    # Same ordering rule as the coordinator (P1): anything that is not streamed text
+    # ends the batch, so a delta can't land after the step it preceded.
+    _child_deltas(broker, started).flush()
+    if isinstance(inner, TurnStarted):
         # A new turn began → the previous turn's narration is complete; commit it.
         _flush_child_narration(broker, started)
     elif isinstance(inner, ToolCalled):
@@ -906,6 +1022,9 @@ def run_lea(context: RunnerContext) -> None:
     skills_tempdir: str | None = None
 
     narration: list[str] = []
+    # Batches streamed text into ~one frame per subscriber poll (P1). `narration` still
+    # accumulates every token for persistence — this only shapes what goes on the wire.
+    deltas = _DeltaStream(events)
     current_turn = 0
     last_tool: str | None = None
     # The intent narration the model wrote just before its current tool call —
@@ -955,8 +1074,9 @@ def run_lea(context: RunnerContext) -> None:
         try:
             # A scalar aggregate over every run — NOT usage_stats()["global"], which
             # summed a 100-session page and so under-reported the very total this cap
-            # is enforced against (AUDIT-2026-07-24 C1).
-            persisted = store.total_spend_usd()
+            # is enforced against (AUDIT-2026-07-24 C1) — and memoized, because this
+            # runs per usage event (P2).
+            persisted = _persisted_spend_usd()
         except Exception:
             logger.exception("Could not read persisted spend; skipping this cap check")
             return
@@ -1054,13 +1174,20 @@ def run_lea(context: RunnerContext) -> None:
                 break
             to_send = None
 
+            # Any event that is not streamed text ends the current text batch, so a
+            # buffered delta can never be published after the event it preceded (P1).
+            # One check here rather than a flush in every branch below: the ordering
+            # rule then cannot be forgotten when a new event type is added.
+            if not isinstance(ev, AssistantTextDelta):
+                deltas.flush()
+
             if isinstance(ev, ToolApprovalRequested):
                 to_send = _await_decision(run_id, session_id, ev, events, stop_event)
                 continue
 
             if isinstance(ev, AssistantTextDelta):
                 narration.append(ev.text)
-                emit(events, "assistant_delta", {"text": ev.text})
+                deltas.add(ev.text)
 
             elif isinstance(ev, TurnStarted):
                 flush_narration()
@@ -1347,6 +1474,9 @@ def run_lea(context: RunnerContext) -> None:
             logger.exception("Failed to mark run %s failed", run_id)
         final_status = "failed"
     finally:
+        # Publish any trailing streamed text before the terminal `done` (P1) — a run
+        # that ends mid-batch must not drop its last words.
+        deltas.flush()
         skills_catalog.cleanup(skills_tempdir)
         # D1: retire any child whose SubagentStarted never saw its SubagentFinished —
         # the coordinator was interrupted or crashed mid-child. Left 'running', its run

@@ -1032,3 +1032,133 @@ def test_reformalize_updates_the_artifact_row_in_place(tmp_path, monkeypatch):
     assert len(rows) == 1, "same declaration re-recorded updates in place"
     assert rows[0]["path"] == "second_home.lean"
     assert rows[0]["run_id"] == second["id"]
+
+
+# --- AUDIT-2026-07-24 P1/P2: cheaper stream, cheaper cap check -----------------
+
+def test_streamed_text_is_batched_but_arrives_whole_and_in_order(tmp_path, monkeypatch):
+    """One SSE frame per model token was invisible to the browser (it polls every
+    80 ms) and cost a dict + list slot retained in the broker for the run's life. The
+    text must still arrive complete, and never after the step it preceded."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Batching")
+    run = store.create_run(session["id"], "m", None, 3)
+
+    def fake(config, messages, **kwargs):
+        yield TurnStarted(1)
+        for word in ("Proving ", "the ", "theorem ", "now."):
+            yield AssistantTextDelta(word)
+        yield ToolCalled("write_file", {"path": "p.lean"})
+        for word in ("Then ", "checking ", "it."):
+            yield AssistantTextDelta(word)
+        yield Finished("completed", "done", 1, session["id"], "m",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    monkeypatch.setattr(bridge, "load_config",
+                        lambda: LeaConfig(model="m", max_turns=3, lea_root=tmp_path))
+    events = Queue()
+    bridge.run_lea(bridge.RunnerContext(session["id"], run["id"], "prove", 
+                                        LeaConfig(model="m", max_turns=3, lea_root=tmp_path),
+                                        events))
+    frames = _drain(events)
+
+    deltas = [f for f in frames if f["type"] == "assistant_delta"]
+    # 7 tokens in, far fewer frames out — but not a single character lost.
+    assert len(deltas) < 7
+    assert "".join(f["payload"]["text"] for f in deltas) == (
+        "Proving the theorem now.Then checking it."
+    )
+    # Ordering: everything narrated before the tool call is published before it.
+    order = [f["type"] for f in frames]
+    tool = next(i for i, f in enumerate(frames)
+                if f["type"] == "status" and f["payload"].get("status") == "tool_call")
+    before = "".join(f["payload"]["text"] for f in frames[:tool] if f["type"] == "assistant_delta")
+    assert before == "Proving the theorem now."
+    assert "done" in order
+
+
+def test_a_trailing_batch_is_published_before_done(tmp_path, monkeypatch):
+    """A run that ends mid-batch must not swallow its last words."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Trailing")
+    run = store.create_run(session["id"], "m", None, 3)
+
+    def fake(config, messages, **kwargs):
+        yield TurnStarted(1)
+        yield AssistantTextDelta("last words")
+        raise RuntimeError("provider died mid-stream")
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    events = Queue()
+    bridge.run_lea(bridge.RunnerContext(session["id"], run["id"], "prove",
+                                        LeaConfig(model="m", max_turns=3, lea_root=tmp_path),
+                                        events))
+    frames = _drain(events)
+
+    types = [f["type"] for f in frames]
+    text = "".join(f["payload"]["text"] for f in frames if f["type"] == "assistant_delta")
+    assert text == "last words"
+    assert types.index("assistant_delta") < types.index("done")
+
+
+def test_persisted_spend_is_read_once_per_window_not_once_per_event(tmp_path, monkeypatch):
+    """The cap is re-checked on every UsageUpdated and every turn. Reading the DB each
+    time meant several aggregates per second per active run, against the same
+    single-writer SQLite the runs are writing to."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    bridge.reset_persisted_spend_cache()
+    reads = []
+    monkeypatch.setattr(store, "total_spend_usd", lambda: reads.append(1) or 0.0)
+
+    for _ in range(50):
+        assert bridge._persisted_spend_usd() == 0.0
+
+    assert len(reads) == 1, f"{len(reads)} DB reads for 50 cap checks"
+
+
+def test_a_run_reads_persisted_spend_once_not_per_usage_event(tmp_path, monkeypatch):
+    """The end-to-end claim: a capped run emitting many usage events hits the database
+    for the persisted total once, not once per event."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    bridge.reset_persisted_spend_cache()
+    session = store.create_session("Capped")
+    run = store.create_run(session["id"], "m", None, 3)
+    reads = []
+    monkeypatch.setattr(store, "total_spend_usd", lambda: reads.append(1) or 0.0)
+
+    def fake(config, messages, **kwargs):
+        for turn in range(1, 4):
+            yield TurnStarted(turn)
+            for _ in range(20):
+                yield UsageUpdated(1, 1, 0.0001)
+        yield Finished("completed", "done", 3, session["id"], "m",
+                       Usage(input_tokens=60, output_tokens=60), 0.006, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(bridge.RunnerContext(
+        session["id"], run["id"], "prove",
+        LeaConfig(model="m", max_turns=3, lea_root=tmp_path, max_spend_usd=100.0),
+        Queue(),
+    ))
+
+    # 63 cap checks (3 turns + 60 usage events) against one database read.
+    assert len(reads) == 1, f"{len(reads)} DB reads across 63 cap checks"
+
+
+def test_the_spend_cache_is_scoped_to_its_database(tmp_path, monkeypatch):
+    """The total is a property of ONE database. Production never repoints DB_PATH but
+    tests do, and a cache that ignored which database it measured would hand one
+    test's total to the next."""
+    bridge.reset_persisted_spend_cache()
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "first.sqlite3")
+    monkeypatch.setattr(store, "total_spend_usd", lambda: 7.0)
+    assert bridge._persisted_spend_usd() == 7.0
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "second.sqlite3")
+    monkeypatch.setattr(store, "total_spend_usd", lambda: 3.0)
+    assert bridge._persisted_spend_usd() == 3.0

@@ -718,3 +718,108 @@ def test_origin_rollup_counts_every_session_and_agrees_with_global(tmp_path, mon
     total = sum(row["cost_usd"] for row in stats["origins"])
     assert abs(total - stats["global"]["cost_usd"]) < 1e-9
     assert abs(total - 30.0) < 1e-9
+
+
+# --- AUDIT-2026-07-24 P3: code steps arrive with their bytes, not N+1 -----------
+# Asserted as CONNECTIONS OPENED rather than elapsed time: the defect was structural
+# (one extra connection + one extra query per step, from building the rows after the
+# connection had closed), so counting the structure is both deterministic and the
+# thing that actually regresses.
+
+def _counting_open(monkeypatch):
+    calls = []
+    real = db._open
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(db, "_open", counted)
+    return calls
+
+
+def _session_with_steps(count, *, project_id=None, path="Lea/Misc/p.lean"):
+    session = store.create_session("Big session", project_id=project_id)
+    run = store.create_run(session["id"], "m", None, 3, project_id=project_id)
+    for i in range(count):
+        store.add_code_step(
+            session["id"], run["id"], path,
+            content=f"theorem t{i} : True := by trivial\n", author="agent", turn=i,
+            check_status="ok",
+        )
+    return session
+
+
+def test_session_detail_does_not_open_a_connection_per_code_step(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = _session_with_steps(40)
+
+    opened = _counting_open(monkeypatch)
+    detail = store.session_detail(session["id"])
+
+    assert len(detail["code_steps"]) == 40
+    # Content still arrives in full — the point is how, not whether.
+    assert detail["code_steps"][0]["code"] == "theorem t0 : True := by trivial\n"
+    assert detail["code_steps"][-1]["code"] == "theorem t39 : True := by trivial\n"
+    # Before the fix this was ~40 connections for the blobs alone, on top of the
+    # handful session_detail legitimately makes.
+    assert len(opened) < 15, f"session_detail opened {len(opened)} connections for 40 steps"
+
+
+def test_code_step_reads_carry_their_content_from_one_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = _session_with_steps(3)
+
+    for read in (
+        lambda: store.latest_code_step_for_path(session["id"], "Lea/Misc/p.lean"),
+        lambda: store.latest_agent_code_step(session["id"]),
+        lambda: store.latest_agent_code_step_for_path(session["id"], "Lea/Misc/p.lean"),
+    ):
+        opened = _counting_open(monkeypatch)
+        step = read()
+        assert step["code"] == "theorem t2 : True := by trivial\n"
+        assert len(opened) == 1, f"{len(opened)} connections for one code-step read"
+
+
+def test_graph_reads_skip_blob_hydration_but_keep_the_verdict(tmp_path, monkeypatch):
+    """`include_content=False` is what makes /graph cheap: it reads only the verdict
+    and the session attribution, across every revision of every file."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    project = store.create_project("proj", title="Proj")
+    _session_with_steps(25, project_id=project["id"])
+
+    with_content = store.code_steps_for_project_path(project["id"], "Lea/Misc/p.lean")
+    opened = _counting_open(monkeypatch)
+    without = store.code_steps_for_project_path(
+        project["id"], "Lea/Misc/p.lean", include_content=False
+    )
+
+    assert len(opened) == 1
+    assert len(without) == len(with_content) == 25
+    # Everything the graph actually reads is identical...
+    for lean, full in zip(without, with_content):
+        assert lean["check_status"] == full["check_status"]
+        assert lean["session_id"] == full["session_id"]
+        assert lean["created_at"] == full["created_at"]
+    # ...and only the bytes it never looks at are withheld.
+    assert without[0]["code"] == ""
+    assert with_content[0]["code"] == "theorem t24 : True := by trivial\n"
+
+
+def test_set_code_step_check_returns_the_updated_row_with_its_content(tmp_path, monkeypatch):
+    """The back-fill path re-reads the row it just updated; that read goes through the
+    same join, so a verdict landing on a step must not blank the canvas."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("S")
+    run = store.create_run(session["id"], "m", None, 3)
+    step = store.add_code_step(session["id"], run["id"], "p.lean", content="proof\n", author="agent")
+
+    updated = store.set_code_step_check(step["id"], "ok", None, artifact_kind="proof")
+
+    assert updated["code"] == "proof\n"
+    assert updated["check_status"] == "ok"
+    assert "blob_content" not in updated
