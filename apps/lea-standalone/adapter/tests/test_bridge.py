@@ -9,10 +9,13 @@ flushed into messages, the run persisted with usage, and the SSE events emitted 
 order — ending with `done`.
 """
 
+import sqlite3
 import time
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
+
+import pytest
 
 from lea.interface import (
     AssistantTextDelta,
@@ -1449,3 +1452,91 @@ def test_an_unreadable_previous_file_is_left_alone_rather_than_deleted(tmp_path,
         namespace=None, turn=1, events=Queue(),
     ) is None
     assert canonical.exists(), "an unrecoverable file must not be deleted"
+
+
+# --- AUDIT-2026-07-24 C6: bookkeeping must not rewrite a finished outcome ------
+
+def _finishing_run(tmp_path, monkeypatch, *, result="proved"):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("C6")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        proof = Path(working_dir) / "Lea" / "Misc" / "p.lean"
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text("import Mathlib\n\ntheorem t : True := by trivial\n")
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": str(proof)})
+        yield FileChanged(str(proof))
+        yield CheckResult(str(proof), "ok", None)
+        yield Finished("completed", "It compiles.", 1, session["id"], "gemini/test",
+                       Usage(input_tokens=10, output_tokens=5), 0.01, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(session["id"], run["id"], "prove", config, queue)
+    return ctx, queue
+
+
+@pytest.mark.parametrize("failing", ["replace_run_usage_breakdown", "set_run_transcript"])
+def test_a_bookkeeping_failure_does_not_rewrite_a_proved_run(tmp_path, monkeypatch, failing):
+    """The Finished handler persists the outcome, THEN records usage, the transcript,
+    and the artifact index. A failure in any of those used to fall through to the
+    outer handler, which marked the run 'failed' — discarding a real proof, and
+    (because the derived session status reads the latest code step's run) making the
+    whole session look broken."""
+    ctx, queue = _finishing_run(tmp_path, monkeypatch)
+
+    def explode(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, failing, explode)
+
+    bridge.run_lea(ctx)
+
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "proved", f"{failing} failing must not undo the outcome"
+    assert run["result_kind"] == "proved"
+    assert store.session_detail(ctx.session_id)["status"] == "proved"
+    done = [f for f in _drain(queue) if f["type"] == "done"][-1]
+    assert done["payload"]["status"] == "proved", "the client must be told the truth too"
+
+
+def test_a_failure_before_the_outcome_is_persisted_still_fails_the_run(tmp_path, monkeypatch):
+    """The guard must not swallow real failures: a run that dies before Finished has
+    no terminal row, so it is still marked failed."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("C6-negative")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+
+    def fake(config, messages, **kwargs):
+        yield TurnStarted(1)
+        raise RuntimeError("the provider died")
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    queue: Queue = Queue()
+    bridge.run_lea(bridge.RunnerContext(
+        session["id"], run["id"], "prove",
+        LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path), queue,
+    ))
+
+    assert store.get_run(run["id"])["status"] == "failed"
+    assert [f for f in _drain(queue) if f["type"] == "done"][-1]["payload"]["status"] == "failed"
+
+
+def test_each_bookkeeping_step_is_independent(tmp_path, monkeypatch):
+    """One failing piece must not cost the others — they are separate records of the
+    same finished run, not a transaction."""
+    ctx, _ = _finishing_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "replace_run_usage_breakdown",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    bridge.run_lea(ctx)
+
+    # The transcript, which runs after the failing step, still landed.
+    assert store.latest_transcript_for_session(ctx.session_id) is not None
+    assert store.get_run(ctx.run_id)["status"] == "proved"

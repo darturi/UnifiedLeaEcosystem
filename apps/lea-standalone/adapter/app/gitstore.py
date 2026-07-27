@@ -19,6 +19,7 @@ tests without monkeypatching. The adapter constructs one at startup:
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -35,6 +36,29 @@ CO_AUTHOR_TRAILER = f"Co-authored-by: Lea <{GIT_USER_EMAIL}>"
 
 class GitStoreError(RuntimeError):
     """A git invocation failed. Carries the failing command's stderr."""
+
+
+# One lock per repo path, so writers to the SAME repo serialize while unrelated repos
+# still commit in parallel (AUDIT-2026-07-24 X2). Keyed by the resolved path rather
+# than by `GitStore` instance: callers construct a fresh `GitStore(proofs_root)` per
+# operation, so an instance-level lock would guard nothing.
+#
+# In-process only, and that is the honest scope: the adapter is one uvicorn process and
+# its runs are threads inside it. It does NOT cover the agent running `git` through the
+# `bash` tool against the same repo — nothing can, short of taking git's own lock — so
+# that remains a (pre-existing, unbounded) race.
+_repo_locks: dict[str, threading.Lock] = {}
+_repo_locks_guard = threading.Lock()
+
+
+def _repo_lock(repo: Path) -> threading.Lock:
+    key = str(Path(repo).resolve())
+    with _repo_locks_guard:
+        lock = _repo_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _repo_locks[key] = lock
+        return lock
 
 
 def commit_message(subject: str) -> str:
@@ -112,16 +136,38 @@ class GitStore:
         self._git(repo, "commit", "--allow-empty", "-q", "-m", commit_message(subject))
         return repo
 
-    def commit_all(self, repo: Path, subject: str) -> str:
-        """Stage everything under ``repo`` and commit it with ``subject``; return the
-        new SHA (or the unchanged HEAD when nothing is staged). The single commit
-        primitive every write path funnels through (D8: commit on every write)."""
-        self._git(repo, "add", "-A")
-        staged = self._git(repo, "diff", "--cached", "--name-only").strip()
-        if not staged:
+    def commit_all(self, repo: Path, subject: str, paths: list[str] | None = None) -> str:
+        """Stage changes under ``repo`` and commit them with ``subject``; return the new
+        SHA (or the unchanged HEAD when nothing is staged). The single commit primitive
+        every write path funnels through (D8: commit on every write).
+
+        ``paths`` limits what is staged to those repo-relative pathspecs. Pass it
+        whenever the caller knows what it wrote (AUDIT-2026-07-24 X2): project sessions
+        SHARE one repo (D24) and up to ``LEA_MAX_CONCURRENT_RUNS`` of them write at
+        once, so an unscoped ``git add -A`` swept a *concurrent* run's half-written
+        proof into this run's commit, under this run's message. Harmless for
+        correctness — SQL owns proof content — but it makes ``git log`` useless as an
+        audit trail, and it is what made the `.gitignore` guard in
+        ``uploads.ensure_overleaf_gitignore`` load-bearing rather than belt-and-braces.
+        Omit it only where the whole tree really is the unit of work (provisioning, a
+        namespace migration).
+
+        Serialized per repo. Git takes ``.git/index.lock`` for the duration of an
+        ``add``/``commit``, and a second one arriving meanwhile does not queue — it
+        fails outright, which surfaced as a ``GitStoreError`` out of an otherwise
+        healthy run. The lock is per resolved repo path, so unrelated repos still
+        commit in parallel.
+        """
+        with _repo_lock(repo):
+            # `-A` *with* a pathspec means "all changes under these paths, including
+            # deletions" — without it a deleted file's removal would not be staged.
+            add_args = ["add", "-A"] + (["--", *paths] if paths else [])
+            self._git(repo, *add_args)
+            staged = self._git(repo, "diff", "--cached", "--name-only").strip()
+            if not staged:
+                return self._git(repo, "rev-parse", "HEAD").strip()
+            self._git(repo, "commit", "-q", "-m", commit_message(subject))
             return self._git(repo, "rev-parse", "HEAD").strip()
-        self._git(repo, "commit", "-q", "-m", commit_message(subject))
-        return self._git(repo, "rev-parse", "HEAD").strip()
 
     def commit_write(self, session_id: str, *, turn, author: str = "agent", tool: str) -> str:
         """DEPRECATED — dead as of v2.3; scheduled for deletion with the contract step.

@@ -117,7 +117,8 @@ def write_text_file(project: dict, proofs_root: Path, rel: str, content: str) ->
     abs_path = safe_abs(repo, rel)
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(content)
-    return GitStore(proofs_root).commit_all(repo, f"edit {rel}")
+    # Scoped to the edited file (X2) — this repo is shared across a project's sessions.
+    return GitStore(proofs_root).commit_all(repo, f"edit {rel}", paths=[rel])
 
 
 def export_zip(repo: Path) -> bytes:

@@ -321,7 +321,7 @@ def write_doc(project: dict, proofs_root: Path, name: str, content: str) -> str:
     lea_dir = repo / ".lea"
     lea_dir.mkdir(parents=True, exist_ok=True)
     (lea_dir / name).write_text(content)
-    return GitStore(proofs_root).commit_all(repo, f"edit .lea/{name}")
+    return GitStore(proofs_root).commit_all(repo, f"edit .lea/{name}", paths=[f".lea/{name}"])
 
 
 def _seed_docs(title: str, namespace: str) -> dict[str, str]:

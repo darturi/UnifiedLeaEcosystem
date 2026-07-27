@@ -650,7 +650,7 @@ def retire_project_artifact_by_slug(slug: str, request: ArtifactRetireRequest) -
         raise HTTPException(status_code=404, detail="No recorded file at that path")
     absolute.unlink()
     try:
-        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry")
+        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry", paths=[rel])
     except GitStoreError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"retire_commit": sha, "path": rel}
@@ -686,7 +686,9 @@ def restore_project_artifact_by_slug(slug: str, request: ArtifactRestoreRequest)
     absolute.parent.mkdir(parents=True, exist_ok=True)
     absolute.write_text(content)
     try:
-        sha = GitStore(repo.parent).commit_all(repo, f"restore {rel} after unverified retry")
+        sha = GitStore(repo.parent).commit_all(
+            repo, f"restore {rel} after unverified retry", paths=[rel],
+        )
     except GitStoreError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"restored": True, "commit": sha, "path": rel}

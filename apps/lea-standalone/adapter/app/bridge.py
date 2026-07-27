@@ -1090,6 +1090,30 @@ def _promote_winner(
     return step
 
 
+def _best_effort(what: str, run_id: str, action) -> None:
+    """Run one piece of post-outcome bookkeeping, logging rather than raising.
+
+    Used only for work that happens AFTER the run's result is durable, where failing
+    loudly would be strictly worse than failing quietly: the result is already correct,
+    and the alternative is discarding it (C6)."""
+    try:
+        action()
+    except Exception:
+        logger.exception("Could not persist the %s for run %s", what, run_id)
+
+
+def _run_is_terminal(run_id: str) -> bool:
+    """Whether the run row already holds a final status. A read failure answers False,
+    so an unreachable database falls back to the old mark-it-failed behaviour rather
+    than silently leaving a run looking live."""
+    try:
+        run = store.get_run(run_id)
+    except Exception:
+        logger.exception("Could not read run %s while handling a failure", run_id)
+        return False
+    return bool(run) and run["status"] not in {"pending", "running"}
+
+
 def run_lea(context: RunnerContext) -> None:
     """Run one Lea activation, streaming normalized SSE events onto the queue.
 
@@ -1413,7 +1437,9 @@ def run_lea(context: RunnerContext) -> None:
                     and not str(last_write_path).endswith(".lean")
                 ):
                     asset_rel = _relativize(last_write_path, repo)
-                    sha = gs.commit_all(repo, f"agent {ev.name}: {asset_rel}")
+                    # Scoped to the asset this tool call wrote (X2): a concurrent run
+                    # in the same project repo must not land in this commit.
+                    sha = gs.commit_all(repo, f"agent {ev.name}: {asset_rel}", paths=[asset_rel])
                     emit(events, "project_updated", {
                         "project_id": project["id"], "path": asset_rel, "commit_sha": sha,
                     })
@@ -1564,25 +1590,46 @@ def run_lea(context: RunnerContext) -> None:
                     cost_usd=ev.cost,
                     result_kind=final_result_kind, result_detail=final_result_detail,
                 )
-                store.replace_run_usage_breakdown(run_id, usage.rows())
+                # Everything past this point is BOOKKEEPING: the run's outcome is
+                # already durable above. Each piece is guarded on its own so one
+                # failure neither loses the others nor escapes to the handler below,
+                # which used to rewrite a proved run to 'failed' over a locked DB or an
+                # unserializable transcript (AUDIT-2026-07-24 C6).
+                _best_effort("usage breakdown", run_id,
+                             lambda: store.replace_run_usage_breakdown(run_id, usage.rows()))
                 # Persist the faithful conversation for the next activation to replay
                 # (multi-turn, D16). Only here, on Finished — an errored run stores none.
-                store.set_run_transcript(run_id, ev.transcript.get("messages", []))
+                _best_effort("transcript", run_id,
+                             lambda: store.set_run_transcript(run_id, ev.transcript.get("messages", [])))
                 # Structured artifact index (4.1): record which declarations this
                 # run's checked files hold, keyed to the run's own FileChanged set.
-                _record_run_artifacts(
-                    session_id, run_id, project, namespace, dict(step_id_by_path)
-                )
+                _best_effort("artifact index", run_id,
+                             lambda: _record_run_artifacts(
+                                 session_id, run_id, project, namespace, dict(step_id_by_path)))
 
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)
         flush_narration()
         emit(events, "run_error", {"message": f"{type(exc).__name__}: {exc}"})
-        try:
-            store.update_run(run_id, "failed")
-        except Exception:
-            logger.exception("Failed to mark run %s failed", run_id)
-        final_status = "failed"
+        # Never downgrade a run that already reached a terminal status (C6). The
+        # Finished handler persists the outcome before doing anything else, so a
+        # failure after that point is a bookkeeping problem, not a failed proof —
+        # marking it 'failed' here discarded a real result AND, because the derived
+        # session status reads the latest code step's run, made the session look broken
+        # too. The `done` frame keeps the real outcome for the same reason.
+        if _run_is_terminal(run_id):
+            logger.warning(
+                "Run %s already finished as %r; keeping that outcome despite the error",
+                run_id, final_status,
+            )
+        else:
+            try:
+                store.update_run(run_id, "failed")
+            except Exception:
+                logger.exception("Failed to mark run %s failed", run_id)
+            final_status = "failed"
+            final_result_kind = None
+            final_result_detail = None
     finally:
         # Publish any trailing streamed text before the terminal `done` (P1) — a run
         # that ends mid-batch must not drop its last words.

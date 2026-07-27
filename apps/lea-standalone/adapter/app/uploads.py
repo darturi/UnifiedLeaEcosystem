@@ -169,7 +169,9 @@ def save_upload(
     sidecar = extract_text(stored, ext)
 
     repo = project_repo_dir(project, proofs_root)
-    GitStore(proofs_root).commit_all(repo, f"upload .lea/files/{name}")
+    # The upload and (when extracted) its .txt sidecar — nothing else (X2).
+    uploaded = [f".lea/files/{name}"] + ([f".lea/files/{sidecar.name}"] if sidecar else [])
+    GitStore(proofs_root).commit_all(repo, f"upload .lea/files/{name}", paths=uploaded)
 
     rel_stored = f".lea/files/{name}"
     rel_extracted = f".lea/files/{sidecar.name}" if sidecar else None
@@ -198,7 +200,8 @@ def delete_file(project: dict, proofs_root: Path, file_row: dict) -> bool:
             p = repo / rel
             if p.exists():
                 p.unlink()
-    GitStore(proofs_root).commit_all(repo, f"delete {file_row['stored_path']}")
+    removed = [rel for rel in (file_row.get("stored_path"), file_row.get("extracted_path")) if rel]
+    GitStore(proofs_root).commit_all(repo, f"delete {file_row['stored_path']}", paths=removed)
     return store.delete_project_file(file_row["id"])
 
 
@@ -326,7 +329,10 @@ def commit_mirror(project: dict, proofs_root: Path) -> str:
     """Commit the project repo after a mirror reconcile (run as a deferred background
     task by the route, so the request returns before git runs)."""
     repo = project_repo_dir(project, proofs_root)
-    return GitStore(proofs_root).commit_all(repo, "overleaf: mirror .tex sources")
+    # The whole mirror subtree is this operation's unit of work, but nothing outside it.
+    return GitStore(proofs_root).commit_all(
+        repo, "overleaf: mirror .tex sources", paths=[f".lea/files/{OVERLEAF_SUBDIR}"],
+    )
 
 
 def sync_overleaf_tex(
