@@ -893,6 +893,47 @@ def test_enqueued_runs_execute_fifo(tmp_path, monkeypatch):
         assert store.get_run(run_id)["status"] == "proved"
 
 
+def test_queued_run_executes_its_snapshotted_model(tmp_path, monkeypatch):
+    """A later global/default change cannot replace the model chosen for a run."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="later-global-model", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=1))
+    runbroker._brokers.clear()
+    executed_models = []
+
+    def fake(
+        config,
+        messages,
+        *,
+        namespace=None,
+        session_id=None,
+        working_dir=None,
+        should_stop=None,
+        gate=None,
+    ):
+        executed_models.append(config.model)
+        yield TurnStarted(1)
+        yield Finished("completed", "done", 1, session_id, config.model,
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    session = store.create_session("snapshot the picker")
+    run = store.create_run(session["id"], "picker/model", None, 3)
+    store.add_message(session["id"], "user", "snapshot the picker", run["id"])
+
+    bridge.enqueue_run(run["id"])
+
+    assert _wait_for(
+        lambda: store.get_run(run["id"])["status"] not in {"pending", "running"}
+    )
+    assert executed_models == ["picker/model"]
+    assert store.get_run(run["id"])["model"] == "picker/model"
+
+
 def test_finished_broker_buffer_ends_in_done(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

@@ -68,6 +68,16 @@ def test_load_config_honors_ui_settings(tmp_path):
     assert config.narrate_tool_steps is True
 
 
+def test_ui_model_is_not_overridden_by_process_environment(tmp_path, monkeypatch):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "ui-selected-model"\n')
+    monkeypatch.setenv("LEA_MODEL", "environment-model")
+
+    config = load_config(config_path)
+
+    assert config.model == "ui-selected-model"
+
+
 def test_provider_keys_go_to_env_not_onto_the_config_object(tmp_path, monkeypatch):
     config_path = tmp_path / "lea.local.toml"
     config_path.write_text(

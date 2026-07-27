@@ -205,6 +205,26 @@ def model_requirements(model: str, path: Path | None = None) -> dict[str, Any]:
     }
 
 
+def validate_configured_model(model: str, path: Path | None = None) -> str:
+    """Validate a model selected for a run against the currently configured keys.
+
+    The Settings UI normally performs the same check while persisting its default,
+    but an explicit per-run model must be safe even when a client bypasses that UI.
+    Return the normalized model so callers can validate and snapshot it in one step.
+    """
+    normalized = str(model).strip()
+    if not normalized:
+        raise SettingsValidationError("model must not be empty", "model")
+    requirements = model_requirements(normalized, path)
+    if not requirements["satisfied"]:
+        required = requirements["required_keys"][0]
+        raise SettingsValidationError(
+            f"An API key ({required['label']}) is required before starting a run with this model.",
+            f"api_keys.{required['env']}",
+        )
+    return normalized
+
+
 def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
     config_path = path or CONFIG_PATH
     current_config = load_config(config_path)

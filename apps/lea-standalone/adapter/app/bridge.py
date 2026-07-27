@@ -151,11 +151,17 @@ def _worker_loop() -> None:
                 admission = runregistry.registry.try_admit(run_id, run["session_id"])
                 if admission.outcome == runregistry.ADMITTED:
                     broker = runbroker.get(run_id) or runbroker.create(run_id)
+                    # Run creation snapshots the selected model. Reload every other
+                    # live setting at admission time, but never let a later settings
+                    # or environment change switch a queued run to another model.
+                    config = load_config()
+                    if run.get("model"):
+                        config = replace(config, model=run["model"])
                     context = RunnerContext(
                         session_id=run["session_id"],
                         run_id=run_id,
                         task=task,
-                        config=load_config(),
+                        config=config,
                         events=broker,
                         autonomous=bool(run.get("autonomous")),
                     )

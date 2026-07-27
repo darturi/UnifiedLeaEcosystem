@@ -91,6 +91,37 @@ def test_update_settings_rejects_selected_model_without_api_key(tmp_path, monkey
         raise AssertionError("Expected SettingsValidationError")
 
 
+def test_validate_configured_model_normalizes_explicit_run_model(tmp_path, monkeypatch):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text("")
+    monkeypatch.setattr(settings_service, "_required_env_keys", lambda model: [])
+
+    model = settings_service.validate_configured_model(
+        "  custom/provider-model  ",
+        config_path,
+    )
+
+    assert model == "custom/provider-model"
+
+
+def test_validate_configured_model_rejects_missing_provider_key(tmp_path, monkeypatch):
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text("")
+    monkeypatch.setattr(
+        settings_service,
+        "_required_env_keys",
+        lambda model: ["EXAMPLE_API_KEY"],
+    )
+
+    try:
+        settings_service.validate_configured_model("example/model", config_path)
+    except settings_service.SettingsValidationError as exc:
+        assert str(exc) == "An API key (Example) is required before starting a run with this model."
+        assert exc.field == "api_keys.EXAMPLE_API_KEY"
+    else:
+        raise AssertionError("Expected SettingsValidationError")
+
+
 def test_update_settings_rejects_malformed_api_key(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()

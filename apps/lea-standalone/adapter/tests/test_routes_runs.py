@@ -106,6 +106,63 @@ def test_create_run_without_slug_stays_project_less(tmp_path, monkeypatch):
     assert store.list_projects() == []
 
 
+def test_create_run_snapshots_explicit_model_over_config_default(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        runs_route.settings_service,
+        "validate_configured_model",
+        lambda model: seen.append(model) or model.strip(),
+    )
+
+    result = runs_route.create_run(
+        RunRequest(message="use the picker", model="picker/model")
+    )
+
+    run = store.get_run(result["run_id"])
+    assert seen == ["picker/model"]
+    assert result["model"] == "picker/model"
+    assert run["model"] == "picker/model"
+
+
+def test_create_run_without_explicit_model_uses_config_default(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    result = runs_route.create_run(RunRequest(message="use the default"))
+
+    assert result["model"] == "m"
+    assert store.get_run(result["run_id"])["model"] == "m"
+
+
+def test_create_run_rejects_explicit_model_without_provider_key(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+
+    def reject_model(model):
+        raise runs_route.settings_service.SettingsValidationError(
+            "A provider key is required.",
+            "api_keys.EXAMPLE_API_KEY",
+        )
+
+    monkeypatch.setattr(
+        runs_route.settings_service,
+        "validate_configured_model",
+        reject_model,
+    )
+
+    try:
+        runs_route.create_run(
+            RunRequest(message="missing credentials", model="example/model")
+        )
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 422
+        assert getattr(exc, "detail", None) == {
+            "message": "A provider key is required.",
+            "field": "api_keys.EXAMPLE_API_KEY",
+        }
+    else:
+        raise AssertionError("Expected HTTPException")
+
+
 def test_create_run_ignores_invalid_slug(tmp_path, monkeypatch):
     _setup(tmp_path, monkeypatch)
     result = runs_route.create_run(

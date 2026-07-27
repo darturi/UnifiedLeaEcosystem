@@ -54,11 +54,12 @@ export async function getSession(sessionId: string): Promise<SessionDetail> {
 export async function createRun(
   message: string,
   sessionId?: string,
-): Promise<{ session_id: string; run_id: string; message: ChatMessage }> {
+  model?: string,
+): Promise<{ session_id: string; run_id: string; model: string; message: ChatMessage }> {
   const response = await fetch('/api/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, session_id: sessionId }),
+    body: JSON.stringify({ message, session_id: sessionId, model }),
   });
   if (!response.ok) {
     throw new Error(await detailMessage(response, `Failed to start run: ${response.statusText}`));
