@@ -35,7 +35,7 @@ import logging
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -128,74 +128,132 @@ def _resolve_task(run: dict[str, Any]) -> str | None:
     )
 
 
-def _worker_loop() -> None:
-    while True:
-        run_id = _run_queue.get()
-        try:
-            while True:
-                run = store.get_run(run_id)
-                if not run or run["status"] != "pending":
-                    if run:
-                        publish_terminal_from_row(run_id)
-                        runbroker.drop(run_id)
-                    break
+# One dispatch attempt's outcome. `DEFER` is the only one that keeps a run waiting.
+_SETTLED, _DISPATCHED, _DEFER = "settled", "dispatched", "defer"
 
-                task = _resolve_task(run)
-                if task is None:
-                    store.update_run(run_id, "failed", result_kind="failed",
-                                     result_detail="Run task not found.")
-                    publish_terminal_from_row(run_id)
-                    runbroker.drop(run_id)
-                    break
+# How long the dispatcher waits between retries when every waiting run is blocked on
+# capacity or on its own session. Only reached when nothing else is arriving.
+_DISPATCH_RETRY_SECONDS = 0.1
 
-                admission = runregistry.registry.try_admit(run_id, run["session_id"])
-                if admission.outcome == runregistry.ADMITTED:
-                    broker = runbroker.get(run_id) or runbroker.create(run_id)
-                    # Run creation snapshots the selected model. Reload every other
-                    # live setting at admission time, but never let a later settings
-                    # or environment change switch a queued run to another model.
-                    config = load_config()
-                    if run.get("model"):
-                        config = replace(config, model=run["model"])
-                    context = RunnerContext(
-                        session_id=run["session_id"],
-                        run_id=run_id,
-                        task=task,
-                        config=config,
-                        events=broker,
-                        autonomous=bool(run.get("autonomous")),
-                    )
-                    try:
-                        Thread(target=run_lea, args=(context,), daemon=True,
-                               name=f"lea-run-{run_id[:8]}").start()
-                    except BaseException:
-                        runregistry.registry.release(run_id)
-                        store.update_run(run_id, "failed", result_kind="failed",
-                                         result_detail="Could not start the run worker.")
-                        publish_terminal_from_row(run_id)
-                        runbroker.drop(run_id)
-                        raise
-                    break
 
-                if admission.outcome == runregistry.ALREADY_ACTIVE:
-                    # A duplicate enqueue/recovery entry; the admitted driver owns it.
-                    break
-                if admission.outcome == runregistry.SESSION_BUSY and admission.incumbent_run_id:
-                    # Preserve main's per-session supersede behavior without letting
-                    # two turns mutate the same session concurrently.
-                    request_stop(admission.incumbent_run_id)
-                # AT_CAPACITY and SESSION_BUSY both retain this run's FIFO place.
-                time.sleep(0.1)
-        except Exception:  # noqa: BLE001 — the worker must survive any single run
-            logger.exception("Run worker failed while driving run %s", run_id)
-            try:
-                current = store.get_run(run_id)
-                if current and current["status"] in {"pending", "running"}:
-                    store.update_run(run_id, "failed")
-            except Exception:
-                logger.exception("Failed to mark run %s failed", run_id)
+def _try_dispatch(run_id: str, superseded: dict[str, str]) -> str:
+    """Attempt to admit and start one run. Never blocks.
+
+    Returns `_SETTLED` (nothing more to do — terminal, missing, or already driven),
+    `_DISPATCHED` (a driver thread is running it), or `_DEFER` (not admissible *yet*).
+    """
+    run = store.get_run(run_id)
+    if not run or run["status"] != "pending":
+        if run:
             publish_terminal_from_row(run_id)
             runbroker.drop(run_id)
+        return _SETTLED
+
+    task = _resolve_task(run)
+    if task is None:
+        store.update_run(run_id, "failed", result_kind="failed",
+                         result_detail="Run task not found.")
+        publish_terminal_from_row(run_id)
+        runbroker.drop(run_id)
+        return _SETTLED
+
+    admission = runregistry.registry.try_admit(run_id, run["session_id"])
+    if admission.outcome == runregistry.ADMITTED:
+        superseded.pop(run_id, None)
+        broker = runbroker.get(run_id) or runbroker.create(run_id)
+        # Run creation snapshots the selected model. Reload every other
+        # live setting at admission time, but never let a later settings
+        # or environment change switch a queued run to another model.
+        config = load_config()
+        if run.get("model"):
+            config = replace(config, model=run["model"])
+        context = RunnerContext(
+            session_id=run["session_id"],
+            run_id=run_id,
+            task=task,
+            config=config,
+            events=broker,
+            autonomous=bool(run.get("autonomous")),
+        )
+        try:
+            Thread(target=run_lea, args=(context,), daemon=True,
+                   name=f"lea-run-{run_id[:8]}").start()
+        except BaseException:
+            runregistry.registry.release(run_id)
+            store.update_run(run_id, "failed", result_kind="failed",
+                             result_detail="Could not start the run worker.")
+            publish_terminal_from_row(run_id)
+            runbroker.drop(run_id)
+            raise
+        return _DISPATCHED
+
+    if admission.outcome == runregistry.ALREADY_ACTIVE:
+        # A duplicate enqueue/recovery entry; the admitted driver owns it.
+        return _SETTLED
+    if admission.outcome == runregistry.SESSION_BUSY and admission.incumbent_run_id:
+        # Preserve main's per-session supersede behavior without letting two turns
+        # mutate the same session concurrently. Asked ONCE per incumbent: the flag is
+        # an Event, so repeating is harmless, but the old loop re-issued it on every
+        # 100 ms poll for as long as the incumbent took to wind down.
+        if superseded.get(run_id) != admission.incumbent_run_id:
+            superseded[run_id] = admission.incumbent_run_id
+            request_stop(admission.incumbent_run_id)
+    return _DEFER
+
+
+def _worker_loop() -> None:
+    """Dispatch queued runs, never letting one that cannot start hold up one that can.
+
+    The previous shape spun in an inner loop on the run at the head of the queue until
+    it was admissible (AUDIT-2026-07-24 X1). That is fine when the blocker is capacity
+    — nothing else could start either — but `SESSION_BUSY` blocks on a *different*
+    session's incumbent winding down, which can take a whole model call, or up to the
+    900-second approval timeout if that incumbent is parked on an unanswered gate.
+    Runs for unrelated sessions sat behind it with slots free, so
+    `LEA_MAX_CONCURRENT_RUNS=4` did not deliver four in the multi-chat case Phase 6
+    raised the default for.
+
+    Now a run that cannot be admitted is set aside and retried on the next pass while
+    the dispatcher keeps draining the queue. `deferred` preserves the relative order of
+    the runs waiting, and is retried before newly arrived ones, so FIFO among the
+    blocked set is unchanged — what is gone is one blocked run's claim on everyone
+    else's turn.
+
+    The queue is polled only while something is deferred; with nothing waiting the
+    dispatcher blocks on `get()` as before and costs nothing when idle.
+    """
+    deferred: list[str] = []
+    # run_id -> the incumbent we have already asked to stop for it, so a supersede is
+    # requested once rather than on every retry.
+    superseded: dict[str, str] = {}
+    while True:
+        try:
+            arrived = _run_queue.get(timeout=_DISPATCH_RETRY_SECONDS if deferred else None)
+        except Empty:
+            arrived = None
+
+        # Deferred first: they have been waiting longest.
+        batch, deferred = deferred, []
+        if arrived is not None:
+            batch.append(arrived)
+
+        for run_id in batch:
+            try:
+                if _try_dispatch(run_id, superseded) == _DEFER:
+                    deferred.append(run_id)
+                else:
+                    superseded.pop(run_id, None)
+            except Exception:  # noqa: BLE001 — the worker must survive any single run
+                logger.exception("Run worker failed while driving run %s", run_id)
+                superseded.pop(run_id, None)
+                try:
+                    current = store.get_run(run_id)
+                    if current and current["status"] in {"pending", "running"}:
+                        store.update_run(run_id, "failed")
+                except Exception:
+                    logger.exception("Failed to mark run %s failed", run_id)
+                publish_terminal_from_row(run_id)
+                runbroker.drop(run_id)
 
 
 def enqueue_run(run_id: str) -> None:
@@ -923,6 +981,38 @@ def _materialize_subagent(
     return child
 
 
+# Sentinel for "there was no file here", so it is distinguishable from "there was a
+# file and it was empty" — restoring the two differently is the whole point.
+_ABSENT = object()
+
+
+def _snapshot_file(path: Path):
+    """The file's current bytes, `_ABSENT` if it doesn't exist, or None if it exists but
+    can't be read. None means "cannot restore", and callers must not delete on it."""
+    if not path.exists():
+        return _ABSENT
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError):
+        logger.warning("could not snapshot %s before overwriting it", path, exc_info=True)
+        return None
+
+
+def _restore_file(path: Path, previous) -> None:
+    """Undo an overwrite guarded by :func:`_snapshot_file`. A snapshot that failed
+    (None) leaves the file alone: we have nothing to put back, and deleting would turn
+    a bad overwrite into data loss."""
+    if previous is _ABSENT:
+        path.unlink(missing_ok=True)
+        return
+    if previous is None:
+        return
+    try:
+        path.write_text(previous)
+    except OSError:
+        logger.exception("could not restore %s after a failed promotion", path)
+
+
 def _promote_winner(
     subagent_results: list[SubagentFinished],
     *,
@@ -957,15 +1047,29 @@ def _promote_winner(
     # The session's canonical proofs dir: its namespace path (loose → Lea/Misc).
     ns_path = (namespace or "Lea.Misc").replace(".", "/")
     canonical = repo / ns_path / Path(winner.candidate_path).name
+    # Whatever stands at the canonical path right now — very possibly a VERIFIED proof
+    # from an earlier run. `promote` overwrites it, and the re-verification that decides
+    # whether the candidate is worth keeping happens afterwards, so a candidate that
+    # failed used to destroy the good proof it replaced and leave itself in its place
+    # (AUDIT-2026-07-24 C3). Nothing recorded the change, either: the code_step is only
+    # written on success, so the file on disk — which is what Lean compiles, what
+    # /export zips, and what `git push` ships — silently diverged from the timeline.
+    previous = _snapshot_file(canonical)
     try:
         collation.promote(winner, canonical)
     except ValueError:
         return None
-    # Re-verify at the NEW path — the child checked a different location.
+    # Re-verify at the NEW path — the child checked a different location. Deliberately
+    # AT the canonical path rather than at a temp one: Lake resolves modules by
+    # location, so the path is part of what is being verified, and checking elsewhere
+    # would verify something other than what we are about to keep. That is why the fix
+    # for C3 is restore-on-failure rather than verify-then-move.
     verdict = _lean_check_file(str(canonical))
     if verdict.status != "ok":
+        _restore_file(canonical, previous)
         logger.warning(
-            "sub-agent candidate %s did not re-verify at %s (%s); not promoting",
+            "sub-agent candidate %s did not re-verify at %s (%s); not promoting "
+            "(restored the previous file)",
             winner.result_id, canonical, verdict.detail,
         )
         return None

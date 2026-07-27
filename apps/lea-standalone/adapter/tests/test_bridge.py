@@ -1203,3 +1203,249 @@ def test_the_spend_cache_is_scoped_to_its_database(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "second.sqlite3")
     monkeypatch.setattr(store, "total_spend_usd", lambda: 3.0)
     assert bridge._persisted_spend_usd() == 3.0
+
+
+# --- AUDIT-2026-07-24 X1: a blocked run must not hold up the queue -------------
+
+def _seed_run(session_title, task, *, session_id=None):
+    session = store.get_session(session_id) if session_id else store.create_session(session_title)
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", task, run["id"])
+    return session, run["id"]
+
+
+def test_a_session_busy_run_does_not_block_a_different_session(tmp_path, monkeypatch):
+    """The dispatcher used to spin on the head of the queue until it was admissible.
+    For SESSION_BUSY that means waiting on a DIFFERENT session's incumbent to wind
+    down — a whole model call, or up to the 900s approval timeout — while unrelated
+    runs sat behind it with slots free.
+    """
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=4))
+    runbroker._brokers.clear()
+
+    release = Event()
+    started: list[str] = []
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        task = messages[-1]["content"]
+        started.append(task)
+        yield TurnStarted(1)
+        if task == "incumbent":
+            # Hold the session's slot until the test lets go — the stall the queue
+            # used to inherit.
+            release.wait(timeout=10)
+        yield Finished("completed", "done", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+
+    session_a, incumbent = _seed_run("A", "incumbent")
+    bridge.enqueue_run(incumbent)
+    assert _wait_for(lambda: "incumbent" in started), "the incumbent takes its slot"
+
+    # A follow-up in the SAME session: cannot be admitted while the incumbent holds it.
+    _, blocked = _seed_run(None, "same-session follow-up", session_id=session_a["id"])
+    bridge.enqueue_run(blocked)
+    # ...and behind it, a run for an unrelated session, which has nothing to wait for.
+    _, independent = _seed_run("B", "unrelated session")
+    bridge.enqueue_run(independent)
+
+    try:
+        assert _wait_for(lambda: "unrelated session" in started, timeout=5.0), (
+            "a run for a different session must start while another session is busy"
+        )
+        # The blocked one is still waiting, exactly as it should be.
+        assert store.get_run(blocked)["status"] == "pending"
+        assert "same-session follow-up" not in started
+    finally:
+        release.set()
+
+    assert _wait_for(lambda: all(
+        store.get_run(rid)["status"] not in {"pending", "running"}
+        for rid in (incumbent, blocked, independent)
+    )), "every run finishes once the incumbent releases"
+    assert "same-session follow-up" in started, "the deferred run is retried, not dropped"
+
+
+def test_deferred_runs_keep_their_relative_order(tmp_path, monkeypatch):
+    """Setting a blocked run aside must not cost it its place relative to the other
+    blocked runs — deferred entries are retried before newly arrived ones."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=1))
+    runbroker._brokers.clear()
+
+    release = Event()
+    started: list[str] = []
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        task = messages[-1]["content"]
+        started.append(task)
+        yield TurnStarted(1)
+        if task == "holder":
+            release.wait(timeout=10)
+        yield Finished("completed", "done", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+
+    _, holder = _seed_run("holder", "holder")
+    bridge.enqueue_run(holder)
+    assert _wait_for(lambda: "holder" in started)
+
+    # At capacity 1 these all defer behind the holder; order among them must survive.
+    waiting = []
+    for label in ("q1", "q2", "q3"):
+        _, run_id = _seed_run(label, label)
+        bridge.enqueue_run(run_id)
+        waiting.append(run_id)
+    assert _wait_for(lambda: all(store.get_run(r)["status"] == "pending" for r in waiting))
+
+    release.set()
+    assert _wait_for(lambda: all(
+        store.get_run(r)["status"] not in {"pending", "running"} for r in waiting
+    ), timeout=15.0)
+    assert [t for t in started if t.startswith("q")] == ["q1", "q2", "q3"]
+
+
+def test_a_supersede_is_requested_once_per_incumbent(tmp_path, monkeypatch):
+    """SESSION_BUSY asks the incumbent to stop. The old loop re-issued that on every
+    100 ms poll for as long as the incumbent took to wind down."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=4))
+    stops = []
+    monkeypatch.setattr(bridge, "request_stop", lambda run_id: stops.append(run_id))
+
+    session = store.create_session("S")
+    incumbent = store.create_run(session["id"], "gemini/test", None, 3)
+    runregistry.registry.try_admit(incumbent["id"], session["id"])
+
+    follow_up = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", "follow up", follow_up["id"])
+
+    superseded: dict[str, str] = {}
+    for _ in range(25):
+        assert bridge._try_dispatch(follow_up["id"], superseded) == bridge._DEFER
+
+    assert stops == [incumbent["id"]], f"asked {len(stops)} times, expected once"
+
+
+# --- AUDIT-2026-07-24 C3: a failed promotion must not destroy the file it replaced --
+
+class _FakeFinished:
+    """The shape `collation.candidate_from_event` reads off a SubagentFinished."""
+
+    def __init__(self, result_id, candidate_path, check_status="ok"):
+        self.result_id = result_id
+        self.candidate_path = candidate_path
+        self.check_status = check_status
+
+
+def _promotion_fixture(tmp_path, monkeypatch, *, existing=None):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    repo = tmp_path / "repo"
+    (repo / "Lea" / "Misc").mkdir(parents=True)
+    canonical = repo / "Lea" / "Misc" / "P.lean"
+    if existing is not None:
+        canonical.write_text(existing)
+
+    scratch = repo / "scratch"
+    scratch.mkdir()
+    candidate = scratch / "P.lean"
+    candidate.write_text("theorem t : True := by trivial\n")
+
+    session = store.create_session("promote")
+    run = store.create_run(session["id"], "m", None, 3)
+    return repo, canonical, session, run, [_FakeFinished("child-1", str(candidate))]
+
+
+def test_a_failed_reverification_restores_the_previous_proof(tmp_path, monkeypatch):
+    """`promote` overwrites the canonical path, and the re-check that decides whether
+    the candidate is any good runs afterwards — so a candidate that fails used to
+    destroy a verified proof from an earlier run and leave itself in its place, with
+    no code_step recording that the file had changed at all."""
+    proven = "import Mathlib\n\ntheorem t : True := by trivial  -- the good proof\n"
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing=proven
+    )
+    monkeypatch.setattr(
+        bridge, "_lean_check_file",
+        lambda path: CheckResult(path, "error", "does not compile here"),
+    )
+
+    promoted = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert promoted is None, "a candidate that fails re-verification is not promoted"
+    assert canonical.read_text() == proven, "the previous proof must survive on disk"
+    assert store.session_detail(session["id"])["code_steps"] == []
+
+
+def test_a_failed_reverification_leaves_no_file_where_there_was_none(tmp_path, monkeypatch):
+    """The other half: when nothing stood at the canonical path, a failed promotion
+    must not leave the broken candidate behind either."""
+    repo, canonical, session, run, results = _promotion_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        bridge, "_lean_check_file",
+        lambda path: CheckResult(path, "error", "nope"),
+    )
+
+    assert bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    ) is None
+    assert not canonical.exists(), "the failed candidate must not be left in place"
+
+
+def test_a_successful_promotion_still_replaces_the_file_and_records_it(tmp_path, monkeypatch):
+    """The guard must not block the case it exists to protect: a candidate that DOES
+    re-verify is promoted, overwrites what was there, and lands as a code_step."""
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing="old and worse\n"
+    )
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda path: CheckResult(path, "ok", None))
+    events = Queue()
+
+    step = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=events,
+    )
+
+    assert step is not None
+    assert canonical.read_text() == "theorem t : True := by trivial\n"
+    assert step["check_status"] == "ok"
+    assert step["path"] == "Lea/Misc/P.lean"
+    assert "promoted" in [f["payload"].get("status") for f in _drain(events)
+                          if f["type"] == "status"]
+
+
+def test_an_unreadable_previous_file_is_left_alone_rather_than_deleted(tmp_path, monkeypatch):
+    """If the snapshot could not be taken there is nothing to put back. Deleting would
+    turn a bad overwrite into outright data loss, so the file stays as promoted."""
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing="previous\n"
+    )
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda path: CheckResult(path, "error", "no"))
+    monkeypatch.setattr(bridge, "_snapshot_file", lambda path: None)  # snapshot failed
+
+    assert bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    ) is None
+    assert canonical.exists(), "an unrecoverable file must not be deleted"
