@@ -10,7 +10,7 @@ graph), so detail here is just meta + the project's sessions.
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
@@ -624,6 +624,28 @@ class ArtifactRestoreRequest(BaseModel):
     retire_commit: str
 
 
+def _is_retirable_artifact(project: dict, rel: str) -> bool:
+    """Whether this path is a proof artifact, as opposed to project infrastructure.
+
+    Recorded in the `artifacts` index or carrying a code_step settles it. Failing that,
+    a `.lean` source outside the `.lea/` asset tree still counts: a proof written
+    before the index existed — or written by the agent through `bash` rather than
+    `write_file` — has neither row, and `/artifacts/restore` explicitly supports
+    exactly that case ("legacy/manual files that have no timeline row"), so refusing it
+    here would break the retry flow this endpoint exists for.
+
+    What that leaves out is the point: `lakefile.toml`, `.gitignore`, and everything
+    under `.lea/` (instructions, memory, blueprint, uploads, the Overleaf mirror) are
+    project infrastructure with no restore path, and an endpoint whose whole job is
+    "delete the previous proof" has no business removing them (AUDIT-2026-07-24 S5)."""
+    if any(row["path"] == rel for row in store.list_artifacts_for_scope(project["id"])):
+        return True
+    if store.code_steps_for_project_path(project["id"], rel, include_content=False):
+        return True
+    parts = PurePosixPath(rel).parts
+    return rel.endswith(".lean") and bool(parts) and parts[0] != ".lea"
+
+
 def _resolve_repo_file(project: dict, rel: str) -> tuple[Path, Path, str]:
     """(repo, absolute, normalized-rel) for a repo-relative path, rejecting
     anything that escapes the project repo."""
@@ -648,6 +670,17 @@ def retire_project_artifact_by_slug(slug: str, request: ArtifactRetireRequest) -
     repo, absolute, rel = _resolve_repo_file(project, request.path)
     if not absolute.is_file():
         raise HTTPException(status_code=404, detail="No recorded file at that path")
+    # "No recorded file at that path" was only ever checking that a file EXISTED, so
+    # this endpoint would unlink anything in the repo — `lakefile.toml`,
+    # `.lea/instructions.md`, another session's proof (AUDIT-2026-07-24 S5). It is a
+    # retry primitive for a *recorded artifact*, so require the path to be one:
+    # indexed in `artifacts`, or carrying a code_step (which covers files written
+    # before the index existed, and is what `/artifacts/restore` reads back).
+    if not _is_retirable_artifact(project, rel):
+        raise HTTPException(
+            status_code=422,
+            detail="That path is not a recorded proof artifact for this project.",
+        )
     absolute.unlink()
     try:
         sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry", paths=[rel])
@@ -752,10 +785,37 @@ def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: Bac
     return {"project_id": project["id"], "slug": project["slug"], **summary}
 
 
+async def _read_capped(file: UploadFile, cap: int) -> bytes:
+    """Read an upload, refusing past `cap` instead of buffering it all first.
+
+    `await file.read()` pulled the WHOLE body into memory and only then let
+    `uploads._validate` check the 25 MB limit (AUDIT-2026-07-24 S7) — so a multi-GB
+    POST could exhaust the adapter, and with it every in-flight run, since the prover
+    runs in this same process. Streaming with a running total means an oversized upload
+    costs one chunk, not the whole file."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise uploads.UploadError(
+                f"File is too large; the cap is {cap // (1024 * 1024)} MB.",
+                code="too_large",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/api/projects/{project_id}/files", status_code=201)
 async def upload_file(project_id: str, file: UploadFile = File(...)) -> dict:
     project = _require_project(project_id)
-    data = await file.read()
+    try:
+        data = await _read_capped(file, uploads.MAX_UPLOAD_BYTES)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=_UPLOAD_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
     try:
         return uploads.save_upload(
             project, _proofs_root(), file.filename or "file", data, mime=file.content_type

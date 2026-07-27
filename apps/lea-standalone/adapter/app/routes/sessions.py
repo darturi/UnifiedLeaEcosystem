@@ -64,6 +64,10 @@ def list_sessions() -> dict:
 # lives before the browser EventSource transparently reconnects (~3h).
 _SESSIONS_POLL_SECONDS = 1.0
 _SESSIONS_MAX_TICKS = 10800
+# How often the SQL digest runs anyway, as a backstop to the in-process change token
+# (P4). 30 ticks ≈ 30s: rare enough to stop being a per-second query, frequent enough
+# that a change the token somehow missed still surfaces quickly.
+_SESSIONS_DIGEST_EVERY = 30
 
 
 @router.get("/api/sessions/events")
@@ -83,12 +87,29 @@ async def session_list_events() -> StreamingResponse:
 
     async def stream():
         last_digest: str | None = None
+        last_token: int | None = None
+        ticks_since_digest = 0
         for _ in range(_SESSIONS_MAX_TICKS):
-            try:
-                digest = store.sessions_digest()
-            except Exception:  # pragma: no cover - defensive; never wedge the stream
-                logger.exception("sessions_digest failed")
-                digest = last_digest
+            # The in-memory change token first (AUDIT-2026-07-24 P4). This loop ran a
+            # real query every second, per connected client, for up to three hours,
+            # against the single-writer database the runs are writing to. Every write
+            # that can move the list bumps the token, so an idle client now costs an
+            # integer comparison.
+            token = store.sessions_change_token()
+            ticks_since_digest += 1
+            digest = last_digest
+            if token != last_token or ticks_since_digest >= _SESSIONS_DIGEST_EVERY:
+                # The token only sees writes from THIS process — which is all of them
+                # today. The periodic SQL digest is the backstop, so if that ever stops
+                # being true the feed degrades to the old latency rather than to
+                # silence.
+                ticks_since_digest = 0
+                try:
+                    digest = store.sessions_digest()
+                except Exception:  # pragma: no cover - defensive; never wedge the stream
+                    logger.exception("sessions_digest failed")
+                    digest = last_digest
+            last_token = token
             if digest != last_digest:
                 last_digest = digest
                 yield f"event: sessions_changed\ndata: {json.dumps({})}\n\n"
@@ -360,16 +381,31 @@ async def lsp_socket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason=str(exc)[:120])
         return
 
+    # Bound the number of live `lake serve` processes (AUDIT-2026-07-24 X3). Each is
+    # multi-GB resident once Mathlib is loaded, and nothing capped them.
+    if not lsp_proxy.acquire_session_slot():
+        await websocket.close(
+            code=1013,  # "try again later"
+            reason=f"too many Lean editor sessions open (max {lsp_proxy.MAX_SESSIONS})",
+        )
+        return
     proxy = lsp_proxy.LspProxy(lake_root, str(lake_root))
     try:
-        await proxy.start()
-    except FileNotFoundError:
-        await websocket.close(code=1011, reason="lake not found on PATH")
-        return
-    try:
+        try:
+            await proxy.start()
+        except FileNotFoundError:
+            await websocket.close(code=1011, reason="lake not found on PATH")
+            return
         await proxy.pump(websocket)
     except WebSocketDisconnect:
+        pass  # ordinary teardown; `stop` runs below
+    finally:
+        # `pump` stops the process in its own finally, but everything between a
+        # successful `start()` and that point was unguarded — a cancellation or an
+        # unexpected error there orphaned the process (X3). `stop` is idempotent, so
+        # calling it unconditionally is free.
         await proxy.stop()
+        lsp_proxy.release_session_slot()
 
 
 @router.get("/api/sessions/{session_id}/export")

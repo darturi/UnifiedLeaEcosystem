@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from uuid import uuid4
 
 from typing import Any
@@ -12,6 +13,27 @@ from .db import ROOT, connect, row_to_dict, utc_now, write
 
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+
+# In-process "something about the session list changed" counter (AUDIT-2026-07-24 P4).
+# `/api/sessions/events` polled `sessions_digest()` — a real query — once a second per
+# connected client, forever, against the single-writer database the runs are writing
+# to. Every write that can move the list bumps this instead, so an idle client costs
+# an integer comparison. The SQL digest stays as a slow backstop: this counter only
+# sees writes from THIS process, which is all of them today, and the backstop means a
+# wrong assumption there degrades to the old latency rather than to silence.
+_change_lock = threading.Lock()
+_change_token = 0
+
+
+def _bump_sessions_changed() -> None:
+    global _change_token
+    with _change_lock:
+        _change_token += 1
+
+
+def sessions_change_token() -> int:
+    with _change_lock:
+        return _change_token
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 PROJECT_NAMESPACE_RE = re.compile(r"^Lea\.[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*$")
 # A skill slug is the stable id AND the materialized filename stem the prover reads
@@ -50,6 +72,7 @@ def create_session(
              parent_id, role, spawned_at_turn, now, now),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+    _bump_sessions_changed()
     return row_to_dict(row)
 
 
@@ -60,6 +83,7 @@ def touch_session(session_id: str) -> None:
     now = utc_now()
     with connect() as conn:
         conn.execute("update sessions set updated_at = ? where id = ?", (now, session_id))
+    _bump_sessions_changed()
 
 
 def get_session(session_id: str) -> dict | None:
@@ -120,14 +144,27 @@ def search_sessions(query: str, limit: int = 30) -> list[dict]:
     if not q:
         return []
     like = f"%{_escape_like(q)}%"
+    # The limit goes into the QUERY, not a slice of the default page (C4). It used to
+    # filter inside a query already truncated to the 100 most-recently-updated
+    # sessions, so past that many a matching older session was simply unreachable —
+    # and search is the ONLY path to an in-project session, which the sidebar hides.
     rows = _list_sessions(
         "(s.title like ? escape '\\' or p.title like ? escape '\\')",
         (like, like),
+        limit=limit,
     )
-    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows[:limit]]
+    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows]
 
 
-def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
+# The default page for the sidebar and the stats table. It is a RENDERING cap, not a
+# fact about the data — `global_usage` and `_origin_rollup` deliberately do not use
+# this query (AUDIT-2026-07-24 C1), and `search_sessions` passes its own (C4).
+DEFAULT_SESSION_PAGE = 100
+
+
+def _list_sessions(
+    extra_where: str = "", params: tuple = (), limit: int = DEFAULT_SESSION_PAGE
+) -> list[dict]:
     where_sql = f"where {extra_where}" if extra_where else ""
     with connect() as conn:
         rows = conn.execute(
@@ -215,9 +252,9 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
             {where_sql}
             group by s.id
             order by s.updated_at desc
-            limit 100
+            limit ?
             """,
-            params,
+            (*params, int(limit)),
         ).fetchall()
     sessions = []
     for row in rows:
@@ -283,6 +320,7 @@ def create_run(
             (run_id, session_id, project_id, "pending", 1 if autonomous else 0, model, provider, max_turns, now, now),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+    _bump_sessions_changed()
     return row_to_dict(row)
 
 
@@ -553,6 +591,17 @@ def delete_project_cascade(project_id: str) -> bool:
             conn.execute(
                 "delete from artifact_blobs where id not in "
                 "(select after_blob_id from timeline where after_blob_id is not null)"
+            )
+        # The artifact index is scoped by project OR by session (`scope` is whichever
+        # applies), and was left behind entirely (AUDIT-2026-07-24 C9). A stale row
+        # survives a re-created slug and makes `_ensure_artifacts_backfilled` think the
+        # fresh project is already indexed, so its real proofs never get imported.
+        conn.execute("delete from artifacts where project_id = ? or scope = ?",
+                     (project_id, project_id))
+        if session_ids:
+            conn.execute(
+                f"delete from artifacts where session_id in ({marks}) or scope in ({marks})",
+                (*session_ids, *session_ids),
             )
         conn.execute("delete from project_files where project_id = ?", (project_id,))
         # Drop any skill assignments pointing at this project (D47) — the skills
@@ -846,6 +895,42 @@ def update_run(
             """,
             (status, final_text, result_kind, result_detail, input_tokens, output_tokens, cost_usd, now, run_id),
         )
+    _bump_sessions_changed()
+
+
+def fail_pending_run(run_id: str, detail: str) -> bool:
+    """Atomically move a run from `pending` to `failed`; True if THIS caller did it.
+
+    The interrupt endpoint used to read the status, ask the registry whether the run
+    was active, and then write — three steps the dispatcher could interleave with
+    (AUDIT-2026-07-24 C7). One conditional UPDATE makes the check and the claim the
+    same operation, so exactly one of "interrupted before it started" and "started"
+    can win."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "update runs set status = 'failed', result_kind = coalesce(result_kind, 'failed'),"
+            " result_detail = coalesce(result_detail, ?), updated_at = ?"
+            " where id = ? and status = 'pending'",
+            (detail, utc_now(), run_id),
+        )
+    _bump_sessions_changed()
+    return cursor.rowcount > 0
+
+
+def claim_pending_run(run_id: str) -> bool:
+    """Atomically move a run from `pending` to `running`; True if THIS caller did it.
+
+    The other half of the same race (C7): `run_lea` used to set `running`
+    unconditionally, so an interrupt that landed between admission and start was
+    overwritten and the run executed anyway — after the endpoint had already told the
+    client it was interrupted."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "update runs set status = 'running', updated_at = ? where id = ? and status = 'pending'",
+            (utc_now(), run_id),
+        )
+    _bump_sessions_changed()
+    return cursor.rowcount > 0
 
 
 def fail_stale_active_runs() -> int:

@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
 
@@ -113,6 +114,32 @@ def _provider_keys(data: dict) -> dict[str, str]:
     return api_keys
 
 
+# The provider keys THIS loader put into `os.environ`, so a later load can take back
+# the ones the user removed (AUDIT-2026-07-24 C8). Only keys we exported are ever
+# popped: a key the user exported in their own shell is theirs, not ours to unset.
+_exported_lock = threading.Lock()
+_exported_keys: set[str] = set()
+
+
+def _export_provider_keys(keys: dict[str, str]) -> None:
+    """Publish the saved keys to `os.environ`, retracting any we previously published
+    that are no longer saved.
+
+    Exporting was one-way, so "Clear" in Settings removed the key from the file while
+    the value stayed live in the environment for the rest of the process — LiteLLM
+    kept authenticating with a credential the user believed they had revoked, and the
+    Settings UI (which reads the file) reported it as gone. The two disagreed, and the
+    environment was the one that mattered."""
+    global _exported_keys
+    with _exported_lock:
+        for stale in _exported_keys - keys.keys():
+            os.environ.pop(stale, None)
+            logger.info("Provider key %s was cleared; removed it from the environment", stale)
+        for env_name, value in keys.items():
+            os.environ[env_name] = value
+        _exported_keys = set(keys)
+
+
 def configured_provider_keys(path: Path | None = None) -> dict[str, str]:
     """The provider API keys present in the config file, env-var-keyed.
 
@@ -190,8 +217,7 @@ def load_config(path: Path | None = None) -> LeaConfig:
     # Secrets go to the process environment (litellm reads them there), not onto
     # the config object — so the config is loggable and the prover, running
     # in-process, sees the keys the same way the old subprocess did.
-    for env_name, value in _provider_keys(data).items():
-        os.environ[env_name] = value
+    _export_provider_keys(_provider_keys(data))
 
     return LeaConfig(
         model=data.get("model", "gemini/gemini-3.1-pro-preview"),

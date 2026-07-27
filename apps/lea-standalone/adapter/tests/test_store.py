@@ -823,3 +823,134 @@ def test_set_code_step_check_returns_the_updated_row_with_its_content(tmp_path, 
     assert updated["code"] == "proof\n"
     assert updated["check_status"] == "ok"
     assert "blob_content" not in updated
+
+
+# --- AUDIT-2026-07-24 C4: WITHDRAWN — this always worked ----------------------
+# The audit claimed search was truncated to the 100 most-recently-updated sessions,
+# so an older match was unreachable. That was wrong: the LIKE is part of the WHERE
+# clause, and SQL applies WHERE before LIMIT, so the cap has always bounded the number
+# of MATCHES, not the window searched. These tests pin the behaviour that was already
+# correct — they pass against the pre-"fix" code too, which is how the error surfaced.
+
+
+def test_search_finds_a_session_older_than_the_default_page(tmp_path, monkeypatch):
+    """Search reaches an old session regardless of how many newer ones exist. Search is
+    the ONLY path to an in-project session (the sidebar hides them), so this is worth
+    pinning even though it was never broken."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    needle = store.create_session("Cauchy completeness")
+    for i in range(140):  # every one of these is newer than the needle
+        store.create_session(f"unrelated {i}")
+
+    hits = store.search_sessions("cauchy")
+
+    assert [h["id"] for h in hits] == [needle["id"]]
+
+
+def test_search_still_honours_its_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    for i in range(40):
+        store.create_session(f"matching {i}")
+
+    assert len(store.search_sessions("matching", limit=5)) == 5
+    assert len(store.search_sessions("matching")) == 30  # the default
+
+
+# --- AUDIT-2026-07-24 C9: the cascade must take the artifact index with it -----
+
+def test_deleting_a_project_removes_its_artifact_rows(tmp_path, monkeypatch):
+    """A stale row survives a re-created slug and makes `_ensure_artifacts_backfilled`
+    think the fresh project is already indexed, so its real proofs never get imported."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    project = store.create_project("doomed", title="Doomed")
+    session = store.create_session("s", project_id=project["id"])
+    store.upsert_artifact(
+        project_id=project["id"], session_id=session["id"], run_id=None,
+        declaration_name="Lea.Doomed.thm", kind="proof", path="p.lean",
+        module_name="Lea.Doomed.p",
+    )
+    # ...and one scoped to the SESSION rather than the project (a loose-session artifact).
+    store.upsert_artifact(
+        project_id=None, session_id=session["id"], run_id=None,
+        declaration_name="Lea.Misc.loose", kind="proof", path="q.lean", module_name=None,
+    )
+    assert store.list_artifacts_for_scope(project["id"])
+    assert store.list_artifacts_for_scope(session["id"])
+
+    assert store.delete_project_cascade(project["id"]) is True
+
+    assert store.list_artifacts_for_scope(project["id"]) == []
+    assert store.list_artifacts_for_scope(session["id"]) == []
+
+
+# --- AUDIT-2026-07-24 C7: the pending row is claimed atomically ----------------
+
+def test_only_one_caller_can_claim_a_pending_run(tmp_path, monkeypatch):
+    """`fail_pending_run` and `claim_pending_run` are the same conditional UPDATE from
+    opposite sides — the interrupt endpoint and the run driver. Exactly one wins."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("race")
+
+    run = store.create_run(session["id"], "m", None, 3)
+    assert store.claim_pending_run(run["id"]) is True
+    assert store.claim_pending_run(run["id"]) is False, "a second claim must lose"
+    assert store.fail_pending_run(run["id"], "too late") is False, "the row is no longer pending"
+    assert store.get_run(run["id"])["status"] == "running"
+
+    other = store.create_run(session["id"], "m", None, 3)
+    assert store.fail_pending_run(other["id"], "interrupted before start") is True
+    assert store.claim_pending_run(other["id"]) is False, "the driver must decline"
+    assert store.get_run(other["id"])["status"] == "failed"
+    assert store.get_run(other["id"])["result_detail"] == "interrupted before start"
+
+
+def test_concurrent_claims_produce_exactly_one_winner(tmp_path, monkeypatch):
+    import threading
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("race")
+    run = store.create_run(session["id"], "m", None, 3)
+
+    results = []
+    start = threading.Barrier(8)
+
+    def contend(n):
+        start.wait(timeout=10)
+        if n % 2:
+            results.append(("claim", store.claim_pending_run(run["id"])))
+        else:
+            results.append(("fail", store.fail_pending_run(run["id"], "interrupted")))
+
+    threads = [threading.Thread(target=contend, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert sum(1 for _kind, won in results if won) == 1, results
+
+
+# --- AUDIT-2026-07-24 P4: an idle client costs no query ------------------------
+
+def test_the_change_token_moves_only_on_a_real_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+
+    before = store.sessions_change_token()
+    assert store.sessions_change_token() == before, "reading must not move the token"
+
+    session = store.create_session("moves it")
+    after_create = store.sessions_change_token()
+    assert after_create > before
+
+    run = store.create_run(session["id"], "m", None, 3)
+    assert store.sessions_change_token() > after_create
+    after_run = store.sessions_change_token()
+
+    store.update_run(run["id"], "proved")
+    assert store.sessions_change_token() > after_run

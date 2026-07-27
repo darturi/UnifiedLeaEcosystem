@@ -496,7 +496,10 @@ def test_a_value_with_control_characters_stays_parseable(tmp_path, monkeypatch, 
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
     config_path = tmp_path / "lea.local.toml"
-    config_path.write_text('model = "gpt-4o"\n')
+    # The selected model is the one whose key this test saves, so the save is
+    # self-consistent. (An earlier draft used `gpt-4o` and passed only because some
+    # other test had leaked OPENAI_API_KEY into os.environ — the exact leak C8 fixes.)
+    config_path.write_text('model = "mistral/mistral-large-latest"\n')
 
     settings_service.update_settings(
         {"api_keys": {"MISTRAL_API_KEY": {"value": hostile}}}, config_path
@@ -504,7 +507,7 @@ def test_a_value_with_control_characters_stays_parseable(tmp_path, monkeypatch, 
 
     # The file still parses, and the value round-trips exactly.
     assert settings_service.configured_provider_keys(config_path)["MISTRAL_API_KEY"] == hostile
-    assert settings_service.settings_payload(config_path)["model"] == "gpt-4o"
+    assert settings_service.settings_payload(config_path)["model"] == "mistral/mistral-large-latest"
 
 
 def test_a_corrupt_config_degrades_to_defaults_instead_of_500ing(tmp_path):

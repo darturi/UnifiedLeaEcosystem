@@ -217,15 +217,14 @@ def interrupt_run(run_id: str) -> dict:
     if run["status"] not in {"pending", "running"}:
         raise HTTPException(status_code=409, detail="Run is not active")
     request_stop(run_id)
-    # A queued run has no driver to read the stop flag. If it won the admission
-    # race, is_active is true and the cooperative path owns finalization.
-    if run["status"] == "pending" and not runregistry.registry.is_active(run_id):
-        store.update_run(
-            run_id,
-            "failed",
-            result_kind="failed",
-            result_detail="Interrupted before the run started.",
-        )
+    # A queued run has no driver to read the stop flag, so the endpoint finalizes it
+    # itself — atomically (AUDIT-2026-07-24 C7). This used to read the status, ask the
+    # registry whether the run was active, and then write, which the dispatcher could
+    # interleave with: the run got marked failed and then started anyway, after the
+    # client had been told it was interrupted. `fail_pending_run` and
+    # `store.claim_pending_run` (in `run_lea`) are the same conditional UPDATE from
+    # opposite sides, so exactly one of them can win.
+    if store.fail_pending_run(run_id, "Interrupted before the run started."):
         bridge.publish_terminal_from_row(run_id)
         return {"status": "interrupted"}
     return {"status": "interrupting"}

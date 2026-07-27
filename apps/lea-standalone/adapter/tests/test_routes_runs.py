@@ -294,9 +294,34 @@ def test_interrupt_pending_unadmitted_run_finalizes_it(tmp_path, monkeypatch):
     assert broker.closed
 
 
-def test_interrupt_pending_admitted_run_stays_cooperative(tmp_path, monkeypatch):
+def test_interrupt_cancels_an_admitted_run_that_has_not_started(tmp_path, monkeypatch):
+    """A run whose slot is claimed but whose driver has not begun is cancelled
+    OUTRIGHT, not left for the cooperative path (AUDIT-2026-07-24 C7).
+
+    This asserts the opposite of what it used to. The old shape checked the registry
+    and returned 'interrupting' with the row still pending, on the theory that the
+    driver owned it — but the driver had not started, so the run went on to claim the
+    row, make a model call, and only then notice the stop flag. Now the row is
+    finalized atomically and `run_lea` refuses to start, so an interrupt at this
+    moment costs nothing. `store.claim_pending_run` is the same UPDATE from the
+    driver's side, so exactly one of them wins.
+    """
     reg = _setup(tmp_path, monkeypatch)
     started = runs_route.create_run(RunRequest(message="prove it", autonomous=True))
     reg.try_admit(started["run_id"], started["session_id"])
+
+    assert runs_route.interrupt_run(started["run_id"]) == {"status": "interrupted"}
+    assert store.get_run(started["run_id"])["status"] == "failed"
+    # ...and the driver, arriving late, must decline to run it.
+    assert store.claim_pending_run(started["run_id"]) is False
+
+
+def test_interrupt_of_an_already_running_run_stays_cooperative(tmp_path, monkeypatch):
+    """Once the driver holds the row, the endpoint must NOT rewrite it — the run stops
+    at its next turn boundary and finalizes itself."""
+    _setup(tmp_path, monkeypatch)
+    started = runs_route.create_run(RunRequest(message="prove it", autonomous=True))
+    assert store.claim_pending_run(started["run_id"]) is True  # the driver got there first
+
     assert runs_route.interrupt_run(started["run_id"]) == {"status": "interrupting"}
-    assert store.get_run(started["run_id"])["status"] == "pending"
+    assert store.get_run(started["run_id"])["status"] == "running"

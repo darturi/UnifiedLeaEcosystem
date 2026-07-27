@@ -1089,3 +1089,94 @@ def test_artifacts_backfill_from_legacy_registry_markdown(tmp_path, monkeypatch)
     by_status = {t["declaration_name"]: t for t in status["targets"]}
     assert by_status["old_thm"]["exists"] is True and by_status["old_thm"]["has_sorry"] is False
     assert by_status["gone_thm"]["recorded"] is True and by_status["gone_thm"]["exists"] is False
+
+
+# --- AUDIT-2026-07-24 S5: retire is for proofs, not project infrastructure -----
+
+@pytest.mark.parametrize("infrastructure", [
+    "lakefile.toml",
+    ".lea/instructions.md",
+    ".lea/memory.md",
+    ".lea/files/paper.pdf",
+    ".gitignore",
+])
+def test_retire_refuses_project_infrastructure(tmp_path, monkeypatch, infrastructure):
+    """"No recorded file at that path" only ever checked that a file EXISTED, so this
+    endpoint would unlink anything in the repo. It is a retry primitive for a proof
+    artifact; project infrastructure has no restore path."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Infra"))
+    repo = proofs / "Lea" / "Infra"
+    target = repo / infrastructure
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("important\n")
+
+    with pytest.raises(HTTPException) as ei:
+        projects_route.retire_project_artifact_by_slug(
+            project["slug"], projects_route.ArtifactRetireRequest(path=infrastructure)
+        )
+
+    assert ei.value.status_code == 422
+    assert target.exists(), f"{infrastructure} must survive"
+    assert target.read_text() == "important\n"
+
+
+def test_retire_still_accepts_a_legacy_proof_with_no_recorded_row(tmp_path, monkeypatch):
+    """A proof written before the artifact index existed — or written by the agent
+    through `bash` rather than `write_file` — has neither an artifact row nor a
+    code_step. `/artifacts/restore` explicitly supports that case, so refusing it here
+    would break the retry flow this endpoint exists for."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Legacy"))
+    repo = proofs / "Lea" / "Legacy"
+    proof = repo / "old_theorem.lean"
+    proof.write_text("theorem old_theorem : True := by trivial\n")
+    from app.gitstore import GitStore
+    GitStore(repo.parent).commit_all(repo, "record old_theorem")
+
+    result = projects_route.retire_project_artifact_by_slug(
+        project["slug"], projects_route.ArtifactRetireRequest(path="old_theorem.lean")
+    )
+
+    assert not proof.exists()
+    assert len(result["retire_commit"]) == 40
+
+
+# --- AUDIT-2026-07-24 S7: the upload cap is enforced while reading -------------
+
+def test_an_oversized_upload_is_refused_without_buffering_it(tmp_path, monkeypatch):
+    """`await file.read()` pulled the WHOLE body into memory and only then checked the
+    25 MB cap, so a multi-GB POST could exhaust the adapter — and with it every
+    in-flight run, since the prover runs in this same process."""
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Uploads"))
+
+    read_calls = []
+
+    class _EndlessUpload:
+        """Never returns empty: a client streaming without end. The route must stop it."""
+        filename = "huge.pdf"
+        content_type = "application/pdf"
+
+        async def read(self, size=-1):
+            read_calls.append(size)
+            return b"\0" * (size if size and size > 0 else 1024)
+
+    with pytest.raises(HTTPException) as ei:
+        asyncio.run(projects_route.upload_file(project["id"], _EndlessUpload()))
+
+    assert ei.value.status_code == 413
+    # Bounded work: the cap is 25 MB and we read 1 MB at a time, so this must stop
+    # after ~26 reads rather than running until memory does.
+    assert len(read_calls) < 40, f"{len(read_calls)} chunks read before refusing"
+    assert all(size == 1024 * 1024 for size in read_calls), "must read in bounded chunks"
+
+
+def test_a_normal_upload_still_works(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Uploads OK"))
+
+    row = _upload(project["id"], "notes.md", b"# notes\n", "text/markdown")
+
+    assert row["filename"] == "notes.md"
+    assert row["stored_path"] == ".lea/files/notes.md"

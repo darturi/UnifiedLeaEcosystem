@@ -57,6 +57,7 @@ from lea.interface import (
     TurnStarted,
     UsageUpdated,
     check as _lean_check_file,
+    verify as _safe_verify_file,
     request_child_stop,
     run_events,
 )
@@ -1018,6 +1019,19 @@ def _materialize_subagent(
     return child
 
 
+def _safeverify_file(path: str) -> str | None:
+    """SafeVerify's verdict for a file: 'ok' | 'rejected' | 'error' | 'unavailable',
+    or None if the audit could not be run at all.
+
+    A crash here is not a rejection — it must not block a promotion, or an unbuilt
+    SafeVerify would silently disable collation entirely."""
+    try:
+        return _safe_verify_file(path).status
+    except Exception:
+        logger.exception("SafeVerify could not audit %s; treating it as not run", path)
+        return None
+
+
 # Sentinel for "there was no file here", so it is distinguishable from "there was a
 # file and it was empty" — restoring the two differently is the whole point.
 _ABSENT = object()
@@ -1078,9 +1092,23 @@ def _promote_winner(
     if not subagent_results:
         return None
     candidates = [collation.candidate_from_event(ev, base_dir=repo) for ev in subagent_results]
-    winner = collation.select_promotable(candidates)
-    if winner is None or not winner.candidate_path:
-        return None
+    # Best-first, and try the next one if the best fails a gate (AUDIT-2026-07-24 C5).
+    # `rank` is total, so once a non-promotable candidate appears everything after it
+    # is worse; there is nothing left to try.
+    for winner in collation.rank(candidates):
+        if not winner.is_promotable or not winner.candidate_path:
+            return None
+        step = _try_promote(
+            winner, session_id=session_id, run_id=run_id, repo=repo,
+            namespace=namespace, turn=turn, events=events,
+        )
+        if step is not None:
+            return step
+    return None
+
+
+def _try_promote(winner, *, session_id, run_id, repo, namespace, turn, events) -> dict | None:
+    """Promote one candidate, or return None having left the tree as it was found."""
     # The session's canonical proofs dir: its namespace path (loose → Lea/Misc).
     ns_path = (namespace or "Lea.Misc").replace(".", "/")
     canonical = repo / ns_path / Path(winner.candidate_path).name
@@ -1108,6 +1136,29 @@ def _promote_winner(
             "sub-agent candidate %s did not re-verify at %s (%s); not promoting "
             "(restored the previous file)",
             winner.result_id, canonical, verdict.detail,
+        )
+        return None
+    # SafeVerify gate (AUDIT-2026-07-24 C5). `collation` documents that a
+    # SafeVerify-REJECTED candidate must never become the proof of record — "promoting
+    # a cheat to the canonical file is exactly the failure SafeVerify exists to catch"
+    # — but its `_TIER_SV_REJECTED` was unreachable, because nothing ever populated
+    # `safeverify_status`. So the guarantee was documented and not enforced.
+    #
+    # Enforced here rather than by SafeVerifying every candidate before ranking: the
+    # audit is a kernel replay, the ranking already put the compiler's verdict first,
+    # and only the winner can become the proof of record — so one audit, at the moment
+    # it decides something, instead of N that mostly inform an ordering.
+    #
+    # ONLY 'rejected' blocks. 'unavailable' (the binary isn't built) and 'error' leave
+    # the candidate where lean_check put it, matching collation's stated degradation:
+    # missing SafeVerify must never *mis*-rank, only fail to catch a cheat.
+    audit = _safeverify_file(str(canonical))
+    if audit == "rejected":
+        _restore_file(canonical, previous)
+        logger.warning(
+            "sub-agent candidate %s compiles but SafeVerify rejected it at %s; not "
+            "promoting (restored the previous file)",
+            winner.result_id, canonical,
         )
         return None
     rel = _relativize(str(canonical), repo)
@@ -1307,7 +1358,17 @@ def run_lea(context: RunnerContext) -> None:
             skill_paths, skills_tempdir = skills_catalog.materialize_project_skills(project["id"])
             if skill_paths:
                 cfg = replace(cfg, skills=skill_paths)
-        store.update_run(run_id, "running")
+        # Claim the row (C7). If the interrupt endpoint got here first the row is no
+        # longer pending, and starting anyway would execute — and bill — a run the
+        # client was already told was cancelled.
+        if not store.claim_pending_run(run_id):
+            current = store.get_run(run_id)
+            final_status = (current or {}).get("status") or "cancelled"
+            final_result_kind = (current or {}).get("result_kind")
+            final_result_detail = (current or {}).get("result_detail")
+            logger.info("Run %s was finalized before it started (%s); not running it",
+                        run_id, final_status)
+            return
         # Multi-turn (D16): replay the session's prior conversation so a follow-up
         # continues with full context — the prover is stateless, so the adapter
         # feeds it the faithful transcript (tool_call/tool_result parts intact) of

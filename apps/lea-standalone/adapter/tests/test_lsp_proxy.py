@@ -165,3 +165,39 @@ def test_a_normal_uri_is_still_rewritten(tmp_path):
     lsp_proxy.rewrite_client_to_server(message, prefix)
 
     assert message["params"]["textDocument"]["uri"] == f"file://{prefix}/proofs/s1/p.lean"
+
+
+# --- AUDIT-2026-07-24 X3: bound the `lake serve` processes --------------------
+
+def test_session_slots_are_bounded_and_released(monkeypatch):
+    """Every WebSocket connection spawned a `lake serve` — an 8 MiB-buffered process
+    that loads Mathlib and is multi-GB resident — with nothing capping them."""
+    import threading
+
+    monkeypatch.setattr(lsp_proxy, "MAX_SESSIONS", 3)
+    monkeypatch.setattr(lsp_proxy, "_session_slots", threading.BoundedSemaphore(3))
+
+    assert [lsp_proxy.acquire_session_slot() for _ in range(3)] == [True, True, True]
+    assert lsp_proxy.acquire_session_slot() is False, "the cap must hold"
+
+    lsp_proxy.release_session_slot()
+    assert lsp_proxy.acquire_session_slot() is True, "a freed slot is reusable"
+
+
+def test_releasing_more_than_was_acquired_is_harmless(monkeypatch):
+    """The route's `finally` runs unconditionally, including on paths that never
+    acquired — an over-release must not raise out of teardown."""
+    import threading
+
+    monkeypatch.setattr(lsp_proxy, "_session_slots", threading.BoundedSemaphore(1))
+    lsp_proxy.release_session_slot()
+    lsp_proxy.release_session_slot()
+    assert lsp_proxy.acquire_session_slot() is True
+
+
+def test_stop_is_idempotent(tmp_path):
+    """The route calls `stop()` in a `finally` even though `pump` also stops the
+    process, so that an error between `start()` and `pump()` cannot orphan it."""
+    proxy = lsp_proxy.LspProxy(tmp_path, str(tmp_path))
+    asyncio.run(proxy.stop())   # never started
+    asyncio.run(proxy.stop())   # and again

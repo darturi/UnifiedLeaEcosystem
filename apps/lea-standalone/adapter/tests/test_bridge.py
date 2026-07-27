@@ -26,6 +26,7 @@ from lea.interface import (
     ToolCalled,
     ToolResulted,
     TurnStarted,
+    VerifyResult,
     UsageUpdated,
 )
 from lea.providers import Usage
@@ -1650,3 +1651,94 @@ def test_the_gap_note_reaches_the_task_the_agent_is_given(tmp_path, monkeypatch)
 
     assert "earlier attempt" in seen["task"]
     assert seen["task"].rstrip().endswith("third"), "the user's actual request stays last"
+
+
+# --- AUDIT-2026-07-24 C5: the SafeVerify gate is enforced at promotion ---------
+
+def test_a_safeverify_rejected_candidate_is_never_promoted(tmp_path, monkeypatch):
+    """`collation` documents that a SafeVerify-REJECTED candidate must never become the
+    proof of record — "promoting a cheat to the canonical file is exactly the failure
+    SafeVerify exists to catch" — but `_TIER_SV_REJECTED` was unreachable because
+    nothing populated `safeverify_status`. The guarantee was documented, not enforced."""
+    proven = "theorem t : True := by trivial  -- the good proof\n"
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing=proven
+    )
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(bridge, "_safe_verify_file",
+                        lambda p: VerifyResult("rejected", "sorry reachable through an import"))
+
+    promoted = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert promoted is None, "a cheat must not become the proof of record"
+    assert canonical.read_text() == proven, "and the good proof it replaced must survive"
+
+
+@pytest.mark.parametrize("status", ["unavailable", "error"])
+def test_safeverify_being_unavailable_does_not_block_promotion(tmp_path, monkeypatch, status):
+    """collation's stated degradation: a missing SafeVerify must never *mis*-rank, only
+    fail to catch a cheat. Blocking here would silently disable collation on any
+    install that skipped the SafeVerify build (`npm run setup -- --skip-verify`)."""
+    repo, canonical, session, run, results = _promotion_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(bridge, "_safe_verify_file", lambda p: VerifyResult(status, None))
+
+    step = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert step is not None
+    assert canonical.read_text() == "theorem t : True := by trivial\n"
+
+
+def test_a_crashing_safeverify_does_not_block_promotion(tmp_path, monkeypatch):
+    """An audit that raises is 'not run', not 'rejected'."""
+    repo, canonical, session, run, results = _promotion_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(bridge, "_safe_verify_file",
+                        lambda p: (_ for _ in ()).throw(RuntimeError("binary missing")))
+
+    assert bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    ) is not None
+
+
+def test_promotion_falls_through_to_the_next_candidate(tmp_path, monkeypatch):
+    """Ranking is best-first, so a rejected winner must not end the attempt — the next
+    promotable candidate gets its turn."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    repo = tmp_path / "repo"
+    (repo / "Lea" / "Misc").mkdir(parents=True)
+    scratch = repo / "scratch"
+    scratch.mkdir()
+    # The shorter proof ranks first; make it the cheat.
+    (scratch / "A.lean").write_text("theorem t : True := by trivial\n")
+    (scratch / "B.lean").write_text("theorem t : True := by\n  exact trivial\n")
+    session = store.create_session("fallthrough")
+    run = store.create_run(session["id"], "m", None, 3)
+    results = [
+        _FakeFinished("cheat", str(scratch / "A.lean")),
+        _FakeFinished("honest", str(scratch / "B.lean")),
+    ]
+
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(
+        bridge, "_safe_verify_file",
+        lambda p: VerifyResult("rejected" if p.endswith("A.lean") else "ok", None),
+    )
+
+    step = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert step is not None
+    assert "promoted_from" not in step or step["path"].endswith("B.lean")
+    assert (repo / "Lea" / "Misc" / "B.lean").exists()
+    assert not (repo / "Lea" / "Misc" / "A.lean").exists(), "the cheat must leave no trace"
