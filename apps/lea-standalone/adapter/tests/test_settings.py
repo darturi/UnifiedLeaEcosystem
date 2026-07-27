@@ -430,3 +430,120 @@ def test_credential_chain_providers_require_no_env_key(tmp_path, monkeypatch):
         assert requirements["provider"] == provider, model
         assert requirements["required_keys"] == [], model
         assert requirements["satisfied"] is True, model
+
+
+# --- AUDIT-2026-07-24 S6: the file that holds every credential -----------------
+
+def test_settings_are_written_atomically_and_owner_only(tmp_path, monkeypatch):
+    """`write_text` truncates first, so an interrupted save left this file EMPTY —
+    every provider key and the GitHub token gone, with no copy anywhere. And it was
+    created under the process umask, typically world-readable, for a file that is
+    entirely secrets."""
+    import os
+    import stat
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(settings_service, "_verify_api_key_credentials", lambda *a, **k: None)
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "gpt-4o"\n')
+    config_path.chmod(0o644)  # a file predating this fix
+
+    settings_service.update_settings(
+        {"api_keys": {"OPENAI_API_KEY": {"value": "sk-secret-abcd"}}}, config_path
+    )
+
+    mode = stat.S_IMODE(config_path.stat().st_mode)
+    assert mode == 0o600, f"secrets file is mode {mode:o}"
+    assert "sk-secret-abcd" in config_path.read_text()
+    # No temp file left beside it.
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".lea.local.toml")] == []
+
+
+def test_a_failed_write_leaves_the_previous_settings_intact(tmp_path, monkeypatch):
+    """The point of writing to a temp file and renaming: a crash mid-write must not
+    take the keys with it."""
+    import app.config as config_module
+
+    original = 'model = "gpt-4o"\nopenai_api_key = "sk-keep-me"\n'
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text(original)
+
+    def die(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(config_module.os, "replace", die)
+
+    with pytest.raises(OSError):
+        config_module.write_private_text(config_path, "brand new content\n")
+
+    assert config_path.read_text() == original, "the previous settings must survive"
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".lea.local.toml")] == []
+
+
+@pytest.mark.parametrize("hostile", [
+    "sk-with-a-\nnewline",
+    "sk-with-a-\ttab",
+    'sk-with-a-"quote',
+    "sk-with-a-\\backslash",
+    "sk-with-a-\x1bescape",
+])
+def test_a_value_with_control_characters_stays_parseable(tmp_path, monkeypatch, hostile):
+    """Only `\\` and `"` were escaped. A value carrying a newline produced a file
+    tomllib refused to parse on EVERY subsequent read — and since only the three
+    first-class providers are format-validated, anything matching `*_API_KEY` reached
+    the writer verbatim."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "gpt-4o"\n')
+
+    settings_service.update_settings(
+        {"api_keys": {"MISTRAL_API_KEY": {"value": hostile}}}, config_path
+    )
+
+    # The file still parses, and the value round-trips exactly.
+    assert settings_service.configured_provider_keys(config_path)["MISTRAL_API_KEY"] == hostile
+    assert settings_service.settings_payload(config_path)["model"] == "gpt-4o"
+
+
+def test_a_corrupt_config_degrades_to_defaults_instead_of_500ing(tmp_path):
+    """Every reader re-parses this file on every call, so an unparseable one turned
+    into a 500 on essentially every endpoint — including the Settings page the user
+    would need in order to repair it."""
+    from app.config import github_token, load_config, permission_tier
+
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "unterminated\n')
+
+    assert load_config(config_path).model  # a default, not an exception
+    assert permission_tier(config_path) == "stepwise"
+    assert github_token(config_path) is None
+    assert settings_service.configured_provider_keys(config_path) == {}
+    assert settings_service.settings_payload(config_path)["api_keys"]["OPENAI_API_KEY"]["configured"] is False
+
+
+def test_a_null_byte_in_a_key_is_refused_rather_than_saved(tmp_path, monkeypatch):
+    """A NUL escapes into the file cleanly but cannot live in a POSIX environment
+    variable — and `load_config` exports every saved key into `os.environ`. Saving one
+    would have broken every subsequent request with `ValueError: embedded null byte`,
+    so it is refused at the boundary: a credential with a NUL in it is a mangled paste,
+    not a credential."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    config_path = tmp_path / "lea.local.toml"
+    config_path.write_text('model = "gpt-4o"\n')
+
+    try:
+        settings_service.update_settings(
+            {"api_keys": {"MISTRAL_API_KEY": {"value": "sk-with-a-\x00null"}}}, config_path
+        )
+    except settings_service.SettingsValidationError as exc:
+        assert exc.field == "api_keys.MISTRAL_API_KEY"
+        assert "null byte" in str(exc)
+    else:
+        raise AssertionError("Expected SettingsValidationError")
+
+    # Nothing was written, and the file still loads.
+    assert "MISTRAL_API_KEY" not in settings_service.configured_provider_keys(config_path)
+    assert settings_service.load_config(config_path).model == "gpt-4o"

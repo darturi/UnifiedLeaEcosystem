@@ -1180,6 +1180,38 @@ def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = 
     return json.loads(row["transcript"])
 
 
+def transcript_gap_for_session(session_id: str, exclude_run_id: str | None = None) -> list[dict]:
+    """Finished runs that left no transcript and are NEWER than the one being replayed.
+
+    `latest_transcript_for_session` silently falls back to the newest run that *has* a
+    transcript. A run that crashed mid-turn never reaches `Finished`, so it stores
+    none — and simply disappears from the replayed history (AUDIT-2026-07-24 C10). The
+    user watched that turn happen; the next one replays a conversation in which it
+    never did, and the agent redoes the work.
+
+    This names what is missing so the caller can say so out loud. Only *terminal* runs
+    count: a pending or running one is not a gap, it is a run.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select id, status, result_kind, result_detail, created_at
+            from runs
+            where session_id = ?
+              and id != ?
+              and transcript is null
+              and status not in ('pending', 'running')
+              and created_at > coalesce((
+                  select max(created_at) from runs
+                  where session_id = ? and transcript is not null and id != ?
+              ), '')
+            order by created_at asc, id asc
+            """,
+            (session_id, exclude_run_id or "", session_id, exclude_run_id or ""),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
 def latest_transcript_run_for_session(session_id: str) -> dict | None:
     """The run that holds the session's latest transcript — id, model, and messages.
 

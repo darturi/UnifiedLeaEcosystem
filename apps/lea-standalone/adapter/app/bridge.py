@@ -630,6 +630,43 @@ def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | N
     return "\n".join(parts)
 
 
+def _transcript_gap_context(session_id: str, run_id: str) -> str | None:
+    """Tell the agent when earlier turns are missing from the history it was handed
+    (AUDIT-2026-07-24 C10), or None when the replayed conversation is continuous.
+
+    A run that crashes mid-turn never reaches `Finished`, so it stores no transcript
+    and `latest_transcript_for_session` quietly falls back to an older run. The
+    conversation then looks continuous while a turn the user watched is simply absent.
+
+    Why this says "unavailable" rather than replaying the partial history: the prover
+    appends the assistant's tool_call message BEFORE the tools run and the tool_result
+    messages after, so a transcript captured at an arbitrary crash point can end on a
+    tool_call with no matching result — a shape every provider rejects. Replaying it
+    would turn a lost turn into a session that cannot start a new one. Recovering the
+    content safely means truncating to the last complete turn boundary, which the
+    prover would have to expose; until then, being honest about the hole beats
+    pretending there isn't one. The files those runs left behind are still on disk, and
+    `_divergence_context` reports them.
+    """
+    gap = store.transcript_gap_for_session(session_id, exclude_run_id=run_id)
+    if not gap:
+        return None
+    lines = [
+        f"NOTE: {len(gap)} earlier attempt(s) in this session ended without a usable "
+        "record of what they did, so the conversation above skips them:",
+    ]
+    for run in gap:
+        detail = (run.get("result_detail") or "").strip().splitlines()
+        reason = detail[0][:160] if detail else (run.get("result_kind") or run.get("status"))
+        lines.append(f"- an attempt that ended as {run.get('status')}: {reason}")
+    lines.append(
+        "Any files they wrote are still on disk and are reflected in the working copy. "
+        "Check the current state of the proof files before assuming work is undone, and "
+        "do not assume the conversation above is the whole history."
+    )
+    return "\n".join(lines)
+
+
 def _artifact_module_name(namespace: str | None, rel: str) -> str | None:
     """Lean module for a repo-relative .lean path in a project repo (whose root
     IS the namespace): `Lea.Project1` + `chapter/decl.lean` → `Lea.Project1.chapter.decl`.
@@ -1282,7 +1319,14 @@ def run_lea(context: RunnerContext) -> None:
         task_content = context.task
         divergence = _divergence_context(session_id, repo_key, gs)
         if divergence:
-            task_content = f"{divergence}\n\n{context.task}"
+            task_content = f"{divergence}\n\n{task_content}"
+        # Transcript gap (C10): `prior` is whatever run last stored a transcript, which
+        # may not be the run that actually ran last — a crash mid-turn stores none and
+        # vanishes from the replay. Say so rather than presenting a history with a
+        # silent hole in it. Prepended last so it is the first thing the model reads.
+        gap = _transcript_gap_context(session_id, run_id)
+        if gap:
+            task_content = f"{gap}\n\n{task_content}"
         # Project context (D25): prepend ONE composed message (instructions + memory +
         # blueprint + file inventory). Strip any stale copy from the replayed
         # transcript first, so exactly one — always current — leads the messages.

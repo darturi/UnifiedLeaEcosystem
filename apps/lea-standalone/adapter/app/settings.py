@@ -14,7 +14,7 @@ from typing import Any
 from .config import (
     ROOT, LEGACY_KEY_ENV, configured_provider_keys, load_config,
     permission_tier as config_permission_tier, PERMISSION_TIERS,
-    github_token as config_github_token,
+    github_token as config_github_token, write_private_text,
 )
 from . import models_catalog
 from . import store
@@ -307,6 +307,18 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
         value = str(value).strip()
         if not value:
             continue
+        # A NUL cannot exist in a POSIX environment variable, and `load_config` exports
+        # every saved key into `os.environ` for LiteLLM to read — so a key containing
+        # one would persist to the file cleanly (the writer escapes it) and then raise
+        # `ValueError: embedded null byte` on the next load, breaking every request.
+        # Rejected at the boundary rather than escaped, because a credential with a NUL
+        # in it is not a credential; the only way to get one here is a mangled paste.
+        if "\x00" in value:
+            raise SettingsValidationError(
+                f"That {_key_label(env_name)} key contains a null byte — it looks like "
+                "a copy/paste problem. Copy the key again.",
+                f"api_keys.{env_name}",
+            )
         if family:
             _validate_api_key_format(family, value)
             _verify_api_key_credentials(family, value, selected_model)
@@ -571,7 +583,38 @@ def _write_toml_updates(path: Path, updates: dict[str, Any]) -> None:
                 insertion.append("")
             next_lines[first_table_index:first_table_index] = insertion
 
-    path.write_text("\n".join(next_lines).rstrip() + "\n")
+    # Atomic, owner-only: this file is the only copy of every provider key and the
+    # GitHub token (S6).
+    write_private_text(path, "\n".join(next_lines).rstrip() + "\n")
+
+
+# TOML basic strings cannot contain a raw control character, and a literal newline
+# ends the string outright. Escaping only `\` and `"` meant a value carrying either —
+# a paste accident, or any client posting straight to `PUT /api/settings`, where only
+# the three first-class providers are format-validated and everything matching
+# `*_API_KEY` is stored verbatim — produced a file `tomllib` then refused to parse on
+# EVERY subsequent read (AUDIT-2026-07-24 S6).
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+
+
+def _escape_toml_basic(text: str) -> str:
+    out: list[str] = []
+    for char in text:
+        if char in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[char])
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def _toml_scalar(value: Any) -> str:
@@ -581,4 +624,4 @@ def _toml_scalar(value: Any) -> str:
         return str(value)
     if isinstance(value, float):
         return str(value)
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + _escape_toml_basic(str(value)) + '"'

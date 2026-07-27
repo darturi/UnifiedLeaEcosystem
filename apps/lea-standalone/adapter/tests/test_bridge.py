@@ -1540,3 +1540,113 @@ def test_each_bookkeeping_step_is_independent(tmp_path, monkeypatch):
     # The transcript, which runs after the failing step, still landed.
     assert store.latest_transcript_for_session(ctx.session_id) is not None
     assert store.get_run(ctx.run_id)["status"] == "proved"
+
+
+# --- AUDIT-2026-07-24 C10: a turn that left no transcript must not vanish ------
+
+def _run_with_transcript(session_id, task, messages):
+    run = store.create_run(session_id, "gemini/test", None, 3)
+    store.add_message(session_id, "user", task, run["id"])
+    store.update_run(run["id"], "proved")
+    store.set_run_transcript(run["id"], messages)
+    return run["id"]
+
+
+def _crashed_run(session_id, task, detail="LiteLLM connection reset"):
+    """A run that died mid-turn: terminal, but never reached Finished, so no transcript."""
+    run = store.create_run(session_id, "gemini/test", None, 3)
+    store.add_message(session_id, "user", task, run["id"])
+    store.update_run(run["id"], "failed", result_kind="failed", result_detail=detail)
+    return run["id"]
+
+
+def test_a_crashed_run_is_reported_as_a_gap_in_the_replayed_history(tmp_path, monkeypatch):
+    """`latest_transcript_for_session` silently falls back to the newest run that HAS a
+    transcript. A run that crashed mid-turn stores none and simply disappears — the
+    user watched that turn happen, and the next one replays a conversation in which it
+    never did."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("gap")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+    _crashed_run(session["id"], "second")
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+    gap = store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"])
+
+    assert len(gap) == 1
+    note = bridge._transcript_gap_context(session["id"], current["id"])
+    assert note is not None
+    assert "1 earlier attempt" in note
+    assert "LiteLLM connection reset" in note
+
+
+def test_a_continuous_history_produces_no_note(tmp_path, monkeypatch):
+    """The note must appear only when something is actually missing — otherwise it is
+    noise in every follow-up."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("continuous")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+
+    assert store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"]) == []
+    assert bridge._transcript_gap_context(session["id"], current["id"]) is None
+
+
+def test_a_crash_before_the_newest_transcript_is_not_a_gap(tmp_path, monkeypatch):
+    """A run that failed and was then superseded by a run that DID store a transcript
+    is already represented — the later transcript covers the conversation."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("recovered")
+    _crashed_run(session["id"], "died")
+    time.sleep(0.01)  # distinct created_at
+    _run_with_transcript(session["id"], "recovered", [{"role": "user", "content": "recovered"}])
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+
+    assert store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"]) == []
+
+
+def test_an_active_run_is_not_a_gap(tmp_path, monkeypatch):
+    """A pending or running run has not lost anything — it has not finished."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("live")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+    store.create_run(session["id"], "gemini/test", None, 3)  # left pending
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+
+    assert store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"]) == []
+
+
+def test_the_gap_note_reaches_the_task_the_agent_is_given(tmp_path, monkeypatch):
+    """End to end: the note must actually be prepended to the run's task, not just
+    computable."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("gap-e2e")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+    _crashed_run(session["id"], "second")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", "third", run["id"])
+
+    seen = {}
+
+    def fake(config, messages, **kwargs):
+        seen["task"] = messages[-1]["content"]
+        yield TurnStarted(1)
+        yield Finished("completed", "done", 1, session["id"], "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(bridge.RunnerContext(
+        session["id"], run["id"], "third",
+        LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path), Queue(),
+    ))
+
+    assert "earlier attempt" in seen["task"]
+    assert seen["task"].rstrip().endswith("third"), "the user's actual request stays last"
