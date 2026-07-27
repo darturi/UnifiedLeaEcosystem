@@ -140,8 +140,51 @@ def _find_lake_root(path: str) -> str | None:
     return None
 
 
+def _readable_roots() -> list[Path] | None:
+    """The directories a run may read from, or None outside any run context.
+
+    Two roots, and both are needed:
+
+      * the run's ``working_dir`` — its own proofs, the project's ``.lea/`` docs and
+        uploads, and (for a project) its sibling sessions' files;
+      * the enclosing **Lake root**, which is what makes Mathlib readable. Confining
+        reads to the workspace alone would break the normal loop, since
+        ``search_mathlib`` returns paths under ``.lake/packages/mathlib/`` and the
+        model reads them next.
+
+    Everything else is out of bounds. `None` (no run context — a standalone CLI call
+    or a test) means unrestricted, matching `_sandboxed_write_path`.
+    """
+    wd = current_working_dir()
+    if wd is None:
+        return None
+    root = Path(wd).expanduser().resolve()
+    roots = [root]
+    lake_root = _find_lake_root(str(root / "_"))
+    if lake_root:
+        roots.append(Path(lake_root).resolve())
+    return roots
+
+
+def _within(target: Path, roots: list[Path]) -> bool:
+    return any(target == root or root in target.parents for root in roots)
+
+
 def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
     p = Path(path).expanduser()
+    # Reads are confined to the run's roots (AUDIT-2026-07-24 S4). `write_file` and
+    # `edit_file` have been sandboxed since F3, but reads were not — so the model could
+    # open anything the adapter process could: `~/.ssh/id_rsa`, the monorepo `.env`, and
+    # `config/lea.local.toml`, which holds every provider key and the GitHub token in
+    # plaintext. That matters most on the autonomous Overleaf path, where the task text
+    # comes from a shared LaTeX document and no approval gate stands between a
+    # prompt-injected instruction and the tool call.
+    roots = _readable_roots()
+    if roots is not None and not _within(p.resolve(), roots):
+        return (
+            f"Error: {path!r} is outside this run's workspace. Read only within your "
+            "session's directory or the Lake project (Mathlib included)."
+        )
     if not p.exists():
         return f"Error: {p} does not exist."
     text = p.read_text()
@@ -427,6 +470,26 @@ def _first_error_line(output: str) -> str | None:
     return None
 
 
+# Environment variables never handed to the agent's shell. `load_config` exports every
+# configured provider key into this process so LiteLLM can read them, which also put
+# them in the environment of every command the model ran — so "read the key" needed no
+# filesystem access at all (AUDIT-2026-07-24 S4). The agent has no use for them: Lean,
+# Lake, and git need none, and the adapter injects the GitHub token into its own push
+# URL rather than via the environment.
+_SECRET_ENV_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+_SECRET_ENV_NAMES = frozenset({"OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AWS_SECRET_ACCESS_KEY"})
+
+
+def _is_secret_env(name: str) -> bool:
+    upper = name.upper()
+    return upper in _SECRET_ENV_NAMES or upper.endswith(_SECRET_ENV_SUFFIXES)
+
+
+def scrubbed_env() -> dict[str, str]:
+    """The process environment minus anything that looks like a credential."""
+    return {k: v for k, v in os.environ.items() if not _is_secret_env(k)}
+
+
 def bash(command: str, timeout: int = 120) -> str:
     # Run in the active run's working dir (item 8) instead of the process-global
     # cwd, so under concurrent runs one run's shell command can't land in
@@ -435,7 +498,8 @@ def bash(command: str, timeout: int = 120) -> str:
     cwd = current_working_dir()
     try:
         result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd
+            command, shell=True, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+            env=scrubbed_env(),
         )
         output = (result.stdout + result.stderr).strip()
         if not output:

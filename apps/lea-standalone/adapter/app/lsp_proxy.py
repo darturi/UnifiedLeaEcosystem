@@ -58,15 +58,42 @@ _TERM_GRACE = float(os.environ.get("LEA_LSP_TERM_GRACE", "3"))
 # (we, like their dev mode, run the server on the host with a real cwd — there is
 # no bubblewrap mount remapping the paths for us).
 
+def _escapes_root(path: str, prefix: str) -> bool:
+    """Whether a rewritten filesystem path lands outside the Lake root.
+
+    The rewrite is a blind string prefix, so a client-supplied URI carrying `..`
+    (`file:///../../../../etc/passwd`) resolved to a real file anywhere on the host,
+    and the Lean server would then read it and report its contents back through
+    diagnostics and hover (AUDIT-2026-07-24 S1). Normalizing here — rather than
+    trusting the client to send a well-formed relative path — is what makes the
+    prefix rewrite safe.
+    """
+    root = os.path.realpath(prefix)
+    return os.path.commonpath([os.path.realpath(path), root]) != root
+
+
 def rewrite_client_to_server(obj, prefix: str):
     """Client → server: prefix every `file://` URI / rootUri and `rootPath` with
-    the Lake root. Mutates and returns `obj`."""
+    the Lake root. Mutates and returns `obj`.
+
+    A URI that escapes the Lake root after rewriting is left **unprefixed**, so it
+    names nothing the server will open, rather than being silently redirected at a
+    real file outside the project."""
     if isinstance(obj, dict):
         for key, val in obj.items():
             if key in ("uri", "rootUri") and isinstance(val, str):
-                obj[key] = val.replace("file://", f"file://{prefix}", 1)
+                rewritten = val.replace("file://", f"file://{prefix}", 1)
+                path = rewritten[len("file://"):] if rewritten.startswith("file://") else None
+                if path is not None and _escapes_root(path, prefix):
+                    logger.warning("dropping LSP uri that escapes the lake root: %r", val)
+                    continue
+                obj[key] = rewritten
             elif key == "rootPath" and isinstance(val, str):
-                obj[key] = os.path.join(prefix, val.lstrip("/"))
+                candidate = os.path.join(prefix, val.lstrip("/"))
+                if _escapes_root(candidate, prefix):
+                    logger.warning("dropping LSP rootPath that escapes the lake root: %r", val)
+                    continue
+                obj[key] = candidate
             else:
                 rewrite_client_to_server(val, prefix)
     elif isinstance(obj, list):

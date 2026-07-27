@@ -26,7 +26,7 @@ from lea.interface import check as interface_check, rebuild as interface_rebuild
 
 from ..artifacts import classify_lean_artifact
 from ..config import load_config
-from .. import filesystem as fs_service, lsp_proxy, projects, store
+from .. import filesystem as fs_service, lsp_proxy, netguard, projects, store
 
 router = APIRouter()
 logger = logging.getLogger("lea-interface.sessions")
@@ -339,6 +339,16 @@ async def lsp_socket(websocket: WebSocket, session_id: str) -> None:
     (v2.2 · D60/D61). Bare JSON per WS frame ⇄ Content-Length-framed stdio, with
     `file://` URI rewriting between the browser's virtual path and the real file.
     The process is spawned on connect and killed on disconnect (idle-reap)."""
+    # WebSockets are exempt from the same-origin policy, so this endpoint was reachable
+    # from ANY page the user had open — and it spawns a `lake serve` per connection and
+    # speaks a protocol that names files (AUDIT-2026-07-24 S1). The HTTP middleware in
+    # `main.py` never sees a handshake, so the same check runs here, before `accept()`.
+    if not netguard.is_allowed_origin(websocket.headers.get("origin")):
+        await websocket.close(code=1008, reason="origin not allowed")
+        return
+    if not netguard.is_allowed_host(websocket.headers.get("host")):
+        await websocket.close(code=1008, reason="host not allowed")
+        return
     await websocket.accept()
     try:
         abs_path, _ = _resolve_proof_path(session_id, None)
