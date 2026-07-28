@@ -26,7 +26,7 @@ from lea.interface import check as interface_check, rebuild as interface_rebuild
 
 from ..artifacts import classify_lean_artifact
 from ..config import load_config
-from .. import filesystem as fs_service, lsp_proxy, projects, store
+from .. import filesystem as fs_service, lsp_proxy, netguard, projects, store
 
 router = APIRouter()
 logger = logging.getLogger("lea-interface.sessions")
@@ -64,6 +64,10 @@ def list_sessions() -> dict:
 # lives before the browser EventSource transparently reconnects (~3h).
 _SESSIONS_POLL_SECONDS = 1.0
 _SESSIONS_MAX_TICKS = 10800
+# How often the SQL digest runs anyway, as a backstop to the in-process change token
+# (P4). 30 ticks ≈ 30s: rare enough to stop being a per-second query, frequent enough
+# that a change the token somehow missed still surfaces quickly.
+_SESSIONS_DIGEST_EVERY = 30
 
 
 @router.get("/api/sessions/events")
@@ -83,12 +87,29 @@ async def session_list_events() -> StreamingResponse:
 
     async def stream():
         last_digest: str | None = None
+        last_token: int | None = None
+        ticks_since_digest = 0
         for _ in range(_SESSIONS_MAX_TICKS):
-            try:
-                digest = store.sessions_digest()
-            except Exception:  # pragma: no cover - defensive; never wedge the stream
-                logger.exception("sessions_digest failed")
-                digest = last_digest
+            # The in-memory change token first (AUDIT-2026-07-24 P4). This loop ran a
+            # real query every second, per connected client, for up to three hours,
+            # against the single-writer database the runs are writing to. Every write
+            # that can move the list bumps the token, so an idle client now costs an
+            # integer comparison.
+            token = store.sessions_change_token()
+            ticks_since_digest += 1
+            digest = last_digest
+            if token != last_token or ticks_since_digest >= _SESSIONS_DIGEST_EVERY:
+                # The token only sees writes from THIS process — which is all of them
+                # today. The periodic SQL digest is the backstop, so if that ever stops
+                # being true the feed degrades to the old latency rather than to
+                # silence.
+                ticks_since_digest = 0
+                try:
+                    digest = store.sessions_digest()
+                except Exception:  # pragma: no cover - defensive; never wedge the stream
+                    logger.exception("sessions_digest failed")
+                    digest = last_digest
+            last_token = token
             if digest != last_digest:
                 last_digest = digest
                 yield f"event: sessions_changed\ndata: {json.dumps({})}\n\n"
@@ -339,6 +360,16 @@ async def lsp_socket(websocket: WebSocket, session_id: str) -> None:
     (v2.2 · D60/D61). Bare JSON per WS frame ⇄ Content-Length-framed stdio, with
     `file://` URI rewriting between the browser's virtual path and the real file.
     The process is spawned on connect and killed on disconnect (idle-reap)."""
+    # WebSockets are exempt from the same-origin policy, so this endpoint was reachable
+    # from ANY page the user had open — and it spawns a `lake serve` per connection and
+    # speaks a protocol that names files (AUDIT-2026-07-24 S1). The HTTP middleware in
+    # `main.py` never sees a handshake, so the same check runs here, before `accept()`.
+    if not netguard.is_allowed_origin(websocket.headers.get("origin")):
+        await websocket.close(code=1008, reason="origin not allowed")
+        return
+    if not netguard.is_allowed_host(websocket.headers.get("host")):
+        await websocket.close(code=1008, reason="host not allowed")
+        return
     await websocket.accept()
     try:
         abs_path, _ = _resolve_proof_path(session_id, None)
@@ -350,16 +381,31 @@ async def lsp_socket(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1011, reason=str(exc)[:120])
         return
 
+    # Bound the number of live `lake serve` processes (AUDIT-2026-07-24 X3). Each is
+    # multi-GB resident once Mathlib is loaded, and nothing capped them.
+    if not lsp_proxy.acquire_session_slot():
+        await websocket.close(
+            code=1013,  # "try again later"
+            reason=f"too many Lean editor sessions open (max {lsp_proxy.MAX_SESSIONS})",
+        )
+        return
     proxy = lsp_proxy.LspProxy(lake_root, str(lake_root))
     try:
-        await proxy.start()
-    except FileNotFoundError:
-        await websocket.close(code=1011, reason="lake not found on PATH")
-        return
-    try:
+        try:
+            await proxy.start()
+        except FileNotFoundError:
+            await websocket.close(code=1011, reason="lake not found on PATH")
+            return
         await proxy.pump(websocket)
     except WebSocketDisconnect:
+        pass  # ordinary teardown; `stop` runs below
+    finally:
+        # `pump` stops the process in its own finally, but everything between a
+        # successful `start()` and that point was unguarded — a cancellation or an
+        # unexpected error there orphaned the process (X3). `stop` is idempotent, so
+        # calling it unconditionally is free.
         await proxy.stop()
+        lsp_proxy.release_session_slot()
 
 
 @router.get("/api/sessions/{session_id}/export")
@@ -401,7 +447,20 @@ def _resolve_proof_path(session_id: str, path: str | None) -> tuple[str, str]:
     """(absolute on-disk path, repo-relative path) for the file to check/verify.
 
     Defaults to the session's latest code_step path. Filesystem-canonical (D3): the
-    on-disk file is what the agent, the user, and lean_check/SafeVerify all touch."""
+    on-disk file is what the agent, the user, and lean_check/SafeVerify all touch.
+
+    The path is **confined to the session's repo** (AUDIT-2026-07-24 S3). It used to
+    be a bare ``repo / rel`` join on a caller-supplied string, so
+    ``{"path": "../../../../etc/passwd"}`` escaped the session directory — and all
+    three callers act on whatever it resolves to: ``lean-check`` runs Lean over it
+    and returns the diagnostics (which quote source lines), ``rebuild`` runs
+    ``lake build`` against it, and ``verify`` runs SafeVerify. ``write_file_session``
+    has had this guard from the start; this is the same one, via the now-shared
+    ``filesystem.safe_abs``, which also keeps ``.git``/``.lake`` internals out of reach.
+
+    The returned relative path is normalized (resolved, POSIX) — the same form
+    ``bridge._relativize`` stores — so the code-step lookups keyed on it are
+    unaffected."""
     config = load_config()
     if config.lea_root is None:
         raise HTTPException(status_code=422, detail="lea_root is not configured")
@@ -413,7 +472,11 @@ def _resolve_proof_path(session_id: str, path: str | None) -> tuple[str, str]:
         raise HTTPException(status_code=404, detail="Session not found")
     gs, repo_key = resolved
     repo = gs.session_repo(repo_key)
-    return str(repo / rel), rel
+    try:
+        abs_path = fs_service.safe_abs(repo, rel)
+    except fs_service.FilesystemError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return str(abs_path), abs_path.relative_to(repo.resolve()).as_posix()
 
 
 def _latest_proof_path(session_id: str) -> str | None:

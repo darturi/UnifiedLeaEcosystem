@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from uuid import uuid4
 
 from typing import Any
@@ -12,6 +13,27 @@ from .db import ROOT, connect, row_to_dict, utc_now, write
 
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+
+# In-process "something about the session list changed" counter (AUDIT-2026-07-24 P4).
+# `/api/sessions/events` polled `sessions_digest()` — a real query — once a second per
+# connected client, forever, against the single-writer database the runs are writing
+# to. Every write that can move the list bumps this instead, so an idle client costs
+# an integer comparison. The SQL digest stays as a slow backstop: this counter only
+# sees writes from THIS process, which is all of them today, and the backstop means a
+# wrong assumption there degrades to the old latency rather than to silence.
+_change_lock = threading.Lock()
+_change_token = 0
+
+
+def _bump_sessions_changed() -> None:
+    global _change_token
+    with _change_lock:
+        _change_token += 1
+
+
+def sessions_change_token() -> int:
+    with _change_lock:
+        return _change_token
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 PROJECT_NAMESPACE_RE = re.compile(r"^Lea\.[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*$")
 # A skill slug is the stable id AND the materialized filename stem the prover reads
@@ -50,6 +72,7 @@ def create_session(
              parent_id, role, spawned_at_turn, now, now),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+    _bump_sessions_changed()
     return row_to_dict(row)
 
 
@@ -60,6 +83,7 @@ def touch_session(session_id: str) -> None:
     now = utc_now()
     with connect() as conn:
         conn.execute("update sessions set updated_at = ? where id = ?", (now, session_id))
+    _bump_sessions_changed()
 
 
 def get_session(session_id: str) -> dict | None:
@@ -120,14 +144,27 @@ def search_sessions(query: str, limit: int = 30) -> list[dict]:
     if not q:
         return []
     like = f"%{_escape_like(q)}%"
+    # The limit goes into the QUERY, not a slice of the default page (C4). It used to
+    # filter inside a query already truncated to the 100 most-recently-updated
+    # sessions, so past that many a matching older session was simply unreachable —
+    # and search is the ONLY path to an in-project session, which the sidebar hides.
     rows = _list_sessions(
         "(s.title like ? escape '\\' or p.title like ? escape '\\')",
         (like, like),
+        limit=limit,
     )
-    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows[:limit]]
+    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows]
 
 
-def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
+# The default page for the sidebar and the stats table. It is a RENDERING cap, not a
+# fact about the data — `global_usage` and `_origin_rollup` deliberately do not use
+# this query (AUDIT-2026-07-24 C1), and `search_sessions` passes its own (C4).
+DEFAULT_SESSION_PAGE = 100
+
+
+def _list_sessions(
+    extra_where: str = "", params: tuple = (), limit: int = DEFAULT_SESSION_PAGE
+) -> list[dict]:
     where_sql = f"where {extra_where}" if extra_where else ""
     with connect() as conn:
         rows = conn.execute(
@@ -215,9 +252,9 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
             {where_sql}
             group by s.id
             order by s.updated_at desc
-            limit 100
+            limit ?
             """,
-            params,
+            (*params, int(limit)),
         ).fetchall()
     sessions = []
     for row in rows:
@@ -283,6 +320,7 @@ def create_run(
             (run_id, session_id, project_id, "pending", 1 if autonomous else 0, model, provider, max_turns, now, now),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+    _bump_sessions_changed()
     return row_to_dict(row)
 
 
@@ -553,6 +591,17 @@ def delete_project_cascade(project_id: str) -> bool:
             conn.execute(
                 "delete from artifact_blobs where id not in "
                 "(select after_blob_id from timeline where after_blob_id is not null)"
+            )
+        # The artifact index is scoped by project OR by session (`scope` is whichever
+        # applies), and was left behind entirely (AUDIT-2026-07-24 C9). A stale row
+        # survives a re-created slug and makes `_ensure_artifacts_backfilled` think the
+        # fresh project is already indexed, so its real proofs never get imported.
+        conn.execute("delete from artifacts where project_id = ? or scope = ?",
+                     (project_id, project_id))
+        if session_ids:
+            conn.execute(
+                f"delete from artifacts where session_id in ({marks}) or scope in ({marks})",
+                (*session_ids, *session_ids),
             )
         conn.execute("delete from project_files where project_id = ?", (project_id,))
         # Drop any skill assignments pointing at this project (D47) — the skills
@@ -846,6 +895,42 @@ def update_run(
             """,
             (status, final_text, result_kind, result_detail, input_tokens, output_tokens, cost_usd, now, run_id),
         )
+    _bump_sessions_changed()
+
+
+def fail_pending_run(run_id: str, detail: str) -> bool:
+    """Atomically move a run from `pending` to `failed`; True if THIS caller did it.
+
+    The interrupt endpoint used to read the status, ask the registry whether the run
+    was active, and then write — three steps the dispatcher could interleave with
+    (AUDIT-2026-07-24 C7). One conditional UPDATE makes the check and the claim the
+    same operation, so exactly one of "interrupted before it started" and "started"
+    can win."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "update runs set status = 'failed', result_kind = coalesce(result_kind, 'failed'),"
+            " result_detail = coalesce(result_detail, ?), updated_at = ?"
+            " where id = ? and status = 'pending'",
+            (detail, utc_now(), run_id),
+        )
+    _bump_sessions_changed()
+    return cursor.rowcount > 0
+
+
+def claim_pending_run(run_id: str) -> bool:
+    """Atomically move a run from `pending` to `running`; True if THIS caller did it.
+
+    The other half of the same race (C7): `run_lea` used to set `running`
+    unconditionally, so an interrupt that landed between admission and start was
+    overwritten and the run executed anyway — after the endpoint had already told the
+    client it was interrupted."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "update runs set status = 'running', updated_at = ? where id = ? and status = 'pending'",
+            (utc_now(), run_id),
+        )
+    _bump_sessions_changed()
+    return cursor.rowcount > 0
 
 
 def fail_stale_active_runs() -> int:
@@ -914,22 +999,33 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     onto the current working step (the canvas's latest snapshot of that file)."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' and path = ? "
-            "order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.path = ? "
+            "order by t.id desc limit 1",
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
 
 
-def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
+def code_steps_for_project_path(
+    project_id: str, path: str, *, include_content: bool = True
+) -> list[dict]:
     """Every code step for a file across a project's sessions, newest first — the raw
     material for a blueprint node's status + session attribution (D29). Joins on the
     session's project_id so loose sessions never leak in. Ordered by `created_at`
     (cross-session recency; `id` only orders within one session), so the first row is
-    the latest verdict and the distinct session order is newest-touched-first."""
+    the latest verdict and the distinct session order is newest-touched-first.
+
+    `include_content=False` returns the rows with `code=""` and skips the blob join
+    entirely (AUDIT-2026-07-24 P3). The blueprint graph calls this once per node and
+    reads only `check_status`/`session_id`/`created_at`, so hydrating every historical
+    revision of every file — each formerly its own connection and its own full copy of
+    the proof — was work whose result was discarded."""
+    content_join = "left join artifact_blobs b on b.id = c.after_blob_id" if include_content else ""
+    content_column = "b.content as blob_content" if include_content else "'' as blob_content"
     with connect() as conn:
         rows = conn.execute(
-            "select c.* from timeline c join sessions s on s.id = c.session_id "
+            f"select c.*, {content_column} from timeline c "
+            f"join sessions s on s.id = c.session_id {content_join} "
             "where s.project_id = ? and c.kind = 'code' and c.path = ? "
             "order by c.created_at desc, c.id desc",
             (project_id, path),
@@ -963,8 +1059,8 @@ def latest_agent_code_step(session_id: str) -> dict | None:
     'knew' (D12). Its content vs. the file's current content reveals human edits."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' and author = 'agent' "
-            "order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.author = 'agent' "
+            "order by t.id desc limit 1",
             (session_id,),
         ).fetchone()
     return _code_step_from_row(row) if row else None
@@ -978,8 +1074,8 @@ def latest_agent_code_step_for_path(session_id: str, path: str) -> dict | None:
     other session's file as diverged too. Keying on the path is what scopes it."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' "
-            "and author = 'agent' and path = ? order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' "
+            "and t.author = 'agent' and t.path = ? order by t.id desc limit 1",
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
@@ -1169,6 +1265,38 @@ def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = 
     return json.loads(row["transcript"])
 
 
+def transcript_gap_for_session(session_id: str, exclude_run_id: str | None = None) -> list[dict]:
+    """Finished runs that left no transcript and are NEWER than the one being replayed.
+
+    `latest_transcript_for_session` silently falls back to the newest run that *has* a
+    transcript. A run that crashed mid-turn never reaches `Finished`, so it stores
+    none — and simply disappears from the replayed history (AUDIT-2026-07-24 C10). The
+    user watched that turn happen; the next one replays a conversation in which it
+    never did, and the agent redoes the work.
+
+    This names what is missing so the caller can say so out loud. Only *terminal* runs
+    count: a pending or running one is not a gap, it is a run.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select id, status, result_kind, result_detail, created_at
+            from runs
+            where session_id = ?
+              and id != ?
+              and transcript is null
+              and status not in ('pending', 'running')
+              and created_at > coalesce((
+                  select max(created_at) from runs
+                  where session_id = ? and transcript is not null and id != ?
+              ), '')
+            order by created_at asc, id asc
+            """,
+            (session_id, exclude_run_id or "", session_id, exclude_run_id or ""),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
 def latest_transcript_run_for_session(session_id: str) -> dict | None:
     """The run that holds the session's latest transcript — id, model, and messages.
 
@@ -1262,17 +1390,34 @@ def _message_from_row(row) -> dict:
     }
 
 
+# Every read that turns timeline rows into code steps selects through this, so the
+# blob arrives WITH the row instead of costing a second query — and a whole extra
+# SQLite connection — per step (AUDIT-2026-07-24 P3). `session_detail` on a session
+# with 200 steps opened 200 connections; `graph.build_graph` did it per revision of
+# per file. Aliased to `blob_content` because `timeline.content` already exists (it
+# holds message text), so `b.content` would collide on the way out.
+TIMELINE_WITH_BLOB = (
+    "select t.*, b.content as blob_content from timeline t "
+    "left join artifact_blobs b on b.id = t.after_blob_id"
+)
+
+
 def _code_step_from_row(row, *, code: str | None = None) -> dict:
     """A timeline code row in the shape the API has always returned.
 
-    `code` is passed when the caller already has the bytes (it just wrote them);
-    otherwise it's read from the blob. A `content_lost` row yields `""` — the row
-    survives to say a step happened, which is more honest than deleting history
-    because its bytes are gone.
+    `code` is passed when the caller already has the bytes (it just wrote them).
+    Otherwise it comes from the row's joined `blob_content` when the query used
+    :data:`TIMELINE_WITH_BLOB`, and only failing that from a separate `blob_content()`
+    lookup — the fallback that used to be the only path. A `content_lost` row yields
+    `""`: the row survives to say a step happened, which is more honest than deleting
+    history because its bytes are gone.
     """
     d = row_to_dict(row)
     if code is None:
-        code = blob_content(d["after_blob_id"]) or ""
+        code = d.get("blob_content")
+        if code is None:
+            code = blob_content(d["after_blob_id"]) or ""
+    d.pop("blob_content", None)
     return {
         "id": str(d["id"]),
         "session_id": d["session_id"],
@@ -1399,6 +1544,29 @@ def add_code_step(
     return _code_step_from_row(row, code=content)
 
 
+def project_has_active_run(project_id: str) -> bool:
+    """True if any session in the project has a pending/running run.
+
+    A real query, not a scan of derived session status (AUDIT-2026-07-24 C2). A
+    session's status is its working-copy *verdict* (D14): once it has any code step
+    the verdict wins and it reads 'proved'/'ok'/'error' — `_derive_session_status`
+    only ever returns 'running' for a session with **no code yet**. So a caller that
+    tested `status == "running"` could see a live run only in a session that had
+    never written a file, which is the opposite of the sessions worth protecting.
+
+    Joined through `sessions.project_id` rather than `runs.project_id` on purpose:
+    the session's project tag is what `repo_for_session` uses to pick the on-disk
+    repo, so it is the link that decides whose working tree a run is writing to —
+    which is exactly what this interlock exists to protect."""
+    with connect() as conn:
+        row = conn.execute(
+            "select 1 from runs r join sessions s on s.id = r.session_id "
+            "where s.project_id = ? and r.status in ('pending', 'running') limit 1",
+            (project_id,),
+        ).fetchone()
+    return row is not None
+
+
 def has_active_run(session_id: str) -> bool:
     """True if the session has a pending/running agent run — the modal lock (D62):
     a user write is refused while the agent is mid-run so the two never race on the
@@ -1459,7 +1627,7 @@ def set_code_step_check(
             "where id = ? and kind = 'code'",
             (check_status, check_detail, artifact_kind if check_status == "ok" else None, int(step_id)),
         )
-        row = conn.execute("select * from timeline where id = ?", (int(step_id),)).fetchone()
+        row = conn.execute(f"{TIMELINE_WITH_BLOB} where t.id = ?", (int(step_id),)).fetchone()
     return _code_step_from_row(row) if row else None
 
 
@@ -1576,8 +1744,12 @@ def session_detail(session_id: str) -> dict | None:
         # counter so the frontend could merge them by a single key; now they're the
         # same rows, split apart on the way out only because the API shape predates
         # the merge. `id` is the order — nothing can disagree about it.
+        # The blob rides along with the row (P3). This used to be a bare
+        # `select * from timeline`, and the code steps were built AFTER the connection
+        # closed — so every step then opened its own connection for its own blob. A
+        # session with 200 steps opened 200 connections to render one thread.
         rows = conn.execute(
-            "select * from timeline where session_id = ? order by id asc",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? order by t.id asc",
             (session_id,),
         ).fetchall()
         status_events = conn.execute(
@@ -1699,7 +1871,70 @@ def _safe_verify_summary(run: dict) -> dict | None:
     return {"run_id": run.get("id"), "status": status, "detail": run.get("safe_verify_detail")}
 
 
+# --- whole-database usage aggregates (AUDIT-2026-07-24 C1) -------------------
+# These are deliberately NOT derived from `list_sessions()`. `usage_stats` used to
+# sum the Python list that query returns — and that query ends in `limit 100`, so
+# the "global" totals were the totals of the 100 most-recently-updated sessions.
+# Past 100 sessions the reported spend *fell* as older sessions aged out of the
+# window, and `max_spend_usd` is enforced against exactly that number, so the cap
+# silently stopped biting once a workspace grew big enough to need it. The `daily`
+# and `models` rollups next to it were already full-table SQL aggregates, so the
+# Stats page could disagree with its own chart.
+#
+# The rule these encode: a total over "everything" is a SQL aggregate over
+# everything. A paginated list is for rendering, never for arithmetic.
+
+
+def total_spend_usd() -> float:
+    """Persisted spend across every run — the number the cap is enforced against.
+
+    One scalar aggregate, kept separate from `usage_stats()` on purpose: the cap is
+    checked at every turn boundary and on every `UsageUpdated` event, and routing
+    that through the full stats payload is both what made it wrong (above) and a
+    heavy per-event query against a single-writer database."""
+    with connect() as conn:
+        row = conn.execute("select coalesce(sum(cost_usd), 0) as cost_usd from runs").fetchone()
+    return float(row["cost_usd"] or 0)
+
+
+def global_usage() -> dict:
+    """The `global` block of `usage_stats` — every session and every run counted."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select
+                (select count(*) from sessions) as session_count,
+                (select count(*) from timeline where kind != 'code') as message_count,
+                coalesce(sum(input_tokens), 0) as input_tokens,
+                coalesce(sum(output_tokens), 0) as output_tokens,
+                coalesce(sum(cost_usd), 0) as cost_usd
+            from runs
+            """
+        ).fetchone()
+    data = row_to_dict(row)
+    session_count = int(data["session_count"] or 0)
+    message_count = int(data["message_count"] or 0)
+    input_tokens = int(data["input_tokens"] or 0)
+    output_tokens = int(data["output_tokens"] or 0)
+    total_tokens = input_tokens + output_tokens
+    cost_usd = float(data["cost_usd"] or 0)
+    return {
+        "session_count": session_count,
+        "message_count": message_count,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd,
+        "average_tokens_per_session": round(total_tokens / session_count) if session_count else 0,
+        "average_cost_per_session": cost_usd / session_count if session_count else 0,
+        "average_messages_per_session": round(message_count / session_count) if session_count else 0,
+    }
+
+
 def usage_stats() -> dict:
+    # `sessions` stays the (100-row) list the Stats table renders — truncating a
+    # rendered list is fine. `global` and `origins` are full-table aggregates, so
+    # they no longer inherit that truncation.
     sessions = list_sessions()
     with connect() as conn:
         daily_rows = conn.execute(
@@ -1733,67 +1968,62 @@ def usage_stats() -> dict:
             """
         ).fetchall()
 
-    total_sessions = len(sessions)
-    total_messages = sum(int(session["message_count"]) for session in sessions)
-    input_tokens = sum(int(session["input_tokens"]) for session in sessions)
-    output_tokens = sum(int(session["output_tokens"]) for session in sessions)
-    total_tokens = input_tokens + output_tokens
-    cost_usd = sum(float(session["cost_usd"]) for session in sessions)
-
     return {
         "sessions": sessions,
-        "origins": _origin_rollup(sessions),
-        "global": {
-            "session_count": total_sessions,
-            "message_count": total_messages,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "cost_usd": cost_usd,
-            "average_tokens_per_session": round(total_tokens / total_sessions) if total_sessions else 0,
-            "average_cost_per_session": cost_usd / total_sessions if total_sessions else 0,
-            "average_messages_per_session": round(total_messages / total_sessions) if total_sessions else 0,
-        },
+        "origins": _origin_rollup(),
+        "global": global_usage(),
         "daily": [_normalize_usage_day(row_to_dict(row)) for row in daily_rows],
         "models": [_normalize_usage_model(row_to_dict(row)) for row in model_rows],
     }
 
 
-def _origin_rollup(sessions: list[dict]) -> list[dict]:
+def _empty_origin_bucket(origin: str) -> dict:
+    return {
+        "origin": origin,
+        "session_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+    }
+
+
+def _origin_rollup() -> list[dict]:
     """Per-origin usage rollup for the Stats "By origin" tab (Direct UI vs Overleaf).
 
-    Aggregated from the same `sessions` rows the `global` totals come from, so the two
-    always agree. Both 'ui' and 'overleaf' rows are always emitted (zeros when absent)
-    so the UI layout is stable. An unexpected origin value falls back to 'ui'."""
-    buckets: dict[str, dict] = {
-        origin: {
-            "origin": origin,
-            "session_count": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-        }
-        for origin in ("ui", "overleaf")
-    }
-    for session in sessions:
-        origin = str(session.get("origin") or "ui")
-        bucket = buckets.setdefault(
-            origin,
-            {
-                "origin": origin,
-                "session_count": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cost_usd": 0.0,
-            },
-        )
-        bucket["session_count"] += 1
-        bucket["input_tokens"] += int(session.get("input_tokens") or 0)
-        bucket["output_tokens"] += int(session.get("output_tokens") or 0)
-        bucket["total_tokens"] += int(session.get("total_tokens") or 0)
-        bucket["cost_usd"] += float(session.get("cost_usd") or 0)
+    A full-table aggregate, like `global_usage` — its contract has always been that
+    the two agree, and the way to keep that promise is for both to count everything.
+    It used to fold the truncated `list_sessions()` page instead, which meant the
+    per-origin totals and the global total were consistently wrong *together*
+    (AUDIT-2026-07-24 C1).
+
+    Both 'ui' and 'overleaf' rows are always emitted (zeros when absent) so the UI
+    layout is stable. A NULL/blank origin falls back to 'ui'."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select
+                coalesce(nullif(trim(s.origin), ''), 'ui') as origin,
+                count(distinct s.id) as session_count,
+                coalesce(sum(r.input_tokens), 0) as input_tokens,
+                coalesce(sum(r.output_tokens), 0) as output_tokens,
+                coalesce(sum(r.cost_usd), 0) as cost_usd
+            from sessions s
+            left join runs r on r.session_id = s.id
+            group by 1
+            """
+        ).fetchall()
+
+    buckets: dict[str, dict] = {origin: _empty_origin_bucket(origin) for origin in ("ui", "overleaf")}
+    for row in rows:
+        data = row_to_dict(row)
+        origin = str(data["origin"])
+        bucket = buckets.setdefault(origin, _empty_origin_bucket(origin))
+        bucket["session_count"] += int(data["session_count"] or 0)
+        bucket["input_tokens"] += int(data["input_tokens"] or 0)
+        bucket["output_tokens"] += int(data["output_tokens"] or 0)
+        bucket["total_tokens"] += int(data["input_tokens"] or 0) + int(data["output_tokens"] or 0)
+        bucket["cost_usd"] += float(data["cost_usd"] or 0)
     # 'ui' and 'overleaf' first (stable UI order), then any unexpected origins.
     ordered = ["ui", "overleaf"] + [k for k in buckets if k not in ("ui", "overleaf")]
     return [buckets[k] for k in ordered]

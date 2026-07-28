@@ -10,7 +10,8 @@ graph), so detail here is just meta + the project's sessions.
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
@@ -86,8 +87,28 @@ class RemoteUpdate(BaseModel):
     remote_url: str
 
 
-# An https GitHub-style repo URL: host / owner / repo (repo may carry a `.git`).
-_GITHUB_REMOTE_RE = re.compile(r"^https://[\w.\-]+/[\w.\-]+/[\w.\-]+$")
+# An https GitHub repo URL: `github.com` / owner / repo (repo may carry a `.git`).
+#
+# The host is pinned deliberately (AUDIT-2026-07-24 S2). This pattern used to be
+# `https://[\w.\-]+/...` — any host — while the error message below promised
+# "a GitHub repo URL". `_push_project` hands the stored value to `push_to_github`,
+# which embeds the global GitHub token in it, so an unpinned host turned "set a
+# remote" into "mail my PAT to a server of the caller's choosing". Each path
+# segment must start with a word character or hyphen, so `..` can't appear as an
+# owner/repo either. `gitstore._inject_token` enforces the same host rule at the
+# credential boundary; this is the input-validation half.
+_GITHUB_REMOTE_RE = re.compile(r"^https://(?:www\.)?github\.com/[\w\-][\w.\-]*/[\w\-][\w.\-]*$")
+
+
+def _normalize_remote_url(remote_url: str) -> str:
+    return str(remote_url or "").strip().rstrip("/")
+
+
+def _is_web_remote(remote_url: str) -> bool:
+    """True for an http(s) remote — the only shape that can carry the token to a
+    server. Local paths and ssh remotes are never credential-bearing."""
+    return urlparse(str(remote_url or "")).scheme in ("http", "https")
+
 
 # Git's wording for "the remote has commits you don't" (a rejected, non-fast-forward push).
 _DIVERGED_MARKERS = ("non-fast-forward", "fetch first", "updates were rejected", "[rejected]")
@@ -339,7 +360,7 @@ def export_project(project_id: str) -> Response:
 def _set_remote_on(project: dict, remote_url: str) -> dict:
     """Validate + store a project's GitHub remote URL — shared by the by-id and
     by-slug routes (D34). The token stays global in Settings."""
-    url = remote_url.strip().rstrip("/")
+    url = _normalize_remote_url(remote_url)
     if not _GITHUB_REMOTE_RE.fullmatch(url):
         raise HTTPException(
             status_code=400,
@@ -358,6 +379,19 @@ def _push_project(project: dict) -> dict:
     token = github_token()
     if not token:
         raise HTTPException(status_code=400, detail="No GitHub token configured. Add one in Settings.")
+    # Re-check the host at the moment the credential would be used (AUDIT-2026-07-24 S2).
+    # `_set_remote_on` validates on the way in, but a row written before the host was
+    # pinned — or by anything else that touches `projects.remote_url` — must not become
+    # a token-delivery target on the way out. Only http(s) remotes can carry the token,
+    # so a local-path or ssh remote is left alone.
+    if _is_web_remote(remote_url) and not _GITHUB_REMOTE_RE.fullmatch(_normalize_remote_url(remote_url)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This project's remote is not a GitHub URL, so pushing it would send your "
+                "GitHub token to another server. Set an https://github.com/... remote first."
+            ),
+        )
     repo = project_service.project_repo_dir(project, _proofs_root())
     try:
         summary = GitStore(_proofs_root()).push_to_github(repo, remote_url, token)
@@ -590,6 +624,28 @@ class ArtifactRestoreRequest(BaseModel):
     retire_commit: str
 
 
+def _is_retirable_artifact(project: dict, rel: str) -> bool:
+    """Whether this path is a proof artifact, as opposed to project infrastructure.
+
+    Recorded in the `artifacts` index or carrying a code_step settles it. Failing that,
+    a `.lean` source outside the `.lea/` asset tree still counts: a proof written
+    before the index existed — or written by the agent through `bash` rather than
+    `write_file` — has neither row, and `/artifacts/restore` explicitly supports
+    exactly that case ("legacy/manual files that have no timeline row"), so refusing it
+    here would break the retry flow this endpoint exists for.
+
+    What that leaves out is the point: `lakefile.toml`, `.gitignore`, and everything
+    under `.lea/` (instructions, memory, blueprint, uploads, the Overleaf mirror) are
+    project infrastructure with no restore path, and an endpoint whose whole job is
+    "delete the previous proof" has no business removing them (AUDIT-2026-07-24 S5)."""
+    if any(row["path"] == rel for row in store.list_artifacts_for_scope(project["id"])):
+        return True
+    if store.code_steps_for_project_path(project["id"], rel, include_content=False):
+        return True
+    parts = PurePosixPath(rel).parts
+    return rel.endswith(".lean") and bool(parts) and parts[0] != ".lea"
+
+
 def _resolve_repo_file(project: dict, rel: str) -> tuple[Path, Path, str]:
     """(repo, absolute, normalized-rel) for a repo-relative path, rejecting
     anything that escapes the project repo."""
@@ -614,9 +670,20 @@ def retire_project_artifact_by_slug(slug: str, request: ArtifactRetireRequest) -
     repo, absolute, rel = _resolve_repo_file(project, request.path)
     if not absolute.is_file():
         raise HTTPException(status_code=404, detail="No recorded file at that path")
+    # "No recorded file at that path" was only ever checking that a file EXISTED, so
+    # this endpoint would unlink anything in the repo — `lakefile.toml`,
+    # `.lea/instructions.md`, another session's proof (AUDIT-2026-07-24 S5). It is a
+    # retry primitive for a *recorded artifact*, so require the path to be one:
+    # indexed in `artifacts`, or carrying a code_step (which covers files written
+    # before the index existed, and is what `/artifacts/restore` reads back).
+    if not _is_retirable_artifact(project, rel):
+        raise HTTPException(
+            status_code=422,
+            detail="That path is not a recorded proof artifact for this project.",
+        )
     absolute.unlink()
     try:
-        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry")
+        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry", paths=[rel])
     except GitStoreError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"retire_commit": sha, "path": rel}
@@ -652,7 +719,9 @@ def restore_project_artifact_by_slug(slug: str, request: ArtifactRestoreRequest)
     absolute.parent.mkdir(parents=True, exist_ok=True)
     absolute.write_text(content)
     try:
-        sha = GitStore(repo.parent).commit_all(repo, f"restore {rel} after unverified retry")
+        sha = GitStore(repo.parent).commit_all(
+            repo, f"restore {rel} after unverified retry", paths=[rel],
+        )
     except GitStoreError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"restored": True, "commit": sha, "path": rel}
@@ -716,10 +785,37 @@ def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: Bac
     return {"project_id": project["id"], "slug": project["slug"], **summary}
 
 
+async def _read_capped(file: UploadFile, cap: int) -> bytes:
+    """Read an upload, refusing past `cap` instead of buffering it all first.
+
+    `await file.read()` pulled the WHOLE body into memory and only then let
+    `uploads._validate` check the 25 MB limit (AUDIT-2026-07-24 S7) — so a multi-GB
+    POST could exhaust the adapter, and with it every in-flight run, since the prover
+    runs in this same process. Streaming with a running total means an oversized upload
+    costs one chunk, not the whole file."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise uploads.UploadError(
+                f"File is too large; the cap is {cap // (1024 * 1024)} MB.",
+                code="too_large",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/api/projects/{project_id}/files", status_code=201)
 async def upload_file(project_id: str, file: UploadFile = File(...)) -> dict:
     project = _require_project(project_id)
-    data = await file.read()
+    try:
+        data = await _read_capped(file, uploads.MAX_UPLOAD_BYTES)
+    except uploads.UploadError as exc:
+        raise HTTPException(status_code=_UPLOAD_ERROR_STATUS.get(exc.code, 400), detail=str(exc))
     try:
         return uploads.save_upload(
             project, _proofs_root(), file.filename or "file", data, mime=file.content_type

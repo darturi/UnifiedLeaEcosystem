@@ -30,6 +30,10 @@ router = APIRouter()
 class RunRequest(BaseModel):
     message: str
     session_id: str | None = None
+    # The interactive picker sends the model explicitly so each run snapshots the
+    # user's choice. Clients that omit it (including older Overleaf companions)
+    # inherit the persisted adapter default.
+    model: str | None = None
     # Autonomous run (D19): when true the run uses no per-tool approval gate and the
     # non-interactive `default` prompt variant, so it formalizes end-to-end with zero
     # human interaction (the Overleaf path). Defaults false → the interactive UI
@@ -121,6 +125,15 @@ def create_run(request: RunRequest) -> dict:
     config = load_config()
     if settings_service.spend_limit_reached(config.max_spend_usd):
         raise HTTPException(status_code=402, detail="Max spend limit has been reached.")
+    selected_model = config.model
+    if request.model is not None:
+        try:
+            selected_model = settings_service.validate_configured_model(request.model)
+        except settings_service.SettingsValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": str(exc), "field": exc.field},
+            ) from exc
 
     project_id: str | None = None
     if request.project_slug:
@@ -154,7 +167,7 @@ def create_run(request: RunRequest) -> dict:
 
     autonomous = request.autonomous or (permission_tier() == "none")
     run = store.create_run(
-        session["id"], config.model, None, config.max_turns,
+        session["id"], selected_model, None, config.max_turns,
         project_id=project_id, autonomous=autonomous,
     )
     user_message = store.add_message(session["id"], "user", message, run["id"])
@@ -163,6 +176,7 @@ def create_run(request: RunRequest) -> dict:
     return {
         "session_id": session["id"],
         "run_id": run["id"],
+        "model": selected_model,
         "message": user_message,
         "project_id": project_id,
         "project_slug": project["slug"] if project else None,
@@ -203,15 +217,14 @@ def interrupt_run(run_id: str) -> dict:
     if run["status"] not in {"pending", "running"}:
         raise HTTPException(status_code=409, detail="Run is not active")
     request_stop(run_id)
-    # A queued run has no driver to read the stop flag. If it won the admission
-    # race, is_active is true and the cooperative path owns finalization.
-    if run["status"] == "pending" and not runregistry.registry.is_active(run_id):
-        store.update_run(
-            run_id,
-            "failed",
-            result_kind="failed",
-            result_detail="Interrupted before the run started.",
-        )
+    # A queued run has no driver to read the stop flag, so the endpoint finalizes it
+    # itself — atomically (AUDIT-2026-07-24 C7). This used to read the status, ask the
+    # registry whether the run was active, and then write, which the dispatcher could
+    # interleave with: the run got marked failed and then started anyway, after the
+    # client had been told it was interrupted. `fail_pending_run` and
+    # `store.claim_pending_run` (in `run_lea`) are the same conditional UPDATE from
+    # opposite sides, so exactly one of them can win.
+    if store.fail_pending_run(run_id, "Interrupted before the run started."):
         bridge.publish_terminal_from_row(run_id)
         return {"status": "interrupted"}
     return {"status": "interrupting"}

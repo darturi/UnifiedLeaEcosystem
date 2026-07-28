@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .config import ROOT
+from .config import ROOT, write_private_text
 
 _OVERRIDES_PATH = ROOT / "config" / "subagent-overrides.json"
 _ALLOWED_FIELDS = ("model", "max_turns", "max_cost", "system_prompt", "tools")
@@ -64,6 +64,7 @@ def save_override(name: str, override: dict) -> dict:
         everything[name] = clean
     else:
         everything.pop(name, None)
-    _OVERRIDES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _OVERRIDES_PATH.write_text(json.dumps(everything, indent=2))
+    # Atomic (S6): a truncate-then-write left every role reset to defaults if it
+    # was interrupted, and this file sits beside the secrets one.
+    write_private_text(_OVERRIDES_PATH, json.dumps(everything, indent=2))
     return clean

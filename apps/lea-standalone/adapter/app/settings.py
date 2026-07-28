@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import socket
 import urllib.error
@@ -13,7 +14,7 @@ from typing import Any
 from .config import (
     ROOT, LEGACY_KEY_ENV, configured_provider_keys, load_config,
     permission_tier as config_permission_tier, PERMISSION_TIERS,
-    github_token as config_github_token,
+    github_token as config_github_token, write_private_text,
 )
 from . import models_catalog
 from . import store
@@ -111,12 +112,11 @@ class ApiKeyUpdate:
 
 def settings_payload(path: Path | None = None) -> dict[str, Any]:
     config = load_config(path)
-    stats = store.usage_stats()
     return {
         "model": config.model,
         "max_turns": config.max_turns,
         "max_spend_usd": config.max_spend_usd,
-        "current_spend_usd": float(stats["global"]["cost_usd"]),
+        "current_spend_usd": current_spend_usd(),
         "api_keys": _api_keys_payload(configured_provider_keys(path)),
         "model_options": MODEL_OPTIONS,
         "permission_tier": config_permission_tier(path),
@@ -154,35 +154,75 @@ def model_catalog() -> list[dict[str, str]]:
 
 
 def _required_env_keys(model: str) -> list[str]:
+    """The env vars that can authenticate `model` — any ONE of them satisfies it.
+
+    A provider LiteLLM recognises is authoritative, *including* when it needs no
+    single env var (Vertex/Bedrock/Ollama authenticate through a credential chain).
+    That empty answer is returned as-is rather than falling through to the family
+    heuristic, which would invent a requirement the provider doesn't have. The
+    heuristic is only for models LiteLLM can't place at all."""
     if models_catalog.is_available():
-        keys = models_catalog.requirements_for(model).get("required_keys") or []
-        if keys:
-            return list(keys)
+        requirements = models_catalog.requirements_for(model)
+        if requirements.get("provider"):
+            return [str(key) for key in (requirements.get("required_keys") or [])]
     family = _model_family(model)
     if family and family in FAMILY_ENV:
         return [FAMILY_ENV[family]]
     return []
 
 
+def _key_available(env: str, saved: set[str]) -> bool:
+    """Whether `env` can authenticate a run: saved in the config file, or already
+    present in the process environment.
+
+    Both count, because both work — `load_config` exports the saved keys into
+    `os.environ` and LiteLLM reads them from there, so a key exported in the user's
+    shell authenticates exactly as well as one typed into Settings. Counting only the
+    file would refuse a model that demonstrably runs.
+
+    Pairing this with the now environment-independent `required_keys` is what makes
+    the check coherent (AUDIT-2026-07-24 C11). Previously the *requirement* was
+    derived from the environment while *satisfaction* was judged against the file, so
+    an exported key erased the requirement instead of meeting it — and every model
+    passed."""
+    return env in saved or bool(os.environ.get(env))
+
+
 def model_requirements(model: str, path: Path | None = None) -> dict[str, Any]:
     """Which key(s) a model needs and whether they're configured — drives the
     dynamic API-key prompt in Settings."""
     required = _required_env_keys(model)
-    configured = set(configured_provider_keys(path).keys())
-    provider = None
-    if models_catalog.is_available():
-        provider = models_catalog.requirements_for(model).get("provider")
-    if not provider:
-        provider = _model_family(model)
+    saved = set(configured_provider_keys(path).keys())
+    provider = models_catalog.provider_for(model) or _model_family(model)
     return {
         "model": model,
         "provider": provider,
         "required_keys": [
-            {"env": env, "label": _key_label(env), "configured": env in configured}
+            {"env": env, "label": _key_label(env), "configured": _key_available(env, saved)}
             for env in required
         ],
-        "satisfied": (not required) or any(env in configured for env in required),
+        "satisfied": (not required) or any(_key_available(env, saved) for env in required),
     }
+
+
+def validate_configured_model(model: str, path: Path | None = None) -> str:
+    """Validate a model selected for a run against the currently configured keys.
+
+    The Settings UI normally performs the same check while persisting its default,
+    but an explicit per-run model must be safe even when a client bypasses that UI.
+    Return the normalized model so callers can validate and snapshot it in one step.
+    """
+    normalized = str(model).strip()
+    if not normalized:
+        raise SettingsValidationError("model must not be empty", "model")
+    requirements = model_requirements(normalized, path)
+    if not requirements["satisfied"]:
+        required = requirements["required_keys"][0]
+        raise SettingsValidationError(
+            f"An API key ({required['label']}) is required before starting a run with this model.",
+            f"api_keys.{required['env']}",
+        )
+    return normalized
 
 
 def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
@@ -267,6 +307,18 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
         value = str(value).strip()
         if not value:
             continue
+        # A NUL cannot exist in a POSIX environment variable, and `load_config` exports
+        # every saved key into `os.environ` for LiteLLM to read — so a key containing
+        # one would persist to the file cleanly (the writer escapes it) and then raise
+        # `ValueError: embedded null byte` on the next load, breaking every request.
+        # Rejected at the boundary rather than escaped, because a credential with a NUL
+        # in it is not a credential; the only way to get one here is a mangled paste.
+        if "\x00" in value:
+            raise SettingsValidationError(
+                f"That {_key_label(env_name)} key contains a null byte — it looks like "
+                "a copy/paste problem. Copy the key again.",
+                f"api_keys.{env_name}",
+            )
         if family:
             _validate_api_key_format(family, value)
             _verify_api_key_credentials(family, value, selected_model)
@@ -283,7 +335,10 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
 
 
 def current_spend_usd() -> float:
-    return float(store.usage_stats()["global"]["cost_usd"])
+    """Total persisted spend. Reads the dedicated scalar aggregate rather than
+    `usage_stats()["global"]`, which was a sum over a 100-row page and therefore
+    under-reported — see `store.total_spend_usd` (AUDIT-2026-07-24 C1)."""
+    return store.total_spend_usd()
 
 
 def spend_limit_reached(max_spend_usd: float | None, pending_cost_usd: float | None = None) -> bool:
@@ -319,8 +374,10 @@ def _validate_selected_model_has_key(
     required = _required_env_keys(model)
     if not required:
         return
+    # Same "saved OR already exported" rule `model_requirements` applies, so Settings
+    # can't refuse to save a model that would in fact run (AUDIT-2026-07-24 C11).
     configured = _configured_env_keys_after(current_keys, updates)
-    if any(env in configured for env in required):
+    if any(_key_available(env, configured) for env in required):
         return
     env = required[0]
     raise SettingsValidationError(
@@ -526,7 +583,38 @@ def _write_toml_updates(path: Path, updates: dict[str, Any]) -> None:
                 insertion.append("")
             next_lines[first_table_index:first_table_index] = insertion
 
-    path.write_text("\n".join(next_lines).rstrip() + "\n")
+    # Atomic, owner-only: this file is the only copy of every provider key and the
+    # GitHub token (S6).
+    write_private_text(path, "\n".join(next_lines).rstrip() + "\n")
+
+
+# TOML basic strings cannot contain a raw control character, and a literal newline
+# ends the string outright. Escaping only `\` and `"` meant a value carrying either —
+# a paste accident, or any client posting straight to `PUT /api/settings`, where only
+# the three first-class providers are format-validated and everything matching
+# `*_API_KEY` is stored verbatim — produced a file `tomllib` then refused to parse on
+# EVERY subsequent read (AUDIT-2026-07-24 S6).
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+
+
+def _escape_toml_basic(text: str) -> str:
+    out: list[str] = []
+    for char in text:
+        if char in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[char])
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    return "".join(out)
 
 
 def _toml_scalar(value: Any) -> str:
@@ -536,4 +624,4 @@ def _toml_scalar(value: Any) -> str:
         return str(value)
     if isinstance(value, float):
         return str(value)
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + _escape_toml_basic(str(value)) + '"'

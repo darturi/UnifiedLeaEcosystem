@@ -133,3 +133,97 @@ def test_delete_project_removes_tree_and_cascades_rows(tmp_path, monkeypatch):
     assert store.get_session(sess["id"]) is None
     # Deleting a missing project is a no-op False.
     assert projects.delete_project(pid, proofs) is False
+
+
+# --- AUDIT-2026-07-24 C2: the namespace-migration busy interlock ---------------
+# `migrate_project_namespace` rewrites every .lean/.md in the repo and then
+# `shutil.move`s the directory. `_project_has_active_runs` is its only guard, and it
+# used to test the session's DERIVED status for "running" — which D14 only ever
+# returns for a session with no code yet. So it was blind to precisely the sessions
+# worth protecting: an agent mid-run in a session that has already written a proof.
+
+def _project_session_with_active_run(project, *, with_code):
+    session = store.create_session("live work", project_id=project["id"])
+    run = store.create_run(session["id"], "m", None, 3, project_id=project["id"])
+    if with_code:
+        store.add_code_step(
+            session["id"], run["id"], "Lea/Demo/p.lean",
+            content="theorem t : True := by trivial\n", author="agent", turn=1,
+            check_status="ok",
+        )
+    store.update_run(run["id"], "running")
+    return session, run
+
+
+def test_active_run_is_detected_in_a_session_that_already_has_code(tmp_path, monkeypatch):
+    _init_db(tmp_path, monkeypatch)
+    project = projects.provision_project("Demo", tmp_path / "proofs")
+    session, _ = _project_session_with_active_run(project, with_code=True)
+
+    # The derived status is the working-copy verdict ("ok" — the check passed), NOT
+    # "running": this is the D14 behaviour the old interlock mistook for "no run is
+    # active". The session's own active_run_count tells the truth.
+    detail = store.session_detail(session["id"])
+    assert detail["status"] == "ok"
+    assert detail["active_run"] is not None
+    assert projects._project_has_active_runs(project["id"]) is True
+
+
+def test_active_run_still_detected_before_any_code_is_written(tmp_path, monkeypatch):
+    """The one case the old check did catch — it must not regress."""
+    _init_db(tmp_path, monkeypatch)
+    project = projects.provision_project("Demo", tmp_path / "proofs")
+    session, _ = _project_session_with_active_run(project, with_code=False)
+
+    assert store.session_detail(session["id"])["status"] == "running"
+    assert projects._project_has_active_runs(project["id"]) is True
+
+
+def test_no_active_run_once_every_run_is_terminal(tmp_path, monkeypatch):
+    _init_db(tmp_path, monkeypatch)
+    project = projects.provision_project("Demo", tmp_path / "proofs")
+    _, run = _project_session_with_active_run(project, with_code=True)
+    store.update_run(run["id"], "proved")
+
+    assert projects._project_has_active_runs(project["id"]) is False
+
+
+def test_migration_refuses_while_a_run_is_live_in_an_established_session(tmp_path, monkeypatch):
+    """The consequence: renaming moved the repo out from under a running agent."""
+    _init_db(tmp_path, monkeypatch)
+    proofs = tmp_path / "proofs"
+    project = projects.provision_project("Demo", proofs)
+    _project_session_with_active_run(project, with_code=True)
+    old_repo = projects.project_repo_dir(project, proofs)
+
+    try:
+        projects.migrate_project_namespace(
+            project, proofs, title="Renamed", namespace="Lea.Renamed",
+        )
+    except projects.ProjectIdentityError as exc:
+        assert exc.code == "project_busy"
+        assert exc.status == 409
+    else:
+        raise AssertionError("Expected the migration to refuse while a run is active")
+
+    # Nothing moved, and the index still points at the original namespace.
+    assert old_repo.is_dir()
+    assert not (proofs / "Lea" / "Renamed").exists()
+    assert store.get_project(project["id"])["namespace"] == "Lea.Demo"
+
+
+def test_migration_proceeds_once_no_run_is_active(tmp_path, monkeypatch):
+    """The guard must not become a blanket refusal — an idle project still renames."""
+    _init_db(tmp_path, monkeypatch)
+    proofs = tmp_path / "proofs"
+    project = projects.provision_project("Demo", proofs)
+    _, run = _project_session_with_active_run(project, with_code=True)
+    store.update_run(run["id"], "proved")
+
+    result = projects.migrate_project_namespace(
+        project, proofs, title="Renamed", namespace="Lea.Renamed",
+    )
+
+    assert result["project"]["namespace"] == "Lea.Renamed"
+    assert (proofs / "Lea" / "Renamed").is_dir()
+    assert not (proofs / "Lea" / "Demo").exists()

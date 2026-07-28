@@ -215,7 +215,7 @@ export default function App() {
     try {
       const session = await createSessionInProject(projectId, content.slice(0, 120));
       resetForNewSession(); // clear the proof view for the fresh session
-      const run = await createRun(content, session.id);
+      const run = await createRun(content, session.id, useModel.getState().model);
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       setRunStatus('running');
@@ -309,7 +309,7 @@ export default function App() {
     }
 
     try {
-      const run = await createRun(content, selectedSessionId);
+      const run = await createRun(content, selectedSessionId, useModel.getState().model);
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       setRunStatus('running');

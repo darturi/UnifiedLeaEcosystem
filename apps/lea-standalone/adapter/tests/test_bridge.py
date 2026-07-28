@@ -9,10 +9,13 @@ flushed into messages, the run persisted with usage, and the SSE events emitted 
 order — ending with `done`.
 """
 
+import sqlite3
 import time
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
+
+import pytest
 
 from lea.interface import (
     AssistantTextDelta,
@@ -23,6 +26,7 @@ from lea.interface import (
     ToolCalled,
     ToolResulted,
     TurnStarted,
+    VerifyResult,
     UsageUpdated,
 )
 from lea.providers import Usage
@@ -893,6 +897,47 @@ def test_enqueued_runs_execute_fifo(tmp_path, monkeypatch):
         assert store.get_run(run_id)["status"] == "proved"
 
 
+def test_queued_run_executes_its_snapshotted_model(tmp_path, monkeypatch):
+    """A later global/default change cannot replace the model chosen for a run."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="later-global-model", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=1))
+    runbroker._brokers.clear()
+    executed_models = []
+
+    def fake(
+        config,
+        messages,
+        *,
+        namespace=None,
+        session_id=None,
+        working_dir=None,
+        should_stop=None,
+        gate=None,
+    ):
+        executed_models.append(config.model)
+        yield TurnStarted(1)
+        yield Finished("completed", "done", 1, session_id, config.model,
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    session = store.create_session("snapshot the picker")
+    run = store.create_run(session["id"], "picker/model", None, 3)
+    store.add_message(session["id"], "user", "snapshot the picker", run["id"])
+
+    bridge.enqueue_run(run["id"])
+
+    assert _wait_for(
+        lambda: store.get_run(run["id"])["status"] not in {"pending", "running"}
+    )
+    assert executed_models == ["picker/model"]
+    assert store.get_run(run["id"])["model"] == "picker/model"
+
+
 def test_finished_broker_buffer_ends_in_done(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
     db.init_db()
@@ -1032,3 +1077,668 @@ def test_reformalize_updates_the_artifact_row_in_place(tmp_path, monkeypatch):
     assert len(rows) == 1, "same declaration re-recorded updates in place"
     assert rows[0]["path"] == "second_home.lean"
     assert rows[0]["run_id"] == second["id"]
+
+
+# --- AUDIT-2026-07-24 P1/P2: cheaper stream, cheaper cap check -----------------
+
+def test_streamed_text_is_batched_but_arrives_whole_and_in_order(tmp_path, monkeypatch):
+    """One SSE frame per model token was invisible to the browser (it polls every
+    80 ms) and cost a dict + list slot retained in the broker for the run's life. The
+    text must still arrive complete, and never after the step it preceded."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Batching")
+    run = store.create_run(session["id"], "m", None, 3)
+
+    def fake(config, messages, **kwargs):
+        yield TurnStarted(1)
+        for word in ("Proving ", "the ", "theorem ", "now."):
+            yield AssistantTextDelta(word)
+        yield ToolCalled("write_file", {"path": "p.lean"})
+        for word in ("Then ", "checking ", "it."):
+            yield AssistantTextDelta(word)
+        yield Finished("completed", "done", 1, session["id"], "m",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    monkeypatch.setattr(bridge, "load_config",
+                        lambda: LeaConfig(model="m", max_turns=3, lea_root=tmp_path))
+    events = Queue()
+    bridge.run_lea(bridge.RunnerContext(session["id"], run["id"], "prove", 
+                                        LeaConfig(model="m", max_turns=3, lea_root=tmp_path),
+                                        events))
+    frames = _drain(events)
+
+    deltas = [f for f in frames if f["type"] == "assistant_delta"]
+    # 7 tokens in, far fewer frames out — but not a single character lost.
+    assert len(deltas) < 7
+    assert "".join(f["payload"]["text"] for f in deltas) == (
+        "Proving the theorem now.Then checking it."
+    )
+    # Ordering: everything narrated before the tool call is published before it.
+    order = [f["type"] for f in frames]
+    tool = next(i for i, f in enumerate(frames)
+                if f["type"] == "status" and f["payload"].get("status") == "tool_call")
+    before = "".join(f["payload"]["text"] for f in frames[:tool] if f["type"] == "assistant_delta")
+    assert before == "Proving the theorem now."
+    assert "done" in order
+
+
+def test_a_trailing_batch_is_published_before_done(tmp_path, monkeypatch):
+    """A run that ends mid-batch must not swallow its last words."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Trailing")
+    run = store.create_run(session["id"], "m", None, 3)
+
+    def fake(config, messages, **kwargs):
+        yield TurnStarted(1)
+        yield AssistantTextDelta("last words")
+        raise RuntimeError("provider died mid-stream")
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    events = Queue()
+    bridge.run_lea(bridge.RunnerContext(session["id"], run["id"], "prove",
+                                        LeaConfig(model="m", max_turns=3, lea_root=tmp_path),
+                                        events))
+    frames = _drain(events)
+
+    types = [f["type"] for f in frames]
+    text = "".join(f["payload"]["text"] for f in frames if f["type"] == "assistant_delta")
+    assert text == "last words"
+    assert types.index("assistant_delta") < types.index("done")
+
+
+def test_persisted_spend_is_read_once_per_window_not_once_per_event(tmp_path, monkeypatch):
+    """The cap is re-checked on every UsageUpdated and every turn. Reading the DB each
+    time meant several aggregates per second per active run, against the same
+    single-writer SQLite the runs are writing to."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    bridge.reset_persisted_spend_cache()
+    reads = []
+    monkeypatch.setattr(store, "total_spend_usd", lambda: reads.append(1) or 0.0)
+
+    for _ in range(50):
+        assert bridge._persisted_spend_usd() == 0.0
+
+    assert len(reads) == 1, f"{len(reads)} DB reads for 50 cap checks"
+
+
+def test_a_run_reads_persisted_spend_once_not_per_usage_event(tmp_path, monkeypatch):
+    """The end-to-end claim: a capped run emitting many usage events hits the database
+    for the persisted total once, not once per event."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    bridge.reset_persisted_spend_cache()
+    session = store.create_session("Capped")
+    run = store.create_run(session["id"], "m", None, 3)
+    reads = []
+    monkeypatch.setattr(store, "total_spend_usd", lambda: reads.append(1) or 0.0)
+
+    def fake(config, messages, **kwargs):
+        for turn in range(1, 4):
+            yield TurnStarted(turn)
+            for _ in range(20):
+                yield UsageUpdated(1, 1, 0.0001)
+        yield Finished("completed", "done", 3, session["id"], "m",
+                       Usage(input_tokens=60, output_tokens=60), 0.006, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(bridge.RunnerContext(
+        session["id"], run["id"], "prove",
+        LeaConfig(model="m", max_turns=3, lea_root=tmp_path, max_spend_usd=100.0),
+        Queue(),
+    ))
+
+    # 63 cap checks (3 turns + 60 usage events) against one database read.
+    assert len(reads) == 1, f"{len(reads)} DB reads across 63 cap checks"
+
+
+def test_the_spend_cache_is_scoped_to_its_database(tmp_path, monkeypatch):
+    """The total is a property of ONE database. Production never repoints DB_PATH but
+    tests do, and a cache that ignored which database it measured would hand one
+    test's total to the next."""
+    bridge.reset_persisted_spend_cache()
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "first.sqlite3")
+    monkeypatch.setattr(store, "total_spend_usd", lambda: 7.0)
+    assert bridge._persisted_spend_usd() == 7.0
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "second.sqlite3")
+    monkeypatch.setattr(store, "total_spend_usd", lambda: 3.0)
+    assert bridge._persisted_spend_usd() == 3.0
+
+
+# --- AUDIT-2026-07-24 X1: a blocked run must not hold up the queue -------------
+
+def _seed_run(session_title, task, *, session_id=None):
+    session = store.get_session(session_id) if session_id else store.create_session(session_title)
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", task, run["id"])
+    return session, run["id"]
+
+
+def test_a_session_busy_run_does_not_block_a_different_session(tmp_path, monkeypatch):
+    """The dispatcher used to spin on the head of the queue until it was admissible.
+    For SESSION_BUSY that means waiting on a DIFFERENT session's incumbent to wind
+    down — a whole model call, or up to the 900s approval timeout — while unrelated
+    runs sat behind it with slots free.
+    """
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=4))
+    runbroker._brokers.clear()
+
+    release = Event()
+    started: list[str] = []
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        task = messages[-1]["content"]
+        started.append(task)
+        yield TurnStarted(1)
+        if task == "incumbent":
+            # Hold the session's slot until the test lets go — the stall the queue
+            # used to inherit.
+            release.wait(timeout=10)
+        yield Finished("completed", "done", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+
+    session_a, incumbent = _seed_run("A", "incumbent")
+    bridge.enqueue_run(incumbent)
+    assert _wait_for(lambda: "incumbent" in started), "the incumbent takes its slot"
+
+    # A follow-up in the SAME session: cannot be admitted while the incumbent holds it.
+    _, blocked = _seed_run(None, "same-session follow-up", session_id=session_a["id"])
+    bridge.enqueue_run(blocked)
+    # ...and behind it, a run for an unrelated session, which has nothing to wait for.
+    _, independent = _seed_run("B", "unrelated session")
+    bridge.enqueue_run(independent)
+
+    try:
+        assert _wait_for(lambda: "unrelated session" in started, timeout=5.0), (
+            "a run for a different session must start while another session is busy"
+        )
+        # The blocked one is still waiting, exactly as it should be.
+        assert store.get_run(blocked)["status"] == "pending"
+        assert "same-session follow-up" not in started
+    finally:
+        release.set()
+
+    assert _wait_for(lambda: all(
+        store.get_run(rid)["status"] not in {"pending", "running"}
+        for rid in (incumbent, blocked, independent)
+    )), "every run finishes once the incumbent releases"
+    assert "same-session follow-up" in started, "the deferred run is retried, not dropped"
+
+
+def test_deferred_runs_keep_their_relative_order(tmp_path, monkeypatch):
+    """Setting a blocked run aside must not cost it its place relative to the other
+    blocked runs — deferred entries are retried before newly arrived ones."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge, "load_config",
+        lambda: LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path),
+    )
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=1))
+    runbroker._brokers.clear()
+
+    release = Event()
+    started: list[str] = []
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        task = messages[-1]["content"]
+        started.append(task)
+        yield TurnStarted(1)
+        if task == "holder":
+            release.wait(timeout=10)
+        yield Finished("completed", "done", 1, session_id, "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+
+    _, holder = _seed_run("holder", "holder")
+    bridge.enqueue_run(holder)
+    assert _wait_for(lambda: "holder" in started)
+
+    # At capacity 1 these all defer behind the holder; order among them must survive.
+    waiting = []
+    for label in ("q1", "q2", "q3"):
+        _, run_id = _seed_run(label, label)
+        bridge.enqueue_run(run_id)
+        waiting.append(run_id)
+    assert _wait_for(lambda: all(store.get_run(r)["status"] == "pending" for r in waiting))
+
+    release.set()
+    assert _wait_for(lambda: all(
+        store.get_run(r)["status"] not in {"pending", "running"} for r in waiting
+    ), timeout=15.0)
+    assert [t for t in started if t.startswith("q")] == ["q1", "q2", "q3"]
+
+
+def test_a_supersede_is_requested_once_per_incumbent(tmp_path, monkeypatch):
+    """SESSION_BUSY asks the incumbent to stop. The old loop re-issued that on every
+    100 ms poll for as long as the incumbent took to wind down."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(runregistry, "registry", RunRegistry(max_concurrent=4))
+    stops = []
+    monkeypatch.setattr(bridge, "request_stop", lambda run_id: stops.append(run_id))
+
+    session = store.create_session("S")
+    incumbent = store.create_run(session["id"], "gemini/test", None, 3)
+    runregistry.registry.try_admit(incumbent["id"], session["id"])
+
+    follow_up = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", "follow up", follow_up["id"])
+
+    superseded: dict[str, str] = {}
+    for _ in range(25):
+        assert bridge._try_dispatch(follow_up["id"], superseded) == bridge._DEFER
+
+    assert stops == [incumbent["id"]], f"asked {len(stops)} times, expected once"
+
+
+# --- AUDIT-2026-07-24 C3: a failed promotion must not destroy the file it replaced --
+
+class _FakeFinished:
+    """The shape `collation.candidate_from_event` reads off a SubagentFinished."""
+
+    def __init__(self, result_id, candidate_path, check_status="ok"):
+        self.result_id = result_id
+        self.candidate_path = candidate_path
+        self.check_status = check_status
+
+
+def _promotion_fixture(tmp_path, monkeypatch, *, existing=None):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    repo = tmp_path / "repo"
+    (repo / "Lea" / "Misc").mkdir(parents=True)
+    canonical = repo / "Lea" / "Misc" / "P.lean"
+    if existing is not None:
+        canonical.write_text(existing)
+
+    scratch = repo / "scratch"
+    scratch.mkdir()
+    candidate = scratch / "P.lean"
+    candidate.write_text("theorem t : True := by trivial\n")
+
+    session = store.create_session("promote")
+    run = store.create_run(session["id"], "m", None, 3)
+    return repo, canonical, session, run, [_FakeFinished("child-1", str(candidate))]
+
+
+def test_a_failed_reverification_restores_the_previous_proof(tmp_path, monkeypatch):
+    """`promote` overwrites the canonical path, and the re-check that decides whether
+    the candidate is any good runs afterwards — so a candidate that fails used to
+    destroy a verified proof from an earlier run and leave itself in its place, with
+    no code_step recording that the file had changed at all."""
+    proven = "import Mathlib\n\ntheorem t : True := by trivial  -- the good proof\n"
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing=proven
+    )
+    monkeypatch.setattr(
+        bridge, "_lean_check_file",
+        lambda path: CheckResult(path, "error", "does not compile here"),
+    )
+
+    promoted = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert promoted is None, "a candidate that fails re-verification is not promoted"
+    assert canonical.read_text() == proven, "the previous proof must survive on disk"
+    assert store.session_detail(session["id"])["code_steps"] == []
+
+
+def test_a_failed_reverification_leaves_no_file_where_there_was_none(tmp_path, monkeypatch):
+    """The other half: when nothing stood at the canonical path, a failed promotion
+    must not leave the broken candidate behind either."""
+    repo, canonical, session, run, results = _promotion_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        bridge, "_lean_check_file",
+        lambda path: CheckResult(path, "error", "nope"),
+    )
+
+    assert bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    ) is None
+    assert not canonical.exists(), "the failed candidate must not be left in place"
+
+
+def test_a_successful_promotion_still_replaces_the_file_and_records_it(tmp_path, monkeypatch):
+    """The guard must not block the case it exists to protect: a candidate that DOES
+    re-verify is promoted, overwrites what was there, and lands as a code_step."""
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing="old and worse\n"
+    )
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda path: CheckResult(path, "ok", None))
+    events = Queue()
+
+    step = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=events,
+    )
+
+    assert step is not None
+    assert canonical.read_text() == "theorem t : True := by trivial\n"
+    assert step["check_status"] == "ok"
+    assert step["path"] == "Lea/Misc/P.lean"
+    assert "promoted" in [f["payload"].get("status") for f in _drain(events)
+                          if f["type"] == "status"]
+
+
+def test_an_unreadable_previous_file_is_left_alone_rather_than_deleted(tmp_path, monkeypatch):
+    """If the snapshot could not be taken there is nothing to put back. Deleting would
+    turn a bad overwrite into outright data loss, so the file stays as promoted."""
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing="previous\n"
+    )
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda path: CheckResult(path, "error", "no"))
+    monkeypatch.setattr(bridge, "_snapshot_file", lambda path: None)  # snapshot failed
+
+    assert bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    ) is None
+    assert canonical.exists(), "an unrecoverable file must not be deleted"
+
+
+# --- AUDIT-2026-07-24 C6: bookkeeping must not rewrite a finished outcome ------
+
+def _finishing_run(tmp_path, monkeypatch, *, result="proved"):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("C6")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    config = LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path)
+
+    def fake(config, messages, *, namespace=None, session_id=None, working_dir=None,
+             should_stop=None, gate=None):
+        proof = Path(working_dir) / "Lea" / "Misc" / "p.lean"
+        proof.parent.mkdir(parents=True, exist_ok=True)
+        proof.write_text("import Mathlib\n\ntheorem t : True := by trivial\n")
+        yield TurnStarted(1)
+        yield ToolCalled("write_file", {"path": str(proof)})
+        yield FileChanged(str(proof))
+        yield CheckResult(str(proof), "ok", None)
+        yield Finished("completed", "It compiles.", 1, session["id"], "gemini/test",
+                       Usage(input_tokens=10, output_tokens=5), 0.01, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    queue: Queue = Queue()
+    ctx = bridge.RunnerContext(session["id"], run["id"], "prove", config, queue)
+    return ctx, queue
+
+
+@pytest.mark.parametrize("failing", ["replace_run_usage_breakdown", "set_run_transcript"])
+def test_a_bookkeeping_failure_does_not_rewrite_a_proved_run(tmp_path, monkeypatch, failing):
+    """The Finished handler persists the outcome, THEN records usage, the transcript,
+    and the artifact index. A failure in any of those used to fall through to the
+    outer handler, which marked the run 'failed' — discarding a real proof, and
+    (because the derived session status reads the latest code step's run) making the
+    whole session look broken."""
+    ctx, queue = _finishing_run(tmp_path, monkeypatch)
+
+    def explode(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, failing, explode)
+
+    bridge.run_lea(ctx)
+
+    run = store.get_run(ctx.run_id)
+    assert run["status"] == "proved", f"{failing} failing must not undo the outcome"
+    assert run["result_kind"] == "proved"
+    assert store.session_detail(ctx.session_id)["status"] == "proved"
+    done = [f for f in _drain(queue) if f["type"] == "done"][-1]
+    assert done["payload"]["status"] == "proved", "the client must be told the truth too"
+
+
+def test_a_failure_before_the_outcome_is_persisted_still_fails_the_run(tmp_path, monkeypatch):
+    """The guard must not swallow real failures: a run that dies before Finished has
+    no terminal row, so it is still marked failed."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("C6-negative")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+
+    def fake(config, messages, **kwargs):
+        yield TurnStarted(1)
+        raise RuntimeError("the provider died")
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    queue: Queue = Queue()
+    bridge.run_lea(bridge.RunnerContext(
+        session["id"], run["id"], "prove",
+        LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path), queue,
+    ))
+
+    assert store.get_run(run["id"])["status"] == "failed"
+    assert [f for f in _drain(queue) if f["type"] == "done"][-1]["payload"]["status"] == "failed"
+
+
+def test_each_bookkeeping_step_is_independent(tmp_path, monkeypatch):
+    """One failing piece must not cost the others — they are separate records of the
+    same finished run, not a transaction."""
+    ctx, _ = _finishing_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(store, "replace_run_usage_breakdown",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    bridge.run_lea(ctx)
+
+    # The transcript, which runs after the failing step, still landed.
+    assert store.latest_transcript_for_session(ctx.session_id) is not None
+    assert store.get_run(ctx.run_id)["status"] == "proved"
+
+
+# --- AUDIT-2026-07-24 C10: a turn that left no transcript must not vanish ------
+
+def _run_with_transcript(session_id, task, messages):
+    run = store.create_run(session_id, "gemini/test", None, 3)
+    store.add_message(session_id, "user", task, run["id"])
+    store.update_run(run["id"], "proved")
+    store.set_run_transcript(run["id"], messages)
+    return run["id"]
+
+
+def _crashed_run(session_id, task, detail="LiteLLM connection reset"):
+    """A run that died mid-turn: terminal, but never reached Finished, so no transcript."""
+    run = store.create_run(session_id, "gemini/test", None, 3)
+    store.add_message(session_id, "user", task, run["id"])
+    store.update_run(run["id"], "failed", result_kind="failed", result_detail=detail)
+    return run["id"]
+
+
+def test_a_crashed_run_is_reported_as_a_gap_in_the_replayed_history(tmp_path, monkeypatch):
+    """`latest_transcript_for_session` silently falls back to the newest run that HAS a
+    transcript. A run that crashed mid-turn stores none and simply disappears — the
+    user watched that turn happen, and the next one replays a conversation in which it
+    never did."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("gap")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+    _crashed_run(session["id"], "second")
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+    gap = store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"])
+
+    assert len(gap) == 1
+    note = bridge._transcript_gap_context(session["id"], current["id"])
+    assert note is not None
+    assert "1 earlier attempt" in note
+    assert "LiteLLM connection reset" in note
+
+
+def test_a_continuous_history_produces_no_note(tmp_path, monkeypatch):
+    """The note must appear only when something is actually missing — otherwise it is
+    noise in every follow-up."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("continuous")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+
+    assert store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"]) == []
+    assert bridge._transcript_gap_context(session["id"], current["id"]) is None
+
+
+def test_a_crash_before_the_newest_transcript_is_not_a_gap(tmp_path, monkeypatch):
+    """A run that failed and was then superseded by a run that DID store a transcript
+    is already represented — the later transcript covers the conversation."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("recovered")
+    _crashed_run(session["id"], "died")
+    time.sleep(0.01)  # distinct created_at
+    _run_with_transcript(session["id"], "recovered", [{"role": "user", "content": "recovered"}])
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+
+    assert store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"]) == []
+
+
+def test_an_active_run_is_not_a_gap(tmp_path, monkeypatch):
+    """A pending or running run has not lost anything — it has not finished."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("live")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+    store.create_run(session["id"], "gemini/test", None, 3)  # left pending
+
+    current = store.create_run(session["id"], "gemini/test", None, 3)
+
+    assert store.transcript_gap_for_session(session["id"], exclude_run_id=current["id"]) == []
+
+
+def test_the_gap_note_reaches_the_task_the_agent_is_given(tmp_path, monkeypatch):
+    """End to end: the note must actually be prepended to the run's task, not just
+    computable."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("gap-e2e")
+    _run_with_transcript(session["id"], "first", [{"role": "user", "content": "first"}])
+    _crashed_run(session["id"], "second")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    store.add_message(session["id"], "user", "third", run["id"])
+
+    seen = {}
+
+    def fake(config, messages, **kwargs):
+        seen["task"] = messages[-1]["content"]
+        yield TurnStarted(1)
+        yield Finished("completed", "done", 1, session["id"], "gemini/test",
+                       Usage(input_tokens=1, output_tokens=1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(bridge, "run_events", fake)
+    bridge.run_lea(bridge.RunnerContext(
+        session["id"], run["id"], "third",
+        LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path), Queue(),
+    ))
+
+    assert "earlier attempt" in seen["task"]
+    assert seen["task"].rstrip().endswith("third"), "the user's actual request stays last"
+
+
+# --- AUDIT-2026-07-24 C5: the SafeVerify gate is enforced at promotion ---------
+
+def test_a_safeverify_rejected_candidate_is_never_promoted(tmp_path, monkeypatch):
+    """`collation` documents that a SafeVerify-REJECTED candidate must never become the
+    proof of record — "promoting a cheat to the canonical file is exactly the failure
+    SafeVerify exists to catch" — but `_TIER_SV_REJECTED` was unreachable because
+    nothing populated `safeverify_status`. The guarantee was documented, not enforced."""
+    proven = "theorem t : True := by trivial  -- the good proof\n"
+    repo, canonical, session, run, results = _promotion_fixture(
+        tmp_path, monkeypatch, existing=proven
+    )
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(bridge, "_safe_verify_file",
+                        lambda p: VerifyResult("rejected", "sorry reachable through an import"))
+
+    promoted = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert promoted is None, "a cheat must not become the proof of record"
+    assert canonical.read_text() == proven, "and the good proof it replaced must survive"
+
+
+@pytest.mark.parametrize("status", ["unavailable", "error"])
+def test_safeverify_being_unavailable_does_not_block_promotion(tmp_path, monkeypatch, status):
+    """collation's stated degradation: a missing SafeVerify must never *mis*-rank, only
+    fail to catch a cheat. Blocking here would silently disable collation on any
+    install that skipped the SafeVerify build (`npm run setup -- --skip-verify`)."""
+    repo, canonical, session, run, results = _promotion_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(bridge, "_safe_verify_file", lambda p: VerifyResult(status, None))
+
+    step = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert step is not None
+    assert canonical.read_text() == "theorem t : True := by trivial\n"
+
+
+def test_a_crashing_safeverify_does_not_block_promotion(tmp_path, monkeypatch):
+    """An audit that raises is 'not run', not 'rejected'."""
+    repo, canonical, session, run, results = _promotion_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(bridge, "_safe_verify_file",
+                        lambda p: (_ for _ in ()).throw(RuntimeError("binary missing")))
+
+    assert bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    ) is not None
+
+
+def test_promotion_falls_through_to_the_next_candidate(tmp_path, monkeypatch):
+    """Ranking is best-first, so a rejected winner must not end the attempt — the next
+    promotable candidate gets its turn."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    repo = tmp_path / "repo"
+    (repo / "Lea" / "Misc").mkdir(parents=True)
+    scratch = repo / "scratch"
+    scratch.mkdir()
+    # The shorter proof ranks first; make it the cheat.
+    (scratch / "A.lean").write_text("theorem t : True := by trivial\n")
+    (scratch / "B.lean").write_text("theorem t : True := by\n  exact trivial\n")
+    session = store.create_session("fallthrough")
+    run = store.create_run(session["id"], "m", None, 3)
+    results = [
+        _FakeFinished("cheat", str(scratch / "A.lean")),
+        _FakeFinished("honest", str(scratch / "B.lean")),
+    ]
+
+    monkeypatch.setattr(bridge, "_lean_check_file", lambda p: CheckResult(p, "ok", None))
+    monkeypatch.setattr(
+        bridge, "_safe_verify_file",
+        lambda p: VerifyResult("rejected" if p.endswith("A.lean") else "ok", None),
+    )
+
+    step = bridge._promote_winner(
+        results, session_id=session["id"], run_id=run["id"], repo=repo,
+        namespace=None, turn=1, events=Queue(),
+    )
+
+    assert step is not None
+    assert "promoted_from" not in step or step["path"].endswith("B.lean")
+    assert (repo / "Lea" / "Misc" / "B.lean").exists()
+    assert not (repo / "Lea" / "Misc" / "A.lean").exists(), "the cheat must leave no trace"
