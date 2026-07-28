@@ -40,6 +40,7 @@ import {
   buildLeaWorkspacePath,
   slugProjectId
 } from "../shared/leanStub.mjs";
+import { hashTargetText } from "../shared/theoremParser.mjs";
 
 test("buildOverleafDocumentUrl builds the canonical public-Overleaf URL", () => {
   assert.equal(
@@ -943,7 +944,7 @@ test("lean pane manifest marks generated artifacts stale when source hash change
     targetLabel: "compactness_criterion",
     declarationName: "compactness_criterion",
     recordedProofPath: proofPath,
-    targetTextHash: "old-source-hash",
+    targetTextHash: hashTargetText("The original source."),
     leaRepoPath: leaRepo,
     leaUiBaseUrl: "http://localhost:5173",
     startedAt: "2026-01-01T00:00:00.000Z",
@@ -965,7 +966,75 @@ test("lean pane manifest marks generated artifacts stale when source hash change
 
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.items[0].status, "stale");
-  assert.equal(res.body.items[0].generatedFromSourceHash, "old-source-hash");
+  assert.equal(res.body.items[0].sourceFreshness, "stale");
+  assert.equal(res.body.items[0].generatedFromSourceHash, hashTargetText("The original source."));
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      targetText: "The source has changed."
+    }]
+  }, state);
+  const staleStatus = statuses.body.statuses["theorem:compactness_criterion"];
+  assert.equal(staleStatus.status, "formalized");
+  assert.equal(staleStatus.sourceFreshness, "stale");
+  assert.equal(staleStatus.generatedFromSourceHash, hashTargetText("The original source."));
+
+  const reverted = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      targetText: "The original source."
+    }]
+  }, state);
+  assert.equal(reverted.body.statuses["theorem:compactness_criterion"].sourceFreshness, "current");
+});
+
+test("source freshness follows the restored artifact rather than a newer failed retry", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.original = {
+    jobId: "original",
+    jobKey: "project-1:theorem:restored_proof",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "restored_proof",
+    declarationName: "restored_proof",
+    targetTextHash: hashTargetText("Original statement."),
+    leaRepoPath: leaRepo,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+  state.jobs.failed_retry = {
+    jobId: "failed_retry",
+    jobKey: "project-1:theorem:restored_proof",
+    status: "failed",
+    finalStatus: "failed",
+    targetKind: "theorem",
+    targetLabel: "restored_proof",
+    declarationName: "restored_proof",
+    targetTextHash: hashTargetText("Changed statement."),
+    leaRepoPath: leaRepo,
+    error: "Retry failed; previous artifact restored.",
+    startedAt: "2026-01-02T00:00:00.000Z",
+    finishedAt: "2026-01-02T00:01:00.000Z"
+  };
+
+  const result = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{
+      targetKind: "theorem",
+      targetLabel: "restored_proof",
+      targetText: "Changed statement."
+    }]
+  }, state);
+  const info = result.body.statuses["theorem:restored_proof"];
+  assert.equal(info.status, "failed");
+  assert.equal(info.sourceFreshness, "stale");
+  assert.equal(info.generatedFromSourceHash, hashTargetText("Original statement."));
 });
 
 test("lean pane manifest uses adapter session code for formalized jobs without recorded proof paths", async () => {

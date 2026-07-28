@@ -16,7 +16,7 @@ const PANE_STATUS_LABELS = {
   disproved: "counterexample",
   "in-progress": "in progress",
   invalid: "invalid",
-  stale: "stale",
+  stale: "out of date",
   error: "error",
   mixed: "mixed",
   unknown: "unknown"
@@ -74,6 +74,7 @@ const PROGRESS_SEGMENT_DEFS = [
   { id: "success", label: "Successful", countKey: "success" },
   { id: "sorry-stubbed", label: "Sorry-stubbed", countKey: "sorryStubbed" },
   { id: "failed", label: "Failed", countKey: "failed" },
+  { id: "out-of-date", label: "Out of date", countKey: "outOfDate" },
   { id: "unformalized", label: "Unformalized", countKey: "unformalized" }
 ];
 
@@ -250,6 +251,7 @@ export function paneProgressBucketForItem(item) {
   if (PROGRESS_SUCCESS_STATUSES.has(status)) return "success";
   if (PROGRESS_STUB_STATUSES.has(status)) return "sorryStubbed";
   if (PROGRESS_FAILED_STATUSES.has(status)) return "failed";
+  if (status === "stale") return "outOfDate";
   return "unformalized";
 }
 
@@ -259,6 +261,7 @@ export function summarizePaneProgress(items) {
     success: 0,
     sorryStubbed: 0,
     failed: 0,
+    outOfDate: 0,
     unformalized: 0,
     inProgress: 0
   };
@@ -298,6 +301,7 @@ export function formatPaneProgressLabel(path, summary) {
   appendProgressLabelPart(parts, summary?.success, "successful");
   appendProgressLabelPart(parts, summary?.sorryStubbed, "sorry-stubbed");
   appendProgressLabelPart(parts, summary?.failed, "failed");
+  appendProgressLabelPart(parts, summary?.outOfDate, "out of date");
   appendProgressLabelPart(parts, summary?.unformalized, "unformalized");
   appendProgressLabelPart(parts, summary?.inProgress, "in progress");
   return `${parts.join(", ")}.`;

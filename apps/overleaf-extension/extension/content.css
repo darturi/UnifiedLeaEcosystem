@@ -93,6 +93,13 @@
   border-color: var(--ol-amber);
 }
 
+.ol-lean-status-stale {
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+  border-color: var(--ol-amber);
+  border-style: dashed;
+}
+
 .ol-lean-status-in_progress {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
@@ -522,6 +529,10 @@ body.ol-lean-pane-resizing {
   background: var(--ol-line-2);
 }
 
+.ol-lean-project-progress-segment-out-of-date {
+  background: var(--ol-amber);
+}
+
 .ol-lean-project-tree-items {
   margin: 6px 0 10px;
   padding-left: 26px;
@@ -538,6 +549,11 @@ body.ol-lean-pane-resizing {
   border-radius: 10px;
   background: var(--ol-panel);
   transition: border-color 180ms ease, box-shadow 180ms ease, background 180ms ease;
+}
+
+.ol-lean-project-item-stale {
+  border-color: var(--ol-amber);
+  background: linear-gradient(var(--ol-amber-soft), var(--ol-panel) 72%);
 }
 
 .ol-lean-project-item-focus {
@@ -608,6 +624,17 @@ body.ol-lean-pane-resizing {
 .ol-lean-project-status-needs-review {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
+}
+
+.ol-lean-project-stale-note {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-left: 3px solid var(--ol-amber);
+  border-radius: 6px;
+  color: var(--ol-ink);
+  background: var(--ol-amber-soft);
+  font-weight: 650;
+  overflow-wrap: anywhere;
 }
 
 .ol-lean-project-status-in-progress {
@@ -1255,6 +1282,11 @@ body.ol-lean-pane-resizing {
 }
 
 .ol-lean-status-chip-unformalized {
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+}
+
+.ol-lean-status-chip-stale {
   color: var(--ol-amber);
   background: var(--ol-amber-soft);
 }

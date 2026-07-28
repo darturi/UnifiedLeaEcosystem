@@ -43,7 +43,7 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("defined"), "defined");
   assert.equal(formatPaneStatus("disproved"), "counterexample");
   assert.equal(formatPaneStatus("in-progress"), "in progress");
-  assert.equal(formatPaneStatus("stale"), "stale");
+  assert.equal(formatPaneStatus("stale"), "out of date");
   assert.equal(formatPaneStatus("mixed"), "mixed");
   assert.equal(formatPaneStatus("nonsense"), "unknown");
   assert.equal(formatPaneStatus(undefined), "unknown");
@@ -267,7 +267,8 @@ test("paneProgressBucketForItem maps pane and companion statuses to progress buc
   for (const status of ["failed", "invalid", "error"]) {
     assert.equal(paneProgressBucketForItem({ status }), "failed");
   }
-  for (const status of ["missing-stub", "unformalized", "unknown", "stale", "in-progress", undefined, "new-weird-status"]) {
+  assert.equal(paneProgressBucketForItem({ status: "stale" }), "outOfDate");
+  for (const status of ["missing-stub", "unformalized", "unknown", "in-progress", undefined, "new-weird-status"]) {
     assert.equal(paneProgressBucketForItem({ status }), "unformalized");
   }
 });
@@ -287,6 +288,7 @@ test("summarizePaneProgress counts representative fractional file summaries", ()
     success: 3,
     sorryStubbed: 0,
     failed: 1,
+    outOfDate: 0,
     unformalized: 4,
     inProgress: 0
   });
@@ -305,6 +307,7 @@ test("summarizePaneProgress counts representative fractional file summaries", ()
     success: 6,
     sorryStubbed: 1,
     failed: 0,
+    outOfDate: 0,
     unformalized: 1,
     inProgress: 0
   });
@@ -318,6 +321,7 @@ test("summarizePaneProgress counts representative fractional file summaries", ()
     success: 0,
     sorryStubbed: 2,
     failed: 0,
+    outOfDate: 0,
     unformalized: 1,
     inProgress: 0
   });
@@ -348,6 +352,24 @@ test("paneProgressSegments returns ordered nonzero segments with percentages", (
     ["sorry-stubbed", 2, 66.66666666666666, "Sorry-stubbed: 2 of 3, 66.7%"],
     ["unformalized", 1, 33.33333333333333, "Unformalized: 1 of 3, 33.3%"]
   ]);
+});
+
+test("pane progress gives stale items their own out-of-date segment", () => {
+  const summary = summarizePaneProgress([
+    { status: "valid" },
+    { status: "stale" },
+    { status: "missing-stub" }
+  ]);
+  assert.equal(summary.outOfDate, 1);
+  assert.equal(summary.unformalized, 1);
+  assert.deepEqual(
+    paneProgressSegments(summary).map((segment) => [segment.id, segment.count]),
+    [["success", 1], ["out-of-date", 1], ["unformalized", 1]]
+  );
+  assert.equal(
+    formatPaneProgressLabel("main.tex", summary),
+    "main.tex: 3 Lea items, 1 successful, 1 out of date, 1 unformalized."
+  );
 });
 
 test("formatPaneProgressLabel omits zero-count buckets and includes running count", () => {

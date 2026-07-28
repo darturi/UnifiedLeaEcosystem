@@ -188,7 +188,17 @@ error
 Lean stub or generated artifact is currently associated with it.
 
 `stale` means the LaTeX source for the labeled item changed after the Lean
-artifact was generated.
+artifact was generated. It is displayed to users as **out of date**: the item
+card uses an amber warning callout, keeps Re-formalize as its primary action,
+and remains linked to the existing Lean artifact because freshness and Lean
+validity are separate facts.
+
+The in-editor badge over the LaTeX marker must derive freshness from the same
+artifact provenance and source hash as the pane. A stale item therefore reads
+**out of date** on both surfaces; neither surface may continue to claim that
+the current LaTeX is formalized. The companion status response retains the
+artifact lifecycle in `status` and reports `sourceFreshness` separately as
+`current`, `stale`, or `unknown`.
 
 ## Ordering
 
@@ -364,4 +374,3 @@ underlying project data.
 10. The pane auto-refreshes when project LaTeX source changes.
 11. Each item includes source metadata suitable for future jump-to-source.
 12. Existing extension behavior remains intact.
-

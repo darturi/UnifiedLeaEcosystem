@@ -7,7 +7,7 @@
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
-  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
+  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub", "stale"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const TEX_MIRROR_FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
@@ -1425,6 +1425,15 @@
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
 
+    if (item.status === "stale") {
+      const staleNote = document.createElement("p");
+      staleNote.className = "ol-lean-project-stale-note";
+      staleNote.setAttribute("role", "status");
+      staleNote.textContent = item.message
+        || "Out of date — the LaTeX changed after this Lean artifact was generated. Re-formalize to synchronize it.";
+      card.appendChild(staleNote);
+    }
+
     if (getStubbedTheoremUses(item).length > 0) {
       const stubbedWarning = document.createElement("p");
       stubbedWarning.className = "ol-lean-project-impact-note";
@@ -2805,7 +2814,7 @@
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
     const stubbedWarning = popover.querySelector(".ol-lean-popover-warning");
     const statusInfo = latestStatuses[key] || {};
-    const currentStatus = statusInfo.status || "unknown";
+    const currentStatus = getDisplayStatus(statusInfo);
     const actionStatus = getActionStatus(statusInfo);
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
     renderTargetWarning(stubbedWarning, target, statusInfo);
@@ -3319,7 +3328,7 @@
     const key = targetKey(target);
     if (!popover || popover.dataset.targetKey !== key) return;
     const statusInfo = latestStatuses[key] || { status: "unknown" };
-    const currentStatus = statusInfo.status || "unknown";
+    const currentStatus = getDisplayStatus(statusInfo);
     const actionStatus = getActionStatus(statusInfo);
     const chip = popover.querySelector(".ol-lean-status-chip");
     const detail = popover.querySelector(".ol-lean-popover-detail");
@@ -3727,7 +3736,7 @@
       const coords = target.coords;
       if (!coords) continue;
       const statusInfo = latestStatuses[targetKey(target)] || { status: "unknown" };
-      const status = statusInfo.status || "unknown";
+      const status = getDisplayStatus(statusInfo);
       const badge = document.createElement("button");
       badge.className = `ol-lean-status ol-lean-status-${status}`;
       badge.type = "button";
@@ -3747,7 +3756,10 @@
       }
       const stubbedUsesLabel = hasStubbedTheoremUses(statusInfo) ? " warning: proof uses sorry-stubbed support" : "";
       const statusLabel = `${formatStatus(status, statusInfo)}${turnProgress.label ? ` ${turnProgress.label}` : ""}${stubbedUsesLabel}`;
-      badge.title = statusInfo.message || `Lean status for ${target.targetLabel}: ${statusLabel}`;
+      badge.title = statusInfo.sourceFreshness === "stale"
+        ? statusInfo.sourceFreshnessMessage
+          || "The LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+        : statusInfo.message || `Lean status for ${target.targetLabel}: ${statusLabel}`;
       badge.setAttribute("aria-label", `Open Lea popover for ${target.targetLabel}. Status: ${statusLabel}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
       badge.style.top = `${coords.top}px`;
@@ -3771,6 +3783,8 @@
         return "in progress";
       case "formalized":
         return "formalized";
+      case "stale":
+        return "out of date";
       case "defined":
         return "defined";
       case "disproved":
@@ -3840,13 +3854,23 @@
 
   function renderTargetWarning(element, target, statusInfo) {
     if (!element) return;
+    const warnings = [];
+    if (statusInfo?.sourceFreshness === "stale") {
+      warnings.push(
+        statusInfo.sourceFreshnessMessage
+        || "The LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+      );
+    }
     const uses = getStubbedTheoremUses(statusInfo);
     if (uses.length > 0) {
-      renderStubbedTheoremUsesWarning(element, statusInfo);
-      return;
+      const names = uses.map((use) => use.declarationName || use.targetLabel).filter(Boolean).join(", ");
+      const plural = uses.length !== 1;
+      warnings.push(plural
+        ? `Proof uses supporting theorems ${names}, which have been sorry stubbed but not fully formalized.`
+        : `Proof uses supporting theorem ${names}, which has been sorry stubbed but not fully formalized.`);
     }
-    element.hidden = true;
-    element.textContent = "";
+    element.hidden = warnings.length === 0;
+    element.textContent = warnings.join(" ");
   }
 
   function getStubbedTheoremUses(statusInfo) {
@@ -3876,6 +3900,8 @@
       case "disproved":
       case "unknown":
         return "Check status";
+      case "stale":
+        return definition ? "Regenerate definition" : "Re-formalize";
       case "sorry_stub":
       case "unformalized":
       default:
@@ -3884,10 +3910,19 @@
   }
 
   function getActionStatus(statusInfo) {
+    if (statusInfo?.sourceFreshness === "stale") {
+      return "stale";
+    }
     if (statusInfo?.status === "failed") {
       return statusInfo.effectiveStatus || "unformalized";
     }
     return statusInfo?.status || "unknown";
+  }
+
+  function getDisplayStatus(statusInfo) {
+    return statusInfo?.sourceFreshness === "stale"
+      ? "stale"
+      : statusInfo?.status || "unknown";
   }
 
   function canViewInLeaUi(status) {

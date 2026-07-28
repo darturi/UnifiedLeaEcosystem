@@ -46,6 +46,7 @@ import { classifyEdit, cascadeRequired, parseDeclarationHeader } from "./leanSig
 import { breakageDescriptor, runCascadeVerification } from "./cascadeVerify.mjs";
 import {
   findActiveJob,
+  findLatestArtifactJob,
   findLatestFinishedJob,
   findLatestJob,
   jobRecency,
@@ -226,13 +227,21 @@ export async function handleGetStatuses(payload, state) {
       continue;
     }
 
-    statuses[targetKey({ targetKind, targetLabel })] = await getTargetStatus({
+    const statusInfo = await getTargetStatus({
       state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId: payload.overleafProjectId || "unknown",
       targetKind,
       targetLabel,
       jobs: state.jobs || {}
+    });
+    statuses[targetKey({ targetKind, targetLabel })] = attachSourceFreshness({
+      state,
+      overleafProjectId: payload.overleafProjectId || "unknown",
+      targetKind,
+      targetLabel,
+      currentSourceHash: hashTargetText(targetText),
+      statusInfo
     });
   }
 
@@ -5412,6 +5421,60 @@ async function getTargetStatus({
   return attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafProjectId, status });
 }
 
+// Source freshness is orthogonal to the artifact's Lean status. A proof may
+// still compile while no longer representing the current LaTeX, so callers
+// retain `status` and receive this second, derived dimension. The comparison is
+// against the job that produced the surviving artifact, never merely the latest
+// finished attempt (a failed retry can restore an older proof).
+function attachSourceFreshness({
+  state,
+  overleafProjectId,
+  targetKind,
+  targetLabel,
+  currentSourceHash,
+  statusInfo
+}) {
+  const status = String(statusInfo?.status || "").toLowerCase();
+  if (status === "in_progress" || status === "unformalized" || status === "unavailable" || status === "offline") {
+    return { ...statusInfo, sourceFreshness: "unknown" };
+  }
+
+  const target = buildLeaTarget({
+    leaRepoPath: state.settings.leaRepoPath,
+    overleafProjectId,
+    targetKind,
+    targetLabel
+  });
+  const artifactJob = findLatestArtifactJob(state.jobs || {}, target.jobKey, {
+    declarationName: statusInfo?.declarationName,
+    recordedProofPath: statusInfo?.recordedProofPath || statusInfo?.relativePath
+  });
+  const association = state.chatSessions?.[target.jobKey] || null;
+  const generatedFromSourceHash = artifactJob?.targetTextHash
+    || (!artifactJob ? association?.sourceHash : null)
+    || "";
+  const current = String(currentSourceHash || "");
+  if (!generatedFromSourceHash || !current) {
+    return {
+      ...statusInfo,
+      sourceFreshness: "unknown",
+      generatedFromSourceHash: generatedFromSourceHash || undefined,
+      generatedAt: artifactJob?.finishedAt || artifactJob?.startedAt || association?.updatedAt || undefined
+    };
+  }
+
+  const sourceFreshness = generatedFromSourceHash === current ? "current" : "stale";
+  return {
+    ...statusInfo,
+    sourceFreshness,
+    generatedFromSourceHash,
+    generatedAt: artifactJob?.finishedAt || artifactJob?.startedAt || association?.updatedAt || undefined,
+    sourceFreshnessMessage: sourceFreshness === "stale"
+      ? "The LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+      : ""
+  };
+}
+
 // Enrich a formalized status with everything TRANSITIVELY upstream of it that
 // is still a sorry stub, derived purely from the files on disk right now
 // (stubbedUpstreamOf, leanDependencyGraph.mjs). This is what drives the amber
@@ -5510,11 +5573,18 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
 
   const paneStatus = mapLeanPaneStatus(statusInfo, item);
   const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
-  const stale = Boolean(
-    latestJob?.targetTextHash &&
-    latestJob.targetTextHash !== item.sourceHash &&
-    ["stub-generated", "valid", "defined", "disproved", "invalid"].includes(paneStatus)
-  );
+  const freshness = attachSourceFreshness({
+    state,
+    overleafProjectId,
+    targetKind,
+    // Jobs are keyed by the stable marker label. The declaration name may have
+    // changed after a manual Lean edit, but that must not fork provenance.
+    targetLabel: item.label || targetLabel,
+    currentSourceHash: item.sourceHash,
+    statusInfo
+  });
+  const stale = freshness.sourceFreshness === "stale"
+    && ["stub-generated", "valid", "defined", "disproved", "invalid"].includes(paneStatus);
   const artifact = await readLeanPaneArtifact({
     leaRepoPath: state.settings.leaRepoPath,
     statusInfo
@@ -5540,8 +5610,9 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     // Drives the pane's live polling: it keeps refreshing while any item is still
     // being formalized, then stops once everything settles.
     inProgress: inProgress && !stale,
-    generatedFromSourceHash: latestJob?.targetTextHash || undefined,
-    lastGeneratedAt: latestJob?.finishedAt || latestJob?.startedAt || undefined,
+    sourceFreshness: freshness.sourceFreshness,
+    generatedFromSourceHash: freshness.generatedFromSourceHash || undefined,
+    lastGeneratedAt: freshness.generatedAt || latestJob?.finishedAt || latestJob?.startedAt || undefined,
     leanDeclarationName,
     leanStub: leanStub || undefined,
     leanArtifactPath: effectiveArtifact.relativePath || artifact.relativePath || statusInfo?.recordedProofPath || statusInfo?.relativePath || undefined,
@@ -5557,7 +5628,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
       ? statusInfo.stubbedTheoremUses
       : undefined,
     message: stale
-      ? "The LaTeX source changed after this Lean artifact was generated."
+      ? "Out of date — the LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
       : statusInfo?.message || undefined,
     // Edit-induced breakage attribution (self-repair Phase 2): who/what broke
     // this item and whether a repair can be offered right now. Undefined for

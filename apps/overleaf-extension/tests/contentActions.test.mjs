@@ -68,6 +68,22 @@ test("targets without coordinates do not render floating status badges", async (
   assert.equal(harness.hasButtonText("unformalized"), false);
 });
 
+test("a source-stale formalization is labeled out of date on the LaTeX badge and in its popover", async () => {
+  const harness = createContentHarness({
+    status: "formalized",
+    sourceFreshness: "stale",
+    sourceFreshnessMessage: "The LaTeX source changed after this Lean artifact was generated.",
+    leaSessionId: "sess-stale"
+  });
+  await harness.loadStatusForVisibleTheorem();
+
+  assert.equal(harness.hasButtonText("out of date"), true);
+  harness.openTargetPopover();
+  assert.match(harness.bodyText(), /LaTeX source changed after this Lean artifact was generated/);
+  assert.equal(harness.hasButtonText("Re-formalize"), true);
+  assert.equal(harness.hasViewInLeaUiButton(), true);
+});
+
 test("definition targets use definition copy and do not show Stub", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -325,14 +341,18 @@ test("Lean pane file rows render proportional progress segments", async () => {
 
   const [progress] = harness.paneProgresses();
   assert.equal(progress.role, "img");
-  assert.equal(progress.label, "main.tex: 8 Lea items, 3 successful, 1 sorry-stubbed, 1 failed, 3 unformalized, 1 in progress.");
+  assert.equal(progress.label, "main.tex: 8 Lea items, 3 successful, 1 sorry-stubbed, 1 failed, 1 out of date, 2 unformalized, 1 in progress.");
   assert.equal(progress.inProgress, true);
   assert.deepEqual(progress.segments.map((segment) => [segment.bucket, segment.count, segment.width]), [
     ["success", "3", "37.5%"],
     ["sorry-stubbed", "1", "12.5%"],
     ["failed", "1", "12.5%"],
-    ["unformalized", "3", "37.5%"]
+    ["out-of-date", "1", "12.5%"],
+    ["unformalized", "2", "25%"]
   ]);
+
+  harness.clickPaneTreeRowText("main.tex");
+  assert.match(harness.bodyText(), /Out of date.*LaTeX changed after this Lean artifact was generated/i);
 });
 
 test("Lean pane polling refresh preserves expanded folder and file rows", async () => {
