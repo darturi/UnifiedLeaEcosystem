@@ -33,6 +33,7 @@
   const LEAN_PANE_CHAT_POLL_RECONCILE_MS = 30000;
   const REPAIR_BATCH_POLL_MS = 2000;
   const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
+  const HUMAN_APPROVAL_STORAGE_KEY = "leaHumanApprovalsV1";
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -60,6 +61,9 @@
   // only the active buffer; the zip refresh happens on this cadence.
   let lastTexMirrorFullSyncAt = 0;
   let latestStatuses = {};
+  let humanApprovals = {};
+  let humanApprovalsLoadPromise = null;
+  let humanApprovalBusyKeys = new Set();
   let badgeLayer = null;
   let settingsButton = null;
   let leanPaneButton = null;
@@ -203,6 +207,11 @@
   renderSettingsButton();
   renderLeanPaneButton();
   hydrateLeanPaneWidthFromStorage();
+  loadHumanApprovals().then(() => {
+    renderStatusBadges();
+    if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
+  }).catch(() => {});
+  chrome.storage?.onChanged?.addListener(handleHumanApprovalStorageChanged);
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
@@ -1058,6 +1067,12 @@
     if (!response.ok) {
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
+    await reconcileHumanApprovals(
+      (payload.items || []).map((item) => ({
+        target: paneItemApprovalTarget(item),
+        statusInfo: item
+      }))
+    );
     renderLeanPaneManifest(payload);
     scheduleLeanPanePollIfNeeded(payload);
   }
@@ -1387,6 +1402,8 @@
     card.className = `ol-lean-project-item ol-lean-project-item-${item.status || "unknown"}`;
     card.dataset.itemId = item.id || "";
 
+    const headerRow = document.createElement("div");
+    headerRow.className = "ol-lean-project-item-header-row";
     const header = document.createElement("button");
     header.type = "button";
     header.className = "ol-lean-project-item-header";
@@ -1418,7 +1435,14 @@
     if (getStubbedTheoremUses(item).length > 0) {
       header.appendChild(createStubbedTheoremUsesMark());
     }
-    card.appendChild(header);
+    headerRow.appendChild(header);
+    if (
+      Object.prototype.hasOwnProperty.call(item, "approvalEligible")
+      || Boolean(item.approvalRevision)
+    ) {
+      headerRow.appendChild(createHumanApprovalButton(paneItemApprovalTarget(item), item, { pane: true }));
+    }
+    card.appendChild(headerRow);
 
     const natural = document.createElement("p");
     natural.className = "ol-lean-project-natural";
@@ -3526,7 +3550,12 @@
     if (!response.ok) {
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
-    postStatuses(withFallbackStatuses(payload.statuses || {}));
+    const statuses = withFallbackStatuses(payload.statuses || {});
+    await reconcileHumanApprovals(latestTargets.map((target) => ({
+      target,
+      statusInfo: statuses[targetKey(target)]
+    })));
+    postStatuses(statuses);
     if (activePopover?.dataset.targetKey) {
       const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
       if (target) updatePopoverStatus(activePopover, target);
@@ -3685,6 +3714,150 @@
     postStatuses(statuses);
   }
 
+  function paneItemApprovalTarget(item) {
+    return {
+      targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+      targetLabel: item?.label || item?.leanDeclarationName || ""
+    };
+  }
+
+  function humanApprovalKey(target) {
+    return `${extractOverleafProjectId()}:${targetKey(target)}`;
+  }
+
+  function humanApprovalRecord(target) {
+    return humanApprovals[humanApprovalKey(target)] || null;
+  }
+
+  function isHumanApproved(target, statusInfo) {
+    const record = humanApprovalRecord(target);
+    return Boolean(
+      record
+      && statusInfo?.approvalEligible
+      && statusInfo?.approvalRevision
+      && record.revision === statusInfo.approvalRevision
+    );
+  }
+
+  async function loadHumanApprovals() {
+    if (humanApprovalsLoadPromise) return humanApprovalsLoadPromise;
+    humanApprovalsLoadPromise = (async () => {
+      if (isExtensionContextInvalidated() || !chrome.storage?.local) {
+        humanApprovals = {};
+        return humanApprovals;
+      }
+      const stored = await chrome.storage.local.get({ [HUMAN_APPROVAL_STORAGE_KEY]: {} });
+      const value = stored?.[HUMAN_APPROVAL_STORAGE_KEY];
+      humanApprovals = value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+      return humanApprovals;
+    })().catch(() => {
+      humanApprovals = {};
+      return humanApprovals;
+    });
+    return humanApprovalsLoadPromise;
+  }
+
+  async function persistHumanApprovals() {
+    if (isExtensionContextInvalidated() || !chrome.storage?.local) return;
+    await chrome.storage.local.set({ [HUMAN_APPROVAL_STORAGE_KEY]: humanApprovals });
+  }
+
+  async function reconcileHumanApprovals(entries) {
+    await loadHumanApprovals();
+    let changed = false;
+    for (const { target, statusInfo } of entries || []) {
+      if (!target?.targetLabel) continue;
+      const key = humanApprovalKey(target);
+      const record = humanApprovals[key];
+      if (!record) continue;
+      if (
+        !statusInfo?.approvalEligible
+        || !statusInfo?.approvalRevision
+        || record.revision !== statusInfo.approvalRevision
+      ) {
+        delete humanApprovals[key];
+        changed = true;
+      }
+    }
+    if (changed) await persistHumanApprovals();
+    return changed;
+  }
+
+  async function toggleHumanApproval(target, statusInfo) {
+    await loadHumanApprovals();
+    const key = humanApprovalKey(target);
+    if (humanApprovalBusyKeys.has(key)) return;
+    humanApprovalBusyKeys.add(key);
+    renderApprovalSurfaces();
+    try {
+      if (isHumanApproved(target, statusInfo)) {
+        delete humanApprovals[key];
+      } else {
+        if (!statusInfo?.approvalEligible || !statusInfo?.approvalRevision) return;
+        humanApprovals[key] = {
+          revision: statusInfo.approvalRevision,
+          approvedAt: new Date().toISOString()
+        };
+      }
+      await persistHumanApprovals();
+    } finally {
+      humanApprovalBusyKeys.delete(key);
+      renderApprovalSurfaces();
+    }
+  }
+
+  function renderApprovalSurfaces() {
+    renderStatusBadges();
+    if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
+    if (activePopover?.dataset.targetKey) {
+      const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
+      if (target) updatePopoverStatus(activePopover, target);
+    }
+  }
+
+  function handleHumanApprovalStorageChanged(changes, areaName) {
+    if (areaName !== "local" || !changes?.[HUMAN_APPROVAL_STORAGE_KEY]) return;
+    const next = changes[HUMAN_APPROVAL_STORAGE_KEY].newValue;
+    humanApprovals = next && typeof next === "object" && !Array.isArray(next) ? { ...next } : {};
+    humanApprovalsLoadPromise = Promise.resolve(humanApprovals);
+    renderApprovalSurfaces();
+  }
+
+  function createHumanApprovalButton(target, statusInfo, { pane = false } = {}) {
+    const approved = isHumanApproved(target, statusInfo);
+    const key = humanApprovalKey(target);
+    const busy = humanApprovalBusyKeys.has(key);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = [
+      "ol-lean-human-approval",
+      pane ? "ol-lean-human-approval-pane" : "ol-lean-human-approval-source",
+      approved ? "ol-lean-human-approval-approved" : ""
+    ].filter(Boolean).join(" ");
+    button.textContent = "✓";
+    button.disabled = busy || !approved && !statusInfo?.approvalEligible;
+    button.setAttribute("aria-pressed", String(approved));
+    button.setAttribute(
+      "aria-label",
+      approved
+        ? `Remove personal approval for ${target.targetLabel}`
+        : `Mark ${target.targetLabel} as personally audited and approved`
+    );
+    button.title = busy
+      ? "Saving personal approval…"
+      : approved
+        ? "Personally audited and approved. Click to remove."
+        : statusInfo?.approvalEligible
+          ? "Mark this exact proof and its current dependencies as personally audited."
+          : statusInfo?.approvalIneligibleReason || "Personal approval is unavailable for this item.";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleHumanApproval(target, statusInfo).catch(() => {});
+    });
+    return button;
+  }
+
   function postStatuses(statuses) {
     latestStatuses = statuses || {};
     const noticeKey = maxSpendNoticeKeyFromStatuses(latestStatuses);
@@ -3771,6 +3944,16 @@
         showTargetPopover(event.clientX, event.clientY, target);
       });
       badgeLayer.appendChild(badge);
+      if (
+        Object.prototype.hasOwnProperty.call(statusInfo, "approvalEligible")
+        || Boolean(statusInfo.approvalRevision)
+      ) {
+        const approval = createHumanApprovalButton(target, statusInfo);
+        const badgeRect = badge.getBoundingClientRect();
+        approval.style.left = `${Math.min(badgeRect.right + 4, window.innerWidth - 24)}px`;
+        approval.style.top = `${coords.top}px`;
+        badgeLayer.appendChild(approval);
+      }
     }
   }
 

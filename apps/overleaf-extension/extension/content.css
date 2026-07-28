@@ -43,6 +43,50 @@
   cursor: pointer;
 }
 
+.ol-lean-human-approval {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--ol-line);
+  border-radius: 6px;
+  color: var(--ol-muted);
+  background: var(--ol-panel);
+  font: 800 12px/1 var(--ol-sans);
+  cursor: pointer;
+}
+
+.ol-lean-human-approval-source {
+  position: fixed;
+  width: 18px;
+  height: 18px;
+  pointer-events: auto;
+}
+
+.ol-lean-human-approval-pane {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin-top: 1px;
+}
+
+.ol-lean-human-approval-approved {
+  color: #ffffff;
+  background: var(--ol-green);
+  border-color: var(--ol-green);
+}
+
+.ol-lean-human-approval:not(.ol-lean-human-approval-approved):not(:disabled) {
+  color: var(--ol-green);
+  border-color: var(--ol-green);
+}
+
+.ol-lean-human-approval:disabled {
+  color: var(--ol-muted);
+  background: var(--ol-line-2);
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .ol-lean-status-progress {
   font-weight: 700;
   opacity: 0.72;
@@ -76,6 +120,7 @@
 }
 
 .ol-lean-status:focus-visible,
+.ol-lean-human-approval:focus-visible,
 .ol-lean-settings-trigger:focus-visible,
 .ol-lean-pane-trigger:focus-visible,
 .ol-lean-project-tree-row:focus-visible,
@@ -573,6 +618,17 @@ body.ol-lean-pane-resizing {
   background: transparent;
   text-align: left;
   cursor: pointer;
+}
+
+.ol-lean-project-item-header-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.ol-lean-project-item-header-row .ol-lean-project-item-header {
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .ol-lean-project-item-title {

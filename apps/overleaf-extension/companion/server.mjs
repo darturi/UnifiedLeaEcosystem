@@ -46,6 +46,10 @@ import {
 import { classifyEdit, cascadeRequired, parseDeclarationHeader } from "./leanSignatureDiff.mjs";
 import { breakageDescriptor, runCascadeVerification } from "./cascadeVerify.mjs";
 import {
+  buildApprovalRevisionContext,
+  computeFormalizationApprovalRevision
+} from "./formalizationApproval.mjs";
+import {
   findActiveJob,
   findLatestArtifactJob,
   findLatestFinishedJob,
@@ -219,6 +223,11 @@ export async function handleGetStatuses(payload, state) {
 
   const targets = Array.isArray(payload.targets) ? payload.targets : [];
   const statuses = {};
+  const overleafProjectId = payload.overleafProjectId || "unknown";
+  const approvalContext = await loadFormalizationApprovalContext({
+    state,
+    overleafProjectId
+  });
 
   for (const rawTarget of targets) {
     const targetKind = normalizeTargetKind(rawTarget?.targetKind);
@@ -235,20 +244,55 @@ export async function handleGetStatuses(payload, state) {
     const statusInfo = await getTargetStatus({
       state,
       leaRepoPath: state.settings.leaRepoPath,
-      overleafProjectId: payload.overleafProjectId || "unknown",
+      overleafProjectId,
       targetKind,
       targetLabel,
       jobs: state.jobs || {}
     });
-    statuses[targetKey({ targetKind, targetLabel })] = attachSourceFreshness({
+    const currentInputHash = hashFormalizationInput({
+      targetKind,
+      targetText,
+      targetUses,
+      targetContext
+    });
+    const freshness = attachSourceFreshness({
       state,
-      overleafProjectId: payload.overleafProjectId || "unknown",
+      overleafProjectId,
       targetKind,
       targetLabel,
       currentSourceHash: hashTargetText(targetText),
-      currentInputHash: hashFormalizationInput({ targetKind, targetText, targetUses, targetContext }),
+      currentInputHash,
       statusInfo
     });
+    const artifact = await readLeanPaneArtifact({
+      leaRepoPath: state.settings.leaRepoPath,
+      statusInfo
+    });
+    const approvalTarget = buildLeaTarget({
+      leaRepoPath: state.settings.leaRepoPath,
+      overleafProjectId,
+      targetKind,
+      targetLabel
+    });
+    const sessionArtifact = artifact.content
+      ? { relativePath: "", content: "" }
+      : await readLeanPaneArtifactFromSession({
+          state,
+          job: findLatestFinishedJob(state.jobs || {}, approvalTarget.jobKey),
+          declarationName: statusInfo?.declarationName || targetLabel
+        });
+    const effectiveArtifact = artifact.content ? artifact : sessionArtifact;
+    statuses[targetKey({ targetKind, targetLabel })] = {
+      ...freshness,
+      ...buildFormalizationApprovalMetadata({
+        statusInfo: freshness,
+        formalizationInputHash: currentInputHash,
+        artifactContent: effectiveArtifact.content,
+        artifactPath: effectiveArtifact.relativePath || artifact.relativePath
+          || freshness.recordedProofPath || freshness.relativePath,
+        approvalContext
+      })
+    };
   }
 
   return { statusCode: 200, body: { statuses } };
@@ -894,13 +938,19 @@ export async function handleLeanPaneManifest(payload, state) {
     };
   }
 
+  const overleafProjectId = payload.overleafProjectId || "unknown";
+  const approvalContext = await loadFormalizationApprovalContext({
+    state,
+    overleafProjectId
+  });
   const items = await mapWithConcurrency(
     manifest.items,
     LEAN_PANE_ENRICH_CONCURRENCY,
     (item) => enrichLeanPaneItem({
       item,
       state,
-      overleafProjectId: payload.overleafProjectId || "unknown"
+      overleafProjectId,
+      approvalContext
     })
   );
 
@@ -5620,7 +5670,74 @@ async function attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafPro
   return addStubbedTheoremUses(status, merged);
 }
 
-async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
+async function loadFormalizationApprovalContext({ state, overleafProjectId }) {
+  try {
+    const namespace = await resolveProjectNamespace({ state, overleafProjectId });
+    const files = await listProjectProofFiles({
+      leaRepoPath: state.settings.leaRepoPath,
+      namespace
+    });
+    return buildApprovalRevisionContext(files);
+  } catch {
+    return buildApprovalRevisionContext();
+  }
+}
+
+function buildFormalizationApprovalMetadata({
+  statusInfo,
+  formalizationInputHash,
+  artifactContent,
+  artifactPath,
+  approvalContext
+}) {
+  const status = String(statusInfo?.status || "").toLowerCase();
+  let reason = "";
+  if (status !== "formalized") {
+    reason = "Only a current, checked proof or definition can be marked as personally approved.";
+  } else if (statusInfo?.sourceFreshness === "stale") {
+    reason = "Re-formalize this out-of-date item before approving it.";
+  } else if (
+    statusInfo?.hasStubbedTheoremUses
+    || (Array.isArray(statusInfo?.stubbedTheoremUses) && statusInfo.stubbedTheoremUses.length > 0)
+  ) {
+    reason = "Formalize its sorry-stubbed dependencies before approving it.";
+  } else if (!String(artifactContent || "")) {
+    reason = "The current Lean artifact is unavailable.";
+  } else if (containsSorryMarker(artifactContent)) {
+    reason = "A proof containing sorry or admit cannot be marked as personally approved.";
+  }
+
+  if (reason) {
+    return {
+      approvalEligible: false,
+      approvalRevision: "",
+      approvalIneligibleReason: reason
+    };
+  }
+
+  const approvalRevision = computeFormalizationApprovalRevision({
+    formalizationInputHash,
+    declarationName: statusInfo?.declarationName,
+    artifactPath,
+    moduleName: statusInfo?.moduleName,
+    artifactContent,
+    context: approvalContext
+  });
+  if (!approvalRevision) {
+    return {
+      approvalEligible: false,
+      approvalRevision: "",
+      approvalIneligibleReason: "The current formalization revision could not be identified."
+    };
+  }
+  return {
+    approvalEligible: true,
+    approvalRevision,
+    approvalIneligibleReason: ""
+  };
+}
+
+async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalContext }) {
   const targetKind = item.leanKind === "def" ? "definition" : "theorem";
   const targetLabel = String(item.leanDeclarationName || "").trim();
   if (!isValidLeanIdentifier(targetLabel)) {
@@ -5659,6 +5776,12 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
 
   const paneStatus = mapLeanPaneStatus(statusInfo, item);
   const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
+  const currentInputHash = hashFormalizationInput({
+    targetKind,
+    targetText: item.naturalLanguageLatex,
+    targetUses: item.targetUses,
+    targetContext: item.targetContext
+  });
   const freshness = attachSourceFreshness({
     state,
     overleafProjectId,
@@ -5667,12 +5790,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     // changed after a manual Lean edit, but that must not fork provenance.
     targetLabel: item.label || targetLabel,
     currentSourceHash: item.sourceHash,
-    currentInputHash: hashFormalizationInput({
-      targetKind,
-      targetText: item.naturalLanguageLatex,
-      targetUses: item.targetUses,
-      targetContext: item.targetContext
-    }),
+    currentInputHash,
     statusInfo
   });
   const stale = freshness.sourceFreshness === "stale"
@@ -5695,6 +5813,14 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
       ? extractLeanStatement(effectiveArtifact.content, leanDeclarationName)
       : ""
   );
+  const approvalMetadata = buildFormalizationApprovalMetadata({
+    statusInfo: freshness,
+    formalizationInputHash: currentInputHash,
+    artifactContent: effectiveArtifact.content,
+    artifactPath: effectiveArtifact.relativePath || artifact.relativePath
+      || statusInfo?.recordedProofPath || statusInfo?.relativePath,
+    approvalContext
+  });
 
   return {
     ...item,
@@ -5709,6 +5835,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     leanStub: leanStub || undefined,
     leanArtifactPath: effectiveArtifact.relativePath || artifact.relativePath || statusInfo?.recordedProofPath || statusInfo?.relativePath || undefined,
     leanArtifactContent: effectiveArtifact.content || undefined,
+    ...approvalMetadata,
     // The document overlay's badge already renders an amber "!" for a
     // formalized proof whose imports are currently sorry-stubbed
     // (renderStubbedTheoremUsesWarning in content.js); the pane used to drop

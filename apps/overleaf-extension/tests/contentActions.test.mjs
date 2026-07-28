@@ -113,6 +113,102 @@ test("definition success renders a defined badge", async () => {
   assert.equal(harness.hasButtonText("formalized"), false);
 });
 
+test("personal approval toggles in browser-local storage and updates the source badge", async () => {
+  const status = {
+    status: "formalized",
+    approvalEligible: true,
+    approvalRevision: "revision-1",
+    approvalIneligibleReason: ""
+  };
+  const harness = createContentHarness(status);
+  await harness.loadVisibleTheorems();
+
+  assert.equal(
+    harness.hasButtonLabel("Mark demo_theorem as personally audited and approved"),
+    true
+  );
+  harness.clickButtonLabel("Mark demo_theorem as personally audited and approved");
+  await flushPromises();
+
+  const key = "project-1:theorem:demo_theorem";
+  assert.equal(harness.localStorageState.leaHumanApprovalsV1[key].revision, "revision-1");
+  assert.equal(harness.hasButtonLabel("Remove personal approval for demo_theorem"), true);
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 1);
+
+  harness.clickButtonLabel("Remove personal approval for demo_theorem");
+  await flushPromises();
+  assert.equal(harness.localStorageState.leaHumanApprovalsV1[key], undefined);
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 0);
+});
+
+test("a changed approval revision automatically removes the local note without resurrecting it", async () => {
+  const key = "project-1:theorem:demo_theorem";
+  const harness = createContentHarness(
+    {
+      status: "formalized",
+      approvalEligible: true,
+      approvalRevision: "revision-new",
+      approvalIneligibleReason: ""
+    },
+    {},
+    {
+      localStorage: {
+        leaHumanApprovalsV1: {
+          [key]: { revision: "revision-old", approvedAt: "2026-07-01T00:00:00.000Z" }
+        }
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  assert.equal(harness.localStorageState.leaHumanApprovalsV1[key], undefined);
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 0);
+  assert.equal(
+    harness.hasButtonLabel("Mark demo_theorem as personally audited and approved"),
+    true
+  );
+});
+
+test("the Lean pane shows the same stored approval as the in-source tag", async () => {
+  const approval = {
+    approvalEligible: true,
+    approvalRevision: "shared-revision",
+    approvalIneligibleReason: ""
+  };
+  const item = {
+    id: "theorem:demo_theorem:0",
+    kind: "theorem",
+    label: "demo_theorem",
+    status: "valid",
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageRendered: "A theorem.",
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    leanDeclarationName: "demo_theorem",
+    leanArtifactContent: "theorem demo_theorem : True := by trivial",
+    ...approval
+  };
+  const harness = createContentHarness(
+    { status: "formalized", ...approval },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [item], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickButtonLabel("Mark demo_theorem as personally audited and approved");
+  await flushPromises();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 2);
+  assert.equal(harness.hasButtonLabel("Remove personal approval for demo_theorem"), true);
+});
+
 test("Lean pane trigger opens a project pane and renders manifest items", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -875,6 +971,8 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const confirmCalls = [];
   const storageSetCalls = [];
   const storageState = { ...(options.storage || {}) };
+  const localStorageState = { ...(options.localStorage || {}) };
+  const storageChangeListeners = [];
   let nextTimerId = 1;
 
   const window = {
@@ -1036,6 +1134,25 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
             storageSetCalls.push({ ...values });
             Object.assign(storageState, values);
           }
+        },
+        local: {
+          async get(defaults) {
+            return { ...defaults, ...localStorageState };
+          },
+          async set(values) {
+            storageSetCalls.push({ ...values });
+            for (const [key, value] of Object.entries(values)) {
+              const oldValue = localStorageState[key];
+              localStorageState[key] = value;
+              const change = { [key]: { oldValue, newValue: value } };
+              for (const listener of storageChangeListeners) listener(change, "local");
+            }
+          }
+        },
+        onChanged: {
+          addListener(listener) {
+            storageChangeListeners.push(listener);
+          }
         }
       }
     }
@@ -1193,6 +1310,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     confirmCalls,
     storageSetCalls,
     storageState,
+    localStorageState,
     postedMessages,
     lastStorageSet() {
       return storageSetCalls[storageSetCalls.length - 1] || null;

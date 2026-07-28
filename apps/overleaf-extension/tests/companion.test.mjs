@@ -1141,6 +1141,78 @@ test("changes to uses and context mark both status surfaces stale without changi
   assert.equal(pane.body.items[0].sourceFreshness, "stale");
 });
 
+test("approval revisions agree across status surfaces and change with transitive upstream artifacts", async () => {
+  const leaRepo = await makeLeaRepo();
+  const basePath = path.join("workspace", "proofs", "Lea", "Project1", "base.lean");
+  const middlePath = path.join("workspace", "proofs", "Lea", "Project1", "middle.lean");
+  const resultPath = path.join("workspace", "proofs", "Lea", "Project1", "result.lean");
+  await writeLeaProjectProof(leaRepo, basePath, "theorem base : True := by\n  trivial\n");
+  await writeLeaProjectProof(
+    leaRepo,
+    middlePath,
+    "import Lea.Project1.base\n\ntheorem middle : True := by\n  exact base\n"
+  );
+  await writeLeaProjectProof(
+    leaRepo,
+    resultPath,
+    "import Lea.Project1.middle\n\ntheorem result : True := by\n  exact middle\n"
+  );
+  const targetStatus = {
+    result: ledgerEntry("result", {
+      content: "import Lea.Project1.middle\n\ntheorem result : True := by\n  exact middle\n"
+    })
+  };
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch([], { targetStatus })
+  });
+  const target = {
+    targetKind: "theorem",
+    targetLabel: "result",
+    targetText: "The result follows from the middle theorem.",
+    targetUses: ["middle"],
+    targetContext: ""
+  };
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [target]
+  }, state);
+  const statusInfo = statuses.body.statuses["theorem:result"];
+  assert.equal(statusInfo.approvalEligible, true);
+  assert.match(statusInfo.approvalRevision, /^[a-f0-9]{64}$/);
+
+  const pane = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}",
+        "% lea: formalize label=result uses={middle}",
+        target.targetText,
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+  assert.equal(pane.body.items[0].approvalEligible, true);
+  assert.equal(pane.body.items[0].approvalRevision, statusInfo.approvalRevision);
+
+  await writeLeaProjectProof(
+    leaRepo,
+    basePath,
+    "theorem base : True := by\n  exact True.intro\n"
+  );
+  const changed = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [target]
+  }, state);
+  assert.notEqual(
+    changed.body.statuses["theorem:result"].approvalRevision,
+    statusInfo.approvalRevision
+  );
+});
+
 test("lean pane manifest uses adapter session code for formalized jobs without recorded proof paths", async () => {
   const leaRepo = await makeLeaRepo();
   const calls = [];
