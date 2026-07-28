@@ -200,6 +200,12 @@ the current LaTeX is formalized. The companion status response retains the
 artifact lifecycle in `status` and reports `sourceFreshness` separately as
 `current`, `stale`, or `unknown`.
 
+Freshness covers all formalization-relevant marker inputs, not only the theorem
+body. Changing `uses={...}` or `context={...}` on a `% lea:` activation comment
+or inline Lea tag makes the artifact out of date even when the natural-language
+statement is unchanged. Marker formatting and whitespace-only changes remain
+normalized away.
+
 ## Ordering
 
 Items should be ordered according to rendered document order, matching the order

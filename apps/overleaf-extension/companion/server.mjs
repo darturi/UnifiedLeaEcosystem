@@ -24,6 +24,7 @@ import {
   slugProjectId
 } from "../shared/leanStub.mjs";
 import {
+  hashFormalizationInput,
   hashTargetText,
   inferLeanDeclarationName,
   isValidLeanIdentifier
@@ -223,6 +224,10 @@ export async function handleGetStatuses(payload, state) {
     const targetKind = normalizeTargetKind(rawTarget?.targetKind);
     const targetLabel = String(rawTarget?.targetLabel || "");
     const targetText = String(rawTarget?.targetText || "");
+    const targetUses = Array.isArray(rawTarget?.targetUses)
+      ? rawTarget.targetUses.map((value) => String(value || "").trim()).filter(Boolean)
+      : [];
+    const targetContext = String(rawTarget?.targetContext || "").trim();
     if (!targetKind || !isValidLeanIdentifier(targetLabel) || !targetText.trim()) {
       continue;
     }
@@ -241,6 +246,7 @@ export async function handleGetStatuses(payload, state) {
       targetKind,
       targetLabel,
       currentSourceHash: hashTargetText(targetText),
+      currentInputHash: hashFormalizationInput({ targetKind, targetText, targetUses, targetContext }),
       statusInfo
     });
   }
@@ -340,7 +346,15 @@ export async function handleFormalize(payload, state) {
         targetText,
         jobs: state.jobs || {}
       });
-  const job = await createLeaJob({ state, target, targetText, targetContext, targetSyntax, resolvedUses: usesResolution.resolvedUses });
+  const job = await createLeaJob({
+    state,
+    target,
+    targetText,
+    targetContext,
+    targetSyntax,
+    sourceUses: targetUses,
+    resolvedUses: usesResolution.resolvedUses
+  });
   // Only the parsed header + module identity ride on the job (persisted with
   // jobs.json); never the full file content -- see snapshotPreRunLeanState.
   if (preRunLean) job.preRunLean = preRunLean;
@@ -436,6 +450,7 @@ export async function handleStub(payload, state) {
     targetText,
     targetContext,
     targetSyntax,
+    sourceUses: targetUses,
     resolvedUses: usesResolution.resolvedUses,
     mode: "stub"
   });
@@ -934,6 +949,11 @@ function normalizeChatTarget(rawTarget, state) {
   if (!isValidLeanIdentifier(targetLabel)) {
     return { ok: false, error: "invalid_label", message: "Target label must be a valid Lean identifier." };
   }
+  const naturalLanguageLatex = String(rawTarget?.naturalLanguageLatex || "");
+  const targetUses = (Array.isArray(rawTarget?.targetUses) ? rawTarget.targetUses : [])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  const targetContext = String(rawTarget?.targetContext || "");
   const target = {
     overleafProjectId,
     targetKind,
@@ -947,7 +967,15 @@ function normalizeChatTarget(rawTarget, state) {
     sourceStartLine: toPositiveInteger(rawTarget?.sourceStartLine),
     sourceEndLine: toPositiveInteger(rawTarget?.sourceEndLine),
     sourceHash: String(rawTarget?.sourceHash || "").trim(),
-    naturalLanguageLatex: String(rawTarget?.naturalLanguageLatex || ""),
+    naturalLanguageLatex,
+    targetUses,
+    targetContext,
+    formalizationInputHash: hashFormalizationInput({
+      targetKind,
+      targetText: naturalLanguageLatex,
+      targetUses,
+      targetContext
+    }),
     leanDeclarationName: String(rawTarget?.leanDeclarationName || "").trim(),
     recordedProofPath: String(rawTarget?.recordedProofPath || "").trim(),
     status: String(rawTarget?.status || "").trim()
@@ -964,7 +992,8 @@ function chatBaseUrls(state) {
 
 // Resolve a target to its Lea session. Newest-wins, preferring job-recorded
 // sessions over the companion association map (the spec: prefer job/session data
-// when it exists). `latestJobHash` drives stale detection; `activeJob` blocks a
+// when it exists). The versioned input hash drives stale detection when
+// available, falling back to the legacy text hash; `activeJob` blocks a
 // concurrent send.
 function resolveChatSession({ state, target }) {
   const jobs = state.jobs || {};
@@ -996,7 +1025,10 @@ function resolveChatSession({ state, target }) {
     (assoc && assoc.leaSessionId) ||
     null;
   const latestJobHash = (finishedJob && finishedJob.targetTextHash) || (assoc && assoc.sourceHash) || null;
-  return { leaSessionId, latestJobHash, activeJob };
+  const latestJobInputHash = deriveArtifactInputHash(finishedJob)
+    || (assoc && assoc.formalizationInputHash)
+    || null;
+  return { leaSessionId, latestJobHash, latestJobInputHash, activeJob };
 }
 
 async function persistChatSessions(state) {
@@ -1169,12 +1201,14 @@ export async function handleChatMessage(payload, state) {
   target.projectName = currentIdentity.projectName;
   target.projectNamespace = currentIdentity.namespace;
 
-  const { leaSessionId, latestJobHash, activeJob } = resolveChatSession({ state, target });
+  const { leaSessionId, latestJobHash, latestJobInputHash, activeJob } = resolveChatSession({ state, target });
   if (activeJob) {
     return errorResponse(409, "run_in_progress", "A Lea run for this item is already in progress.");
   }
 
-  const stale = Boolean(latestJobHash && target.sourceHash && latestJobHash !== target.sourceHash);
+  const generatedFromHash = latestJobInputHash || latestJobHash;
+  const currentHash = latestJobInputHash ? target.formalizationInputHash : target.sourceHash;
+  const stale = Boolean(generatedFromHash && currentHash && generatedFromHash !== currentHash);
   const prompt = buildChatPrompt(target, { stale, firstMessage: !leaSessionId, userText: message });
 
   // Self-repair Phase 1: snapshot the recorded declaration BEFORE the run so
@@ -1223,6 +1257,7 @@ export async function handleChatMessage(payload, state) {
     createdAt: existing?.createdAt || now,
     updatedAt: now,
     sourceHash: target.sourceHash || existing?.sourceHash || null,
+    formalizationInputHash: target.formalizationInputHash || existing?.formalizationInputHash || null,
     // Any lastRunImpact still on the record here belongs to THIS run's own
     // terminal continuation (a fast run can finish before this write; the
     // PREVIOUS run's impact was cleared before startChatRun). Preserving it
@@ -1894,6 +1929,7 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     declarationName: linkedJob?.declarationName || target.targetLabel,
     declarationNameHint: linkedJob?.declarationNameHint || null,
     targetTextHash: linkedJob?.targetTextHash || null,
+    formalizationInputHash: deriveArtifactInputHash(linkedJob) || null,
     recordedProofPath: linkedJob?.recordedProofPath || null,
     moduleName: linkedJob?.moduleName || null,
     leanStatement: linkedJob?.leanStatement || null,
@@ -3957,7 +3993,16 @@ function validateLeaRuntime(state, { requireApiKey }) {
   return { ok: true };
 }
 
-async function createLeaJob({ state, target, targetText, targetContext = "", targetSyntax = "comment", resolvedUses = [], mode = "formalization" }) {
+async function createLeaJob({
+  state,
+  target,
+  targetText,
+  targetContext = "",
+  targetSyntax = "comment",
+  sourceUses = [],
+  resolvedUses = [],
+  mode = "formalization"
+}) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jobId = `${target.targetKind}-${target.targetLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
@@ -3988,6 +4033,12 @@ async function createLeaJob({ state, target, targetText, targetContext = "", tar
     targetUses: resolvedUses,
     targetContext,
     targetTextHash: hashTargetText(targetText),
+    formalizationInputHash: hashFormalizationInput({
+      targetKind: target.targetKind,
+      targetText,
+      targetUses: sourceUses,
+      targetContext
+    }),
     relativePath: target.relativePath,
     absolutePath: target.absolutePath,
     logPath,
@@ -5432,6 +5483,7 @@ function attachSourceFreshness({
   targetKind,
   targetLabel,
   currentSourceHash,
+  currentInputHash,
   statusInfo
 }) {
   const status = String(statusInfo?.status || "").toLowerCase();
@@ -5453,26 +5505,60 @@ function attachSourceFreshness({
   const generatedFromSourceHash = artifactJob?.targetTextHash
     || (!artifactJob ? association?.sourceHash : null)
     || "";
+  const generatedFromInputHash = deriveArtifactInputHash(artifactJob)
+    || (!artifactJob ? association?.formalizationInputHash : null)
+    || "";
   const current = String(currentSourceHash || "");
-  if (!generatedFromSourceHash || !current) {
+  const currentInput = String(currentInputHash || "");
+  const comparableGeneratedHash = generatedFromInputHash || generatedFromSourceHash;
+  const comparableCurrentHash = generatedFromInputHash ? currentInput : current;
+  if (!comparableGeneratedHash || !comparableCurrentHash) {
     return {
       ...statusInfo,
       sourceFreshness: "unknown",
       generatedFromSourceHash: generatedFromSourceHash || undefined,
+      generatedFromInputHash: generatedFromInputHash || undefined,
       generatedAt: artifactJob?.finishedAt || artifactJob?.startedAt || association?.updatedAt || undefined
     };
   }
 
-  const sourceFreshness = generatedFromSourceHash === current ? "current" : "stale";
+  const sourceFreshness = comparableGeneratedHash === comparableCurrentHash ? "current" : "stale";
   return {
     ...statusInfo,
     sourceFreshness,
     generatedFromSourceHash,
+    generatedFromInputHash: generatedFromInputHash || undefined,
     generatedAt: artifactJob?.finishedAt || artifactJob?.startedAt || association?.updatedAt || undefined,
     sourceFreshnessMessage: sourceFreshness === "stale"
-      ? "The LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+      ? "The LaTeX source changed after this Lean artifact was generated. Statement and Lea activation metadata are both tracked; re-formalize to synchronize it."
       : ""
   };
+}
+
+// Jobs written before `formalizationInputHash` was introduced already contain
+// enough prompt metadata to derive it: the canonical body hash, resolved uses
+// (including their original labels), and context. Truly older/incomplete
+// records return no composite hash and retain text-only freshness semantics.
+function deriveArtifactInputHash(job) {
+  if (!job) return "";
+  if (job.formalizationInputHash) return String(job.formalizationInputHash);
+  if (
+    !job.targetTextHash
+    || !Array.isArray(job.targetUses)
+    || !Object.prototype.hasOwnProperty.call(job, "targetContext")
+  ) {
+    return "";
+  }
+  const targetUses = job.targetUses
+    .map((use) => typeof use === "string" ? use : use?.targetLabel)
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return hashFormalizationInput({
+    targetKind: job.targetKind,
+    targetTextHash: job.targetTextHash,
+    targetUses,
+    targetContext: job.targetContext
+  });
 }
 
 // Enrich a formalized status with everything TRANSITIVELY upstream of it that
@@ -5581,6 +5667,12 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
     // changed after a manual Lean edit, but that must not fork provenance.
     targetLabel: item.label || targetLabel,
     currentSourceHash: item.sourceHash,
+    currentInputHash: hashFormalizationInput({
+      targetKind,
+      targetText: item.naturalLanguageLatex,
+      targetUses: item.targetUses,
+      targetContext: item.targetContext
+    }),
     statusInfo
   });
   const stale = freshness.sourceFreshness === "stale"
@@ -5628,7 +5720,7 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId }) {
       ? statusInfo.stubbedTheoremUses
       : undefined,
     message: stale
-      ? "Out of date — the LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+      ? "Out of date — the LaTeX source changed after this Lean artifact was generated. Statement and Lea activation metadata are both tracked; re-formalize to synchronize it."
       : statusInfo?.message || undefined,
     // Edit-induced breakage attribution (self-repair Phase 2): who/what broke
     // this item and whether a repair can be offered right now. Undefined for

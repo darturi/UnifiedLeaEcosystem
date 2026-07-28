@@ -3515,7 +3515,9 @@
         targets: latestTargets.map((target) => ({
           targetKind: target.targetKind,
           targetLabel: target.targetLabel,
-          targetText: target.targetText
+          targetText: target.targetText,
+          targetUses: target.targetUses || [],
+          targetContext: target.targetContext || ""
         }))
       })
     });

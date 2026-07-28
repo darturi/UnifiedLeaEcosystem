@@ -432,6 +432,8 @@ export function paneItemToChatTarget(item, overleafProjectId) {
     sourceEndLine: item?.sourceEndLine,
     sourceHash: item?.sourceHash || "",
     naturalLanguageLatex: item?.naturalLanguageLatex || "",
+    targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
+    targetContext: item?.targetContext || "",
     leanDeclarationName: item?.leanDeclarationName || "",
     recordedProofPath: item?.leanArtifactPath || "",
     status: item?.status || ""
