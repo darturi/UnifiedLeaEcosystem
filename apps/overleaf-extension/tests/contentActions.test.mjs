@@ -826,6 +826,52 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   assert.equal(body.targetContext, "Use the helper.");
   assert.equal(body.projectName, "Test Project");
   assert.equal(body.projectNamespace, "Lea.TestProject");
+  assert.equal(body.sourceFile, "main.tex");
+  assert.equal(body.sourceStartLine, 1);
+  assert.equal(body.sourceEndLine, 4);
+  assert.equal(body.mirroredSourcePath, ".lea/files/overleaf/main.tex");
+  assert.match(body.sourceExcerpt, /A theorem\./);
+});
+
+test("Lean pane keeps Formalize after an upstream dependency blocks startup", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeError: "Formalize referenced theorem first: helper_lemma.",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          formalizable: true,
+          targetUses: ["helper_lemma"]
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.equal(harness.hasButtonText("Formalize"), true);
+  assert.equal(harness.hasButtonText("Retry formalize"), false);
+  assert.match(harness.bodyText(), /Formalize referenced theorem first: helper_lemma\./);
 });
 
 // --- Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md) ----------
@@ -1053,12 +1099,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
       const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
+      const failingFormalize = Boolean(options.formalizeError) && String(url).endsWith("/formalize");
       return {
-        ok: !failingRepairStart,
-        status: failingRepairStart ? 502 : 200,
+        ok: !failingRepairStart && !failingFormalize,
+        status: failingRepairStart || failingFormalize ? 400 : 200,
         async json() {
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
+          }
+          if (failingFormalize) {
+            return { ok: false, error: "unresolved_uses", message: options.formalizeError };
           }
           if (String(url).includes("/project/identity?")) {
             return {

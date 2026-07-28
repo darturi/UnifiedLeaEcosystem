@@ -395,6 +395,15 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
   }
 
   function withCoords(view, target) {
+    const sourceFile = getActiveDocPath();
+    const docLength = Number.isFinite(view.state.doc.length)
+      ? view.state.doc.length
+      : view.state.doc.toString().length;
+    const sourceStartLine = documentLineAt(view.state.doc, Math.max(0, target.from || 0));
+    const sourceEndLine = documentLineAt(
+      view.state.doc,
+      Math.max(0, Math.min(target.to || target.from || 0, docLength))
+    );
     return {
       targetKind: target.targetKind,
       targetLabel: target.targetLabel,
@@ -404,6 +413,9 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
       latexEnvironment: target.latexEnvironment,
       latexLabel: target.latexLabel,
       sourceHash: target.sourceHash,
+      sourceFile,
+      sourceStartLine,
+      sourceEndLine,
       syntax: target.syntax,
       code: target.code,
       message: target.message,
@@ -414,6 +426,11 @@ import { parseTargetDocument } from "./targetParserCore.mjs";
       bodyTo: target.bodyTo,
       coords: getTargetCoords(view, target)
     };
+  }
+
+  function documentLineAt(doc, offset) {
+    if (typeof doc?.lineAt === "function") return doc.lineAt(offset).number;
+    return doc?.toString().slice(0, offset).split("\n").length || 1;
   }
 
   function hasCoords(target) {

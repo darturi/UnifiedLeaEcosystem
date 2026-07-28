@@ -170,8 +170,22 @@ def _within(target: Path, roots: list[Path]) -> bool:
     return any(target == root or root in target.parents for root in roots)
 
 
-def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+def _run_relative_path(path: str) -> Path:
+    """Resolve a model path against this activation's working directory.
+
+    The adapter process has a stable process cwd while concurrent activations each
+    declare their own ``working_dir`` through ``run_context``. Project context paths
+    such as ``.lea/files/overleaf/main.tex`` must therefore be anchored explicitly.
+    """
     p = Path(path).expanduser()
+    wd = current_working_dir()
+    if wd is None or p.is_absolute():
+        return p.resolve()
+    return (Path(wd).expanduser().resolve() / p).resolve()
+
+
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+    p = _run_relative_path(path)
     # Reads are confined to the run's roots (AUDIT-2026-07-24 S4). `write_file` and
     # `edit_file` have been sandboxed since F3, but reads were not — so the model could
     # open anything the adapter process could: `~/.ssh/id_rsa`, the monorepo `.env`, and
@@ -180,7 +194,7 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
     # comes from a shared LaTeX document and no approval gate stands between a
     # prompt-injected instruction and the tool call.
     roots = _readable_roots()
-    if roots is not None and not _within(p.resolve(), roots):
+    if roots is not None and not _within(p, roots):
         return (
             f"Error: {path!r} is outside this run's workspace. Read only within your "
             "session's directory or the Lake project (Mathlib included)."
@@ -269,7 +283,13 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 
 def lean_check(path: str, *, use_lsp: bool = True) -> str:
-    p = Path(path).resolve()
+    p = _run_relative_path(path)
+    roots = _readable_roots()
+    if roots is not None and not _within(p, roots):
+        return (
+            f"Error: {path!r} is outside this run's workspace. Check only within your "
+            "session's directory or the Lake project."
+        )
     if not p.exists():
         return f"Error: {p} does not exist."
 

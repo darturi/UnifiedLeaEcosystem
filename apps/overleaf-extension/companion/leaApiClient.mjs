@@ -134,10 +134,10 @@ export function fetchAdapterUsageStats({ fetchImpl, baseUrl }) {
   });
 }
 
-// Mirror the Overleaf project's .tex sources into the matching adapter project's
+// Mirror the Overleaf project's .tex/.sty/.cls sources into the matching adapter project's
 // `.lea/files/overleaf/` (resolved by slug, get-or-create — same slug the run uses).
 // The adapter reconciles synchronously and defers the git commit, so this returns
-// quickly; `files` is `[{ path, content }]` (.tex only). Best-effort: a transport
+// quickly; `files` is `[{ path, content }]`. Best-effort: a transport
 // failure surfaces as `{ ok:false }` and the caller logs/ignores it.
 export function mirrorProjectTexFiles({ fetchImpl, baseUrl, slug, files, mode = "reconcile" }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/mirror`, {

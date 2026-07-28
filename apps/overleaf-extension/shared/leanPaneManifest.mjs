@@ -192,6 +192,7 @@ export function parseLeanPaneItemsFromFile(file, initialOrder = 0) {
       sourceStartOffset: from,
       sourceEndOffset: to,
       sourceHash: hashTargetText(naturalLanguageLatex),
+      syntax: target?.syntax || "comment",
       naturalLanguageLatex,
       naturalLanguageRendered: renderLightLatex(naturalLanguageLatex),
       leanKind: leanKindFor(target, kind),

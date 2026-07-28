@@ -389,7 +389,12 @@ export function paneItemToFormalizeTarget(item) {
     targetLabel: item?.label || item?.leanDeclarationName || "",
     targetText: item?.naturalLanguageLatex || "",
     targetUses: Array.isArray(item?.targetUses) ? item.targetUses : [],
-    targetContext: item?.targetContext || ""
+    targetContext: item?.targetContext || "",
+    sourceFile: item?.sourceFile || "",
+    sourceStartLine: item?.sourceStartLine,
+    sourceEndLine: item?.sourceEndLine,
+    sourceHash: item?.sourceHash || "",
+    syntax: item?.syntax || "comment"
   };
 }
 

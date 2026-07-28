@@ -205,14 +205,24 @@ test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item",
     label: "even_nat",
     naturalLanguageLatex: "A natural number is even...",
     targetUses: ["parity"],
-    targetContext: "Use Nat parity."
+    targetContext: "Use Nat parity.",
+    sourceFile: "sections/parity.tex",
+    sourceStartLine: 14,
+    sourceEndLine: 19,
+    sourceHash: "source-hash",
+    syntax: "comment"
   });
   assert.deepEqual(target, {
     targetKind: "definition",
     targetLabel: "even_nat",
     targetText: "A natural number is even...",
     targetUses: ["parity"],
-    targetContext: "Use Nat parity."
+    targetContext: "Use Nat parity.",
+    sourceFile: "sections/parity.tex",
+    sourceStartLine: 14,
+    sourceEndLine: 19,
+    sourceHash: "source-hash",
+    syntax: "comment"
   });
 
   const theorem = paneItemToFormalizeTarget({ leanKind: "theorem", label: "thm", naturalLanguageLatex: "X" });

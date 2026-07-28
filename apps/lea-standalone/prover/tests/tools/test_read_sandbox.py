@@ -56,6 +56,22 @@ def test_reads_inside_the_session_workspace_are_allowed() -> None:
         check("a proof in the session dir reads normally", "theorem t" in out)
 
 
+def test_relative_paths_are_resolved_from_the_run_workspace() -> None:
+    """The repo-relative paths in project context must work verbatim."""
+    with tempfile.TemporaryDirectory() as d:
+        lake_root = _workspace(Path(d).resolve())
+        session = lake_root / "proofs" / "s1"
+        source = session / ".lea" / "files" / "overleaf" / "main.tex"
+        source.parent.mkdir(parents=True)
+        source.write_text("\\section{Local context}\n")
+        with run_context(working_dir=str(session)):
+            out = tools.read_file(".lea/files/overleaf/main.tex")
+        check(
+            "a project-relative Overleaf source reads from the run workspace",
+            "Local context" in out,
+        )
+
+
 def test_mathlib_under_the_lake_root_stays_readable() -> None:
     """The case a workspace-only rule would have broken: search_mathlib hands back
     paths under .lake/packages, and the model reads them on the next turn."""
@@ -158,6 +174,7 @@ def test_bash_still_runs_normal_commands() -> None:
 def main() -> None:
     print("Read-path sandbox + scrubbed shell env tests (AUDIT-2026-07-24 S4):")
     test_reads_inside_the_session_workspace_are_allowed()
+    test_relative_paths_are_resolved_from_the_run_workspace()
     test_mathlib_under_the_lake_root_stays_readable()
     test_a_sibling_session_in_the_same_project_is_readable()
     test_credential_files_outside_the_lake_root_are_refused()

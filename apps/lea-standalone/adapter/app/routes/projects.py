@@ -765,7 +765,7 @@ def list_files(project_id: str) -> dict:
 
 @router.post("/api/projects/by-slug/{slug}/mirror")
 def mirror_overleaf_tex(slug: str, request: MirrorRequest, background_tasks: BackgroundTasks) -> dict:
-    """Mirror the Overleaf project's `.tex` sources into the matching project's
+    """Mirror the Overleaf project's `.tex`/`.sty`/`.cls` sources into the matching project's
     `.lea/files/overleaf/` (resolving/creating the project by slug, like `/api/runs`).
     Reconcile is synchronous (files on disk + indexed before returning); the git commit
     is **deferred** to a background task so the formalize path never waits on git."""

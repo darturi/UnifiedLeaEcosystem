@@ -10,6 +10,8 @@
   const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub", "stale"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const TEX_MIRROR_FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+  const TARGET_CONTEXT_RADIUS_LINES = 24;
+  const TARGET_CONTEXT_MAX_CHARS = 12000;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
   const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
@@ -2141,7 +2143,8 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-formalize-button";
-    button.textContent = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+    const idleLabel = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+    button.textContent = idleLabel;
     button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -2152,7 +2155,11 @@
         await refreshLeanPaneNow({ background: true });
       } catch (error) {
         button.disabled = false;
-        button.textContent = "Retry formalize";
+        // Startup can be rejected before Lea creates a run (for example when a
+        // declared upstream theorem has not been formalized yet). Keep the
+        // action consistent with the manifest state rather than implying an
+        // initial formalization effort occurred.
+        button.textContent = idleLabel;
         if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
       }
     });
@@ -2451,7 +2458,13 @@
     renderChatPanel();
     try {
       // Flush the latest .tex mirror so Lea sees current source before answering.
-      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const mirrorResult = await syncTexMirrorNow({ force: true });
+      leanPaneChatTarget = {
+        ...leanPaneChatTarget,
+        ...(await buildFormalizationSourceContext(leanPaneChatTarget, {
+          verifyMirror: mirrorResult?.disabled !== true
+        }))
+      };
       const baseUrl = await chatCompanionBaseUrl();
       const response = await fetch(`${baseUrl}/lean-pane/chat/message`, {
         method: "POST",
@@ -3193,7 +3206,7 @@
           </label>
           <label class="ol-lean-checkbox-field">
             <input type="checkbox" data-role="tex-mirror">
-            <span>Mirror Overleaf .tex into the project</span>
+            <span>Mirror Overleaf LaTeX sources into the project</span>
           </label>
           <button type="button" class="ol-lean-save-button" data-role="save-settings" disabled>Save changes</button>
         </section>
@@ -3397,10 +3410,55 @@
     renderTargetWarning(stubbedWarning, target, statusInfo);
   }
 
+  async function buildFormalizationSourceContext(target, { verifyMirror = true } = {}) {
+    const sourceFile = normalizeDocPath(target?.sourceFile || latestActiveTexPath);
+    const candidates = [
+      ...(Array.isArray(lastMirrorFiles) ? lastMirrorFiles : []),
+      ...(Array.isArray(lastLeanPaneFiles) ? lastLeanPaneFiles : [])
+    ];
+    // The editor buffer is authoritative for the active file, including when
+    // mirroring has just been disabled and the cached mirror may be older.
+    let source = sourceFile && normalizeDocPath(latestActiveTexPath) === sourceFile
+      ? { path: sourceFile, content: latestActiveTex }
+      : candidates.find((file) => normalizeDocPath(file?.path) === sourceFile);
+    const content = typeof source?.content === "string" ? source.content : "";
+    const sourceStartLine = Math.max(1, Number(target?.sourceStartLine) || 1);
+    const sourceEndLine = Math.max(sourceStartLine, Number(target?.sourceEndLine) || sourceStartLine);
+    const lines = content.split(/\r?\n/);
+    const excerptStartLine = Math.max(1, sourceStartLine - TARGET_CONTEXT_RADIUS_LINES);
+    const excerptEndLine = Math.min(lines.length, sourceEndLine + TARGET_CONTEXT_RADIUS_LINES);
+    let sourceExcerpt = content
+      ? lines.slice(excerptStartLine - 1, excerptEndLine).join("\n")
+      : "";
+    if (sourceExcerpt.length > TARGET_CONTEXT_MAX_CHARS) {
+      sourceExcerpt = `${sourceExcerpt.slice(0, TARGET_CONTEXT_MAX_CHARS)}\n[excerpt truncated]`;
+    }
+    const uniqueFiles = new Map();
+    for (const file of candidates) {
+      const normalized = normalizeDocPath(file?.path);
+      if (normalized && !uniqueFiles.has(normalized)) uniqueFiles.set(normalized, String(file?.content ?? ""));
+    }
+    return {
+      sourceFile,
+      sourceStartLine,
+      sourceEndLine,
+      mirroredSourcePath: sourceFile ? `.lea/files/overleaf/${sourceFile}` : "",
+      sourceFileHash: content && verifyMirror ? await sha256(content) : "",
+      mirrorAvailable: verifyMirror,
+      sourceExcerpt,
+      sourceExcerptStartLine: sourceExcerpt ? excerptStartLine : null,
+      sourceExcerptEndLine: sourceExcerpt ? excerptEndLine : null,
+      sourceCorpusFileCount: uniqueFiles.size,
+      sourceCorpusChars: [...uniqueFiles.values()].reduce((total, text) => total + text.length, 0)
+    };
+  }
+
   async function formalize(target) {
-    // Flush any pending .tex mirror so the run's context is current (a no-op when
-    // nothing changed since the last background sync).
-    await syncTexMirrorNow({ force: true }).catch(() => {});
+    // A run must never begin against a mirror that failed to accept the live buffer.
+    const mirrorResult = await syncTexMirrorNow({ force: true });
+    const sourceContext = await buildFormalizationSourceContext(target, {
+      verifyMirror: mirrorResult?.disabled !== true
+    });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
@@ -3413,9 +3471,11 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        syntax: target.syntax || "comment",
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         projectNamespace: lastProjectIdentity?.namespace || "",
-        sourceHash: await sha256(normalizeTargetText(target.targetText))
+        sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        ...sourceContext
       })
     });
 
@@ -3429,7 +3489,10 @@
   async function stubTheorem(target) {
     // Stubbing also needs the current .tex mirror because statement translation may
     // depend on local notation/definitions in the surrounding document.
-    await syncTexMirrorNow({ force: true }).catch(() => {});
+    const mirrorResult = await syncTexMirrorNow({ force: true });
+    const sourceContext = await buildFormalizationSourceContext(target, {
+      verifyMirror: mirrorResult?.disabled !== true
+    });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/stub`, {
@@ -3442,9 +3505,11 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        syntax: target.syntax || "comment",
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         projectNamespace: lastProjectIdentity?.namespace || "",
-        sourceHash: await sha256(normalizeTargetText(target.targetText))
+        sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        ...sourceContext
       })
     });
 
@@ -3457,12 +3522,13 @@
 
   // Build the full per-item payload /stub and /formalize expect (the same shape
   // the single-item formalize() sends), for every item a batch will run over.
-  async function buildBatchTargetPayloads(items) {
+  async function buildBatchTargetPayloads(items, { verifyMirror = true } = {}) {
     const overleafProjectId = extractOverleafProjectId();
     const projectName = lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []);
     const projectNamespace = lastProjectIdentity?.namespace || "";
     return Promise.all(items.map(async (item) => {
       const target = leanPaneView.paneItemToFormalizeTarget(item);
+      const sourceContext = await buildFormalizationSourceContext(target, { verifyMirror });
       return {
         overleafProjectId,
         targetKind: target.targetKind,
@@ -3470,9 +3536,11 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        syntax: target.syntax || "comment",
         projectName,
         projectNamespace,
-        sourceHash: await sha256(normalizeTargetText(target.targetText))
+        sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        ...sourceContext
       };
     }));
   }
@@ -3486,9 +3554,11 @@
     leanPaneRepairError = null;
     if (items.length === 0) return;
     try {
-      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const mirrorResult = await syncTexMirrorNow({ force: true });
       const baseUrl = await chatCompanionBaseUrl();
-      const payloads = await buildBatchTargetPayloads(items);
+      const payloads = await buildBatchTargetPayloads(items, {
+        verifyMirror: mirrorResult?.disabled !== true
+      });
       const response = await fetch(`${baseUrl}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3596,7 +3666,11 @@
 
     if (texMirrorSyncPromise) {
       // Coalesce with an in-flight sync; its result may already be current.
-      await texMirrorSyncPromise.catch(() => {});
+      if (force) {
+        await texMirrorSyncPromise;
+      } else {
+        await texMirrorSyncPromise.catch(() => {});
+      }
     }
 
     const projectId = latestActiveTexProjectId || extractOverleafProjectId();
@@ -3614,7 +3688,7 @@
     }
 
     const settings = await loadCompanionSettings();
-    if (settings.leaTexMirrorEnabled === false) return null;
+    if (settings.leaTexMirrorEnabled === false) return { disabled: true };
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
 
     texMirrorSyncPromise = (async () => {
@@ -3663,7 +3737,15 @@
       // divergence self-heals without a zip per formalize.
       const needFetch = !cacheUsable || !activeKnown ||
         Date.now() - lastTexMirrorFullSyncAt > TEX_MIRROR_FULL_SYNC_INTERVAL_MS;
-      const files = needFetch ? await collectProjectTexFiles(projectId) : lastMirrorFiles;
+      const files = needFetch
+        ? await collectProjectTexFiles(projectId)
+        : lastMirrorFiles.map((file) => ({ ...file }));
+      // A forced formalize flush can arrive before the edit debounce. Even with a
+      // healthy full-project cache, the live editor buffer is authoritative.
+      if (activeRel && typeof latestActiveTex === "string") {
+        const active = files.find((file) => file.path === activeRel);
+        if (active) active.content = latestActiveTex;
+      }
       const response = await fetch(`${baseUrl}/mirror-tex`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3698,8 +3780,8 @@
       throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
     }
     const buffer = await response.arrayBuffer();
-    const { extractTexFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
-    const files = await extractTexFromZip(buffer);
+    const { extractLatexSourcesFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
+    const files = await extractLatexSourcesFromZip(buffer);
 
     if (latestActiveTexPath && typeof latestActiveTex === "string") {
       // Override only an entry that already exists in the archive — never invent a
