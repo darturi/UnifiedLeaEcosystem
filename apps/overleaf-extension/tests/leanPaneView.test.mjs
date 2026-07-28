@@ -88,16 +88,17 @@ test("hasInProgressItems detects any in-progress item", () => {
   assert.equal(hasInProgressItems(undefined), false);
 });
 
-test("canFormalizePaneItem requires a valid marker, an actionable state, and no active run", () => {
+test("canFormalizePaneItem keeps reruns available for settled items and blocks active runs", () => {
   const base = { formalizable: true, inProgress: false, status: "missing-stub" };
   assert.equal(canFormalizePaneItem(base), true);
   assert.equal(canFormalizePaneItem({ ...base, status: "stale" }), true);
   assert.equal(canFormalizePaneItem({ ...base, status: "invalid" }), true);
-  // Terminal-good states and running jobs are not re-formalizable from the pane.
-  assert.equal(canFormalizePaneItem({ ...base, status: "valid" }), false);
-  assert.equal(canFormalizePaneItem({ ...base, status: "defined" }), false);
-  assert.equal(canFormalizePaneItem({ ...base, status: "disproved" }), false);
+  // Terminal-good states remain explicitly re-formalizable.
+  assert.equal(canFormalizePaneItem({ ...base, status: "valid" }), true);
+  assert.equal(canFormalizePaneItem({ ...base, status: "defined" }), true);
+  assert.equal(canFormalizePaneItem({ ...base, status: "disproved" }), true);
   assert.equal(canFormalizePaneItem({ ...base, inProgress: true }), false);
+  assert.equal(canFormalizePaneItem({ ...base, status: "in-progress" }), false);
   // A malformed marker (no valid target) is not formalizable.
   assert.equal(canFormalizePaneItem({ ...base, formalizable: false }), false);
   assert.equal(canFormalizePaneItem(undefined), false);
@@ -162,7 +163,7 @@ test("paneItemActions promotes Repair over Re-formalize on a broken item and kee
   assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
 });
 
-test("paneItemActions leaves a settled valid item with no primary action", () => {
+test("paneItemActions keeps Re-formalize primary on a settled valid item", () => {
   const item = {
     formalizable: true,
     inProgress: false,
@@ -173,7 +174,7 @@ test("paneItemActions leaves a settled valid item with no primary action", () =>
     leanArtifactContent: "theorem main_theorem : True := by trivial"
   };
   const actions = paneItemActions(item);
-  assert.equal(actions.primary, null);
+  assert.deepEqual(actions.primary, { id: "formalize", label: "Re-formalize" });
   assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
   assert.deepEqual(actions.overflow.map((action) => action.id), ["edit"]);
 });
@@ -647,7 +648,7 @@ test("formatRepairOutcome is operation-aware for stub and formalize batches", ()
   assert.equal(formatRepairOutcome({ targetLabel: "t", state: "canceled" }, "formalize"), "t: stopped.");
 });
 
-test("stubbableItems / formalizableItems select via the per-item action predicates", () => {
+test("stubbableItems / formalizableItems skip completed work in project-level batches", () => {
   const items = [
     { targetLabel: "fresh_thm", status: "missing-stub", leanKind: "theorem", formalizable: true },
     { targetLabel: "fresh_def", status: "missing-stub", leanKind: "def", formalizable: true },
@@ -660,9 +661,9 @@ test("stubbableItems / formalizableItems select via the per-item action predicat
   // Stub: un-stubbed THEOREMS only -- no definitions, no already-stubbed, none
   // in progress, none without a valid marker.
   assert.deepEqual(stubbableItems(items).map((i) => i.targetLabel), ["fresh_thm"]);
-  // Formalize: everything not yet verified -- fresh items (incl. definitions),
-  // sorry-stubs to complete, and broken items to re-formalize; never a valid
-  // proof, an in-progress run, or an unmarked item.
+  // Formalize all: everything not yet verified -- fresh items (incl.
+  // definitions), sorry-stubs to complete, and broken items to re-formalize.
+  // A valid proof remains individually rerunnable but is not restarted in bulk.
   assert.deepEqual(
     formalizableItems(items).map((i) => i.targetLabel),
     ["fresh_thm", "fresh_def", "stubbed_thm", "broken_thm"]

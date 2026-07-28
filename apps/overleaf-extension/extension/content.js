@@ -3065,7 +3065,16 @@
         run: formalize
       }];
     }
-    if (status === "formalized" || status === "unknown") {
+    if (status === "formalized" || status === "defined" || status === "disproved") {
+      return [{
+        role: "theorem-action",
+        label: definition ? "Regenerate definition" : "Re-formalize",
+        primary: true,
+        pendingText: "Starting Lea...",
+        run: formalize
+      }];
+    }
+    if (status === "unknown") {
       return [{
         role: "theorem-action",
         label: "Check status",
@@ -4083,10 +4092,10 @@
       case "formalized":
       case "defined":
       case "disproved":
-      case "unknown":
-        return "Check status";
       case "stale":
         return definition ? "Regenerate definition" : "Re-formalize";
+      case "unknown":
+        return "Check status";
       case "sorry_stub":
       case "unformalized":
       default:

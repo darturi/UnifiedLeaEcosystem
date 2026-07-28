@@ -349,17 +349,19 @@ export function hasInProgressItems(items) {
   return Array.isArray(items) && items.some((item) => item && item.inProgress);
 }
 
-// Pane statuses where starting (or restarting) a formalization run is meaningful.
-// Terminal-good states (valid / defined / disproved) and a running job are excluded.
-const FORMALIZABLE_PANE_STATUSES = new Set([
+// Pane statuses included by the project-level "Formalize all" action. Completed
+// work stays out of a batch even though its per-item Re-formalize action remains
+// available.
+const BATCH_FORMALIZABLE_PANE_STATUSES = new Set([
   "missing-stub", "stub-generated", "stale", "invalid", "unknown", "error"
 ]);
 
-// Whether the pane should offer a Formalize action for an item: it must be a valid
-// marker target, not already running, and in an actionable state.
+// Whether the pane should offer a Formalize / Re-formalize action for an item.
+// Any valid marker target can be rerun, including a settled valid, defined, or
+// disproved item; only an active run suppresses the action.
 export function canFormalizePaneItem(item) {
   if (!item || !item.formalizable || item.inProgress) return false;
-  return FORMALIZABLE_PANE_STATUSES.has(item.status);
+  return item.status !== "in-progress";
 }
 
 // Whether the pane should offer a sorry-stub action for an item. Mirrors the
@@ -689,16 +691,16 @@ export function formatBreakageAttribution(breakage) {
 
 // One line per item for the batch progress / outcome list.
 // The eligible sets the project-level "Stub all" / "Formalize all" launchers
-// operate over. These delegate to the SAME per-item predicates the individual
-// buttons use (canStubPaneItem / canFormalizePaneItem) so a batch offers work
-// on exactly the items whose own buttons would offer it -- honoring
-// `formalizable` and skipping in-progress runs and already-valid work.
+// operate over. The batch intentionally skips completed work: users can rerun a
+// settled item explicitly without making "Formalize all" restart every proof.
 export function stubbableItems(items) {
   return (Array.isArray(items) ? items : []).filter(canStubPaneItem);
 }
 
 export function formalizableItems(items) {
-  return (Array.isArray(items) ? items : []).filter(canFormalizePaneItem);
+  return (Array.isArray(items) ? items : []).filter(
+    (item) => canFormalizePaneItem(item) && BATCH_FORMALIZABLE_PANE_STATUSES.has(item.status)
+  );
 }
 
 // One line per batch item. Wording depends on the batch `operation` only for

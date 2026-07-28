@@ -84,6 +84,20 @@ test("a source-stale formalization is labeled out of date on the LaTeX badge and
   assert.equal(harness.hasViewInLeaUiButton(), true);
 });
 
+test("a current formalization still offers Re-formalize in its popover", async () => {
+  const harness = createContentHarness({
+    status: "formalized",
+    sourceFreshness: "current",
+    leaSessionId: "sess-current"
+  });
+  await harness.loadStatusForVisibleTheorem();
+
+  harness.openTargetPopover();
+  assert.equal(harness.hasButtonText("Re-formalize"), true);
+  assert.equal(harness.hasButtonText("Check status"), false);
+  assert.equal(harness.hasViewInLeaUiButton(), true);
+});
+
 test("definition targets use definition copy and do not show Stub", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
