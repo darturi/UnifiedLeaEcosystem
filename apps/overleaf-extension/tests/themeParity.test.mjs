@@ -78,7 +78,11 @@ test("extension surfaces load the shared theme before component CSS", async () =
     entry.matches?.includes("https://www.overleaf.com/project/*"),
   );
 
-  assert.deepEqual(overleafScript?.css, ["lea-theme.css", "content.css"]);
+  assert.deepEqual(overleafScript?.css, [
+    "vendor/katex/katex.min.css",
+    "lea-theme.css",
+    "content.css"
+  ]);
   assert.ok(
     optionsHtml.indexOf('href="lea-theme.css"') < optionsHtml.indexOf('href="options.css"'),
     "options page must load the shared theme before its component styles",

@@ -12,6 +12,7 @@ import {
   formatBreakageAttribution,
   formatDependentOutcome,
   formatDependentsImpact,
+  formatLiteLatexText,
   formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
@@ -422,6 +423,23 @@ test("parsePaneLatex splits inline and display math delimiters", () => {
     { type: "math", text: "a_n\\to 0", display: true },
     { type: "text", text: " now." }
   ]);
+
+  assert.deepEqual(parsePaneLatex([
+    "Before.",
+    "\\begin{align}",
+    "a &\\triangleq b \\\\",
+    "c &= d",
+    "\\end{align}",
+    "After."
+  ].join("\n")), [
+    { type: "text", text: "Before.\n" },
+    {
+      type: "math",
+      text: "\\begin{align}\na &\\triangleq b \\\\\nc &= d\n\\end{align}",
+      display: true
+    },
+    { type: "text", text: "\nAfter." }
+  ]);
 });
 
 test("parsePaneLatex leaves unmatched delimiters as readable text", () => {
@@ -442,11 +460,34 @@ test("formatLiteMath prettifies common theorem math without dependencies", () =>
     { type: "sub", text: "n+1" },
     { type: "text", text: " → α" }
   ]);
+
+  assert.deepEqual(formatLiteMath("f(x) \\triangleq x^2"), [
+    { type: "text", text: "f(x) ≜ x" },
+    { type: "sup", text: "2" }
+  ]);
 });
 
 test("formatLiteMath keeps unknown commands visible as fallback text", () => {
   assert.deepEqual(formatLiteMath("\\Spec R \\subseteq X"), [
-    { type: "text", text: "Spec R ⊆ X" }
+    { type: "text", text: "\\Spec R ⊆ X" }
+  ]);
+});
+
+test("formatLiteLatexText styles common prose and preserves unknown commands", () => {
+  assert.deepEqual(
+    formatLiteLatexText("A \\emph{locally \\textbf{finite}} family~uses \\Spec and \\eqref{eq:key}."),
+    [
+      { type: "text", text: "A ", marks: [] },
+      { type: "text", text: "locally ", marks: ["em"] },
+      { type: "text", text: "finite", marks: ["em", "strong"] },
+      { type: "text", text: " family\u00a0uses \\Spec and ", marks: [] },
+      { type: "text", text: "(eq:key)", marks: ["ref"] },
+      { type: "text", text: ".", marks: [] }
+    ]
+  );
+
+  assert.deepEqual(formatLiteLatexText("\\label{hidden}Cost: \\$5 \\& 10\\%."), [
+    { type: "text", text: "Cost: $5 & 10%.", marks: [] }
   ]);
 });
 

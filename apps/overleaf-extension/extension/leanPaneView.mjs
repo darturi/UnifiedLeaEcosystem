@@ -6,6 +6,8 @@
 // this module lazily via `import(chrome.runtime.getURL("leanPaneView.mjs"))` (the
 // same web-accessible-resource pattern as zipTex.mjs / targetParserCore.mjs).
 
+export { renderPaneMath } from "./leanPaneMath.mjs";
+
 const PANE_STATUS_LABELS = {
   "missing-stub": "missing stub",
   "stub-generated": "stub generated",
@@ -52,6 +54,7 @@ const MATH_COMMANDS = new Map([
   ["Rightarrow", "⇒"], ["implies", "⇒"], ["iff", "⇔"], ["leftrightarrow", "↔"],
   ["le", "≤"], ["leq", "≤"], ["ge", "≥"], ["geq", "≥"], ["neq", "≠"],
   ["ne", "≠"], ["approx", "≈"], ["equiv", "≡"], ["sim", "∼"],
+  ["triangleq", "≜"], ["coloneqq", "≔"], ["coloneq", "≔"],
   ["cdot", "·"], ["times", "×"], ["pm", "±"], ["setminus", "∖"],
   ["partial", "∂"], ["nabla", "∇"], ["infty", "∞"], ["infinity", "∞"],
   ["land", "∧"], ["lor", "∨"], ["neg", "¬"], ["bot", "⊥"], ["top", "⊤"],
@@ -64,6 +67,27 @@ const DOUBLE_STRUCK = {
   Q: "ℚ", R: "ℝ", S: "𝕊", T: "𝕋", U: "𝕌", V: "𝕍", W: "𝕎", X: "𝕏",
   Y: "𝕐", Z: "ℤ"
 };
+
+const PANE_TEXT_COMMAND_MARKS = new Map([
+  ["emph", "em"],
+  ["textit", "em"],
+  ["textbf", "strong"],
+  ["texttt", "code"],
+  ["textrm", ""],
+  ["textnormal", ""],
+  ["mbox", ""]
+]);
+
+const PANE_REFERENCE_COMMANDS = new Set(["ref", "eqref", "autoref", "cite"]);
+const PANE_TEXT_ESCAPES = new Map([
+  ["%", "%"],
+  ["&", "&"],
+  ["#", "#"],
+  ["_", "_"],
+  ["{", "{"],
+  ["}", "}"],
+  ["$", "$"]
+]);
 
 const SUCCESS_PANE_STATUSES = new Set(["valid", "defined", "disproved"]);
 const PROGRESS_SUCCESS_STATUSES = new Set(["valid", "formalized", "defined", "disproved"]);
@@ -111,7 +135,9 @@ export function parsePaneLatex(source) {
 
     appendPaneLatexSegment(segments, {
       type: "math",
-      text: text.slice(contentStart, closeIndex),
+      text: next.includeDelimiters
+        ? text.slice(next.index, closeIndex + next.close.length)
+        : text.slice(contentStart, closeIndex),
       display: next.display
     });
     cursor = closeIndex + next.close.length;
@@ -143,6 +169,17 @@ export function formatLiteMath(source) {
   }
 
   return segments.filter((segment) => segment.text);
+}
+
+// Render the non-math portions of theorem text conservatively. This is not a
+// TeX interpreter: it handles the small set of prose commands that commonly
+// occur in theorem statements and preserves unknown commands verbatim. Keeping
+// the result structured lets content.js build DOM nodes without injecting the
+// original LaTeX as HTML.
+export function formatLiteLatexText(source) {
+  const parts = [];
+  appendLiteLatexText(parts, String(source || ""), []);
+  return parts;
 }
 
 export function highlightLeanLine(line) {
@@ -789,6 +826,12 @@ function formatProgressPercent(value) {
 
 function findNextMathDelimiter(text, cursor) {
   const delimiters = [
+    { open: "\\begin{equation*}", close: "\\end{equation*}", display: true, includeDelimiters: true },
+    { open: "\\begin{equation}", close: "\\end{equation}", display: true, includeDelimiters: true },
+    { open: "\\begin{align*}", close: "\\end{align*}", display: true, includeDelimiters: true },
+    { open: "\\begin{align}", close: "\\end{align}", display: true, includeDelimiters: true },
+    { open: "\\begin{gather*}", close: "\\end{gather*}", display: true, includeDelimiters: true },
+    { open: "\\begin{gather}", close: "\\end{gather}", display: true, includeDelimiters: true },
     { open: "$$", close: "$$", display: true },
     { open: "\\[", close: "\\]", display: true },
     { open: "\\(", close: "\\)", display: false },
@@ -861,9 +904,114 @@ function normalizeLiteMath(source) {
 
   return text
     .replace(/\\([{}])/g, "$1")
-    .replace(/\\([A-Za-z]+)\b/g, (_match, command) => MATH_COMMANDS.get(command) || command)
+    .replace(/\\([A-Za-z]+)\b/g, (_match, command) => (
+      MATH_COMMANDS.has(command) ? MATH_COMMANDS.get(command) : `\\${command}`
+    ))
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function appendLiteLatexText(parts, text, inheritedMarks) {
+  for (let index = 0; index < text.length;) {
+    const char = text[index];
+    if (char === "~") {
+      appendLiteLatexPart(parts, "\u00a0", inheritedMarks);
+      index += 1;
+      continue;
+    }
+    if (char !== "\\") {
+      appendLiteLatexPart(parts, char, inheritedMarks);
+      index += 1;
+      continue;
+    }
+
+    const escaped = text[index + 1];
+    if (PANE_TEXT_ESCAPES.has(escaped)) {
+      appendLiteLatexPart(parts, PANE_TEXT_ESCAPES.get(escaped), inheritedMarks);
+      index += 2;
+      continue;
+    }
+    if (escaped === "\\") {
+      appendLiteLatexPart(parts, "\n", inheritedMarks);
+      index += 2;
+      continue;
+    }
+    if (escaped === " ") {
+      appendLiteLatexPart(parts, " ", inheritedMarks);
+      index += 2;
+      continue;
+    }
+
+    const commandMatch = text.slice(index).match(/^\\([A-Za-z]+)\b/);
+    if (!commandMatch) {
+      appendLiteLatexPart(parts, "\\", inheritedMarks);
+      index += 1;
+      continue;
+    }
+
+    const command = commandMatch[1];
+    const commandEnd = index + commandMatch[0].length;
+    const groupStart = skipLiteLatexWhitespace(text, commandEnd);
+    const group = parseLiteLatexGroup(text, groupStart);
+
+    if (command === "label" && group) {
+      index = group.end;
+      continue;
+    }
+
+    if (PANE_TEXT_COMMAND_MARKS.has(command) && group) {
+      const mark = PANE_TEXT_COMMAND_MARKS.get(command);
+      const marks = mark ? [...inheritedMarks, mark] : inheritedMarks;
+      appendLiteLatexText(parts, group.text, marks);
+      index = group.end;
+      continue;
+    }
+
+    if (PANE_REFERENCE_COMMANDS.has(command) && group) {
+      const referenceText = command === "eqref" ? `(${group.text})` : group.text;
+      appendLiteLatexPart(parts, referenceText, [...inheritedMarks, "ref"]);
+      index = group.end;
+      continue;
+    }
+
+    // Unknown commands stay source-visible. In particular, never turn \Spec
+    // into "Spec" merely because this lightweight prose path does not know it.
+    appendLiteLatexPart(parts, commandMatch[0], inheritedMarks);
+    index = commandEnd;
+  }
+}
+
+function appendLiteLatexPart(parts, text, marks) {
+  if (!text) return;
+  const normalizedMarks = [...new Set(marks)].sort();
+  const previous = parts[parts.length - 1];
+  if (previous && previous.marks.join("\u0000") === normalizedMarks.join("\u0000")) {
+    previous.text += text;
+    return;
+  }
+  parts.push({ type: "text", text, marks: normalizedMarks });
+}
+
+function skipLiteLatexWhitespace(text, cursor) {
+  let index = cursor;
+  while (index < text.length && /[ \t]/.test(text[index])) index += 1;
+  return index;
+}
+
+function parseLiteLatexGroup(text, cursor) {
+  if (text[cursor] !== "{") return null;
+  let depth = 1;
+  for (let index = cursor + 1; index < text.length; index += 1) {
+    if (text[index] === "{" && !isEscaped(text, index)) {
+      depth += 1;
+    } else if (text[index] === "}" && !isEscaped(text, index)) {
+      depth -= 1;
+      if (depth === 0) {
+        return { text: text.slice(cursor + 1, index), end: index + 1 };
+      }
+    }
+  }
+  return null;
 }
 
 function parseMathScriptArgument(text, cursor) {

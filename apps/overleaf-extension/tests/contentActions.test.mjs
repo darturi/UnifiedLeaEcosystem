@@ -610,6 +610,95 @@ test("Lean pane renders lightweight math and highlighted Lean code", async () =>
   assert.ok(harness.countSelector(".ol-lean-project-lean-com") >= 1);
 });
 
+test("Lean pane uses KaTeX for standard notation and styles surrounding LaTeX prose", async () => {
+  const renderCalls = [];
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      katex: {
+        render(source, element, options) {
+          renderCalls.push({ source, options });
+          const rendered = element.appendChild(new FakeElement("span"));
+          rendered.className = "katex";
+          rendered.textContent = source.replace("\\triangleq", "≜");
+        }
+      },
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "definition:notation:0",
+          kind: "definition",
+          label: "notation",
+          title: "Notation",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageLatex: "Set $f(x) \\triangleq x^2$ and call it \\emph{canonical}.",
+          leanKind: "def",
+          leanDeclarationName: "notation"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.equal(renderCalls.length, 1);
+  assert.equal(renderCalls[0].source, "f(x) \\triangleq x^2");
+  assert.equal(renderCalls[0].options.trust, false);
+  assert.equal(renderCalls[0].options.throwOnError, true);
+  assert.equal(renderCalls[0].options.output, "htmlAndMathml");
+  assert.equal(harness.countSelector(".katex"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-latex-em"), 1);
+  assert.match(harness.bodyText(), /f\(x\) ≜ x\^2 and call it canonical\./);
+});
+
+test("Lean pane preserves readable math when KaTeX rejects an expression", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      katex: {
+        render() {
+          throw new Error("Undefined control sequence");
+        }
+      },
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:fallback:0",
+          kind: "theorem",
+          label: "fallback",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 3,
+          naturalLanguageLatex: "Assume $\\ProjectSpecific x \\subseteq X$.",
+          leanKind: "theorem",
+          leanDeclarationName: "fallback"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.equal(harness.countSelector(".ol-lean-project-math-fallback"), 1);
+  assert.match(harness.bodyText(), /\\ProjectSpecific x ⊆ X/);
+});
+
 test("Lean pane 'Go to source' posts a navigate message with the item's offsets", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -1084,6 +1173,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const context = {
     URL,
     TextEncoder,
+    katex: options.katex,
     clearTimeout(id) {
       const index = timers.findIndex((timer) => timer.id === id);
       if (index !== -1) timers.splice(index, 1);

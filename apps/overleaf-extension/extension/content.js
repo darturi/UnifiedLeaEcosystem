@@ -2069,13 +2069,20 @@
 
     for (const segment of segments) {
       if (segment.type !== "math") {
-        element.appendChild(document.createTextNode(segment.text));
+        renderLeanPaneLatexText(element, segment.text);
         continue;
       }
       const math = document.createElement("span");
       math.className = segment.display
         ? "ol-lean-project-math ol-lean-project-math-display"
         : "ol-lean-project-math";
+      if (renderLeanPaneKatex(math, segment.text, segment.display)) {
+        element.appendChild(math);
+        continue;
+      }
+
+      math.classList.add("ol-lean-project-math-fallback");
+      math.dataset.mathRenderer = "fallback";
       const parts = leanPaneView.formatLiteMath(segment.text);
       if (parts.length === 0) {
         math.textContent = segment.text;
@@ -2092,6 +2099,39 @@
         }
       }
       element.appendChild(math);
+    }
+  }
+
+  function renderLeanPaneKatex(element, source, displayMode) {
+    const renderer = typeof katex !== "undefined" ? katex : globalThis.katex;
+    const result = leanPaneView.renderPaneMath(renderer, element, source, displayMode);
+    if (result.ok) {
+      element.dataset.mathRenderer = "katex";
+      return true;
+    }
+    if (renderer?.render) {
+      element.title = `Could not fully render this expression: ${errorText(result.error)}`;
+    }
+    return false;
+  }
+
+  function renderLeanPaneLatexText(element, source) {
+    const parts = leanPaneView.formatLiteLatexText(source);
+    if (parts.length === 0) {
+      element.appendChild(document.createTextNode(source || ""));
+      return;
+    }
+    for (const part of parts) {
+      if (!Array.isArray(part.marks) || part.marks.length === 0) {
+        element.appendChild(document.createTextNode(part.text));
+        continue;
+      }
+      const span = document.createElement("span");
+      span.className = part.marks
+        .map((mark) => `ol-lean-project-latex-${mark}`)
+        .join(" ");
+      span.textContent = part.text;
+      element.appendChild(span);
     }
   }
 

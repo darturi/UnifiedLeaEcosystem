@@ -720,9 +720,8 @@ body.ol-lean-pane-resizing {
   display: inline;
   margin: 0 1px;
   color: var(--ol-ink);
-  font-family: var(--ol-serif);
   font-size: 1.04em;
-  line-height: 1;
+  line-height: normal;
   white-space: nowrap;
 }
 
@@ -732,6 +731,19 @@ body.ol-lean-pane-resizing {
   overflow-x: auto;
   text-align: center;
   white-space: nowrap;
+}
+
+.ol-lean-project-math > .katex {
+  font-size: 1em;
+}
+
+.ol-lean-project-math-display > .katex-display {
+  margin: 0;
+  overflow: visible;
+}
+
+.ol-lean-project-math-fallback {
+  font-family: var(--ol-serif);
 }
 
 .ol-lean-project-math-script {
@@ -747,6 +759,26 @@ body.ol-lean-pane-resizing {
 
 .ol-lean-project-math-sub {
   vertical-align: sub;
+}
+
+.ol-lean-project-latex-em {
+  font-style: italic;
+}
+
+.ol-lean-project-latex-strong {
+  font-weight: 700;
+}
+
+.ol-lean-project-latex-code {
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--ol-code-bg);
+  font-family: var(--ol-mono);
+  font-size: 0.92em;
+}
+
+.ol-lean-project-latex-ref {
+  color: var(--ol-blue);
 }
 
 .ol-lean-project-missing,
