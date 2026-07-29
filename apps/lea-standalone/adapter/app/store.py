@@ -1555,6 +1555,82 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     return _code_step_from_row(row) if row else None
 
 
+def current_code_steps_for_formalization(
+    formalization_id: str,
+    *,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Latest snapshot of every linked path for a formalization.
+
+    With ``session_id`` this is the immutable conversation-local view. Without
+    it, project formalizations resolve each path across every session in the
+    shared project; loose formalizations resolve across their associated
+    sessions. The query intentionally does not require the winning timeline row
+    to carry this formalization id: two declarations may share one file, and a
+    write attributed to either declaration changes the current bytes for both.
+    """
+    scope_clause = "t.session_id = ?"
+    params: list[object] = [formalization_id]
+    if session_id is not None:
+        params.append(session_id)
+    else:
+        scope_clause = """
+        (
+          (f.project_id is not null and s.project_id = f.project_id)
+          or
+          (f.project_id is null and exists (
+            select 1 from session_formalizations sf
+            where sf.formalization_id = f.id and sf.session_id = t.session_id
+          ))
+        )
+        """
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            select * from (
+              select
+                t.*,
+                b.content as blob_content,
+                b.sha256 as blob_sha256,
+                ff.role as formalization_file_role,
+                s.title as updating_session_title,
+                row_number() over (
+                  partition by ff.path
+                  order by t.created_at desc, t.id desc
+                ) as rn
+              from formalization_files ff
+              join formalizations f on f.id = ff.formalization_id
+              join timeline t on t.kind = 'code' and t.path = ff.path
+              join sessions s on s.id = t.session_id
+              left join artifact_blobs b on b.id = t.after_blob_id
+              where ff.formalization_id = ? and {scope_clause}
+            )
+            where rn = 1
+            order by case formalization_file_role
+                       when 'primary' then 0
+                       when 'support' then 1
+                       else 2
+                     end,
+                     path asc
+            """,
+            params,
+        ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        raw = row_to_dict(row)
+        step = _code_step_from_row(row)
+        step.update(
+            {
+                "role": raw["formalization_file_role"],
+                "blob_id": raw.get("after_blob_id"),
+                "blob_sha256": raw.get("blob_sha256"),
+                "updating_session_title": raw.get("updating_session_title"),
+            }
+        )
+        result.append(step)
+    return result
+
+
 def code_steps_for_project_path(
     project_id: str, path: str, *, include_content: bool = True
 ) -> list[dict]:

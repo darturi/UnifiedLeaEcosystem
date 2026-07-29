@@ -348,6 +348,55 @@ def test_write_file_no_op_save_creates_no_step(tmp_path, monkeypatch):
     assert len(store.session_detail(session["id"])["code_steps"]) == 1
 
 
+def test_write_file_rejects_stale_cross_session_revision(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    project = store.create_project(
+        "shared",
+        title="Shared",
+        description=None,
+        namespace="Lea.Shared",
+        repo_path="Lea/Shared",
+    )
+    session_one = store.create_session("A first", project_id=project["id"])
+    session_two = store.create_session("A revised", project_id=project["id"])
+    theorem = store.create_formalization(
+        project_id=project["id"], loose_session_id=None,
+        display_title="A", declaration_name="a",
+    )
+    for session in (session_one, session_two):
+        store.link_session_formalization(session["id"], theorem["id"])
+    store.link_formalization_file(theorem["id"], "A.lean", "primary")
+    store.add_code_step(
+        session_one["id"], None, "A.lean",
+        content="theorem a : True := by trivial",
+        check_status="ok", formalization_id=theorem["id"],
+    )
+    stale = sessions_route.formalization_service.current_snapshot(theorem["id"])
+    store.add_code_step(
+        session_two["id"], None, "A.lean",
+        content="theorem a : True := by\n  trivial",
+        check_status="ok", formalization_id=theorem["id"],
+    )
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.write_file_session(
+            session_one["id"],
+            FileWriteRequest(
+                path="A.lean",
+                content="theorem a : True := by\n  exact True.intro",
+                formalization_id=theorem["id"],
+                base_revision=stale["revision_token"],
+            ),
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "revision_conflict"
+    assert exc.value.detail["last_updated_session"]["id"] == session_two["id"]
+    assert len(store.session_detail(session_one["id"])["code_steps"]) == 1
+
+
 def test_session_list_events_emits_initial_sessions_changed(tmp_path, monkeypatch):
     # The feed fires `sessions_changed` on connect (digest goes None -> current), so
     # a client that connects mid-change still re-syncs. We pull only the first frame;

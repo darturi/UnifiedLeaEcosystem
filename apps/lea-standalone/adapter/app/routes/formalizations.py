@@ -95,6 +95,22 @@ def formalization_detail(formalization_id: str) -> dict:
     return item
 
 
+@router.get("/api/formalizations/{formalization_id}/current")
+def formalization_current(
+    formalization_id: str,
+    session_id: str | None = None,
+) -> dict:
+    if session_id is not None and store.get_session(session_id) is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    item = service.current_snapshot(
+        formalization_id,
+        conversation_session_id=session_id,
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="Formalization not found")
+    return item
+
+
 @router.patch("/api/formalizations/{formalization_id}")
 def update_formalization(
     formalization_id: str, request: FormalizationUpdate

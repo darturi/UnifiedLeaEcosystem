@@ -52,6 +52,12 @@ extension. The delivered implementation includes:
   companion; and
 - migration, service, route, frontend helper, and companion contract coverage.
 
+The cross-conversation consistency revision adds a derived canonical snapshot
+for each formalization. The canvas displays that project-wide snapshot by
+default while preserving session code steps as historical evidence. Revision
+tokens protect manual edits from overwriting work performed in another
+conversation.
+
 The standalone scope state was integrated into the existing proof-session store
 instead of introducing another state container. This preserves one source of
 truth for the selected session, run, and formalization.

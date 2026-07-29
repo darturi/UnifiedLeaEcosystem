@@ -152,6 +152,30 @@ The rail must:
 Selecting a formalization changes the canvas scope, not the canonical chat
 transcript.
 
+### Current Version Across Conversations
+
+A session timeline is immutable conversation history; it is not the canonical
+current copy of a formalization. When a formalization is selected, the canvas
+defaults to its latest project-wide file revisions across every project
+session.
+
+If the open conversation last touched an older revision, the canvas must:
+
+- display the current project version by default;
+- identify the conversation that last updated it;
+- offer `View this conversation's version`;
+- offer `Open updating conversation`; and
+- label historical snapshots so they cannot be mistaken for current source.
+
+Canonical snapshots and historical code steps remain separate frontend data
+sources. The current revision is derived from formalization-file membership and
+the latest project timeline blobs; no mutable current-content pointer is stored.
+
+Manual edits to a current formalization carry its revision token. A changed
+token produces `409 revision_conflict` before the shared file is written.
+Checks and SafeVerify evidence are current only when they reference the
+canonical file revision.
+
 ### Automatic Composer Attribution
 
 The composer should not require a persistent scope dropdown. Lea infers the

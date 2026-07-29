@@ -158,6 +158,31 @@ export interface Formalization {
   updated_at: string;
 }
 
+export interface CurrentFormalizationFile extends CodeStep {
+  role: 'primary' | 'support' | 'generated';
+  blob_id?: string | null;
+  blob_sha256?: string | null;
+  updating_session_title?: string | null;
+}
+
+export interface FormalizationCurrentSnapshot {
+  formalization_id: string;
+  project_id?: string | null;
+  revision_token?: string | null;
+  files: CurrentFormalizationFile[];
+  last_updated_session?: { id: string; title: string } | null;
+  last_updated_at?: string | null;
+  conversation?: {
+    session_id: string;
+    revision_token?: string | null;
+    files: CurrentFormalizationFile[];
+    last_updated_at?: string | null;
+    is_current: boolean;
+  } | null;
+  validity_status: FormalizationValidity | string;
+  safe_verify?: Formalization['safe_verify'];
+}
+
 // An uploaded reference doc (D27). Bytes live in the project repo under
 // `.lea/files/`; this row is the pointer + extraction metadata. `extracted_path`
 // is the `.txt` sidecar for Tier-2 (pdf/docx); null for native text + images.
@@ -303,7 +328,7 @@ export interface CodeStep {
   formalization_id?: string | null;
   seq?: number;
   turn?: number | null;
-  author: 'agent' | 'user';
+  author: 'agent' | 'user' | 'environment';
   path: string;
   summary?: string | null;
   // True when the step's content couldn't be recovered (a pre-v2.3 row whose git

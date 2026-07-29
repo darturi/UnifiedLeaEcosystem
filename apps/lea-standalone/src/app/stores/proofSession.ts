@@ -4,6 +4,7 @@ import type {
   ChatMessage,
   CodeStep,
   Formalization,
+  FormalizationCurrentSnapshot,
   RunStatus,
   SafeVerifyResult,
   StatusEvent,
@@ -62,6 +63,14 @@ interface ProofSessionState {
   setFormalizationScope: (scope: 'project' | 'new' | string) => void;
   composerScopeOverride: 'project' | 'new' | string | null;
   setComposerScopeOverride: (scope: 'project' | 'new' | string | null) => void;
+  currentFormalizationSnapshot: FormalizationCurrentSnapshot | null;
+  setCurrentFormalizationSnapshot: (
+    snapshot: FormalizationCurrentSnapshot | null
+  ) => void;
+  formalizationRefreshToken: number;
+  bumpFormalizationRefresh: () => void;
+  canvasRevisionMode: 'current' | 'historical';
+  setCanvasRevisionMode: (mode: 'current' | 'historical') => void;
 
   // Canvas-edit nudge (M20): the file the user just edited, prompting a note in
   // the composer. Set after a canvas edit; cleared on send / new session / load.
@@ -154,6 +163,14 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   setFormalizationScope: (formalizationScope) => set({ formalizationScope }),
   composerScopeOverride: null,
   setComposerScopeOverride: (composerScopeOverride) => set({ composerScopeOverride }),
+  currentFormalizationSnapshot: null,
+  setCurrentFormalizationSnapshot: (currentFormalizationSnapshot) =>
+    set({ currentFormalizationSnapshot }),
+  formalizationRefreshToken: 0,
+  bumpFormalizationRefresh: () =>
+    set((state) => ({ formalizationRefreshToken: state.formalizationRefreshToken + 1 })),
+  canvasRevisionMode: 'current',
+  setCanvasRevisionMode: (canvasRevisionMode) => set({ canvasRevisionMode }),
 
   editedPath: undefined,
   setEditedPath: (editedPath) => set({ editedPath }),

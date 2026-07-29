@@ -713,6 +713,13 @@ def _formalization_context_message(formalization: dict | None) -> dict | None:
     if files:
         lines.append("- known files:")
         lines.extend(f"  - {item['role']}: {item['path']}" for item in files)
+    current = formalization_service.current_snapshot(formalization["id"])
+    updated_session = (current or {}).get("last_updated_session")
+    if updated_session:
+        lines.append(
+            "- current project revision last updated in conversation: "
+            f"{updated_session['title']} ({updated_session['id']})"
+        )
     lines.append(
         "Keep new proof writes for this target in its known primary file when one "
         "exists. You may reference other project declarations without changing focus."

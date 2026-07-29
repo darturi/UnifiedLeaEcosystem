@@ -186,3 +186,85 @@ def test_external_source_staleness_compares_current_and_artifact_hash(
     )
     assert step["check_status"] == "ok"
     assert formalizations.get(item["id"])["validity_status"] == "stale"
+
+
+def test_current_snapshot_crosses_sessions_without_rewriting_history(
+    tmp_path, monkeypatch
+):
+    _fresh(tmp_path, monkeypatch)
+    project = _project()
+    session_one = store.create_session("Theorem A", project_id=project["id"])
+    session_two = store.create_session("Definition B", project_id=project["id"])
+    theorem = store.create_formalization(
+        project_id=project["id"],
+        loose_session_id=None,
+        display_title="Theorem A",
+        declaration_name="theorem_a",
+    )
+    for session in (session_one, session_two):
+        store.link_session_formalization(session["id"], theorem["id"])
+    store.link_formalization_file(theorem["id"], "A.lean", "primary")
+
+    first = store.add_code_step(
+        session_one["id"], None, "A.lean",
+        content="theorem theorem_a : True := by trivial",
+        check_status="ok", artifact_kind="proof",
+        formalization_id=theorem["id"],
+    )
+    before = formalizations.current_snapshot(
+        theorem["id"], conversation_session_id=session_one["id"]
+    )
+    second = store.add_code_step(
+        session_two["id"], None, "A.lean",
+        content="theorem theorem_a : True := by\n  trivial",
+        check_status="ok", artifact_kind="proof",
+        formalization_id=theorem["id"],
+    )
+
+    current = formalizations.current_snapshot(
+        theorem["id"], conversation_session_id=session_one["id"]
+    )
+    assert current["files"][0]["id"] == second["id"]
+    assert current["files"][0]["code"].endswith("by\n  trivial")
+    assert current["last_updated_session"] == {
+        "id": session_two["id"],
+        "title": "Definition B",
+    }
+    assert current["conversation"]["files"][0]["id"] == first["id"]
+    assert current["conversation"]["is_current"] is False
+    assert current["revision_token"] != before["revision_token"]
+    assert store.session_detail(session_one["id"])["code_steps"][0]["id"] == first["id"]
+
+
+def test_shared_file_change_controls_current_validity(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    project = _project()
+    session_one = store.create_session("A", project_id=project["id"])
+    session_two = store.create_session("B", project_id=project["id"])
+    theorem = store.create_formalization(
+        project_id=project["id"], loose_session_id=None,
+        display_title="A", declaration_name="a",
+    )
+    other = store.create_formalization(
+        project_id=project["id"], loose_session_id=None,
+        display_title="B", declaration_name="b",
+    )
+    for item in (theorem, other):
+        store.link_formalization_file(item["id"], "Shared.lean", "primary")
+    store.link_session_formalization(session_one["id"], theorem["id"])
+    store.link_session_formalization(session_two["id"], other["id"])
+    store.add_code_step(
+        session_one["id"], None, "Shared.lean",
+        content="theorem a : True := by trivial",
+        check_status="ok", artifact_kind="proof",
+        formalization_id=theorem["id"],
+    )
+    assert formalizations.get(theorem["id"])["validity_status"] == "proved"
+
+    store.add_code_step(
+        session_two["id"], None, "Shared.lean",
+        content="theorem a : True := by trivial\n\ntheorem b : False := by trivial",
+        check_status="error", check_detail="type mismatch",
+        formalization_id=other["id"],
+    )
+    assert formalizations.get(theorem["id"])["validity_status"] == "failing"

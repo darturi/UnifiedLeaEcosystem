@@ -142,3 +142,29 @@ export function inferComposerFormalizationScope({
   }
   return 'project';
 }
+
+/**
+ * Keep canonical project snapshots and immutable conversation history as two
+ * distinct canvas sources. Never merge them into one stepper.
+ *
+ * @param {{
+ *   mode: 'current' | 'historical',
+ *   formalizationId: string,
+ *   snapshot?: { formalization_id?: string, files?: any[] } | null,
+ *   historicalSteps?: any[]
+ * }} options
+ */
+export function formalizationCanvasSteps({
+  mode,
+  formalizationId,
+  snapshot,
+  historicalSteps,
+}) {
+  if (
+    mode === 'current'
+    && snapshot?.formalization_id === formalizationId
+  ) {
+    return [...(snapshot.files || [])];
+  }
+  return [...(historicalSteps || [])];
+}

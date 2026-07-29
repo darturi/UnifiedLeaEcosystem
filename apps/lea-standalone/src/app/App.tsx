@@ -44,6 +44,7 @@ import {
   verifySession,
   writeSessionFile,
   updateSessionTitle,
+  RevisionConflictError,
 } from './lib/api';
 
 const SELECTED_SESSION_KEY = 'lea:selectedSessionId';
@@ -122,6 +123,18 @@ export default function App() {
   const setFormalizationScope = useProofSession((s) => s.setFormalizationScope);
   const composerScopeOverride = useProofSession((s) => s.composerScopeOverride);
   const setComposerScopeOverride = useProofSession((s) => s.setComposerScopeOverride);
+  const currentFormalizationSnapshot = useProofSession(
+    (s) => s.currentFormalizationSnapshot,
+  );
+  const setCurrentFormalizationSnapshot = useProofSession(
+    (s) => s.setCurrentFormalizationSnapshot,
+  );
+  const bumpFormalizationRefresh = useProofSession(
+    (s) => s.bumpFormalizationRefresh,
+  );
+  const setCanvasRevisionMode = useProofSession(
+    (s) => s.setCanvasRevisionMode,
+  );
   // Model state (active model, catalog, featured, key-missing) lives in the model
   // store (R4); ChatThread reads it directly. App only kicks off the startup load
   // (in the restore effect) + re-sync on returning from Settings.
@@ -196,10 +209,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Subscribe once to the session-list feed. Each `sessions_changed` event just
-  // re-fetches the list; this only swaps the sidebar array and never touches the
-  // open session's detail/streaming state (selection is keyed by id), so it can't
-  // clobber a live run or steal focus. The browser EventSource auto-reconnects if
+  // Subscribe once to the session-list feed. Each `sessions_changed` event
+  // refreshes the sidebar and invalidates the selected formalization's canonical
+  // snapshot. It never rewrites the open session timeline. The browser EventSource auto-reconnects if
   // the capped server stream recycles. A session started anywhere — including an
   // Overleaf-driven formalization the companion creates via POST /api/runs —
   // appears live without a manual refresh.
@@ -207,6 +219,7 @@ export default function App() {
     const source = new EventSource('/api/sessions/events');
     source.addEventListener('sessions_changed', () => {
       refreshSessions().catch(() => {});
+      bumpFormalizationRefresh();
     });
     return () => source.close();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -398,6 +411,8 @@ export default function App() {
     setFormalizations([]);
     setFormalizationScope('new');
     setComposerScopeOverride(null);
+    setCurrentFormalizationSnapshot(null);
+    setCanvasRevisionMode('current');
     window.localStorage.removeItem(SELECTED_SESSION_KEY);
   };
 
@@ -450,6 +465,7 @@ export default function App() {
           viewedScope: formalizationScope,
         });
       setFormalizationScope(resolvedScope);
+      setCanvasRevisionMode('current');
       const scope =
         resolvedScope === 'new'
           ? { new_formalization: { display_title: content.slice(0, 120) } }
@@ -516,6 +532,7 @@ export default function App() {
 
   const selectStep = (idx: number) => {
     setCodeIndex(idx);
+    setCanvasRevisionMode('historical');
     setCanvasCollapsed(false);
   };
 
@@ -524,24 +541,40 @@ export default function App() {
   // The canvas passes the file it's showing (#10); fall back to the latest step's
   // file for the single-file case. So Edit/lean_check and SafeVerify act on the
   // *chosen* file, not always the newest (possibly scratch) one.
-  const handleSaveAndCheck = async (content: string, path?: string): Promise<CheckOutcome> => {
+  const handleSaveAndCheck = async (
+    content: string,
+    path?: string,
+    baseRevision?: string,
+  ): Promise<CheckOutcome> => {
     const target = path ?? sortedCode[sortedCode.length - 1]?.path;
     if (!selectedSessionId || !target) return { status: 'error', detail: 'No file to edit.' };
     const focusId =
       formalizationScope === 'project' || formalizationScope === 'new'
         ? undefined : formalizationScope;
-    await writeSessionFile(
-      selectedSessionId,
-      target,
-      content,
-      'Manual edit from the canvas.',
-      focusId,
-    );
+    try {
+      await writeSessionFile(
+        selectedSessionId,
+        target,
+        content,
+        'Manual edit from the canvas.',
+        focusId,
+        baseRevision || currentFormalizationSnapshot?.revision_token || undefined,
+      );
+    } catch (err) {
+      if (err instanceof RevisionConflictError) {
+        setCanvasRevisionMode('current');
+        bumpFormalizationRefresh();
+        setError(err.message);
+      }
+      throw err;
+    }
     const result = await leanCheckSession(selectedSessionId, target, focusId);
     await reconcile(selectedSessionId);
     await refreshSessions();
     setEditedPath(target); // after reconcile (which clears it) — surface the nudge
     setSafeVerify(null); // the edit invalidates any prior SafeVerify verdict
+    setCanvasRevisionMode('current');
+    bumpFormalizationRefresh();
     return result;
   };
 
@@ -553,6 +586,7 @@ export default function App() {
         ? undefined : formalizationScope;
     const result = await verifySession(selectedSessionId, target, focusId);
     setSafeVerify({ status: result.status, detail: result.detail });
+    bumpFormalizationRefresh();
     return result;
   };
 
@@ -715,6 +749,12 @@ export default function App() {
             onClose={() => setCanvasCollapsed(true)}
             onSaveAndCheck={handleSaveAndCheck}
             onVerify={handleVerify}
+            onOpenSession={(id) => {
+              closeProject();
+              loadSession(id).catch((err) =>
+                setError(err instanceof Error ? err.message : String(err)),
+              );
+            }}
           />
         </div>
       </div>

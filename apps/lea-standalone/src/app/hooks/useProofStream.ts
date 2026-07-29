@@ -105,6 +105,8 @@ export function useProofStream() {
       setFormalizations,
       setFormalizationScope,
       setComposerScopeOverride,
+      setCurrentFormalizationSnapshot,
+      setCanvasRevisionMode,
     } = useProofSession.getState();
     // Fresh session context → drop any sub-agent live/error state from the previous one.
     setSubagentProgress({});
@@ -117,6 +119,8 @@ export function useProofStream() {
       formalizations,
     }));
     setComposerScopeOverride(null);
+    setCurrentFormalizationSnapshot(null);
+    setCanvasRevisionMode('current');
     useSessions.getState().setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
@@ -318,7 +322,11 @@ export function useProofStream() {
           // Actual declaration attribution is stronger evidence than the
           // pre-run inference. Follow the formalization Lea is really editing.
           useProofSession.getState().setFormalizationScope(payload.formalization_id);
+          useProofSession.getState().setCanvasRevisionMode('current');
           scope = payload.formalization_id;
+        }
+        if (payload.formalization_id) {
+          useProofSession.getState().bumpFormalizationRefresh();
         }
         const shouldFollow =
           scope === 'project'

@@ -56,6 +56,9 @@ class FileWriteRequest(BaseModel):
     content: str
     note: str | None = None  # optional explanation of the edit (D11)
     formalization_id: str | None = None
+    # Optional optimistic-concurrency token from
+    # GET /api/formalizations/{id}/current. Old clients may omit it.
+    base_revision: str | None = None
 
 
 class SessionUpdate(BaseModel):
@@ -271,9 +274,52 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     formalization_id = _validated_formalization_id(
         session_id, request.formalization_id
     )
-    latest = store.latest_code_step_for_path(session_id, request.path)
+    current_snapshot = (
+        formalization_service.current_snapshot(
+            formalization_id, conversation_session_id=session_id
+        )
+        if formalization_id else None
+    )
+    if (
+        request.base_revision is not None
+        and current_snapshot
+        and request.base_revision != current_snapshot.get("revision_token")
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "revision_conflict",
+                "message": (
+                    "This formalization changed in another conversation. "
+                    "Refresh the current version before saving."
+                ),
+                "current_revision": current_snapshot.get("revision_token"),
+                "last_updated_session": current_snapshot.get(
+                    "last_updated_session"
+                ),
+            },
+        )
+    latest = None
+    if current_snapshot:
+        latest = next(
+            (
+                step for step in current_snapshot.get("files", [])
+                if step.get("path") == request.path
+            ),
+            None,
+        )
+    if latest is None:
+        latest = store.latest_code_step_for_path(session_id, request.path)
     if latest and not latest.get("content_lost") and latest["code"] == request.content:
-        return {"unchanged": True, "code_step": None, "note": None}
+        return {
+            "unchanged": True,
+            "code_step": None,
+            "note": None,
+            "revision_token": (
+                current_snapshot.get("revision_token")
+                if current_snapshot else None
+            ),
+        }
 
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     abs_path.write_text(request.content)
@@ -296,7 +342,20 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
             session_id, "user", request.note.strip(), None, kind="edit_note",
             formalization_id=formalization_id,
         )
-    return {"unchanged": False, "code_step": step, "note": note_message}
+    updated_snapshot = (
+        formalization_service.current_snapshot(
+            formalization_id, conversation_session_id=session_id
+        )
+        if formalization_id else None
+    )
+    return {
+        "unchanged": False,
+        "code_step": step,
+        "note": note_message,
+        "revision_token": (
+            updated_snapshot.get("revision_token") if updated_snapshot else None
+        ),
+    }
 
 
 @router.post("/api/sessions/{session_id}/lean-check")
@@ -333,9 +392,22 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
     )
     result = interface_check(abs_path)
     artifact_kind = classify_lean_artifact(Path(abs_path).read_text()) if result.status == "ok" else None
-    step = store.latest_code_step_for_path(session_id, rel)
+    session_step = store.latest_code_step_for_path(session_id, rel)
+    current_snapshot = (
+        formalization_service.current_snapshot(formalization_id)
+        if formalization_id else None
+    )
+    current_step = next(
+        (
+            item for item in (current_snapshot or {}).get("files", [])
+            if item.get("path") == rel
+        ),
+        None,
+    )
+    step = current_step or session_step
     if step and (
         request.author
+        or step.get("session_id") != session_id
         or (
             formalization_id
             and step.get("formalization_id") != formalization_id
@@ -348,7 +420,7 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
             # The file is unchanged, so this is the same content — and because blobs
             # are content-addressed, the re-check's step shares the existing blob
             # rather than duplicating the proof.
-            content=step["code"],
+            content=Path(abs_path).read_text(),
             author=request.author or step.get("author") or "user",
             summary=request.summary,
             check_status=result.status,
@@ -412,7 +484,16 @@ def verify_session(session_id: str, request: PathRequest) -> dict:
         session_id, request.formalization_id
     )
     step = store.latest_code_step_for_path(session_id, rel)
-    if not formalization_id and step:
+    if formalization_id:
+        current_snapshot = formalization_service.current_snapshot(formalization_id)
+        step = next(
+            (
+                item for item in (current_snapshot or {}).get("files", [])
+                if item.get("path") == rel
+            ),
+            step,
+        )
+    elif step:
         formalization_id = step.get("formalization_id")
     result = interface_verify(abs_path)
     verification = store.record_verification_event(

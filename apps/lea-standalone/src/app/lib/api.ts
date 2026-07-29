@@ -23,6 +23,7 @@ import type {
   TreeEntry,
   SearchResult,
   Formalization,
+  FormalizationCurrentSnapshot,
 } from './types';
 
 export * from './types';
@@ -109,6 +110,20 @@ export async function getFormalization(formalizationId: string): Promise<Formali
   );
   if (!response.ok) {
     throw new Error(await detailMessage(response, 'Failed to load formalization.'));
+  }
+  return response.json();
+}
+
+export async function getCurrentFormalization(
+  formalizationId: string,
+  sessionId?: string,
+): Promise<FormalizationCurrentSnapshot> {
+  const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+  const response = await fetch(
+    `/api/formalizations/${encodeURIComponent(formalizationId)}/current${query}`,
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, 'Failed to load the current formalization.'));
   }
   return response.json();
 }
@@ -545,6 +560,25 @@ export interface FileWriteResult {
   unchanged: boolean;
   code_step?: CodeStep | null;
   note?: ChatMessage | null;
+  revision_token?: string | null;
+}
+
+export class RevisionConflictError extends Error {
+  currentRevision?: string | null;
+  lastUpdatedSession?: { id: string; title: string } | null;
+
+  constructor(
+    message: string,
+    detail?: {
+      current_revision?: string | null;
+      last_updated_session?: { id: string; title: string } | null;
+    },
+  ) {
+    super(message);
+    this.name = 'RevisionConflictError';
+    this.currentRevision = detail?.current_revision;
+    this.lastUpdatedSession = detail?.last_updated_session;
+  }
 }
 
 export async function writeSessionFile(
@@ -553,13 +587,29 @@ export async function writeSessionFile(
   content: string,
   note?: string,
   formalizationId?: string,
+  baseRevision?: string,
 ): Promise<FileWriteResult> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/file`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, content, note, formalization_id: formalizationId }),
+    body: JSON.stringify({
+      path,
+      content,
+      note,
+      formalization_id: formalizationId,
+      base_revision: baseRevision,
+    }),
   });
   if (!response.ok) {
+    if (response.status === 409) {
+      const body = await response.json().catch(() => ({} as any));
+      if (body.detail?.code === 'revision_conflict') {
+        throw new RevisionConflictError(
+          body.detail.message || 'This formalization changed in another conversation.',
+          body.detail,
+        );
+      }
+    }
     throw new Error(await detailMessage(response, `Failed to save file: ${response.statusText}`));
   }
   return response.json();

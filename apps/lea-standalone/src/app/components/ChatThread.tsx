@@ -757,6 +757,9 @@ function FormalizationScope({ session }: { session?: SessionSummary }) {
   const setScope = useProofSession((state) => state.setFormalizationScope);
   const override = useProofSession((state) => state.composerScopeOverride);
   const setOverride = useProofSession((state) => state.setComposerScopeOverride);
+  const setCanvasRevisionMode = useProofSession(
+    (state) => state.setCanvasRevisionMode,
+  );
   const [overrideOpen, setOverrideOpen] = useState(false);
   const projectLabel = session?.project_id ? 'Project discussion' : 'General discussion';
   const overrideFormalization =
@@ -774,10 +777,12 @@ function FormalizationScope({ session }: { session?: SessionSummary }) {
   const viewScope = (nextScope: string) => {
     setScope(nextScope);
     setOverride(null);
+    setCanvasRevisionMode('current');
   };
   const manuallyTarget = (nextScope: string) => {
     setScope(nextScope);
     setOverride(nextScope);
+    setCanvasRevisionMode('current');
     setOverrideOpen(false);
   };
 

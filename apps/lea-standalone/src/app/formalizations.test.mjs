@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   filesForFormalization,
+  formalizationCanvasSteps,
   inferComposerFormalizationScope,
   restoreFormalizationSelection,
   sessionFormalizationSummary,
@@ -124,5 +125,31 @@ test('composer inference does not confuse one-letter declarations with prose art
       viewedScope: 'a',
     }),
     'b',
+  );
+});
+
+test('canonical and conversation snapshots remain separate canvas sources', () => {
+  const historical = [{ id: 's1-v1', session_id: 's1', code: 'old' }];
+  const snapshot = {
+    formalization_id: 'a',
+    files: [{ id: 's2-v2', session_id: 's2', code: 'current' }],
+  };
+  assert.deepEqual(
+    formalizationCanvasSteps({
+      mode: 'current',
+      formalizationId: 'a',
+      snapshot,
+      historicalSteps: historical,
+    }).map((step) => step.id),
+    ['s2-v2'],
+  );
+  assert.deepEqual(
+    formalizationCanvasSteps({
+      mode: 'historical',
+      formalizationId: 'a',
+      snapshot,
+      historicalSteps: historical,
+    }).map((step) => step.id),
+    ['s1-v1'],
   );
 });

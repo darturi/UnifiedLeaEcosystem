@@ -6,10 +6,11 @@ derives validity/activity without caching either on the formalization row.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections import Counter
 
-from .artifacts import contains_sorry_marker
+from .artifacts import contains_sorry_marker, declaration_present
 from .db import connect, row_to_dict
 from . import store
 
@@ -28,6 +29,11 @@ def _validity(
         return "planned"
     if latest_step is None:
         return "unchecked"
+    declaration_name = formalization.get("declaration_name")
+    if declaration_name and not declaration_present(
+        latest_step.get("blob_content"), declaration_name
+    ):
+        return "unchecked"
     if (
         latest_step.get("check_status") == "error"
         or contains_sorry_marker(latest_step.get("blob_content"))
@@ -42,7 +48,13 @@ def _validity(
     result_kind = (latest_run or {}).get("result_kind")
     if result_kind == "disproved":
         return "disproved"
-    artifact_kind = (artifact or {}).get("kind") or latest_step.get("artifact_kind")
+    step_artifact_kind = (
+        latest_step.get("artifact_kind")
+        if str(latest_step.get("formalization_id") or "")
+        == str(formalization.get("id") or "")
+        else None
+    )
+    artifact_kind = (artifact or {}).get("kind") or step_artifact_kind
     if artifact_kind == "definition" or formalization.get("kind") == "definition":
         return "defined"
     if result_kind == "needs_review":
@@ -99,22 +111,33 @@ def decorate(rows: list[dict]) -> list[dict]:
             """
             select * from (
                 select t.*, b.content as blob_content,
+                       f.id as resolved_formalization_id,
                        row_number() over (
-                           partition by t.formalization_id
+                           partition by f.id
                            order by
                              case ff.role
                                when 'primary' then 0
                                when 'support' then 1
                                else 2
                              end,
+                             t.created_at desc,
                              t.id desc
                        ) as rn
-                from timeline t
-                join formalization_files ff
-                  on ff.formalization_id = t.formalization_id
-                 and ff.path = t.path
+                from formalizations f
+                join formalization_files ff on ff.formalization_id = f.id
+                join timeline t on t.kind = 'code' and t.path = ff.path
+                join sessions s on s.id = t.session_id
                 left join artifact_blobs b on b.id = t.after_blob_id
-                where t.kind = 'code' and t.formalization_id in ({marks})
+                where f.id in ({marks})
+                  and (
+                    (f.project_id is not null and s.project_id = f.project_id)
+                    or
+                    (f.project_id is null and exists (
+                      select 1 from session_formalizations sf
+                      where sf.formalization_id = f.id
+                        and sf.session_id = t.session_id
+                    ))
+                  )
             ) where rn = 1
             """,
             ids,
@@ -192,7 +215,9 @@ def decorate(rows: list[dict]) -> list[dict]:
     first_artifact: dict[str, dict] = {}
     for item in artifacts:
         first_artifact.setdefault(str(item["formalization_id"]), item)
-    step_by_id = {str(item["formalization_id"]): item for item in latest_steps}
+    step_by_id = {
+        str(item["resolved_formalization_id"]): item for item in latest_steps
+    }
     active_by_id = {str(item["focus_formalization_id"]): item for item in active_runs}
     run_by_id = {str(item["focus_formalization_id"]): item for item in latest_runs}
     verify_by_id = {str(item["formalization_id"]): item for item in verifications}
@@ -275,6 +300,79 @@ def get(formalization_id: str) -> dict | None:
     if not row:
         return None
     return decorate([row])[0]
+
+
+def _revision_token(steps: list[dict]) -> str | None:
+    parts = [
+        f"{step['path']}:{step.get('blob_sha256') or step.get('blob_id') or step['id']}"
+        for step in sorted(steps, key=lambda item: item["path"])
+    ]
+    if not parts:
+        return None
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def current_snapshot(
+    formalization_id: str,
+    *,
+    conversation_session_id: str | None = None,
+) -> dict | None:
+    """Canonical project view plus the optional open conversation's revision."""
+    formalization = get(formalization_id)
+    if formalization is None:
+        return None
+    current_files = store.current_code_steps_for_formalization(formalization_id)
+    conversation_files = (
+        store.current_code_steps_for_formalization(
+            formalization_id, session_id=conversation_session_id
+        )
+        if conversation_session_id else []
+    )
+    current_revision = _revision_token(current_files)
+    conversation_revision = _revision_token(conversation_files)
+    newest = max(
+        current_files,
+        key=lambda item: (item.get("created_at") or "", int(item["id"])),
+        default=None,
+    )
+    conversation_newest = max(
+        conversation_files,
+        key=lambda item: (item.get("created_at") or "", int(item["id"])),
+        default=None,
+    )
+    return {
+        "formalization_id": formalization_id,
+        "project_id": formalization.get("project_id"),
+        "revision_token": current_revision,
+        "files": current_files,
+        "last_updated_session": (
+            {
+                "id": newest["session_id"],
+                "title": newest.get("updating_session_title") or "Conversation",
+            }
+            if newest else None
+        ),
+        "last_updated_at": newest.get("created_at") if newest else None,
+        "conversation": (
+            {
+                "session_id": conversation_session_id,
+                "revision_token": conversation_revision,
+                "files": conversation_files,
+                "last_updated_at": (
+                    conversation_newest.get("created_at")
+                    if conversation_newest else None
+                ),
+                "is_current": bool(
+                    current_revision
+                    and conversation_revision
+                    and current_revision == conversation_revision
+                ),
+            }
+            if conversation_session_id else None
+        ),
+        "validity_status": formalization["validity_status"],
+        "safe_verify": formalization.get("safe_verify"),
+    }
 
 
 def for_project(project_id: str) -> list[dict]:
