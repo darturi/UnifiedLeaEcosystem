@@ -1,4 +1,4 @@
-"""Lea's six tools — the minimum surface area for Lean formalization."""
+"""Lea's built-in tools — the minimum surface area for Lean formalization."""
 
 import os
 import re
@@ -7,6 +7,7 @@ import tempfile
 import threading
 from pathlib import Path
 
+from .imports import IMPORT_COMMAND_RE, direct_imports, without_comments
 from .runctx import current_depth, current_working_dir
 
 # Item 6 / D74 — bound the two fallbacks that each load their OWN full Mathlib
@@ -128,6 +129,24 @@ TOOLS_SCHEMA = [
             "required": ["query"],
         },
     },
+    {
+        "name": "suggest_imports",
+        "description": (
+            "Analyze a compiling .lean file with Mathlib's min-imports linter and "
+            "return a targeted replacement import block. Read-only: it checks a "
+            "disposable copy and never modifies the proof file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the compiling .lean proof file to analyze.",
+                }
+            },
+            "required": ["path"],
+        },
+    },
 ]
 
 
@@ -170,8 +189,22 @@ def _within(target: Path, roots: list[Path]) -> bool:
     return any(target == root or root in target.parents for root in roots)
 
 
-def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+def _run_relative_path(path: str) -> Path:
+    """Resolve a model path against this activation's working directory.
+
+    The adapter process has a stable process cwd while concurrent activations each
+    declare their own ``working_dir`` through ``run_context``. Project context paths
+    such as ``.lea/files/overleaf/main.tex`` must therefore be anchored explicitly.
+    """
     p = Path(path).expanduser()
+    wd = current_working_dir()
+    if wd is None or p.is_absolute():
+        return p.resolve()
+    return (Path(wd).expanduser().resolve() / p).resolve()
+
+
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+    p = _run_relative_path(path)
     # Reads are confined to the run's roots (AUDIT-2026-07-24 S4). `write_file` and
     # `edit_file` have been sandboxed since F3, but reads were not — so the model could
     # open anything the adapter process could: `~/.ssh/id_rsa`, the monorepo `.env`, and
@@ -180,7 +213,7 @@ def read_file(path: str, start_line: int | None = None, end_line: int | None = N
     # comes from a shared LaTeX document and no approval gate stands between a
     # prompt-injected instruction and the tool call.
     roots = _readable_roots()
-    if roots is not None and not _within(p.resolve(), roots):
+    if roots is not None and not _within(p, roots):
         return (
             f"Error: {path!r} is outside this run's workspace. Read only within your "
             "session's directory or the Lake project (Mathlib included)."
@@ -241,11 +274,31 @@ def _sandboxed_write_path(path: str) -> Path:
     return target
 
 
+_BROAD_IMPORT_OVERRIDE = "LEA_ALLOW_BROAD_MATHLIB_IMPORT"
+
+
+def _broad_import_error(path: Path, content: str) -> str | None:
+    """Policy diagnostic for model-authored Lean files that import the Mathlib barrel."""
+    if path.suffix != ".lean" or "Mathlib" not in direct_imports(content):
+        return None
+    if os.environ.get(_BROAD_IMPORT_OVERRIDE, "").strip().lower() in {"1", "true", "yes"}:
+        return None
+    return (
+        "Error: generated Lean files may not use the umbrella `import Mathlib`. "
+        "Import targeted `Mathlib.<domain>.<module>` modules instead. If this is an "
+        "existing compiling proof, call `suggest_imports` on it for an exact "
+        "replacement block. Operators may temporarily bypass this generated-file "
+        f"policy with {_BROAD_IMPORT_OVERRIDE}=1."
+    )
+
+
 def write_file(path: str, content: str) -> str:
     try:
         p = _sandboxed_write_path(path)
     except _SandboxViolation as exc:
         return f"Error: {exc}"
+    if policy_error := _broad_import_error(p, content):
+        return policy_error
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content)
     return f"Wrote {len(content)} bytes to {p}"
@@ -264,12 +317,21 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
         return "Error: old_string not found in file."
     if count > 1:
         return f"Error: old_string appears {count} times. Provide more context to make it unique."
-    p.write_text(text.replace(old_string, new_string, 1))
+    updated = text.replace(old_string, new_string, 1)
+    if policy_error := _broad_import_error(p, updated):
+        return policy_error
+    p.write_text(updated)
     return "OK"
 
 
 def lean_check(path: str, *, use_lsp: bool = True) -> str:
-    p = Path(path).resolve()
+    p = _run_relative_path(path)
+    roots = _readable_roots()
+    if roots is not None and not _within(p, roots):
+        return (
+            f"Error: {path!r} is outside this run's workspace. Check only within your "
+            "session's directory or the Lake project."
+        )
     if not p.exists():
         return f"Error: {p} does not exist."
 
@@ -341,6 +403,24 @@ def lean_check_cold(path: str) -> str:
     normal warm `lean_check`, which that same test confirmed does work.
     """
     return lean_check(path, use_lsp=False)
+
+
+def _generated_lean_check(path: str) -> str:
+    """Agent-facing check with the generated-artifact import policy enforced.
+
+    Adapter/manual checks call `lean_check` directly and remain able to inspect
+    legacy user-authored files. Model tool calls use this wrapper, so writing a
+    barrel import through `bash` cannot bypass the write/edit gate and receive a
+    successful final verdict.
+    """
+    p = _run_relative_path(path)
+    if p.exists():
+        try:
+            if policy_error := _broad_import_error(p, p.read_text()):
+                return policy_error
+        except OSError:
+            pass
+    return lean_check(path)
 
 
 def rebuild_module(path: str) -> str:
@@ -584,14 +664,122 @@ def search_mathlib(query: str, max_results: int = 10, path: str | None = None) -
         return "Error: search timed out."
 
 
+def _import_analysis_source(code: str) -> str:
+    """Add a broad analysis import + `#import_bumps` to a disposable source copy."""
+    lines = code.splitlines(keepends=True)
+    clean_lines = without_comments(code).splitlines(keepends=True)
+    import_lines = [
+        i for i, line in enumerate(clean_lines)
+        if IMPORT_COMMAND_RE.fullmatch(line.rstrip("\r\n"))
+    ]
+
+    if "Mathlib" not in direct_imports(code):
+        insert_at = import_lines[0] if import_lines else 0
+        if not import_lines:
+            for i, line in enumerate(lines):
+                if re.fullmatch(r"[ \t]*module(?:[ \t].*)?[ \t]*(?://.*)?\r?\n?", line):
+                    insert_at = i + 1
+                    break
+        lines.insert(insert_at, "import Mathlib\n")
+        import_lines = [i + (1 if i >= insert_at else 0) for i in import_lines]
+        import_lines.append(insert_at)
+
+    bump_at = max(import_lines) + 1
+    lines.insert(bump_at, "#import_bumps\n")
+    return "".join(lines)
+
+
+def _import_analysis_has_error(output: str) -> bool:
+    return bool(re.search(r"(?mi)^.*\berror:", output)) or output.startswith("Error:")
+
+
+def suggest_imports(path: str) -> str:
+    """Suggest a targeted direct-import block without modifying the source file.
+
+    Mathlib's incremental min-imports linter needs to read its own file at EOF, so
+    the analysis runs on a short-lived sibling file rather than a purely virtual
+    LSP document. The persistent daemon still handles the check, keeping its broad
+    analysis import warm; the temporary document is explicitly closed afterward.
+    """
+    p = _run_relative_path(path)
+    roots = _readable_roots()
+    if roots is not None and not _within(p, roots):
+        return (
+            f"Error: {path!r} is outside this run's workspace. Analyze imports only "
+            "within your session's directory or the Lake project."
+        )
+    if not p.exists():
+        return f"Error: {p} does not exist."
+    if p.suffix != ".lean":
+        return f"Error: {p} is not a .lean file."
+    if not _find_lake_root(str(p)):
+        return f"Error: no Lake project (lakefile.lean/lakefile.toml) found above {p}."
+
+    code = p.read_text()
+    analysis = _import_analysis_source(code)
+    output = ""
+    with tempfile.TemporaryDirectory(dir=p.parent, prefix=".lea-imports-") as td:
+        scratch_dir = Path(td)
+        scratch = scratch_dir / p.name
+        scratch.write_text(analysis)
+        try:
+            output = lean_check(str(scratch))
+        finally:
+            try:
+                from .lsp_daemon import close_documents_under
+
+                close_documents_under(str(scratch_dir))
+            except Exception:
+                pass
+
+    if _import_analysis_has_error(output):
+        return (
+            "Error: import analysis could not elaborate the disposable copy. "
+            "Make sure the original proof compiles before calling `suggest_imports`.\n"
+            + output
+        )
+
+    unneeded = set(re.findall(r"unneeded import '([A-Za-z_][A-Za-z0-9_'.]*)'", output))
+    reported = re.findall(
+        r"(?m)^(?:public[ \t]+)?import[ \t]+([A-Za-z_][A-Za-z0-9_'.]*)[ \t]*$",
+        output,
+    )
+    current = direct_imports(code)
+    suggested = [
+        module for module in current
+        if module != "Mathlib" and module not in unneeded
+    ]
+    suggested.extend(module for module in reported if module not in suggested)
+
+    # A broad analysis of even a core-only theorem should report Mathlib as
+    # unneeded. If it did not, avoid returning a dangerously empty block merely
+    # because a future Mathlib diagnostic format stopped matching our parser.
+    if not suggested and "Mathlib" not in unneeded:
+        return (
+            "Error: Mathlib import analysis completed but its suggestions could "
+            "not be parsed. Keep the current targeted imports and run `lean_check`."
+        )
+
+    if suggested:
+        block = "\n".join(f"import {module}" for module in suggested)
+    else:
+        block = "(no explicit imports required; Lean imports Init automatically)"
+    return (
+        f"Suggested replacement import block for {p}:\n{block}\n\n"
+        "Replace only the file's import commands, then run `lean_check` again. "
+        "The min-imports analysis is advisory and may miss unusual attribute dependencies."
+    )
+
+
 # Dispatch table
 TOOL_HANDLERS = {
     "bash": lambda args: bash(args["command"], args.get("timeout", 120)),
     "read_file": lambda args: read_file(args["path"], args.get("start_line"), args.get("end_line")),
     "write_file": lambda args: write_file(args["path"], args["content"]),
     "edit_file": lambda args: edit_file(args["path"], args["old_string"], args["new_string"]),
-    "lean_check": lambda args: lean_check(args["path"]),
+    "lean_check": lambda args: _generated_lean_check(args["path"]),
     "search_mathlib": lambda args: search_mathlib(args["query"], args.get("max_results", 10), args.get("path")),
+    "suggest_imports": lambda args: suggest_imports(args["path"]),
 }
 
 

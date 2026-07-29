@@ -97,6 +97,13 @@ def test_compose_context_message(tmp_path, monkeypatch):
     (repo / ".lea" / "instructions.md").write_text("# Instructions\nProve continuity.")
     (repo / ".lea" / "files").mkdir()
     (repo / ".lea" / "files" / "paper.txt").write_text("notes")
+    overleaf = repo / ".lea" / "files" / "overleaf"
+    overleaf.mkdir()
+    (overleaf / "main.tex").write_text(
+        "\\documentclass{article}\n\\input{sections/results}\n\\begin{document}\n"
+    )
+    (overleaf / "notation.sty").write_text("\\newcommand{\\NN}{\\mathbb{N}}\n")
+    (repo / "existing.lean").write_text("theorem existing : True := by trivial\n")
 
     msg = projects.compose_context_message(project, repo)
     assert msg["role"] == "user"
@@ -107,6 +114,13 @@ def test_compose_context_message(tmp_path, monkeypatch):
     assert "Do not derive a namespace from the display name" in msg["content"]
     assert "Prove continuity." in msg["content"]
     assert "`.lea/files/paper.txt`" in msg["content"]  # inventory line
+    assert "`.lea/files/overleaf/main.tex`" in msg["content"]
+    assert "`.lea/files/overleaf/notation.sty`" in msg["content"]
+    assert "Likely root document(s)" in msg["content"]
+    assert "includes `sections/results`" in msg["content"]
+    assert "read every mirrored LaTeX source before planning" in msg["content"]
+    assert "## Project Lean modules" in msg["content"]
+    assert "`existing.lean`" in msg["content"]
     # D26: the agent is told, concretely, to keep memory.md current with edit_file.
     assert ".lea/memory.md" in msg["content"]
     assert "edit_file" in msg["content"]

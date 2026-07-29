@@ -7,9 +7,11 @@
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
-  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub"]);
+  const LEA_UI_VIEW_STATUSES = new Set(["formalized", "defined", "disproved", "in_progress", "sorry_stub", "stale"]);
   const TEX_MIRROR_SYNC_DELAY_MS = 1500;
   const TEX_MIRROR_FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+  const TARGET_CONTEXT_RADIUS_LINES = 24;
+  const TARGET_CONTEXT_MAX_CHARS = 12000;
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
   const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
@@ -33,6 +35,7 @@
   const LEAN_PANE_CHAT_POLL_RECONCILE_MS = 30000;
   const REPAIR_BATCH_POLL_MS = 2000;
   const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
+  const HUMAN_APPROVAL_STORAGE_KEY = "leaHumanApprovalsV1";
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
     google: "Google AI",
@@ -60,6 +63,9 @@
   // only the active buffer; the zip refresh happens on this cadence.
   let lastTexMirrorFullSyncAt = 0;
   let latestStatuses = {};
+  let humanApprovals = {};
+  let humanApprovalsLoadPromise = null;
+  let humanApprovalBusyKeys = new Set();
   let badgeLayer = null;
   let settingsButton = null;
   let leanPaneButton = null;
@@ -131,6 +137,10 @@
   // this holds only the latest /lean-pane/repair/status snapshot.
   let leanPaneRepairBatch = null;
   let leanPaneRepairBatchTimer = 0;
+  // Batch queue disclosure survives the pane's replaceChildren re-render, but
+  // is scoped to one batch id so a new run always starts compact.
+  let leanPaneExpandedBatchQueueId = "";
+  let leanPaneExpandedBatchCompletedId = "";
   // A repair DISPATCH failure, scoped to what was being dispatched:
   // { itemKey, message } with itemKey = the single item's target label, or
   // "batch" (PLAN-self-repair-stale-offers Fix 4 -- a global string rendered
@@ -203,6 +213,11 @@
   renderSettingsButton();
   renderLeanPaneButton();
   hydrateLeanPaneWidthFromStorage();
+  loadHumanApprovals().then(() => {
+    renderStatusBadges();
+    if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
+  }).catch(() => {});
+  chrome.storage?.onChanged?.addListener(handleHumanApprovalStorageChanged);
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
@@ -1058,6 +1073,12 @@
     if (!response.ok) {
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
+    await reconcileHumanApprovals(
+      (payload.items || []).map((item) => ({
+        target: paneItemApprovalTarget(item),
+        statusInfo: item
+      }))
+    );
     renderLeanPaneManifest(payload);
     scheduleLeanPanePollIfNeeded(payload);
   }
@@ -1387,6 +1408,8 @@
     card.className = `ol-lean-project-item ol-lean-project-item-${item.status || "unknown"}`;
     card.dataset.itemId = item.id || "";
 
+    const headerRow = document.createElement("div");
+    headerRow.className = "ol-lean-project-item-header-row";
     const header = document.createElement("button");
     header.type = "button";
     header.className = "ol-lean-project-item-header";
@@ -1418,12 +1441,28 @@
     if (getStubbedTheoremUses(item).length > 0) {
       header.appendChild(createStubbedTheoremUsesMark());
     }
-    card.appendChild(header);
+    headerRow.appendChild(header);
+    if (
+      Object.prototype.hasOwnProperty.call(item, "approvalEligible")
+      || Boolean(item.approvalRevision)
+    ) {
+      headerRow.appendChild(createHumanApprovalButton(paneItemApprovalTarget(item), item, { pane: true }));
+    }
+    card.appendChild(headerRow);
 
     const natural = document.createElement("p");
     natural.className = "ol-lean-project-natural";
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
+
+    if (item.status === "stale") {
+      const staleNote = document.createElement("p");
+      staleNote.className = "ol-lean-project-stale-note";
+      staleNote.setAttribute("role", "status");
+      staleNote.textContent = item.message
+        || "Out of date — the LaTeX changed after this Lean artifact was generated. Re-formalize to synchronize it.";
+      card.appendChild(staleNote);
+    }
 
     if (getStubbedTheoremUses(item).length > 0) {
       const stubbedWarning = document.createElement("p");
@@ -1582,7 +1621,9 @@
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
         leanPaneRepairBatch = payload;
-        startRepairBatchPolling();
+        leanPaneExpandedBatchQueueId = "";
+        leanPaneExpandedBatchCompletedId = "";
+        startRepairBatchPolling({ immediate: true });
       }
     } catch (error) {
       leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
@@ -1634,7 +1675,7 @@
       });
       const payload = await response.json().catch(() => ({}));
       if (response.ok) leanPaneRepairBatch = payload;
-      startRepairBatchPolling();
+      startRepairBatchPolling({ immediate: true });
     } catch (error) {
       leanPaneRepairError = { itemKey: "batch", message: normalizeErrorMessage(error) };
     }
@@ -1696,43 +1737,245 @@
     return row;
   }
 
-  // Live batch progress at the top of the pane: one line per item
-  // (formatRepairOutcome), plus continue/dismiss controls when the batch
-  // paused on a failure or the spend cap.
+  // Live batch progress at the top of the pane. The companion already returns
+  // dependency-ordered entries, so the client can render a real queue (active
+  // ordinal, next items, exact outcomes) without duplicating orchestration.
   function renderLeanPaneRepairBatchPanel() {
     const batch = leanPaneRepairBatch;
     if (!batch || !Array.isArray(batch.items) || batch.items.length === 0) return null;
     const operation = batch.operation || "repair";
     const noun = operation === "stub" ? "Stub" : operation === "formalize" ? "Formalize" : "Repair";
-    const doneVerb = operation === "stub" ? "stubbed" : operation === "formalize" ? "formalized" : "repaired";
-    const doneStates = operation === "stub"
+    const runningVerb = operation === "stub" ? "Stubbing" : operation === "formalize" ? "Formalizing" : "Repairing";
+    const completedStates = new Set(operation === "stub"
+      ? ["stubbed"]
+      : operation === "formalize"
+        ? ["formalized"]
+        : ["repaired"]);
+    const successfulStates = new Set(operation === "stub"
       ? ["stubbed"]
       : operation === "formalize"
         ? ["formalized", "disproved"]
-        : ["repaired", "needs_review"];
-    const runningVerb = operation === "stub" ? "Stubbing" : operation === "formalize" ? "Formalizing" : "Repairing";
+        : ["repaired", "needs_review"]);
+    const attentionStates = new Set(["failed", "skipped", "canceled", "needs_review", "disproved"]);
+    const completedEntries = batch.items.filter((entry) => completedStates.has(entry.state));
+    const attentionEntries = batch.items.filter((entry) => attentionStates.has(entry.state));
+    const reportedActiveEntry = batch.items.find((entry) => entry.state === "running") || null;
+    // The launch response can land after the batch loop is marked running but
+    // just before its first entry flips pending → running. Show that first
+    // dispatch as current instead of briefly rendering an idle-looking queue.
+    const activeEntry = reportedActiveEntry || (
+      batch.running && !batch.done && !batch.pausedOn && !batch.stopping
+        ? batch.items.find((entry) => entry.state === "pending") || null
+        : null
+    );
+    const queuedEntries = batch.items.filter((entry) => entry.state === "pending" && entry !== activeEntry);
+    const activeIndex = activeEntry ? batch.items.indexOf(activeEntry) : -1;
+    const total = batch.items.length;
+    const completedCount = batch.items.filter((entry) => successfulStates.has(entry.state)).length;
+    const failedCount = batch.items.filter((entry) => entry.state === "failed").length;
+    const skippedCount = batch.items.filter((entry) => entry.state === "skipped").length;
+    const canceledCount = batch.items.filter((entry) => entry.state === "canceled").length;
+
     const panel = document.createElement("div");
-    panel.className = "ol-lean-project-repair-batch";
-    const heading = document.createElement("p");
-    const doneCount = batch.items.filter((entry) => doneStates.includes(entry.state)).length;
-    heading.textContent = batch.canceled
-      ? `${noun} all stopped: ${doneCount}/${batch.items.length} ${doneVerb} before stopping.`
+    panel.className = `ol-lean-project-repair-batch ol-lean-batch-queue${
+      batch.pausedOn
+        ? " ol-lean-batch-queue-paused"
+        : batch.canceled
+          ? " ol-lean-batch-queue-stopped"
+          : batch.done
+            ? " ol-lean-batch-queue-done"
+            : ""
+    }`;
+
+    const header = document.createElement("div");
+    header.className = "ol-lean-batch-queue-header";
+    const heading = document.createElement("div");
+    heading.className = "ol-lean-batch-queue-heading";
+    const title = document.createElement("strong");
+    title.textContent = `${noun} all`;
+    heading.appendChild(title);
+    const state = document.createElement("span");
+    state.className = "ol-lean-batch-queue-state";
+    state.setAttribute("aria-live", "polite");
+    state.textContent = batch.canceled
+      ? "Stopped"
       : batch.stopping
-        ? "Stopping..."
+        ? "Stopping…"
         : batch.done
-          ? `${noun} all finished: ${doneCount}/${batch.items.length} ${doneVerb}.`
+          ? "Complete"
           : batch.pausedOn
-            ? batch.pausedOn.reason === "max_spend"
-              ? `${noun} all paused: the max spend limit was reached.`
-              : `${noun} all paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
-            : `${runningVerb} ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
-    panel.appendChild(heading);
+            ? "Paused"
+            : `${runningVerb}…`;
+    heading.appendChild(state);
+    header.appendChild(heading);
+    const count = document.createElement("span");
+    count.className = "ol-lean-batch-queue-count";
+    count.textContent = formatBatchQueueCount({
+      batch,
+      completedCount,
+      failedCount,
+      skippedCount,
+      canceledCount,
+      total
+    });
+    header.appendChild(count);
+    panel.appendChild(header);
+
+    const progress = document.createElement("div");
+    progress.className = "ol-lean-batch-queue-progress";
+    progress.setAttribute("role", "progressbar");
+    progress.setAttribute("aria-label", formatBatchQueueProgressLabel({
+      noun,
+      completedCount,
+      failedCount,
+      skippedCount,
+      canceledCount,
+      total
+    }));
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", String(total));
+    progress.setAttribute("aria-valuenow", String(completedCount));
     for (const entry of batch.items) {
-      const line = document.createElement("p");
-      line.className = "ol-lean-project-repair-batch-item";
-      line.textContent = leanPaneView.formatRepairOutcome(entry, operation);
-      panel.appendChild(line);
+      const segment = document.createElement("span");
+      const stateClass = entry === activeEntry
+        ? "active"
+        : entry.state === "failed"
+          ? "failed"
+          : entry.state === "skipped"
+            ? "skipped"
+            : entry.state === "canceled"
+              ? "canceled"
+              : entry.state === "disproved" || entry.state === "needs_review"
+                ? "attention"
+                : successfulStates.has(entry.state)
+                  ? "success"
+                  : "pending";
+      segment.className = `ol-lean-batch-queue-progress-segment ol-lean-batch-queue-progress-${stateClass}`;
+      segment.style.width = `${100 / total}%`;
+      segment.setAttribute("aria-hidden", "true");
+      progress.appendChild(segment);
     }
+    panel.appendChild(progress);
+
+    if (batch.pausedOn) {
+      const callout = document.createElement("div");
+      callout.className = "ol-lean-batch-queue-callout";
+      const calloutTitle = document.createElement("strong");
+      calloutTitle.textContent = batch.pausedOn.reason === "max_spend"
+        ? "Maximum spend reached"
+        : `${batch.pausedOn.targetLabel || "An item"} failed`;
+      callout.appendChild(calloutTitle);
+      const calloutDetail = document.createElement("span");
+      calloutDetail.textContent = batch.pausedOn.reason === "max_spend"
+        ? "Increase or clear the spend limit before continuing."
+        : queuedEntries.length > 0
+          ? `${queuedEntries.length} independent item${queuedEntries.length === 1 ? "" : "s"} can still run.`
+          : "No independent items remain in the queue.";
+      callout.appendChild(calloutDetail);
+      panel.appendChild(callout);
+    }
+
+    if (activeEntry) {
+      const current = document.createElement("section");
+      current.className = "ol-lean-batch-queue-current";
+      const meta = document.createElement("span");
+      meta.className = "ol-lean-batch-queue-eyebrow";
+      meta.textContent = `Current · ${activeIndex + 1} of ${total}`;
+      current.appendChild(meta);
+      const currentRow = renderBatchQueueEntry(activeEntry, activeIndex, {
+        marker: "●",
+        stateClass: "running",
+        detail: formatBatchQueueActiveDetail(activeEntry, runningVerb)
+      });
+      current.appendChild(currentRow);
+      panel.appendChild(current);
+    }
+
+    if (queuedEntries.length > 0) {
+      const queued = document.createElement("section");
+      queued.className = "ol-lean-batch-queue-section";
+      const queuedHeading = document.createElement("strong");
+      queuedHeading.className = "ol-lean-batch-queue-section-title";
+      queuedHeading.textContent = "Next";
+      queued.appendChild(queuedHeading);
+      const list = document.createElement("ol");
+      list.className = "ol-lean-batch-queue-list";
+      const queueExpanded = leanPaneExpandedBatchQueueId === batch.batchId;
+      const visibleQueued = queueExpanded ? queuedEntries : queuedEntries.slice(0, 3);
+      for (const entry of visibleQueued) {
+        const entryIndex = batch.items.indexOf(entry);
+        list.appendChild(renderBatchQueueEntry(entry, entryIndex, {
+          marker: "○",
+          stateClass: "pending",
+          detail: `Queued · position ${entryIndex + 1} of ${total}`
+        }));
+      }
+      queued.appendChild(list);
+      if (queuedEntries.length > 3) {
+        const remaining = queuedEntries.length - 3;
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "ol-lean-batch-queue-disclosure";
+        toggle.setAttribute("aria-expanded", String(queueExpanded));
+        toggle.textContent = queueExpanded ? "Show fewer queued" : `+${remaining} more queued`;
+        toggle.addEventListener("click", () => {
+          leanPaneExpandedBatchQueueId = queueExpanded ? "" : batch.batchId;
+          renderLeanPaneManifest(lastLeanPaneManifest);
+        });
+        queued.appendChild(toggle);
+      }
+      panel.appendChild(queued);
+    }
+
+    if (attentionEntries.length > 0) {
+      const attention = document.createElement("section");
+      attention.className = "ol-lean-batch-queue-section ol-lean-batch-queue-attention";
+      const attentionHeading = document.createElement("strong");
+      attentionHeading.className = "ol-lean-batch-queue-section-title";
+      attentionHeading.textContent = "Needs attention";
+      attention.appendChild(attentionHeading);
+      const list = document.createElement("ul");
+      list.className = "ol-lean-batch-queue-list";
+      for (const entry of attentionEntries) {
+        list.appendChild(renderBatchQueueEntry(entry, batch.items.indexOf(entry), {
+          marker: entry.state === "disproved" ? "◇" : "!",
+          stateClass: entry.state,
+          detail: formatBatchQueueOutcomeDetail(entry, operation)
+        }));
+      }
+      attention.appendChild(list);
+      panel.appendChild(attention);
+    }
+
+    if (completedEntries.length > 0) {
+      const completed = document.createElement("section");
+      completed.className = "ol-lean-batch-queue-section ol-lean-batch-queue-completed";
+      const completedExpanded = leanPaneExpandedBatchCompletedId === batch.batchId;
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "ol-lean-batch-queue-completed-toggle";
+      toggle.setAttribute("aria-expanded", String(completedExpanded));
+      toggle.textContent = `${completedExpanded ? "Hide" : "Show"} ${completedEntries.length} completed`;
+      toggle.addEventListener("click", () => {
+        leanPaneExpandedBatchCompletedId = completedExpanded ? "" : batch.batchId;
+        renderLeanPaneManifest(lastLeanPaneManifest);
+      });
+      completed.appendChild(toggle);
+      if (completedExpanded) {
+        const list = document.createElement("ul");
+        list.className = "ol-lean-batch-queue-list";
+        for (const entry of completedEntries) {
+          list.appendChild(renderBatchQueueEntry(entry, batch.items.indexOf(entry), {
+            marker: "✓",
+            stateClass: "completed",
+            detail: formatBatchQueueOutcomeDetail(entry, operation)
+          }));
+        }
+        completed.appendChild(list);
+      }
+      panel.appendChild(completed);
+    }
+
     if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
@@ -1767,12 +2010,77 @@
       dismiss.textContent = "Dismiss";
       dismiss.addEventListener("click", () => {
         leanPaneRepairBatch = null;
+        leanPaneExpandedBatchQueueId = "";
+        leanPaneExpandedBatchCompletedId = "";
         renderLeanPaneManifest(lastLeanPaneManifest);
       });
       controls.appendChild(dismiss);
     }
     if (controls.children.length > 0) panel.appendChild(controls);
     return panel;
+  }
+
+  function renderBatchQueueEntry(entry, index, { marker, stateClass, detail }) {
+    const row = document.createElement("li");
+    row.className = `ol-lean-batch-queue-item ol-lean-batch-queue-item-${stateClass}`;
+    row.dataset.position = String(index + 1);
+    const icon = document.createElement("span");
+    icon.className = "ol-lean-batch-queue-marker";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = marker;
+    row.appendChild(icon);
+    const copy = document.createElement("span");
+    copy.className = "ol-lean-batch-queue-item-copy";
+    const label = document.createElement("strong");
+    label.textContent = entry.targetLabel || `Item ${index + 1}`;
+    copy.appendChild(label);
+    const description = document.createElement("span");
+    description.className = "ol-lean-batch-queue-item-detail";
+    description.textContent = detail;
+    copy.appendChild(description);
+    row.appendChild(copy);
+    return row;
+  }
+
+  function formatBatchQueueActiveDetail(entry, runningVerb) {
+    const statusInfo = latestStatuses[targetKey(entry)] || {};
+    const paneItem = (lastLeanPaneManifest?.items || []).find((item) => (
+      item.label === entry.targetLabel
+      && (entry.targetKind !== "definition" || item.leanKind === "def")
+    ));
+    const progress = statusInfo.turnProgress || paneItem?.turnProgress;
+    const current = Number.parseInt(String(progress?.current || ""), 10);
+    const max = Number.parseInt(String(progress?.max || ""), 10);
+    const turn = Number.isFinite(current) && current > 0 && Number.isFinite(max) && max > 0
+      ? ` · Lea turn ${current} of ${max}`
+      : "";
+    return `${runningVerb}…${turn}`;
+  }
+
+  function formatBatchQueueOutcomeDetail(entry, operation) {
+    const outcome = leanPaneView.formatRepairOutcome(entry, operation);
+    const prefix = `${entry?.targetLabel || ""}: `;
+    return outcome.startsWith(prefix) ? outcome.slice(prefix.length) : outcome;
+  }
+
+  function formatBatchQueueCount({ batch, completedCount, failedCount, skippedCount, canceledCount, total }) {
+    if (!batch.canceled && !batch.pausedOn && !batch.done) {
+      return `${completedCount} / ${total} complete`;
+    }
+    const parts = [];
+    if (completedCount > 0) parts.push(`${completedCount} complete`);
+    if (failedCount > 0) parts.push(`${failedCount} failed`);
+    if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
+    if (canceledCount > 0) parts.push(`${canceledCount} stopped`);
+    return parts.length > 0 ? parts.join(" · ") : `0 / ${total} complete`;
+  }
+
+  function formatBatchQueueProgressLabel({ noun, completedCount, failedCount, skippedCount, canceledCount, total }) {
+    const parts = [`${noun} all: ${completedCount} of ${total} completed`];
+    if (failedCount > 0) parts.push(`${failedCount} failed`);
+    if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
+    if (canceledCount > 0) parts.push(`${canceledCount} stopped`);
+    return `${parts.join(", ")}.`;
   }
 
   // Open the inline edit view for an item: shows the current artifact
@@ -2034,13 +2342,20 @@
 
     for (const segment of segments) {
       if (segment.type !== "math") {
-        element.appendChild(document.createTextNode(segment.text));
+        renderLeanPaneLatexText(element, segment.text);
         continue;
       }
       const math = document.createElement("span");
       math.className = segment.display
         ? "ol-lean-project-math ol-lean-project-math-display"
         : "ol-lean-project-math";
+      if (renderLeanPaneKatex(math, segment.text, segment.display)) {
+        element.appendChild(math);
+        continue;
+      }
+
+      math.classList.add("ol-lean-project-math-fallback");
+      math.dataset.mathRenderer = "fallback";
       const parts = leanPaneView.formatLiteMath(segment.text);
       if (parts.length === 0) {
         math.textContent = segment.text;
@@ -2057,6 +2372,39 @@
         }
       }
       element.appendChild(math);
+    }
+  }
+
+  function renderLeanPaneKatex(element, source, displayMode) {
+    const renderer = typeof katex !== "undefined" ? katex : globalThis.katex;
+    const result = leanPaneView.renderPaneMath(renderer, element, source, displayMode);
+    if (result.ok) {
+      element.dataset.mathRenderer = "katex";
+      return true;
+    }
+    if (renderer?.render) {
+      element.title = `Could not fully render this expression: ${errorText(result.error)}`;
+    }
+    return false;
+  }
+
+  function renderLeanPaneLatexText(element, source) {
+    const parts = leanPaneView.formatLiteLatexText(source);
+    if (parts.length === 0) {
+      element.appendChild(document.createTextNode(source || ""));
+      return;
+    }
+    for (const part of parts) {
+      if (!Array.isArray(part.marks) || part.marks.length === 0) {
+        element.appendChild(document.createTextNode(part.text));
+        continue;
+      }
+      const span = document.createElement("span");
+      span.className = part.marks
+        .map((mark) => `ol-lean-project-latex-${mark}`)
+        .join(" ");
+      span.textContent = part.text;
+      element.appendChild(span);
     }
   }
 
@@ -2108,7 +2456,8 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-formalize-button";
-    button.textContent = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+    const idleLabel = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+    button.textContent = idleLabel;
     button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -2119,7 +2468,11 @@
         await refreshLeanPaneNow({ background: true });
       } catch (error) {
         button.disabled = false;
-        button.textContent = "Retry formalize";
+        // Startup can be rejected before Lea creates a run (for example when a
+        // declared upstream theorem has not been formalized yet). Keep the
+        // action consistent with the manifest state rather than implying an
+        // initial formalization effort occurred.
+        button.textContent = idleLabel;
         if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
       }
     });
@@ -2418,7 +2771,13 @@
     renderChatPanel();
     try {
       // Flush the latest .tex mirror so Lea sees current source before answering.
-      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const mirrorResult = await syncTexMirrorNow({ force: true });
+      leanPaneChatTarget = {
+        ...leanPaneChatTarget,
+        ...(await buildFormalizationSourceContext(leanPaneChatTarget, {
+          verifyMirror: mirrorResult?.disabled !== true
+        }))
+      };
       const baseUrl = await chatCompanionBaseUrl();
       const response = await fetch(`${baseUrl}/lean-pane/chat/message`, {
         method: "POST",
@@ -2805,7 +3164,7 @@
     const leanStatement = popover.querySelector(".ol-lean-popover-lean");
     const stubbedWarning = popover.querySelector(".ol-lean-popover-warning");
     const statusInfo = latestStatuses[key] || {};
-    const currentStatus = statusInfo.status || "unknown";
+    const currentStatus = getDisplayStatus(statusInfo);
     const actionStatus = getActionStatus(statusInfo);
     renderLeanStatement(leanStatement, statusInfo.leanStatement || "");
     renderTargetWarning(stubbedWarning, target, statusInfo);
@@ -3032,7 +3391,16 @@
         run: formalize
       }];
     }
-    if (status === "formalized" || status === "unknown") {
+    if (status === "formalized" || status === "defined" || status === "disproved") {
+      return [{
+        role: "theorem-action",
+        label: definition ? "Regenerate definition" : "Re-formalize",
+        primary: true,
+        pendingText: "Starting Lea...",
+        run: formalize
+      }];
+    }
+    if (status === "unknown") {
       return [{
         role: "theorem-action",
         label: "Check status",
@@ -3151,7 +3519,7 @@
           </label>
           <label class="ol-lean-checkbox-field">
             <input type="checkbox" data-role="tex-mirror">
-            <span>Mirror Overleaf .tex into the project</span>
+            <span>Mirror Overleaf LaTeX sources into the project</span>
           </label>
           <button type="button" class="ol-lean-save-button" data-role="save-settings" disabled>Save changes</button>
         </section>
@@ -3319,7 +3687,7 @@
     const key = targetKey(target);
     if (!popover || popover.dataset.targetKey !== key) return;
     const statusInfo = latestStatuses[key] || { status: "unknown" };
-    const currentStatus = statusInfo.status || "unknown";
+    const currentStatus = getDisplayStatus(statusInfo);
     const actionStatus = getActionStatus(statusInfo);
     const chip = popover.querySelector(".ol-lean-status-chip");
     const detail = popover.querySelector(".ol-lean-popover-detail");
@@ -3355,10 +3723,55 @@
     renderTargetWarning(stubbedWarning, target, statusInfo);
   }
 
+  async function buildFormalizationSourceContext(target, { verifyMirror = true } = {}) {
+    const sourceFile = normalizeDocPath(target?.sourceFile || latestActiveTexPath);
+    const candidates = [
+      ...(Array.isArray(lastMirrorFiles) ? lastMirrorFiles : []),
+      ...(Array.isArray(lastLeanPaneFiles) ? lastLeanPaneFiles : [])
+    ];
+    // The editor buffer is authoritative for the active file, including when
+    // mirroring has just been disabled and the cached mirror may be older.
+    let source = sourceFile && normalizeDocPath(latestActiveTexPath) === sourceFile
+      ? { path: sourceFile, content: latestActiveTex }
+      : candidates.find((file) => normalizeDocPath(file?.path) === sourceFile);
+    const content = typeof source?.content === "string" ? source.content : "";
+    const sourceStartLine = Math.max(1, Number(target?.sourceStartLine) || 1);
+    const sourceEndLine = Math.max(sourceStartLine, Number(target?.sourceEndLine) || sourceStartLine);
+    const lines = content.split(/\r?\n/);
+    const excerptStartLine = Math.max(1, sourceStartLine - TARGET_CONTEXT_RADIUS_LINES);
+    const excerptEndLine = Math.min(lines.length, sourceEndLine + TARGET_CONTEXT_RADIUS_LINES);
+    let sourceExcerpt = content
+      ? lines.slice(excerptStartLine - 1, excerptEndLine).join("\n")
+      : "";
+    if (sourceExcerpt.length > TARGET_CONTEXT_MAX_CHARS) {
+      sourceExcerpt = `${sourceExcerpt.slice(0, TARGET_CONTEXT_MAX_CHARS)}\n[excerpt truncated]`;
+    }
+    const uniqueFiles = new Map();
+    for (const file of candidates) {
+      const normalized = normalizeDocPath(file?.path);
+      if (normalized && !uniqueFiles.has(normalized)) uniqueFiles.set(normalized, String(file?.content ?? ""));
+    }
+    return {
+      sourceFile,
+      sourceStartLine,
+      sourceEndLine,
+      mirroredSourcePath: sourceFile ? `.lea/files/overleaf/${sourceFile}` : "",
+      sourceFileHash: content && verifyMirror ? await sha256(content) : "",
+      mirrorAvailable: verifyMirror,
+      sourceExcerpt,
+      sourceExcerptStartLine: sourceExcerpt ? excerptStartLine : null,
+      sourceExcerptEndLine: sourceExcerpt ? excerptEndLine : null,
+      sourceCorpusFileCount: uniqueFiles.size,
+      sourceCorpusChars: [...uniqueFiles.values()].reduce((total, text) => total + text.length, 0)
+    };
+  }
+
   async function formalize(target) {
-    // Flush any pending .tex mirror so the run's context is current (a no-op when
-    // nothing changed since the last background sync).
-    await syncTexMirrorNow({ force: true }).catch(() => {});
+    // A run must never begin against a mirror that failed to accept the live buffer.
+    const mirrorResult = await syncTexMirrorNow({ force: true });
+    const sourceContext = await buildFormalizationSourceContext(target, {
+      verifyMirror: mirrorResult?.disabled !== true
+    });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/formalize`, {
@@ -3371,9 +3784,11 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        syntax: target.syntax || "comment",
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         projectNamespace: lastProjectIdentity?.namespace || "",
-        sourceHash: await sha256(normalizeTargetText(target.targetText))
+        sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        ...sourceContext
       })
     });
 
@@ -3387,7 +3802,10 @@
   async function stubTheorem(target) {
     // Stubbing also needs the current .tex mirror because statement translation may
     // depend on local notation/definitions in the surrounding document.
-    await syncTexMirrorNow({ force: true }).catch(() => {});
+    const mirrorResult = await syncTexMirrorNow({ force: true });
+    const sourceContext = await buildFormalizationSourceContext(target, {
+      verifyMirror: mirrorResult?.disabled !== true
+    });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const response = await fetch(`${baseUrl}/stub`, {
@@ -3400,9 +3818,11 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        syntax: target.syntax || "comment",
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         projectNamespace: lastProjectIdentity?.namespace || "",
-        sourceHash: await sha256(normalizeTargetText(target.targetText))
+        sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        ...sourceContext
       })
     });
 
@@ -3415,12 +3835,13 @@
 
   // Build the full per-item payload /stub and /formalize expect (the same shape
   // the single-item formalize() sends), for every item a batch will run over.
-  async function buildBatchTargetPayloads(items) {
+  async function buildBatchTargetPayloads(items, { verifyMirror = true } = {}) {
     const overleafProjectId = extractOverleafProjectId();
     const projectName = lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []);
     const projectNamespace = lastProjectIdentity?.namespace || "";
     return Promise.all(items.map(async (item) => {
       const target = leanPaneView.paneItemToFormalizeTarget(item);
+      const sourceContext = await buildFormalizationSourceContext(target, { verifyMirror });
       return {
         overleafProjectId,
         targetKind: target.targetKind,
@@ -3428,9 +3849,11 @@
         targetText: target.targetText,
         targetUses: target.targetUses || [],
         targetContext: target.targetContext || "",
+        syntax: target.syntax || "comment",
         projectName,
         projectNamespace,
-        sourceHash: await sha256(normalizeTargetText(target.targetText))
+        sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        ...sourceContext
       };
     }));
   }
@@ -3444,9 +3867,11 @@
     leanPaneRepairError = null;
     if (items.length === 0) return;
     try {
-      await syncTexMirrorNow({ force: true }).catch(() => {});
+      const mirrorResult = await syncTexMirrorNow({ force: true });
       const baseUrl = await chatCompanionBaseUrl();
-      const payloads = await buildBatchTargetPayloads(items);
+      const payloads = await buildBatchTargetPayloads(items, {
+        verifyMirror: mirrorResult?.disabled !== true
+      });
       const response = await fetch(`${baseUrl}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3455,7 +3880,9 @@
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
       leanPaneRepairBatch = payload;
-      startRepairBatchPolling();
+      leanPaneExpandedBatchQueueId = "";
+      leanPaneExpandedBatchCompletedId = "";
+      startRepairBatchPolling({ immediate: true });
     } catch (error) {
       leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
     }
@@ -3506,7 +3933,9 @@
         targets: latestTargets.map((target) => ({
           targetKind: target.targetKind,
           targetLabel: target.targetLabel,
-          targetText: target.targetText
+          targetText: target.targetText,
+          targetUses: target.targetUses || [],
+          targetContext: target.targetContext || ""
         }))
       })
     });
@@ -3515,7 +3944,12 @@
     if (!response.ok) {
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
-    postStatuses(withFallbackStatuses(payload.statuses || {}));
+    const statuses = withFallbackStatuses(payload.statuses || {});
+    await reconcileHumanApprovals(latestTargets.map((target) => ({
+      target,
+      statusInfo: statuses[targetKey(target)]
+    })));
+    postStatuses(statuses);
     if (activePopover?.dataset.targetKey) {
       const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
       if (target) updatePopoverStatus(activePopover, target);
@@ -3547,7 +3981,11 @@
 
     if (texMirrorSyncPromise) {
       // Coalesce with an in-flight sync; its result may already be current.
-      await texMirrorSyncPromise.catch(() => {});
+      if (force) {
+        await texMirrorSyncPromise;
+      } else {
+        await texMirrorSyncPromise.catch(() => {});
+      }
     }
 
     const projectId = latestActiveTexProjectId || extractOverleafProjectId();
@@ -3565,7 +4003,7 @@
     }
 
     const settings = await loadCompanionSettings();
-    if (settings.leaTexMirrorEnabled === false) return null;
+    if (settings.leaTexMirrorEnabled === false) return { disabled: true };
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
 
     texMirrorSyncPromise = (async () => {
@@ -3614,7 +4052,15 @@
       // divergence self-heals without a zip per formalize.
       const needFetch = !cacheUsable || !activeKnown ||
         Date.now() - lastTexMirrorFullSyncAt > TEX_MIRROR_FULL_SYNC_INTERVAL_MS;
-      const files = needFetch ? await collectProjectTexFiles(projectId) : lastMirrorFiles;
+      const files = needFetch
+        ? await collectProjectTexFiles(projectId)
+        : lastMirrorFiles.map((file) => ({ ...file }));
+      // A forced formalize flush can arrive before the edit debounce. Even with a
+      // healthy full-project cache, the live editor buffer is authoritative.
+      if (activeRel && typeof latestActiveTex === "string") {
+        const active = files.find((file) => file.path === activeRel);
+        if (active) active.content = latestActiveTex;
+      }
       const response = await fetch(`${baseUrl}/mirror-tex`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3649,8 +4095,8 @@
       throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
     }
     const buffer = await response.arrayBuffer();
-    const { extractTexFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
-    const files = await extractTexFromZip(buffer);
+    const { extractLatexSourcesFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
+    const files = await extractLatexSourcesFromZip(buffer);
 
     if (latestActiveTexPath && typeof latestActiveTex === "string") {
       // Override only an entry that already exists in the archive — never invent a
@@ -3672,6 +4118,150 @@
       };
     }
     postStatuses(statuses);
+  }
+
+  function paneItemApprovalTarget(item) {
+    return {
+      targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+      targetLabel: item?.label || item?.leanDeclarationName || ""
+    };
+  }
+
+  function humanApprovalKey(target) {
+    return `${extractOverleafProjectId()}:${targetKey(target)}`;
+  }
+
+  function humanApprovalRecord(target) {
+    return humanApprovals[humanApprovalKey(target)] || null;
+  }
+
+  function isHumanApproved(target, statusInfo) {
+    const record = humanApprovalRecord(target);
+    return Boolean(
+      record
+      && statusInfo?.approvalEligible
+      && statusInfo?.approvalRevision
+      && record.revision === statusInfo.approvalRevision
+    );
+  }
+
+  async function loadHumanApprovals() {
+    if (humanApprovalsLoadPromise) return humanApprovalsLoadPromise;
+    humanApprovalsLoadPromise = (async () => {
+      if (isExtensionContextInvalidated() || !chrome.storage?.local) {
+        humanApprovals = {};
+        return humanApprovals;
+      }
+      const stored = await chrome.storage.local.get({ [HUMAN_APPROVAL_STORAGE_KEY]: {} });
+      const value = stored?.[HUMAN_APPROVAL_STORAGE_KEY];
+      humanApprovals = value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+      return humanApprovals;
+    })().catch(() => {
+      humanApprovals = {};
+      return humanApprovals;
+    });
+    return humanApprovalsLoadPromise;
+  }
+
+  async function persistHumanApprovals() {
+    if (isExtensionContextInvalidated() || !chrome.storage?.local) return;
+    await chrome.storage.local.set({ [HUMAN_APPROVAL_STORAGE_KEY]: humanApprovals });
+  }
+
+  async function reconcileHumanApprovals(entries) {
+    await loadHumanApprovals();
+    let changed = false;
+    for (const { target, statusInfo } of entries || []) {
+      if (!target?.targetLabel) continue;
+      const key = humanApprovalKey(target);
+      const record = humanApprovals[key];
+      if (!record) continue;
+      if (
+        !statusInfo?.approvalEligible
+        || !statusInfo?.approvalRevision
+        || record.revision !== statusInfo.approvalRevision
+      ) {
+        delete humanApprovals[key];
+        changed = true;
+      }
+    }
+    if (changed) await persistHumanApprovals();
+    return changed;
+  }
+
+  async function toggleHumanApproval(target, statusInfo) {
+    await loadHumanApprovals();
+    const key = humanApprovalKey(target);
+    if (humanApprovalBusyKeys.has(key)) return;
+    humanApprovalBusyKeys.add(key);
+    renderApprovalSurfaces();
+    try {
+      if (isHumanApproved(target, statusInfo)) {
+        delete humanApprovals[key];
+      } else {
+        if (!statusInfo?.approvalEligible || !statusInfo?.approvalRevision) return;
+        humanApprovals[key] = {
+          revision: statusInfo.approvalRevision,
+          approvedAt: new Date().toISOString()
+        };
+      }
+      await persistHumanApprovals();
+    } finally {
+      humanApprovalBusyKeys.delete(key);
+      renderApprovalSurfaces();
+    }
+  }
+
+  function renderApprovalSurfaces() {
+    renderStatusBadges();
+    if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
+    if (activePopover?.dataset.targetKey) {
+      const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
+      if (target) updatePopoverStatus(activePopover, target);
+    }
+  }
+
+  function handleHumanApprovalStorageChanged(changes, areaName) {
+    if (areaName !== "local" || !changes?.[HUMAN_APPROVAL_STORAGE_KEY]) return;
+    const next = changes[HUMAN_APPROVAL_STORAGE_KEY].newValue;
+    humanApprovals = next && typeof next === "object" && !Array.isArray(next) ? { ...next } : {};
+    humanApprovalsLoadPromise = Promise.resolve(humanApprovals);
+    renderApprovalSurfaces();
+  }
+
+  function createHumanApprovalButton(target, statusInfo, { pane = false } = {}) {
+    const approved = isHumanApproved(target, statusInfo);
+    const key = humanApprovalKey(target);
+    const busy = humanApprovalBusyKeys.has(key);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = [
+      "ol-lean-human-approval",
+      pane ? "ol-lean-human-approval-pane" : "ol-lean-human-approval-source",
+      approved ? "ol-lean-human-approval-approved" : ""
+    ].filter(Boolean).join(" ");
+    button.textContent = "✓";
+    button.disabled = busy || !approved && !statusInfo?.approvalEligible;
+    button.setAttribute("aria-pressed", String(approved));
+    button.setAttribute(
+      "aria-label",
+      approved
+        ? `Remove personal approval for ${target.targetLabel}`
+        : `Mark ${target.targetLabel} as personally audited and approved`
+    );
+    button.title = busy
+      ? "Saving personal approval…"
+      : approved
+        ? "Personally audited and approved. Click to remove."
+        : statusInfo?.approvalEligible
+          ? "Mark this exact proof and its current dependencies as personally audited."
+          : statusInfo?.approvalIneligibleReason || "Personal approval is unavailable for this item.";
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleHumanApproval(target, statusInfo).catch(() => {});
+    });
+    return button;
   }
 
   function postStatuses(statuses) {
@@ -3727,7 +4317,7 @@
       const coords = target.coords;
       if (!coords) continue;
       const statusInfo = latestStatuses[targetKey(target)] || { status: "unknown" };
-      const status = statusInfo.status || "unknown";
+      const status = getDisplayStatus(statusInfo);
       const badge = document.createElement("button");
       badge.className = `ol-lean-status ol-lean-status-${status}`;
       badge.type = "button";
@@ -3747,7 +4337,10 @@
       }
       const stubbedUsesLabel = hasStubbedTheoremUses(statusInfo) ? " warning: proof uses sorry-stubbed support" : "";
       const statusLabel = `${formatStatus(status, statusInfo)}${turnProgress.label ? ` ${turnProgress.label}` : ""}${stubbedUsesLabel}`;
-      badge.title = statusInfo.message || `Lean status for ${target.targetLabel}: ${statusLabel}`;
+      badge.title = statusInfo.sourceFreshness === "stale"
+        ? statusInfo.sourceFreshnessMessage
+          || "The LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+        : statusInfo.message || `Lean status for ${target.targetLabel}: ${statusLabel}`;
       badge.setAttribute("aria-label", `Open Lea popover for ${target.targetLabel}. Status: ${statusLabel}.`);
       badge.style.left = `${Math.min(coords.left + 8, window.innerWidth - 140)}px`;
       badge.style.top = `${coords.top}px`;
@@ -3757,6 +4350,16 @@
         showTargetPopover(event.clientX, event.clientY, target);
       });
       badgeLayer.appendChild(badge);
+      if (
+        Object.prototype.hasOwnProperty.call(statusInfo, "approvalEligible")
+        || Boolean(statusInfo.approvalRevision)
+      ) {
+        const approval = createHumanApprovalButton(target, statusInfo);
+        const badgeRect = badge.getBoundingClientRect();
+        approval.style.left = `${Math.min(badgeRect.right + 4, window.innerWidth - 24)}px`;
+        approval.style.top = `${coords.top}px`;
+        badgeLayer.appendChild(approval);
+      }
     }
   }
 
@@ -3771,6 +4374,8 @@
         return "in progress";
       case "formalized":
         return "formalized";
+      case "stale":
+        return "out of date";
       case "defined":
         return "defined";
       case "disproved":
@@ -3840,13 +4445,23 @@
 
   function renderTargetWarning(element, target, statusInfo) {
     if (!element) return;
+    const warnings = [];
+    if (statusInfo?.sourceFreshness === "stale") {
+      warnings.push(
+        statusInfo.sourceFreshnessMessage
+        || "The LaTeX source changed after this Lean artifact was generated. Re-formalize to synchronize it."
+      );
+    }
     const uses = getStubbedTheoremUses(statusInfo);
     if (uses.length > 0) {
-      renderStubbedTheoremUsesWarning(element, statusInfo);
-      return;
+      const names = uses.map((use) => use.declarationName || use.targetLabel).filter(Boolean).join(", ");
+      const plural = uses.length !== 1;
+      warnings.push(plural
+        ? `Proof uses supporting theorems ${names}, which have been sorry stubbed but not fully formalized.`
+        : `Proof uses supporting theorem ${names}, which has been sorry stubbed but not fully formalized.`);
     }
-    element.hidden = true;
-    element.textContent = "";
+    element.hidden = warnings.length === 0;
+    element.textContent = warnings.join(" ");
   }
 
   function getStubbedTheoremUses(statusInfo) {
@@ -3874,6 +4489,8 @@
       case "formalized":
       case "defined":
       case "disproved":
+      case "stale":
+        return definition ? "Regenerate definition" : "Re-formalize";
       case "unknown":
         return "Check status";
       case "sorry_stub":
@@ -3884,10 +4501,19 @@
   }
 
   function getActionStatus(statusInfo) {
+    if (statusInfo?.sourceFreshness === "stale") {
+      return "stale";
+    }
     if (statusInfo?.status === "failed") {
       return statusInfo.effectiveStatus || "unformalized";
     }
     return statusInfo?.status || "unknown";
+  }
+
+  function getDisplayStatus(statusInfo) {
+    return statusInfo?.sourceFreshness === "stale"
+      ? "stale"
+      : statusInfo?.status || "unknown";
   }
 
   function canViewInLeaUi(status) {

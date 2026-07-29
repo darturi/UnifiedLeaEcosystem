@@ -68,6 +68,36 @@ test("targets without coordinates do not render floating status badges", async (
   assert.equal(harness.hasButtonText("unformalized"), false);
 });
 
+test("a source-stale formalization is labeled out of date on the LaTeX badge and in its popover", async () => {
+  const harness = createContentHarness({
+    status: "formalized",
+    sourceFreshness: "stale",
+    sourceFreshnessMessage: "The LaTeX source changed after this Lean artifact was generated.",
+    leaSessionId: "sess-stale"
+  });
+  await harness.loadStatusForVisibleTheorem();
+
+  assert.equal(harness.hasButtonText("out of date"), true);
+  harness.openTargetPopover();
+  assert.match(harness.bodyText(), /LaTeX source changed after this Lean artifact was generated/);
+  assert.equal(harness.hasButtonText("Re-formalize"), true);
+  assert.equal(harness.hasViewInLeaUiButton(), true);
+});
+
+test("a current formalization still offers Re-formalize in its popover", async () => {
+  const harness = createContentHarness({
+    status: "formalized",
+    sourceFreshness: "current",
+    leaSessionId: "sess-current"
+  });
+  await harness.loadStatusForVisibleTheorem();
+
+  harness.openTargetPopover();
+  assert.equal(harness.hasButtonText("Re-formalize"), true);
+  assert.equal(harness.hasButtonText("Check status"), false);
+  assert.equal(harness.hasViewInLeaUiButton(), true);
+});
+
 test("definition targets use definition copy and do not show Stub", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -95,6 +125,102 @@ test("definition success renders a defined badge", async () => {
 
   assert.equal(harness.hasButtonText("defined"), true);
   assert.equal(harness.hasButtonText("formalized"), false);
+});
+
+test("personal approval toggles in browser-local storage and updates the source badge", async () => {
+  const status = {
+    status: "formalized",
+    approvalEligible: true,
+    approvalRevision: "revision-1",
+    approvalIneligibleReason: ""
+  };
+  const harness = createContentHarness(status);
+  await harness.loadVisibleTheorems();
+
+  assert.equal(
+    harness.hasButtonLabel("Mark demo_theorem as personally audited and approved"),
+    true
+  );
+  harness.clickButtonLabel("Mark demo_theorem as personally audited and approved");
+  await flushPromises();
+
+  const key = "project-1:theorem:demo_theorem";
+  assert.equal(harness.localStorageState.leaHumanApprovalsV1[key].revision, "revision-1");
+  assert.equal(harness.hasButtonLabel("Remove personal approval for demo_theorem"), true);
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 1);
+
+  harness.clickButtonLabel("Remove personal approval for demo_theorem");
+  await flushPromises();
+  assert.equal(harness.localStorageState.leaHumanApprovalsV1[key], undefined);
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 0);
+});
+
+test("a changed approval revision automatically removes the local note without resurrecting it", async () => {
+  const key = "project-1:theorem:demo_theorem";
+  const harness = createContentHarness(
+    {
+      status: "formalized",
+      approvalEligible: true,
+      approvalRevision: "revision-new",
+      approvalIneligibleReason: ""
+    },
+    {},
+    {
+      localStorage: {
+        leaHumanApprovalsV1: {
+          [key]: { revision: "revision-old", approvedAt: "2026-07-01T00:00:00.000Z" }
+        }
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  assert.equal(harness.localStorageState.leaHumanApprovalsV1[key], undefined);
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 0);
+  assert.equal(
+    harness.hasButtonLabel("Mark demo_theorem as personally audited and approved"),
+    true
+  );
+});
+
+test("the Lean pane shows the same stored approval as the in-source tag", async () => {
+  const approval = {
+    approvalEligible: true,
+    approvalRevision: "shared-revision",
+    approvalIneligibleReason: ""
+  };
+  const item = {
+    id: "theorem:demo_theorem:0",
+    kind: "theorem",
+    label: "demo_theorem",
+    status: "valid",
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageRendered: "A theorem.",
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    leanDeclarationName: "demo_theorem",
+    leanArtifactContent: "theorem demo_theorem : True := by trivial",
+    ...approval
+  };
+  const harness = createContentHarness(
+    { status: "formalized", ...approval },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [item], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickButtonLabel("Mark demo_theorem as personally audited and approved");
+  await flushPromises();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.equal(harness.countSelector(".ol-lean-human-approval-approved"), 2);
+  assert.equal(harness.hasButtonLabel("Remove personal approval for demo_theorem"), true);
 });
 
 test("Lean pane trigger opens a project pane and renders manifest items", async () => {
@@ -325,14 +451,18 @@ test("Lean pane file rows render proportional progress segments", async () => {
 
   const [progress] = harness.paneProgresses();
   assert.equal(progress.role, "img");
-  assert.equal(progress.label, "main.tex: 8 Lea items, 3 successful, 1 sorry-stubbed, 1 failed, 3 unformalized, 1 in progress.");
+  assert.equal(progress.label, "main.tex: 8 Lea items, 3 successful, 1 sorry-stubbed, 1 failed, 1 out of date, 2 unformalized, 1 in progress.");
   assert.equal(progress.inProgress, true);
   assert.deepEqual(progress.segments.map((segment) => [segment.bucket, segment.count, segment.width]), [
     ["success", "3", "37.5%"],
     ["sorry-stubbed", "1", "12.5%"],
     ["failed", "1", "12.5%"],
-    ["unformalized", "3", "37.5%"]
+    ["out-of-date", "1", "12.5%"],
+    ["unformalized", "2", "25%"]
   ]);
+
+  harness.clickPaneTreeRowText("main.tex");
+  assert.match(harness.bodyText(), /Out of date.*LaTeX changed after this Lean artifact was generated/i);
 });
 
 test("Lean pane polling refresh preserves expanded folder and file rows", async () => {
@@ -478,6 +608,95 @@ test("Lean pane renders lightweight math and highlighted Lean code", async () =>
   assert.equal(harness.hasButtonLabel("Copy stub"), true);
   assert.equal(harness.hasButtonLabel("Copy artifact"), true);
   assert.ok(harness.countSelector(".ol-lean-project-lean-com") >= 1);
+});
+
+test("Lean pane uses KaTeX for standard notation and styles surrounding LaTeX prose", async () => {
+  const renderCalls = [];
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      katex: {
+        render(source, element, options) {
+          renderCalls.push({ source, options });
+          const rendered = element.appendChild(new FakeElement("span"));
+          rendered.className = "katex";
+          rendered.textContent = source.replace("\\triangleq", "≜");
+        }
+      },
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "definition:notation:0",
+          kind: "definition",
+          label: "notation",
+          title: "Notation",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageLatex: "Set $f(x) \\triangleq x^2$ and call it \\emph{canonical}.",
+          leanKind: "def",
+          leanDeclarationName: "notation"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.equal(renderCalls.length, 1);
+  assert.equal(renderCalls[0].source, "f(x) \\triangleq x^2");
+  assert.equal(renderCalls[0].options.trust, false);
+  assert.equal(renderCalls[0].options.throwOnError, true);
+  assert.equal(renderCalls[0].options.output, "htmlAndMathml");
+  assert.equal(harness.countSelector(".katex"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-latex-em"), 1);
+  assert.match(harness.bodyText(), /f\(x\) ≜ x\^2 and call it canonical\./);
+});
+
+test("Lean pane preserves readable math when KaTeX rejects an expression", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      katex: {
+        render() {
+          throw new Error("Undefined control sequence");
+        }
+      },
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:fallback:0",
+          kind: "theorem",
+          label: "fallback",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 3,
+          naturalLanguageLatex: "Assume $\\ProjectSpecific x \\subseteq X$.",
+          leanKind: "theorem",
+          leanDeclarationName: "fallback"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.equal(harness.countSelector(".ol-lean-project-math-fallback"), 1);
+  assert.match(harness.bodyText(), /\\ProjectSpecific x ⊆ X/);
 });
 
 test("Lean pane 'Go to source' posts a navigate message with the item's offsets", async () => {
@@ -696,6 +915,214 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   assert.equal(body.targetContext, "Use the helper.");
   assert.equal(body.projectName, "Test Project");
   assert.equal(body.projectNamespace, "Lea.TestProject");
+  assert.equal(body.sourceFile, "main.tex");
+  assert.equal(body.sourceStartLine, 1);
+  assert.equal(body.sourceEndLine, 4);
+  assert.equal(body.mirroredSourcePath, ".lea/files/overleaf/main.tex");
+  assert.match(body.sourceExcerpt, /A theorem\./);
+});
+
+test("Lean pane keeps Formalize after an upstream dependency blocks startup", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeError: "Formalize referenced theorem first: helper_lemma.",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          formalizable: true,
+          targetUses: ["helper_lemma"]
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.equal(harness.hasButtonText("Formalize"), true);
+  assert.equal(harness.hasButtonText("Retry formalize"), false);
+  assert.match(harness.bodyText(), /Formalize referenced theorem first: helper_lemma\./);
+});
+
+test("Formalize all renders an accessible, collapsible queue with active turn progress", async () => {
+  const items = Array.from({ length: 8 }, (_unused, index) => {
+    const number = index + 1;
+    return {
+      id: `theorem:t${number}:${index}`,
+      kind: "theorem",
+      label: `t${number}`,
+      status: "missing-stub",
+      sourceFile: "main.tex",
+      sourceStartLine: number,
+      sourceEndLine: number,
+      naturalLanguageLatex: `Theorem ${number}.`,
+      leanKind: "theorem",
+      leanDeclarationName: `t${number}`,
+      formalizable: true,
+      ...(number === 4 ? { turnProgress: { current: 7, max: 20 } } : {})
+    };
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items, diagnostics: [] },
+      targetBatch: {
+        ok: true,
+        batchId: "formalize-batch-1",
+        operation: "formalize",
+        done: false,
+        running: true,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "t1", state: "formalized" },
+          { targetKind: "theorem", targetLabel: "t2", state: "formalized" },
+          { targetKind: "theorem", targetLabel: "t3", state: "formalized" },
+          // Initial launch snapshots can still report the first dispatch as
+          // pending even though the batch loop itself is already running.
+          { targetKind: "theorem", targetLabel: "t4", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t5", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t6", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t7", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t8", state: "pending" }
+        ]
+      }
+    }
+  );
+
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Formalize all (8)");
+  await flushPromises();
+
+  let queue = harness.batchQueue();
+  assert.ok(queue, "expected a batch queue card");
+  assert.deepEqual(queue.progress, {
+    role: "progressbar",
+    label: "Formalize all: 3 of 8 completed.",
+    min: "0",
+    max: "8",
+    now: "3"
+  });
+  assert.match(queue.text, /Current · 4 of 8●t4Formalizing… · Lea turn 7 of 20/);
+  assert.equal(queue.pendingCount, 3, "only the next three queued items start expanded");
+  assert.equal(queue.completedCount, 0, "completed work starts collapsed");
+  assert.match(queue.text, /t5Queued · position 5 of 8/);
+  assert.match(queue.text, /\+1 more queued/);
+  assert.match(queue.text, /Show 3 completed/);
+
+  harness.clickButtonText("+1 more queued");
+  queue = harness.batchQueue();
+  assert.equal(queue.pendingCount, 4);
+  assert.match(queue.text, /t8Queued · position 8 of 8/);
+
+  harness.clickButtonText("Show 3 completed");
+  queue = harness.batchQueue();
+  assert.equal(queue.completedCount, 3);
+  assert.match(queue.text, /t1formalized and verified\./);
+  assert.match(queue.text, /Hide 3 completed/);
+});
+
+test("stopping a batch preserves a completed race winner and reports stopped items separately", async () => {
+  const items = Array.from({ length: 4 }, (_unused, index) => {
+    const number = index + 1;
+    return {
+      id: `theorem:stop_t${number}:${index}`,
+      kind: "theorem",
+      label: `stop_t${number}`,
+      status: "missing-stub",
+      sourceFile: "main.tex",
+      sourceStartLine: number,
+      sourceEndLine: number,
+      naturalLanguageLatex: `Stop theorem ${number}.`,
+      leanKind: "theorem",
+      leanDeclarationName: `stop_t${number}`,
+      formalizable: true
+    };
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items, diagnostics: [] },
+      targetBatch: {
+        ok: true,
+        batchId: "formalize-stop-race",
+        operation: "formalize",
+        done: false,
+        running: true,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "stop_t1", state: "running" },
+          { targetKind: "theorem", targetLabel: "stop_t2", state: "pending" },
+          { targetKind: "theorem", targetLabel: "stop_t3", state: "pending" },
+          { targetKind: "theorem", targetLabel: "stop_t4", state: "pending" }
+        ]
+      },
+      batchCancel: {
+        ok: true,
+        batchId: "formalize-stop-race",
+        operation: "formalize",
+        done: true,
+        canceled: true,
+        running: false,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "stop_t1", state: "formalized" },
+          { targetKind: "theorem", targetLabel: "stop_t2", state: "canceled" },
+          { targetKind: "theorem", targetLabel: "stop_t3", state: "canceled" },
+          { targetKind: "theorem", targetLabel: "stop_t4", state: "canceled" }
+        ]
+      }
+    }
+  );
+
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Formalize all (4)");
+  await flushPromises();
+  harness.clickButtonText("Stop");
+  await flushPromises();
+
+  let queue = harness.batchQueue();
+  assert.match(queue.text, /Formalize allStopped1 complete · 3 stopped/);
+  assert.deepEqual(queue.progress, {
+    role: "progressbar",
+    label: "Formalize all: 1 of 4 completed, 3 stopped.",
+    min: "0",
+    max: "4",
+    now: "1"
+  });
+  assert.deepEqual(queue.progressSegments, ["success", "canceled", "canceled", "canceled"]);
+  assert.match(queue.text, /stop_t2stopped\./);
+  assert.match(queue.text, /Show 1 completed/);
+  harness.clickButtonText("Show 1 completed");
+  queue = harness.batchQueue();
+  assert.match(queue.text, /stop_t1formalized and verified\./);
+  assert.doesNotMatch(queue.text, /stop_t1stopped\./);
 });
 
 // --- Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md) ----------
@@ -855,6 +1282,8 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const confirmCalls = [];
   const storageSetCalls = [];
   const storageState = { ...(options.storage || {}) };
+  const localStorageState = { ...(options.localStorage || {}) };
+  const storageChangeListeners = [];
   let nextTimerId = 1;
 
   const window = {
@@ -906,6 +1335,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const context = {
     URL,
     TextEncoder,
+    katex: options.katex,
     clearTimeout(id) {
       const index = timers.findIndex((timer) => timer.id === id);
       if (index !== -1) timers.splice(index, 1);
@@ -921,12 +1351,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
       const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
+      const failingFormalize = Boolean(options.formalizeError) && String(url).endsWith("/formalize");
       return {
-        ok: !failingRepairStart,
-        status: failingRepairStart ? 502 : 200,
+        ok: !failingRepairStart && !failingFormalize,
+        status: failingRepairStart || failingFormalize ? 400 : 200,
         async json() {
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
+          }
+          if (failingFormalize) {
+            return { ok: false, error: "unresolved_uses", message: options.formalizeError };
           }
           if (String(url).includes("/project/identity?")) {
             return {
@@ -946,6 +1380,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
             return typeof options.manifest === "function"
               ? options.manifest(fetchCalls)
               : options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
+          }
+          if (String(url).includes("/formalize/all") || String(url).includes("/stub/all")) {
+            return options.targetBatch || {
+              ok: true,
+              batchId: "target-batch-1",
+              operation: String(url).includes("/stub/all") ? "stub" : "formalize",
+              done: false,
+              pausedOn: null,
+              items: []
+            };
           }
           if (String(url).includes("/formalize")) {
             return { jobId: "job-1", status: "in_progress" };
@@ -973,6 +1417,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
           }
           if (String(url).includes("/lean-pane/repair/start")) {
             return options.repairStart || { status: "in_progress", jobId: "repair-job-1" };
+          }
+          if (String(url).includes("/lean-pane/repair/all/cancel")) {
+            return options.batchCancel || options.repairAll || { ok: true, batchId: "batch-1", done: true, canceled: true, pausedOn: null, items: [] };
           }
           if (String(url).includes("/lean-pane/repair/all/continue")) {
             return options.repairContinue || options.repairAll || { ok: true, batchId: "batch-1", done: false, pausedOn: null, items: [] };
@@ -1015,6 +1462,25 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
           async set(values) {
             storageSetCalls.push({ ...values });
             Object.assign(storageState, values);
+          }
+        },
+        local: {
+          async get(defaults) {
+            return { ...defaults, ...localStorageState };
+          },
+          async set(values) {
+            storageSetCalls.push({ ...values });
+            for (const [key, value] of Object.entries(values)) {
+              const oldValue = localStorageState[key];
+              localStorageState[key] = value;
+              const change = { [key]: { oldValue, newValue: value } };
+              for (const listener of storageChangeListeners) listener(change, "local");
+            }
+          }
+        },
+        onChanged: {
+          addListener(listener) {
+            storageChangeListeners.push(listener);
           }
         }
       }
@@ -1173,6 +1639,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     confirmCalls,
     storageSetCalls,
     storageState,
+    localStorageState,
     postedMessages,
     lastStorageSet() {
       return storageSetCalls[storageSetCalls.length - 1] || null;
@@ -1205,6 +1672,28 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               title: segment.title
             }))
         }));
+    },
+    batchQueue() {
+      const queue = document.body.querySelector(".ol-lean-batch-queue");
+      if (!queue) return null;
+      const progress = queue.querySelector(".ol-lean-batch-queue-progress");
+      return {
+        text: queue.textContent,
+        progress: progress ? {
+          role: progress.attributes.role,
+          label: progress.attributes["aria-label"],
+          min: progress.attributes["aria-valuemin"],
+          max: progress.attributes["aria-valuemax"],
+          now: progress.attributes["aria-valuenow"]
+        } : null,
+        progressSegments: progress
+          ? progress.querySelectorAll(".ol-lean-batch-queue-progress-segment")
+            .map((segment) => segment.className.replace("ol-lean-batch-queue-progress-segment ol-lean-batch-queue-progress-", ""))
+          : [],
+        pendingCount: queue.querySelectorAll(".ol-lean-batch-queue-item-pending").length,
+        completedCount: queue.querySelectorAll(".ol-lean-batch-queue-item-completed").length,
+        attentionCount: queue.querySelectorAll(".ol-lean-batch-queue-attention").length
+      };
     },
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");
@@ -1630,10 +2119,10 @@ test("post-save impact summary offers 'Repair all (N)' and posts the batch; the 
   const body = JSON.parse(batchCall.options.body);
   assert.deepEqual(body.items.map((i) => i.targetLabel), ["corollary_a", "corollary_b"]);
 
-  // the live batch panel renders per-item progress
-  assert.match(harness.bodyText(), /Repairing 2 items/);
-  assert.match(harness.bodyText(), /corollary_a: repairing\.\.\./);
-  assert.match(harness.bodyText(), /corollary_b: waiting\./);
+  // the live batch panel renders an ordered queue with the active ordinal
+  assert.match(harness.bodyText(), /Repair allRepairing…0 \/ 2 complete/);
+  assert.match(harness.bodyText(), /Current · 1 of 2●corollary_aRepairing…/);
+  assert.match(harness.bodyText(), /Next○corollary_bQueued · position 2 of 2/);
 });
 
 // --- Stale-offer reconciliation (docs/PLAN-self-repair-stale-offers.md) ----

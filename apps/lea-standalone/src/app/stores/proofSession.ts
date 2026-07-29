@@ -3,6 +3,8 @@ import type {
   ApprovalRecord,
   ChatMessage,
   CodeStep,
+  Formalization,
+  FormalizationCurrentSnapshot,
   RunStatus,
   SafeVerifyResult,
   StatusEvent,
@@ -55,6 +57,21 @@ const apply = <T,>(update: Updater<T>, current: T): T =>
  *   useProofSession.getState().setEditedPath(path);           // write from non-React code
  */
 interface ProofSessionState {
+  formalizations: Formalization[];
+  setFormalizations: (formalizations: Formalization[]) => void;
+  formalizationScope: 'project' | 'new' | string;
+  setFormalizationScope: (scope: 'project' | 'new' | string) => void;
+  composerScopeOverride: 'project' | 'new' | string | null;
+  setComposerScopeOverride: (scope: 'project' | 'new' | string | null) => void;
+  currentFormalizationSnapshot: FormalizationCurrentSnapshot | null;
+  setCurrentFormalizationSnapshot: (
+    snapshot: FormalizationCurrentSnapshot | null
+  ) => void;
+  formalizationRefreshToken: number;
+  bumpFormalizationRefresh: () => void;
+  canvasRevisionMode: 'current' | 'historical';
+  setCanvasRevisionMode: (mode: 'current' | 'historical') => void;
+
   // Canvas-edit nudge (M20): the file the user just edited, prompting a note in
   // the composer. Set after a canvas edit; cleared on send / new session / load.
   editedPath?: string;
@@ -116,6 +133,8 @@ interface ProofSessionState {
   setRunStatusById: (update: Updater<Record<string, string>>) => void;
   runResultKindById: Record<string, string | null | undefined>;
   setRunResultKindById: (update: Updater<Record<string, string | null | undefined>>) => void;
+  runFocusById: Record<string, string | null | undefined>;
+  setRunFocusById: (update: Updater<Record<string, string | null | undefined>>) => void;
 
   // Theorem-approval gate: the approval history (each gains a decision once
   // resolved; M13) + a busy flag while a decision is in flight.
@@ -138,6 +157,21 @@ interface ProofSessionState {
 }
 
 export const useProofSession = create<ProofSessionState>((set) => ({
+  formalizations: [],
+  setFormalizations: (formalizations) => set({ formalizations }),
+  formalizationScope: 'new',
+  setFormalizationScope: (formalizationScope) => set({ formalizationScope }),
+  composerScopeOverride: null,
+  setComposerScopeOverride: (composerScopeOverride) => set({ composerScopeOverride }),
+  currentFormalizationSnapshot: null,
+  setCurrentFormalizationSnapshot: (currentFormalizationSnapshot) =>
+    set({ currentFormalizationSnapshot }),
+  formalizationRefreshToken: 0,
+  bumpFormalizationRefresh: () =>
+    set((state) => ({ formalizationRefreshToken: state.formalizationRefreshToken + 1 })),
+  canvasRevisionMode: 'current',
+  setCanvasRevisionMode: (canvasRevisionMode) => set({ canvasRevisionMode }),
+
   editedPath: undefined,
   setEditedPath: (editedPath) => set({ editedPath }),
 
@@ -176,6 +210,8 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   setRunStatusById: (update) => set((s) => ({ runStatusById: apply(update, s.runStatusById) })),
   runResultKindById: {},
   setRunResultKindById: (update) => set((s) => ({ runResultKindById: apply(update, s.runResultKindById) })),
+  runFocusById: {},
+  setRunFocusById: (update) => set((s) => ({ runFocusById: apply(update, s.runFocusById) })),
 
   approvals: [],
   setApprovals: (update) => set((s) => ({ approvals: apply(update, s.approvals) })),

@@ -48,6 +48,8 @@ MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 ALLOWED_EXT: dict[str, str] = {
     ".pdf": "application/pdf",
     ".tex": "text/x-tex",
+    ".sty": "text/x-tex",
+    ".cls": "text/x-tex",
     ".md": "text/markdown",
     ".txt": "text/plain",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -56,7 +58,7 @@ ALLOWED_EXT: dict[str, str] = {
     ".jpeg": "image/jpeg",
 }
 
-_NATIVE_TEXT = {".tex", ".md", ".txt"}  # Tier 1 — readable as-is
+_NATIVE_TEXT = {".tex", ".sty", ".cls", ".md", ".txt"}  # Tier 1 — readable as-is
 _EXTRACTABLE = {".pdf", ".docx"}        # Tier 2 — extract a .txt sidecar
 # everything else allowed (images) is Tier 3 — stored only
 
@@ -205,8 +207,8 @@ def delete_file(project: dict, proofs_root: Path, file_row: dict) -> bool:
     return store.delete_project_file(file_row["id"])
 
 
-# ── Overleaf .tex mirror (background sync, D27 extended) ───────────────────────────
-# The Overleaf extension mirrors the project's .tex sources into a dedicated subtree
+# ── Overleaf LaTeX-source mirror (background sync, D27 extended) ──────────────────
+# The extension mirrors the project's .tex/.sty/.cls sources into a dedicated subtree
 # of `.lea/files/` so they surface to the prover exactly like an uploaded reference
 # doc — but with UPDATE-by-path semantics (not the `-2`/`-3` collision rename a fresh
 # upload gets) and tagged `kind="overleaf"` so they can never clobber a user upload
@@ -216,6 +218,7 @@ def delete_file(project: dict, proofs_root: Path, file_row: dict) -> bool:
 
 OVERLEAF_KIND = "overleaf"
 OVERLEAF_SUBDIR = "overleaf"  # under .lea/files/
+OVERLEAF_SOURCE_EXTS = {".tex", ".sty", ".cls"}
 
 
 def overleaf_dir(project: dict, proofs_root: Path) -> Path:
@@ -223,12 +226,12 @@ def overleaf_dir(project: dict, proofs_root: Path) -> Path:
     return files_dir(project, proofs_root) / OVERLEAF_SUBDIR
 
 
-# Only mirrored `.tex` sources (and this `.gitignore`) belong in the overleaf subtree.
-# `*` ignores everything; `!*/` lets git descend into nested folders; `!*.tex` re-includes
-# the sources at any depth. This stops commit-on-write (D8, ``git add -A``) from ever
+# Only mirrored LaTeX sources (and this `.gitignore`) belong in the subtree.
+# The allow rules re-include `.tex`, `.sty`, and `.cls` at any depth. This stops
+# commit-on-write (D8, ``git add -A``) from ever
 # capturing LaTeX build artifacts (`.pdf`/`.synctex.gz`/`.aux`/`.log`/`.fls`/`.fdb_latexmk`)
 # that the agent may generate by compiling the mirrored document.
-OVERLEAF_GITIGNORE = "*\n!*/\n!*.tex\n!.gitignore\n"
+OVERLEAF_GITIGNORE = "*\n!*/\n!*.tex\n!*.sty\n!*.cls\n!.gitignore\n"
 
 
 def _gitignore_ok(base: Path) -> bool:
@@ -268,12 +271,14 @@ def _prune_empty_dirs(base: Path) -> None:
 
 
 def _normalize_tex_relpath(path: str) -> str:
-    """An Overleaf-relative path → a safe POSIX subpath under the mirror dir. Rejects
-    absolutes/escapes and non-``.tex``; folds unsafe characters per path segment.
-    Raises :class:`UploadError` on a bad or non-``.tex`` path."""
+    """An Overleaf-relative path → a safe POSIX subpath under the mirror dir."""
     raw = str(path or "").strip().replace("\\", "/").lstrip("/")
-    if not raw.lower().endswith(".tex"):
-        raise UploadError(f"not a .tex path: {path!r}", code="unsupported")
+    if Path(raw).suffix.lower() not in OVERLEAF_SOURCE_EXTS:
+        allowed = ", ".join(sorted(OVERLEAF_SOURCE_EXTS))
+        raise UploadError(
+            f"not a supported LaTeX source path: {path!r} (allowed: {allowed})",
+            code="unsupported",
+        )
     parts: list[str] = []
     for seg in raw.split("/"):
         if seg in ("", "."):
@@ -282,7 +287,7 @@ def _normalize_tex_relpath(path: str) -> str:
             raise UploadError("path escapes the project", code="invalid")
         parts.append(re.sub(r"[^A-Za-z0-9._-]+", "-", seg).strip("-._") or "file")
     if not parts:
-        raise UploadError("empty .tex path", code="invalid")
+        raise UploadError("empty LaTeX source path", code="invalid")
     return "/".join(parts)
 
 
@@ -303,8 +308,8 @@ def _current_mirror(project: dict, proofs_root: Path) -> dict[str, str]:
     base = overleaf_dir(project, proofs_root)
     out: dict[str, str] = {}
     if base.is_dir():
-        for p in sorted(base.rglob("*.tex")):
-            if p.is_file():
+        for p in sorted(base.rglob("*")):
+            if p.is_file() and p.suffix.lower() in OVERLEAF_SOURCE_EXTS:
                 try:
                     out[p.relative_to(base).as_posix()] = p.read_text()
                 except OSError:
@@ -331,7 +336,7 @@ def commit_mirror(project: dict, proofs_root: Path) -> str:
     repo = project_repo_dir(project, proofs_root)
     # The whole mirror subtree is this operation's unit of work, but nothing outside it.
     return GitStore(proofs_root).commit_all(
-        repo, "overleaf: mirror .tex sources", paths=[f".lea/files/{OVERLEAF_SUBDIR}"],
+        repo, "overleaf: mirror LaTeX sources", paths=[f".lea/files/{OVERLEAF_SUBDIR}"],
     )
 
 
@@ -344,13 +349,13 @@ def sync_overleaf_tex(
     mode: str = "reconcile",
 ) -> dict:
     """Reconcile the project's mirrored ``.lea/files/overleaf/**`` against the incoming
-    ``.tex`` set: upsert changed files, index new rows (``kind="overleaf"``), drop rows
+    LaTeX-source set: upsert changed files, index new rows (``kind="overleaf"``), drop rows
     for removed ones. The subtree is treated as **exclusively mirror-owned** — only the
-    incoming ``.tex`` (plus a ``.gitignore``) survive, so any LaTeX build artifacts the
+    incoming sources (plus a ``.gitignore``) survive, so any LaTeX build artifacts the
     agent generated by compiling the document are pruned, and the ``.gitignore`` stops
     commit-on-write from capturing new ones. Idempotent and order-independent.
 
-    Short-circuits to a no-op only when the ``.tex`` are byte-identical to disk AND the
+    Short-circuits to a no-op only when the sources are byte-identical to disk AND the
     subtree is already clean (nothing to prune, ``.gitignore`` present). When
     ``commit=False`` the git commit is deferred to the caller; the returned ``changed``
     flag says whether a commit is needed. Returns a summary dict.
@@ -417,11 +422,13 @@ def sync_overleaf_tex(
         if stored_rel not in existing:
             store.create_project_file(
                 project["id"], filename=rel, stored_path=stored_rel,
-                mime="text/x-tex", kind=OVERLEAF_KIND, extracted_path=None,
+                mime=ALLOWED_EXT.get(Path(rel).suffix.lower(), "text/plain"),
+                kind=OVERLEAF_KIND,
+                extracted_path=None,
             )
 
-    # Reconcile only: prune everything in the subtree that isn't a desired .tex —
-    # build artifacts the agent produced by compiling, plus any .tex removed from
+    # Reconcile only: prune everything that isn't a desired LaTeX source —
+    # build artifacts the agent produced by compiling, plus any source removed from
     # Overleaf (.gitignore kept) — and drop index rows for .tex no longer present.
     # Upsert must never delete: absence just means "not the active buffer".
     pruned = 0

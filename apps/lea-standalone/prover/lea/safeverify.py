@@ -34,6 +34,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+from .imports import direct_imports
+
 PROVER_ROOT = Path(__file__).resolve().parent.parent
 SAFE_VERIFY_DIR = PROVER_ROOT / "third_party" / "SafeVerify"
 WORKSPACE = PROVER_ROOT / "workspace"
@@ -103,6 +105,36 @@ def namespace_context(code: str) -> tuple[str, str]:
     open_block = "".join(f"namespace {n}\n" for n in names) + "\n"
     close_block = "\n" + "".join(f"end {n}\n" for n in reversed(names))
     return open_block, close_block
+
+
+# A target may import only immutable dependencies plus already-built Lea project
+# siblings. Copying an arbitrary model-authored module into the trusted target
+# would defeat SafeVerify's import-superset defense against type redefinitions.
+_TRUSTED_TARGET_IMPORT_ROOTS = frozenset(
+    {"Init", "Lean", "Std", "Batteries", "Mathlib", "Lea"}
+)
+
+
+def trusted_target_import_prelude(code: str) -> str:
+    """Direct imports safe to reproduce in a target derived from ``code``.
+
+    The previous target always used ``import Mathlib``. Because SafeVerify
+    requires the submission's transitive imports to cover the target's closure,
+    that accidentally made every targeted submission unverifiable. Reusing only
+    trusted direct imports keeps the same superset check, but makes its baseline
+    the proof's actual dependency closure rather than the Mathlib barrel.
+
+    `Lea.*` modules are the project's already-built sibling artifacts. The replay
+    path already exposes exactly that build directory through `_replay_env`; they
+    are needed when a project theorem's *statement* mentions a sibling definition.
+    Unknown package roots are deliberately omitted, so they cannot establish the
+    trusted meaning of names in the target signature.
+    """
+    imports: list[str] = []
+    for module in direct_imports(code):
+        if module.split(".", 1)[0] in _TRUSTED_TARGET_IMPORT_ROOTS:
+            imports.append(module)
+    return "".join(f"import {module}\n" for module in imports)
 
 
 # --- the grader (recovered from eval/utils/verify.py) -----------------------

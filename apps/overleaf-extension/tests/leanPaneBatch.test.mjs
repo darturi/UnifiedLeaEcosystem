@@ -10,7 +10,8 @@ import {
   handleStubAll,
   handleFormalizeAll,
   handleBatchCancel,
-  orderTargetsByUses
+  orderTargetsByUses,
+  settleCanceledBatchEntry
 } from "../companion/server.mjs";
 
 const PROJECT = "project-1";
@@ -131,6 +132,25 @@ test("cancel of a still-running batch defers settlement to its loop (reports sto
   assert.equal(res.body.done, false);
   assert.equal(res.body.stopping, true);
   assert.equal(batch.cancelRequested, true);
+});
+
+test("a successful active run that wins the stop race remains completed", () => {
+  const entry = { targetLabel: "winner", state: "running", reason: null, runJobId: null };
+  settleCanceledBatchEntry(entry, { ok: true, state: "formalized", jobId: "job-winner" });
+  assert.deepEqual(entry, {
+    targetLabel: "winner",
+    state: "formalized",
+    reason: null,
+    runJobId: "job-winner"
+  });
+});
+
+test("an interrupted active run becomes canceled", () => {
+  const entry = { targetLabel: "interrupted", state: "running", reason: null, runJobId: "job-interrupted" };
+  settleCanceledBatchEntry(entry, { ok: false, jobId: "job-interrupted" });
+  assert.equal(entry.state, "canceled");
+  assert.equal(entry.reason, "canceled");
+  assert.equal(entry.runJobId, "job-interrupted");
 });
 
 test("orderTargetsByUses ignores uses that are not part of the batch", () => {

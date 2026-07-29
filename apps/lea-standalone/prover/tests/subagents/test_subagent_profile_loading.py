@@ -142,7 +142,8 @@ def test_generalist_has_no_profile_and_keeps_item18_behavior():
     check("generalist toolset excludes spawn_subagent", "spawn_subagent" not in child.tools)
     check("generalist toolset is the built-in default",
           set(child.tools) == {"read_file", "write_file", "edit_file",
-                               "lean_check", "bash", "search_mathlib"})
+                               "lean_check", "bash", "search_mathlib",
+                               "suggest_imports"})
     check("generalist has no role head", child.system_prompt_head is None)
     check("generalist turns are bounded", child.max_turns == DEFAULT_CHILD_MAX_TURNS)
 

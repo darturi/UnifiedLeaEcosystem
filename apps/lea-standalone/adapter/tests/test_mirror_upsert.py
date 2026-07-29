@@ -75,3 +75,18 @@ def test_reconcile_still_prunes_absent_files(tmp_path, monkeypatch):
     assert not (base / "chapters" / "ch1.tex").exists()
     rows = store.list_project_files_by_kind(project["id"], uploads.OVERLEAF_KIND)
     assert len(rows) == 1
+
+
+def test_mirror_accepts_local_style_and_class_sources(tmp_path, monkeypatch):
+    project, proofs_root = _setup(tmp_path, monkeypatch)
+
+    summary = uploads.sync_overleaf_tex(project, proofs_root, [
+        {"path": "main.tex", "content": "\\documentclass{local}"},
+        {"path": "local.cls", "content": "\\ProvidesClass{local}"},
+        {"path": "notation.sty", "content": "\\newcommand{\\NN}{\\mathbb{N}}"},
+    ], commit=False)
+
+    base = uploads.overleaf_dir(project, proofs_root)
+    assert summary["written"] == 2
+    assert (base / "local.cls").is_file()
+    assert (base / "notation.sty").is_file()

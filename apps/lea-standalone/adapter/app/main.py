@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from .db import init_db
-from .routes import projects, runs, search, sessions, settings, skills, subagents
+from .routes import formalizations, projects, runs, search, sessions, settings, skills, subagents
 from . import bridge, netguard, store
 
 app = FastAPI(title="Lea Interface API")
@@ -78,6 +78,7 @@ app.include_router(sessions.router)
 app.include_router(runs.router)
 app.include_router(settings.router)
 app.include_router(projects.router)
+app.include_router(formalizations.router)
 app.include_router(search.router)
 app.include_router(skills.router)
 app.include_router(subagents.router)

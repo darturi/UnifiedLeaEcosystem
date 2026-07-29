@@ -44,7 +44,9 @@ from .providers import stream, TextDelta, Done, Usage
 # `read_file` / `search_mathlib` result, once acted on. These are safe to mask
 # outside the recent window. Writers/`bash` are NOT here: their output is more
 # likely load-bearing and is rarely the token hog anyway.
-_PRUNABLE_TOOLS = frozenset({"lean_check", "read_file", "search_mathlib"})
+_PRUNABLE_TOOLS = frozenset(
+    {"lean_check", "read_file", "search_mathlib", "suggest_imports"}
+)
 
 # A masked result must still say enough that the model knows something was there
 # and why it's gone — but stay tiny. Only content longer than this is worth masking.

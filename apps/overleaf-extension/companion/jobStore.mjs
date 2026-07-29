@@ -30,6 +30,50 @@ export function findLatestFinishedJob(jobs, jobKey) {
   return jobsByRecencyDesc(jobs, (job) => job.jobKey === jobKey && job.status !== "in_progress")[0] || null;
 }
 
+// The newest job whose terminal result can be the provenance of an artifact
+// that still exists. Failed attempts are deliberately excluded: a retry retires
+// the previous proof before running and restores it on failure, so attributing
+// the restored proof to the failed retry's source hash would incorrectly make
+// it look current.
+const ARTIFACT_JOB_STATUSES = new Set([
+  "formalized",
+  "repaired",
+  "needs_review",
+  "disproved",
+  "sorry_stub"
+]);
+
+function hasArtifactResult(job) {
+  if (ARTIFACT_JOB_STATUSES.has(job?.status)) return true;
+  // A proof run can fail while still leaving a checked sorry stub as its
+  // explicit effective result. That stub has real source provenance.
+  return job?.status === "failed"
+    && job?.finalStatus === "sorry_stub"
+    && Boolean(job?.declarationName)
+    && Boolean(job?.recordedProofPath);
+}
+
+export function findLatestArtifactJob(jobs, jobKey, {
+  declarationName = "",
+  recordedProofPath = ""
+} = {}) {
+  const candidates = jobsByRecencyDesc(
+    jobs,
+    (job) => job.jobKey === jobKey
+      && hasArtifactResult(job)
+      && Boolean(job.targetTextHash)
+  );
+  if (candidates.length === 0) return null;
+
+  const wantedDeclaration = String(declarationName || "").trim();
+  const wantedPath = String(recordedProofPath || "").trim();
+  const matching = candidates.find((job) => {
+    if (wantedPath && job.recordedProofPath === wantedPath) return true;
+    return wantedDeclaration && job.declarationName === wantedDeclaration;
+  });
+  return matching || candidates[0];
+}
+
 // Retention prune (PLAN-system-hardening 0.2 / review B4): nothing ever removed
 // jobs, so jobs.json grew without bound and every /statuses hit paid for it.
 // Per jobKey we keep a superset of everything the status/selection queries can

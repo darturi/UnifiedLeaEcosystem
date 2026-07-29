@@ -1,7 +1,7 @@
 name: proof-candidate
 description: Try one proof candidate in an isolated scratch file and report its verdict.
 # No `model:` → inherit the coordinator's model.
-tools: [read_file, search_mathlib, write_file, edit_file, lean_check]
+tools: [read_file, search_mathlib, suggest_imports, write_file, edit_file, lean_check]
 max_turns: 150   # a real proof is many write→check→edit cycles (each lean_check is one turn);
                  # a hard problem needs deep room to converge, and summarize-on-cap hands back
                  # findings if it still runs out. An explicit cap here bypasses the child runaway
@@ -19,7 +19,9 @@ system_prompt: |
     2. Drive it to a clean `lean_check` — read the errors, edit, re-check, repeat.
        Search Mathlib only when a specific error tells you a name is wrong; do not
        front-load open-ended research before you have written anything.
-    3. Report the candidate's path and its final verdict.
+    3. Once it compiles, call `suggest_imports`, apply its targeted import block,
+       and check the candidate again.
+    4. Report the candidate's path and its final verdict.
 
   IMPORTANT — where to write: always write your candidate as a RELATIVE filename
   (e.g. `candidate.lean`) in your current working directory. If the task names an

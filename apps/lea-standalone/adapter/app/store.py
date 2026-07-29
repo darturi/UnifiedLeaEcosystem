@@ -86,6 +86,21 @@ def touch_session(session_id: str) -> None:
     _bump_sessions_changed()
 
 
+def update_session_title(session_id: str, title: str) -> dict | None:
+    with connect() as conn:
+        conn.execute(
+            "update sessions set title = ?, updated_at = ? where id = ?",
+            (title[:120], utc_now(), session_id),
+        )
+        row = conn.execute(
+            "select * from sessions where id = ?", (session_id,)
+        ).fetchone()
+    if row:
+        _bump_sessions_changed()
+        return row_to_dict(row)
+    return None
+
+
 def get_session(session_id: str) -> dict | None:
     with connect() as conn:
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
@@ -308,20 +323,478 @@ def create_run(
     max_turns: int | None,
     project_id: str | None = None,
     autonomous: bool = False,
+    focus_formalization_id: str | None = None,
+    focus_source_hash: str | None = None,
 ) -> dict:
     now = utc_now()
     run_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into runs (id, session_id, project_id, status, autonomous, model, provider, max_turns, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into runs (
+                id, session_id, project_id, status, autonomous, model, provider,
+                max_turns, focus_formalization_id, focus_source_hash, created_at, updated_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, session_id, project_id, "pending", 1 if autonomous else 0, model, provider, max_turns, now, now),
+            (
+                run_id, session_id, project_id, "pending",
+                1 if autonomous else 0, model, provider, max_turns,
+                focus_formalization_id, focus_source_hash, now, now,
+            ),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
     _bump_sessions_changed()
     return row_to_dict(row)
+
+
+FORMALIZATION_KINDS = {
+    "theorem", "lemma", "definition", "counterexample", "disproof", "other",
+}
+FORMALIZATION_FILE_ROLES = {"primary", "support", "generated"}
+
+
+def _normalize_formalization_kind(kind: str | None) -> str:
+    value = str(kind or "theorem").strip().lower()
+    if value == "proof":
+        value = "theorem"
+    if value not in FORMALIZATION_KINDS:
+        raise ValueError(f"unsupported formalization kind: {value}")
+    return value
+
+
+def _formalization_from_conn(conn, formalization_id: str) -> dict | None:
+    row = conn.execute(
+        "select * from formalizations where id = ?", (formalization_id,)
+    ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def create_formalization(
+    *,
+    project_id: str | None,
+    loose_session_id: str | None,
+    display_title: str,
+    kind: str = "theorem",
+    declaration_name: str | None = None,
+    statement: str | None = None,
+    origin: str = "ui",
+    origin_key: str | None = None,
+    source_hash: str | None = None,
+) -> dict:
+    now = utc_now()
+    formalization_id = str(uuid4())
+    title = str(display_title or declaration_name or "Untitled formalization").strip()
+    with write() as conn:
+        conn.execute(
+            """
+            insert into formalizations (
+                id, project_id, loose_session_id, display_title, declaration_name,
+                kind, statement, origin, origin_key, source_hash, created_at, updated_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                formalization_id, project_id, loose_session_id, title[:160],
+                (declaration_name or "").strip() or None,
+                _normalize_formalization_kind(kind), statement,
+                (origin or "ui").strip() or "ui",
+                (origin_key or "").strip() or None,
+                (source_hash or "").strip() or None,
+                now, now,
+            ),
+        )
+        result = _formalization_from_conn(conn, formalization_id)
+    assert result is not None
+    return result
+
+
+def get_formalization(formalization_id: str) -> dict | None:
+    with connect() as conn:
+        return _formalization_from_conn(conn, formalization_id)
+
+
+def find_formalization_by_origin(
+    project_id: str, origin: str, origin_key: str
+) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select * from formalizations
+            where project_id = ? and origin = ? and origin_key = ?
+            """,
+            (project_id, origin, origin_key),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def find_formalization_by_declaration(
+    *,
+    project_id: str | None,
+    loose_session_id: str | None,
+    declaration_name: str,
+) -> dict | None:
+    """Resolve a stable target by declaration within exactly one scope."""
+    if bool(project_id) == bool(loose_session_id):
+        raise ValueError("provide exactly one formalization scope")
+    scope_column = "project_id" if project_id else "loose_session_id"
+    scope_value = project_id or loose_session_id
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            select * from formalizations
+            where {scope_column} = ? and declaration_name = ?
+            """,
+            (scope_value, declaration_name),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def update_formalization(
+    formalization_id: str,
+    *,
+    display_title: str | None = None,
+    declaration_name: str | None = None,
+    statement: str | None = None,
+    kind: str | None = None,
+    source_hash: str | None = None,
+) -> dict | None:
+    with write() as conn:
+        current = _formalization_from_conn(conn, formalization_id)
+        if not current:
+            return None
+        if declaration_name is not None and declaration_name != current.get("declaration_name"):
+            artifact = conn.execute(
+                "select 1 from artifacts where formalization_id = ? limit 1",
+                (formalization_id,),
+            ).fetchone()
+            if artifact:
+                raise ValueError("a checked formalization's declaration cannot be renamed here")
+        conn.execute(
+            """
+            update formalizations
+            set display_title = ?, declaration_name = ?, statement = ?, kind = ?,
+                source_hash = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                (
+                    str(display_title).strip()[:160]
+                    if display_title is not None
+                    else current["display_title"]
+                ) or current["display_title"],
+                (
+                    str(declaration_name).strip() or None
+                    if declaration_name is not None
+                    else current["declaration_name"]
+                ),
+                statement if statement is not None else current["statement"],
+                _normalize_formalization_kind(kind) if kind is not None else current["kind"],
+                (
+                    str(source_hash).strip() or None
+                    if source_hash is not None
+                    else current["source_hash"]
+                ),
+                utc_now(),
+                formalization_id,
+            ),
+        )
+        return _formalization_from_conn(conn, formalization_id)
+
+
+def link_session_formalization(session_id: str, formalization_id: str) -> None:
+    with write() as conn:
+        conn.execute(
+            """
+            insert or ignore into session_formalizations (
+                session_id, formalization_id, created_at
+            ) values (?, ?, ?)
+            """,
+            (session_id, formalization_id, utc_now()),
+        )
+
+
+def link_formalization_file(
+    formalization_id: str, path: str, role: str = "generated"
+) -> dict:
+    role_value = str(role or "generated").lower()
+    if role_value not in FORMALIZATION_FILE_ROLES:
+        raise ValueError(f"unsupported formalization file role: {role_value}")
+    now = utc_now()
+    with write() as conn:
+        if role_value == "primary":
+            conn.execute(
+                """
+                update formalization_files set role = 'support', updated_at = ?
+                where formalization_id = ? and role = 'primary' and path <> ?
+                """,
+                (now, formalization_id, path),
+            )
+        conn.execute(
+            """
+            insert into formalization_files (
+                formalization_id, path, role, created_at, updated_at
+            ) values (?, ?, ?, ?, ?)
+            on conflict(formalization_id, path)
+            do update set role = excluded.role, updated_at = excluded.updated_at
+            """,
+            (formalization_id, path, role_value, now, now),
+        )
+        row = conn.execute(
+            """
+            select * from formalization_files
+            where formalization_id = ? and path = ?
+            """,
+            (formalization_id, path),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def list_formalization_files(formalization_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select * from formalization_files
+            where formalization_id = ?
+            order by case role when 'primary' then 0 when 'support' then 1 else 2 end,
+                     path asc
+            """,
+            (formalization_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_raw_project_formalizations(project_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select * from formalizations
+            where project_id = ?
+            order by updated_at desc, display_title asc
+            """,
+            (project_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_raw_session_formalizations(session_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select f.*
+            from formalizations f
+            join session_formalizations sf on sf.formalization_id = f.id
+            where sf.session_id = ?
+            order by f.updated_at desc, f.display_title asc
+            """,
+            (session_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def session_ids_for_formalization(formalization_id: str) -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select sf.session_id
+            from session_formalizations sf
+            join sessions s on s.id = sf.session_id
+            where sf.formalization_id = ?
+            order by s.updated_at desc
+            """,
+            (formalization_id,),
+        ).fetchall()
+    return [str(row["session_id"]) for row in rows]
+
+
+def create_run_bundle(
+    *,
+    message: str,
+    session_id: str | None,
+    project_id: str | None,
+    session_origin: str,
+    session_origin_url: str | None,
+    model: str,
+    provider: str | None,
+    max_turns: int | None,
+    autonomous: bool,
+    focus_formalization_id: str | None = None,
+    focus_source_hash: str | None = None,
+    new_formalization: dict | None = None,
+) -> dict:
+    """Atomically create/resolve the conversation scope, run, and user message."""
+    if focus_formalization_id and new_formalization:
+        raise ValueError("choose an existing focus or a new formalization, not both")
+    now = utc_now()
+    with write() as conn:
+        if session_id:
+            session_row = conn.execute(
+                "select * from sessions where id = ?", (session_id,)
+            ).fetchone()
+            if not session_row:
+                raise LookupError("session not found")
+            session = row_to_dict(session_row)
+            if project_id and not session.get("project_id"):
+                conn.execute(
+                    "update sessions set project_id = ?, updated_at = ? where id = ?",
+                    (project_id, now, session_id),
+                )
+                session["project_id"] = project_id
+            elif project_id is None and session.get("project_id"):
+                project_id = session["project_id"]
+            elif project_id and session.get("project_id") != project_id:
+                raise ValueError("session belongs to a different project")
+        else:
+            session_id = str(uuid4())
+            conn.execute(
+                """
+                insert into sessions (
+                    id, project_id, title, origin, origin_url, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id, project_id, message[:120] or "Untitled conversation",
+                    (session_origin or "ui").strip() or "ui",
+                    session_origin_url, now, now,
+                ),
+            )
+            session = row_to_dict(
+                conn.execute(
+                    "select * from sessions where id = ?", (session_id,)
+                ).fetchone()
+            )
+
+        formalization = None
+        if new_formalization:
+            origin = str(new_formalization.get("origin") or "ui").strip() or "ui"
+            origin_key = str(new_formalization.get("origin_key") or "").strip() or None
+            if project_id and origin_key:
+                existing = conn.execute(
+                    """
+                    select * from formalizations
+                    where project_id = ? and origin = ? and origin_key = ?
+                    """,
+                    (project_id, origin, origin_key),
+                ).fetchone()
+                if existing:
+                    formalization = row_to_dict(existing)
+            if formalization is None:
+                focus_formalization_id = str(uuid4())
+                title = str(
+                    new_formalization.get("display_title")
+                    or new_formalization.get("declaration_name")
+                    or message[:120]
+                    or "Untitled formalization"
+                ).strip()
+                conn.execute(
+                    """
+                    insert into formalizations (
+                        id, project_id, loose_session_id, display_title,
+                        declaration_name, kind, statement, origin, origin_key,
+                        source_hash, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        focus_formalization_id, project_id,
+                        None if project_id else session_id, title[:160],
+                        str(new_formalization.get("declaration_name") or "").strip() or None,
+                        _normalize_formalization_kind(new_formalization.get("kind")),
+                        new_formalization.get("statement"), origin, origin_key,
+                        str(new_formalization.get("source_hash") or "").strip() or None,
+                        now, now,
+                    ),
+                )
+                formalization = _formalization_from_conn(conn, focus_formalization_id)
+            else:
+                focus_formalization_id = formalization["id"]
+                requested_decl = str(
+                    new_formalization.get("declaration_name") or ""
+                ).strip() or None
+                if (
+                    requested_decl
+                    and formalization.get("declaration_name")
+                    and requested_decl != formalization["declaration_name"]
+                ):
+                    raise ValueError("origin key resolves to a conflicting declaration")
+                requested_kind = _normalize_formalization_kind(
+                    new_formalization.get("kind")
+                )
+                if requested_kind != formalization.get("kind"):
+                    raise ValueError("origin key resolves to a conflicting kind")
+        elif focus_formalization_id:
+            formalization = _formalization_from_conn(conn, focus_formalization_id)
+            if not formalization:
+                raise LookupError("formalization not found")
+
+        if formalization:
+            if project_id:
+                if formalization.get("project_id") != project_id:
+                    raise ValueError("formalization belongs to a different project")
+            elif formalization.get("loose_session_id") != session_id:
+                raise ValueError("loose formalization belongs to a different session")
+            conn.execute(
+                """
+                insert or ignore into session_formalizations (
+                    session_id, formalization_id, created_at
+                ) values (?, ?, ?)
+                """,
+                (session_id, formalization["id"], now),
+            )
+            source_hash = str(focus_source_hash or "").strip() or None
+            if source_hash:
+                conn.execute(
+                    """
+                    update formalizations
+                    set source_hash = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (source_hash, now, formalization["id"]),
+                )
+                formalization["source_hash"] = source_hash
+
+        run_id = str(uuid4())
+        conn.execute(
+            """
+            insert into runs (
+                id, session_id, project_id, status, autonomous, model, provider,
+                max_turns, focus_formalization_id, focus_source_hash,
+                created_at, updated_at
+            ) values (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id, session_id, project_id, 1 if autonomous else 0,
+                model, provider, max_turns, focus_formalization_id,
+                str(focus_source_hash or "").strip() or None, now, now,
+            ),
+        )
+        message_cursor = conn.execute(
+            """
+            insert into timeline (
+                session_id, run_id, kind, author, content, formalization_id, created_at
+            ) values (?, ?, 'message', 'user', ?, ?, ?)
+            """,
+            (session_id, run_id, message, focus_formalization_id, now),
+        )
+        conn.execute(
+            "update sessions set updated_at = ? where id = ?", (now, session_id)
+        )
+        run = row_to_dict(
+            conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+        )
+        user_message = _message_from_row(
+            conn.execute(
+                "select * from timeline where id = ?", (message_cursor.lastrowid,)
+            ).fetchone()
+        )
+        session = row_to_dict(
+            conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+        )
+    _bump_sessions_changed()
+    return {
+        "session": session,
+        "formalization": formalization,
+        "run": run,
+        "message": user_message,
+    }
 
 
 def list_projects() -> list[dict]:
@@ -575,6 +1048,45 @@ def delete_project_cascade(project_id: str) -> bool:
                 "select id from sessions where project_id = ?", (project_id,)
             ).fetchall()
         ]
+        formalization_ids = [
+            r["id"] for r in conn.execute(
+                "select id from formalizations where project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if session_ids:
+            marks = ",".join("?" for _ in session_ids)
+            formalization_ids.extend(
+                r["id"] for r in conn.execute(
+                    f"select id from formalizations where loose_session_id in ({marks})",
+                    session_ids,
+                ).fetchall()
+            )
+            conn.execute(
+                f"delete from verification_events where session_id in ({marks})",
+                session_ids,
+            )
+            conn.execute(
+                f"delete from session_formalizations where session_id in ({marks})",
+                session_ids,
+            )
+        if formalization_ids:
+            form_marks = ",".join("?" for _ in formalization_ids)
+            conn.execute(
+                f"delete from verification_events where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
+            conn.execute(
+                f"delete from session_formalizations where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
+            conn.execute(
+                f"delete from formalization_files where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
+            conn.execute(
+                f"update artifacts set formalization_id = null where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
         if session_ids:
             marks = ",".join("?" for _ in session_ids)
             # `messages`/`code_steps` are pre-cutover rows kept until the contract
@@ -604,6 +1116,12 @@ def delete_project_cascade(project_id: str) -> bool:
                 (*session_ids, *session_ids),
             )
         conn.execute("delete from project_files where project_id = ?", (project_id,))
+        if formalization_ids:
+            form_marks = ",".join("?" for _ in formalization_ids)
+            conn.execute(
+                f"delete from formalizations where id in ({form_marks})",
+                formalization_ids,
+            )
         # Drop any skill assignments pointing at this project (D47) — the skills
         # themselves survive (they may be global or assigned elsewhere).
         conn.execute("delete from skill_projects where project_id = ?", (project_id,))
@@ -992,6 +1510,37 @@ def set_session_safe_verify(session_id: str, status: str, detail: str | None) ->
         )
 
 
+def record_verification_event(
+    *,
+    session_id: str,
+    formalization_id: str | None,
+    path: str,
+    status: str,
+    detail: str | None,
+    code_step_id: str | int | None,
+    run_id: str | None = None,
+) -> dict:
+    event_id = str(uuid4())
+    with write() as conn:
+        conn.execute(
+            """
+            insert into verification_events (
+                id, formalization_id, session_id, run_id, code_step_id,
+                path, status, detail, created_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id, formalization_id, session_id, run_id,
+                int(code_step_id) if code_step_id is not None else None,
+                path, status, detail, utc_now(),
+            ),
+        )
+        row = conn.execute(
+            "select * from verification_events where id = ?", (event_id,)
+        ).fetchone()
+    return row_to_dict(row)
+
+
 def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     """The most recent code step for a file in a session (newest id wins).
 
@@ -1004,6 +1553,82 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
+
+
+def current_code_steps_for_formalization(
+    formalization_id: str,
+    *,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Latest snapshot of every linked path for a formalization.
+
+    With ``session_id`` this is the immutable conversation-local view. Without
+    it, project formalizations resolve each path across every session in the
+    shared project; loose formalizations resolve across their associated
+    sessions. The query intentionally does not require the winning timeline row
+    to carry this formalization id: two declarations may share one file, and a
+    write attributed to either declaration changes the current bytes for both.
+    """
+    scope_clause = "t.session_id = ?"
+    params: list[object] = [formalization_id]
+    if session_id is not None:
+        params.append(session_id)
+    else:
+        scope_clause = """
+        (
+          (f.project_id is not null and s.project_id = f.project_id)
+          or
+          (f.project_id is null and exists (
+            select 1 from session_formalizations sf
+            where sf.formalization_id = f.id and sf.session_id = t.session_id
+          ))
+        )
+        """
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            select * from (
+              select
+                t.*,
+                b.content as blob_content,
+                b.sha256 as blob_sha256,
+                ff.role as formalization_file_role,
+                s.title as updating_session_title,
+                row_number() over (
+                  partition by ff.path
+                  order by t.created_at desc, t.id desc
+                ) as rn
+              from formalization_files ff
+              join formalizations f on f.id = ff.formalization_id
+              join timeline t on t.kind = 'code' and t.path = ff.path
+              join sessions s on s.id = t.session_id
+              left join artifact_blobs b on b.id = t.after_blob_id
+              where ff.formalization_id = ? and {scope_clause}
+            )
+            where rn = 1
+            order by case formalization_file_role
+                       when 'primary' then 0
+                       when 'support' then 1
+                       else 2
+                     end,
+                     path asc
+            """,
+            params,
+        ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        raw = row_to_dict(row)
+        step = _code_step_from_row(row)
+        step.update(
+            {
+                "role": raw["formalization_file_role"],
+                "blob_id": raw.get("after_blob_id"),
+                "blob_sha256": raw.get("blob_sha256"),
+                "updating_session_title": raw.get("updating_session_title"),
+            }
+        )
+        result.append(step)
+    return result
 
 
 def code_steps_for_project_path(
@@ -1062,6 +1687,20 @@ def latest_agent_code_step(session_id: str) -> dict | None:
             f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.author = 'agent' "
             "order by t.id desc limit 1",
             (session_id,),
+        ).fetchone()
+    return _code_step_from_row(row) if row else None
+
+
+def latest_agent_code_step_for_formalization(
+    session_id: str, formalization_id: str
+) -> dict | None:
+    """The latest agent snapshot attributed to one formalization."""
+    with connect() as conn:
+        row = conn.execute(
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' "
+            "and t.author = 'agent' and t.formalization_id = ? "
+            "order by t.id desc limit 1",
+            (session_id, formalization_id),
         ).fetchone()
     return _code_step_from_row(row) if row else None
 
@@ -1139,6 +1778,8 @@ def upsert_artifact(
     kind: str | None,
     path: str,
     module_name: str | None,
+    formalization_id: str | None = None,
+    source_hash: str | None = None,
 ) -> dict:
     scope = project_id or session_id
     if not scope:
@@ -1154,18 +1795,24 @@ def upsert_artifact(
         if existing:
             conn.execute(
                 "update artifacts set project_id = ?, session_id = ?, run_id = ?,"
-                " kind = ?, path = ?, module_name = ?, updated_at = ? where id = ?",
-                (project_id, session_id, run_id, kind, path, module_name, now, existing["id"]),
+                " kind = ?, path = ?, module_name = ?, formalization_id = coalesce(?, formalization_id),"
+                " source_hash = coalesce(?, source_hash), updated_at = ? where id = ?",
+                (
+                    project_id, session_id, run_id, kind, path, module_name,
+                    formalization_id, source_hash, now, existing["id"],
+                ),
             )
             artifact_id = existing["id"]
         else:
             artifact_id = str(uuid4())
             conn.execute(
                 "insert into artifacts (id, scope, project_id, session_id, run_id,"
-                " declaration_name, kind, path, module_name, created_at, updated_at)"
-                " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " declaration_name, kind, path, module_name, formalization_id,"
+                " source_hash, created_at, updated_at)"
+                " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (artifact_id, scope, project_id, session_id, run_id,
-                 declaration_name, kind, path, module_name, now, now),
+                 declaration_name, kind, path, module_name, formalization_id,
+                 source_hash, now, now),
             )
         row = conn.execute("select * from artifacts where id = ?", (artifact_id,)).fetchone()
     return row_to_dict(row)
@@ -1382,6 +2029,7 @@ def _message_from_row(row) -> dict:
         "id": str(d["id"]),
         "session_id": d["session_id"],
         "run_id": d["run_id"],
+        "formalization_id": d.get("formalization_id"),
         "role": "user" if d["author"] == "user" else "assistant",
         "content": d["content"],
         "kind": d["kind"] if d["kind"] in ("edit_note", "compaction") else "assistant",
@@ -1422,6 +2070,7 @@ def _code_step_from_row(row, *, code: str | None = None) -> dict:
         "id": str(d["id"]),
         "session_id": d["session_id"],
         "run_id": d["run_id"],
+        "formalization_id": d.get("formalization_id"),
         "seq": d["id"],
         "turn": d["turn"],
         "author": d["author"],
@@ -1443,6 +2092,7 @@ def add_message(
     run_id: str | None = None,
     kind: str = "assistant",
     commit_sha: str | None = None,
+    formalization_id: str | None = None,
 ) -> dict:
     """Append a transcript message. A user's edit explanation (D11) is just this
     with `kind='edit_note'` — no bespoke channel; it rides the same path that feeds
@@ -1455,8 +2105,10 @@ def add_message(
     with write() as conn:
         cur = conn.execute(
             """
-            insert into timeline (session_id, run_id, kind, author, content, created_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into timeline (
+                session_id, run_id, kind, author, content, formalization_id, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1464,6 +2116,7 @@ def add_message(
                 kind if kind in ("edit_note", "compaction") else "message",
                 "user" if role == "user" else "agent",
                 content,
+                formalization_id,
                 utc_now(),
             ),
         )
@@ -1485,6 +2138,7 @@ def add_code_step(
     check_detail: str | None = None,
     artifact_kind: str | None = None,
     provenance: dict | None = None,
+    formalization_id: str | None = None,
 ) -> dict:
     """Record a timeline step holding a file's full contents after a write.
 
@@ -1520,9 +2174,10 @@ def add_code_step(
             """
             insert into timeline (
                 session_id, run_id, kind, author, turn, path, after_blob_id,
-                summary, check_status, check_detail, artifact_kind, data, created_at
+                summary, check_status, check_detail, artifact_kind, data,
+                formalization_id, created_at
             )
-            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1536,6 +2191,7 @@ def add_code_step(
                 check_detail,
                 artifact_kind if check_status == "ok" else None,
                 data_json,
+                formalization_id,
                 now,
             ),
         )
@@ -1579,7 +2235,13 @@ def has_active_run(session_id: str) -> bool:
     return row is not None
 
 
-def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
+def upsert_user_code_step(
+    session_id: str,
+    path: str,
+    *,
+    content: str,
+    formalization_id: str | None = None,
+) -> dict:
     """Record a user edit, coalescing rapid successive edits into one timeline step.
 
     Auto-save (v2.2) saves on every debounced keystroke-pause, which would spray the
@@ -1595,7 +2257,12 @@ def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
     looking at, so the editor — not history — is their undo. Blobs are content-
     addressed, so an intermediate state that recurs anywhere else is still reachable."""
     latest = latest_code_step_for_path(session_id, path)
-    if latest and latest.get("author") == "user" and latest.get("run_id") is None:
+    if (
+        latest
+        and latest.get("author") == "user"
+        and latest.get("run_id") is None
+        and latest.get("formalization_id") == formalization_id
+    ):
         with write() as conn:
             blob_id = _put_blob(conn, content)
             conn.execute(
@@ -1606,7 +2273,10 @@ def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
             row = conn.execute("select * from timeline where id = ?", (int(latest["id"]),)).fetchone()
         touch_session(session_id)
         return _code_step_from_row(row, code=content)
-    return add_code_step(session_id, None, path, content=content, author="user")
+    return add_code_step(
+        session_id, None, path, content=content, author="user",
+        formalization_id=formalization_id,
+    )
 
 
 def set_code_step_check(
@@ -1778,7 +2448,8 @@ def session_detail(session_id: str) -> dict | None:
         # by the Phase 1 integration harness, PLAN-system-hardening).
         runs = conn.execute(
             "select id, status, result_kind, result_detail,"
-            " input_tokens, output_tokens, cost_usd"
+            " input_tokens, output_tokens, cost_usd, focus_formalization_id,"
+            " focus_source_hash"
             " from runs where session_id = ? order by created_at asc, id asc",
             (session_id,),
         ).fetchall()
