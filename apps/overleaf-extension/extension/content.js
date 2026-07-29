@@ -137,6 +137,10 @@
   // this holds only the latest /lean-pane/repair/status snapshot.
   let leanPaneRepairBatch = null;
   let leanPaneRepairBatchTimer = 0;
+  // Batch queue disclosure survives the pane's replaceChildren re-render, but
+  // is scoped to one batch id so a new run always starts compact.
+  let leanPaneExpandedBatchQueueId = "";
+  let leanPaneExpandedBatchCompletedId = "";
   // A repair DISPATCH failure, scoped to what was being dispatched:
   // { itemKey, message } with itemKey = the single item's target label, or
   // "batch" (PLAN-self-repair-stale-offers Fix 4 -- a global string rendered
@@ -1617,7 +1621,9 @@
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
         leanPaneRepairBatch = payload;
-        startRepairBatchPolling();
+        leanPaneExpandedBatchQueueId = "";
+        leanPaneExpandedBatchCompletedId = "";
+        startRepairBatchPolling({ immediate: true });
       }
     } catch (error) {
       leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
@@ -1669,7 +1675,7 @@
       });
       const payload = await response.json().catch(() => ({}));
       if (response.ok) leanPaneRepairBatch = payload;
-      startRepairBatchPolling();
+      startRepairBatchPolling({ immediate: true });
     } catch (error) {
       leanPaneRepairError = { itemKey: "batch", message: normalizeErrorMessage(error) };
     }
@@ -1731,43 +1737,245 @@
     return row;
   }
 
-  // Live batch progress at the top of the pane: one line per item
-  // (formatRepairOutcome), plus continue/dismiss controls when the batch
-  // paused on a failure or the spend cap.
+  // Live batch progress at the top of the pane. The companion already returns
+  // dependency-ordered entries, so the client can render a real queue (active
+  // ordinal, next items, exact outcomes) without duplicating orchestration.
   function renderLeanPaneRepairBatchPanel() {
     const batch = leanPaneRepairBatch;
     if (!batch || !Array.isArray(batch.items) || batch.items.length === 0) return null;
     const operation = batch.operation || "repair";
     const noun = operation === "stub" ? "Stub" : operation === "formalize" ? "Formalize" : "Repair";
-    const doneVerb = operation === "stub" ? "stubbed" : operation === "formalize" ? "formalized" : "repaired";
-    const doneStates = operation === "stub"
+    const runningVerb = operation === "stub" ? "Stubbing" : operation === "formalize" ? "Formalizing" : "Repairing";
+    const completedStates = new Set(operation === "stub"
+      ? ["stubbed"]
+      : operation === "formalize"
+        ? ["formalized"]
+        : ["repaired"]);
+    const successfulStates = new Set(operation === "stub"
       ? ["stubbed"]
       : operation === "formalize"
         ? ["formalized", "disproved"]
-        : ["repaired", "needs_review"];
-    const runningVerb = operation === "stub" ? "Stubbing" : operation === "formalize" ? "Formalizing" : "Repairing";
+        : ["repaired", "needs_review"]);
+    const attentionStates = new Set(["failed", "skipped", "canceled", "needs_review", "disproved"]);
+    const completedEntries = batch.items.filter((entry) => completedStates.has(entry.state));
+    const attentionEntries = batch.items.filter((entry) => attentionStates.has(entry.state));
+    const reportedActiveEntry = batch.items.find((entry) => entry.state === "running") || null;
+    // The launch response can land after the batch loop is marked running but
+    // just before its first entry flips pending → running. Show that first
+    // dispatch as current instead of briefly rendering an idle-looking queue.
+    const activeEntry = reportedActiveEntry || (
+      batch.running && !batch.done && !batch.pausedOn && !batch.stopping
+        ? batch.items.find((entry) => entry.state === "pending") || null
+        : null
+    );
+    const queuedEntries = batch.items.filter((entry) => entry.state === "pending" && entry !== activeEntry);
+    const activeIndex = activeEntry ? batch.items.indexOf(activeEntry) : -1;
+    const total = batch.items.length;
+    const completedCount = batch.items.filter((entry) => successfulStates.has(entry.state)).length;
+    const failedCount = batch.items.filter((entry) => entry.state === "failed").length;
+    const skippedCount = batch.items.filter((entry) => entry.state === "skipped").length;
+    const canceledCount = batch.items.filter((entry) => entry.state === "canceled").length;
+
     const panel = document.createElement("div");
-    panel.className = "ol-lean-project-repair-batch";
-    const heading = document.createElement("p");
-    const doneCount = batch.items.filter((entry) => doneStates.includes(entry.state)).length;
-    heading.textContent = batch.canceled
-      ? `${noun} all stopped: ${doneCount}/${batch.items.length} ${doneVerb} before stopping.`
+    panel.className = `ol-lean-project-repair-batch ol-lean-batch-queue${
+      batch.pausedOn
+        ? " ol-lean-batch-queue-paused"
+        : batch.canceled
+          ? " ol-lean-batch-queue-stopped"
+          : batch.done
+            ? " ol-lean-batch-queue-done"
+            : ""
+    }`;
+
+    const header = document.createElement("div");
+    header.className = "ol-lean-batch-queue-header";
+    const heading = document.createElement("div");
+    heading.className = "ol-lean-batch-queue-heading";
+    const title = document.createElement("strong");
+    title.textContent = `${noun} all`;
+    heading.appendChild(title);
+    const state = document.createElement("span");
+    state.className = "ol-lean-batch-queue-state";
+    state.setAttribute("aria-live", "polite");
+    state.textContent = batch.canceled
+      ? "Stopped"
       : batch.stopping
-        ? "Stopping..."
+        ? "Stopping…"
         : batch.done
-          ? `${noun} all finished: ${doneCount}/${batch.items.length} ${doneVerb}.`
+          ? "Complete"
           : batch.pausedOn
-            ? batch.pausedOn.reason === "max_spend"
-              ? `${noun} all paused: the max spend limit was reached.`
-              : `${noun} all paused: ${batch.pausedOn.targetLabel || "an item"} failed.`
-            : `${runningVerb} ${batch.items.length} item${batch.items.length === 1 ? "" : "s"}...`;
-    panel.appendChild(heading);
+            ? "Paused"
+            : `${runningVerb}…`;
+    heading.appendChild(state);
+    header.appendChild(heading);
+    const count = document.createElement("span");
+    count.className = "ol-lean-batch-queue-count";
+    count.textContent = formatBatchQueueCount({
+      batch,
+      completedCount,
+      failedCount,
+      skippedCount,
+      canceledCount,
+      total
+    });
+    header.appendChild(count);
+    panel.appendChild(header);
+
+    const progress = document.createElement("div");
+    progress.className = "ol-lean-batch-queue-progress";
+    progress.setAttribute("role", "progressbar");
+    progress.setAttribute("aria-label", formatBatchQueueProgressLabel({
+      noun,
+      completedCount,
+      failedCount,
+      skippedCount,
+      canceledCount,
+      total
+    }));
+    progress.setAttribute("aria-valuemin", "0");
+    progress.setAttribute("aria-valuemax", String(total));
+    progress.setAttribute("aria-valuenow", String(completedCount));
     for (const entry of batch.items) {
-      const line = document.createElement("p");
-      line.className = "ol-lean-project-repair-batch-item";
-      line.textContent = leanPaneView.formatRepairOutcome(entry, operation);
-      panel.appendChild(line);
+      const segment = document.createElement("span");
+      const stateClass = entry === activeEntry
+        ? "active"
+        : entry.state === "failed"
+          ? "failed"
+          : entry.state === "skipped"
+            ? "skipped"
+            : entry.state === "canceled"
+              ? "canceled"
+              : entry.state === "disproved" || entry.state === "needs_review"
+                ? "attention"
+                : successfulStates.has(entry.state)
+                  ? "success"
+                  : "pending";
+      segment.className = `ol-lean-batch-queue-progress-segment ol-lean-batch-queue-progress-${stateClass}`;
+      segment.style.width = `${100 / total}%`;
+      segment.setAttribute("aria-hidden", "true");
+      progress.appendChild(segment);
     }
+    panel.appendChild(progress);
+
+    if (batch.pausedOn) {
+      const callout = document.createElement("div");
+      callout.className = "ol-lean-batch-queue-callout";
+      const calloutTitle = document.createElement("strong");
+      calloutTitle.textContent = batch.pausedOn.reason === "max_spend"
+        ? "Maximum spend reached"
+        : `${batch.pausedOn.targetLabel || "An item"} failed`;
+      callout.appendChild(calloutTitle);
+      const calloutDetail = document.createElement("span");
+      calloutDetail.textContent = batch.pausedOn.reason === "max_spend"
+        ? "Increase or clear the spend limit before continuing."
+        : queuedEntries.length > 0
+          ? `${queuedEntries.length} independent item${queuedEntries.length === 1 ? "" : "s"} can still run.`
+          : "No independent items remain in the queue.";
+      callout.appendChild(calloutDetail);
+      panel.appendChild(callout);
+    }
+
+    if (activeEntry) {
+      const current = document.createElement("section");
+      current.className = "ol-lean-batch-queue-current";
+      const meta = document.createElement("span");
+      meta.className = "ol-lean-batch-queue-eyebrow";
+      meta.textContent = `Current · ${activeIndex + 1} of ${total}`;
+      current.appendChild(meta);
+      const currentRow = renderBatchQueueEntry(activeEntry, activeIndex, {
+        marker: "●",
+        stateClass: "running",
+        detail: formatBatchQueueActiveDetail(activeEntry, runningVerb)
+      });
+      current.appendChild(currentRow);
+      panel.appendChild(current);
+    }
+
+    if (queuedEntries.length > 0) {
+      const queued = document.createElement("section");
+      queued.className = "ol-lean-batch-queue-section";
+      const queuedHeading = document.createElement("strong");
+      queuedHeading.className = "ol-lean-batch-queue-section-title";
+      queuedHeading.textContent = "Next";
+      queued.appendChild(queuedHeading);
+      const list = document.createElement("ol");
+      list.className = "ol-lean-batch-queue-list";
+      const queueExpanded = leanPaneExpandedBatchQueueId === batch.batchId;
+      const visibleQueued = queueExpanded ? queuedEntries : queuedEntries.slice(0, 3);
+      for (const entry of visibleQueued) {
+        const entryIndex = batch.items.indexOf(entry);
+        list.appendChild(renderBatchQueueEntry(entry, entryIndex, {
+          marker: "○",
+          stateClass: "pending",
+          detail: `Queued · position ${entryIndex + 1} of ${total}`
+        }));
+      }
+      queued.appendChild(list);
+      if (queuedEntries.length > 3) {
+        const remaining = queuedEntries.length - 3;
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "ol-lean-batch-queue-disclosure";
+        toggle.setAttribute("aria-expanded", String(queueExpanded));
+        toggle.textContent = queueExpanded ? "Show fewer queued" : `+${remaining} more queued`;
+        toggle.addEventListener("click", () => {
+          leanPaneExpandedBatchQueueId = queueExpanded ? "" : batch.batchId;
+          renderLeanPaneManifest(lastLeanPaneManifest);
+        });
+        queued.appendChild(toggle);
+      }
+      panel.appendChild(queued);
+    }
+
+    if (attentionEntries.length > 0) {
+      const attention = document.createElement("section");
+      attention.className = "ol-lean-batch-queue-section ol-lean-batch-queue-attention";
+      const attentionHeading = document.createElement("strong");
+      attentionHeading.className = "ol-lean-batch-queue-section-title";
+      attentionHeading.textContent = "Needs attention";
+      attention.appendChild(attentionHeading);
+      const list = document.createElement("ul");
+      list.className = "ol-lean-batch-queue-list";
+      for (const entry of attentionEntries) {
+        list.appendChild(renderBatchQueueEntry(entry, batch.items.indexOf(entry), {
+          marker: entry.state === "disproved" ? "◇" : "!",
+          stateClass: entry.state,
+          detail: formatBatchQueueOutcomeDetail(entry, operation)
+        }));
+      }
+      attention.appendChild(list);
+      panel.appendChild(attention);
+    }
+
+    if (completedEntries.length > 0) {
+      const completed = document.createElement("section");
+      completed.className = "ol-lean-batch-queue-section ol-lean-batch-queue-completed";
+      const completedExpanded = leanPaneExpandedBatchCompletedId === batch.batchId;
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "ol-lean-batch-queue-completed-toggle";
+      toggle.setAttribute("aria-expanded", String(completedExpanded));
+      toggle.textContent = `${completedExpanded ? "Hide" : "Show"} ${completedEntries.length} completed`;
+      toggle.addEventListener("click", () => {
+        leanPaneExpandedBatchCompletedId = completedExpanded ? "" : batch.batchId;
+        renderLeanPaneManifest(lastLeanPaneManifest);
+      });
+      completed.appendChild(toggle);
+      if (completedExpanded) {
+        const list = document.createElement("ul");
+        list.className = "ol-lean-batch-queue-list";
+        for (const entry of completedEntries) {
+          list.appendChild(renderBatchQueueEntry(entry, batch.items.indexOf(entry), {
+            marker: "✓",
+            stateClass: "completed",
+            detail: formatBatchQueueOutcomeDetail(entry, operation)
+          }));
+        }
+        completed.appendChild(list);
+      }
+      panel.appendChild(completed);
+    }
+
     if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
@@ -1802,12 +2010,77 @@
       dismiss.textContent = "Dismiss";
       dismiss.addEventListener("click", () => {
         leanPaneRepairBatch = null;
+        leanPaneExpandedBatchQueueId = "";
+        leanPaneExpandedBatchCompletedId = "";
         renderLeanPaneManifest(lastLeanPaneManifest);
       });
       controls.appendChild(dismiss);
     }
     if (controls.children.length > 0) panel.appendChild(controls);
     return panel;
+  }
+
+  function renderBatchQueueEntry(entry, index, { marker, stateClass, detail }) {
+    const row = document.createElement("li");
+    row.className = `ol-lean-batch-queue-item ol-lean-batch-queue-item-${stateClass}`;
+    row.dataset.position = String(index + 1);
+    const icon = document.createElement("span");
+    icon.className = "ol-lean-batch-queue-marker";
+    icon.setAttribute("aria-hidden", "true");
+    icon.textContent = marker;
+    row.appendChild(icon);
+    const copy = document.createElement("span");
+    copy.className = "ol-lean-batch-queue-item-copy";
+    const label = document.createElement("strong");
+    label.textContent = entry.targetLabel || `Item ${index + 1}`;
+    copy.appendChild(label);
+    const description = document.createElement("span");
+    description.className = "ol-lean-batch-queue-item-detail";
+    description.textContent = detail;
+    copy.appendChild(description);
+    row.appendChild(copy);
+    return row;
+  }
+
+  function formatBatchQueueActiveDetail(entry, runningVerb) {
+    const statusInfo = latestStatuses[targetKey(entry)] || {};
+    const paneItem = (lastLeanPaneManifest?.items || []).find((item) => (
+      item.label === entry.targetLabel
+      && (entry.targetKind !== "definition" || item.leanKind === "def")
+    ));
+    const progress = statusInfo.turnProgress || paneItem?.turnProgress;
+    const current = Number.parseInt(String(progress?.current || ""), 10);
+    const max = Number.parseInt(String(progress?.max || ""), 10);
+    const turn = Number.isFinite(current) && current > 0 && Number.isFinite(max) && max > 0
+      ? ` · Lea turn ${current} of ${max}`
+      : "";
+    return `${runningVerb}…${turn}`;
+  }
+
+  function formatBatchQueueOutcomeDetail(entry, operation) {
+    const outcome = leanPaneView.formatRepairOutcome(entry, operation);
+    const prefix = `${entry?.targetLabel || ""}: `;
+    return outcome.startsWith(prefix) ? outcome.slice(prefix.length) : outcome;
+  }
+
+  function formatBatchQueueCount({ batch, completedCount, failedCount, skippedCount, canceledCount, total }) {
+    if (!batch.canceled && !batch.pausedOn && !batch.done) {
+      return `${completedCount} / ${total} complete`;
+    }
+    const parts = [];
+    if (completedCount > 0) parts.push(`${completedCount} complete`);
+    if (failedCount > 0) parts.push(`${failedCount} failed`);
+    if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
+    if (canceledCount > 0) parts.push(`${canceledCount} stopped`);
+    return parts.length > 0 ? parts.join(" · ") : `0 / ${total} complete`;
+  }
+
+  function formatBatchQueueProgressLabel({ noun, completedCount, failedCount, skippedCount, canceledCount, total }) {
+    const parts = [`${noun} all: ${completedCount} of ${total} completed`];
+    if (failedCount > 0) parts.push(`${failedCount} failed`);
+    if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
+    if (canceledCount > 0) parts.push(`${canceledCount} stopped`);
+    return `${parts.join(", ")}.`;
   }
 
   // Open the inline edit view for an item: shows the current artifact
@@ -3607,7 +3880,9 @@
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload?.message || `Companion returned HTTP ${response.status}.`);
       leanPaneRepairBatch = payload;
-      startRepairBatchPolling();
+      leanPaneExpandedBatchQueueId = "";
+      leanPaneExpandedBatchCompletedId = "";
+      startRepairBatchPolling({ immediate: true });
     } catch (error) {
       leanPaneRepairError = { itemKey: errorKey, message: normalizeErrorMessage(error) };
     }

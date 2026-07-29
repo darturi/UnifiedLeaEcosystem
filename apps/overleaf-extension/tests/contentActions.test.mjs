@@ -963,6 +963,168 @@ test("Lean pane keeps Formalize after an upstream dependency blocks startup", as
   assert.match(harness.bodyText(), /Formalize referenced theorem first: helper_lemma\./);
 });
 
+test("Formalize all renders an accessible, collapsible queue with active turn progress", async () => {
+  const items = Array.from({ length: 8 }, (_unused, index) => {
+    const number = index + 1;
+    return {
+      id: `theorem:t${number}:${index}`,
+      kind: "theorem",
+      label: `t${number}`,
+      status: "missing-stub",
+      sourceFile: "main.tex",
+      sourceStartLine: number,
+      sourceEndLine: number,
+      naturalLanguageLatex: `Theorem ${number}.`,
+      leanKind: "theorem",
+      leanDeclarationName: `t${number}`,
+      formalizable: true,
+      ...(number === 4 ? { turnProgress: { current: 7, max: 20 } } : {})
+    };
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items, diagnostics: [] },
+      targetBatch: {
+        ok: true,
+        batchId: "formalize-batch-1",
+        operation: "formalize",
+        done: false,
+        running: true,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "t1", state: "formalized" },
+          { targetKind: "theorem", targetLabel: "t2", state: "formalized" },
+          { targetKind: "theorem", targetLabel: "t3", state: "formalized" },
+          // Initial launch snapshots can still report the first dispatch as
+          // pending even though the batch loop itself is already running.
+          { targetKind: "theorem", targetLabel: "t4", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t5", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t6", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t7", state: "pending" },
+          { targetKind: "theorem", targetLabel: "t8", state: "pending" }
+        ]
+      }
+    }
+  );
+
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Formalize all (8)");
+  await flushPromises();
+
+  let queue = harness.batchQueue();
+  assert.ok(queue, "expected a batch queue card");
+  assert.deepEqual(queue.progress, {
+    role: "progressbar",
+    label: "Formalize all: 3 of 8 completed.",
+    min: "0",
+    max: "8",
+    now: "3"
+  });
+  assert.match(queue.text, /Current · 4 of 8●t4Formalizing… · Lea turn 7 of 20/);
+  assert.equal(queue.pendingCount, 3, "only the next three queued items start expanded");
+  assert.equal(queue.completedCount, 0, "completed work starts collapsed");
+  assert.match(queue.text, /t5Queued · position 5 of 8/);
+  assert.match(queue.text, /\+1 more queued/);
+  assert.match(queue.text, /Show 3 completed/);
+
+  harness.clickButtonText("+1 more queued");
+  queue = harness.batchQueue();
+  assert.equal(queue.pendingCount, 4);
+  assert.match(queue.text, /t8Queued · position 8 of 8/);
+
+  harness.clickButtonText("Show 3 completed");
+  queue = harness.batchQueue();
+  assert.equal(queue.completedCount, 3);
+  assert.match(queue.text, /t1formalized and verified\./);
+  assert.match(queue.text, /Hide 3 completed/);
+});
+
+test("stopping a batch preserves a completed race winner and reports stopped items separately", async () => {
+  const items = Array.from({ length: 4 }, (_unused, index) => {
+    const number = index + 1;
+    return {
+      id: `theorem:stop_t${number}:${index}`,
+      kind: "theorem",
+      label: `stop_t${number}`,
+      status: "missing-stub",
+      sourceFile: "main.tex",
+      sourceStartLine: number,
+      sourceEndLine: number,
+      naturalLanguageLatex: `Stop theorem ${number}.`,
+      leanKind: "theorem",
+      leanDeclarationName: `stop_t${number}`,
+      formalizable: true
+    };
+  });
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items, diagnostics: [] },
+      targetBatch: {
+        ok: true,
+        batchId: "formalize-stop-race",
+        operation: "formalize",
+        done: false,
+        running: true,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "stop_t1", state: "running" },
+          { targetKind: "theorem", targetLabel: "stop_t2", state: "pending" },
+          { targetKind: "theorem", targetLabel: "stop_t3", state: "pending" },
+          { targetKind: "theorem", targetLabel: "stop_t4", state: "pending" }
+        ]
+      },
+      batchCancel: {
+        ok: true,
+        batchId: "formalize-stop-race",
+        operation: "formalize",
+        done: true,
+        canceled: true,
+        running: false,
+        pausedOn: null,
+        items: [
+          { targetKind: "theorem", targetLabel: "stop_t1", state: "formalized" },
+          { targetKind: "theorem", targetLabel: "stop_t2", state: "canceled" },
+          { targetKind: "theorem", targetLabel: "stop_t3", state: "canceled" },
+          { targetKind: "theorem", targetLabel: "stop_t4", state: "canceled" }
+        ]
+      }
+    }
+  );
+
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Formalize all (4)");
+  await flushPromises();
+  harness.clickButtonText("Stop");
+  await flushPromises();
+
+  let queue = harness.batchQueue();
+  assert.match(queue.text, /Formalize allStopped1 complete · 3 stopped/);
+  assert.deepEqual(queue.progress, {
+    role: "progressbar",
+    label: "Formalize all: 1 of 4 completed, 3 stopped.",
+    min: "0",
+    max: "4",
+    now: "1"
+  });
+  assert.deepEqual(queue.progressSegments, ["success", "canceled", "canceled", "canceled"]);
+  assert.match(queue.text, /stop_t2stopped\./);
+  assert.match(queue.text, /Show 1 completed/);
+  harness.clickButtonText("Show 1 completed");
+  queue = harness.batchQueue();
+  assert.match(queue.text, /stop_t1formalized and verified\./);
+  assert.doesNotMatch(queue.text, /stop_t1stopped\./);
+});
+
 // --- Manual edit (docs/FEATURE-overleaf-lean-pane-manual-edit.md) ----------
 
 function editableItem(overrides = {}) {
@@ -1219,6 +1381,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               ? options.manifest(fetchCalls)
               : options.manifest || { ok: true, rootFile: "main.tex", items: [], diagnostics: [] };
           }
+          if (String(url).includes("/formalize/all") || String(url).includes("/stub/all")) {
+            return options.targetBatch || {
+              ok: true,
+              batchId: "target-batch-1",
+              operation: String(url).includes("/stub/all") ? "stub" : "formalize",
+              done: false,
+              pausedOn: null,
+              items: []
+            };
+          }
           if (String(url).includes("/formalize")) {
             return { jobId: "job-1", status: "in_progress" };
           }
@@ -1245,6 +1417,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
           }
           if (String(url).includes("/lean-pane/repair/start")) {
             return options.repairStart || { status: "in_progress", jobId: "repair-job-1" };
+          }
+          if (String(url).includes("/lean-pane/repair/all/cancel")) {
+            return options.batchCancel || options.repairAll || { ok: true, batchId: "batch-1", done: true, canceled: true, pausedOn: null, items: [] };
           }
           if (String(url).includes("/lean-pane/repair/all/continue")) {
             return options.repairContinue || options.repairAll || { ok: true, batchId: "batch-1", done: false, pausedOn: null, items: [] };
@@ -1497,6 +1672,28 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               title: segment.title
             }))
         }));
+    },
+    batchQueue() {
+      const queue = document.body.querySelector(".ol-lean-batch-queue");
+      if (!queue) return null;
+      const progress = queue.querySelector(".ol-lean-batch-queue-progress");
+      return {
+        text: queue.textContent,
+        progress: progress ? {
+          role: progress.attributes.role,
+          label: progress.attributes["aria-label"],
+          min: progress.attributes["aria-valuemin"],
+          max: progress.attributes["aria-valuemax"],
+          now: progress.attributes["aria-valuenow"]
+        } : null,
+        progressSegments: progress
+          ? progress.querySelectorAll(".ol-lean-batch-queue-progress-segment")
+            .map((segment) => segment.className.replace("ol-lean-batch-queue-progress-segment ol-lean-batch-queue-progress-", ""))
+          : [],
+        pendingCount: queue.querySelectorAll(".ol-lean-batch-queue-item-pending").length,
+        completedCount: queue.querySelectorAll(".ol-lean-batch-queue-item-completed").length,
+        attentionCount: queue.querySelectorAll(".ol-lean-batch-queue-attention").length
+      };
     },
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");
@@ -1922,10 +2119,10 @@ test("post-save impact summary offers 'Repair all (N)' and posts the batch; the 
   const body = JSON.parse(batchCall.options.body);
   assert.deepEqual(body.items.map((i) => i.targetLabel), ["corollary_a", "corollary_b"]);
 
-  // the live batch panel renders per-item progress
-  assert.match(harness.bodyText(), /Repairing 2 items/);
-  assert.match(harness.bodyText(), /corollary_a: repairing\.\.\./);
-  assert.match(harness.bodyText(), /corollary_b: waiting\./);
+  // the live batch panel renders an ordered queue with the active ordinal
+  assert.match(harness.bodyText(), /Repair allRepairing…0 \/ 2 complete/);
+  assert.match(harness.bodyText(), /Current · 1 of 2●corollary_aRepairing…/);
+  assert.match(harness.bodyText(), /Next○corollary_bQueued · position 2 of 2/);
 });
 
 // --- Stale-offer reconciliation (docs/PLAN-self-repair-stale-offers.md) ----

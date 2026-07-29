@@ -2714,13 +2714,21 @@ async function runStubBatchItem(state, entry) {
   return { ok: false, reason: body.error || body.message || "stub_failed", jobId: body.jobId || null };
 }
 
-async function runFormalizeBatchItem(state, entry) {
+async function runFormalizeBatchItem(state, entry, batch) {
   const result = await handleFormalize(entry.payload, state);
   const body = result?.body || {};
   if (result?.statusCode === 402 || body.error === "max_spend_reached") return { paused: true };
   if (result?.statusCode !== 200 || !body.jobId) {
     return { ok: false, reason: body.error || body.message || "formalize_start_failed", jobId: body.jobId || null };
   }
+  // Publish the live job identity before waiting for it to settle. Stop uses
+  // this id to interrupt the adapter run; assigning it only after await made a
+  // running formalization temporarily uninterruptible.
+  entry.runJobId = body.jobId;
+  // Stop may have landed during handleFormalize's startup awaits, before the
+  // job id was available to handleBatchCancel. Retry the interrupt now that
+  // the active adapter run can be identified.
+  if (batch.cancelRequested) await interruptBatchActiveRun(state, batch);
   const finalJob = await awaitJobSettled(state, body.jobId);
   const status = String(finalJob?.status || "").toLowerCase();
   if (status === "formalized" || finalJob?.finalStatus === "formalized") {
@@ -2751,13 +2759,14 @@ async function runTargetBatch(state, batch) {
       publishBatch();
       const outcome = batch.operation === "stub"
         ? await runStubBatchItem(state, entry)
-        : await runFormalizeBatchItem(state, entry);
+        : await runFormalizeBatchItem(state, entry, batch);
 
       // Stopped mid-run: the run was interrupted by handleBatchCancel. Record
-      // the current item as canceled and let the `finally` settle the rest.
+      // it as canceled unless it won the race and genuinely completed first.
+      // In that case preserve the successful outcome and only stop the
+      // remaining queue.
       if (batch.cancelRequested) {
-        entry.state = "canceled";
-        entry.runJobId = outcome.jobId || entry.runJobId || null;
+        settleCanceledBatchEntry(entry, outcome);
         break;
       }
 
@@ -2870,12 +2879,19 @@ async function runRepairBatch(state, batch) {
       entry.state = "running";
       entry.runJobId = started.job.jobId;
       publishBatch();
+      if (batch.cancelRequested) await interruptBatchActiveRun(state, batch);
       await started.runPromise;
 
-      // Stopped mid-run: the run was interrupted by handleBatchCancel. Record
-      // the current item as canceled and let the `finally` settle the rest.
+      // Preserve a repair that completed before the interrupt won the race.
       if (batch.cancelRequested) {
-        entry.state = "canceled";
+        const finalJob = state.jobs[started.job.jobId] || started.job;
+        settleCanceledBatchEntry(entry, finalJob.finalStatus === "repaired"
+          ? {
+              ok: true,
+              state: finalJob.lastRepair?.state === "needs_review" ? "needs_review" : "repaired",
+              jobId: started.job.jobId
+            }
+          : { ok: false, jobId: started.job.jobId });
         break;
       }
 
@@ -2911,6 +2927,20 @@ async function runRepairBatch(state, batch) {
     }
     publishBatch();
   }
+}
+
+// Stop is inherently a race with the active run's terminal event. A successful
+// terminal outcome is durable truth and must never be rewritten as canceled;
+// only an interrupted/failed in-flight outcome becomes canceled.
+export function settleCanceledBatchEntry(entry, outcome = {}) {
+  entry.runJobId = outcome.jobId || entry.runJobId || null;
+  if (outcome.ok && outcome.state) {
+    entry.state = outcome.state;
+    entry.reason = null;
+    return;
+  }
+  entry.state = "canceled";
+  entry.reason = entry.reason || "canceled";
 }
 
 
@@ -6206,6 +6236,9 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     // Drives the pane's live polling: it keeps refreshing while any item is still
     // being formalized, then stops once everything settles.
     inProgress: inProgress && !stale,
+    // Let the batch queue show the active Lea turn even when the target lives
+    // in a different project file and therefore has no in-document badge.
+    turnProgress: inProgress && !stale ? statusInfo?.turnProgress : undefined,
     sourceFreshness: freshness.sourceFreshness,
     generatedFromSourceHash: freshness.generatedFromSourceHash || undefined,
     lastGeneratedAt: freshness.generatedAt || latestJob?.finishedAt || latestJob?.startedAt || undefined,

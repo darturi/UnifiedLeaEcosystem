@@ -1456,12 +1456,14 @@ test("lean pane manifest flags in-progress items for live polling", async () => 
     fetchImpl: makeLeaApiFetch([])
   });
 
-  await handleFormalize({
+  const started = await handleFormalize({
     overleafProjectId: "project-1",
     targetKind: "theorem",
     targetLabel: "compactness_criterion",
     targetText: "Every open cover has a finite subcover."
   }, state);
+  state.jobs[started.body.jobId].leaCurrentTurn = 7;
+  state.jobs[started.body.jobId].leaMaxTurns = 20;
 
   const res = await handleLeanPaneManifest({
     overleafProjectId: "project-1",
@@ -1479,6 +1481,7 @@ test("lean pane manifest flags in-progress items for live polling", async () => 
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.items[0].status, "in-progress");
   assert.equal(res.body.items[0].inProgress, true);
+  assert.deepEqual(res.body.items[0].turnProgress, { current: 7, max: 20 });
 });
 
 test("lean pane manifest keeps polling when an active job already has valid proof evidence", async () => {
