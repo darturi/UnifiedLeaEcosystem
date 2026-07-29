@@ -4286,7 +4286,8 @@ async function createLeaJob({
   const jobId = `${target.targetKind}-${target.targetLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
   const declarationNameHint = inferLeanDeclarationName(targetText);
-  const previousJob = jobsByRecencyDesc(state.jobs || {}, () => true)
+  const previousSessionJob = findLatestJobWithLeaSession(state.jobs || {}, target.jobKey);
+  const previousFormalizationJob = jobsByRecencyDesc(state.jobs || {}, () => true)
     .find((item) => item?.jobKey === target.jobKey && item?.formalizationId);
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
@@ -4335,8 +4336,17 @@ async function createLeaJob({
     leaRepoPath: state.settings.leaRepoPath,
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
-    leaSessionId: null,
-    formalizationId: previousJob?.formalizationId || null,
+    // A target owns one continuing Lea conversation. Re-formalization creates a
+    // fresh run in that conversation; dropping this id made POST /api/runs create
+    // a second session even though the companion still knew the original one.
+    leaSessionId:
+      previousSessionJob?.leaSessionId
+      || previousSessionJob?.recorderSessionId
+      || null,
+    formalizationId:
+      previousSessionJob?.formalizationId
+      || previousFormalizationJob?.formalizationId
+      || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,

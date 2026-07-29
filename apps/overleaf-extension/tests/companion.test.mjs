@@ -4128,6 +4128,51 @@ test("formalize after a saved stub reuses the stub session and proof file", asyn
   assert.equal(await fileExists(path.join(leaRepo, proofPath)), true);
 });
 
+test("re-formalize creates a new run in the target's existing Lea session", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls, {
+      sessionId: "sess-existing",
+      sessionDetail: {
+        runs: [{ id: "api-run-1", input_tokens: 10, output_tokens: 5, cost_usd: 0.001 }],
+        code_steps: []
+      }
+    })
+  });
+  state.jobs.previous = {
+    jobId: "previous",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectNamespace: "Lea.Project1",
+    leaSessionId: "sess-existing",
+    formalizationId: "formalization-existing",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    targetText: "Every open cover has a finite subcover."
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.equal(runCall.body.session_id, "sess-existing");
+  assert.equal(runCall.body.focus_formalization_id, "formalization-existing");
+  assert.equal(runCall.body.new_formalization, undefined);
+});
+
 test("resolveProofOutcome trusts an adapter-verified run even with no local proof file", async () => {
   // The adapter defers project-markdown recording, so the companion often
   // cannot locate the proof on disk (localStatus === unformalized). A successful
