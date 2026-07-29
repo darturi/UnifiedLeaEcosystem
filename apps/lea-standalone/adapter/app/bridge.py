@@ -883,7 +883,7 @@ def _with_subagents(cfg: LeaConfig) -> LeaConfig:
     `spawn_subagent` is registered `opt_in=True` in the prover, so an unfiltered toolset
     (`tools=None`) never contains it. The coordinator gets its normal default toolset —
     whatever `build_toolset(None)` resolves — PLUS spawn_subagent, named explicitly, so
-    the model can delegate. Resolving the default at call time (not hard-coding the six
+    the model can delegate. Resolving the default at call time (not hard-coding the
     built-ins) keeps this correct if the default set ever changes."""
     from lea.registry import build_toolset
 

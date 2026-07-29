@@ -492,6 +492,10 @@ def _fallback_tool_narration(tool_name: str, args: dict) -> str:
         if isinstance(query, str) and query:
             return f"I will search Mathlib for lemmas related to `{query}` so the next proof step can use existing results."
         return "I will search Mathlib for a relevant lemma before continuing the proof."
+    if tool_name == "suggest_imports":
+        if isinstance(path, str) and path:
+            return f"I will analyze `{path}` and replace broad or redundant imports with targeted modules."
+        return "I will analyze the proof's imports and identify a targeted replacement block."
     return f"I will use `{tool_name}` for the next proof step and then use its result to continue."
 
 

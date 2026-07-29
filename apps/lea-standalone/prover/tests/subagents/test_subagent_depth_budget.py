@@ -95,7 +95,8 @@ def test_coordinator_at_depth_0_spawns_a_child(monkeypatch):
         check("the child's toolset excludes spawn_subagent", "spawn_subagent" not in (child_tools or []))
         check("the child's toolset is the built-in default",
               set(child_tools or []) == {"read_file", "write_file", "edit_file",
-                                         "lean_check", "bash", "search_mathlib"})
+                                         "lean_check", "bash", "search_mathlib",
+                                         "suggest_imports"})
         check("the child drops MCP servers", c.get("config").mcp_servers == {})
         # Parent cap 30 is above the runaway ceiling, so the child is clamped to it.
         check("the child's turns are bounded to the ceiling",

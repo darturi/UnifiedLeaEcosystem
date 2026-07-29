@@ -91,7 +91,7 @@ The model can now call `lean_goal`, `lean_run_code`, `lean_loogle`, etc. directl
 
 #### Optional: restrict the toolset
 
-By default the model sees **all** tools (the six built-ins + every MCP tool). To
+By default the model sees **all** tools (the built-ins + every MCP tool). To
 hand it a focused set, use the `agent.tools` allowlist (names are matched exactly,
 order = the order shown to the model):
 

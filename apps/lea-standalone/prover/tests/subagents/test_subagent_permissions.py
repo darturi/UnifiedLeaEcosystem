@@ -38,8 +38,14 @@ from lea.subagents import _child_config, _parent_tool_names, compose_child_tools
 
 _FAILURES: list[str] = []
 
-_BUILTINS = {"read_file", "write_file", "edit_file", "lean_check", "bash", "search_mathlib"}
-_FULL = ["read_file", "write_file", "edit_file", "lean_check", "bash", "search_mathlib", "spawn_subagent"]
+_BUILTINS = {
+    "read_file", "write_file", "edit_file", "lean_check", "bash",
+    "search_mathlib", "suggest_imports",
+}
+_FULL = [
+    "read_file", "write_file", "edit_file", "lean_check", "bash",
+    "search_mathlib", "suggest_imports", "spawn_subagent",
+]
 _READONLY = ["read_file", "search_mathlib", "spawn_subagent"]
 
 
@@ -135,7 +141,8 @@ def test_child_config_applies_the_intersection():
     # the child ends up with only what the parent also had.
     parent = _cfg(tools=_READONLY)
     prof = AgentProfile(name="proof-candidate", system_prompt="H",
-                        tools=["read_file", "write_file", "edit_file", "lean_check", "search_mathlib"])
+                        tools=["read_file", "write_file", "edit_file", "lean_check",
+                               "search_mathlib", "suggest_imports"])
     child = _child_config(parent, prof)
     check("the child cannot write beyond a write-less parent",
           "write_file" not in child.tools and "edit_file" not in child.tools)

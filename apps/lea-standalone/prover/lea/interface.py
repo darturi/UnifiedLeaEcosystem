@@ -157,12 +157,15 @@ def verify(path: str) -> VerifyResult:
     # target declares a root-level `div_6`, which SafeVerify can't find in the
     # namespaced submission and rejects a valid proof.
     ns_open, ns_close = safeverify.namespace_context(code)
+    import_prelude = safeverify.trusted_target_import_prelude(code)
 
     with tempfile.TemporaryDirectory(dir=sv_root, prefix=f"{stem}_") as td:
         scratch = Path(td)
         target = scratch / f"{stem}_sv_target.lean"
         submission = scratch / f"{stem}_sv_submission.lean"
-        target.write_text("import Mathlib\n\n" + ns_open + signature + " := by\n  sorry\n" + ns_close)
+        target.write_text(
+            import_prelude + "\n" + ns_open + signature + " := by\n  sorry\n" + ns_close
+        )
         submission.write_text(code if code.endswith("\n") else code + "\n")
         try:
             # Thread the per-call dir down to the olean/report scratch too — the

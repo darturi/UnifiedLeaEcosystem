@@ -79,8 +79,11 @@ def test_with_subagents_adds_spawn_to_default_toolset():
     out = bridge._with_subagents(cfg)
     assert out.tools is not None
     assert "spawn_subagent" in out.tools
-    # the six built-ins are still there, spawn_subagent appended
-    assert {"read_file", "write_file", "edit_file", "lean_check", "bash", "search_mathlib"} <= set(out.tools)
+    # the built-ins are still there, spawn_subagent appended
+    assert {
+        "read_file", "write_file", "edit_file", "lean_check", "bash",
+        "search_mathlib", "suggest_imports",
+    } <= set(out.tools)
     assert out.tools[-1] == "spawn_subagent"
     # nothing else about the config changed
     assert out.model == cfg.model and out.max_turns == cfg.max_turns
