@@ -12,6 +12,7 @@ import { useProofSession } from '../stores/proofSession';
 import { useSessions } from '../stores/sessions';
 import { sortCodeSteps } from '../lib/timeline.mjs';
 import { mainFileIndex } from '../lib/canvasFiles.mjs';
+import { restoreFormalizationSelection } from '../lib/formalizations.mjs';
 
 // SSE reattach backoff (v2.3 item 14). A browser EventSource cannot read an HTTP
 // status — a 409 (server at capacity / a run driven elsewhere) surfaces only as
@@ -80,6 +81,7 @@ export function useProofStream() {
   };
 
   const applyDetail = (detail: SessionDetail) => {
+    const previousScope = useProofSession.getState().formalizationScope;
     const {
       setMessages,
       setCodeSteps,
@@ -93,16 +95,28 @@ export function useProofStream() {
       setApprovalBusy,
       setRunStatusById,
       setRunResultKindById,
+      setRunFocusById,
       setEditedPath,
       setSafeVerify,
       setVerifySurface,
       setGoalSurface,
       setSubagentProgress,
       setSubagentErrors,
+      setFormalizations,
+      setFormalizationScope,
+      setComposerScopeOverride,
     } = useProofSession.getState();
     // Fresh session context → drop any sub-agent live/error state from the previous one.
     setSubagentProgress({});
     setSubagentErrors({});
+    const formalizations = detail.formalizations || [];
+    setFormalizations(formalizations);
+    setFormalizationScope(restoreFormalizationSelection({
+      currentId: previousScope,
+      latestFocusId: detail.latest_focus_formalization_id,
+      formalizations,
+    }));
+    setComposerScopeOverride(null);
     useSessions.getState().setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
@@ -139,16 +153,20 @@ export function useProofStream() {
     setApprovalBusy(false);
     const statuses: Record<string, string> = {};
     const resultKinds: Record<string, string | null | undefined> = {};
+    const focuses: Record<string, string | null | undefined> = {};
     for (const r of detail.runs || []) {
       statuses[r.id] = r.status;
       resultKinds[r.id] = r.result_kind;
+      focuses[r.id] = r.focus_formalization_id;
     }
     if (active) {
       statuses[active.id] = active.status;
       resultKinds[active.id] = active.result_kind;
+      focuses[active.id] = active.focus_formalization_id;
     }
     setRunStatusById(statuses);
     setRunResultKindById(resultKinds);
+    setRunFocusById(focuses);
     setEditedPath(undefined);
     setSafeVerify(detail.safe_verify || null);
     setVerifySurface(null);
@@ -295,7 +313,18 @@ export function useProofStream() {
         const next = sortCodeSteps([...current, payload]);
         setCodeSteps(next);
         const idx = next.findIndex((s) => s.id === payload.id);
-        if (idx >= 0) setCodeIndex(idx);
+        let scope = useProofSession.getState().formalizationScope;
+        if (payload.formalization_id && payload.formalization_id !== scope) {
+          // Actual declaration attribution is stronger evidence than the
+          // pre-run inference. Follow the formalization Lea is really editing.
+          useProofSession.getState().setFormalizationScope(payload.formalization_id);
+          scope = payload.formalization_id;
+        }
+        const shouldFollow =
+          scope === 'project'
+          || scope === 'new'
+          || payload.formalization_id === scope;
+        if (idx >= 0 && shouldFollow) setCodeIndex(idx);
       }
     });
 

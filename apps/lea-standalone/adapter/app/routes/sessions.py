@@ -26,6 +26,7 @@ from lea.interface import check as interface_check, rebuild as interface_rebuild
 
 from ..artifacts import classify_lean_artifact
 from ..config import load_config
+from .. import formalizations as formalization_service
 from .. import filesystem as fs_service, lsp_proxy, netguard, projects, store
 
 router = APIRouter()
@@ -47,12 +48,34 @@ class PathRequest(BaseModel):
     # exactly, so the standalone UI's existing calls are unaffected.
     author: str | None = None
     summary: str | None = None
+    formalization_id: str | None = None
 
 
 class FileWriteRequest(BaseModel):
     path: str
     content: str
     note: str | None = None  # optional explanation of the edit (D11)
+    formalization_id: str | None = None
+
+
+class SessionUpdate(BaseModel):
+    title: str
+
+
+def _validated_formalization_id(
+    session_id: str, formalization_id: str | None
+) -> str | None:
+    if not formalization_id:
+        return None
+    formalization = store.get_formalization(formalization_id)
+    if not formalization:
+        raise HTTPException(status_code=404, detail="Formalization not found")
+    if session_id not in store.session_ids_for_formalization(formalization_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Formalization is not associated with this session",
+        )
+    return formalization_id
 
 
 @router.get("/api/sessions")
@@ -132,7 +155,30 @@ def session_detail(session_id: str) -> dict:
     detail = store.session_detail(session_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Session not found")
-    return detail
+    items = formalization_service.for_session(session_id)
+    focused_runs = [
+        run for run in (detail.get("runs") or [])
+        if run.get("focus_formalization_id")
+    ]
+    return {
+        **detail,
+        "formalizations": items,
+        "formalization_summary": formalization_service.summary(items),
+        "latest_focus_formalization_id": (
+            focused_runs[-1]["focus_formalization_id"] if focused_runs else None
+        ),
+    }
+
+
+@router.patch("/api/sessions/{session_id}")
+def update_session(session_id: str, request: SessionUpdate) -> dict:
+    title = request.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    updated = store.update_session_title(session_id, title)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return updated
 
 
 @router.post("/api/sessions/{session_id}/compact")
@@ -222,6 +268,9 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     # directly against the stored step — the same question, without a second store
     # having to agree. `before` is the stored content, not the file on disk: the disk
     # is about to be overwritten either way, and the step is what history shows.
+    formalization_id = _validated_formalization_id(
+        session_id, request.formalization_id
+    )
     latest = store.latest_code_step_for_path(session_id, request.path)
     if latest and not latest.get("content_lost") and latest["code"] == request.content:
         return {"unchanged": True, "code_step": None, "note": None}
@@ -231,13 +280,21 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
 
     # Coalesce rapid auto-saves into one 'your edit' timeline step (D62) — see
     # store.upsert_user_code_step.
-    step = store.upsert_user_code_step(session_id, request.path, content=request.content)
+    step = store.upsert_user_code_step(
+        session_id,
+        request.path,
+        content=request.content,
+        formalization_id=formalization_id,
+    )
+    if formalization_id:
+        store.link_formalization_file(formalization_id, request.path, "generated")
     # A human edit changes the proof, so any prior SafeVerify verdict is stale.
     store.set_session_safe_verify(session_id, None, None)
     note_message = None
     if request.note and request.note.strip():
         note_message = store.add_message(
             session_id, "user", request.note.strip(), None, kind="edit_note",
+            formalization_id=formalization_id,
         )
     return {"unchanged": False, "code_step": step, "note": note_message}
 
@@ -271,10 +328,19 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
     rebuilt module) by the time this check reaches it.
     """
     abs_path, rel = _resolve_proof_path(session_id, request.path)
+    formalization_id = _validated_formalization_id(
+        session_id, request.formalization_id
+    )
     result = interface_check(abs_path)
     artifact_kind = classify_lean_artifact(Path(abs_path).read_text()) if result.status == "ok" else None
     step = store.latest_code_step_for_path(session_id, rel)
-    if request.author and step:
+    if step and (
+        request.author
+        or (
+            formalization_id
+            and step.get("formalization_id") != formalization_id
+        )
+    ):
         new_step = store.add_code_step(
             session_id,
             None,
@@ -283,16 +349,28 @@ def lean_check_session(session_id: str, request: PathRequest) -> dict:
             # are content-addressed, the re-check's step shares the existing blob
             # rather than duplicating the proof.
             content=step["code"],
-            author=request.author,
+            author=request.author or step.get("author") or "user",
             summary=request.summary,
             check_status=result.status,
             check_detail=result.detail,
             artifact_kind=artifact_kind,
+            formalization_id=formalization_id or step.get("formalization_id"),
         )
-        return {"path": rel, "status": result.status, "detail": result.detail, "code_step": new_step}
+        return {
+            "path": rel,
+            "status": result.status,
+            "detail": result.detail,
+            "formalization_id": new_step.get("formalization_id"),
+            "code_step": new_step,
+        }
     if step:
         store.set_code_step_check(step["id"], result.status, result.detail, artifact_kind=artifact_kind)
-    return {"path": rel, "status": result.status, "detail": result.detail}
+    return {
+        "path": rel,
+        "status": result.status,
+        "detail": result.detail,
+        "formalization_id": formalization_id or (step or {}).get("formalization_id"),
+    }
 
 
 @router.post("/api/sessions/{session_id}/rebuild")
@@ -330,10 +408,31 @@ def verify_session(session_id: str, request: PathRequest) -> dict:
     """Standalone SafeVerify on a session's working file (kernel replay + axiom
     audit, no run, D2). status: ok | rejected | error | unavailable."""
     abs_path, rel = _resolve_proof_path(session_id, request.path)
+    formalization_id = _validated_formalization_id(
+        session_id, request.formalization_id
+    )
+    step = store.latest_code_step_for_path(session_id, rel)
+    if not formalization_id and step:
+        formalization_id = step.get("formalization_id")
     result = interface_verify(abs_path)
+    verification = store.record_verification_event(
+        session_id=session_id,
+        formalization_id=formalization_id,
+        path=rel,
+        status=result.status,
+        detail=result.detail,
+        code_step_id=step.get("id") if step else None,
+        run_id=step.get("run_id") if step else None,
+    )
     # Persist the verdict so it survives reload (surfaced as session_detail.safe_verify).
     store.set_session_safe_verify(session_id, result.status, result.detail)
-    return {"path": rel, "status": result.status, "detail": result.detail}
+    return {
+        "path": rel,
+        "status": result.status,
+        "detail": result.detail,
+        "formalization_id": formalization_id,
+        "verification_event": verification,
+    }
 
 
 @router.get("/api/sessions/{session_id}/lsp-info")
@@ -483,5 +582,3 @@ def _latest_proof_path(session_id: str) -> str | None:
     detail = store.session_detail(session_id)
     steps = (detail or {}).get("code_steps") or []
     return steps[-1]["path"] if steps else None
-
-

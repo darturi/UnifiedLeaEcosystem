@@ -1,6 +1,6 @@
 # Feature: Multi-Formalization Sessions
 
-> **Status:** Proposed — 2026-07-28
+> **Status:** Implemented — 2026-07-28
 
 ## Summary
 
@@ -152,32 +152,32 @@ The rail must:
 Selecting a formalization changes the canvas scope, not the canonical chat
 transcript.
 
-### Composer Scope
+### Automatic Composer Attribution
 
-The composer must show its scope immediately above or inside the input:
+The composer should not require a persistent scope dropdown. Lea infers the
+next run's focus from, in order:
 
-```text
-[ Project discussion ▾ ]  Ask Lea…
-[ Working on: continuous_mul ▾ ]  Ask Lea…
-[ New formalization ▾ ]  Describe the statement…
-```
+1. formalizations explicitly named in the message;
+2. an explicit one-shot user override;
+3. the formalization currently viewed in the canvas, as an ambiguity hint;
+4. new-formalization language such as “prove another theorem”; or
+5. project discussion when no single target is evident.
 
-Available scopes:
+The normal composer displays a passive `Scope: automatic` chip. Clicking it
+opens an escape-hatch override for project discussion or a linked
+formalization. An override applies to the next run and is then cleared.
 
-1. **Project discussion** — no single formalization focus.
-2. **Existing formalization** — continue, explain, repair, or revise it.
-3. **New formalization** — create a new target in the current session.
+`+ New formalization` remains an explicit action in the formalization rail. It
+creates no database row until the user submits the message.
 
-The selected scope must be visible before submission and included in the run
-request. Scope changes must not clear the draft.
-
-Lea may suggest a scope based on the prompt, but the suggestion must be visible
-and user-correctable. Intent classification alone must not silently reassign an
-existing formalization.
+Actual declaration attribution from streamed code changes is stronger evidence
+than the pre-run inference. If Lea edits a different formalization, the UI
+follows that formalization and the persisted code/check evidence remains
+attached to what was actually changed.
 
 ### Creating a Formalization
 
-When `New formalization` is selected:
+When `+ New formalization` is selected:
 
 1. The user submits a natural-language request.
 2. The adapter creates a draft formalization associated with the current

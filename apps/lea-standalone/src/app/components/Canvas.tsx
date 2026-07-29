@@ -7,6 +7,7 @@ import { deriveCodeStepProofStatus } from '../lib/proofDisplay.mjs';
 import { sortCodeSteps } from '../lib/timeline.mjs';
 import { distinctFiles, latestIndexForPath, mainFilePath } from '../lib/canvasFiles.mjs';
 import { useProofSession } from '../stores/proofSession';
+import { stepsForFormalization } from '../lib/formalizations.mjs';
 
 export interface CheckOutcome {
   status: string;
@@ -36,14 +37,46 @@ export function Canvas({
   const [mode, setMode] = useState<'history' | 'live'>('history');
   // R1b/R1c: canvas state (verdict, snapshots, stepper position, run-active flag)
   // comes straight from the store now — no props from App.
-  const persistedVerify = useProofSession((s) => s.safeVerify);
+  const sessionPersistedVerify = useProofSession((s) => s.safeVerify);
   const isRunning = useProofSession((s) => s.isRunning);
   const rawSteps = useProofSession((s) => s.codeSteps);
-  const codeSteps = useMemo(() => sortCodeSteps(rawSteps), [rawSteps]);
-  const index = useProofSession((s) => s.codeIndex);
-  const onIndexChange = useProofSession((s) => s.setCodeIndex);
+  const allCodeSteps = useMemo(() => sortCodeSteps(rawSteps), [rawSteps]);
+  const scope = useProofSession((s) => s.formalizationScope);
+  const formalizations = useProofSession((s) => s.formalizations);
+  const scoped = scope !== 'project' && scope !== 'new';
+  const scopedFormalization = scoped
+    ? formalizations.find((item) => item.id === scope)
+    : undefined;
+  const persistedVerify = scoped
+    ? (
+        scopedFormalization?.safe_verify?.current
+          ? {
+              status: scopedFormalization.safe_verify.status,
+              detail: scopedFormalization.safe_verify.detail,
+            }
+          : null
+      )
+    : sessionPersistedVerify;
+  const codeSteps = useMemo(
+    () => scoped
+      ? stepsForFormalization(allCodeSteps, scope)
+      : allCodeSteps,
+    [allCodeSteps, scope, scoped],
+  );
+  const globalIndex = useProofSession((s) => s.codeIndex);
+  const setGlobalIndex = useProofSession((s) => s.setCodeIndex);
   const total = codeSteps.length;
-  const safeIndex = Math.min(Math.max(index, 0), Math.max(total - 1, 0));
+  const selectedId = allCodeSteps[globalIndex]?.id;
+  const selectedScopedIndex = codeSteps.findIndex((item) => item.id === selectedId);
+  const safeIndex = selectedScopedIndex >= 0
+    ? selectedScopedIndex
+    : Math.max(0, total - 1);
+  const onIndexChange = (nextIndex: number) => {
+    const bounded = Math.min(Math.max(nextIndex, 0), Math.max(total - 1, 0));
+    const id = codeSteps[bounded]?.id;
+    const nextGlobal = allCodeSteps.findIndex((item) => item.id === id);
+    if (nextGlobal >= 0) setGlobalIndex(nextGlobal);
+  };
   const step = codeSteps[safeIndex];
 
   // Live mode needs a saved session + a file to open. If those go away (e.g. the
@@ -190,7 +223,11 @@ export function Canvas({
       )}
 
       {!step ? (
-        <div className="canvas-empty">Lean code will appear here as Lea edits files.</div>
+        <div className="canvas-empty">
+          {scoped
+            ? 'This formalization has no attributed Lean file yet.'
+            : 'Lean code will appear here as Lea edits files.'}
+        </div>
       ) : (
         <div className="code-wrap">
           <pre className="code">

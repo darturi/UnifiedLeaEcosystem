@@ -22,6 +22,7 @@ import type {
   BlueprintWarning,
   TreeEntry,
   SearchResult,
+  Formalization,
 } from './types';
 
 export * from './types';
@@ -55,14 +56,74 @@ export async function createRun(
   message: string,
   sessionId?: string,
   model?: string,
-): Promise<{ session_id: string; run_id: string; model: string; message: ChatMessage }> {
+  scope?: {
+    focus_formalization_id?: string;
+    focus_source_hash?: string;
+    project_slug?: string;
+    project_title?: string;
+    project_namespace?: string;
+    new_formalization?: {
+      display_title: string;
+      kind?: string;
+      declaration_name?: string;
+      statement?: string;
+      origin?: string;
+      origin_key?: string;
+      source_hash?: string;
+    };
+  },
+): Promise<{
+  session_id: string;
+  run_id: string;
+  model: string;
+  message: ChatMessage;
+  focus_formalization_id?: string | null;
+  formalization?: Formalization | null;
+}> {
   const response = await fetch('/api/runs', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, session_id: sessionId, model }),
+    body: JSON.stringify({ message, session_id: sessionId, model, ...scope }),
   });
   if (!response.ok) {
     throw new Error(await detailMessage(response, `Failed to start run: ${response.statusText}`));
+  }
+  return response.json();
+}
+
+export async function listProjectFormalizations(
+  projectId: string,
+): Promise<{ formalizations: Formalization[]; summary: Record<string, number> }> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/formalizations`,
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, 'Failed to load formalizations.'));
+  }
+  return response.json();
+}
+
+export async function getFormalization(formalizationId: string): Promise<Formalization> {
+  const response = await fetch(
+    `/api/formalizations/${encodeURIComponent(formalizationId)}`,
+  );
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, 'Failed to load formalization.'));
+  }
+  return response.json();
+}
+
+export async function updateSessionTitle(
+  sessionId: string,
+  title: string,
+): Promise<SessionSummary> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) {
+    throw new Error(await detailMessage(response, 'Failed to rename conversation.'));
   }
   return response.json();
 }
@@ -491,11 +552,12 @@ export async function writeSessionFile(
   path: string,
   content: string,
   note?: string,
+  formalizationId?: string,
 ): Promise<FileWriteResult> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/file`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, content, note }),
+    body: JSON.stringify({ path, content, note, formalization_id: formalizationId }),
   });
   if (!response.ok) {
     throw new Error(await detailMessage(response, `Failed to save file: ${response.statusText}`));
@@ -506,11 +568,12 @@ export async function writeSessionFile(
 export async function leanCheckSession(
   sessionId: string,
   path?: string,
+  formalizationId?: string,
 ): Promise<{ path: string; status: 'ok' | 'error'; detail?: string | null }> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/lean-check`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, formalization_id: formalizationId }),
   });
   if (!response.ok) {
     throw new Error(await detailMessage(response, `lean_check failed: ${response.statusText}`));
@@ -521,11 +584,12 @@ export async function leanCheckSession(
 export async function verifySession(
   sessionId: string,
   path?: string,
+  formalizationId?: string,
 ): Promise<{ path: string; status: SafeVerifyStatus; detail?: string | null }> {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/verify`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, formalization_id: formalizationId }),
   });
   if (!response.ok) {
     throw new Error(await detailMessage(response, `Verify failed: ${response.statusText}`));

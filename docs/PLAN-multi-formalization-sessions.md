@@ -1,6 +1,6 @@
 # Plan — Multi-Formalization Sessions
 
-> **Status:** Proposed — 2026-07-28
+> **Status:** Implemented — 2026-07-28
 >
 > Implements
 > [`FEATURE-multi-formalization-sessions.md`](FEATURE-multi-formalization-sessions.md).
@@ -35,6 +35,26 @@ schema and attribution
   → edit/check/verify correctness
   → search, Overleaf, and rollout
 ```
+
+## Implementation Record
+
+The plan was completed on 2026-07-28 as an additive migration and compatible API
+extension. The delivered implementation includes:
+
+- first-class formalizations, session membership, file attribution, run focus,
+  and snapshot-scoped verification evidence;
+- independent derived validity and run activity without a mutable status
+  column;
+- atomic focused/new-formalization run creation and focused prover context;
+- a session scope rail, scoped canvas, project Formalizations view, search,
+  deep links, and conversation rename support;
+- shared identity and source-freshness propagation through the Overleaf
+  companion; and
+- migration, service, route, frontend helper, and companion contract coverage.
+
+The standalone scope state was integrated into the existing proof-session store
+instead of introducing another state container. This preserves one source of
+truth for the selected session, run, and formalization.
 
 ## Scope Decisions (Locked)
 
@@ -501,7 +521,7 @@ Own:
 - open session's formalization list;
 - project formalization list;
 - selected formalization id;
-- composer scope (`project`, `existing`, `new`);
+- one-shot composer override (`project`, `existing`, `new`, or automatic);
 - per-formalization selected file/step in ephemeral browser state.
 
 Do not duplicate code steps or chat messages into this store. Those remain in
@@ -525,6 +545,7 @@ Create `src/app/lib/formalizations.mjs` with pure functions:
 - `restoreFormalizationSelection`
 - `formalizationStatusLabel`
 - `formalizationStatusClass`
+- `inferComposerFormalizationScope`
 
 Node tests should pin fallback and aggregation behavior before React wiring.
 
@@ -562,9 +583,8 @@ Rules:
 - focused view receives filtered steps;
 - `All files` preserves current behavior, including scratch files;
 - streamed focused code steps keep the selected formalization live-following;
-- a code step for another formalization does not steal canvas focus;
-- manual selection prevents auto-follow until the selected formalization itself
-  changes;
+- a code step attributed to another formalization updates the canvas to the
+  formalization Lea is actually editing;
 - SafeVerify shown in Phase 2 is read-only formalization evidence from the API.
 
 ### 2.6 Add Project Formalizations Tab
@@ -690,22 +710,23 @@ If the focused declaration name is known, artifact extraction must search for
 that exact declaration rather than blindly using the first declaration in the
 file. Legacy unfocused runs retain the existing first-declaration fallback.
 
-### 3.5 Add Composer Scope
+### 3.5 Add Automatic Composer Attribution
 
-Add `ComposerScope.tsx` to `ChatThread.tsx`.
+`ChatThread.tsx` shows a passive `Scope: automatic` chip rather than a
+persistent dropdown. Its menu provides a one-shot manual override.
+
+`App.handleSubmit` loads project candidates when available, resolves explicit
+declaration names before using the viewed formalization as a hint, detects new
+formalization intent, and passes the resolved focus into `createRun`.
 
 Behavior:
 
-- default to the selected formalization when one is focused;
-- allow `Project discussion`;
-- allow any linked formalization;
-- allow `New formalization`;
-- keep scope when draft text changes;
-- clear a one-shot `New formalization` scope after the server returns its draft
-  and replace it with that formalization id;
-- show server validation errors without losing the prompt.
-
-`App.handleSubmit` passes the selected scope into `createRun`.
+- an explicit theorem/definition name beats the currently viewed item;
+- messages naming several formalizations remain project-wide;
+- the selected canvas item is only an ambiguity hint;
+- an explicit override beats inference and clears after a successful submit;
+- actual streamed code attribution updates the visible formalization;
+- server validation errors retain the prompt and manual override.
 
 ### 3.6 Enable `+ New Formalization`
 
@@ -749,7 +770,8 @@ Adapter:
 
 Frontend:
 
-- scope serialization;
+- explicit-name inference and ambiguity fallback;
+- one-shot override serialization;
 - new scope replaced by returned id;
 - project discussion sends null focus;
 - scope survives API error;
@@ -1216,8 +1238,8 @@ The feature is complete when:
    current SafeVerify evidence.
 3. The chat transcript remains continuous and globally ordered.
 4. The project exposes Formalizations independently of Conversations.
-5. The composer visibly sends project, existing-focus, or new-formalization
-   scope.
+5. The composer automatically resolves project, existing-focus, or
+   new-formalization scope and offers a visible one-shot override.
 6. A failing second theorem cannot make a proved first theorem appear failed.
 7. Manual edits, checks, divergence, and SafeVerify remain attached to the
    correct formalization snapshot.

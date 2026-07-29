@@ -1144,11 +1144,16 @@ function resolveChatSession({ state, target }) {
     (linkedJob && (linkedJob.leaSessionId || linkedJob.recorderSessionId)) ||
     (assoc && assoc.leaSessionId) ||
     null;
+  const formalizationId =
+    activeJob?.formalizationId
+    || linkedJob?.formalizationId
+    || assoc?.formalizationId
+    || null;
   const latestJobHash = (finishedJob && finishedJob.targetTextHash) || (assoc && assoc.sourceHash) || null;
   const latestJobInputHash = deriveArtifactInputHash(finishedJob)
     || (assoc && assoc.formalizationInputHash)
     || null;
-  return { leaSessionId, latestJobHash, latestJobInputHash, activeJob };
+  return { leaSessionId, formalizationId, latestJobHash, latestJobInputHash, activeJob };
 }
 
 async function persistChatSessions(state) {
@@ -1171,7 +1176,7 @@ export async function handleChatSession(payload, state) {
     uiBaseUrl = null;
   }
 
-  const { leaSessionId, activeJob } = resolveChatSession({ state, target });
+  const { leaSessionId, formalizationId, activeJob } = resolveChatSession({ state, target });
   if (!leaSessionId) {
     return {
       statusCode: 200,
@@ -1188,7 +1193,9 @@ export async function handleChatSession(payload, state) {
     };
   }
 
-  const leaSessionUrl = uiBaseUrl ? buildLeaSessionUrl(uiBaseUrl, leaSessionId) : null;
+  const leaSessionUrl = uiBaseUrl
+    ? buildLeaSessionUrl(uiBaseUrl, leaSessionId, formalizationId)
+    : null;
   let baseUrl;
   try {
     baseUrl = chatBaseUrls(state).baseUrl;
@@ -1321,7 +1328,13 @@ export async function handleChatMessage(payload, state) {
   target.projectName = currentIdentity.projectName;
   target.projectNamespace = currentIdentity.namespace;
 
-  const { leaSessionId, latestJobHash, latestJobInputHash, activeJob } = resolveChatSession({ state, target });
+  const {
+    leaSessionId,
+    formalizationId,
+    latestJobHash,
+    latestJobInputHash,
+    activeJob,
+  } = resolveChatSession({ state, target });
   if (activeJob) {
     return errorResponse(409, "run_in_progress", "A Lea run for this item is already in progress.");
   }
@@ -1361,7 +1374,14 @@ export async function handleChatMessage(payload, state) {
 
   let started;
   try {
-    started = await startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot });
+    started = await startChatRun({
+      state,
+      target,
+      leaSessionId,
+      formalizationId,
+      prompt,
+      preRunSnapshot,
+    });
   } catch (error) {
     return errorResponse(502, "chat_run_failed", error instanceof Error ? error.message : String(error));
   }
@@ -1378,6 +1398,7 @@ export async function handleChatMessage(payload, state) {
     updatedAt: now,
     sourceHash: target.sourceHash || existing?.sourceHash || null,
     formalizationInputHash: target.formalizationInputHash || existing?.formalizationInputHash || null,
+    formalizationId: started.formalizationId || formalizationId || existing?.formalizationId || null,
     // Any lastRunImpact still on the record here belongs to THIS run's own
     // terminal continuation (a fast run can finish before this write; the
     // PREVIOUS run's impact was cleared before startChatRun). Preserving it
@@ -1722,7 +1743,8 @@ export async function handleLeanPaneEditSave(payload, state) {
   if (!before.ok) return errorResponse(before.error === "adapter_unavailable" ? 502 : 404, before.error, before.message);
 
   const write = await writeApiSessionFile({
-    fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path, content, note
+    fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path, content, note,
+    formalizationId: linkedJob?.formalizationId || null
   });
   if (!write.ok) {
     return errorResponse(write.status || 502, "edit_write_failed", write.error || "Could not save the edit.");
@@ -1731,7 +1753,14 @@ export async function handleLeanPaneEditSave(payload, state) {
     return { statusCode: 200, body: { ok: true, unchanged: true, dependentsImpact: [] } };
   }
 
-  const check = await runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId: leaSessionId, path: before.path });
+  const check = await runApiSessionLeanCheck({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    sessionId: leaSessionId,
+    path: before.path,
+    formalizationId: linkedJob?.formalizationId || null,
+  });
   if (!check.ok) {
     // AUDIT M3: the WRITE already landed — the file on disk is the user's new
     // content. A bare 502 here would leave the pane's chip reading the
@@ -2072,6 +2101,7 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaSessionId,
+    formalizationId: linkedJob?.formalizationId || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,
@@ -2916,7 +2946,14 @@ function recordEditCheckVerdict(job, { status, detail } = {}, breakage = null) {
 // SSE stream to completion in the background while the extension polls; this
 // keeps the POST /lean-pane/chat/message response fast and guarantees a single
 // driver for the run.
-function startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot = null }) {
+function startChatRun({
+  state,
+  target,
+  leaSessionId,
+  formalizationId = null,
+  prompt,
+  preRunSnapshot = null,
+}) {
   const { baseUrl, uiBaseUrl } = chatBaseUrls(state);
   let settle;
   let settled = false;
@@ -2943,15 +2980,34 @@ function startChatRun({ state, target, leaSessionId, prompt, preRunSnapshot = nu
     projectNamespace: target.projectNamespace || null,
     origin: "overleaf",
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
-    onRunStarted: async (runId, sessionId) => {
+    focusFormalizationId: formalizationId,
+    focusSourceHash: target.sourceHash || null,
+    newFormalization: formalizationId ? null : {
+      display_title: target.targetLabel,
+      kind: target.targetKind,
+      declaration_name: target.leanDeclarationName || target.targetLabel,
+      statement: target.naturalLanguageLatex || null,
+      origin: "overleaf",
+      origin_key: target.targetKey,
+      source_hash: target.sourceHash || null
+    },
+    onRunStarted: async (runId, sessionId, startBody = {}) => {
       const resolvedSessionId = sessionId || leaSessionId || null;
+      const resolvedFormalizationId =
+        startBody.focus_formalization_id
+        || startBody.formalization?.id
+        || formalizationId
+        || null;
       resolvedRunSessionId = resolvedSessionId;
       publishEvent(state, "chat-updated", { overleafProjectId: target.overleafProjectId, targetKey: target.targetKey });
       finish({
         ok: true,
         runId,
         sessionId: resolvedSessionId,
-        leaSessionUrl: resolvedSessionId ? buildLeaSessionUrl(uiBaseUrl, resolvedSessionId) : null
+        formalizationId: resolvedFormalizationId,
+        leaSessionUrl: resolvedSessionId
+          ? buildLeaSessionUrl(uiBaseUrl, resolvedSessionId, resolvedFormalizationId)
+          : null
       });
     },
     // Live-ish chat mirror (PLAN 3.1): the run's adapter events flow through
@@ -4230,6 +4286,8 @@ async function createLeaJob({
   const jobId = `${target.targetKind}-${target.targetLabel}-${timestamp}`;
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
   const declarationNameHint = inferLeanDeclarationName(targetText);
+  const previousJob = jobsByRecencyDesc(state.jobs || {}, () => true)
+    .find((item) => item?.jobKey === target.jobKey && item?.formalizationId);
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
@@ -4278,6 +4336,7 @@ async function createLeaJob({
     leaWorkspacePath: buildLeaWorkspacePath(state.settings.leaRepoPath),
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaSessionId: null,
+    formalizationId: previousJob?.formalizationId || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
     leaProvider: modelInfo.family,
@@ -4550,6 +4609,16 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
     projectNamespace: target.projectNamespace || job.projectNamespace || null,
     origin: "overleaf",
     originUrl: buildOverleafDocumentUrl(target.overleafProjectId),
+    focusFormalizationId: job.formalizationId || null,
+    focusSourceHash: job.targetTextHash || null,
+    newFormalization: job.formalizationId ? null : {
+      display_title: job.targetLabel,
+      kind: job.targetKind,
+      declaration_name: job.declarationName || job.targetLabel,
+      origin: "overleaf",
+      origin_key: job.jobKey,
+      source_hash: job.targetTextHash || null
+    },
     appendLog,
     logPath: job.logPath,
     onRunStarted: async (apiRunId, sessionId, startBody = {}) => {
@@ -4558,6 +4627,11 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       job.projectNamespace = startBody.project_namespace || job.projectNamespace || null;
       job.projectSlug = startBody.project_slug || job.projectSlug || target.projectSlug;
       job.adapterProjectId = startBody.project_id || job.adapterProjectId || null;
+      job.formalizationId =
+        startBody.focus_formalization_id
+        || startBody.formalization?.id
+        || job.formalizationId
+        || null;
       if (startBody.project_namespace) target.projectNamespace = startBody.project_namespace;
       if (startBody.project_slug) target.projectSlug = startBody.project_slug;
       await persistJobs(state);
@@ -5681,9 +5755,10 @@ function normalizeLeaUiBaseUrl(value) {
   return text;
 }
 
-function buildLeaSessionUrl(baseUrl, sessionId) {
+function buildLeaSessionUrl(baseUrl, sessionId, formalizationId = null) {
   const url = new URL(normalizeLeaUiBaseUrl(baseUrl || DEFAULT_LEA_UI_BASE_URL));
   url.searchParams.set("session", sessionId);
+  if (formalizationId) url.searchParams.set("formalization", formalizationId);
   return url.toString();
 }
 
@@ -5731,7 +5806,9 @@ function buildJobResponse({ job, status, target }) {
     resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "needs_review" ? "needs_review" : status === "formalized" ? (target.targetKind === "definition" ? "defined" : "proved") : null),
     resultDetail: job.resultDetail || null,
     leaSessionId,
-    leaSessionUrl: leaSessionId ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId) : null,
+    leaSessionUrl: leaSessionId
+      ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId, job.formalizationId)
+      : null,
     startedAt: job.startedAt,
     finishedAt: job.finishedAt
   };
@@ -6579,7 +6656,11 @@ function addLeaSessionLink(status, job) {
     return status;
   }
   status.leaSessionId = sessionId;
-  status.leaSessionUrl = buildLeaSessionUrl(job.leaUiBaseUrl, sessionId);
+  status.leaSessionUrl = buildLeaSessionUrl(
+    job.leaUiBaseUrl,
+    sessionId,
+    job.formalizationId,
+  );
   return status;
 }
 

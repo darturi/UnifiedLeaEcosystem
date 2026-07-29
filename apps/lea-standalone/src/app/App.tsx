@@ -11,9 +11,14 @@ import { ProjectsHub } from './components/ProjectsHub';
 import { NewProjectDialog } from './components/NewProjectDialog';
 import { SearchOverlay } from './components/SearchOverlay';
 import { sortCodeSteps } from './lib/timeline.mjs';
+import { inferComposerFormalizationScope } from './lib/formalizations.mjs';
 import { parseSlashCommand } from './lib/slashCommands.js';
 import { runSlashCommand } from './lib/slashCommandRunner';
-import { pickInitialSession, stripSessionParam } from './sessionDeepLink.mjs';
+import {
+  pickInitialSession,
+  readDeepLinkFormalizationId,
+  stripNavigationParams,
+} from './sessionDeepLink.mjs';
 import { useProofSession } from './stores/proofSession';
 import { useSessions } from './stores/sessions';
 import { useProjects } from './stores/projects';
@@ -28,14 +33,17 @@ import {
   type RunStatus,
   type SessionDetail,
   type StatusEvent,
+  type Formalization,
   createRun,
-  createSessionInProject,
   getSession,
+  getFormalization,
+  listProjectFormalizations,
   interruptRun,
   leanCheckSession,
   submitApproval,
   verifySession,
   writeSessionFile,
+  updateSessionTitle,
 } from './lib/api';
 
 const SELECTED_SESSION_KEY = 'lea:selectedSessionId';
@@ -76,6 +84,7 @@ export default function App() {
   const setRunStatus = useProofSession((s) => s.setRunStatus);
   const setRunStatusById = useProofSession((s) => s.setRunStatusById);
   const setRunResultKindById = useProofSession((s) => s.setRunResultKindById);
+  const setRunFocusById = useProofSession((s) => s.setRunFocusById);
   const approvals = useProofSession((s) => s.approvals);
   const setApprovals = useProofSession((s) => s.setApprovals);
   const approvalBusy = useProofSession((s) => s.approvalBusy);
@@ -107,6 +116,12 @@ export default function App() {
   const setSafeVerify = useProofSession((s) => s.setSafeVerify);
   const setVerifySurface = useProofSession((s) => s.setVerifySurface);
   const setGoalSurface = useProofSession((s) => s.setGoalSurface);
+  const formalizations = useProofSession((s) => s.formalizations);
+  const setFormalizations = useProofSession((s) => s.setFormalizations);
+  const formalizationScope = useProofSession((s) => s.formalizationScope);
+  const setFormalizationScope = useProofSession((s) => s.setFormalizationScope);
+  const composerScopeOverride = useProofSession((s) => s.composerScopeOverride);
+  const setComposerScopeOverride = useProofSession((s) => s.setComposerScopeOverride);
   // Model state (active model, catalog, featured, key-missing) lives in the model
   // store (R4); ChatThread reads it directly. App only kicks off the startup load
   // (in the restore effect) + re-sync on returning from Settings.
@@ -137,14 +152,34 @@ export default function App() {
         savedId: window.localStorage.getItem(SELECTED_SESSION_KEY),
         sessions: loaded,
       });
-      if (source === 'deep-link') {
+      const deepLinkedFormalizationId = readDeepLinkFormalizationId(
+        window.location.search,
+      );
+      if (source === 'deep-link' || deepLinkedFormalizationId) {
         // Strip the param so a later reload falls back to the saved-session restore.
-        const cleaned = stripSessionParam(window.location.search);
+        const cleaned = stripNavigationParams(window.location.search);
         window.history.replaceState(
           {},
           '',
           `${window.location.pathname}${cleaned}${window.location.hash}`,
         );
+      }
+      if (deepLinkedFormalizationId) {
+        const formalization = await getFormalization(deepLinkedFormalizationId);
+        const targetSessionId =
+          source === 'deep-link'
+            ? initialSessionId
+            : formalization.sessions[0]?.id;
+        if (targetSessionId && targetSessionId !== initialSessionId) {
+          await loadSession(targetSessionId);
+        }
+        if (targetSessionId) {
+          setFormalizationScope(formalization.id);
+          setCanvasCollapsed(false);
+        } else if (formalization.project_id) {
+          await openProject(formalization.project_id);
+          setView('project');
+        }
       }
       if (initialSessionId) {
         try {
@@ -210,25 +245,81 @@ export default function App() {
   const handleStartProjectProof = async (message: string) => {
     const content = message.trim();
     if (!content || !currentProject) return;
-    const projectId = currentProject.id;
     setError(undefined);
     try {
-      const session = await createSessionInProject(projectId, content.slice(0, 120));
       resetForNewSession(); // clear the proof view for the fresh session
-      const run = await createRun(content, session.id, useModel.getState().model);
+      const run = await createRun(
+        content,
+        undefined,
+        useModel.getState().model,
+        {
+          project_slug: currentProject.slug,
+          project_title: currentProject.title,
+          project_namespace: currentProject.namespace,
+          new_formalization: { display_title: content.slice(0, 120) },
+        },
+      );
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       setRunStatus('running');
       setRunStatusById((prev) => ({ ...prev, [run.run_id]: 'running' }));
       setRunResultKindById((prev) => ({ ...prev, [run.run_id]: null }));
+      setRunFocusById((prev) => ({
+        ...prev,
+        [run.run_id]: run.focus_formalization_id,
+      }));
       setIsRunning(true);
       setMessages([run.message]);
+      setFormalizations(run.formalization ? [run.formalization] : []);
+      setFormalizationScope(run.focus_formalization_id || 'new');
       window.localStorage.setItem(SELECTED_SESSION_KEY, run.session_id);
       setView('main');
       await refreshSessions();
       attachStream(run.run_id, run.session_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to start the proof.');
+    }
+  };
+
+  const handleStartProjectFormalization = async (
+    formalization: Formalization,
+    message?: string,
+  ) => {
+    if (!currentProject) return;
+    const content = (
+      message
+      || `Continue working on ${formalization.declaration_name || formalization.display_title}.`
+    ).trim();
+    setError(undefined);
+    try {
+      resetForNewSession();
+      const run = await createRun(
+        content,
+        undefined,
+        useModel.getState().model,
+        {
+          project_slug: currentProject.slug,
+          project_title: currentProject.title,
+          project_namespace: currentProject.namespace,
+          focus_formalization_id: formalization.id,
+        },
+      );
+      setSelectedSessionId(run.session_id);
+      setCurrentRunId(run.run_id);
+      setRunStatus('running');
+      setRunStatusById({ [run.run_id]: 'running' });
+      setRunResultKindById({ [run.run_id]: null });
+      setRunFocusById({ [run.run_id]: run.focus_formalization_id });
+      setIsRunning(true);
+      setMessages([run.message]);
+      setFormalizations([formalization]);
+      setFormalizationScope(formalization.id);
+      window.localStorage.setItem(SELECTED_SESSION_KEY, run.session_id);
+      setView('main');
+      await refreshSessions();
+      attachStream(run.run_id, run.session_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to start the conversation.');
     }
   };
 
@@ -244,6 +335,31 @@ export default function App() {
     closeProject();
     setView('main');
     loadSession(sessionId).catch((err) => setError(err instanceof Error ? err.message : String(err)));
+  };
+
+  const handleOpenFormalization = async (formalizationId: string) => {
+    try {
+      const formalization = await getFormalization(formalizationId);
+      const recentSession = formalization.sessions[0];
+      if (recentSession) {
+        closeProject();
+        setView('main');
+        await loadSession(recentSession.id);
+        setFormalizationScope(formalization.id);
+        setCanvasCollapsed(false);
+      } else if (formalization.project_id) {
+        await openProject(formalization.project_id);
+        setView('project');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to open formalization.');
+    }
+  };
+
+  const handleRenameSession = async (nextTitle: string) => {
+    if (!selectedSessionId) return;
+    await updateSessionTitle(selectedSessionId, nextTitle);
+    await refreshSessions();
   };
 
   // F9: ⌘K (and Ctrl+K) toggles the global search overlay, from any view.
@@ -270,6 +386,7 @@ export default function App() {
     setRunStatus(undefined);
     setRunStatusById({});
     setRunResultKindById({});
+    setRunFocusById({});
     setApprovals([]);
     setApprovalBusy(false);
     setError(undefined);
@@ -278,6 +395,9 @@ export default function App() {
     setSafeVerify(null);
     setVerifySurface(null);
     setGoalSurface(null);
+    setFormalizations([]);
+    setFormalizationScope('new');
+    setComposerScopeOverride(null);
     window.localStorage.removeItem(SELECTED_SESSION_KEY);
   };
 
@@ -309,14 +429,60 @@ export default function App() {
     }
 
     try {
-      const run = await createRun(content, selectedSessionId, useModel.getState().model);
+      let scopeCandidates = formalizations;
+      if (!composerScopeOverride && selectedSession?.project_id) {
+        try {
+          const projectItems = await listProjectFormalizations(selectedSession.project_id);
+          const byId = new Map(
+            [...formalizations, ...projectItems.formalizations].map((item) => [item.id, item]),
+          );
+          scopeCandidates = [...byId.values()];
+        } catch {
+          // Scope inference remains useful with the session-local list when the
+          // project list is temporarily unavailable.
+        }
+      }
+      const resolvedScope =
+        composerScopeOverride
+        || inferComposerFormalizationScope({
+          message: content,
+          formalizations: scopeCandidates,
+          viewedScope: formalizationScope,
+        });
+      setFormalizationScope(resolvedScope);
+      const scope =
+        resolvedScope === 'new'
+          ? { new_formalization: { display_title: content.slice(0, 120) } }
+          : resolvedScope === 'project'
+            ? undefined
+            : { focus_formalization_id: resolvedScope };
+      const run = await createRun(
+        content,
+        selectedSessionId,
+        useModel.getState().model,
+        scope,
+      );
       setSelectedSessionId(run.session_id);
       setCurrentRunId(run.run_id);
       setRunStatus('running');
       setRunStatusById((prev) => ({ ...prev, [run.run_id]: 'running' }));
       setRunResultKindById((prev) => ({ ...prev, [run.run_id]: null }));
+      setRunFocusById((prev) => ({
+        ...prev,
+        [run.run_id]: run.focus_formalization_id,
+      }));
       setIsRunning(true);
       setMessages((current) => [...current, run.message]);
+      if (run.formalization) {
+        setFormalizations([
+          ...formalizations.filter((item) => item.id !== run.formalization!.id),
+          run.formalization,
+        ]);
+      }
+      if (run.focus_formalization_id) {
+        setFormalizationScope(run.focus_formalization_id);
+      }
+      setComposerScopeOverride(null);
       setDraft('');
       window.localStorage.setItem(SELECTED_SESSION_KEY, run.session_id);
       await refreshSessions();
@@ -361,8 +527,17 @@ export default function App() {
   const handleSaveAndCheck = async (content: string, path?: string): Promise<CheckOutcome> => {
     const target = path ?? sortedCode[sortedCode.length - 1]?.path;
     if (!selectedSessionId || !target) return { status: 'error', detail: 'No file to edit.' };
-    await writeSessionFile(selectedSessionId, target, content, 'Manual edit from the canvas.');
-    const result = await leanCheckSession(selectedSessionId, target);
+    const focusId =
+      formalizationScope === 'project' || formalizationScope === 'new'
+        ? undefined : formalizationScope;
+    await writeSessionFile(
+      selectedSessionId,
+      target,
+      content,
+      'Manual edit from the canvas.',
+      focusId,
+    );
+    const result = await leanCheckSession(selectedSessionId, target, focusId);
     await reconcile(selectedSessionId);
     await refreshSessions();
     setEditedPath(target); // after reconcile (which clears it) — surface the nudge
@@ -373,7 +548,10 @@ export default function App() {
   const handleVerify = async (path?: string): Promise<CheckOutcome> => {
     const target = path ?? sortedCode[sortedCode.length - 1]?.path;
     if (!selectedSessionId) return { status: 'error', detail: 'No session.' };
-    const result = await verifySession(selectedSessionId, target);
+    const focusId =
+      formalizationScope === 'project' || formalizationScope === 'new'
+        ? undefined : formalizationScope;
+    const result = await verifySession(selectedSessionId, target, focusId);
     setSafeVerify({ status: result.status, detail: result.detail });
     return result;
   };
@@ -384,6 +562,7 @@ export default function App() {
       open={searchOpen}
       onClose={() => setSearchOpen(false)}
       onOpenSession={handleOpenSearchResult}
+      onOpenFormalization={handleOpenFormalization}
     />
   );
 
@@ -406,6 +585,7 @@ export default function App() {
           project={currentProject}
           onBack={leaveProject}
           onStartProof={handleStartProjectProof}
+          onStartFormalization={handleStartProjectFormalization}
           onOpenSession={handleOpenProjectSession}
         />
       </>
@@ -515,6 +695,7 @@ export default function App() {
             onInterrupt={handleInterrupt}
             canvasCollapsed={canvasCollapsed}
             onToggleCanvas={() => setCanvasCollapsed((v) => !v)}
+            onRenameSession={handleRenameSession}
           />
 
           {!canvasCollapsed && (

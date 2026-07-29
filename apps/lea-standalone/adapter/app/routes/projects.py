@@ -598,6 +598,12 @@ def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
             except OSError:
                 exists = False
         check = store.latest_check_for_project_path(project["id"], row["path"])
+        formalization = (
+            store.get_formalization(row["formalization_id"])
+            if row.get("formalization_id") else None
+        )
+        current_source_hash = (formalization or {}).get("source_hash")
+        artifact_source_hash = row.get("source_hash")
         targets.append({
             "declaration_name": name,
             "recorded": True,
@@ -610,6 +616,14 @@ def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
             "check_status": check["check_status"] if check else None,
             "check_detail": check["check_detail"] if check else None,
             "check_author": check["author"] if check else None,
+            "formalization_id": row.get("formalization_id"),
+            "current_source_hash": current_source_hash,
+            "artifact_source_hash": artifact_source_hash,
+            "stale": bool(
+                current_source_hash
+                and artifact_source_hash
+                and current_source_hash != artifact_source_hash
+            ),
             "content": content[:_TARGET_STATUS_CONTENT_CAP] if exists else None,
         })
     return {"project_id": project["id"], "slug": project["slug"], "targets": targets}

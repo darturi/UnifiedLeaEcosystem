@@ -36,6 +36,8 @@ export type RunStatus =
 export interface RunSummary {
   id: string;
   status: RunStatus | string;
+  focus_formalization_id?: string | null;
+  focus_source_hash?: string | null;
   result_kind?: 'proved' | 'disproved' | 'needs_review' | string | null;
   result_detail?: string | null;
 }
@@ -108,6 +110,52 @@ export interface Project {
 // GET /api/projects/{id}: the project meta plus its sessions (the project window).
 export interface ProjectDetail extends Project {
   sessions: SessionSummary[];
+}
+
+export type FormalizationValidity =
+  | 'draft'
+  | 'planned'
+  | 'unchecked'
+  | 'failing'
+  | 'proved'
+  | 'defined'
+  | 'disproved'
+  | 'needs_review'
+  | 'stale';
+
+export interface FormalizationFile {
+  formalization_id: string;
+  path: string;
+  role: 'primary' | 'support' | 'generated';
+}
+
+export interface Formalization {
+  id: string;
+  project_id?: string | null;
+  loose_session_id?: string | null;
+  display_title: string;
+  declaration_name?: string | null;
+  kind: string;
+  statement?: string | null;
+  origin: string;
+  origin_key?: string | null;
+  source_hash?: string | null;
+  validity_status: FormalizationValidity | string;
+  activity: {
+    status: 'idle' | 'queued' | 'running' | 'waiting_for_approval' | string;
+    run_id?: string | null;
+  };
+  primary_path?: string | null;
+  files: FormalizationFile[];
+  sessions: Array<{ id: string; title: string; updated_at: string }>;
+  safe_verify?: {
+    id: string;
+    status: SafeVerifyStatus;
+    detail?: string | null;
+    current: boolean;
+  } | null;
+  created_at: string;
+  updated_at: string;
 }
 
 // An uploaded reference doc (D27). Bytes live in the project repo under
@@ -210,12 +258,17 @@ export interface ProjectGraph {
 // project session, which the sidebar hides.
 export interface SearchResult {
   id: string;
+  result_type?: 'session' | 'formalization';
   title: string;
-  status: SessionStatus;
+  status: SessionStatus | FormalizationValidity | string;
   updated_at: string;
   project_id: string | null;
   project_title?: string | null;
   project_namespace?: string | null;
+  declaration_name?: string | null;
+  formalization_kind?: string | null;
+  session_id?: string | null;
+  primary_path?: string | null;
 }
 
 // ── Filesystem tab (v2.1 Slice 6, D34) ────────────────────────────────────────
@@ -233,6 +286,7 @@ export interface ChatMessage {
   id: string;
   session_id: string;
   run_id?: string | null;
+  formalization_id?: string | null;
   role: 'user' | 'assistant';
   content: string;
   kind?: 'assistant' | 'edit_note' | string;
@@ -246,6 +300,7 @@ export interface CodeStep {
   id: string;
   session_id: string;
   run_id?: string | null;
+  formalization_id?: string | null;
   seq?: number;
   turn?: number | null;
   author: 'agent' | 'user';
@@ -333,6 +388,8 @@ export interface ActiveRun {
   pending_approval?: PendingApproval | null;
   result_kind?: string | null;
   result_detail?: string | null;
+  focus_formalization_id?: string | null;
+  focus_source_hash?: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -344,6 +401,9 @@ export interface SessionDetail extends SessionSummary {
   active_run?: ActiveRun | null;
   runs?: RunSummary[];
   safe_verify?: SafeVerifyResult | null;
+  formalizations?: Formalization[];
+  formalization_summary?: Record<string, number>;
+  latest_focus_formalization_id?: string | null;
 }
 
 // ── SSE event payloads (GET /api/runs/{run_id}/events) ─────────────────────────

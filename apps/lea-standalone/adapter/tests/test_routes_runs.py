@@ -2,11 +2,13 @@
 
 import asyncio
 
+import pytest
+
 from app import db, runbroker, runregistry, store
 from app.config import LeaConfig
 from app.runregistry import RunRegistry
 from app.routes import runs as runs_route
-from app.routes.runs import RunRequest
+from app.routes.runs import NewFormalizationRequest, RunRequest
 
 
 class _Req:
@@ -104,6 +106,67 @@ def test_create_run_without_slug_stays_project_less(tmp_path, monkeypatch):
     assert result["project_slug"] is None
     assert result["project_namespace"] is None
     assert store.list_projects() == []
+
+
+def test_new_formalization_and_run_are_created_atomically(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    result = runs_route.create_run(
+        RunRequest(
+            message="prove compact_image",
+            project_slug="topology",
+            new_formalization=NewFormalizationRequest(
+                display_title="Compact image",
+                declaration_name="compact_image",
+            ),
+        )
+    )
+
+    assert result["formalization"]["id"] == result["focus_formalization_id"]
+    detail = store.session_detail(result["session_id"])
+    assert detail["runs"][0]["focus_formalization_id"] == result["formalization"]["id"]
+    assert detail["messages"][0]["formalization_id"] == result["formalization"]["id"]
+    assert [
+        item["id"]
+        for item in store.list_raw_session_formalizations(result["session_id"])
+    ] == [result["formalization"]["id"]]
+
+
+def test_external_origin_key_reuses_formalization_across_sessions(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    request = dict(
+        message="formalize source target",
+        project_slug="paper",
+        origin="overleaf",
+        new_formalization=NewFormalizationRequest(
+            display_title="source_target",
+            declaration_name="source_target",
+            origin="overleaf",
+            origin_key="paper:theorem:source_target",
+            source_hash="v1",
+        ),
+    )
+    first = runs_route.create_run(RunRequest(**request))
+    second = runs_route.create_run(RunRequest(**request))
+
+    assert first["session_id"] != second["session_id"]
+    assert first["formalization"]["id"] == second["formalization"]["id"]
+
+
+def test_invalid_focus_rolls_back_the_whole_bundle(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    before = len(store.list_sessions())
+
+    with pytest.raises(Exception) as caught:
+        runs_route.create_run(
+            RunRequest(
+                message="should not persist",
+                project_slug="analysis",
+                focus_formalization_id="missing",
+            )
+        )
+
+    assert getattr(caught.value, "status_code", None) == 404
+    assert len(store.list_sessions()) == before
 
 
 def test_create_run_snapshots_explicit_model_over_config_default(tmp_path, monkeypatch):

@@ -62,12 +62,13 @@ from lea.interface import (
     run_events,
 )
 
-from .artifacts import classify_lean_artifact, extract_declaration_name
+from .artifacts import classify_lean_artifact, declaration_present, extract_declaration_name
 from .config import LeaConfig, load_config
 from .gitstore import GitStore, GitStoreError
-from . import collation, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
+from . import collation, formalizations as formalization_service, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
+_FORMALIZATION_CONTEXT_MARKER = "<!-- lea:formalization-context -->"
 
 # Admission — which run may start and whether there's room — lives in
 # `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim.
@@ -583,7 +584,12 @@ def _classify(code: str) -> str | None:
         return None
 
 
-def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | None:
+def _divergence_context(
+    session_id: str,
+    repo_key: str,
+    gs: GitStore,
+    formalization_id: str | None = None,
+) -> str | None:
     """Diff-on-divergence (D12): if the human edited the proof since the agent last
     acted, return a context block (a diff + any edit notes) to fold into the next
     run's task — so the agent sees and acknowledges the changes (D13). None when
@@ -599,7 +605,11 @@ def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | N
     version compared two git revisions, and its `before` was only as good as a
     pointer nobody verified (see 0004's backfill: one such pointer named a commit
     whose tree never contained the file)."""
-    agent_step = store.latest_agent_code_step(session_id)
+    agent_step = (
+        store.latest_agent_code_step_for_formalization(session_id, formalization_id)
+        if formalization_id
+        else store.latest_agent_code_step(session_id)
+    )
     if not agent_step or not agent_step.get("path"):
         return None
     path = agent_step["path"]
@@ -677,7 +687,69 @@ def _artifact_module_name(namespace: str | None, rel: str) -> str | None:
     return f"{namespace}.{rel[:-len('.lean')].replace('/', '.')}"
 
 
-def _record_run_artifacts(session_id, run_id, project, namespace, steps_by_path) -> None:
+def _formalization_context_message(formalization: dict | None) -> dict | None:
+    """Build the current, replaceable run-focus message for the prover."""
+    if not formalization:
+        return None
+    files = store.list_formalization_files(formalization["id"])
+    lines = [
+        _FORMALIZATION_CONTEXT_MARKER,
+        "The current run is focused on this formalization:",
+        f"- id: {formalization['id']}",
+        f"- title: {formalization['display_title']}",
+        f"- kind: {formalization['kind']}",
+    ]
+    if formalization.get("declaration_name"):
+        lines.append(f"- Lean declaration: {formalization['declaration_name']}")
+    if formalization.get("statement"):
+        lines.append(f"- statement: {formalization['statement']}")
+    if formalization.get("validity_status"):
+        lines.append(f"- current validity: {formalization['validity_status']}")
+    activity = (formalization.get("activity") or {}).get("status")
+    if activity:
+        lines.append(f"- current activity: {activity}")
+    if formalization.get("source_hash"):
+        lines.append(f"- external source hash: {formalization['source_hash']}")
+    if files:
+        lines.append("- known files:")
+        lines.extend(f"  - {item['role']}: {item['path']}" for item in files)
+    lines.append(
+        "Keep new proof writes for this target in its known primary file when one "
+        "exists. You may reference other project declarations without changing focus."
+    )
+    return {"role": "user", "content": "\n".join(lines)}
+
+
+def _is_formalization_context_message(message: dict) -> bool:
+    return _FORMALIZATION_CONTEXT_MARKER in str(message.get("content") or "")
+
+
+def _attributable_formalization(
+    path: str, focus_formalization_id: str | None
+) -> str | None:
+    """Attribute proof files, but never scratch or adapter-support output."""
+    normalized = path.replace("\\", "/")
+    lowered = normalized.lower()
+    if (
+        not focus_formalization_id
+        or not normalized.endswith(".lean")
+        or "scratch" in lowered
+        or normalized.startswith(".lea/")
+    ):
+        return None
+    return focus_formalization_id
+
+
+def _record_run_artifacts(
+    session_id,
+    run_id,
+    project,
+    namespace,
+    steps_by_path,
+    *,
+    focus_formalization_id: str | None = None,
+    source_hash: str | None = None,
+) -> None:
     """Write the structured artifact index rows for this run's checked files
     (PLAN-system-hardening 4.1). Only files whose latest step verdict is ok
     are recorded — a broken write is not an artifact. Best-effort by design:
@@ -696,9 +768,49 @@ def _record_run_artifacts(session_id, run_id, project, namespace, steps_by_path)
             # the exact bytes carried by this run's checked code step. Reading a
             # git commit_sha here would resurrect the stale dual-store design.
             code = step.get("code") or ""
-            declaration = extract_declaration_name(code)
+            focused = (
+                store.get_formalization(focus_formalization_id)
+                if focus_formalization_id else None
+            )
+            focused_declaration = (
+                focused.get("declaration_name") if focused else None
+            )
+            if focused_declaration and not declaration_present(
+                code, focused_declaration
+            ):
+                store.link_formalization_file(
+                    focus_formalization_id, rel, "support"
+                )
+                continue
+            declaration = focused_declaration or extract_declaration_name(code)
             if not declaration:
                 continue
+            formalization = focused
+            if (
+                formalization is not None
+                and not formalization.get("declaration_name")
+            ):
+                formalization = store.update_formalization(
+                    formalization["id"], declaration_name=declaration
+                )
+            if formalization is None:
+                formalization = store.find_formalization_by_declaration(
+                    project_id=project["id"] if project else None,
+                    loose_session_id=None if project else session_id,
+                    declaration_name=declaration,
+                )
+                if formalization is None:
+                    formalization = store.create_formalization(
+                        project_id=project["id"] if project else None,
+                        loose_session_id=None if project else session_id,
+                        display_title=declaration,
+                        declaration_name=declaration,
+                        kind=step.get("artifact_kind") or classify_lean_artifact(code),
+                        origin="legacy-run",
+                    )
+            formalization_id = formalization["id"]
+            store.link_session_formalization(session_id, formalization_id)
+            store.link_formalization_file(formalization_id, rel, "primary")
             store.upsert_artifact(
                 project_id=project["id"] if project else None,
                 session_id=session_id,
@@ -707,6 +819,8 @@ def _record_run_artifacts(session_id, run_id, project, namespace, steps_by_path)
                 kind=step.get("artifact_kind") or classify_lean_artifact(code),
                 path=rel,
                 module_name=_artifact_module_name(namespace, rel),
+                formalization_id=formalization_id,
+                source_hash=source_hash,
             )
         except Exception:
             logger.exception("Could not record artifact row for %s in run %s", rel, run_id)
@@ -1073,6 +1187,7 @@ def _promote_winner(
     namespace: str | None,
     turn: int,
     events,
+    formalization_id: str | None = None,
 ) -> dict | None:
     """Deterministic collation (item 25): promote the best *compiling* sub-agent candidate
     as the coordinator's proof, and record it as a code_step — the compiler decides, not
@@ -1100,14 +1215,17 @@ def _promote_winner(
             return None
         step = _try_promote(
             winner, session_id=session_id, run_id=run_id, repo=repo,
-            namespace=namespace, turn=turn, events=events,
+            namespace=namespace, formalization_id=formalization_id,
+            turn=turn, events=events,
         )
         if step is not None:
             return step
     return None
 
 
-def _try_promote(winner, *, session_id, run_id, repo, namespace, turn, events) -> dict | None:
+def _try_promote(
+    winner, *, session_id, run_id, repo, namespace, formalization_id, turn, events
+) -> dict | None:
     """Promote one candidate, or return None having left the tree as it was found."""
     # The session's canonical proofs dir: its namespace path (loose → Lea/Misc).
     ns_path = (namespace or "Lea.Misc").replace(".", "/")
@@ -1167,6 +1285,7 @@ def _try_promote(winner, *, session_id, run_id, repo, namespace, turn, events) -
         summary=f"Promoted the winning sub-agent candidate ({winner.result_id}).",
         check_status="ok", check_detail=None,
         artifact_kind=_classify(winner.text or ""),
+        formalization_id=formalization_id,
         provenance={"promoted_from": winner.result_id},
     )
     emit(events, "code_step", step)
@@ -1278,6 +1397,8 @@ def run_lea(context: RunnerContext) -> None:
     final_status = "failed"
     final_result_kind: str | None = None
     final_result_detail: str | None = None
+    focus_formalization_id: str | None = None
+    focus_source_hash: str | None = None
 
     # Mid-run spend enforcement (PLAN-system-hardening 0.1): the cap used to be
     # checked only at POST /api/runs, so one run could overshoot it by its entire
@@ -1319,7 +1440,18 @@ def run_lea(context: RunnerContext) -> None:
         if not text or text == last_persisted:
             return
         last_persisted = text
-        emit(events, "message", store.add_message(session_id, "assistant", text, run_id, kind="assistant"))
+        emit(
+            events,
+            "message",
+            store.add_message(
+                session_id,
+                "assistant",
+                text,
+                run_id,
+                kind="assistant",
+                formalization_id=focus_formalization_id,
+            ),
+        )
 
     def flush_narration() -> str:
         text = "".join(narration)
@@ -1336,6 +1468,15 @@ def run_lea(context: RunnerContext) -> None:
         # session-keyed primitive below operates on the right repo unchanged. The real
         # session_id still keys all DB rows.
         session = store.get_session(session_id)
+        run_row = store.get_run(run_id)
+        focus_formalization_id = (
+            run_row.get("focus_formalization_id") if run_row else None
+        )
+        focus_source_hash = run_row.get("focus_source_hash") if run_row else None
+        focused_formalization = (
+            formalization_service.get(focus_formalization_id)
+            if focus_formalization_id else None
+        )
         project = (
             store.get_project(session["project_id"])
             if session and session.get("project_id") else None
@@ -1378,7 +1519,9 @@ def run_lea(context: RunnerContext) -> None:
         # the agent last acted, prepend their diff (+ notes) to the task so the agent
         # works from the current canvas, not its stale memory.
         task_content = context.task
-        divergence = _divergence_context(session_id, repo_key, gs)
+        divergence = _divergence_context(
+            session_id, repo_key, gs, focus_formalization_id
+        )
         if divergence:
             task_content = f"{divergence}\n\n{task_content}"
         # Transcript gap (C10): `prior` is whatever run last stored a transcript, which
@@ -1395,7 +1538,14 @@ def run_lea(context: RunnerContext) -> None:
         ctx = projects.compose_context_message(project, repo) if project else None
         if ctx:
             prior = [m for m in prior if not projects.is_context_message(m)]
-        messages = ([ctx] if ctx else []) + prior + [{"role": "user", "content": task_content}]
+        focus_ctx = _formalization_context_message(focused_formalization)
+        prior = [m for m in prior if not _is_formalization_context_message(m)]
+        messages = (
+            ([ctx] if ctx else [])
+            + ([focus_ctx] if focus_ctx else [])
+            + prior
+            + [{"role": "user", "content": task_content}]
+        )
 
         # Drive the generator manually (not `for`): the per-tool gate (D19) is a
         # two-way exchange — the prover yields ToolApprovalRequested and we feed the
@@ -1447,6 +1597,9 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, FileChanged):
                 rel = _relativize(ev.path, repo)
+                formalization_id = _attributable_formalization(
+                    rel, focus_formalization_id
+                )
                 # The file on disk *is* the after-state — the prover has already
                 # written it. Reading it here is what makes the stored content and
                 # the streamed snapshot the same bytes by construction, rather than
@@ -1455,12 +1608,20 @@ def run_lea(context: RunnerContext) -> None:
                 step = store.add_code_step(
                     session_id, run_id, rel, content=_read_after(ev.path),
                     author="agent", turn=current_turn, summary=last_intent,
+                    formalization_id=formalization_id,
                 )
+                if formalization_id:
+                    store.link_formalization_file(
+                        formalization_id, rel, "generated"
+                    )
                 step_id_by_path[rel] = step["id"]
                 emit(events, "code_step", step)  # already carries `code`
 
             elif isinstance(ev, CheckResult):
                 rel = _relativize(ev.path, repo)
+                formalization_id = _attributable_formalization(
+                    rel, focus_formalization_id
+                )
                 step_id = step_id_by_path.get(rel)
                 if step_id is None:
                     # A file this run never wrote through write_file/edit_file — a
@@ -1474,7 +1635,12 @@ def run_lea(context: RunnerContext) -> None:
                         author="agent", turn=current_turn, summary=last_intent,
                         check_status=ev.status, check_detail=ev.detail,
                         artifact_kind=_classify(_read_after(ev.path)) if ev.status == "ok" else None,
+                        formalization_id=formalization_id,
                     )
+                    if formalization_id:
+                        store.link_formalization_file(
+                            formalization_id, rel, "generated"
+                        )
                     step_id_by_path[rel] = step["id"]
                     if ev.status == "ok":
                         checked_artifact_kind = step.get("artifact_kind")
@@ -1526,7 +1692,11 @@ def run_lea(context: RunnerContext) -> None:
                     "referenced_files": [],
                 })
                 emit(events, "message",
-                     store.add_message(session_id, "assistant", _payload, run_id, kind="compaction"))
+                     store.add_message(
+                         session_id, "assistant", _payload, run_id,
+                         kind="compaction",
+                         formalization_id=focus_formalization_id,
+                     ))
 
             elif isinstance(ev, ToolResulted):
                 # A project asset write (D33): a non-.lean write_file/edit_file in a
@@ -1672,7 +1842,9 @@ def run_lea(context: RunnerContext) -> None:
                 if not produced_clean and subagent_results:
                     promoted = _promote_winner(
                         subagent_results, session_id=session_id, run_id=run_id,
-                        repo=repo, namespace=namespace, turn=current_turn, events=events,
+                        repo=repo, namespace=namespace,
+                        formalization_id=focus_formalization_id,
+                        turn=current_turn, events=events,
                     )
                     if promoted:
                         checked_artifact_kind = promoted.get("artifact_kind") or checked_artifact_kind
@@ -1710,7 +1882,10 @@ def run_lea(context: RunnerContext) -> None:
                 # run's checked files hold, keyed to the run's own FileChanged set.
                 _best_effort("artifact index", run_id,
                              lambda: _record_run_artifacts(
-                                 session_id, run_id, project, namespace, dict(step_id_by_path)))
+                                 session_id, run_id, project, namespace,
+                                 dict(step_id_by_path),
+                                 focus_formalization_id=focus_formalization_id,
+                                 source_hash=focus_source_hash))
 
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)

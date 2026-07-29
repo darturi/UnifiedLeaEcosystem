@@ -89,6 +89,9 @@
 .chat { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 .pane-head { display: flex; align-items: center; gap: 10px; padding: 13px 22px; border-bottom: 1px solid var(--line); }
 .pane-head .ttl { font-weight: 600; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pane-head .title-button { border: 0; background: none; color: var(--ink); font: inherit; cursor: text; padding: 0; text-align: left; }
+.pane-head .title-edit { min-width: 140px; max-width: 340px; border: 1px solid var(--accent); border-radius: 6px;
+  padding: 3px 7px; background: var(--panel); color: var(--ink); font: inherit; font-weight: 600; outline: none; }
 .chip { font-size: 11.5px; padding: 2px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--ink-2); background: var(--panel); white-space: nowrap; }
 .chip.ok { color: var(--green); border-color: var(--green-soft); background: var(--green-soft); }
 .chip.run { color: var(--amber); border-color: var(--amber-soft); background: var(--amber-soft); }
@@ -140,6 +143,10 @@
 
 .thread { flex: 1; min-height: 0; overflow-y: auto; padding: 24px 0 12px; }
 .thread-inner { max-width: 720px; margin: 0 auto; padding: 0 24px; }
+.run-episode { display: flex; align-items: center; gap: 8px; margin: 18px 0 8px; color: var(--muted);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .35px; }
+.run-episode::after { content: ""; height: 1px; background: var(--line); flex: 1; }
+.run-episode strong { color: var(--ink-2); font-weight: 600; text-transform: none; letter-spacing: 0; }
 .msg { margin-bottom: 22px; }
 .msg .role { font-size: 12px; color: var(--muted); margin-bottom: 6px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
 .avatar { width: 20px; height: 20px; border-radius: 5px; display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff; }
@@ -192,6 +199,37 @@
 .final .meta { font-size: 12px; color: var(--muted); display: flex; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
 
 .composer { padding: 12px 24px 18px; }
+.composer .form-scope { max-width: 720px; margin: 0 auto 8px; display: grid; gap: 7px; }
+.composer .form-rail { display: flex; gap: 6px; overflow-x: auto; padding: 1px 0 2px; }
+.composer .form-rail button { flex: none; display: inline-flex; align-items: center; gap: 6px; max-width: 230px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 999px;
+  padding: 5px 9px; cursor: pointer; font: inherit; font-size: 11.5px; white-space: nowrap; }
+.composer .form-rail button:hover, .composer .form-rail button.active {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--ink); background: var(--accent-soft); }
+.composer .form-rail button small { max-width: 74px; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+.composer .form-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.composer .form-dot.ok { background: var(--green); }
+.composer .form-dot.fail { background: var(--red); }
+.composer .form-dot.run { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.composer .form-dot.warn { background: var(--amber); }
+.composer .scope-override { position: relative; width: max-content; max-width: 100%; }
+.composer .scope-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
+  border: 0; background: transparent; color: var(--muted); border-radius: 7px; padding: 3px 5px;
+  cursor: pointer; font: inherit; font-size: 11.5px; }
+.composer .scope-chip:hover, .composer .scope-chip[aria-expanded="true"] {
+  color: var(--ink-2); background: var(--panel-2); }
+.composer .scope-chip.manual { color: var(--accent); }
+.composer .scope-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); opacity: .75; }
+.composer .scope-chip.manual .scope-chip-dot { background: var(--accent); opacity: 1; }
+.composer .scope-menu { position: absolute; z-index: 20; left: 0; bottom: calc(100% + 5px);
+  width: min(340px, calc(100vw - 48px)); max-height: 280px; overflow-y: auto; padding: 5px;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+  box-shadow: 0 12px 32px rgba(31, 26, 23, .14); }
+.composer .scope-menu button { width: 100%; display: grid; gap: 2px; text-align: left;
+  border: 0; border-radius: 7px; background: transparent; color: var(--ink-2); padding: 7px 9px;
+  cursor: pointer; font: inherit; font-size: 12px; }
+.composer .scope-menu button:hover, .composer .scope-menu button.active { background: var(--accent-soft); }
+.composer .scope-menu button small { color: var(--muted); font-size: 10.5px; }
 .composer .edit-badge { max-width: 720px; margin: 0 auto 8px; font-size: 12.5px; color: var(--amber);
   background: var(--amber-soft); border: 1px solid #ecd9b4; border-radius: 9px; padding: 7px 12px; }
 .composer .edit-badge code { background: rgba(0,0,0,.05); }
@@ -470,6 +508,27 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
   padding: 11px 14px; border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .pw-tab:hover { color: var(--ink-2); }
 .pw-tab.active { color: var(--ink); border-bottom-color: var(--accent); font-weight: 550; }
+.pw-formalizations { max-width: 980px; margin: 0 auto; }
+.pw-form-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.pw-form-summary span { border: 1px solid var(--line); border-radius: 999px; padding: 4px 9px; color: var(--muted); font-size: 12px; }
+.pw-form-summary .ok { color: var(--green); }
+.pw-form-summary .fail { color: var(--red); }
+.pw-form-summary .warn { color: var(--amber); }
+.pw-form-controls { display: flex; gap: 8px; margin-bottom: 12px; }
+.pw-form-controls input { flex: 1; min-width: 0; }
+.pw-form-controls input, .pw-form-controls select { border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); color: var(--ink); padding: 8px 10px; font: inherit; }
+.pw-form-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 7px; }
+.pw-form-row { display: flex; align-items: stretch; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); overflow: hidden; }
+.pw-form-main { flex: 1; min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: 10px; border: 0; background: none; padding: 11px 13px; text-align: left; cursor: pointer; color: var(--ink); }
+.pw-form-main:disabled { cursor: default; }
+.pw-form-main strong, .pw-form-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pw-form-main small { color: var(--muted); margin-top: 3px; font-size: 11.5px; font-weight: 400; }
+.pw-form-state { color: var(--muted); font-size: 11.5px; text-transform: capitalize; }
+.pw-form-continue { border: 0; border-left: 1px solid var(--line); background: var(--panel-2, #fafafa);
+  color: var(--accent); padding: 0 13px; cursor: pointer; font: inherit; font-size: 12px; }
+.pw-form-continue:hover { background: var(--accent-soft); }
 .pw-body { padding: 22px 28px; max-width: 900px; }
 .pw-sec-label { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 10px; }
 .pw-empty { color: var(--muted); font-size: 13.5px; line-height: 1.55; background: var(--panel-2);
@@ -793,6 +852,7 @@ pre.code { margin: 0; padding: 16px 0; font-family: ui-monospace, monospace; fon
 .search-row.active { background: var(--accent-soft); }
 .search-row .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
 .search-row-title { flex: 1; font-size: 13.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-row-title small { display: block; color: var(--muted); font-size: 10.5px; font-weight: 400; text-transform: capitalize; }
 .search-tag { font-size: 11px; color: var(--accent); background: var(--accent-soft); border-radius: 5px;
   padding: 1px 7px; flex: none; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-row-when { font-size: 11.5px; color: var(--muted); flex: none; }

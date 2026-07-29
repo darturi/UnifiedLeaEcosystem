@@ -140,6 +140,78 @@ test("runApiProofJob: forwards origin/origin_url + project tags to POST /api/run
   assert.equal(postBody.project_slug, "doc-a");
 });
 
+test("runApiProofJob: forwards stable formalization identity and source provenance", async () => {
+  let postBody = null;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      postBody = JSON.parse(options.body);
+      return jsonResponse({
+        session_id: "sess-f",
+        run_id: "run-f",
+        focus_formalization_id: "form-f",
+      });
+    }
+    if (url.includes("/api/runs/run-f/events")) {
+      return sseResponse([frame("done", { status: "proved" })]);
+    }
+    if (url.includes("/api/sessions/sess-f")) {
+      return jsonResponse({ runs: [{ id: "run-f" }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize stable target",
+    focusFormalizationId: "form-f",
+    focusSourceHash: "source-v2",
+    timeoutMs: 5000,
+  });
+
+  assert.equal(postBody.focus_formalization_id, "form-f");
+  assert.equal(postBody.focus_source_hash, "source-v2");
+  assert.equal(result.formalizationId, "form-f");
+});
+
+test("runApiProofJob: creates an external formalization with an origin key", async () => {
+  let postBody = null;
+  const fetchImpl = async (url, options = {}) => {
+    if (url.endsWith("/api/runs") && options.method === "POST") {
+      postBody = JSON.parse(options.body);
+      return jsonResponse({
+        session_id: "sess-new",
+        run_id: "run-new",
+        formalization: { id: "form-new" },
+      });
+    }
+    if (url.includes("/api/runs/run-new/events")) {
+      return sseResponse([frame("done", { status: "proved" })]);
+    }
+    if (url.includes("/api/sessions/sess-new")) {
+      return jsonResponse({ runs: [{ id: "run-new" }] });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const result = await runApiProofJob({
+    fetchImpl,
+    baseUrl: "http://127.0.0.1:8001",
+    message: "Formalize new target",
+    newFormalization: {
+      display_title: "compact_image",
+      declaration_name: "compact_image",
+      origin: "overleaf",
+      origin_key: "doc:theorem:compact_image",
+      source_hash: "source-v1",
+    },
+    timeoutMs: 5000,
+  });
+
+  assert.equal(postBody.new_formalization.origin_key, "doc:theorem:compact_image");
+  assert.equal(result.formalizationId, "form-new");
+});
+
 test("runApiProofJob: omits origin fields when not provided (interactive parity)", async () => {
   let postBody = null;
   const fetchImpl = async (url, options = {}) => {

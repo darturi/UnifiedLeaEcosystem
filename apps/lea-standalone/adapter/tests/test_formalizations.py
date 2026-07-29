@@ -1,0 +1,188 @@
+"""First-class formalizations: schema, attribution, and derived evidence."""
+
+import sqlite3
+
+import pytest
+
+from app import db, formalizations, store
+
+
+def _fresh(tmp_path, monkeypatch):
+    path = tmp_path / "test.sqlite3"
+    monkeypatch.setattr(db, "DB_PATH", path)
+    db.init_db()
+    return path
+
+
+def _project():
+    return store.create_project(
+        "analysis",
+        title="Analysis",
+        description=None,
+        namespace="Lea.Analysis",
+        repo_path="Lea/Analysis",
+    )
+
+
+def test_migration_adds_scoped_tables_columns_constraints_and_indexes(
+    tmp_path, monkeypatch
+):
+    path = _fresh(tmp_path, monkeypatch)
+    with sqlite3.connect(path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "select name from sqlite_master where type = 'table'"
+            )
+        }
+        assert {
+            "formalizations",
+            "session_formalizations",
+            "formalization_files",
+            "verification_events",
+        } <= tables
+        assert "focus_formalization_id" in {
+            row[1] for row in conn.execute("pragma table_info(runs)")
+        }
+        assert "formalization_id" in {
+            row[1] for row in conn.execute("pragma table_info(timeline)")
+        }
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "select name from sqlite_master where type = 'index'"
+            )
+        }
+        assert {
+            "ux_formalizations_project_declaration",
+            "ux_formalizations_loose_declaration",
+            "ux_formalization_files_primary",
+            "ix_verification_formalization_path",
+        } <= indexes
+
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """
+                insert into formalizations (
+                    id, display_title, kind, origin, created_at, updated_at
+                ) values ('bad', 'bad', 'theorem', 'ui', 't', 't')
+                """
+            )
+
+
+def test_one_session_keeps_independent_formalization_validity(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    project = _project()
+    session = store.create_session("Several related results", project_id=project["id"])
+    proved = store.create_formalization(
+        project_id=project["id"],
+        loose_session_id=None,
+        display_title="The proved theorem",
+        declaration_name="proved_theorem",
+    )
+    failing = store.create_formalization(
+        project_id=project["id"],
+        loose_session_id=None,
+        display_title="The failing theorem",
+        declaration_name="failing_theorem",
+    )
+    for item in (proved, failing):
+        store.link_session_formalization(session["id"], item["id"])
+
+    run_a = store.create_run(
+        session["id"], "m", None, 3,
+        project_id=project["id"],
+        focus_formalization_id=proved["id"],
+    )
+    step_a = store.add_code_step(
+        session["id"], run_a["id"], "proved.lean",
+        content="theorem proved_theorem : True := by trivial",
+        check_status="ok", artifact_kind="proof",
+        formalization_id=proved["id"],
+    )
+    store.link_formalization_file(proved["id"], "proved.lean", "primary")
+    store.update_run(run_a["id"], "proved", result_kind="proved")
+    store.upsert_artifact(
+        project_id=project["id"], session_id=session["id"], run_id=run_a["id"],
+        declaration_name="proved_theorem", kind="proof", path="proved.lean",
+        module_name="Lea.Analysis.proved", formalization_id=proved["id"],
+    )
+
+    run_b = store.create_run(
+        session["id"], "m", None, 3,
+        project_id=project["id"],
+        focus_formalization_id=failing["id"],
+    )
+    store.add_code_step(
+        session["id"], run_b["id"], "failing.lean",
+        content="theorem failing_theorem : False := by trivial",
+        check_status="error", check_detail="type mismatch",
+        formalization_id=failing["id"],
+    )
+    store.link_formalization_file(failing["id"], "failing.lean", "primary")
+    store.update_run(run_b["id"], "failed")
+
+    by_id = {item["id"]: item for item in formalizations.for_session(session["id"])}
+    assert by_id[proved["id"]]["validity_status"] == "proved"
+    assert by_id[failing["id"]]["validity_status"] == "failing"
+    assert step_a["formalization_id"] == proved["id"]
+
+
+def test_safe_verify_is_current_only_for_the_verified_snapshot(tmp_path, monkeypatch):
+    _fresh(tmp_path, monkeypatch)
+    session = store.create_session("Verify one target")
+    item = store.create_formalization(
+        project_id=None,
+        loose_session_id=session["id"],
+        display_title="target",
+        declaration_name="target",
+    )
+    store.link_session_formalization(session["id"], item["id"])
+    store.link_formalization_file(item["id"], "target.lean", "primary")
+    first = store.add_code_step(
+        session["id"], None, "target.lean",
+        content="theorem target : True := by trivial",
+        check_status="ok", formalization_id=item["id"],
+    )
+    store.record_verification_event(
+        session_id=session["id"], formalization_id=item["id"],
+        path="target.lean", status="ok", detail=None,
+        code_step_id=first["id"],
+    )
+    assert formalizations.get(item["id"])["safe_verify"]["current"] is True
+
+    store.add_code_step(
+        session["id"], None, "target.lean",
+        content="theorem target : True := by\n  trivial",
+        formalization_id=item["id"],
+    )
+    assert formalizations.get(item["id"])["safe_verify"]["current"] is False
+
+
+def test_external_source_staleness_compares_current_and_artifact_hash(
+    tmp_path, monkeypatch
+):
+    _fresh(tmp_path, monkeypatch)
+    project = _project()
+    session = store.create_session("External target", project_id=project["id"])
+    item = store.create_formalization(
+        project_id=project["id"], loose_session_id=None,
+        display_title="external", declaration_name="external",
+        origin="overleaf", origin_key="doc:theorem:external",
+        source_hash="new",
+    )
+    store.link_session_formalization(session["id"], item["id"])
+    store.link_formalization_file(item["id"], "external.lean", "primary")
+    step = store.add_code_step(
+        session["id"], None, "external.lean",
+        content="theorem external : True := by trivial",
+        check_status="ok", formalization_id=item["id"],
+    )
+    store.upsert_artifact(
+        project_id=project["id"], session_id=session["id"], run_id=None,
+        declaration_name="external", kind="proof", path="external.lean",
+        module_name="Lea.Analysis.external", formalization_id=item["id"],
+        source_hash="old",
+    )
+    assert step["check_status"] == "ok"
+    assert formalizations.get(item["id"])["validity_status"] == "stale"

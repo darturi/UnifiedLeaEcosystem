@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -25,6 +26,16 @@ from .. import settings as settings_service
 from .. import store
 
 router = APIRouter()
+
+
+class NewFormalizationRequest(BaseModel):
+    display_title: str
+    kind: str = "theorem"
+    declaration_name: str | None = None
+    statement: str | None = None
+    origin: str = "ui"
+    origin_key: str | None = None
+    source_hash: str | None = None
 
 
 class RunRequest(BaseModel):
@@ -53,6 +64,9 @@ class RunRequest(BaseModel):
     # Independent of `project_slug` (usage namespacing) by design.
     origin: str | None = None
     origin_url: str | None = None
+    focus_formalization_id: str | None = None
+    focus_source_hash: str | None = None
+    new_formalization: NewFormalizationRequest | None = None
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -149,28 +163,37 @@ def create_run(request: RunRequest) -> dict:
         except ValueError:
             project_id = None
 
-    if request.session_id:
-        session = store.get_session(request.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        if project_id and not session.get("project_id"):
-            store.assign_session_project(session["id"], project_id)
-        if project_id is None and session.get("project_id"):
-            project_id = session["project_id"]
-    else:
-        session = store.create_session(
-            message,
-            project_id=project_id,
-            origin=(request.origin or "ui"),
-            origin_url=request.origin_url,
-        )
-
     autonomous = request.autonomous or (permission_tier() == "none")
-    run = store.create_run(
-        session["id"], selected_model, None, config.max_turns,
-        project_id=project_id, autonomous=autonomous,
+    new_formalization = (
+        request.new_formalization.model_dump()
+        if request.new_formalization is not None else None
     )
-    user_message = store.add_message(session["id"], "user", message, run["id"])
+    focus_source_hash = request.focus_source_hash
+    if not focus_source_hash and new_formalization:
+        focus_source_hash = new_formalization.get("source_hash")
+    try:
+        bundle = store.create_run_bundle(
+            message=message,
+            session_id=request.session_id,
+            project_id=project_id,
+            session_origin=(request.origin or "ui"),
+            session_origin_url=request.origin_url,
+            model=selected_model,
+            provider=None,
+            max_turns=config.max_turns,
+            autonomous=autonomous,
+            focus_formalization_id=request.focus_formalization_id,
+            focus_source_hash=focus_source_hash,
+            new_formalization=new_formalization,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session = bundle["session"]
+    run = bundle["run"]
+    user_message = bundle["message"]
+    project_id = session.get("project_id")
     bridge.enqueue_run(run["id"])
     project = store.get_project(project_id) if project_id else None
     return {
@@ -178,6 +201,8 @@ def create_run(request: RunRequest) -> dict:
         "run_id": run["id"],
         "model": selected_model,
         "message": user_message,
+        "focus_formalization_id": run.get("focus_formalization_id"),
+        "formalization": bundle.get("formalization"),
         "project_id": project_id,
         "project_slug": project["slug"] if project else None,
         "project_namespace": project["namespace"] if project else None,

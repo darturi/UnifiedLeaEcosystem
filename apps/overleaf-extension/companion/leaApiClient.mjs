@@ -322,7 +322,22 @@ export async function exportProjectZipBySlug({ fetchImpl, baseUrl, slug }) {
   };
 }
 
-export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId = null, autonomous = true, projectSlug = null, projectTitle = null, projectNamespace = null, origin = null, originUrl = null }) {
+export async function startApiRun({
+  fetchImpl,
+  baseUrl,
+  apiKey,
+  message,
+  sessionId = null,
+  autonomous = true,
+  projectSlug = null,
+  projectTitle = null,
+  projectNamespace = null,
+  origin = null,
+  originUrl = null,
+  focusFormalizationId = null,
+  focusSourceHash = null,
+  newFormalization = null,
+}) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
   // end-to-end with zero human interaction. (The client also auto-resolves any
@@ -346,6 +361,9 @@ export async function startApiRun({ fetchImpl, baseUrl, apiKey, message, session
   }
   if (origin) body.origin = origin;
   if (originUrl) body.origin_url = originUrl;
+  if (focusFormalizationId) body.focus_formalization_id = focusFormalizationId;
+  if (focusSourceHash) body.focus_source_hash = focusSourceHash;
+  if (newFormalization) body.new_formalization = newFormalization;
   return fetchJson(fetchImpl, `${baseUrl}/api/runs`, {
     method: "POST",
     headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -402,9 +420,13 @@ export function fetchApiSessionDetail({ fetchImpl, baseUrl, apiKey, sessionId })
 // no-op save. Used by the Overleaf lean pane's manual-edit surface
 // (docs/FEATURE-overleaf-lean-pane-manual-edit.md) -- the same primitive the
 // standalone canvas already uses, just called from a second client.
-export function writeApiSessionFile({ fetchImpl, baseUrl, apiKey, sessionId, path, content, note }) {
+export function writeApiSessionFile({
+  fetchImpl, baseUrl, apiKey, sessionId, path, content, note,
+  formalizationId = null,
+}) {
   const body = { path, content };
   if (note) body.note = note;
+  if (formalizationId) body.formalization_id = formalizationId;
   return fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/file`, {
     method: "POST",
     headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -419,11 +441,15 @@ export function writeApiSessionFile({ fetchImpl, baseUrl, apiKey, sessionId, pat
 // records a *new* code_step attributed to that author -- used for
 // re-verifying a project dependent that the edit itself didn't touch. See
 // docs/PLAN-overleaf-lean-pane-manual-edit.md Phase 1/2.
-export function runApiSessionLeanCheck({ fetchImpl, baseUrl, apiKey, sessionId, path, author, summary }) {
+export function runApiSessionLeanCheck({
+  fetchImpl, baseUrl, apiKey, sessionId, path, author, summary,
+  formalizationId = null,
+}) {
   const body = {};
   if (path) body.path = path;
   if (author) body.author = author;
   if (summary) body.summary = summary;
+  if (formalizationId) body.formalization_id = formalizationId;
   return fetchJson(fetchImpl, `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/lean-check`, {
     method: "POST",
     headers: buildHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -615,6 +641,9 @@ export async function runApiProofJob({
   projectNamespace = null,
   origin = null,
   originUrl = null,
+  focusFormalizationId = null,
+  focusSourceHash = null,
+  newFormalization = null,
   appendLog = null,
   logPath = null,
   onEvent = null,
@@ -625,7 +654,22 @@ export async function runApiProofJob({
     if (appendLog && logPath) await appendLog(logPath, line);
   };
 
-  const start = await startApiRun({ fetchImpl, baseUrl, apiKey, message, sessionId, autonomous, projectSlug, projectTitle, projectNamespace, origin, originUrl });
+  const start = await startApiRun({
+    fetchImpl,
+    baseUrl,
+    apiKey,
+    message,
+    sessionId,
+    autonomous,
+    projectSlug,
+    projectTitle,
+    projectNamespace,
+    origin,
+    originUrl,
+    focusFormalizationId,
+    focusSourceHash,
+    newFormalization,
+  });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
   const runId = start.body?.run_id;
@@ -731,6 +775,7 @@ export async function runApiProofJob({
       doneStatus: outcome?.doneStatus || null,
       resultKind: outcome?.resultKind || null,
       resultDetail: outcome?.resultDetail || null,
+      formalizationId: start.body?.focus_formalization_id || start.body?.formalization?.id || null,
       error: "Lea adapter run timed out.",
       ...usage,
     };
@@ -743,6 +788,7 @@ export async function runApiProofJob({
     doneStatus: outcome.doneStatus,
     resultKind: outcome.resultKind || null,
     resultDetail: outcome.resultDetail || null,
+    formalizationId: start.body?.focus_formalization_id || start.body?.formalization?.id || null,
     error: outcome.ok ? undefined : outcome.error,
     ...usage,
   };
