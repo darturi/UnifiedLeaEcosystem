@@ -122,6 +122,13 @@ def test_new_formalization_and_run_are_created_atomically(tmp_path, monkeypatch)
     )
 
     assert result["formalization"]["id"] == result["focus_formalization_id"]
+    assert result["formalization"]["activity"] == {
+        "status": "queued",
+        "run_id": result["run_id"],
+    }
+    assert result["formalization"]["validity_status"] == "planned"
+    assert result["formalization"]["files"] == []
+    assert result["formalization"]["sessions"][0]["id"] == result["session_id"]
     detail = store.session_detail(result["session_id"])
     assert detail["runs"][0]["focus_formalization_id"] == result["formalization"]["id"]
     assert detail["messages"][0]["formalization_id"] == result["formalization"]["id"]

@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from ..config import load_config, permission_tier
 from .. import bridge
+from .. import formalizations as formalization_service
 from ..bridge import request_stop, request_subagent_stop
 from .. import projects
 from .. import runbroker
@@ -195,6 +196,12 @@ def create_run(request: RunRequest) -> dict:
     user_message = bundle["message"]
     project_id = session.get("project_id")
     bridge.enqueue_run(run["id"])
+    raw_formalization = bundle.get("formalization")
+    formalization = (
+        formalization_service.decorate([raw_formalization])[0]
+        if raw_formalization is not None
+        else None
+    )
     project = store.get_project(project_id) if project_id else None
     return {
         "session_id": session["id"],
@@ -202,7 +209,7 @@ def create_run(request: RunRequest) -> dict:
         "model": selected_model,
         "message": user_message,
         "focus_formalization_id": run.get("focus_formalization_id"),
-        "formalization": bundle.get("formalization"),
+        "formalization": formalization,
         "project_id": project_id,
         "project_slug": project["slug"] if project else None,
         "project_namespace": project["namespace"] if project else None,
