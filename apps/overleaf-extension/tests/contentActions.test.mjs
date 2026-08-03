@@ -1243,7 +1243,34 @@ test("Lean pane keeps Formalize after an upstream dependency blocks startup", as
 
   assert.equal(harness.hasButtonText("Formalize"), true);
   assert.equal(harness.hasButtonText("Retry formalize"), false);
-  assert.match(harness.bodyText(), /Formalize referenced theorem first: helper_lemma\./);
+  assert.deepEqual(harness.paneActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Dependency must be formalized firstFormalize referenced theorem first: helper_lemma. No Lea run was started."
+  });
+});
+
+test("source popover explains when an upstream dependency blocks formalization startup", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    { targetUses: ["helper_lemma"] },
+    {
+      locationPath: "/project/unknown",
+      formalizeError: "Formalize referenced theorem first: helper_lemma."
+    }
+  );
+  await harness.loadStatusForVisibleTheorem();
+  harness.openTargetPopover();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.popoverActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Formalization blockedFormalize referenced theorem first: helper_lemma. No Lea run was started."
+  });
+  assert.equal(harness.hasButtonText("Formalize"), true);
 });
 
 test("Lean pane shows an item-local cost-cap alert that survives refresh and clears on retry", async () => {
@@ -2093,6 +2120,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     paneActionError() {
       const alert = document.body.querySelector(".ol-lean-project-action-error");
+      return alert ? {
+        role: alert.attributes.role,
+        live: alert.attributes["aria-live"],
+        text: alert.textContent
+      } : null;
+    },
+    popoverActionError() {
+      const alert = document.body.querySelector(".ol-lean-popover-status-error");
       return alert ? {
         role: alert.attributes.role,
         live: alert.attributes["aria-live"],

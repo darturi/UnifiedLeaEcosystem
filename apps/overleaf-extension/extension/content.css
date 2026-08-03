@@ -2144,6 +2144,26 @@ button.ol-lean-project-relationship-chip {
   margin: 0 14px 12px;
 }
 
+.ol-lean-popover-status-error {
+  min-height: 0;
+  margin: 10px 0 0;
+  padding: 9px 10px;
+  color: var(--ol-red-ink);
+  background: var(--ol-red-soft);
+  border: 1px solid var(--ol-red);
+  border-radius: var(--ol-radius-sm);
+}
+
+.ol-lean-popover-status-error strong,
+.ol-lean-popover-status-error span {
+  display: block;
+}
+
+.ol-lean-popover-status-error span {
+  margin-top: 3px;
+  font-weight: 400;
+}
+
 .ol-lean-popover-lean {
   max-width: 100%;
   max-height: 118px;

@@ -2020,6 +2020,19 @@
     }
   }
 
+  function isUnresolvedUsesError(error) {
+    return String(error?.code || "") === "unresolved_uses";
+  }
+
+  function actionFailureMessage(error) {
+    const message = typeof error?.message === "string"
+      ? error.message
+      : normalizeErrorMessage(error);
+    return isUnresolvedUsesError(error)
+      ? `${message} No Lea run was started.`
+      : message;
+  }
+
   function leanPaneActionErrorForItem(item) {
     const local = leanPaneActionErrors.get(leanPaneActionErrorKey(item));
     if (local) return local;
@@ -2037,6 +2050,7 @@
     const error = leanPaneActionErrorForItem(item);
     if (!error) return null;
     const maxSpend = error.code === MAX_SPEND_ERROR_CODE;
+    const dependencyBlocked = isUnresolvedUsesError(error);
     const alert = document.createElement("div");
     alert.className = "ol-lean-project-action-error";
     alert.setAttribute("role", "alert");
@@ -2046,11 +2060,13 @@
     const title = document.createElement("strong");
     title.textContent = maxSpend
       ? "Cost cap reached"
-      : error.operation === "stub"
-        ? "Could not create Lean stub"
-        : "Could not start formalization";
+      : dependencyBlocked
+        ? "Dependency must be formalized first"
+        : error.operation === "stub"
+          ? "Could not create Lean stub"
+          : "Could not start formalization";
     const message = document.createElement("p");
-    message.textContent = maxSpend ? MAX_SPEND_PANE_MESSAGE : error.message;
+    message.textContent = maxSpend ? MAX_SPEND_PANE_MESSAGE : actionFailureMessage(error);
     copy.appendChild(title);
     copy.appendChild(message);
     alert.appendChild(copy);
@@ -3756,14 +3772,17 @@
         for (const actionButton of actions.querySelectorAll("button")) {
           actionButton.disabled = true;
         }
-        status.textContent = spec.pendingText;
+        renderPopoverActionStatus(status, spec.pendingText);
         try {
           const result = await spec.run(target);
-          status.textContent = `${formatStatus(result.status, result)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
+          renderPopoverActionStatus(
+            status,
+            `${formatStatus(result.status, result)}${result.relativePath ? ` at ${result.relativePath}` : ""}`
+          );
           renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[targetKey(target)]?.leanStatement || "");
           await refreshStatusesNow();
         } catch (error) {
-          status.textContent = error instanceof Error ? error.message : String(error);
+          renderPopoverActionError(status, error);
           if (isMaxSpendError(error)) {
             showCostCapNotice(null, { force: true, noticeKey: `error:${Date.now()}` });
           }
@@ -3823,6 +3842,31 @@
     closeButton.textContent = "Close";
     closeButton.addEventListener("click", closePopover);
     actions.appendChild(closeButton);
+  }
+
+  function renderPopoverActionStatus(status, message) {
+    status.classList.remove("ol-lean-popover-status-error");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = message;
+  }
+
+  function renderPopoverActionError(status, error) {
+    const dependencyBlocked = isUnresolvedUsesError(error);
+    status.classList.add("ol-lean-popover-status-error");
+    status.setAttribute("role", "alert");
+    status.setAttribute("aria-live", "assertive");
+    status.textContent = "";
+    status.replaceChildren();
+
+    const title = document.createElement("strong");
+    title.textContent = dependencyBlocked
+      ? "Formalization blocked"
+      : "Action failed";
+    const message = document.createElement("span");
+    message.textContent = actionFailureMessage(error);
+    status.appendChild(title);
+    status.appendChild(message);
   }
 
   async function showTargetInLeanPane(target) {
