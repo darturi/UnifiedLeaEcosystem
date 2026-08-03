@@ -262,16 +262,42 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
 });
 
 test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
+  const manifest = (calls) => {
+    const renamed = calls.some((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
+    const namespace = renamed ? "Lea.FourierNotes" : "Lea.TestProject";
+    return {
+      ok: true,
+      rootFile: "main.tex",
+      items: [{
+        id: "theorem:demo_theorem:0",
+        kind: "theorem",
+        label: "demo_theorem",
+        title: "Demo theorem",
+        status: "valid",
+        sourceFile: "main.tex",
+        sourceStartLine: 1,
+        sourceEndLine: 4,
+        documentOrder: 0,
+        naturalLanguageLatex: "A theorem.",
+        leanKind: "theorem",
+        leanDeclarationName: "demo_theorem",
+        leanArtifactContent: `namespace ${namespace}\n\ntheorem demo_theorem : True := by trivial\n\nend ${namespace}`
+      }],
+      diagnostics: []
+    };
+  };
   const harness = createContentHarness(
     { status: "unformalized" },
     {},
     {
-      locationPath: "/project/project-1",
-      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      // The harness uses the active buffer directly for the synthetic
+      // "unknown" project, avoiding an unrelated Overleaf ZIP fixture.
+      locationPath: "/project/unknown",
+      manifest,
       projectIdentity: {
-        projectId: "adapter-project-1",
-        overleafProjectId: "project-1",
-        slug: "project-1",
+        projectId: "adapter-project-unknown",
+        overleafProjectId: "unknown",
+        slug: "unknown",
         projectName: "Test Project",
         namespace: "Lea.TestProject",
         exists: true,
@@ -310,7 +336,7 @@ test("project rename uses an accessible Lea dialog with a live namespace preview
   const saveCall = harness.fetchCalls.find((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
   assert.ok(saveCall, "expected project identity PUT");
   assert.deepEqual(JSON.parse(saveCall.options.body), {
-    overleafProjectId: "project-1",
+    overleafProjectId: "unknown",
     projectName: "Fourier Notes",
     mode: "rename-namespace",
     namespace: "Lea.FourierNotes",
@@ -320,6 +346,15 @@ test("project rename uses an accessible Lea dialog with a live namespace preview
   assert.equal(harness.projectIdentityDialog(), null);
   assert.match(harness.bodyText(), /Fourier Notes/);
   assert.match(harness.bodyText(), /Project name and Lean namespace saved/);
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  assert.match(harness.bodyText(), /namespace Lea\.FourierNotes/);
+  assert.doesNotMatch(harness.bodyText(), /namespace Lea\.TestProject/);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/lean-pane/manifest")).length,
+    2,
+    "rename should refresh the open Lean pane manifest"
+  );
 });
 
 test("project rename can keep the existing namespace when the suggested namespace is occupied", async () => {
@@ -1478,6 +1513,15 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const storageState = { ...(options.storage || {}) };
   const localStorageState = { ...(options.localStorage || {}) };
   const storageChangeListeners = [];
+  let currentProjectIdentity = options.projectIdentity || {
+    projectId: "adapter-project-1",
+    overleafProjectId: "project-1",
+    slug: "project-1",
+    projectName: "Test Project",
+    namespace: "Lea.TestProject",
+    exists: true,
+    hasRecordedProofs: true
+  };
   let nextTimerId = 1;
 
   const window = {
@@ -1583,39 +1627,24 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
           }
           if (String(url).endsWith("/project/identity") && fetchOptions?.method === "PUT") {
             const request = JSON.parse(fetchOptions?.body || "{}");
-            const current = options.projectIdentity || {
-              projectId: "adapter-project-1",
-              overleafProjectId: "project-1",
-              slug: "project-1",
-              projectName: "Test Project",
-              namespace: "Lea.TestProject",
-              exists: true,
-              hasRecordedProofs: true
-            };
             const update = typeof options.projectIdentityUpdate === "function"
               ? options.projectIdentityUpdate(request, fetchCalls)
               : options.projectIdentityUpdate;
-            return update || {
+            const response = update || {
               ok: true,
               identity: {
-                ...current,
+                ...currentProjectIdentity,
                 projectName: request.projectName,
-                namespace: request.mode === "rename-namespace" ? request.namespace : current.namespace
+                namespace: request.mode === "rename-namespace" ? request.namespace : currentProjectIdentity.namespace
               }
             };
+            if (response?.identity) currentProjectIdentity = response.identity;
+            return response;
           }
           if (String(url).includes("/project/identity?")) {
             return {
               ok: true,
-              identity: options.projectIdentity || {
-                projectId: "adapter-project-1",
-                overleafProjectId: "project-1",
-                slug: "project-1",
-                projectName: "Test Project",
-                namespace: "Lea.TestProject",
-                exists: true,
-                hasRecordedProofs: true
-              }
+              identity: currentProjectIdentity
             };
           }
           if (String(url).includes("/lean-pane/manifest")) {

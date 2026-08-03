@@ -187,6 +187,73 @@ test("project identity endpoints proxy adapter state without creating on missing
   assert.equal(calls.find((call) => call.options.method === "PUT").body.create_if_missing, true);
 });
 
+test("namespace migration rebases cached job artifact pointers without rewriting history", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "PUT") {
+        return jsonResponse(200, {
+          identity: {
+            projectId: "p1",
+            slug: "project-1",
+            projectName: "Fourier Notes",
+            namespace: "Lea.FourierNotes",
+            namespaceEditable: true,
+            repoPath: "proofs/Lea/FourierNotes",
+            hasRecordedProofs: true,
+            exists: true
+          },
+          migration: {
+            oldNamespace: "Lea.OldName",
+            newNamespace: "Lea.FourierNotes"
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  });
+  const oldAbsolute = path.join(leaRepo, "workspace", "proofs", "Lea", "OldName", "proof.lean");
+  state.jobs.old = {
+    jobId: "old",
+    jobKey: "project-1:theorem:proof",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectName: "Old Name",
+    projectNamespace: "Lea.OldName",
+    moduleName: "Lea.OldName.proof",
+    recordedProofPath: "workspace/proofs/Lea/OldName/proof.lean",
+    absolutePath: oldAbsolute,
+    stubbedTheoremUses: [{
+      moduleName: "Lea.OldName.helper",
+      relativePath: "workspace/proofs/Lea/OldName/helper.lean",
+      absolutePath: path.join(leaRepo, "workspace", "proofs", "Lea", "OldName", "helper.lean")
+    }]
+  };
+
+  const update = await handleProjectIdentityUpdate({
+    overleafProjectId: "project-1",
+    projectName: "Fourier Notes",
+    mode: "rename-namespace",
+    namespace: "Lea.FourierNotes",
+    expectedNamespace: "Lea.OldName"
+  }, state);
+
+  assert.equal(update.statusCode, 200);
+  assert.equal(state.jobs.old.projectNamespace, "Lea.FourierNotes");
+  assert.equal(state.jobs.old.moduleName, "Lea.FourierNotes.proof");
+  assert.equal(state.jobs.old.recordedProofPath, "workspace/proofs/Lea/FourierNotes/proof.lean");
+  assert.equal(
+    state.jobs.old.absolutePath,
+    path.join(leaRepo, "workspace", "proofs", "Lea", "FourierNotes", "proof.lean")
+  );
+  assert.equal(state.jobs.old.stubbedTheoremUses[0].moduleName, "Lea.FourierNotes.helper");
+  assert.equal(
+    state.jobs.old.stubbedTheoremUses[0].relativePath,
+    "workspace/proofs/Lea/FourierNotes/helper.lean"
+  );
+});
+
 test("settings response includes model families and key status", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({

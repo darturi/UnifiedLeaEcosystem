@@ -773,6 +773,74 @@ async function resolveRunProjectIdentity({ state, overleafProjectId, projectSlug
   return fallbackRunProjectIdentity({ overleafProjectId, projectSlug: slug, projectName, projectNamespace });
 }
 
+function rebaseNamespaceQualifiedValue(value, oldNamespace, newNamespace) {
+  const current = String(value || "");
+  if (current === oldNamespace) return newNamespace;
+  return current.startsWith(`${oldNamespace}.`)
+    ? `${newNamespace}${current.slice(oldNamespace.length)}`
+    : current;
+}
+
+function rebaseNamespaceProofPath(value, oldNamespace, newNamespace) {
+  let current = String(value || "");
+  for (const separator of ["/", "\\"]) {
+    const oldPath = oldNamespace.split(".").join(separator);
+    const newPath = newNamespace.split(".").join(separator);
+    const marker = `workspace${separator}proofs${separator}${oldPath}`;
+    const index = current.indexOf(marker);
+    if (index < 0) continue;
+    if (index > 0 && current[index - 1] !== separator) continue;
+    const boundary = index + marker.length;
+    if (boundary !== current.length && current[boundary] !== separator) continue;
+    current = `${current.slice(0, index)}workspace${separator}proofs${separator}${newPath}${current.slice(boundary)}`;
+  }
+  return current;
+}
+
+// jobs.json is a companion-side cache, not proof history. When the adapter
+// migrates the project, keep every cached path/module pointer aligned with the
+// new working tree. Historical adapter code_steps remain untouched and are
+// still available as provenance snapshots.
+function rebaseJobProjectIdentity(job, { oldNamespace, newNamespace, projectName }) {
+  let changed = false;
+  const setIfChanged = (key, next) => {
+    if (job[key] !== next) {
+      job[key] = next;
+      changed = true;
+    }
+  };
+  setIfChanged("projectName", projectName);
+  setIfChanged("projectNamespace", newNamespace);
+  for (const key of ["moduleName"]) {
+    if (job[key]) setIfChanged(key, rebaseNamespaceQualifiedValue(job[key], oldNamespace, newNamespace));
+  }
+  for (const key of ["recordedProofPath", "relativePath", "absolutePath"]) {
+    if (job[key]) setIfChanged(key, rebaseNamespaceProofPath(job[key], oldNamespace, newNamespace));
+  }
+  if (Array.isArray(job.stubbedTheoremUses)) {
+    for (const use of job.stubbedTheoremUses) {
+      if (!use || typeof use !== "object") continue;
+      for (const key of ["moduleName"]) {
+        if (!use[key]) continue;
+        const next = rebaseNamespaceQualifiedValue(use[key], oldNamespace, newNamespace);
+        if (use[key] !== next) {
+          use[key] = next;
+          changed = true;
+        }
+      }
+      for (const key of ["relativePath", "absolutePath"]) {
+        if (!use[key]) continue;
+        const next = rebaseNamespaceProofPath(use[key], oldNamespace, newNamespace);
+        if (use[key] !== next) {
+          use[key] = next;
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
 export async function handleProjectIdentityPreview(payload, state) {
   const target = resolveShareTarget(payload, state);
   if (target.error) return target.error;
@@ -808,23 +876,26 @@ export async function handleProjectIdentityUpdate(payload, state) {
     return errorResponse(result.status || 502, adapterErrorCode(result, "project_identity_update_failed"), adapterDetail(result, "Could not update project identity."));
   }
   const identity = normalizeCompanionIdentity(result.body?.identity, overleafProjectId);
+  const migration = result.body?.migration || null;
   state.projectIdentities ||= {};
   state.projectIdentities[identity.slug] = identity;
   let jobsChanged = false;
   for (const job of Object.values(state.jobs || {})) {
     if (job?.overleafProjectId === overleafProjectId || job?.projectSlug === target.slug) {
-      if (job.projectName !== identity.projectName) {
+      if (migration?.oldNamespace && migration?.newNamespace) {
+        jobsChanged = rebaseJobProjectIdentity(job, {
+          oldNamespace: migration.oldNamespace,
+          newNamespace: migration.newNamespace,
+          projectName: identity.projectName
+        }) || jobsChanged;
+      } else if (job.projectName !== identity.projectName) {
         job.projectName = identity.projectName;
-        jobsChanged = true;
-      }
-      if (result.body?.migration && job.projectNamespace !== identity.namespace) {
-        job.projectNamespace = identity.namespace;
         jobsChanged = true;
       }
     }
   }
   if (jobsChanged) await persistJobs(state);
-  return { statusCode: 200, body: { ok: true, identity, migration: result.body?.migration || null } };
+  return { statusCode: 200, body: { ok: true, identity, migration } };
 }
 
 async function resolveProjectNamespace({ state, overleafProjectId, projectSlug = "" }) {
@@ -1010,9 +1081,15 @@ export async function handleLeanPaneManifest(payload, state) {
   }
 
   const overleafProjectId = payload.overleafProjectId || "unknown";
+  const identity = await resolveRunProjectIdentity({
+    state,
+    overleafProjectId,
+    refresh: true
+  });
   const approvalContext = await loadFormalizationApprovalContext({
     state,
-    overleafProjectId
+    overleafProjectId,
+    projectNamespace: identity.namespace
   });
   const items = await mapWithConcurrency(
     manifest.items,
@@ -1021,6 +1098,8 @@ export async function handleLeanPaneManifest(payload, state) {
       item,
       state,
       overleafProjectId,
+      projectName: identity.projectName,
+      projectNamespace: identity.namespace,
       approvalContext
     })
   );
@@ -1567,10 +1646,19 @@ async function loadEditableSessionFile({ state, leaSessionId, overleafProjectId,
   const namespace = detail.body.project_namespace
     || linkedJob?.projectNamespace
     || projectNamespaceFromSlug(linkedJob?.projectSlug || slugProjectId(overleafProjectId));
+  const current = await readLeanPaneArtifact({
+    leaRepoPath: state.settings.leaRepoPath,
+    statusInfo: {
+      recordedProofPath: proofPathFromProjectStep({ namespace, stepPath: step.path })
+    }
+  });
   return {
     ok: true,
     path: step.path,
-    content: String(step.code || ""),
+    // A session code_step is an immutable historical snapshot. The working
+    // file may have been namespace-rewritten since that step was recorded, so
+    // edit from disk whenever the current project path exists.
+    content: current.exists ? current.content : String(step.code || ""),
     namespace,
     moduleName: moduleNameFromProjectStep({ namespace, stepPath: step.path })
   };
@@ -6079,9 +6167,10 @@ async function attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafPro
   return addStubbedTheoremUses(status, merged);
 }
 
-async function loadFormalizationApprovalContext({ state, overleafProjectId }) {
+async function loadFormalizationApprovalContext({ state, overleafProjectId, projectNamespace = "" }) {
   try {
-    const namespace = await resolveProjectNamespace({ state, overleafProjectId });
+    const namespace = String(projectNamespace || "").trim()
+      || await resolveProjectNamespace({ state, overleafProjectId });
     const files = await listProjectProofFiles({
       leaRepoPath: state.settings.leaRepoPath,
       namespace
@@ -6146,7 +6235,14 @@ function buildFormalizationApprovalMetadata({
   };
 }
 
-async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalContext }) {
+async function enrichLeanPaneItem({
+  item,
+  state,
+  overleafProjectId,
+  projectName = "",
+  projectNamespace = "",
+  approvalContext
+}) {
   const targetKind = item.leanKind === "def" ? "definition" : "theorem";
   const targetLabel = String(item.leanDeclarationName || "").trim();
   if (!isValidLeanIdentifier(targetLabel)) {
@@ -6161,7 +6257,9 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
-    targetLabel
+    targetLabel,
+    projectName,
+    projectNamespace
   });
   const latestJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
 
@@ -6171,6 +6269,8 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
       state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId,
+      projectName,
+      projectNamespace,
       targetKind,
       targetLabel,
       jobs: state.jobs || {}
@@ -6218,14 +6318,27 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     statusInfo
   });
   const leanDeclarationName = statusInfo?.declarationName || item.leanDeclarationName;
-  const sessionArtifact = artifact.content
+  const ledgerArtifact = statusInfo?.artifactExists
+    ? {
+        relativePath: statusInfo?.recordedProofPath || statusInfo?.relativePath || "",
+        content: typeof statusInfo?.artifactContent === "string" ? statusInfo.artifactContent : "",
+        exists: true
+      }
+    : { relativePath: "", content: "", exists: false };
+  const hasAuthoritativeArtifactEvidence = Boolean(statusInfo?.artifactRecorded);
+  const sessionArtifact = artifact.exists || ledgerArtifact.exists || hasAuthoritativeArtifactEvidence
     ? { relativePath: "", content: "" }
     : await readLeanPaneArtifactFromSession({
         state,
         job: latestJob,
-        declarationName: leanDeclarationName
+        declarationName: leanDeclarationName,
+        projectNamespace
       });
-  const effectiveArtifact = artifact.content ? artifact : sessionArtifact;
+  const effectiveArtifact = artifact.exists
+    ? artifact
+    : ledgerArtifact.exists
+      ? ledgerArtifact
+      : sessionArtifact;
   const leanStub = statusInfo?.leanStatement || (
     effectiveArtifact.content && leanDeclarationName
       ? extractLeanStatement(effectiveArtifact.content, leanDeclarationName)
@@ -6337,7 +6450,7 @@ function mapLeanPaneStatus(statusInfo, item) {
   return "unknown";
 }
 
-async function readLeanPaneArtifactFromSession({ state, job, declarationName }) {
+async function readLeanPaneArtifactFromSession({ state, job, declarationName, projectNamespace = "" }) {
   const sessionId = job?.leaSessionId || job?.recorderSessionId || "";
   if (!sessionId || !declarationName) {
     return { relativePath: "", content: "" };
@@ -6361,11 +6474,23 @@ async function readLeanPaneArtifactFromSession({ state, job, declarationName }) 
   if (!step) {
     return { relativePath: "", content: "" };
   }
-  const namespace = detail.body.project_namespace || job.projectNamespace || projectNamespaceFromSlug(job.projectSlug);
-  return {
-    relativePath: proofPathFromProjectStep({ namespace, stepPath: step.path }),
-    content: String(step.code || "")
-  };
+  const namespace = String(projectNamespace || "").trim()
+    || detail.body.project_namespace
+    || job.projectNamespace
+    || projectNamespaceFromSlug(job.projectSlug);
+  const current = await readLeanPaneArtifact({
+    leaRepoPath: state.settings.leaRepoPath,
+    statusInfo: {
+      recordedProofPath: proofPathFromProjectStep({ namespace, stepPath: step.path })
+    }
+  });
+  return current.exists
+    ? current
+    : {
+        relativePath: proofPathFromProjectStep({ namespace, stepPath: step.path }),
+        content: String(step.code || ""),
+        exists: false
+      };
 }
 
 async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
@@ -6382,15 +6507,16 @@ async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
     }
   }
   if (!absolutePath || !existsSync(absolutePath)) {
-    return { relativePath, content: "" };
+    return { relativePath, content: "", exists: false };
   }
   try {
     return {
       relativePath: relativePath || relativeToLeaRepo({ leaRepoPath, absolutePath }),
-      content: await fs.readFile(absolutePath, "utf8")
+      content: await fs.readFile(absolutePath, "utf8"),
+      exists: true
     };
   } catch {
-    return { relativePath, content: "" };
+    return { relativePath, content: "", exists: false };
   }
 }
 
@@ -6511,6 +6637,12 @@ async function getTheoremStatus({
   ].filter(Boolean))];
   const ledger = await fetchTargetStatusFromAdapter({ state, target, declarations: candidates });
   const evidence = candidates.map((name) => ledger?.[name]).find((entry) => entry?.recorded) || null;
+  const artifactEvidence = evidence
+    ? {
+        artifactRecorded: true,
+        artifactExists: Boolean(evidence.exists)
+      }
+    : {};
 
   // Edit-broken knowledge the ADAPTER cannot have: the cascade's import-graph
   // propagation overrules a spuriously-passing rebuild of a transitive
@@ -6535,16 +6667,27 @@ async function getTheoremStatus({
       // change must surface as broken — with its repair offer — not as a
       // plain stub (the legacy engine's override had the same precedence).
       if (linkedJob) {
-        return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
+        return withLeaSession({
+          ...buildEditBrokenTheoremStatus({ linkedJob, target }),
+          ...base,
+          ...artifactEvidence
+        });
       }
-      return { status: "failed", ...base, effectiveStatus: "unformalized", message: evidence.check_detail || "This item no longer compiles." };
+      return {
+        status: "failed",
+        ...base,
+        ...artifactEvidence,
+        effectiveStatus: "unformalized",
+        message: evidence.check_detail || "This item no longer compiles."
+      };
     }
     if (evidence.has_sorry) {
-      return withLeaSession({ status: "sorry_stub", ...base, leanStatement });
+      return withLeaSession({ status: "sorry_stub", ...base, ...artifactEvidence, leanStatement });
     }
     const status = {
       status: "formalized",
       ...base,
+      ...artifactEvidence,
       resultKind: target.targetKind === "definition" ? "defined" : "proved",
       leanStatement
     };
@@ -6554,7 +6697,10 @@ async function getTheoremStatus({
   if (editBroken) {
     // No file evidence, but the overlay knows the item's newest real compile
     // failed (manual edit / cascade on a pre-index artifact).
-    return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
+    return withLeaSession({
+      ...buildEditBrokenTheoremStatus({ linkedJob, target }),
+      ...artifactEvidence
+    });
   }
 
   // No usable file evidence: the overlay's newest terminal run decides. An
@@ -6580,15 +6726,21 @@ async function getTheoremStatus({
 
   if (newest?.status === "failed") {
     const logTail = await readLogTail(newest.job.logPath);
-    return withLeaSession(buildFailedTheoremStatus({
-      failedJob: newest.job,
-      target,
-      equivalentStatus: getEquivalentTheoremStatus({ status: "unformalized" }),
-      logTail
-    }));
+    return withLeaSession({
+      ...buildFailedTheoremStatus({
+        failedJob: newest.job,
+        target,
+        equivalentStatus: getEquivalentTheoremStatus({ status: "unformalized" }),
+        logTail
+      }),
+      ...artifactEvidence
+    });
   }
   if (newest) {
-    return withLeaSession(buildJobResponse({ job: newest.job, status: newest.status, target }));
+    return withLeaSession({
+      ...buildJobResponse({ job: newest.job, status: newest.status, target }),
+      ...artifactEvidence
+    });
   }
 
   return {
@@ -6601,7 +6753,8 @@ async function getTheoremStatus({
     absolutePath: target.absolutePath,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
-    projectMarkdownPath: target.projectMarkdownPath
+    projectMarkdownPath: target.projectMarkdownPath,
+    ...artifactEvidence
   };
 }
 

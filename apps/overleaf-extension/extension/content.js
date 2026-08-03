@@ -1613,12 +1613,30 @@
     renderLeanPaneProjectIdentity(lastProjectIdentity);
     if (state.popover) renderProjectSettingsSection(state.popover, lastProjectIdentity);
     const savedNamespace = result.identity?.namespace || state.currentNamespace || preview?.namespace || "";
-    const message = !migrate && savedNamespace
+    let message = !migrate && savedNamespace
       ? `Project name saved. Lean files still use namespace ${savedNamespace}.`
       : "Project name and Lean namespace saved.";
+    let feedbackKind = "success";
+    if (migrate && leanPane) {
+      try {
+        // The rename endpoint migrates the files synchronously. Re-fetch the
+        // manifest before dismissing the dialog so already-rendered code uses
+        // those rewritten working files immediately.
+        if (leanPaneMainView === "blueprint") {
+          // No Lean source is visible in Blueprint, but its cached Items view
+          // would otherwise resurrect the pre-rename manifest when selected.
+          lastLeanPaneManifest = null;
+        } else {
+          await refreshLeanPaneNow({ background: true });
+        }
+      } catch (error) {
+        message += ` The Lean pane could not refresh: ${normalizeErrorMessage(error)}`;
+        feedbackKind = "error";
+      }
+    }
     const { source, popover } = state;
     closeProjectIdentityEditor();
-    renderProjectIdentityFeedback({ source, popover, message, kind: "success" });
+    renderProjectIdentityFeedback({ source, popover, message, kind: feedbackKind });
     return true;
   }
 

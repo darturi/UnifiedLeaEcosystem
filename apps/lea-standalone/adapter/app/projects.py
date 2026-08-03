@@ -624,6 +624,11 @@ def migrate_project_namespace(
         namespace=new_namespace,
         repo_path=new_repo_path,
     )
+    rebased_artifact_modules = store.rebase_project_artifact_modules(
+        project["id"],
+        old_namespace=old_namespace,
+        new_namespace=new_namespace,
+    )
 
     failed_files = []
     checked_files = 0
@@ -643,6 +648,7 @@ def migrate_project_namespace(
             "oldNamespace": old_namespace,
             "newNamespace": new_namespace,
             "commitSha": commit_sha,
+            "rebasedArtifactModules": rebased_artifact_modules,
             "checkedFiles": checked_files,
             "failedFiles": failed_files,
         },
