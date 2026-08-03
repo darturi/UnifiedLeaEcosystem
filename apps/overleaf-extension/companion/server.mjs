@@ -5845,6 +5845,7 @@ function buildJobResponse({ job, status, target }) {
         : ""),
     resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "needs_review" ? "needs_review" : status === "formalized" ? (target.targetKind === "definition" ? "defined" : "proved") : null),
     resultDetail: job.resultDetail || null,
+    finalStatus: job.finalStatus || null,
     leaSessionId,
     leaSessionUrl: leaSessionId
       ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId, job.formalizationId)
@@ -6184,6 +6185,15 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
 
   const paneStatus = mapLeanPaneStatus(statusInfo, item);
   const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
+  // A failed retry may restore the previous verified artifact. In that case
+  // artifact truth correctly keeps the item valid, but the newest attempt's
+  // max-spend failure still needs to reach the pane so the user's click does
+  // not look like a no-op. Suppress the old failure while a newer run is live.
+  const maxSpendFailure = !inProgress && latestJob?.finalStatus === "max_spend"
+    ? latestJob
+    : !inProgress && statusInfo?.finalStatus === "max_spend"
+      ? statusInfo
+      : null;
   const currentInputHash = hashFormalizationInput({
     targetKind,
     targetText: item.naturalLanguageLatex,
@@ -6239,6 +6249,11 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     // Let the batch queue show the active Lea turn even when the target lives
     // in a different project file and therefore has no in-document badge.
     turnProgress: inProgress && !stale ? statusInfo?.turnProgress : undefined,
+    finalStatus: statusInfo?.finalStatus || undefined,
+    failureCode: maxSpendFailure ? "max_spend_reached" : undefined,
+    failureMessage: maxSpendFailure
+      ? maxSpendFailure.error || maxSpendFailure.message || MAX_SPEND_MESSAGE
+      : undefined,
     sourceFreshness: freshness.sourceFreshness,
     generatedFromSourceHash: freshness.generatedFromSourceHash || undefined,
     lastGeneratedAt: freshness.generatedAt || latestJob?.finishedAt || latestJob?.startedAt || undefined,

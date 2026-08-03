@@ -412,6 +412,27 @@ test("formalize refuses a source version that the mirror did not acknowledge", a
   assert.deepEqual(state.jobs, {});
 });
 
+test("formalize returns a structured error when the spend cap is already reached", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "capped_theorem",
+    targetText: "A theorem that cannot start."
+  }, state);
+
+  assert.equal(result.statusCode, 402);
+  assert.equal(result.body.error, "max_spend_reached");
+  assert.equal(result.body.message, "Max spend limit has been reached.");
+  assert.deepEqual(state.jobs, {});
+});
+
 test("lean pane manifest returns missing-stub items without artifacts", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -437,6 +458,45 @@ test("lean pane manifest returns missing-stub items without artifacts", async ()
   assert.equal(res.body.items[0].latexLabel, "thm:compactness");
   assert.equal(res.body.items[0].status, "missing-stub");
   assert.equal(res.body.items[0].leanDeclarationName, "compactness_criterion");
+});
+
+test("lean pane manifest preserves a terminal max-spend failure for item-level feedback", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.capped = {
+    jobId: "capped",
+    jobKey: "project-1:theorem:capped_theorem",
+    status: "failed",
+    finalStatus: "max_spend",
+    error: "Max spend limit reached. Lea run was cancelled.",
+    targetKind: "theorem",
+    targetLabel: "capped_theorem",
+    declarationName: "capped_theorem",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:capped}",
+        "% lea: formalize label=capped_theorem",
+        "A theorem whose run reached the cap.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "invalid");
+  assert.equal(res.body.items[0].finalStatus, "max_spend");
+  assert.equal(res.body.items[0].failureCode, "max_spend_reached");
+  assert.equal(res.body.items[0].failureMessage, "Max spend limit reached. Lea run was cancelled.");
 });
 
 test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => {

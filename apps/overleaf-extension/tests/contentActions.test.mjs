@@ -261,6 +261,108 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /missing stub/);
 });
 
+test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/project-1",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      projectIdentity: {
+        projectId: "adapter-project-1",
+        overleafProjectId: "project-1",
+        slug: "project-1",
+        projectName: "Test Project",
+        namespace: "Lea.TestProject",
+        exists: true,
+        hasRecordedProofs: true
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  harness.clickButtonText("Rename");
+  await flushPromises();
+
+  assert.deepEqual(harness.projectIdentityDialog(), {
+    role: "dialog",
+    modal: "true",
+    label: "ol-lean-project-identity-title"
+  });
+  assert.match(harness.bodyText(), /Rename project/);
+  assert.match(harness.bodyText(), /Display nameTest Project/);
+  assert.match(harness.bodyText(), /Lean namespaceLea\.TestProject/);
+  assert.equal(harness.promptCalls.length, 0);
+  assert.equal(harness.confirmCalls.length, 0);
+
+  harness.setProjectIdentityName("Fourier Notes");
+  await harness.runScheduledTimers();
+
+  assert.equal(harness.projectIdentityNamespace(), "Lea.FourierNotes");
+  assert.match(harness.bodyText(), /Lea\.TestProject → Lea\.FourierNotes/);
+  assert.match(harness.bodyText(), /migrate recorded proof files/);
+
+  harness.clickButtonText("Save changes");
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
+  assert.ok(saveCall, "expected project identity PUT");
+  assert.deepEqual(JSON.parse(saveCall.options.body), {
+    overleafProjectId: "project-1",
+    projectName: "Fourier Notes",
+    mode: "rename-namespace",
+    namespace: "Lea.FourierNotes",
+    expectedNamespace: "Lea.TestProject",
+    createIfMissing: true
+  });
+  assert.equal(harness.projectIdentityDialog(), null);
+  assert.match(harness.bodyText(), /Fourier Notes/);
+  assert.match(harness.bodyText(), /Project name and Lean namespace saved/);
+});
+
+test("project rename can keep the existing namespace when the suggested namespace is occupied", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/project-1",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      projectPreview: {
+        project_name: "Shared Notes",
+        namespace: "Lea.SharedNotes",
+        available: false,
+        suggestions: ["Lea.SharedNotes2", "Lea.SharedNotes2026"]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Rename");
+  await flushPromises();
+
+  harness.setProjectIdentityName("Shared Notes");
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /Lea\.SharedNotes is already in use/);
+  assert.equal(harness.hasButtonText("Lea.SharedNotes2"), true);
+  harness.setProjectIdentitySync(false);
+  assert.match(harness.bodyText(), /Only the display name will change/);
+
+  harness.clickButtonText("Save changes");
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
+  assert.ok(saveCall, "expected project identity PUT");
+  const body = JSON.parse(saveCall.options.body);
+  assert.equal(body.mode, "display-only");
+  assert.equal(body.namespace, "");
+  assert.equal(harness.promptCalls.length, 0);
+  assert.equal(harness.confirmCalls.length, 0);
+});
+
 test("Lean pane renders a persisted drag resize handle", async () => {
   const harness = createContentHarness({ status: "unformalized" });
   await harness.loadVisibleTheorems();
@@ -963,6 +1065,97 @@ test("Lean pane keeps Formalize after an upstream dependency blocks startup", as
   assert.match(harness.bodyText(), /Formalize referenced theorem first: helper_lemma\./);
 });
 
+test("Lean pane shows an item-local cost-cap alert that survives refresh and clears on retry", async () => {
+  const item = {
+    id: "theorem:main_theorem:0",
+    kind: "theorem",
+    label: "main_theorem",
+    status: "missing-stub",
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    formalizable: true
+  };
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeFailure: (calls) => calls.filter((call) => call.url.endsWith("/formalize")).length === 1
+        ? {
+            status: 402,
+            error: "max_spend_reached",
+            message: "Max spend limit has been reached."
+          }
+        : null,
+      manifest: { ok: true, rootFile: "main.tex", items: [item], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.paneActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Cost cap reachedLea could not complete this formalization because the configured maximum spend has been reached. Increase or clear the cap in Lea settings, then try again.Open settings"
+  });
+  assert.equal(harness.hasButtonText("Formalize"), true);
+
+  harness.clickButtonLabel("Refresh Lean pane");
+  await flushPromises();
+  assert.match(harness.paneActionError()?.text || "", /Cost cap reached/);
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+  assert.equal(harness.paneActionError(), null);
+});
+
+test("Lean pane explains a max-spend failure reported after a run started", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "invalid",
+          finalStatus: "max_spend",
+          failureCode: "max_spend_reached",
+          failureMessage: "Max spend limit reached. Lea run was cancelled.",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          formalizable: true
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  assert.match(harness.paneActionError()?.text || "", /Cost cap reached/);
+  assert.match(harness.paneActionError()?.text || "", /Increase or clear the cap in Lea settings/);
+});
+
 test("Formalize all renders an accessible, collapsible queue with active turn progress", async () => {
   const items = Array.from({ length: 8 }, (_unused, index) => {
     const number = index + 1;
@@ -1279,6 +1472,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const timers = [];
   const fetchCalls = [];
   const postedMessages = [];
+  const promptCalls = [];
   const confirmCalls = [];
   const storageSetCalls = [];
   const storageState = { ...(options.storage || {}) };
@@ -1290,6 +1484,10 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     innerWidth: 1024,
     innerHeight: 768,
     location: { pathname: options.locationPath || "/project/project-1" },
+    prompt(text, value) {
+      promptCalls.push({ text: String(text), value: String(value || "") });
+      return options.promptResponse ?? value ?? null;
+    },
     confirm(text) {
       confirmCalls.push(String(text));
       return options.confirmResponse !== false;
@@ -1351,16 +1549,60 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
       const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
-      const failingFormalize = Boolean(options.formalizeError) && String(url).endsWith("/formalize");
+      const formalizeRequest = String(url).endsWith("/formalize");
+      const formalizeFailure = formalizeRequest
+        ? typeof options.formalizeFailure === "function"
+          ? options.formalizeFailure(fetchCalls)
+          : options.formalizeFailure || (options.formalizeError
+            ? { status: 400, error: "unresolved_uses", message: options.formalizeError }
+            : null)
+        : null;
+      const failingFormalize = Boolean(formalizeFailure);
       return {
         ok: !failingRepairStart && !failingFormalize,
-        status: failingRepairStart || failingFormalize ? 400 : 200,
+        status: failingRepairStart ? 400 : failingFormalize ? formalizeFailure.status || 400 : 200,
         async json() {
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
           }
           if (failingFormalize) {
-            return { ok: false, error: "unresolved_uses", message: options.formalizeError };
+            return { ok: false, ...formalizeFailure };
+          }
+          if (String(url).includes("/project/identity/preview")) {
+            const request = JSON.parse(fetchOptions?.body || "{}");
+            const preview = typeof options.projectPreview === "function"
+              ? options.projectPreview(request, fetchCalls)
+              : options.projectPreview;
+            return preview || {
+              ok: true,
+              project_name: request.projectName,
+              namespace: request.namespace || `Lea.${String(request.projectName || "Project").replace(/[^A-Za-z0-9]+/g, "")}`,
+              available: true,
+              suggestions: []
+            };
+          }
+          if (String(url).endsWith("/project/identity") && fetchOptions?.method === "PUT") {
+            const request = JSON.parse(fetchOptions?.body || "{}");
+            const current = options.projectIdentity || {
+              projectId: "adapter-project-1",
+              overleafProjectId: "project-1",
+              slug: "project-1",
+              projectName: "Test Project",
+              namespace: "Lea.TestProject",
+              exists: true,
+              hasRecordedProofs: true
+            };
+            const update = typeof options.projectIdentityUpdate === "function"
+              ? options.projectIdentityUpdate(request, fetchCalls)
+              : options.projectIdentityUpdate;
+            return update || {
+              ok: true,
+              identity: {
+                ...current,
+                projectName: request.projectName,
+                namespace: request.mode === "rename-namespace" ? request.namespace : current.namespace
+              }
+            };
           }
           if (String(url).includes("/project/identity?")) {
             return {
@@ -1594,6 +1836,29 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     editTextarea() {
       return document.body.querySelector(".ol-lean-project-edit-textarea");
     },
+    setProjectIdentityName(value) {
+      const input = document.body.querySelector(".ol-lean-project-identity-input");
+      assert.ok(input, "expected project identity input");
+      input.value = value;
+      input.dispatchEvent({ type: "input" });
+    },
+    setProjectIdentitySync(checked) {
+      const input = document.body.querySelector(".ol-lean-project-identity-sync-input");
+      assert.ok(input, "expected project identity sync input");
+      input.checked = Boolean(checked);
+      input.dispatchEvent({ type: "change" });
+    },
+    projectIdentityDialog() {
+      const dialog = document.body.querySelector(".ol-lean-project-identity-dialog");
+      return dialog ? {
+        role: dialog.attributes.role,
+        modal: dialog.attributes["aria-modal"],
+        label: dialog.attributes["aria-labelledby"]
+      } : null;
+    },
+    projectIdentityNamespace() {
+      return document.body.querySelector(".ol-lean-project-identity-namespace-value")?.textContent || "";
+    },
     setEditTextareaValue(value) {
       const textarea = this.editTextarea();
       assert.ok(textarea, "expected the edit textarea to be present");
@@ -1636,6 +1901,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       await flushPromises();
     },
     fetchCalls,
+    promptCalls,
     confirmCalls,
     storageSetCalls,
     storageState,
@@ -1649,6 +1915,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
+    },
+    paneActionError() {
+      const alert = document.body.querySelector(".ol-lean-project-action-error");
+      return alert ? {
+        role: alert.attributes.role,
+        live: alert.attributes["aria-live"],
+        text: alert.textContent
+      } : null;
     },
     paneTreeRowTexts() {
       return document.body
@@ -1852,6 +2126,17 @@ class FakeElement {
       const mark = this.appendChild(new FakeElement("span"));
       mark.className = "ol-lean-trigger-mark";
       mark.textContent = "L";
+      return;
+    }
+    if (html.includes("Cost cap reached")) {
+      const copy = this.appendChild(new FakeElement("div"));
+      const title = copy.appendChild(new FakeElement("strong"));
+      title.textContent = "Cost cap reached";
+      const detail = copy.appendChild(new FakeElement("span"));
+      detail.textContent = "Lea stopped because the configured spend limit was reached.";
+      const dismiss = this.appendChild(new FakeElement("button"));
+      dismiss.setAttribute("aria-label", "Dismiss cost cap notice");
+      dismiss.textContent = "x";
     }
   }
 
