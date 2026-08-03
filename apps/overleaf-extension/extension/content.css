@@ -124,6 +124,7 @@
 .ol-lean-settings-trigger:focus-visible,
 .ol-lean-pane-trigger:focus-visible,
 .ol-lean-project-tree-row:focus-visible,
+.ol-lean-project-relationship-chip.is-navigable:focus-visible,
 .ol-lean-theorem-popover button:focus-visible,
 .ol-lean-popover button:focus-visible,
 .ol-lean-popover select:focus-visible,
@@ -1104,6 +1105,101 @@ body.ol-lean-pane-resizing {
 .ol-lean-project-natural {
   color: var(--ol-ink-2);
   white-space: pre-wrap;
+}
+
+.ol-lean-project-relationships {
+  display: grid;
+  gap: 6px;
+  margin-top: 9px;
+  padding: 7px 9px;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-project-relationship-row {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  align-items: start;
+  gap: 5px;
+}
+
+.ol-lean-project-relationship-label,
+.ol-lean-project-relationship-arrow {
+  padding-top: 4px;
+  color: var(--ol-muted);
+  font: 650 10px/1.2 var(--ol-sans);
+  white-space: nowrap;
+}
+
+.ol-lean-project-relationship-arrow {
+  font-weight: 500;
+}
+
+.ol-lean-project-relationship-list {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ol-lean-project-relationship-chip {
+  max-width: 100%;
+  padding: 3px 6px;
+  overflow: hidden;
+  border: 1px solid var(--ol-line);
+  border-radius: 999px;
+  color: var(--ol-muted);
+  background: var(--ol-panel);
+  font: 600 10px/1.2 var(--ol-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.ol-lean-project-relationship-chip {
+  appearance: none;
+}
+
+.ol-lean-project-relationship-chip.is-navigable {
+  cursor: pointer;
+}
+
+.ol-lean-project-relationship-chip.is-navigable:hover {
+  border-color: currentColor;
+}
+
+.ol-lean-project-relationship-chip-valid,
+.ol-lean-project-relationship-chip-defined {
+  border-color: var(--ol-green);
+  color: var(--ol-green);
+  background: var(--ol-green-soft);
+}
+
+.ol-lean-project-relationship-chip-disproved {
+  border-color: var(--ol-accent);
+  color: var(--ol-accent-ink);
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-project-relationship-chip-stub-generated,
+.ol-lean-project-relationship-chip-stale,
+.ol-lean-project-relationship-chip-missing-stub {
+  border-color: var(--ol-amber);
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+}
+
+.ol-lean-project-relationship-chip-invalid,
+.ol-lean-project-relationship-chip-error {
+  border-color: var(--ol-red);
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+}
+
+.ol-lean-project-relationship-chip.is-unavailable {
+  border-style: dashed;
+  color: var(--ol-muted);
+  background: transparent;
 }
 
 .ol-lean-project-math {

@@ -1151,6 +1151,7 @@
     const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
     const tree = leanPaneView.buildLeanPaneTree(items);
+    const useRelationships = leanPaneView.buildPaneUseRelationships(items);
     const fileCount = tree.files.length;
     lastLeanPaneManifest = manifest || null;
     prepareLeanPaneTreeExpansion(manifest, tree);
@@ -1180,7 +1181,7 @@
       const treeElement = document.createElement("div");
       treeElement.className = "ol-lean-project-tree";
       for (const node of tree.children) {
-        treeElement.appendChild(renderLeanPaneTreeNode(node, 0, manifest));
+        treeElement.appendChild(renderLeanPaneTreeNode(node, 0, manifest, useRelationships));
       }
       leanPaneBody.appendChild(treeElement);
     }
@@ -1677,7 +1678,7 @@
     }
   }
 
-  function renderLeanPaneTreeNode(node, depth, manifest) {
+  function renderLeanPaneTreeNode(node, depth, manifest, useRelationships) {
     const expanded = leanPaneExpandedTreeNodeIds.has(node.id);
     const section = document.createElement("section");
     section.className = `ol-lean-project-tree-node ol-lean-project-tree-node-${node.type}`;
@@ -1691,7 +1692,7 @@
     row.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${node.type === "folder" ? "folder" : "file"} ${node.path || node.name}`);
     row.addEventListener("click", () => {
       toggleLeanPaneTreeNode(node.id);
-      section.replaceWith(renderLeanPaneTreeNode(node, depth, manifest));
+      section.replaceWith(renderLeanPaneTreeNode(node, depth, manifest, useRelationships));
     });
 
     const disclosure = document.createElement("span");
@@ -1724,12 +1725,12 @@
       children.className = "ol-lean-project-tree-children";
       if (node.type === "folder") {
         for (const child of node.children) {
-          children.appendChild(renderLeanPaneTreeNode(child, depth + 1, manifest));
+          children.appendChild(renderLeanPaneTreeNode(child, depth + 1, manifest, useRelationships));
         }
       } else {
         children.className = "ol-lean-project-tree-items";
         for (const item of node.items) {
-          children.appendChild(renderLeanPaneItem(item));
+          children.appendChild(renderLeanPaneItem(item, useRelationships));
         }
       }
       section.appendChild(children);
@@ -1765,7 +1766,7 @@
     }
   }
 
-  function renderLeanPaneItem(item) {
+  function renderLeanPaneItem(item, useRelationships) {
     const expanded = leanPaneExpandedItemIds.has(item.id);
     const card = document.createElement("section");
     card.className = `ol-lean-project-item ol-lean-project-item-${item.status || "unknown"}`;
@@ -1783,7 +1784,7 @@
       } else {
         leanPaneExpandedItemIds.add(item.id);
       }
-      card.replaceWith(renderLeanPaneItem(item));
+      card.replaceWith(renderLeanPaneItem(item, useRelationships));
     });
 
     const text = document.createElement("span");
@@ -1818,6 +1819,9 @@
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
 
+    const relationships = renderLeanPaneUseRelationships(item, useRelationships);
+    if (relationships) card.appendChild(relationships);
+
     if (item.status === "stale") {
       const staleNote = document.createElement("p");
       staleNote.className = "ol-lean-project-stale-note";
@@ -1847,6 +1851,88 @@
       card.appendChild(renderLeanPaneItemDetail(item));
     }
     return card;
+  }
+
+  function renderLeanPaneUseRelationships(item, useRelationships) {
+    const uses = useRelationships?.usesByItem?.get(item) || [];
+    const usedBy = useRelationships?.usedByItem?.get(item) || [];
+    if (uses.length === 0 && usedBy.length === 0) return null;
+
+    const container = document.createElement("div");
+    container.className = "ol-lean-project-relationships";
+    container.setAttribute("role", "group");
+    container.setAttribute("aria-label", `Relationships for ${item.label || item.leanDeclarationName || "this item"}`);
+    if (uses.length > 0) {
+      container.appendChild(renderLeanPaneUseRelationshipRow("Uses", "→", "uses", uses));
+    }
+    if (usedBy.length > 0) {
+      container.appendChild(renderLeanPaneUseRelationshipRow("Used by", "←", "used-by", usedBy));
+    }
+    return container;
+  }
+
+  function renderLeanPaneUseRelationshipRow(label, arrow, direction, relationships) {
+    const row = document.createElement("div");
+    row.className = "ol-lean-project-relationship-row";
+
+    const heading = document.createElement("span");
+    heading.className = "ol-lean-project-relationship-label";
+    heading.textContent = label;
+    row.appendChild(heading);
+
+    const arrowElement = document.createElement("span");
+    arrowElement.className = "ol-lean-project-relationship-arrow";
+    arrowElement.setAttribute("aria-hidden", "true");
+    arrowElement.textContent = arrow;
+    row.appendChild(arrowElement);
+
+    const list = document.createElement("div");
+    list.className = "ol-lean-project-relationship-list";
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", label);
+    for (const relationship of relationships) {
+      list.appendChild(renderLeanPaneUseRelationshipChip(relationship, direction));
+    }
+    row.appendChild(list);
+    return row;
+  }
+
+  function renderLeanPaneUseRelationshipChip(relationship, direction) {
+    const navigable = Boolean(relationship?.item);
+    const element = document.createElement(navigable ? "button" : "span");
+    if (navigable) element.type = "button";
+    const status = String(relationship?.status || "unknown").toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+    element.className = [
+      "ol-lean-project-relationship-chip",
+      `ol-lean-project-relationship-chip-${status}`,
+      navigable ? "is-navigable" : "is-unavailable",
+      relationship?.resolution === "ambiguous" ? "is-ambiguous" : ""
+    ].filter(Boolean).join(" ");
+    element.dataset.relationshipDirection = direction;
+    element.dataset.targetLabel = relationship?.label || "";
+    element.textContent = relationship?.label || "";
+
+    if (navigable) {
+      const role = direction === "uses" ? "dependency" : "dependent";
+      const state = leanPaneView.formatPaneStatus(relationship.status || "unknown");
+      const accessibleLabel = `Open ${role} ${relationship.label}, currently ${state}`;
+      element.setAttribute("aria-label", accessibleLabel);
+      element.title = accessibleLabel;
+      element.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        revealLeanPaneItem(relationship.item);
+      });
+    } else {
+      const ambiguous = relationship?.resolution === "ambiguous";
+      const message = ambiguous
+        ? `${relationship.label} matches more than one item in the Lean-pane inventory.`
+        : `${relationship.label} is not present in the current Lean-pane inventory.`;
+      element.setAttribute("aria-label", message);
+      element.setAttribute("aria-disabled", "true");
+      element.title = message;
+    }
+    return element;
   }
 
   function renderLeanPaneItemDetail(item) {
@@ -3751,13 +3837,19 @@
     if (!item) {
       throw new Error(`Could not find ${target.targetLabel || "this item"} in the Lean pane.`);
     }
+    revealLeanPaneItem(item);
+    return item;
+  }
+
+  function revealLeanPaneItem(item) {
+    if (!item || !lastLeanPaneManifest) return false;
     for (const id of leanPaneView.treeAncestorIdsForFile(item.sourceFile || "")) {
       leanPaneExpandedTreeNodeIds.add(id);
     }
     leanPaneExpandedItemIds.add(item.id);
     renderLeanPaneManifest(lastLeanPaneManifest);
     highlightLeanPaneItem(item.id);
-    return item;
+    return true;
   }
 
   function findLeanPaneItemForTarget(items, target) {

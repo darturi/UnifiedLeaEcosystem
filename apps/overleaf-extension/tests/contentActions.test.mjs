@@ -698,6 +698,152 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
 });
 
+test("Lean pane shows navigable uses and used-by relationships across project files", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        items: [
+          {
+            id: "theorem:support:0",
+            kind: "theorem",
+            label: "support",
+            status: "valid",
+            sourceFile: "foundations/base.tex",
+            documentOrder: 0,
+            naturalLanguageLatex: "A supporting theorem.",
+            leanKind: "theorem",
+            targetUses: []
+          },
+          {
+            id: "theorem:isolated:1",
+            kind: "theorem",
+            label: "isolated",
+            status: "valid",
+            sourceFile: "main.tex",
+            documentOrder: 1,
+            naturalLanguageLatex: "An unrelated theorem.",
+            leanKind: "theorem",
+            targetUses: []
+          },
+          {
+            id: "theorem:result:2",
+            kind: "theorem",
+            label: "result",
+            status: "invalid",
+            sourceFile: "sections/result.tex",
+            documentOrder: 2,
+            naturalLanguageLatex: "The main result.",
+            leanKind: "theorem",
+            targetUses: ["support", "outside_inventory"]
+          }
+        ],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("sections/");
+  harness.clickPaneTreeRowText("result.tex");
+
+  assert.equal(harness.countSelector(".ol-lean-project-relationships"), 1);
+  assert.deepEqual(
+    harness.relationshipChips().map((chip) => ({
+      text: chip.text,
+      direction: chip.direction,
+      navigable: chip.navigable,
+      unavailable: chip.unavailable
+    })),
+    [
+      { text: "support", direction: "uses", navigable: true, unavailable: false },
+      { text: "outside_inventory", direction: "uses", navigable: false, unavailable: true }
+    ]
+  );
+  const supportChip = harness.relationshipChips()[0];
+  assert.match(supportChip.className, /ol-lean-project-relationship-chip-valid/);
+  assert.match(supportChip.ariaLabel, /Open dependency support, currently valid/);
+  const outsideChip = harness.relationshipChips()[1];
+  assert.equal(outsideChip.ariaDisabled, "true");
+  assert.match(outsideChip.title, /not present in the current Lean-pane inventory/);
+
+  harness.clickRelationshipChip("support");
+  assert.equal(harness.focusedPaneItemId(), "theorem:support:0");
+  assert.equal(harness.firstFocusedPaneItemScrolled(), true);
+  assert.ok(harness.paneTreeRowTexts().some((text) => text.includes("base.tex")));
+  assert.ok(harness.relationshipChips().some((chip) => (
+    chip.text === "result"
+    && chip.direction === "used-by"
+    && chip.navigable
+    && /currently invalid/.test(chip.ariaLabel)
+  )));
+
+  harness.clickRelationshipChip("result", "used-by");
+  assert.equal(harness.focusedPaneItemId(), "theorem:result:2");
+});
+
+test("Lean pane relationship chips survive polling and reflect refreshed target status", async () => {
+  let manifestCalls = 0;
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: () => {
+        const first = manifestCalls === 0;
+        manifestCalls += 1;
+        return {
+          ok: true,
+          items: [
+            {
+              id: "theorem:support:0",
+              kind: "theorem",
+              label: "support",
+              status: first ? "valid" : "invalid",
+              sourceFile: "main.tex",
+              documentOrder: 0,
+              naturalLanguageLatex: "Support.",
+              leanKind: "theorem",
+              targetUses: []
+            },
+            {
+              id: "theorem:result:1",
+              kind: "theorem",
+              label: "result",
+              status: first ? "in-progress" : "valid",
+              inProgress: first,
+              sourceFile: "main.tex",
+              documentOrder: 1,
+              naturalLanguageLatex: "Result.",
+              leanKind: "theorem",
+              targetUses: ["support"]
+            }
+          ],
+          diagnostics: []
+        };
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.ok(harness.relationshipChips().some((chip) => (
+    chip.text === "support" && /relationship-chip-valid/.test(chip.className)
+  )));
+
+  await harness.runScheduledTimers();
+
+  assert.ok(harness.relationshipChips().some((chip) => (
+    chip.text === "support" && /relationship-chip-invalid/.test(chip.className)
+  )));
+});
+
 test("Lean pane renders lightweight math and highlighted Lean code", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -1958,6 +2104,32 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         .querySelectorAll(".ol-lean-project-tree-row")
         .map((row) => row.textContent);
     },
+    relationshipChips() {
+      return document.body
+        .querySelectorAll(".ol-lean-project-relationship-chip")
+        .map((chip) => ({
+          text: chip.textContent,
+          direction: chip.dataset.relationshipDirection,
+          targetLabel: chip.dataset.targetLabel,
+          ariaLabel: chip.attributes["aria-label"],
+          ariaDisabled: chip.attributes["aria-disabled"],
+          navigable: chip.classList.contains("is-navigable"),
+          unavailable: chip.classList.contains("is-unavailable"),
+          className: chip.className,
+          title: chip.title
+        }));
+    },
+    clickRelationshipChip(text, direction = "uses") {
+      const chip = document.body
+        .querySelectorAll(".ol-lean-project-relationship-chip")
+        .find((candidate) => (
+          candidate.textContent === text
+          && candidate.dataset.relationshipDirection === direction
+          && candidate.classList.contains("is-navigable")
+        ));
+      assert.ok(chip, `expected navigable ${direction} relationship chip "${text}"`);
+      chip.click();
+    },
     paneProgresses() {
       return document.body
         .querySelectorAll(".ol-lean-project-progress")
@@ -2001,6 +2173,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");
       return Boolean(item?.scrollIntoViewOptions);
+    },
+    focusedPaneItemId() {
+      return document.body.querySelector(".ol-lean-project-item-focus")?.dataset.itemId || "";
     }
   };
 }
