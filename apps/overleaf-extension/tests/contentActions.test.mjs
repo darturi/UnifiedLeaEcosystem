@@ -1248,6 +1248,9 @@ test("Lean pane keeps Formalize after an upstream dependency blocks startup", as
     live: "assertive",
     text: "Dependency must be formalized firstFormalize referenced theorem first: helper_lemma. No Lea run was started."
   });
+  assert.equal(harness.hasButtonLabel("Dismiss error message"), true);
+  harness.clickButtonLabel("Dismiss error message");
+  assert.equal(harness.paneActionError(), null);
 });
 
 test("source popover explains when an upstream dependency blocks formalization startup", async () => {
@@ -1273,7 +1276,34 @@ test("source popover explains when an upstream dependency blocks formalization s
   assert.equal(harness.hasButtonText("Formalize"), true);
 });
 
-test("Lean pane shows an item-local cost-cap alert that survives refresh and clears on retry", async () => {
+test("source popover reports a cost cap inline without a separate floating notice", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeFailure: {
+        status: 402,
+        error: "max_spend_reached",
+        message: "Max spend limit has been reached."
+      }
+    }
+  );
+  await harness.loadStatusForVisibleTheorem();
+  harness.openTargetPopover();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.popoverActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Action failedMax spend limit has been reached."
+  });
+  assert.equal(harness.countSelector(".ol-lean-cost-cap-notice"), 0);
+});
+
+test("Lean pane cost-cap dismissal survives refresh and clears for a retry", async () => {
   const item = {
     id: "theorem:main_theorem:0",
     kind: "theorem",
@@ -1315,11 +1345,16 @@ test("Lean pane shows an item-local cost-cap alert that survives refresh and cle
     live: "assertive",
     text: "Cost cap reachedLea could not complete this formalization because the configured maximum spend has been reached. Increase or clear the cap in Lea settings, then try again.Open settings"
   });
+  assert.equal(harness.countSelector(".ol-lean-cost-cap-notice"), 0);
   assert.equal(harness.hasButtonText("Formalize"), true);
+  assert.equal(harness.hasButtonLabel("Dismiss error message"), true);
+
+  harness.clickButtonLabel("Dismiss error message");
+  assert.equal(harness.paneActionError(), null);
 
   harness.clickButtonLabel("Refresh Lean pane");
   await flushPromises();
-  assert.match(harness.paneActionError()?.text || "", /Cost cap reached/);
+  assert.equal(harness.paneActionError(), null);
 
   harness.clickButtonText("Formalize");
   await flushPromises();
@@ -1362,6 +1397,13 @@ test("Lean pane explains a max-spend failure reported after a run started", asyn
 
   assert.match(harness.paneActionError()?.text || "", /Cost cap reached/);
   assert.match(harness.paneActionError()?.text || "", /Increase or clear the cap in Lea settings/);
+  assert.equal(harness.countSelector(".ol-lean-cost-cap-notice"), 0);
+  harness.clickButtonLabel("Dismiss error message");
+  assert.equal(harness.paneActionError(), null);
+
+  harness.clickButtonLabel("Refresh Lean pane");
+  await flushPromises();
+  assert.equal(harness.paneActionError(), null);
 });
 
 test("Formalize all renders an accessible, collapsible queue with active turn progress", async () => {
@@ -2366,16 +2408,6 @@ class FakeElement {
       mark.className = "ol-lean-trigger-mark";
       mark.textContent = "L";
       return;
-    }
-    if (html.includes("Cost cap reached")) {
-      const copy = this.appendChild(new FakeElement("div"));
-      const title = copy.appendChild(new FakeElement("strong"));
-      title.textContent = "Cost cap reached";
-      const detail = copy.appendChild(new FakeElement("span"));
-      detail.textContent = "Lea stopped because the configured spend limit was reached.";
-      const dismiss = this.appendChild(new FakeElement("button"));
-      dismiss.setAttribute("aria-label", "Dismiss cost cap notice");
-      dismiss.textContent = "x";
     }
   }
 

@@ -1936,56 +1936,6 @@ button.ol-lean-project-relationship-chip {
   border-bottom: 1px solid var(--ol-line);
 }
 
-.ol-lean-cost-cap-notice {
-  position: fixed;
-  z-index: 2147483647;
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  width: min(280px, calc(100vw - 24px));
-  box-sizing: border-box;
-  padding: 10px 10px 10px 12px;
-  color: var(--ol-red);
-  background: var(--ol-red-soft);
-  border: 1px solid var(--ol-red);
-  border-radius: 10px;
-  box-shadow: 0 8px 24px rgba(209, 67, 67, 0.14);
-  font: 12px/1.35 var(--ol-sans);
-}
-
-.ol-lean-cost-cap-notice div {
-  min-width: 0;
-}
-
-.ol-lean-cost-cap-notice strong,
-.ol-lean-cost-cap-notice span {
-  display: block;
-}
-
-.ol-lean-cost-cap-notice strong {
-  margin-bottom: 2px;
-  color: var(--ol-red-ink);
-  font-weight: 700;
-}
-
-.ol-lean-cost-cap-notice button {
-  flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  border: 0;
-  border-radius: 6px;
-  color: var(--ol-red-ink);
-  background: transparent;
-  cursor: pointer;
-  font: 700 14px/1 var(--ol-sans);
-}
-
-.ol-lean-cost-cap-notice button:hover,
-.ol-lean-cost-cap-notice button:focus-visible {
-  background: rgba(209, 67, 67, 0.14);
-}
-
 .ol-lean-popover-header {
   display: flex;
   align-items: center;
@@ -2422,7 +2372,8 @@ button.ol-lean-project-relationship-chip {
   background: var(--ol-panel);
 }
 
-.ol-lean-settings-panel label {
+.ol-lean-settings-panel label,
+.ol-lean-settings-panel .ol-lean-model-field {
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -2448,6 +2399,12 @@ button.ol-lean-project-relationship-chip {
   width: 72px;
   font-family: var(--ol-mono);
   text-align: center;
+}
+
+.ol-lean-settings-panel .lea-model-requirement-field input {
+  width: 100%;
+  font-family: var(--ol-sans);
+  text-align: left;
 }
 
 .ol-lean-save-button {
@@ -2805,3 +2762,54 @@ button.ol-lean-project-relationship-chip {
   overflow-x: auto;
 }
 .bp-detail-empty { font-size: 12.5px; color: var(--ol-muted); padding: 6px 0; line-height: 1.5; }
+
+/* Every transient error surface inside the Lean pane uses the same compact,
+   keyboard-accessible dismiss control. The glyph is decorative CSS so it
+   does not get folded into the alert's spoken or copied message text. */
+.ol-lean-dismissible-error {
+  position: relative;
+  padding-right: 38px;
+}
+
+.ol-lean-error-dismiss {
+  appearance: none;
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: 0;
+  padding: 0;
+  color: currentColor;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.72;
+}
+
+.ol-lean-error-dismiss::before {
+  content: "\00d7";
+  font: 600 18px/1 var(--ol-sans);
+}
+
+.ol-lean-error-dismiss:hover {
+  background: color-mix(in srgb, currentColor 9%, transparent);
+  opacity: 1;
+}
+
+.ol-lean-error-dismiss:focus-visible {
+  border-color: currentColor;
+  outline: 2px solid color-mix(in srgb, currentColor 24%, transparent);
+  outline-offset: 1px;
+  opacity: 1;
+}
+
+.ol-lean-project-edit-error.ol-lean-dismissible-error {
+  min-height: 24px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}

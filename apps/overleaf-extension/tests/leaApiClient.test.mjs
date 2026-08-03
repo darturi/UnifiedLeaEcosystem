@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  fetchAdapterModelCatalog,
+  fetchAdapterModelRequirements,
   parseSseFrame,
   runApiProofJob,
 } from "../companion/leaApiClient.mjs";
@@ -40,6 +42,34 @@ test("parseSseFrame tolerates a missing/blank data line", () => {
   const { type, data } = parseSseFrame("event: done");
   assert.equal(type, "done");
   assert.equal(data, null);
+});
+
+test("adapter model helpers call the catalog and encoded requirements endpoints", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url: String(url), method: options.method });
+    if (String(url).endsWith("/api/models")) {
+      return jsonResponse({ models: [{ value: "mistral/large", provider: "mistral" }] });
+    }
+    return jsonResponse({
+      model: "custom/model id",
+      provider: "custom",
+      required_keys: [{ env: "CUSTOM_API_KEY", configured: false }],
+      satisfied: false
+    });
+  };
+
+  const catalog = await fetchAdapterModelCatalog({ fetchImpl, baseUrl: "http://adapter" });
+  const requirements = await fetchAdapterModelRequirements({
+    fetchImpl,
+    baseUrl: "http://adapter",
+    model: "custom/model id"
+  });
+
+  assert.equal(catalog.body.models[0].value, "mistral/large");
+  assert.equal(requirements.body.required_keys[0].env, "CUSTOM_API_KEY");
+  assert.equal(calls[0].url, "http://adapter/api/models");
+  assert.equal(calls[1].url, "http://adapter/api/models/requirements?model=custom%2Fmodel%20id");
 });
 
 test("runApiProofJob: proved done → ok with usage read back from the run row", async () => {

@@ -61,6 +61,8 @@ import {
 import { createEventBus, publishEvent } from "./eventBus.mjs";
 import {
   exportProjectZipBySlug,
+  fetchAdapterModelCatalog,
+  fetchAdapterModelRequirements,
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
@@ -128,12 +130,7 @@ export { LEA_MODEL_OPTIONS };
 const LEA_MODEL_BY_ID = LEA_MODEL_BY_VALUE;
 const LEGACY_LEA_MODEL_ALIASES = new Map([
   ["anthropic/claude-opus-4-20250514", "anthropic/claude-opus-4-8"],
-  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"],
-  // The lea-standalone adapter stores bare Anthropic IDs (no provider prefix);
-  // map them back to the companion catalog's prefixed form when reading shared
-  // settings so the model round-trips between the two settings UIs.
-  ["claude-opus-4-8", "anthropic/claude-opus-4-8"],
-  ["claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"]
+  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"]
 ]);
 
 // The settings whose single source of truth is the lea-standalone adapter's
@@ -2143,7 +2140,7 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
-  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL)) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+  const modelInfo = configuredModelMetadata(state);
 
   return {
     jobId,
@@ -2191,10 +2188,10 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     leaSessionId,
     formalizationId: linkedJob?.formalizationId || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
-    leaProvider: modelInfo.family,
-    leaProviderFamily: modelInfo.family,
-    leaModel: modelInfo.value,
+    leaApiKeyConfigured: modelInfo.apiKeyConfigured,
+    leaProvider: modelInfo.provider,
+    leaProviderFamily: modelInfo.provider,
+    leaModel: modelInfo.model,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaCurrentTurn: null,
@@ -3203,6 +3200,92 @@ async function finishChatRunCascade({ state, target, preRunSnapshot, leaSessionI
   await persistChatSessions(state);
 }
 
+function fallbackModelCatalog(selectedModel = "") {
+  const models = LEA_MODEL_OPTIONS.map((model) => ({
+    value: String(model.value),
+    label: String(model.label || model.value),
+    provider: normalizeProviderFamilyId(model.family || ""),
+    ...(model.tag ? { tag: String(model.tag) } : {})
+  }));
+  const selected = String(selectedModel || "").trim();
+  if (selected && !models.some((model) => model.value === selected)) {
+    models.unshift({ value: selected, label: selected, provider: "", current: true });
+  }
+  return models;
+}
+
+function normalizeAdapterCatalog(models) {
+  if (!Array.isArray(models)) return [];
+  return models
+    .map((model) => ({
+      value: String(model?.value || "").trim(),
+      label: String(model?.label || model?.value || "").trim(),
+      provider: normalizeProviderFamilyId(model?.provider || model?.family || "")
+    }))
+    .filter((model) => model.value);
+}
+
+export async function handleGetModelCatalog(state) {
+  const selectedModel = normalizeLeaModelId(state.settings?.leaModel || DEFAULT_LEA_MODEL);
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return {
+      statusCode: 200,
+      body: { models: fallbackModelCatalog(selectedModel), source: "fallback", degraded: true }
+    };
+  }
+  const result = await fetchAdapterModelCatalog({ fetchImpl: state.fetchImpl || fetch, baseUrl });
+  const models = normalizeAdapterCatalog(result.body?.models);
+  if (!result.ok || models.length === 0) {
+    return {
+      statusCode: 200,
+      body: { models: fallbackModelCatalog(selectedModel), source: "fallback", degraded: true }
+    };
+  }
+  return { statusCode: 200, body: { models, source: "adapter", degraded: false } };
+}
+
+function fallbackModelRequirements(model, state) {
+  const info = LEA_MODEL_BY_ID.get(normalizeLeaModelId(model));
+  const family = info ? LEA_MODEL_FAMILY_BY_ID.get(normalizeProviderFamilyId(info.family)) : null;
+  const requiredKeys = (family?.envVars || []).map((env) => ({
+    env,
+    label: family.label,
+    configured: Boolean(state.adapterSettings?.api_keys?.[env]?.configured || state.env?.[env])
+  }));
+  return {
+    model,
+    provider: family?.id || null,
+    required_keys: requiredKeys,
+    satisfied: requiredKeys.length === 0 || requiredKeys.some((key) => key.configured),
+    degraded: true
+  };
+}
+
+export async function handleGetModelRequirements(model, state) {
+  const normalized = normalizeLeaModelId(String(model || "").trim());
+  if (!normalized) {
+    return errorResponse(400, "invalid_lea_model", "Lea model must not be empty.");
+  }
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return { statusCode: 200, body: fallbackModelRequirements(normalized, state) };
+  }
+  const result = await fetchAdapterModelRequirements({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    model: normalized
+  });
+  if (!result.ok || !result.body || typeof result.body !== "object") {
+    return { statusCode: 200, body: fallbackModelRequirements(normalized, state) };
+  }
+  return { statusCode: 200, body: { ...result.body, model: normalized, degraded: false } };
+}
+
 export async function handleUpdateLeaSettings(payload, state) {
   const leaRepoPath = String(payload.leaRepoPath || "").trim();
   const validation = await validateLeaRepo(leaRepoPath);
@@ -3214,12 +3297,6 @@ export async function handleUpdateLeaSettings(payload, state) {
   // key configured only in the lea-standalone UI.
   await syncSharedSettingsFromAdapter(state);
 
-  const model = normalizeLeaModelId(payload.leaModel || DEFAULT_LEA_MODEL);
-  const modelInfo = LEA_MODEL_BY_ID.get(model);
-  if (!modelInfo) {
-    return errorResponse(400, "invalid_lea_model", "Lea model must be one of the supported models.");
-  }
-
   let leaApiBaseUrl;
   try {
     leaApiBaseUrl = normalizeLeaApiBaseUrl(
@@ -3229,7 +3306,25 @@ export async function handleUpdateLeaSettings(payload, state) {
     return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
   }
 
-  const providerEnvPatch = buildProviderEnvPatch(payload.leaProviderApiKeys);
+  const model = normalizeLeaModelId(String(payload.leaModel || "").trim());
+  if (!model) {
+    return errorResponse(400, "invalid_lea_model", "Lea model must not be empty.");
+  }
+  const requirementsResult = await fetchAdapterModelRequirements({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: leaApiBaseUrl,
+    model
+  });
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  const selectedProvider = normalizeProviderFamilyId(
+    requirementsResult.ok && requirementsResult.body?.provider
+      ? requirementsResult.body.provider
+      : modelInfo?.family || model.split("/")[0]
+  );
+  const providerEnvPatch = {
+    ...buildProviderEnvPatch(payload.leaProviderApiKeys),
+    ...buildDirectApiKeyEnvPatch(payload.leaApiKeys)
+  };
   let leaMaxSpendUsd;
   try {
     leaMaxSpendUsd = normalizeLeaMaxSpendUsd(
@@ -3248,7 +3343,7 @@ export async function handleUpdateLeaSettings(payload, state) {
     leaRepoPath: path.resolve(leaRepoPath),
     leaWorkspacePath: validation.leaWorkspacePath,
     leaApiBaseUrl,
-    leaProvider: modelInfo.family,
+    leaProvider: selectedProvider,
     leaModel: model,
     leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
     leaMaxSpendUsd,
@@ -3259,17 +3354,10 @@ export async function handleUpdateLeaSettings(payload, state) {
     )
   };
   const nextState = { ...state, settings: nextSettings, env: { ...(state.env || {}), ...providerEnvPatch } };
-  if (!isProviderKeyConfigured(nextState, modelInfo.family)) {
-    return errorResponse(
-      400,
-      `missing_${modelInfo.family}_key`,
-      `${LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family)?.label || modelInfo.family} API key must be set in the lea-standalone settings, .env, or the companion process environment before selecting this model.`
-    );
-  }
   const keyValidation = await validateProviderApiKeys({
     fetchImpl: state.fetchImpl || fetch,
     providerEnvPatch,
-    selectedFamilyId: modelInfo.family,
+    selectedFamilyId: selectedProvider,
     state: nextState
   });
   if (!keyValidation.ok) {
@@ -3280,7 +3368,12 @@ export async function handleUpdateLeaSettings(payload, state) {
     max_turns: nextSettings.leaMaxTurns,
     max_spend_usd: nextSettings.leaMaxSpendUsd
   };
-  const apiKeyPatch = buildAdapterApiKeyPatch(payload.leaProviderApiKeys, nextState, modelInfo.family);
+  const apiKeyPatch = buildAdapterApiKeyPatch(
+    payload.leaProviderApiKeys,
+    payload.leaApiKeys,
+    nextState,
+    selectedProvider
+  );
   if (Object.keys(apiKeyPatch).length > 0) adapterBody.api_keys = apiKeyPatch;
   const pushed = await putAdapterSettings({
     fetchImpl: state.fetchImpl || fetch,
@@ -3491,6 +3584,18 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "GET" && url.pathname === "/settings") {
     sendJson(response, 200, await buildSettingsResponse(state));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/settings/models") {
+    const result = await handleGetModelCatalog(state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/settings/models/requirements") {
+    const result = await handleGetModelRequirements(url.searchParams.get("model") || "", state);
+    sendJson(response, result.statusCode, result.body);
     return;
   }
 
@@ -3716,18 +3821,26 @@ export async function buildSettingsResponse(state) {
   await syncSharedSettingsFromAdapter(state);
   const leaRepoPath = state.settings.leaRepoPath || "";
   const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL);
-  const modelInfo = LEA_MODEL_BY_ID.get(model) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+  const requirements = (await handleGetModelRequirements(model, state)).body;
+  state.adapterModelRequirements = requirements;
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  const provider = normalizeProviderFamilyId(requirements?.provider || modelInfo?.family || model.split("/")[0]);
   return {
     ok: true,
     leaRepoPath,
     leaWorkspacePath: leaRepoPath ? buildLeaWorkspacePath(leaRepoPath) : "",
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: isProviderKeyConfigured(state, modelInfo.family),
-    leaProvider: modelInfo.family,
-    leaProviderFamily: modelInfo.family,
+    leaApiKeyConfigured: requirements?.satisfied !== false,
+    leaProvider: provider,
+    leaProviderFamily: provider,
     leaProviderKeys: buildProviderKeyStatus(state),
-    leaModel: modelInfo.value,
+    leaApiKeys: state.adapterSettings?.api_keys || {},
+    leaModelRequirements: requirements,
+    leaModel: model,
+    // Featured/offline fallback only. The exhaustive catalog lives at
+    // GET /settings/models and is intentionally not duplicated in every
+    // settings response.
     leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
@@ -3741,6 +3854,22 @@ export async function buildSettingsResponse(state) {
     // adapter's lea.local.toml and is set via POST /settings/github-token (D34).
     githubTokenConfigured: Boolean(state.adapterSettings?.github_token?.configured)
   };
+}
+
+function configuredModelMetadata(state) {
+  const model = normalizeLeaModelId(state.settings?.leaModel || DEFAULT_LEA_MODEL);
+  const info = LEA_MODEL_BY_ID.get(model);
+  const provider = normalizeProviderFamilyId(
+    state.adapterModelRequirements?.model === model
+      ? state.adapterModelRequirements.provider
+      : state.settings?.leaProvider || info?.family || model.split("/")[0]
+  );
+  const apiKeyConfigured = state.adapterModelRequirements?.model === model
+    ? state.adapterModelRequirements.satisfied !== false
+    : info
+      ? isProviderKeyConfigured(state, info.family)
+      : true;
+  return { model, provider, apiKeyConfigured };
 }
 
 function buildProviderKeyStatus(state) {
@@ -3796,11 +3925,10 @@ async function syncSharedSettingsFromAdapter(state) {
   }
   if (adapter.model) {
     const mapped = normalizeLeaModelId(String(adapter.model));
-    // Only adopt the adapter's model if it maps to a model the companion knows,
-    // so we never overlay an ID the run preflight would reject as unsupported.
-    if (LEA_MODEL_BY_ID.has(mapped)) {
-      state.settings.leaModel = mapped;
-    }
+    // The adapter owns the model catalog and accepts custom model IDs. Mirroring
+    // its current value must therefore never be gated by the companion fallback
+    // shortlist.
+    if (mapped) state.settings.leaModel = mapped;
   }
   return adapter;
 }
@@ -3924,7 +4052,7 @@ const ADAPTER_KEY_ENV_BY_FAMILY = {
 // user just entered in the Overleaf options form, plus (if available) the raw key
 // for the selected model's family — so the adapter, the single source of truth,
 // always ends up holding the key the selected model needs.
-function buildAdapterApiKeyPatch(patchKeys, state, selectedFamilyId) {
+function buildAdapterApiKeyPatch(patchKeys, directKeys, state, selectedFamilyId) {
   const patch = {};
   if (patchKeys && typeof patchKeys === "object" && !Array.isArray(patchKeys)) {
     for (const [rawFamilyId, rawValue] of Object.entries(patchKeys)) {
@@ -3934,11 +4062,31 @@ function buildAdapterApiKeyPatch(patchKeys, state, selectedFamilyId) {
       if (env && value) patch[env] = { value };
     }
   }
+  for (const [env, value] of Object.entries(buildDirectApiKeyEnvPatch(directKeys))) {
+    patch[env] = { value };
+  }
   const selected = normalizeProviderFamilyId(selectedFamilyId);
   const selectedEnv = ADAPTER_KEY_ENV_BY_FAMILY[selected];
   if (selectedEnv && !patch[selectedEnv]) {
     const value = getProviderApiKey(state, selected);
     if (value) patch[selectedEnv] = { value };
+  }
+  return patch;
+}
+
+function buildDirectApiKeyEnvPatch(patchKeys) {
+  const patch = {};
+  if (!patchKeys || typeof patchKeys !== "object" || Array.isArray(patchKeys)) {
+    return patch;
+  }
+  for (const [rawEnv, rawValue] of Object.entries(patchKeys)) {
+    const env = String(rawEnv || "").trim();
+    const value = String(rawValue || "").trim();
+    // The adapter accepts dynamic provider credentials under conventional
+    // *_API_KEY names. Restrict the root .env mirror to the same narrow class
+    // rather than turning this local endpoint into an arbitrary env writer.
+    if (!/^[A-Z][A-Z0-9_]*_API_KEY$/.test(env) || !value) continue;
+    patch[env] = value;
   }
   return patch;
 }
@@ -4373,11 +4521,12 @@ function validateLeaRuntime(state, { requireApiKey }) {
   } catch {
     return { ok: false, error: "invalid_lea_api_url", message: "Lea API base URL must be an absolute http(s) URL." };
   }
-  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL));
-  if (!modelInfo) {
-    return { ok: false, error: "invalid_lea_model", message: "Lea model must be one of the supported models." };
+  const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL).trim();
+  if (!model) {
+    return { ok: false, error: "invalid_lea_model", message: "Lea model must not be empty." };
   }
-  if (requireApiKey && !isProviderKeyConfigured(state, modelInfo.family)) {
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  if (requireApiKey && modelInfo && !isProviderKeyConfigured(state, modelInfo.family)) {
     const family = LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family);
     const envList = family?.envVars?.join(" or ") || "provider API key";
     return {
@@ -4410,7 +4559,7 @@ async function createLeaJob({
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
-  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL)) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+  const modelInfo = configuredModelMetadata(state);
 
   return {
     jobId,
@@ -4466,10 +4615,10 @@ async function createLeaJob({
       || previousFormalizationJob?.formalizationId
       || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
-    leaProvider: modelInfo.family,
-    leaProviderFamily: modelInfo.family,
-    leaModel: modelInfo.value,
+    leaApiKeyConfigured: modelInfo.apiKeyConfigured,
+    leaProvider: modelInfo.provider,
+    leaProviderFamily: modelInfo.provider,
+    leaModel: modelInfo.model,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaCurrentTurn: null,

@@ -1,9 +1,9 @@
 (function () {
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
   const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
-  // Placeholder only, used before the first successful /settings fetch; the
-  // companion (backed by packages/lea-model-catalog) is authoritative and may
-  // re-map it. Keep in sync with the catalog default and options.js (AUDIT L9).
+  // Placeholder only, used before the first successful companion fetch. The
+  // adapter's LiteLLM catalog is authoritative; the shared package supplies the
+  // offline featured fallback. Keep the default in sync with options.js (AUDIT L9).
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
@@ -160,13 +160,14 @@
   // the shared inventory status line) disappears almost immediately. Keep the
   // latest error per item in module state and render it with the item detail.
   let leanPaneActionErrors = new Map();
+  // Error messages reported by the manifest can be re-created on every
+  // background refresh. Keep exact dismissed-message fingerprints for the
+  // lifetime of the open pane so a dismissal remains respected until the
+  // error changes or the user explicitly retries the action.
+  let dismissedLeanPaneErrorKeys = new Set();
   // At most one item-card overflow ("More actions") menu is open at a time;
   // the same global click/Escape listeners that dismiss popovers close it.
   let activeOverflowMenu = null;
-  let costCapNotice = null;
-  let dismissedCostCapNoticeKeys = new Set();
-  let activeCostCapNoticeKeys = new Set();
-  let costCapUsageLimitReached = false;
   // Editor-hook watchdog (PLAN-system-hardening 0.4): warns when the editor is
   // visible but the page bridge never hooked Overleaf's UNSTABLE_ editor event
   // — i.e. Overleaf changed and the integration is silently dead.
@@ -457,6 +458,7 @@
     leanPaneShareState = null;
     leanPaneShareBusy = false;
     leanPaneActionErrors = new Map();
+    dismissedLeanPaneErrorKeys = new Set();
     if (!leanPane) return;
     leanPane.remove();
     leanPane = null;
@@ -1046,7 +1048,13 @@
     const line = document.createElement("p");
     line.textContent = text;
     wrap.appendChild(line);
-    return wrap;
+    return kind === "error"
+      ? makeLeanPaneErrorDismissible(wrap, {
+          onDismiss: () => {
+            if (leanPaneStatus) leanPaneStatus.textContent = "Blueprint error dismissed. Refresh to try again.";
+          }
+        })
+      : wrap;
   }
 
   // Edits to the open document re-render the pane from the cached file set with the
@@ -1161,14 +1169,24 @@
       : "No labeled theorem, lemma, proposition, corollary, or definition environments found.";
 
     if (Array.isArray(manifest?.diagnostics) && manifest.diagnostics.length > 0) {
+      const visibleDiagnostics = manifest.diagnostics.slice(0, 4);
+      const dismissKey = leanPaneErrorKey(
+        "diagnostics",
+        ...visibleDiagnostics.map((diagnostic) => diagnostic.message || diagnostic.code || "Lean pane diagnostic")
+      );
       const diagnostics = document.createElement("div");
       diagnostics.className = "ol-lean-project-pane-diagnostics";
-      for (const diagnostic of manifest.diagnostics.slice(0, 4)) {
+      for (const diagnostic of visibleDiagnostics) {
         const line = document.createElement("p");
         line.textContent = diagnostic.message || diagnostic.code || "Lean pane diagnostic";
         diagnostics.appendChild(line);
       }
-      leanPaneBody.appendChild(diagnostics);
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        leanPaneBody.appendChild(makeLeanPaneErrorDismissible(diagnostics, {
+          errorKey: dismissKey,
+          label: "Dismiss Lean pane diagnostics"
+        }));
+      }
     }
 
     const repairBatchPanel = renderLeanPaneRepairBatchPanel();
@@ -2000,12 +2018,51 @@
     return detail;
   }
 
+  function leanPaneErrorKey(...parts) {
+    return parts.map((part) => String(part ?? "")).join("\u001f");
+  }
+
+  function clearDismissedLeanPaneErrors(prefix) {
+    const prefixWithSeparator = `${prefix}\u001f`;
+    for (const key of dismissedLeanPaneErrorKeys) {
+      if (key === prefix || key.startsWith(prefixWithSeparator)) {
+        dismissedLeanPaneErrorKeys.delete(key);
+      }
+    }
+  }
+
+  function makeLeanPaneErrorDismissible(element, {
+    errorKey = "",
+    label = "Dismiss error message",
+    onDismiss = null,
+    removeOnDismiss = true
+  } = {}) {
+    if (!element) return element;
+    element.classList.add("ol-lean-dismissible-error");
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "ol-lean-error-dismiss";
+    dismiss.setAttribute("aria-label", label);
+    dismiss.title = "Dismiss";
+    dismiss.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (errorKey) dismissedLeanPaneErrorKeys.add(errorKey);
+      onDismiss?.();
+      if (removeOnDismiss) element.remove();
+    });
+    element.appendChild(dismiss);
+    return element;
+  }
+
   function leanPaneActionErrorKey(item) {
     return String(item?.id || `${item?.leanKind || "theorem"}:${item?.label || item?.leanDeclarationName || ""}`);
   }
 
   function clearLeanPaneActionError(item) {
-    leanPaneActionErrors.delete(leanPaneActionErrorKey(item));
+    const itemKey = leanPaneActionErrorKey(item);
+    leanPaneActionErrors.delete(itemKey);
+    clearDismissedLeanPaneErrors(leanPaneErrorKey("action", itemKey));
   }
 
   function rememberLeanPaneActionError(item, error, operation = "formalize") {
@@ -2015,9 +2072,6 @@
       message: normalizeErrorMessage(error),
       operation
     });
-    if (maxSpend) {
-      showCostCapNotice(null, { force: true, noticeKey: `error:${Date.now()}` });
-    }
   }
 
   function isUnresolvedUsesError(error) {
@@ -2049,6 +2103,15 @@
   function renderLeanPaneActionError(item) {
     const error = leanPaneActionErrorForItem(item);
     if (!error) return null;
+    const itemKey = leanPaneActionErrorKey(item);
+    const dismissKey = leanPaneErrorKey(
+      "action",
+      itemKey,
+      error.code,
+      error.operation,
+      error.message
+    );
+    if (dismissedLeanPaneErrorKeys.has(dismissKey)) return null;
     const maxSpend = error.code === MAX_SPEND_ERROR_CODE;
     const dependencyBlocked = isUnresolvedUsesError(error);
     const alert = document.createElement("div");
@@ -2084,7 +2147,10 @@
       });
       alert.appendChild(settings);
     }
-    return alert;
+    return makeLeanPaneErrorDismissible(alert, {
+      errorKey: dismissKey,
+      onDismiss: () => leanPaneActionErrors.delete(itemKey)
+    });
   }
 
   // --- Self-repair actions (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
@@ -2114,6 +2180,7 @@
     const attribution = document.createElement("p");
     attribution.textContent = leanPaneView.formatBreakageAttribution(item.breakage);
     container.appendChild(attribution);
+    const itemKey = item.leanDeclarationName || item.label || "";
     const repair = item.breakage.repair;
     if (repair?.state === "running") {
       const line = document.createElement("p");
@@ -2121,17 +2188,26 @@
       line.textContent = "A repair run is in progress for this item...";
       container.appendChild(line);
     } else if (repair?.state === "failed") {
+      const reason = repair.failureReason || "the repaired file still does not compile.";
+      const dismissKey = leanPaneErrorKey("repair-result", itemKey, reason);
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
-      line.textContent = `Repair failed: ${repair.failureReason || "the repaired file still does not compile."}`;
-      container.appendChild(line);
+      line.textContent = `Repair failed: ${reason}`;
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        container.appendChild(makeLeanPaneErrorDismissible(line, { errorKey: dismissKey }));
+      }
     }
-    const itemKey = item.leanDeclarationName || item.label || "";
     if (leanPaneRepairError && leanPaneRepairError.itemKey === itemKey) {
+      const dismissKey = leanPaneErrorKey("repair-dispatch", itemKey, leanPaneRepairError.message);
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
       line.textContent = leanPaneRepairError.message;
-      container.appendChild(line);
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        container.appendChild(makeLeanPaneErrorDismissible(line, {
+          errorKey: dismissKey,
+          onDismiss: () => { leanPaneRepairError = null; }
+        }));
+      }
     }
     return container;
   }
@@ -2141,6 +2217,10 @@
   async function requestRepair({ overleafProjectId, items }) {
     leanPaneRepairError = null;
     const errorKey = items.length === 1 ? items[0].targetLabel : "batch";
+    clearDismissedLeanPaneErrors(leanPaneErrorKey("repair-dispatch", errorKey));
+    for (const item of items) {
+      clearDismissedLeanPaneErrors(leanPaneErrorKey("repair-result", item.targetLabel));
+    }
     try {
       const baseUrl = await chatCompanionBaseUrl();
       if (items.length === 1) {
@@ -2516,10 +2596,16 @@
     }
 
     if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
+      const dismissKey = leanPaneErrorKey("repair-dispatch", "batch", leanPaneRepairError.message);
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
       line.textContent = leanPaneRepairError.message;
-      panel.appendChild(line);
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        panel.appendChild(makeLeanPaneErrorDismissible(line, {
+          errorKey: dismissKey,
+          onDismiss: () => { leanPaneRepairError = null; }
+        }));
+      }
     }
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-detail-actions";
@@ -2663,6 +2749,25 @@
     renderLeanPaneManifest(lastLeanPaneManifest);
   }
 
+  function renderLeanPaneEditErrorLine(errorLine) {
+    errorLine.replaceChildren();
+    errorLine.classList.remove("ol-lean-dismissible-error");
+    errorLine.hidden = !leanPaneEditError;
+    if (!leanPaneEditError) return;
+    const message = document.createElement("span");
+    message.textContent = leanPaneEditError;
+    errorLine.appendChild(message);
+    makeLeanPaneErrorDismissible(errorLine, {
+      removeOnDismiss: false,
+      onDismiss: () => {
+        leanPaneEditError = "";
+        errorLine.hidden = true;
+        errorLine.replaceChildren();
+        errorLine.classList.remove("ol-lean-dismissible-error");
+      }
+    });
+  }
+
   function renderLeanPaneEditControls(item) {
     const container = document.createElement("div");
     container.className = "ol-lean-project-edit";
@@ -2707,8 +2812,7 @@
 
     const errorLine = document.createElement("p");
     errorLine.className = "ol-lean-project-edit-error";
-    errorLine.hidden = !leanPaneEditError;
-    errorLine.textContent = leanPaneEditError || "";
+    renderLeanPaneEditErrorLine(errorLine);
     container.appendChild(errorLine);
 
     const actions = document.createElement("div");
@@ -2764,8 +2868,7 @@
         cancelButton.disabled = false;
         textarea.disabled = false;
         saveButton.textContent = "Save";
-        errorLine.hidden = false;
-        errorLine.textContent = leanPaneEditError;
+        renderLeanPaneEditErrorLine(errorLine);
       }
     });
 
@@ -3501,7 +3604,12 @@
       const error = document.createElement("p");
       error.className = "ol-lean-chat-error";
       error.textContent = normalizeErrorMessage(leanPaneChatError);
-      panel.appendChild(error);
+      panel.appendChild(makeLeanPaneErrorDismissible(error, {
+        onDismiss: () => {
+          leanPaneChatError = null;
+          renderChatPanel();
+        }
+      }));
     }
 
     // Composer
@@ -3678,7 +3786,17 @@
     const message = document.createElement("p");
     message.className = "ol-lean-project-pane-error";
     message.textContent = normalizeErrorMessage(error);
-    leanPaneBody.appendChild(message);
+    leanPaneBody.appendChild(makeLeanPaneErrorDismissible(message, {
+      onDismiss: () => {
+        if (leanPaneMainView === "blueprint" && leanPaneBlueprintGraph) {
+          renderBlueprintBody(leanPaneBlueprintGraph);
+        } else if (leanPaneMainView === "items" && lastLeanPaneManifest) {
+          renderLeanPaneManifest(lastLeanPaneManifest);
+        } else if (leanPaneStatus) {
+          leanPaneStatus.textContent = "Error dismissed. Refresh to try again.";
+        }
+      }
+    }));
   }
 
   function showTargetPopover(clientX, clientY, target) {
@@ -3783,9 +3901,6 @@
           await refreshStatusesNow();
         } catch (error) {
           renderPopoverActionError(status, error);
-          if (isMaxSpendError(error)) {
-            showCostCapNotice(null, { force: true, noticeKey: `error:${Date.now()}` });
-          }
           const latestStatus = latestStatuses[targetKey(target)] || { status: currentStatus };
           renderTargetActions(actions, target, latestStatus.status || currentStatus, status, leanStatement, getActionStatus(latestStatus));
         }
@@ -4082,10 +4197,12 @@
           </div>
         </section>
         <section class="ol-lean-settings-panel">
-          <label>
+          <div class="ol-lean-model-field">
             <span>Model</span>
-            <select data-role="model"></select>
-          </label>
+            <div data-role="model"></div>
+          </div>
+          <p class="lea-model-requirement-note" data-role="model-catalog-status"></p>
+          <div class="lea-model-requirements" data-role="model-requirements" aria-live="polite"></div>
           <label>
             <span>Max turns</span>
             <input type="number" min="1" max="200" data-role="max-turns">
@@ -4113,7 +4230,10 @@
     const saveButton = popover.querySelector("[data-role='save-settings']");
 
     closeButton.addEventListener("click", closePopover);
-    modelSelect.addEventListener("change", markSettingsDirty);
+    modelSelect.addEventListener("change", () => {
+      markSettingsDirty();
+      void loadPopoverModelRequirements(popover, modelSelect.value);
+    });
     maxTurnsInput.addEventListener("input", markSettingsDirty);
     maxSpendInput.addEventListener("input", markSettingsDirty);
     texMirrorInput.addEventListener("change", markSettingsDirty);
@@ -4127,7 +4247,7 @@
     }
     for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
       input.addEventListener("input", () => {
-        refreshModelAvailability(popover);
+        updatePopoverRequirementSummary(popover);
         markSettingsDirty();
       });
     }
@@ -4193,9 +4313,11 @@
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
         popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
         popover.dataset.savedTexMirror = String(settings.leaTexMirrorEnabled !== false);
+        popover.leaApiKeys = settings.leaApiKeys || popover.leaApiKeys || {};
         renderProviderKeys(popover, settings.leaProviderKeys || {});
         clearProviderKeyInputs(popover);
-        refreshModelAvailability(popover);
+        clearDynamicApiKeyInputs(popover);
+        renderPopoverModelRequirements(popover, settings.leaModelRequirements || null);
         markSettingsDirty();
         scheduleTexMirrorSync();
         status.textContent = "Settings saved.";
@@ -4208,7 +4330,6 @@
     document.body.appendChild(popover);
     positionSettingsPopover(popover);
     activePopover = popover;
-    positionCostCapNotice(popover);
     loadPopoverSettings(popover).catch((error) => {
       status.textContent = error instanceof Error ? error.message : String(error);
     });
@@ -4218,17 +4339,12 @@
     scheduleUsageRefresh(popover);
 
     function markSettingsDirty() {
-      const family = getModelFamily(
-        getStoredModelOptions(popover),
-        modelSelect.value || popover.dataset.savedModel || DEFAULT_LEA_MODEL
-      );
-      const selectedFamilyConfigured = Boolean(getEffectiveProviderKeyStatus(popover)[family]?.configured);
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
         String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
         normalizeMaxSpendInput(maxSpendInput.value) !== (popover.dataset.savedMaxSpend || "") ||
         String(texMirrorInput.checked) !== (popover.dataset.savedTexMirror || "true") ||
         hasProviderKeyInput(popover);
-      saveButton.disabled = !dirty || !selectedFamilyConfigured;
+      saveButton.disabled = !dirty;
     }
   }
 
@@ -4236,10 +4352,10 @@
     clearTimeout(usageRefreshTimer);
     usageRefreshTimer = null;
     if (activePopover) {
+      activePopover.querySelector("[data-role='model']")?.leaModelPicker?.destroy();
       activePopover.remove();
       activePopover = null;
     }
-    positionCostCapNotice();
   }
 
   function positionPopover(popover, clientX, clientY) {
@@ -4843,10 +4959,6 @@
 
   function postStatuses(statuses) {
     latestStatuses = statuses || {};
-    const noticeKey = maxSpendNoticeKeyFromStatuses(latestStatuses);
-    if (noticeKey) {
-      showCostCapNotice(null, { noticeKey });
-    }
     renderStatusBadges();
   }
 
@@ -5184,6 +5296,14 @@
       if (!response.ok) {
         throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
       }
+      let catalogPayload = {};
+      try {
+        const catalogResponse = await fetch(`${baseUrl}/settings/models`);
+        catalogPayload = await catalogResponse.json().catch(() => ({}));
+        if (!catalogResponse.ok) catalogPayload = {};
+      } catch {
+        catalogPayload = {};
+      }
       const settings = {
         companionUrl: baseUrl,
         leaRepoPath: payload.leaRepoPath || stored.leaRepoPath || "",
@@ -5195,7 +5315,14 @@
         leaCurrentSpendUsd: payload.leaCurrentSpendUsd ?? 0,
         leaTexMirrorEnabled: payload.leaTexMirrorEnabled ?? stored.leaTexMirrorEnabled ?? DEFAULT_LEA_TEX_MIRROR_ENABLED,
         leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
-        leaProviderKeys: payload.leaProviderKeys || {}
+        leaModelCatalog: Array.isArray(catalogPayload.models) && catalogPayload.models.length > 0
+          ? catalogPayload.models
+          : payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
+        leaModelCatalogDegraded: catalogPayload.degraded !== false,
+        leaProviderKeys: payload.leaProviderKeys || {},
+        leaApiKeys: payload.leaApiKeys || {},
+        leaModelRequirements: payload.leaModelRequirements || null,
+        githubTokenConfigured: Boolean(payload.githubTokenConfigured)
       };
       await chrome.storage.sync.set({
         companionUrl: settings.companionUrl,
@@ -5213,7 +5340,11 @@
         ...stored,
         companionUrl: baseUrl,
         leaModelOptions: DEFAULT_MODEL_OPTIONS,
-        leaProviderKeys: {}
+        leaModelCatalog: DEFAULT_MODEL_OPTIONS,
+        leaModelCatalogDegraded: true,
+        leaProviderKeys: {},
+        leaApiKeys: {},
+        leaModelRequirements: null
       };
     }
   }
@@ -5225,13 +5356,22 @@
     const maxSpendInput = popover.querySelector("[data-role='max-spend']");
     const texMirrorInput = popover.querySelector("[data-role='tex-mirror']");
     popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
+    popover.leaModelCatalog = settings.leaModelCatalog || settings.leaModelOptions || DEFAULT_MODEL_OPTIONS;
+    popover.leaApiKeys = settings.leaApiKeys || {};
     renderProviderKeys(popover, settings.leaProviderKeys || {});
     renderModelOptions(
       modelSelect,
+      popover.leaModelCatalog,
       settings.leaModelOptions || DEFAULT_MODEL_OPTIONS,
-      settings.leaModel || DEFAULT_LEA_MODEL,
-      getEffectiveProviderKeyStatus(popover)
+      settings.leaModel || DEFAULT_LEA_MODEL
     );
+    const catalogStatus = popover.querySelector("[data-role='model-catalog-status']");
+    if (catalogStatus) {
+      catalogStatus.textContent = settings.leaModelCatalogDegraded
+        ? "Adapter catalog unavailable — using the offline fallback."
+        : `${popover.leaModelCatalog.length.toLocaleString()} models available; search by ID or provider.`;
+    }
+    renderPopoverModelRequirements(popover, settings.leaModelRequirements);
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
     maxSpendInput.value = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     texMirrorInput.checked = settings.leaTexMirrorEnabled !== false;
@@ -5294,33 +5434,13 @@
     return body;
   }
 
-  function renderModelOptions(select, options, selectedModel, providerKeys = {}) {
-    select.replaceChildren();
-    const byFamily = new Map();
-    for (const model of options) {
-      const family = normalizeFamily(model.family || "openai");
-      if (!byFamily.has(family)) {
-        byFamily.set(family, []);
-      }
-      byFamily.get(family).push(model);
-    }
-
-    for (const [family, models] of byFamily) {
-      const group = document.createElement("optgroup");
-      group.label = MODEL_FAMILY_LABELS[family] || family;
-      const familyConfigured = Boolean(providerKeys[family]?.configured);
-      for (const model of models) {
-        const option = document.createElement("option");
-        option.value = model.value || model.id;
-        option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
-        option.disabled = !familyConfigured && option.value !== selectedModel;
-        group.appendChild(option);
-      }
-      select.appendChild(group);
-    }
-    select.value = [...select.options].some((option) => option.value === selectedModel)
-      ? selectedModel
-      : DEFAULT_LEA_MODEL;
+  function renderModelOptions(select, catalog, featured, selectedModel) {
+    globalThis.LeaModelPicker.createModelPicker({
+      root: select,
+      value: selectedModel,
+      catalog,
+      featured
+    });
   }
 
   function renderProviderKeys(popover, providerKeys) {
@@ -5337,47 +5457,94 @@
     }
   }
 
-  function refreshModelAvailability(popover) {
-    const modelSelect = popover.querySelector("[data-role='model']");
-    const selected = modelSelect.value || popover.dataset.savedModel || DEFAULT_LEA_MODEL;
-    renderModelOptions(modelSelect, getStoredModelOptions(popover), selected, getEffectiveProviderKeyStatus(popover));
-  }
-
-  function getStoredModelOptions(popover) {
+  async function loadPopoverModelRequirements(popover, model) {
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     try {
-      const options = JSON.parse(popover.dataset.modelOptions || "[]");
-      return Array.isArray(options) && options.length > 0 ? options : DEFAULT_MODEL_OPTIONS;
+      const response = await fetch(
+        `${baseUrl}/settings/models/requirements?model=${encodeURIComponent(model)}`
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
+      renderPopoverModelRequirements(popover, payload);
     } catch {
-      return DEFAULT_MODEL_OPTIONS;
+      renderPopoverModelRequirements(popover, null);
     }
   }
 
-  function getSavedProviderKeyStatus(popover) {
-    try {
-      return JSON.parse(popover.dataset.providerKeys || "{}") || {};
-    } catch {
-      return {};
+  function staticProviderInputForEnv(popover, env) {
+    const family = env === "OPENAI_API_KEY"
+      ? "openai"
+      : env === "GOOGLE_API_KEY" || env === "GEMINI_API_KEY"
+        ? "google"
+        : env === "ANTHROPIC_API_KEY" || env === "ANTHROPIC_AUTH_TOKEN"
+          ? "anthropic"
+          : "";
+    return family ? popover.querySelector(`[data-role='provider-key-input'][data-family='${family}']`) : null;
+  }
+
+  function popoverRequirementConfigured(popover, requirement) {
+    if (requirement?.configured || popover.leaApiKeys?.[requirement?.env]?.configured) return true;
+    const staticInput = staticProviderInputForEnv(popover, requirement?.env);
+    if (staticInput?.value.trim()) return true;
+    return [...popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")]
+      .some((input) => input.dataset.env === requirement?.env && Boolean(input.value.trim()));
+  }
+
+  function updatePopoverRequirementSummary(popover) {
+    const container = popover.querySelector("[data-role='model-requirements']");
+    const requirements = container?.leaRequirements;
+    const note = container?.querySelector(".lea-model-requirement-note");
+    if (!requirements || !note) return;
+    const required = Array.isArray(requirements.required_keys) ? requirements.required_keys : [];
+    const satisfied = required.length === 0 || required.some((key) => popoverRequirementConfigured(popover, key));
+    note.dataset.satisfied = satisfied ? "true" : "false";
+    if (required.length === 0) {
+      note.textContent = requirements.degraded
+        ? "Provider requirements are unavailable while the adapter is offline."
+        : "This model does not require a single API-key credential.";
+    } else if (satisfied) {
+      note.textContent = `${requirements.provider || "Model"} credentials are configured.`;
+    } else {
+      note.textContent = `Add one of: ${required.map((key) => key.env).join(" or ")}.`;
     }
   }
 
-  function getEffectiveProviderKeyStatus(popover) {
-    const status = { ...getSavedProviderKeyStatus(popover) };
-    for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
-      if (!input.value.trim()) continue;
-      status[input.dataset.family] = {
-        ...(status[input.dataset.family] || {}),
-        configured: true
-      };
+  function renderPopoverModelRequirements(popover, requirements) {
+    const container = popover.querySelector("[data-role='model-requirements']");
+    if (!container) return;
+    container.replaceChildren();
+    container.leaRequirements = requirements;
+    if (!requirements) {
+      const note = document.createElement("p");
+      note.className = "lea-model-requirement-note";
+      note.textContent = "Model credential requirements are currently unavailable.";
+      container.appendChild(note);
+      return;
     }
-    return status;
-  }
-
-  function getModelFamily(options, modelId) {
-    return normalizeFamily(options.find((model) => (model.value || model.id) === modelId)?.family || "openai");
-  }
-
-  function normalizeFamily(family) {
-    return family === "gemini" ? "google" : family;
+    const note = document.createElement("p");
+    note.className = "lea-model-requirement-note";
+    container.appendChild(note);
+    for (const requirement of requirements.required_keys || []) {
+      if (staticProviderInputForEnv(popover, requirement.env)) continue;
+      const label = document.createElement("label");
+      label.className = "lea-model-requirement-field";
+      label.textContent = requirement.label || requirement.env;
+      const input = document.createElement("input");
+      input.type = "password";
+      input.autocomplete = "off";
+      input.dataset.env = requirement.env;
+      input.placeholder = requirement.configured || popover.leaApiKeys?.[requirement.env]?.configured
+        ? "Configured — leave blank to keep"
+        : requirement.env;
+      input.addEventListener("input", () => {
+        updatePopoverRequirementSummary(popover);
+        popover.querySelector("[data-role='save-settings']").disabled = false;
+      });
+      label.appendChild(input);
+      container.appendChild(label);
+    }
+    updatePopoverRequirementSummary(popover);
   }
 
   function collectProviderApiKeyPatch(popover) {
@@ -5389,8 +5556,17 @@
     return patch;
   }
 
+  function collectDynamicApiKeyPatch(popover) {
+    const patch = {};
+    for (const input of popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")) {
+      const value = input.value.trim();
+      if (value) patch[input.dataset.env] = value;
+    }
+    return patch;
+  }
+
   function hasProviderKeyInput(popover) {
-    return [...popover.querySelectorAll("[data-role='provider-key-input']")]
+    return [...popover.querySelectorAll("[data-role='provider-key-input'], [data-role='model-requirements'] input[data-env]")]
       .some((input) => Boolean(input.value.trim()));
   }
 
@@ -5398,6 +5574,12 @@
     for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
       input.value = "";
       input.hidden = true;
+    }
+  }
+
+  function clearDynamicApiKeyInputs(popover) {
+    for (const input of popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")) {
+      input.value = "";
     }
   }
 
@@ -5418,7 +5600,8 @@
         leaMaxTurns,
         leaMaxSpendUsd,
         leaTexMirrorEnabled,
-        leaProviderApiKeys: collectProviderApiKeyPatch(popover)
+        leaProviderApiKeys: collectProviderApiKeyPatch(popover),
+        leaApiKeys: collectDynamicApiKeyPatch(popover)
       })
     });
     const payload = await response.json().catch(() => ({}));
@@ -5486,8 +5669,6 @@
     if (maxSpend === null || maxSpend === undefined || maxSpend === "") {
       summary.hidden = true;
       summary.textContent = "";
-      costCapUsageLimitReached = false;
-      removeCostCapNotice();
       return;
     }
     const current = payload?.leaCurrentSpendUsd ?? payload?.allTime?.costUsd ?? 0;
@@ -5495,110 +5676,6 @@
     summary.textContent = `Cost cap: ${formatCost(current)} / ${formatCost(maxSpend)}`;
     const reached = Boolean(payload?.leaSpendLimitReached);
     summary.dataset.reached = reached ? "true" : "false";
-    if (reached) {
-      showCostCapNotice(popover, {
-        force: !costCapUsageLimitReached,
-        noticeKey: `usage:${maxSpend}:${current}`
-      });
-    } else {
-      removeCostCapNotice();
-    }
-    costCapUsageLimitReached = reached;
-  }
-
-  function showCostCapNotice(anchor = null, { force = false, noticeKey = "global" } = {}) {
-    if (force) {
-      dismissedCostCapNoticeKeys = new Set();
-    }
-    if (dismissedCostCapNoticeKeys.has(noticeKey)) return;
-    activeCostCapNoticeKeys.add(noticeKey);
-    if (!costCapNotice) {
-      costCapNotice = document.createElement("div");
-      costCapNotice.className = "ol-lean-cost-cap-notice";
-      costCapNotice.setAttribute("role", "alert");
-      costCapNotice.addEventListener("click", (event) => {
-        event.stopPropagation();
-      });
-      costCapNotice.innerHTML = `
-        <div>
-          <strong>Cost cap reached</strong>
-          <span>Lea stopped because the configured spend limit was reached.</span>
-        </div>
-        <button type="button" aria-label="Dismiss cost cap notice">x</button>
-      `;
-      costCapNotice.querySelector("button").addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        for (const key of activeCostCapNoticeKeys) {
-          dismissedCostCapNoticeKeys.add(key);
-        }
-        dismissedCostCapNoticeKeys.add(maxSpendNoticeKeyFromStatuses(latestStatuses));
-        removeCostCapNotice();
-      });
-      document.body.appendChild(costCapNotice);
-    }
-    positionCostCapNotice(anchor);
-  }
-
-  function positionCostCapNotice(anchor = null) {
-    if (!costCapNotice) return;
-    const settingsPopover = activePopover?.classList?.contains("ol-lean-settings-popover")
-      ? activePopover
-      : null;
-    const target = anchor?.isConnected
-      ? anchor
-      : settingsPopover?.isConnected
-        ? settingsPopover
-        : settingsButton?.isConnected
-          ? settingsButton
-          : null;
-    const noticeRect = costCapNotice.getBoundingClientRect();
-    const gap = 10;
-    if (!target) {
-      costCapNotice.dataset.position = "floating";
-      costCapNotice.style.left = `${Math.max(12, window.innerWidth - noticeRect.width - 20)}px`;
-      costCapNotice.style.top = `${Math.max(12, window.innerHeight - noticeRect.height - 20)}px`;
-      return;
-    }
-    const targetRect = target.getBoundingClientRect();
-    const belowTop = targetRect.bottom + gap;
-    const fitsBelow = belowTop + noticeRect.height <= window.innerHeight - 12;
-    const top = fitsBelow
-      ? belowTop
-      : Math.max(12, targetRect.top - noticeRect.height - gap);
-    const left = Math.min(
-      Math.max(12, targetRect.right - noticeRect.width),
-      window.innerWidth - noticeRect.width - 12
-    );
-    costCapNotice.dataset.position = fitsBelow ? "below" : "above";
-    costCapNotice.style.left = `${left}px`;
-    costCapNotice.style.top = `${top}px`;
-  }
-
-  function removeCostCapNotice() {
-    if (!costCapNotice) return;
-    costCapNotice.remove();
-    costCapNotice = null;
-    activeCostCapNoticeKeys = new Set();
-  }
-
-  function isMaxSpendStatus(statusInfo) {
-    return String(statusInfo?.message || "").includes("Max spend limit") ||
-      String(statusInfo?.finalStatus || "").toLowerCase() === "max_spend";
-  }
-
-  function maxSpendNoticeKeyFromStatuses(statuses) {
-    const parts = [];
-    for (const [statusKey, statusInfo] of Object.entries(statuses || {})) {
-      if (!isMaxSpendStatus(statusInfo)) continue;
-      parts.push([
-        statusKey,
-        statusInfo.jobId || "",
-        statusInfo.finishedAt || "",
-        statusInfo.message || ""
-      ].join(":"));
-    }
-    return parts.sort().join("|");
   }
 
   function isMaxSpendError(error) {

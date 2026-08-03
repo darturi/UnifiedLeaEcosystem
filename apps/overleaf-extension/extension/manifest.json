@@ -11,8 +11,8 @@
   "content_scripts": [
     {
       "matches": ["https://www.overleaf.com/project/*"],
-      "js": ["vendor/katex/katex.min.js", "content.js"],
-      "css": ["vendor/katex/katex.min.css", "lea-theme.css", "content.css"],
+      "js": ["vendor/katex/katex.min.js", "modelPicker.js", "content.js"],
+      "css": ["vendor/katex/katex.min.css", "lea-theme.css", "modelPicker.css", "content.css"],
       "run_at": "document_start"
     },
     {

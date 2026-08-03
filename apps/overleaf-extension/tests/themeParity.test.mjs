@@ -81,16 +81,26 @@ test("extension surfaces load the shared theme before component CSS", async () =
   assert.deepEqual(overleafScript?.css, [
     "vendor/katex/katex.min.css",
     "lea-theme.css",
+    "modelPicker.css",
     "content.css"
+  ]);
+  assert.deepEqual(overleafScript?.js, [
+    "vendor/katex/katex.min.js",
+    "modelPicker.js",
+    "content.js"
   ]);
   assert.ok(
     optionsHtml.indexOf('href="lea-theme.css"') < optionsHtml.indexOf('href="options.css"'),
     "options page must load the shared theme before its component styles",
   );
+  assert.ok(
+    optionsHtml.indexOf('src="modelPicker.js"') < optionsHtml.indexOf('src="options.js"'),
+    "options page must load the shared model picker before its controller",
+  );
 });
 
 test("retired warm-paper chrome colors do not return to extension surfaces", async () => {
-  const files = ["lea-theme.css", "content.css", "options.css"];
+  const files = ["lea-theme.css", "modelPicker.css", "content.css", "options.css"];
   const css = (
     await Promise.all(files.map((file) => readFile(path.join(EXTENSION, file), "utf8")))
   ).join("\n").toLowerCase();

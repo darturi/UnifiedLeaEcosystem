@@ -108,7 +108,8 @@ fieldset.section-controls {
   border: 0;
 }
 
-label {
+label,
+.model-field {
   display: flex;
   min-width: 0;
   flex-direction: column;
