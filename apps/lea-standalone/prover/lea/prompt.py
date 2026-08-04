@@ -95,6 +95,24 @@ Use the `lean_check` **tool** (via your tool-calling interface) for ALL .lean co
 For ANY Mathlib lookup, use the `search_mathlib` tool — do NOT run `grep`, `find`, or `rg` on Mathlib source via `bash`. The dedicated tool already knows the correct path, filters irrelevant matches, and is faster. Reserve `bash` for shell operations that aren't about searching Mathlib (e.g., `lake build`, file I/O beyond the dedicated tools)."""
 
 
+_IMPORT_POLICY = """\
+## Import policy — targeted modules only
+- Generated proof files must NOT use the umbrella `import Mathlib`. Import a small,
+  domain-appropriate set of modules containing the declarations, notation, and
+  tactics the proof actually uses.
+- A `search_mathlib` hit in `Mathlib/Foo/Bar.lean` corresponds to
+  `import Mathlib.Foo.Bar`.
+- When Lean reports an unknown declaration, notation, or tactic, locate and add
+  its defining module; do not fall back to `import Mathlib`.
+- Once a proof compiles, call `suggest_imports` on the file, replace its import
+  block with the suggested direct imports, and run `lean_check` again.
+- `suggest_imports` may analyze a disposable broad-import copy internally. Never
+  create such a scratch file yourself: `import Mathlib` is forbidden in every
+  file you write, including temporary candidates.
+- The goal is a small, robust import set, not a theoretically unique minimum. Do
+  not spend proof-search turns manually shaving already-targeted imports."""
+
+
 _TACTIC_CASCADE = """\
 ## Tactic Cascade by Goal Shape
 
@@ -291,12 +309,13 @@ math statements into Lean 4 proofs that compile with zero errors and zero `sorry
 5. If some sorrys can't be filled, **reflect**: step back and ask whether the decomposition is wrong.
 
 ## Style
-- Start files with `import Mathlib` when needed.
 - Use `by` tactic mode for proofs.
 - Keep proofs short. Try the simplest tactic first before anything complex.
 - One theorem per file unless the user asks otherwise.
 
 {_TOOLS}
+
+{_IMPORT_POLICY}
 
 {_TACTIC_CASCADE}
 
@@ -370,6 +389,8 @@ The conversation above may already contain Lean proofs you wrote earlier; build 
 {_WORKSPACE}
 
 {_TOOLS}
+
+{_IMPORT_POLICY}
 
 {_TACTIC_CASCADE}
 

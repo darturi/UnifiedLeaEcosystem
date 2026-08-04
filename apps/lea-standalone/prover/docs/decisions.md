@@ -115,7 +115,7 @@ cost gives the UI/users live spend transparency.
 **Decision.** Replace the two hand-synced globals (`TOOLS_SCHEMA` list +
 `TOOL_HANDLERS` dict) with a registry of `Tool` records (`name` + model-facing
 `schema` + `dict[args] -> str` `handler`). The loop never imports tools directly;
-it calls `build_toolset(config.tools)`. The six built-ins register at import (so
+it calls `build_toolset(config.tools)`. The built-ins register at import (so
 they stay the readable source) and custom tools register through a public API —
 `@tool(...)`/`register(...)` — from Python modules named in `agent.tool_modules`.
 
@@ -131,7 +131,7 @@ lets users add, drop, or reorder tools from config without touching the loop, an
 gives MCP a place to land (MCP tools will register here too). The allowlist over
 an enabled/disabled pair keeps one knob with no conflicting state; ordering falls
 out for free. Built-ins keep using the readable `TOOLS_SCHEMA`/`TOOL_HANDLERS`
-tables as their source and register in bulk, so nothing about today's six tools
+tables as their source and register in bulk, so nothing about today's built-in tools
 changed — only how the loop reaches them. The event contract, sessions, and
 transcripts are untouched.
 
@@ -229,7 +229,7 @@ on), marked where Lea follows it vs. diverges and why.
 
 **Pre-existing Lea ≠ mini (predate this work):**
 - **Tools.** mini's default is text-based (bash in fenced code blocks, no tool API);
-  Lea uses the native tool-calling API with six tools.
+  Lea uses the native tool-calling API with a built-in toolset.
 - **Message format.** mini stores OpenAI-format messages natively; Lea keeps a
   neutral format and converts to OpenAI shape inside `stream()` (to preserve the
   contract while streaming).

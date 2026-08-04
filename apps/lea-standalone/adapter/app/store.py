@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from uuid import uuid4
 
 from typing import Any
@@ -12,6 +13,27 @@ from .db import ROOT, connect, row_to_dict, utc_now, write
 
 
 RAW_EVENT_LOG_DIR = ROOT / "data" / "lea-api-events"
+
+# In-process "something about the session list changed" counter (AUDIT-2026-07-24 P4).
+# `/api/sessions/events` polled `sessions_digest()` — a real query — once a second per
+# connected client, forever, against the single-writer database the runs are writing
+# to. Every write that can move the list bumps this instead, so an idle client costs
+# an integer comparison. The SQL digest stays as a slow backstop: this counter only
+# sees writes from THIS process, which is all of them today, and the backstop means a
+# wrong assumption there degrades to the old latency rather than to silence.
+_change_lock = threading.Lock()
+_change_token = 0
+
+
+def _bump_sessions_changed() -> None:
+    global _change_token
+    with _change_lock:
+        _change_token += 1
+
+
+def sessions_change_token() -> int:
+    with _change_lock:
+        return _change_token
 PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 PROJECT_NAMESPACE_RE = re.compile(r"^Lea\.[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)*$")
 # A skill slug is the stable id AND the materialized filename stem the prover reads
@@ -50,6 +72,7 @@ def create_session(
              parent_id, role, spawned_at_turn, now, now),
         )
         row = conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+    _bump_sessions_changed()
     return row_to_dict(row)
 
 
@@ -60,6 +83,22 @@ def touch_session(session_id: str) -> None:
     now = utc_now()
     with connect() as conn:
         conn.execute("update sessions set updated_at = ? where id = ?", (now, session_id))
+    _bump_sessions_changed()
+
+
+def update_session_title(session_id: str, title: str) -> dict | None:
+    with connect() as conn:
+        conn.execute(
+            "update sessions set title = ?, updated_at = ? where id = ?",
+            (title[:120], utc_now(), session_id),
+        )
+        row = conn.execute(
+            "select * from sessions where id = ?", (session_id,)
+        ).fetchone()
+    if row:
+        _bump_sessions_changed()
+        return row_to_dict(row)
+    return None
 
 
 def get_session(session_id: str) -> dict | None:
@@ -120,14 +159,27 @@ def search_sessions(query: str, limit: int = 30) -> list[dict]:
     if not q:
         return []
     like = f"%{_escape_like(q)}%"
+    # The limit goes into the QUERY, not a slice of the default page (C4). It used to
+    # filter inside a query already truncated to the 100 most-recently-updated
+    # sessions, so past that many a matching older session was simply unreachable —
+    # and search is the ONLY path to an in-project session, which the sidebar hides.
     rows = _list_sessions(
         "(s.title like ? escape '\\' or p.title like ? escape '\\')",
         (like, like),
+        limit=limit,
     )
-    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows[:limit]]
+    return [{field: row.get(field) for field in _SEARCH_FIELDS} for row in rows]
 
 
-def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
+# The default page for the sidebar and the stats table. It is a RENDERING cap, not a
+# fact about the data — `global_usage` and `_origin_rollup` deliberately do not use
+# this query (AUDIT-2026-07-24 C1), and `search_sessions` passes its own (C4).
+DEFAULT_SESSION_PAGE = 100
+
+
+def _list_sessions(
+    extra_where: str = "", params: tuple = (), limit: int = DEFAULT_SESSION_PAGE
+) -> list[dict]:
     where_sql = f"where {extra_where}" if extra_where else ""
     with connect() as conn:
         rows = conn.execute(
@@ -230,9 +282,9 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
             {where_sql}
             group by s.id
             order by s.updated_at desc
-            limit 100
+            limit ?
             """,
-            params,
+            (*params, int(limit)),
         ).fetchall()
     sessions = []
     for row in rows:
@@ -286,19 +338,478 @@ def create_run(
     max_turns: int | None,
     project_id: str | None = None,
     autonomous: bool = False,
+    focus_formalization_id: str | None = None,
+    focus_source_hash: str | None = None,
 ) -> dict:
     now = utc_now()
     run_id = str(uuid4())
     with connect() as conn:
         conn.execute(
             """
-            insert into runs (id, session_id, project_id, status, autonomous, model, provider, max_turns, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            insert into runs (
+                id, session_id, project_id, status, autonomous, model, provider,
+                max_turns, focus_formalization_id, focus_source_hash, created_at, updated_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, session_id, project_id, "pending", 1 if autonomous else 0, model, provider, max_turns, now, now),
+            (
+                run_id, session_id, project_id, "pending",
+                1 if autonomous else 0, model, provider, max_turns,
+                focus_formalization_id, focus_source_hash, now, now,
+            ),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+    _bump_sessions_changed()
     return row_to_dict(row)
+
+
+FORMALIZATION_KINDS = {
+    "theorem", "lemma", "definition", "counterexample", "disproof", "other",
+}
+FORMALIZATION_FILE_ROLES = {"primary", "support", "generated"}
+
+
+def _normalize_formalization_kind(kind: str | None) -> str:
+    value = str(kind or "theorem").strip().lower()
+    if value == "proof":
+        value = "theorem"
+    if value not in FORMALIZATION_KINDS:
+        raise ValueError(f"unsupported formalization kind: {value}")
+    return value
+
+
+def _formalization_from_conn(conn, formalization_id: str) -> dict | None:
+    row = conn.execute(
+        "select * from formalizations where id = ?", (formalization_id,)
+    ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def create_formalization(
+    *,
+    project_id: str | None,
+    loose_session_id: str | None,
+    display_title: str,
+    kind: str = "theorem",
+    declaration_name: str | None = None,
+    statement: str | None = None,
+    origin: str = "ui",
+    origin_key: str | None = None,
+    source_hash: str | None = None,
+) -> dict:
+    now = utc_now()
+    formalization_id = str(uuid4())
+    title = str(display_title or declaration_name or "Untitled formalization").strip()
+    with write() as conn:
+        conn.execute(
+            """
+            insert into formalizations (
+                id, project_id, loose_session_id, display_title, declaration_name,
+                kind, statement, origin, origin_key, source_hash, created_at, updated_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                formalization_id, project_id, loose_session_id, title[:160],
+                (declaration_name or "").strip() or None,
+                _normalize_formalization_kind(kind), statement,
+                (origin or "ui").strip() or "ui",
+                (origin_key or "").strip() or None,
+                (source_hash or "").strip() or None,
+                now, now,
+            ),
+        )
+        result = _formalization_from_conn(conn, formalization_id)
+    assert result is not None
+    return result
+
+
+def get_formalization(formalization_id: str) -> dict | None:
+    with connect() as conn:
+        return _formalization_from_conn(conn, formalization_id)
+
+
+def find_formalization_by_origin(
+    project_id: str, origin: str, origin_key: str
+) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select * from formalizations
+            where project_id = ? and origin = ? and origin_key = ?
+            """,
+            (project_id, origin, origin_key),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def find_formalization_by_declaration(
+    *,
+    project_id: str | None,
+    loose_session_id: str | None,
+    declaration_name: str,
+) -> dict | None:
+    """Resolve a stable target by declaration within exactly one scope."""
+    if bool(project_id) == bool(loose_session_id):
+        raise ValueError("provide exactly one formalization scope")
+    scope_column = "project_id" if project_id else "loose_session_id"
+    scope_value = project_id or loose_session_id
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            select * from formalizations
+            where {scope_column} = ? and declaration_name = ?
+            """,
+            (scope_value, declaration_name),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def update_formalization(
+    formalization_id: str,
+    *,
+    display_title: str | None = None,
+    declaration_name: str | None = None,
+    statement: str | None = None,
+    kind: str | None = None,
+    source_hash: str | None = None,
+) -> dict | None:
+    with write() as conn:
+        current = _formalization_from_conn(conn, formalization_id)
+        if not current:
+            return None
+        if declaration_name is not None and declaration_name != current.get("declaration_name"):
+            artifact = conn.execute(
+                "select 1 from artifacts where formalization_id = ? limit 1",
+                (formalization_id,),
+            ).fetchone()
+            if artifact:
+                raise ValueError("a checked formalization's declaration cannot be renamed here")
+        conn.execute(
+            """
+            update formalizations
+            set display_title = ?, declaration_name = ?, statement = ?, kind = ?,
+                source_hash = ?, updated_at = ?
+            where id = ?
+            """,
+            (
+                (
+                    str(display_title).strip()[:160]
+                    if display_title is not None
+                    else current["display_title"]
+                ) or current["display_title"],
+                (
+                    str(declaration_name).strip() or None
+                    if declaration_name is not None
+                    else current["declaration_name"]
+                ),
+                statement if statement is not None else current["statement"],
+                _normalize_formalization_kind(kind) if kind is not None else current["kind"],
+                (
+                    str(source_hash).strip() or None
+                    if source_hash is not None
+                    else current["source_hash"]
+                ),
+                utc_now(),
+                formalization_id,
+            ),
+        )
+        return _formalization_from_conn(conn, formalization_id)
+
+
+def link_session_formalization(session_id: str, formalization_id: str) -> None:
+    with write() as conn:
+        conn.execute(
+            """
+            insert or ignore into session_formalizations (
+                session_id, formalization_id, created_at
+            ) values (?, ?, ?)
+            """,
+            (session_id, formalization_id, utc_now()),
+        )
+
+
+def link_formalization_file(
+    formalization_id: str, path: str, role: str = "generated"
+) -> dict:
+    role_value = str(role or "generated").lower()
+    if role_value not in FORMALIZATION_FILE_ROLES:
+        raise ValueError(f"unsupported formalization file role: {role_value}")
+    now = utc_now()
+    with write() as conn:
+        if role_value == "primary":
+            conn.execute(
+                """
+                update formalization_files set role = 'support', updated_at = ?
+                where formalization_id = ? and role = 'primary' and path <> ?
+                """,
+                (now, formalization_id, path),
+            )
+        conn.execute(
+            """
+            insert into formalization_files (
+                formalization_id, path, role, created_at, updated_at
+            ) values (?, ?, ?, ?, ?)
+            on conflict(formalization_id, path)
+            do update set role = excluded.role, updated_at = excluded.updated_at
+            """,
+            (formalization_id, path, role_value, now, now),
+        )
+        row = conn.execute(
+            """
+            select * from formalization_files
+            where formalization_id = ? and path = ?
+            """,
+            (formalization_id, path),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def list_formalization_files(formalization_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select * from formalization_files
+            where formalization_id = ?
+            order by case role when 'primary' then 0 when 'support' then 1 else 2 end,
+                     path asc
+            """,
+            (formalization_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_raw_project_formalizations(project_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select * from formalizations
+            where project_id = ?
+            order by updated_at desc, display_title asc
+            """,
+            (project_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_raw_session_formalizations(session_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select f.*
+            from formalizations f
+            join session_formalizations sf on sf.formalization_id = f.id
+            where sf.session_id = ?
+            order by f.updated_at desc, f.display_title asc
+            """,
+            (session_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def session_ids_for_formalization(formalization_id: str) -> list[str]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select sf.session_id
+            from session_formalizations sf
+            join sessions s on s.id = sf.session_id
+            where sf.formalization_id = ?
+            order by s.updated_at desc
+            """,
+            (formalization_id,),
+        ).fetchall()
+    return [str(row["session_id"]) for row in rows]
+
+
+def create_run_bundle(
+    *,
+    message: str,
+    session_id: str | None,
+    project_id: str | None,
+    session_origin: str,
+    session_origin_url: str | None,
+    model: str,
+    provider: str | None,
+    max_turns: int | None,
+    autonomous: bool,
+    focus_formalization_id: str | None = None,
+    focus_source_hash: str | None = None,
+    new_formalization: dict | None = None,
+) -> dict:
+    """Atomically create/resolve the conversation scope, run, and user message."""
+    if focus_formalization_id and new_formalization:
+        raise ValueError("choose an existing focus or a new formalization, not both")
+    now = utc_now()
+    with write() as conn:
+        if session_id:
+            session_row = conn.execute(
+                "select * from sessions where id = ?", (session_id,)
+            ).fetchone()
+            if not session_row:
+                raise LookupError("session not found")
+            session = row_to_dict(session_row)
+            if project_id and not session.get("project_id"):
+                conn.execute(
+                    "update sessions set project_id = ?, updated_at = ? where id = ?",
+                    (project_id, now, session_id),
+                )
+                session["project_id"] = project_id
+            elif project_id is None and session.get("project_id"):
+                project_id = session["project_id"]
+            elif project_id and session.get("project_id") != project_id:
+                raise ValueError("session belongs to a different project")
+        else:
+            session_id = str(uuid4())
+            conn.execute(
+                """
+                insert into sessions (
+                    id, project_id, title, origin, origin_url, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id, project_id, message[:120] or "Untitled conversation",
+                    (session_origin or "ui").strip() or "ui",
+                    session_origin_url, now, now,
+                ),
+            )
+            session = row_to_dict(
+                conn.execute(
+                    "select * from sessions where id = ?", (session_id,)
+                ).fetchone()
+            )
+
+        formalization = None
+        if new_formalization:
+            origin = str(new_formalization.get("origin") or "ui").strip() or "ui"
+            origin_key = str(new_formalization.get("origin_key") or "").strip() or None
+            if project_id and origin_key:
+                existing = conn.execute(
+                    """
+                    select * from formalizations
+                    where project_id = ? and origin = ? and origin_key = ?
+                    """,
+                    (project_id, origin, origin_key),
+                ).fetchone()
+                if existing:
+                    formalization = row_to_dict(existing)
+            if formalization is None:
+                focus_formalization_id = str(uuid4())
+                title = str(
+                    new_formalization.get("display_title")
+                    or new_formalization.get("declaration_name")
+                    or message[:120]
+                    or "Untitled formalization"
+                ).strip()
+                conn.execute(
+                    """
+                    insert into formalizations (
+                        id, project_id, loose_session_id, display_title,
+                        declaration_name, kind, statement, origin, origin_key,
+                        source_hash, created_at, updated_at
+                    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        focus_formalization_id, project_id,
+                        None if project_id else session_id, title[:160],
+                        str(new_formalization.get("declaration_name") or "").strip() or None,
+                        _normalize_formalization_kind(new_formalization.get("kind")),
+                        new_formalization.get("statement"), origin, origin_key,
+                        str(new_formalization.get("source_hash") or "").strip() or None,
+                        now, now,
+                    ),
+                )
+                formalization = _formalization_from_conn(conn, focus_formalization_id)
+            else:
+                focus_formalization_id = formalization["id"]
+                requested_decl = str(
+                    new_formalization.get("declaration_name") or ""
+                ).strip() or None
+                if (
+                    requested_decl
+                    and formalization.get("declaration_name")
+                    and requested_decl != formalization["declaration_name"]
+                ):
+                    raise ValueError("origin key resolves to a conflicting declaration")
+                requested_kind = _normalize_formalization_kind(
+                    new_formalization.get("kind")
+                )
+                if requested_kind != formalization.get("kind"):
+                    raise ValueError("origin key resolves to a conflicting kind")
+        elif focus_formalization_id:
+            formalization = _formalization_from_conn(conn, focus_formalization_id)
+            if not formalization:
+                raise LookupError("formalization not found")
+
+        if formalization:
+            if project_id:
+                if formalization.get("project_id") != project_id:
+                    raise ValueError("formalization belongs to a different project")
+            elif formalization.get("loose_session_id") != session_id:
+                raise ValueError("loose formalization belongs to a different session")
+            conn.execute(
+                """
+                insert or ignore into session_formalizations (
+                    session_id, formalization_id, created_at
+                ) values (?, ?, ?)
+                """,
+                (session_id, formalization["id"], now),
+            )
+            source_hash = str(focus_source_hash or "").strip() or None
+            if source_hash:
+                conn.execute(
+                    """
+                    update formalizations
+                    set source_hash = ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (source_hash, now, formalization["id"]),
+                )
+                formalization["source_hash"] = source_hash
+
+        run_id = str(uuid4())
+        conn.execute(
+            """
+            insert into runs (
+                id, session_id, project_id, status, autonomous, model, provider,
+                max_turns, focus_formalization_id, focus_source_hash,
+                created_at, updated_at
+            ) values (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id, session_id, project_id, 1 if autonomous else 0,
+                model, provider, max_turns, focus_formalization_id,
+                str(focus_source_hash or "").strip() or None, now, now,
+            ),
+        )
+        message_cursor = conn.execute(
+            """
+            insert into timeline (
+                session_id, run_id, kind, author, content, formalization_id, created_at
+            ) values (?, ?, 'message', 'user', ?, ?, ?)
+            """,
+            (session_id, run_id, message, focus_formalization_id, now),
+        )
+        conn.execute(
+            "update sessions set updated_at = ? where id = ?", (now, session_id)
+        )
+        run = row_to_dict(
+            conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
+        )
+        user_message = _message_from_row(
+            conn.execute(
+                "select * from timeline where id = ?", (message_cursor.lastrowid,)
+            ).fetchone()
+        )
+        session = row_to_dict(
+            conn.execute("select * from sessions where id = ?", (session_id,)).fetchone()
+        )
+    _bump_sessions_changed()
+    return {
+        "session": session,
+        "formalization": formalization,
+        "run": run,
+        "message": user_message,
+    }
 
 
 def list_projects() -> list[dict]:
@@ -552,6 +1063,45 @@ def delete_project_cascade(project_id: str) -> bool:
                 "select id from sessions where project_id = ?", (project_id,)
             ).fetchall()
         ]
+        formalization_ids = [
+            r["id"] for r in conn.execute(
+                "select id from formalizations where project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if session_ids:
+            marks = ",".join("?" for _ in session_ids)
+            formalization_ids.extend(
+                r["id"] for r in conn.execute(
+                    f"select id from formalizations where loose_session_id in ({marks})",
+                    session_ids,
+                ).fetchall()
+            )
+            conn.execute(
+                f"delete from verification_events where session_id in ({marks})",
+                session_ids,
+            )
+            conn.execute(
+                f"delete from session_formalizations where session_id in ({marks})",
+                session_ids,
+            )
+        if formalization_ids:
+            form_marks = ",".join("?" for _ in formalization_ids)
+            conn.execute(
+                f"delete from verification_events where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
+            conn.execute(
+                f"delete from session_formalizations where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
+            conn.execute(
+                f"delete from formalization_files where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
+            conn.execute(
+                f"update artifacts set formalization_id = null where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
         if session_ids:
             marks = ",".join("?" for _ in session_ids)
             # `messages`/`code_steps` are pre-cutover rows kept until the contract
@@ -569,7 +1119,24 @@ def delete_project_cascade(project_id: str) -> bool:
                 "delete from artifact_blobs where id not in "
                 "(select after_blob_id from timeline where after_blob_id is not null)"
             )
+        # The artifact index is scoped by project OR by session (`scope` is whichever
+        # applies), and was left behind entirely (AUDIT-2026-07-24 C9). A stale row
+        # survives a re-created slug and makes `_ensure_artifacts_backfilled` think the
+        # fresh project is already indexed, so its real proofs never get imported.
+        conn.execute("delete from artifacts where project_id = ? or scope = ?",
+                     (project_id, project_id))
+        if session_ids:
+            conn.execute(
+                f"delete from artifacts where session_id in ({marks}) or scope in ({marks})",
+                (*session_ids, *session_ids),
+            )
         conn.execute("delete from project_files where project_id = ?", (project_id,))
+        if formalization_ids:
+            form_marks = ",".join("?" for _ in formalization_ids)
+            conn.execute(
+                f"delete from formalizations where id in ({form_marks})",
+                formalization_ids,
+            )
         # Drop any skill assignments pointing at this project (D47) — the skills
         # themselves survive (they may be global or assigned elsewhere).
         conn.execute("delete from skill_projects where project_id = ?", (project_id,))
@@ -861,16 +1428,52 @@ def update_run(
             """,
             (status, final_text, result_kind, result_detail, input_tokens, output_tokens, cost_usd, now, run_id),
         )
+    _bump_sessions_changed()
+
+
+def fail_pending_run(run_id: str, detail: str) -> bool:
+    """Atomically move a run from `pending` to `failed`; True if THIS caller did it.
+
+    The interrupt endpoint used to read the status, ask the registry whether the run
+    was active, and then write — three steps the dispatcher could interleave with
+    (AUDIT-2026-07-24 C7). One conditional UPDATE makes the check and the claim the
+    same operation, so exactly one of "interrupted before it started" and "started"
+    can win."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "update runs set status = 'failed', result_kind = coalesce(result_kind, 'failed'),"
+            " result_detail = coalesce(result_detail, ?), updated_at = ?"
+            " where id = ? and status = 'pending'",
+            (detail, utc_now(), run_id),
+        )
+    _bump_sessions_changed()
+    return cursor.rowcount > 0
+
+
+def claim_pending_run(run_id: str) -> bool:
+    """Atomically move a run from `pending` to `running`; True if THIS caller did it.
+
+    The other half of the same race (C7): `run_lea` used to set `running`
+    unconditionally, so an interrupt that landed between admission and start was
+    overwritten and the run executed anyway — after the endpoint had already told the
+    client it was interrupted."""
+    with connect() as conn:
+        cursor = conn.execute(
+            "update runs set status = 'running', updated_at = ? where id = ? and status = 'pending'",
+            (utc_now(), run_id),
+        )
+    _bump_sessions_changed()
+    return cursor.rowcount > 0
 
 
 def fail_stale_active_runs() -> int:
-    """Crash recovery, called once at startup: any run still `pending`/`running`
-    in the DB has no live runner thread (they died with the previous process), so
-    mark it failed. Without this, a run created but never driven — e.g. its client
-    gave up while queued for the single-run slot — sits `pending` forever and the
-    derived session status (D14) shows an eternal 'thinking'. Returns the count."""
+    """Crash recovery, called once at startup: a run still `running` in the DB
+    has no live worker after a restart, so mark it failed. `pending` runs are
+    NOT reaped anymore (Phase 2): they are honest queue entries that
+    bridge.recover_runs_at_startup re-enqueues, so queued work survives a
+    restart instead of being stranded. Returns the count reaped."""
     now = utc_now()
-    detail = "Run did not finish: the adapter restarted (or the run was never started) before it completed."
+    detail = "Run did not finish: the adapter restarted before it completed."
     with connect() as conn:
         cursor = conn.execute(
             """
@@ -879,7 +1482,7 @@ def fail_stale_active_runs() -> int:
                 result_kind = coalesce(result_kind, 'failed'),
                 result_detail = coalesce(result_detail, ?),
                 updated_at = ?
-            where status in ('pending', 'running')
+            where status = 'running'
             """,
             (detail, now),
         )
@@ -922,6 +1525,37 @@ def set_session_safe_verify(session_id: str, status: str, detail: str | None) ->
         )
 
 
+def record_verification_event(
+    *,
+    session_id: str,
+    formalization_id: str | None,
+    path: str,
+    status: str,
+    detail: str | None,
+    code_step_id: str | int | None,
+    run_id: str | None = None,
+) -> dict:
+    event_id = str(uuid4())
+    with write() as conn:
+        conn.execute(
+            """
+            insert into verification_events (
+                id, formalization_id, session_id, run_id, code_step_id,
+                path, status, detail, created_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id, formalization_id, session_id, run_id,
+                int(code_step_id) if code_step_id is not None else None,
+                path, status, detail, utc_now(),
+            ),
+        )
+        row = conn.execute(
+            "select * from verification_events where id = ?", (event_id,)
+        ).fetchone()
+    return row_to_dict(row)
+
+
 def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     """The most recent code step for a file in a session (newest id wins).
 
@@ -929,22 +1563,109 @@ def latest_code_step_for_path(session_id: str, path: str) -> dict | None:
     onto the current working step (the canvas's latest snapshot of that file)."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' and path = ? "
-            "order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.path = ? "
+            "order by t.id desc limit 1",
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
 
 
-def code_steps_for_project_path(project_id: str, path: str) -> list[dict]:
+def current_code_steps_for_formalization(
+    formalization_id: str,
+    *,
+    session_id: str | None = None,
+) -> list[dict]:
+    """Latest snapshot of every linked path for a formalization.
+
+    With ``session_id`` this is the immutable conversation-local view. Without
+    it, project formalizations resolve each path across every session in the
+    shared project; loose formalizations resolve across their associated
+    sessions. The query intentionally does not require the winning timeline row
+    to carry this formalization id: two declarations may share one file, and a
+    write attributed to either declaration changes the current bytes for both.
+    """
+    scope_clause = "t.session_id = ?"
+    params: list[object] = [formalization_id]
+    if session_id is not None:
+        params.append(session_id)
+    else:
+        scope_clause = """
+        (
+          (f.project_id is not null and s.project_id = f.project_id)
+          or
+          (f.project_id is null and exists (
+            select 1 from session_formalizations sf
+            where sf.formalization_id = f.id and sf.session_id = t.session_id
+          ))
+        )
+        """
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            select * from (
+              select
+                t.*,
+                b.content as blob_content,
+                b.sha256 as blob_sha256,
+                ff.role as formalization_file_role,
+                s.title as updating_session_title,
+                row_number() over (
+                  partition by ff.path
+                  order by t.created_at desc, t.id desc
+                ) as rn
+              from formalization_files ff
+              join formalizations f on f.id = ff.formalization_id
+              join timeline t on t.kind = 'code' and t.path = ff.path
+              join sessions s on s.id = t.session_id
+              left join artifact_blobs b on b.id = t.after_blob_id
+              where ff.formalization_id = ? and {scope_clause}
+            )
+            where rn = 1
+            order by case formalization_file_role
+                       when 'primary' then 0
+                       when 'support' then 1
+                       else 2
+                     end,
+                     path asc
+            """,
+            params,
+        ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        raw = row_to_dict(row)
+        step = _code_step_from_row(row)
+        step.update(
+            {
+                "role": raw["formalization_file_role"],
+                "blob_id": raw.get("after_blob_id"),
+                "blob_sha256": raw.get("blob_sha256"),
+                "updating_session_title": raw.get("updating_session_title"),
+            }
+        )
+        result.append(step)
+    return result
+
+
+def code_steps_for_project_path(
+    project_id: str, path: str, *, include_content: bool = True
+) -> list[dict]:
     """Every code step for a file across a project's sessions, newest first — the raw
     material for a blueprint node's status + session attribution (D29). Joins on the
     session's project_id so loose sessions never leak in. Ordered by `created_at`
     (cross-session recency; `id` only orders within one session), so the first row is
-    the latest verdict and the distinct session order is newest-touched-first."""
+    the latest verdict and the distinct session order is newest-touched-first.
+
+    `include_content=False` returns the rows with `code=""` and skips the blob join
+    entirely (AUDIT-2026-07-24 P3). The blueprint graph calls this once per node and
+    reads only `check_status`/`session_id`/`created_at`, so hydrating every historical
+    revision of every file — each formerly its own connection and its own full copy of
+    the proof — was work whose result was discarded."""
+    content_join = "left join artifact_blobs b on b.id = c.after_blob_id" if include_content else ""
+    content_column = "b.content as blob_content" if include_content else "'' as blob_content"
     with connect() as conn:
         rows = conn.execute(
-            "select c.* from timeline c join sessions s on s.id = c.session_id "
+            f"select c.*, {content_column} from timeline c "
+            f"join sessions s on s.id = c.session_id {content_join} "
             "where s.project_id = ? and c.kind = 'code' and c.path = ? "
             "order by c.created_at desc, c.id desc",
             (project_id, path),
@@ -978,9 +1699,23 @@ def latest_agent_code_step(session_id: str) -> dict | None:
     'knew' (D12). Its content vs. the file's current content reveals human edits."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' and author = 'agent' "
-            "order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' and t.author = 'agent' "
+            "order by t.id desc limit 1",
             (session_id,),
+        ).fetchone()
+    return _code_step_from_row(row) if row else None
+
+
+def latest_agent_code_step_for_formalization(
+    session_id: str, formalization_id: str
+) -> dict | None:
+    """The latest agent snapshot attributed to one formalization."""
+    with connect() as conn:
+        row = conn.execute(
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' "
+            "and t.author = 'agent' and t.formalization_id = ? "
+            "order by t.id desc limit 1",
+            (session_id, formalization_id),
         ).fetchone()
     return _code_step_from_row(row) if row else None
 
@@ -993,8 +1728,8 @@ def latest_agent_code_step_for_path(session_id: str, path: str) -> dict | None:
     other session's file as diverged too. Keying on the path is what scopes it."""
     with connect() as conn:
         row = conn.execute(
-            "select * from timeline where session_id = ? and kind = 'code' "
-            "and author = 'agent' and path = ? order by id desc limit 1",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? and t.kind = 'code' "
+            "and t.author = 'agent' and t.path = ? order by t.id desc limit 1",
             (session_id, path),
         ).fetchone()
     return _code_step_from_row(row) if row else None
@@ -1034,6 +1769,167 @@ def get_run_status(run_id: str) -> dict | None:
     return row_to_dict(row) if row else None
 
 
+def list_runs_by_status(status: str) -> list[dict]:
+    """Runs with a status in stable FIFO order, used for startup recovery."""
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from runs where status = ? order by created_at asc, id asc",
+            (status,),
+        ).fetchall()
+    return [_normalize_run(row_to_dict(row)) for row in rows]
+
+
+# --- Structured artifact index (PLAN-system-hardening 4.1) -------------------
+# One row per (scope, declaration): "declaration X currently lives at path Y".
+# Written by the run finalizer; read by the Overleaf companion instead of
+# reverse-engineering artifacts from registry-markdown diffs.
+
+def upsert_artifact(
+    *,
+    project_id: str | None,
+    session_id: str | None,
+    run_id: str | None,
+    declaration_name: str,
+    kind: str | None,
+    path: str,
+    module_name: str | None,
+    formalization_id: str | None = None,
+    source_hash: str | None = None,
+) -> dict:
+    scope = project_id or session_id
+    if not scope:
+        raise ValueError("an artifact needs a project or a session scope")
+    now = utc_now()
+    # Concurrent runs can finish in the same project, so serialize the
+    # read-then-upsert and keep one stable row id per (scope, declaration).
+    with write() as conn:
+        existing = conn.execute(
+            "select id from artifacts where scope = ? and declaration_name = ?",
+            (scope, declaration_name),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "update artifacts set project_id = ?, session_id = ?, run_id = ?,"
+                " kind = ?, path = ?, module_name = ?, formalization_id = coalesce(?, formalization_id),"
+                " source_hash = coalesce(?, source_hash), updated_at = ? where id = ?",
+                (
+                    project_id, session_id, run_id, kind, path, module_name,
+                    formalization_id, source_hash, now, existing["id"],
+                ),
+            )
+            artifact_id = existing["id"]
+        else:
+            artifact_id = str(uuid4())
+            conn.execute(
+                "insert into artifacts (id, scope, project_id, session_id, run_id,"
+                " declaration_name, kind, path, module_name, formalization_id,"
+                " source_hash, created_at, updated_at)"
+                " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (artifact_id, scope, project_id, session_id, run_id,
+                 declaration_name, kind, path, module_name, formalization_id,
+                 source_hash, now, now),
+            )
+        row = conn.execute("select * from artifacts where id = ?", (artifact_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def latest_check_for_project_path(project_id: str, path: str) -> dict | None:
+    """The newest recorded check verdict for a repo-relative path across ALL of
+    a project's sessions (they share one repo, D24). One of the ledger facts
+    the target-status endpoint serves (PLAN 4.4): agent runs, manual edits,
+    and cascade re-checks all land in the unified timeline."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select t.check_status, t.check_detail, t.author, t.data, t.created_at
+            from timeline t
+            join sessions s on s.id = t.session_id
+            where s.project_id = ? and t.kind = 'code' and t.path = ?
+              and t.check_status is not null
+            order by t.created_at desc, t.id desc
+            limit 1
+            """,
+            (project_id, path),
+        ).fetchone()
+    if not row:
+        return None
+    result = row_to_dict(row)
+    if result.get("data"):
+        try:
+            result["author"] = json.loads(result["data"]).get("reason") or result["author"]
+        except (TypeError, ValueError):
+            pass
+    result.pop("data", None)
+    return result
+
+
+def list_artifacts_for_scope(scope: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from artifacts where scope = ? order by declaration_name asc",
+            (scope,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def rebase_project_artifact_modules(
+    project_id: str,
+    *,
+    old_namespace: str,
+    new_namespace: str,
+) -> int:
+    """Rebase cached artifact module names after an explicit project rename.
+
+    Artifact ``path`` values are relative to the project repo and therefore do
+    not change when the repo moves. ``module_name`` is namespace-qualified,
+    however, and is returned by the target-status ledger to the Overleaf pane.
+    Only exact namespace matches (or dot-delimited descendants) are rewritten
+    so similarly-prefixed namespaces cannot be changed accidentally.
+    """
+    old_ns = validate_project_namespace(old_namespace)
+    new_ns = validate_project_namespace(new_namespace)
+    if old_ns == new_ns:
+        return 0
+    now = utc_now()
+    changed = 0
+    with write() as conn:
+        rows = conn.execute(
+            "select id, module_name from artifacts where project_id = ?",
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            module_name = str(row["module_name"] or "")
+            if module_name == old_ns:
+                rebased = new_ns
+            elif module_name.startswith(f"{old_ns}."):
+                rebased = f"{new_ns}{module_name[len(old_ns):]}"
+            else:
+                continue
+            conn.execute(
+                "update artifacts set module_name = ?, updated_at = ? where id = ?",
+                (rebased, now, row["id"]),
+            )
+            changed += 1
+    return changed
+
+
+def queue_position(run_id: str) -> int | None:
+    """How many pending runs precede this pending run (0 = next up). None when
+    the run is not pending. Derived, never stored — invariant 2."""
+    with connect() as conn:
+        row = conn.execute(
+            "select created_at, id, status from runs where id = ?", (run_id,)
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            return None
+        ahead = conn.execute(
+            "select count(*) as n from runs where status = 'pending'"
+            " and (created_at < ? or (created_at = ? and id < ?))",
+            (row["created_at"], row["created_at"], row["id"]),
+        ).fetchone()
+    return int(ahead["n"])
+
+
 def set_run_transcript(run_id: str, messages: list) -> None:
     """Persist the faithful prover conversation at this run's end (D16/multi-turn).
 
@@ -1070,6 +1966,38 @@ def latest_transcript_for_session(session_id: str, exclude_run_id: str | None = 
     if not row or row["transcript"] is None:
         return None
     return json.loads(row["transcript"])
+
+
+def transcript_gap_for_session(session_id: str, exclude_run_id: str | None = None) -> list[dict]:
+    """Finished runs that left no transcript and are NEWER than the one being replayed.
+
+    `latest_transcript_for_session` silently falls back to the newest run that *has* a
+    transcript. A run that crashed mid-turn never reaches `Finished`, so it stores
+    none — and simply disappears from the replayed history (AUDIT-2026-07-24 C10). The
+    user watched that turn happen; the next one replays a conversation in which it
+    never did, and the agent redoes the work.
+
+    This names what is missing so the caller can say so out loud. Only *terminal* runs
+    count: a pending or running one is not a gap, it is a run.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select id, status, result_kind, result_detail, created_at
+            from runs
+            where session_id = ?
+              and id != ?
+              and transcript is null
+              and status not in ('pending', 'running')
+              and created_at > coalesce((
+                  select max(created_at) from runs
+                  where session_id = ? and transcript is not null and id != ?
+              ), '')
+            order by created_at asc, id asc
+            """,
+            (session_id, exclude_run_id or "", session_id, exclude_run_id or ""),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
 
 
 def latest_transcript_run_for_session(session_id: str) -> dict | None:
@@ -1157,6 +2085,7 @@ def _message_from_row(row) -> dict:
         "id": str(d["id"]),
         "session_id": d["session_id"],
         "run_id": d["run_id"],
+        "formalization_id": d.get("formalization_id"),
         "role": "user" if d["author"] == "user" else "assistant",
         "content": d["content"],
         "kind": d["kind"] if d["kind"] in ("edit_note", "compaction") else "assistant",
@@ -1165,21 +2094,39 @@ def _message_from_row(row) -> dict:
     }
 
 
+# Every read that turns timeline rows into code steps selects through this, so the
+# blob arrives WITH the row instead of costing a second query — and a whole extra
+# SQLite connection — per step (AUDIT-2026-07-24 P3). `session_detail` on a session
+# with 200 steps opened 200 connections; `graph.build_graph` did it per revision of
+# per file. Aliased to `blob_content` because `timeline.content` already exists (it
+# holds message text), so `b.content` would collide on the way out.
+TIMELINE_WITH_BLOB = (
+    "select t.*, b.content as blob_content from timeline t "
+    "left join artifact_blobs b on b.id = t.after_blob_id"
+)
+
+
 def _code_step_from_row(row, *, code: str | None = None) -> dict:
     """A timeline code row in the shape the API has always returned.
 
-    `code` is passed when the caller already has the bytes (it just wrote them);
-    otherwise it's read from the blob. A `content_lost` row yields `""` — the row
-    survives to say a step happened, which is more honest than deleting history
-    because its bytes are gone.
+    `code` is passed when the caller already has the bytes (it just wrote them).
+    Otherwise it comes from the row's joined `blob_content` when the query used
+    :data:`TIMELINE_WITH_BLOB`, and only failing that from a separate `blob_content()`
+    lookup — the fallback that used to be the only path. A `content_lost` row yields
+    `""`: the row survives to say a step happened, which is more honest than deleting
+    history because its bytes are gone.
     """
     d = row_to_dict(row)
     if code is None:
-        code = blob_content(d["after_blob_id"]) or ""
+        code = d.get("blob_content")
+        if code is None:
+            code = blob_content(d["after_blob_id"]) or ""
+    d.pop("blob_content", None)
     return {
         "id": str(d["id"]),
         "session_id": d["session_id"],
         "run_id": d["run_id"],
+        "formalization_id": d.get("formalization_id"),
         "seq": d["id"],
         "turn": d["turn"],
         "author": d["author"],
@@ -1201,6 +2148,7 @@ def add_message(
     run_id: str | None = None,
     kind: str = "assistant",
     commit_sha: str | None = None,
+    formalization_id: str | None = None,
 ) -> dict:
     """Append a transcript message. A user's edit explanation (D11) is just this
     with `kind='edit_note'` — no bespoke channel; it rides the same path that feeds
@@ -1213,8 +2161,10 @@ def add_message(
     with write() as conn:
         cur = conn.execute(
             """
-            insert into timeline (session_id, run_id, kind, author, content, created_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into timeline (
+                session_id, run_id, kind, author, content, formalization_id, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1222,6 +2172,7 @@ def add_message(
                 kind if kind in ("edit_note", "compaction") else "message",
                 "user" if role == "user" else "agent",
                 content,
+                formalization_id,
                 utc_now(),
             ),
         )
@@ -1325,6 +2276,7 @@ def add_code_step(
     artifact_kind: str | None = None,
     provenance: dict | None = None,
     content_lost: bool = False,
+    formalization_id: str | None = None,
 ) -> dict:
     """Record a timeline step holding a file's full contents after a write.
 
@@ -1372,10 +2324,10 @@ def add_code_step(
             """
             insert into timeline (
                 session_id, run_id, kind, author, turn, path, after_blob_id,
-                summary, check_status, check_detail, artifact_kind, data, created_at,
-                content_lost
+                summary, check_status, check_detail, artifact_kind, data,
+                formalization_id, created_at, content_lost
             )
-            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1389,6 +2341,7 @@ def add_code_step(
                 check_detail,
                 artifact_kind if check_status == "ok" else None,
                 data_json,
+                formalization_id,
                 now,
                 1 if content_lost else 0,
             ),
@@ -1396,6 +2349,29 @@ def add_code_step(
         row = conn.execute("select * from timeline where id = ?", (cur.lastrowid,)).fetchone()
     touch_session(session_id)
     return _code_step_from_row(row, code=("" if content_lost else content))
+
+
+def project_has_active_run(project_id: str) -> bool:
+    """True if any session in the project has a pending/running run.
+
+    A real query, not a scan of derived session status (AUDIT-2026-07-24 C2). A
+    session's status is its working-copy *verdict* (D14): once it has any code step
+    the verdict wins and it reads 'proved'/'ok'/'error' — `_derive_session_status`
+    only ever returns 'running' for a session with **no code yet**. So a caller that
+    tested `status == "running"` could see a live run only in a session that had
+    never written a file, which is the opposite of the sessions worth protecting.
+
+    Joined through `sessions.project_id` rather than `runs.project_id` on purpose:
+    the session's project tag is what `repo_for_session` uses to pick the on-disk
+    repo, so it is the link that decides whose working tree a run is writing to —
+    which is exactly what this interlock exists to protect."""
+    with connect() as conn:
+        row = conn.execute(
+            "select 1 from runs r join sessions s on s.id = r.session_id "
+            "where s.project_id = ? and r.status in ('pending', 'running') limit 1",
+            (project_id,),
+        ).fetchone()
+    return row is not None
 
 
 def has_active_run(session_id: str) -> bool:
@@ -1410,7 +2386,13 @@ def has_active_run(session_id: str) -> bool:
     return row is not None
 
 
-def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
+def upsert_user_code_step(
+    session_id: str,
+    path: str,
+    *,
+    content: str,
+    formalization_id: str | None = None,
+) -> dict:
     """Record a user edit, coalescing rapid successive edits into one timeline step.
 
     Auto-save (v2.2) saves on every debounced keystroke-pause, which would spray the
@@ -1426,7 +2408,12 @@ def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
     looking at, so the editor — not history — is their undo. Blobs are content-
     addressed, so an intermediate state that recurs anywhere else is still reachable."""
     latest = latest_code_step_for_path(session_id, path)
-    if latest and latest.get("author") == "user" and latest.get("run_id") is None:
+    if (
+        latest
+        and latest.get("author") == "user"
+        and latest.get("run_id") is None
+        and latest.get("formalization_id") == formalization_id
+    ):
         with write() as conn:
             blob_id = _put_blob(conn, content)
             conn.execute(
@@ -1437,7 +2424,10 @@ def upsert_user_code_step(session_id: str, path: str, *, content: str) -> dict:
             row = conn.execute("select * from timeline where id = ?", (int(latest["id"]),)).fetchone()
         touch_session(session_id)
         return _code_step_from_row(row, code=content)
-    return add_code_step(session_id, None, path, content=content, author="user")
+    return add_code_step(
+        session_id, None, path, content=content, author="user",
+        formalization_id=formalization_id,
+    )
 
 
 def set_code_step_check(
@@ -1458,7 +2448,7 @@ def set_code_step_check(
             "where id = ? and kind = 'code'",
             (check_status, check_detail, artifact_kind if check_status == "ok" else None, int(step_id)),
         )
-        row = conn.execute("select * from timeline where id = ?", (int(step_id),)).fetchone()
+        row = conn.execute(f"{TIMELINE_WITH_BLOB} where t.id = ?", (int(step_id),)).fetchone()
     return _code_step_from_row(row) if row else None
 
 
@@ -1575,8 +2565,12 @@ def session_detail(session_id: str) -> dict | None:
         # counter so the frontend could merge them by a single key; now they're the
         # same rows, split apart on the way out only because the API shape predates
         # the merge. `id` is the order — nothing can disagree about it.
+        # The blob rides along with the row (P3). This used to be a bare
+        # `select * from timeline`, and the code steps were built AFTER the connection
+        # closed — so every step then opened its own connection for its own blob. A
+        # session with 200 steps opened 200 connections to render one thread.
         rows = conn.execute(
-            "select * from timeline where session_id = ? order by id asc",
+            f"{TIMELINE_WITH_BLOB} where t.session_id = ? order by t.id asc",
             (session_id,),
         ).fetchall()
         status_events = conn.execute(
@@ -1599,8 +2593,15 @@ def session_detail(session_id: str) -> dict | None:
         ).fetchone()
         # Per-run outcomes (id + status), so the UI can place the "Proved"
         # milestone after the run that completed — live and on reload (M16).
+        # Usage columns ride along for the Overleaf companion, whose
+        # fetchApiRunUsage reads this run's tokens/cost off the persisted row
+        # (they were missing here, so every companion job recorded $0 — caught
+        # by the Phase 1 integration harness, PLAN-system-hardening).
         runs = conn.execute(
-            "select id, status, result_kind, result_detail from runs where session_id = ? order by created_at asc, id asc",
+            "select id, status, result_kind, result_detail,"
+            " input_tokens, output_tokens, cost_usd, focus_formalization_id,"
+            " focus_source_hash"
+            " from runs where session_id = ? order by created_at asc, id asc",
             (session_id,),
         ).fetchall()
         project = None
@@ -1697,7 +2698,70 @@ def _safe_verify_summary(run: dict) -> dict | None:
     return {"run_id": run.get("id"), "status": status, "detail": run.get("safe_verify_detail")}
 
 
+# --- whole-database usage aggregates (AUDIT-2026-07-24 C1) -------------------
+# These are deliberately NOT derived from `list_sessions()`. `usage_stats` used to
+# sum the Python list that query returns — and that query ends in `limit 100`, so
+# the "global" totals were the totals of the 100 most-recently-updated sessions.
+# Past 100 sessions the reported spend *fell* as older sessions aged out of the
+# window, and `max_spend_usd` is enforced against exactly that number, so the cap
+# silently stopped biting once a workspace grew big enough to need it. The `daily`
+# and `models` rollups next to it were already full-table SQL aggregates, so the
+# Stats page could disagree with its own chart.
+#
+# The rule these encode: a total over "everything" is a SQL aggregate over
+# everything. A paginated list is for rendering, never for arithmetic.
+
+
+def total_spend_usd() -> float:
+    """Persisted spend across every run — the number the cap is enforced against.
+
+    One scalar aggregate, kept separate from `usage_stats()` on purpose: the cap is
+    checked at every turn boundary and on every `UsageUpdated` event, and routing
+    that through the full stats payload is both what made it wrong (above) and a
+    heavy per-event query against a single-writer database."""
+    with connect() as conn:
+        row = conn.execute("select coalesce(sum(cost_usd), 0) as cost_usd from runs").fetchone()
+    return float(row["cost_usd"] or 0)
+
+
+def global_usage() -> dict:
+    """The `global` block of `usage_stats` — every session and every run counted."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select
+                (select count(*) from sessions) as session_count,
+                (select count(*) from timeline where kind != 'code') as message_count,
+                coalesce(sum(input_tokens), 0) as input_tokens,
+                coalesce(sum(output_tokens), 0) as output_tokens,
+                coalesce(sum(cost_usd), 0) as cost_usd
+            from runs
+            """
+        ).fetchone()
+    data = row_to_dict(row)
+    session_count = int(data["session_count"] or 0)
+    message_count = int(data["message_count"] or 0)
+    input_tokens = int(data["input_tokens"] or 0)
+    output_tokens = int(data["output_tokens"] or 0)
+    total_tokens = input_tokens + output_tokens
+    cost_usd = float(data["cost_usd"] or 0)
+    return {
+        "session_count": session_count,
+        "message_count": message_count,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cost_usd": cost_usd,
+        "average_tokens_per_session": round(total_tokens / session_count) if session_count else 0,
+        "average_cost_per_session": cost_usd / session_count if session_count else 0,
+        "average_messages_per_session": round(message_count / session_count) if session_count else 0,
+    }
+
+
 def usage_stats() -> dict:
+    # `sessions` stays the (100-row) list the Stats table renders — truncating a
+    # rendered list is fine. `global` and `origins` are full-table aggregates, so
+    # they no longer inherit that truncation.
     sessions = list_sessions()
     with connect() as conn:
         daily_rows = conn.execute(
@@ -1731,67 +2795,62 @@ def usage_stats() -> dict:
             """
         ).fetchall()
 
-    total_sessions = len(sessions)
-    total_messages = sum(int(session["message_count"]) for session in sessions)
-    input_tokens = sum(int(session["input_tokens"]) for session in sessions)
-    output_tokens = sum(int(session["output_tokens"]) for session in sessions)
-    total_tokens = input_tokens + output_tokens
-    cost_usd = sum(float(session["cost_usd"]) for session in sessions)
-
     return {
         "sessions": sessions,
-        "origins": _origin_rollup(sessions),
-        "global": {
-            "session_count": total_sessions,
-            "message_count": total_messages,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "cost_usd": cost_usd,
-            "average_tokens_per_session": round(total_tokens / total_sessions) if total_sessions else 0,
-            "average_cost_per_session": cost_usd / total_sessions if total_sessions else 0,
-            "average_messages_per_session": round(total_messages / total_sessions) if total_sessions else 0,
-        },
+        "origins": _origin_rollup(),
+        "global": global_usage(),
         "daily": [_normalize_usage_day(row_to_dict(row)) for row in daily_rows],
         "models": [_normalize_usage_model(row_to_dict(row)) for row in model_rows],
     }
 
 
-def _origin_rollup(sessions: list[dict]) -> list[dict]:
+def _empty_origin_bucket(origin: str) -> dict:
+    return {
+        "origin": origin,
+        "session_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+    }
+
+
+def _origin_rollup() -> list[dict]:
     """Per-origin usage rollup for the Stats "By origin" tab (Direct UI vs Overleaf).
 
-    Aggregated from the same `sessions` rows the `global` totals come from, so the two
-    always agree. Both 'ui' and 'overleaf' rows are always emitted (zeros when absent)
-    so the UI layout is stable. An unexpected origin value falls back to 'ui'."""
-    buckets: dict[str, dict] = {
-        origin: {
-            "origin": origin,
-            "session_count": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-        }
-        for origin in ("ui", "overleaf")
-    }
-    for session in sessions:
-        origin = str(session.get("origin") or "ui")
-        bucket = buckets.setdefault(
-            origin,
-            {
-                "origin": origin,
-                "session_count": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cost_usd": 0.0,
-            },
-        )
-        bucket["session_count"] += 1
-        bucket["input_tokens"] += int(session.get("input_tokens") or 0)
-        bucket["output_tokens"] += int(session.get("output_tokens") or 0)
-        bucket["total_tokens"] += int(session.get("total_tokens") or 0)
-        bucket["cost_usd"] += float(session.get("cost_usd") or 0)
+    A full-table aggregate, like `global_usage` — its contract has always been that
+    the two agree, and the way to keep that promise is for both to count everything.
+    It used to fold the truncated `list_sessions()` page instead, which meant the
+    per-origin totals and the global total were consistently wrong *together*
+    (AUDIT-2026-07-24 C1).
+
+    Both 'ui' and 'overleaf' rows are always emitted (zeros when absent) so the UI
+    layout is stable. A NULL/blank origin falls back to 'ui'."""
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select
+                coalesce(nullif(trim(s.origin), ''), 'ui') as origin,
+                count(distinct s.id) as session_count,
+                coalesce(sum(r.input_tokens), 0) as input_tokens,
+                coalesce(sum(r.output_tokens), 0) as output_tokens,
+                coalesce(sum(r.cost_usd), 0) as cost_usd
+            from sessions s
+            left join runs r on r.session_id = s.id
+            group by 1
+            """
+        ).fetchall()
+
+    buckets: dict[str, dict] = {origin: _empty_origin_bucket(origin) for origin in ("ui", "overleaf")}
+    for row in rows:
+        data = row_to_dict(row)
+        origin = str(data["origin"])
+        bucket = buckets.setdefault(origin, _empty_origin_bucket(origin))
+        bucket["session_count"] += int(data["session_count"] or 0)
+        bucket["input_tokens"] += int(data["input_tokens"] or 0)
+        bucket["output_tokens"] += int(data["output_tokens"] or 0)
+        bucket["total_tokens"] += int(data["input_tokens"] or 0) + int(data["output_tokens"] or 0)
+        bucket["cost_usd"] += float(data["cost_usd"] or 0)
     # 'ui' and 'overleaf' first (stable UI order), then any unexpected origins.
     ordered = ["ui", "overleaf"] + [k for k in buckets if k not in ("ui", "overleaf")]
     return [buckets[k] for k in ordered]

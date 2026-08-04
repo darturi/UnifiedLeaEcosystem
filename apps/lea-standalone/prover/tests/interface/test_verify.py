@@ -75,6 +75,23 @@ def test_namespace_context():
     check("closes the namespace", cl2.strip() == "end Lea.Misc")
 
 
+def test_trusted_target_import_prelude():
+    code = (
+        "/-\nimport Mathlib\n-/\n"
+        "import Mathlib.Data.Nat.Prime.Basic Mathlib.Tactic.NormNum.Basic\n"
+        "import Lea.Project.helper\n"
+        "import Untrusted.ModelAuthored\n"
+        "import Mathlib.Data.Nat.Prime.Basic\n"
+    )
+    prelude = safeverify.trusted_target_import_prelude(code)
+    check("target keeps targeted Mathlib import",
+          "import Mathlib.Data.Nat.Prime.Basic\n" in prelude)
+    check("target keeps trusted Lea sibling", "import Lea.Project.helper\n" in prelude)
+    check("target keeps each import once", prelude.count("Mathlib.Data.Nat.Prime.Basic") == 1)
+    check("target omits untrusted package root", "Untrusted.ModelAuthored" not in prelude)
+    check("target ignores commented barrel import", "\nimport Mathlib\n" not in f"\n{prelude}")
+
+
 def test_target_reproduces_submission_namespace():
     """Regression (the n³-n false reject): a namespaced proof's target must be
     built inside the SAME namespace, or SafeVerify looks up a root-level `div_6`,
@@ -161,6 +178,13 @@ def test_verify_target_has_defs_and_all_theorems():
     check("verify target keeps the def", "def HasBound" in target)
     check("verify target sorries both lemmas", target.count(":= by sorry") == 2)
     check("verify maps grader ok -> ok", r.status == "ok")
+    # The COMPOSITION of two independently-developed fixes: the whole file's defs and
+    # theorems, but carrying a TRUSTED import prelude rather than the submission's own
+    # import lines. Either half alone regresses the other — the submission's imports
+    # would let an untrusted module define names appearing in the target's signatures,
+    # and a bare-signature target does not compile for a project file at all.
+    check("verify target carries the trusted prelude, not a duplicated raw import",
+          target.count("import Mathlib") == 1)
 
 
 # --- the opt-in safe_verify tool ---------------------------------------------
@@ -194,6 +218,30 @@ def test_safe_verify_tool_is_opt_in_and_formats_verdicts():
         check("unavailable surfaced", "UNAVAILABLE" in handler({"path": "x.lean"}))
     finally:
         _iface.verify = orig
+
+def test_target_uses_submission_targeted_imports_not_mathlib_barrel():
+    captured: dict[str, str] = {}
+
+    def fake_verify_proof(target, submission, workspace, **k):
+        captured["target"] = Path(target).read_text()
+        return (True, "OK")
+
+    safeverify.is_available = lambda: True
+    safeverify.verify_proof = fake_verify_proof
+    code = (
+        "import Mathlib.Data.Nat.Prime.Basic\n\n"
+        "theorem targeted_prime (n : Nat) : n = n := by rfl\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "Targeted.lean"
+        f.write_text(code)
+        try:
+            interface.verify(str(f))
+        finally:
+            _restore()
+    target = captured.get("target", "")
+    check("target retains narrow import", "import Mathlib.Data.Nat.Prime.Basic" in target)
+    check("target does not widen to Mathlib barrel", "\nimport Mathlib\n" not in f"\n{target}")
 
 
 # --- pure: replay LEAN_PATH augmentation -------------------------------------
@@ -295,6 +343,33 @@ def test_integration_real_binary():
         bad.unlink(missing_ok=True)
 
 
+def test_integration_targeted_import():
+    """A narrow submission must pass the real import-superset check.
+
+    This is the regression the old hard-coded `import Mathlib` target made
+    impossible: the submission's small transitive closure could never cover the
+    target's all-Mathlib closure.
+    """
+    if os.environ.get("LEA_RUN_SV_INTEGRATION") != "1":
+        print("  skip targeted-import integration (set LEA_RUN_SV_INTEGRATION=1)")
+        return
+    if not safeverify.is_available():
+        print("  skip targeted-import integration (SafeVerify binary not built)")
+        return
+    scratch = safeverify.WORKSPACE / ".sv_scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    proof = scratch / "A6Targeted.lean"
+    proof.write_text(
+        "import Mathlib.Data.Nat.Prime.Basic\n\n"
+        "theorem a6_targeted (n : Nat) : n = n := by rfl\n"
+    )
+    try:
+        r = interface.verify(str(proof))
+        check("integration: targeted-import proof -> ok", r.status == "ok")
+    finally:
+        proof.unlink(missing_ok=True)
+
+
 def test_integration_sibling_import():
     """The LEAN_PATH fix: a project proof that `import`s a sibling lemma must
     audit, not fail 'unknown module prefix Lea'. Needs the sibling olean built in
@@ -332,10 +407,12 @@ def main():
     print("interface.verify (A6) tests:")
     test_theorem_signature()
     test_namespace_context()
+    test_trusted_target_import_prelude()
     test_target_reproduces_submission_namespace()
     test_sorry_target_keeps_defs_and_sorries_every_theorem()
     test_sorry_target_noops_without_theorems()
     test_verify_target_has_defs_and_all_theorems()
+    test_target_uses_submission_targeted_imports_not_mathlib_barrel()
     test_safe_verify_tool_is_opt_in_and_formats_verdicts()
     test_replay_env_adds_workspace_build_lib()
     test_replay_env_skips_missing_build_lib()
@@ -345,6 +422,7 @@ def main():
     test_unavailable()
     test_no_theorem_is_error()
     test_integration_real_binary()
+    test_integration_targeted_import()
     test_integration_sibling_import()
     print()
     if _FAILURES:

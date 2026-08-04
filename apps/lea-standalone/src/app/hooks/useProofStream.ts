@@ -13,6 +13,7 @@ import { useProofSession } from '../stores/proofSession';
 import { useSessions } from '../stores/sessions';
 import { sortCodeSteps } from '../lib/timeline.mjs';
 import { mainFileIndex } from '../lib/canvasFiles.mjs';
+import { restoreFormalizationSelection } from '../lib/formalizations.mjs';
 
 // SSE reattach backoff (v2.3 item 14). A browser EventSource cannot read an HTTP
 // status — a 409 (server at capacity / a run driven elsewhere) surfaces only as
@@ -81,6 +82,7 @@ export function useProofStream() {
   };
 
   const applyDetail = (detail: SessionDetail) => {
+    const previousScope = useProofSession.getState().formalizationScope;
     const {
       setMessages,
       setCodeSteps,
@@ -94,15 +96,30 @@ export function useProofStream() {
       setApprovalBusy,
       setRunStatusById,
       setRunResultKindById,
+      setRunFocusById,
       setEditedPath,
       setSafeVerify,
       setVerifySurface,
       setGoalSurface,
+      setFormalizations,
+      setFormalizationScope,
     } = useProofSession.getState();
     // Fresh session context → drop EVERYTHING scoped to the previous session, through
     // the same one call "New session" uses. Clearing a hand-picked subset here is what
     // let stale state leak across a switch; every field is re-set from `detail` below.
+    // It also covers what upstream set by hand here (composerScopeOverride,
+    // currentFormalizationSnapshot, canvasRevisionMode), which all reset to the same
+    // defaults — they now live in SESSION_SCOPED instead of being repeated.
     useProofSession.getState().resetSessionScoped();
+    const formalizations = detail.formalizations || [];
+    setFormalizations(formalizations);
+    // Not a plain reset: the selected scope is RESTORED from the detail, so it must be
+    // applied after the wipe rather than left at the default.
+    setFormalizationScope(restoreFormalizationSelection({
+      currentId: previousScope,
+      latestFocusId: detail.latest_focus_formalization_id,
+      formalizations,
+    }));
     useSessions.getState().setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
@@ -144,16 +161,20 @@ export function useProofStream() {
     setApprovalBusy(false);
     const statuses: Record<string, string> = {};
     const resultKinds: Record<string, string | null | undefined> = {};
+    const focuses: Record<string, string | null | undefined> = {};
     for (const r of detail.runs || []) {
       statuses[r.id] = r.status;
       resultKinds[r.id] = r.result_kind;
+      focuses[r.id] = r.focus_formalization_id;
     }
     if (active) {
       statuses[active.id] = active.status;
       resultKinds[active.id] = active.result_kind;
+      focuses[active.id] = active.focus_formalization_id;
     }
     setRunStatusById(statuses);
     setRunResultKindById(resultKinds);
+    setRunFocusById(focuses);
     setEditedPath(undefined);
     setSafeVerify(detail.safe_verify || null);
     setVerifySurface(null);
@@ -311,7 +332,22 @@ export function useProofStream() {
         const next = sortCodeSteps([...current, payload]);
         setCodeSteps(next);
         const idx = next.findIndex((s) => s.id === payload.id);
-        if (idx >= 0) setCodeIndex(idx);
+        let scope = useProofSession.getState().formalizationScope;
+        if (payload.formalization_id && payload.formalization_id !== scope) {
+          // Actual declaration attribution is stronger evidence than the
+          // pre-run inference. Follow the formalization Lea is really editing.
+          useProofSession.getState().setFormalizationScope(payload.formalization_id);
+          useProofSession.getState().setCanvasRevisionMode('current');
+          scope = payload.formalization_id;
+        }
+        if (payload.formalization_id) {
+          useProofSession.getState().bumpFormalizationRefresh();
+        }
+        const shouldFollow =
+          scope === 'project'
+          || scope === 'new'
+          || payload.formalization_id === scope;
+        if (idx >= 0 && shouldFollow) setCodeIndex(idx);
       }
     });
 
@@ -329,6 +365,36 @@ export function useProofStream() {
           check_status: payload.check_status ?? null,
           check_detail: payload.check_detail ?? null,
           created_at: payload.created_at || new Date().toISOString(),
+        },
+      ]);
+    });
+
+    // Server-side queue (Phase 2): a pending run's stream opens with its FIFO
+    // position. Surface it on the status timeline so waiting reads as an
+    // honest "queued behind N" instead of a bare spinner.
+    source.addEventListener('queued', (event) => {
+      let position: number | null = null;
+      try {
+        const payload = JSON.parse((event as MessageEvent).data || '{}') as { position?: number };
+        position = typeof payload.position === 'number' ? payload.position : null;
+      } catch {
+        /* position stays unknown */
+      }
+      setStatusEvents((current) => [
+        ...current,
+        {
+          id: `queued-${runId}`,
+          session_id: sessionId,
+          run_id: runId,
+          status: 'queued',
+          message:
+            position && position > 0
+              ? `Queued behind ${position} other ${position === 1 ? 'run' : 'runs'}…`
+              : 'Queued — starting shortly…',
+          turn: null,
+          check_status: null,
+          check_detail: null,
+          created_at: new Date().toISOString(),
         },
       ]);
     });

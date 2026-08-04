@@ -646,6 +646,54 @@ def test_text_only_history_serializes_for_provider():
     )
 
 
+def test_reasoning_items_are_persisted_with_the_tool_turn():
+    """Responses continuation state survives agent execution and transcript storage."""
+    temp = tempfile.TemporaryDirectory()
+    source_path = Path(temp.name) / "Source.txt"
+    source_path.write_text("context")
+    calls = {"n": 0}
+    reasoning_item = {
+        "id": "rs_agent_1",
+        "type": "reasoning",
+        "encrypted_content": "encrypted-agent-state",
+        "summary": [],
+    }
+
+    def fake_stream(model, system, messages, tools, model_kwargs=None, streaming=True):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield ToolCall("read_file", {"path": str(source_path)})
+            yield _ToolMeta("call_read")
+            yield Done(Usage(5, 2), 0.0001, [reasoning_item])
+            return
+        yield TextDelta("The requested context is available.")
+        yield Done(Usage(4, 2), 0.0001)
+
+    agent.stream = fake_stream
+    agent.load_system_prompt = lambda variant, skills=None, workspace=None, namespace=None: "SYS"
+    config = dataclasses.replace(cfg(tools=["read_file"]), prompt_variant="interactive")
+    events = list(agent.run_events(config, msgs("inspect this context")))
+    finished = events[-1]
+    first_assistant = next(
+        message
+        for message in finished.transcript["messages"]
+        if message.get("role") == "assistant"
+        and any(part.get("type") == "tool_call" for part in message.get("content", []))
+    )
+    check(
+        "reasoning item persisted beside originating tool call",
+        {"type": "reasoning", "items": [reasoning_item]} in first_assistant["content"],
+    )
+    check(
+        "reasoning item remains internal",
+        not any(
+            isinstance(event, AssistantTextDelta) and "encrypted-agent-state" in event.text
+            for event in events
+        ),
+    )
+    temp.cleanup()
+
+
 def test_run_events_uses_caller_messages_verbatim():
     # A9/D16: run_events is messages-in. It does NOT build or inject anything
     # (project context, etc.) — the caller (adapter) assembles the transcript and
@@ -684,6 +732,7 @@ def main():
     test_interactive_sorry_skeleton_is_not_proved()
     test_interactive_assistant_turn_routes_to_chat_and_keeps_tools()
     test_text_only_history_serializes_for_provider()
+    test_reasoning_items_are_persisted_with_the_tool_turn()
     test_run_events_uses_caller_messages_verbatim()
     print()
     if _FAILURES:

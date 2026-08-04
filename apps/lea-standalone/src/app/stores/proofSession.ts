@@ -4,6 +4,8 @@ import type {
   ChatMessage,
   CodeStep,
   Diagnostic,
+  Formalization,
+  FormalizationCurrentSnapshot,
   RunStatus,
   SafeVerifyResult,
   StatusEvent,
@@ -56,6 +58,21 @@ const apply = <T,>(update: Updater<T>, current: T): T =>
  *   useProofSession.getState().setEditedPath(path);           // write from non-React code
  */
 interface ProofSessionState {
+  formalizations: Formalization[];
+  setFormalizations: (formalizations: Formalization[]) => void;
+  formalizationScope: 'project' | 'new' | string;
+  setFormalizationScope: (scope: 'project' | 'new' | string) => void;
+  composerScopeOverride: 'project' | 'new' | string | null;
+  setComposerScopeOverride: (scope: 'project' | 'new' | string | null) => void;
+  currentFormalizationSnapshot: FormalizationCurrentSnapshot | null;
+  setCurrentFormalizationSnapshot: (
+    snapshot: FormalizationCurrentSnapshot | null
+  ) => void;
+  formalizationRefreshToken: number;
+  bumpFormalizationRefresh: () => void;
+  canvasRevisionMode: 'current' | 'historical';
+  setCanvasRevisionMode: (mode: 'current' | 'historical') => void;
+
   // Canvas-edit nudge (M20): the file the user just edited, prompting a note in
   // the composer. Set after a canvas edit; cleared on send / new session / load.
   editedPath?: string;
@@ -130,6 +147,8 @@ interface ProofSessionState {
   setRunStatusById: (update: Updater<Record<string, string>>) => void;
   runResultKindById: Record<string, string | null | undefined>;
   setRunResultKindById: (update: Updater<Record<string, string | null | undefined>>) => void;
+  runFocusById: Record<string, string | null | undefined>;
+  setRunFocusById: (update: Updater<Record<string, string | null | undefined>>) => void;
 
   // Theorem-approval gate: the approval history (each gains a decision once
   // resolved; M13) + a busy flag while a decision is in flight.
@@ -181,7 +200,27 @@ interface ProofSessionState {
 /** The session-scoped slice defaults — the single definition `resetSessionScoped`
  *  and the store's initial state both use, so they can never disagree. */
 const SESSION_SCOPED = {
-  editedPath: undefined,
+  // Multi-formalization state (upstream). Every one of these belongs to ONE session,
+  // so every one has to be here: carrying a previous session's formalization list or
+  // selected scope into the next one is the same bug as the glued diagnostic card.
+  formalizations: [] as Formalization[],
+  formalizationScope: 'new' as 'project' | 'new' | string,
+  composerScopeOverride: null as 'project' | 'new' | string | null,
+  currentFormalizationSnapshot: null as FormalizationCurrentSnapshot | null,
+  formalizationRefreshToken: 0,
+  canvasRevisionMode: 'current' as 'current' | 'historical',
+  runFocusById: {} as Record<string, string | null | undefined>,
+  editedPath: undefined as string | undefined,
+  error: undefined as string | undefined,
+  reconnecting: undefined as string | undefined,
+  codeIndex: 0,
+  isRunning: false,
+  currentRunId: undefined as string | undefined,
+  runStatus: undefined as RunStatus | undefined,
+  approvalBusy: false,
+  safeVerify: null as SafeVerifyResult | null,
+  verifySurface: null as SafeVerifyResult | null,
+  goalSurface: null as { rendered: string; line: number } | null,
   diagnostics: [] as Diagnostic[],
   codeSteps: [] as CodeStep[],
   messages: [] as ChatMessage[],
@@ -197,9 +236,16 @@ const SESSION_SCOPED = {
 
 export const useProofSession = create<ProofSessionState>((set) => ({
   ...SESSION_SCOPED,
+  setFormalizations: (formalizations) => set({ formalizations }),
+  setFormalizationScope: (formalizationScope) => set({ formalizationScope }),
+  setComposerScopeOverride: (composerScopeOverride) => set({ composerScopeOverride }),
+  setCurrentFormalizationSnapshot: (currentFormalizationSnapshot) =>
+    set({ currentFormalizationSnapshot }),
+  bumpFormalizationRefresh: () =>
+    set((state) => ({ formalizationRefreshToken: state.formalizationRefreshToken + 1 })),
+  setCanvasRevisionMode: (canvasRevisionMode) => set({ canvasRevisionMode }),
   setEditedPath: (editedPath) => set({ editedPath }),
 
-  error: undefined,
   setError: (error) => set({ error }),
 
   setDiagnostics: (update) => set((s) => ({ diagnostics: apply(update, s.diagnostics) })),
@@ -215,36 +261,28 @@ export const useProofSession = create<ProofSessionState>((set) => ({
       return { diagnostics: [...s.diagnostics, diagnostic] };
     }),
 
-  reconnecting: undefined,
   setReconnecting: (reconnecting) => set({ reconnecting }),
 
-  safeVerify: null,
   setSafeVerify: (safeVerify) => set({ safeVerify }),
 
-  verifySurface: null,
   setVerifySurface: (verifySurface) => set({ verifySurface }),
 
-  goalSurface: null,
   setGoalSurface: (goalSurface) => set({ goalSurface }),
 
   setCodeSteps: (codeSteps) => set({ codeSteps }),
-  codeIndex: 0,
   setCodeIndex: (codeIndex) => set({ codeIndex }),
 
   setMessages: (update) => set((s) => ({ messages: apply(update, s.messages) })),
   setStatusEvents: (update) => set((s) => ({ statusEvents: apply(update, s.statusEvents) })),
 
-  isRunning: false,
   setIsRunning: (isRunning) => set({ isRunning }),
-  currentRunId: undefined,
   setCurrentRunId: (currentRunId) => set({ currentRunId }),
-  runStatus: undefined,
   setRunStatus: (runStatus) => set({ runStatus }),
   setRunStatusById: (update) => set((s) => ({ runStatusById: apply(update, s.runStatusById) })),
   setRunResultKindById: (update) => set((s) => ({ runResultKindById: apply(update, s.runResultKindById) })),
+  setRunFocusById: (update) => set((s) => ({ runFocusById: apply(update, s.runFocusById) })),
 
   setApprovals: (update) => set((s) => ({ approvals: apply(update, s.approvals) })),
-  approvalBusy: false,
   setApprovalBusy: (approvalBusy) => set({ approvalBusy }),
 
   setSubagentProgress: (update) =>

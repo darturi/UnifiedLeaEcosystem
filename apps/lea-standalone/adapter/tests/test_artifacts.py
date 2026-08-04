@@ -36,3 +36,20 @@ def test_ignores_declaration_words_in_comments_and_strings():
 def label : String := "lemma also fake"
 '''
     assert classify_lean_artifact(code) == "definition"
+
+
+def test_extract_declaration_name_basic_kinds():
+    from app.artifacts import extract_declaration_name
+    assert extract_declaration_name("theorem foo_bar : True := trivial") == "foo_bar"
+    assert extract_declaration_name("def Subadditive (a : Nat) : Prop := True") == "Subadditive"
+    assert extract_declaration_name("private lemma aux' : True := trivial") == "aux'"
+    assert extract_declaration_name("noncomputable instance instFoo : Inhabited Nat := ⟨0⟩") == "instFoo"
+
+
+def test_extract_declaration_name_skips_comments_and_none_cases():
+    from app.artifacts import extract_declaration_name
+    assert extract_declaration_name("-- theorem commented_out : True\ntheorem real_one : True := trivial") == "real_one"
+    assert extract_declaration_name("/- theorem block_comment : True -/\nlemma survivor : True := trivial") == "survivor"
+    assert extract_declaration_name("import Mathlib\nopen Nat\n") is None
+    assert extract_declaration_name("") is None
+    assert extract_declaration_name(None) is None

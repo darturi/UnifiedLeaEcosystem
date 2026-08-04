@@ -348,6 +348,55 @@ def test_write_file_no_op_save_creates_no_step(tmp_path, monkeypatch):
     assert len(store.session_detail(session["id"])["code_steps"]) == 1
 
 
+def test_write_file_rejects_stale_cross_session_revision(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    project = store.create_project(
+        "shared",
+        title="Shared",
+        description=None,
+        namespace="Lea.Shared",
+        repo_path="Lea/Shared",
+    )
+    session_one = store.create_session("A first", project_id=project["id"])
+    session_two = store.create_session("A revised", project_id=project["id"])
+    theorem = store.create_formalization(
+        project_id=project["id"], loose_session_id=None,
+        display_title="A", declaration_name="a",
+    )
+    for session in (session_one, session_two):
+        store.link_session_formalization(session["id"], theorem["id"])
+    store.link_formalization_file(theorem["id"], "A.lean", "primary")
+    store.add_code_step(
+        session_one["id"], None, "A.lean",
+        content="theorem a : True := by trivial",
+        check_status="ok", formalization_id=theorem["id"],
+    )
+    stale = sessions_route.formalization_service.current_snapshot(theorem["id"])
+    store.add_code_step(
+        session_two["id"], None, "A.lean",
+        content="theorem a : True := by\n  trivial",
+        check_status="ok", formalization_id=theorem["id"],
+    )
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    with pytest.raises(HTTPException) as exc:
+        sessions_route.write_file_session(
+            session_one["id"],
+            FileWriteRequest(
+                path="A.lean",
+                content="theorem a : True := by\n  exact True.intro",
+                formalization_id=theorem["id"],
+                base_revision=stale["revision_token"],
+            ),
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "revision_conflict"
+    assert exc.value.detail["last_updated_session"]["id"] == session_two["id"]
+    assert len(store.session_detail(session_one["id"])["code_steps"]) == 1
+
+
 def test_session_list_events_emits_initial_sessions_changed(tmp_path, monkeypatch):
     # The feed fires `sessions_changed` on connect (digest goes None -> current), so
     # a client that connects mid-change still re-syncs. We pull only the first frame;
@@ -497,3 +546,83 @@ def test_compact_refuses_while_a_run_is_active(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         sessions_route.compact_session(session["id"])
     assert exc.value.status_code == 409
+
+
+# --- AUDIT-2026-07-24 S3: the caller-supplied path is confined to the repo ------
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "../../../../etc/passwd",              # classic traversal
+        "Lea/Misc/../../../../etc/passwd",     # traversal through a legitimate prefix
+        "/etc/passwd",                         # absolute path
+        ".git/config",                         # repo internals
+        ".lake/packages/mathlib/x.lean",       # build tree
+    ],
+)
+def test_check_verify_and_rebuild_refuse_paths_outside_the_session_repo(
+    tmp_path, monkeypatch, escape
+):
+    """`path` is caller-supplied and these three endpoints run a Lean toolchain over
+    whatever it resolves to, handing the diagnostics back — so an unconfined join made
+    every readable file on the host reachable through the API."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_code(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+
+    def never(*args, **kwargs):
+        raise AssertionError(f"a Lean toolchain was invoked on the escaping path {escape!r}")
+
+    monkeypatch.setattr(sessions_route, "interface_check", never)
+    monkeypatch.setattr(sessions_route, "interface_verify", never)
+    monkeypatch.setattr(sessions_route, "interface_rebuild", never)
+
+    for call in (
+        sessions_route.lean_check_session,
+        sessions_route.verify_session,
+        sessions_route.rebuild_session_module,
+    ):
+        with pytest.raises(HTTPException) as ei:
+            call(session["id"], PathRequest(path=escape))
+        assert ei.value.status_code == 400, (call.__name__, escape)
+
+    # Nothing was recorded against the escaping path either.
+    assert len(store.session_detail(session["id"])["code_steps"]) == 1
+
+
+def test_escaping_path_is_refused_before_a_cascade_step_is_written(tmp_path, monkeypatch):
+    """The `author=` branch of lean-check writes a NEW code_step. Confinement has to
+    happen before that, or a refused path still lands in the timeline."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_code(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_check",
+                        lambda p, cold=False: CheckResult(p, "ok", None))
+
+    with pytest.raises(HTTPException) as ei:
+        sessions_route.lean_check_session(
+            session["id"], PathRequest(path="../../../../etc/passwd", author="cascade")
+        )
+    assert ei.value.status_code == 400
+    assert len(store.session_detail(session["id"])["code_steps"]) == 1
+
+
+def test_a_legitimate_path_still_resolves_and_normalizes(tmp_path, monkeypatch):
+    """The guard must not change the answer for in-repo paths: an equivalent but
+    un-normalized spelling resolves to the same repo-relative key the store uses."""
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session, _ = _seed_session_with_code(tmp_path)
+    monkeypatch.setattr(sessions_route, "load_config", _config_for(tmp_path))
+    monkeypatch.setattr(sessions_route, "interface_check",
+                        lambda p, cold=False: CheckResult(p, "ok", None))
+
+    plain = sessions_route.lean_check_session(session["id"], PathRequest(path="Lea/Misc/p.lean"))
+    noisy = sessions_route.lean_check_session(
+        session["id"], PathRequest(path="./Lea/Other/../Misc/p.lean")
+    )
+
+    assert plain["path"] == noisy["path"] == "Lea/Misc/p.lean"
+    assert store.latest_code_step_for_path(session["id"], "Lea/Misc/p.lean")["check_status"] == "ok"

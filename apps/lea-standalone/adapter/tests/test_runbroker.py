@@ -87,3 +87,58 @@ def test_put_is_thread_safe_under_concurrent_publishers():
         t.join()
     seqs = [e["seq"] for e in b.events_after(0)]
     assert seqs == list(range(1, 801)), "seqs must be unique and contiguous under contention"
+
+
+# --- AUDIT-2026-07-24 P1: replay is an index slice, not a rescan ---------------
+
+def test_events_after_returns_exactly_the_tail(tmp_path):
+    """`seq` IS the 1-based index, so `seq > cursor` is `_events[cursor:]`. The old
+    filter form re-examined every buffered event on every call — and the subscriber
+    loop calls this every 80 ms, per connection."""
+    broker = runbroker.RunBroker("r1")
+    for i in range(50):
+        broker.put({"type": "assistant_delta", "payload": {"text": f"t{i}"}})
+
+    assert [e["seq"] for e in broker.events_after(0)] == list(range(1, 51))
+    assert [e["seq"] for e in broker.events_after(47)] == [48, 49, 50]
+    assert broker.events_after(50) == []
+
+
+def test_events_after_clamps_a_hostile_cursor(tmp_path):
+    """The cursor comes from a client-supplied Last-Event-ID/?since=. A raw negative
+    index would silently re-send the tail; an over-large one would raise or wrap."""
+    broker = runbroker.RunBroker("r1")
+    for i in range(5):
+        broker.put({"type": "status", "payload": {"n": i}})
+
+    assert [e["seq"] for e in broker.events_after(-1)] == [1, 2, 3, 4, 5]
+    assert [e["seq"] for e in broker.events_after(-999)] == [1, 2, 3, 4, 5]
+    assert broker.events_after(5) == []
+    assert broker.events_after(999) == []
+
+
+def test_replay_is_stable_under_concurrent_publication(tmp_path):
+    """A subscriber replaying while the driver publishes must see a consistent prefix —
+    the slice is taken under the lock and copied out."""
+    import threading
+
+    broker = runbroker.RunBroker("r1")
+    seen = []
+    stop = threading.Event()
+
+    def reader():
+        cursor = 0
+        while not stop.is_set():
+            for event in broker.events_after(cursor):
+                cursor = event["seq"]
+                seen.append(cursor)
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    for i in range(500):
+        broker.put({"type": "assistant_delta", "payload": {"text": str(i)}})
+    stop.set()
+    thread.join(timeout=5)
+
+    assert seen == sorted(seen), "replay delivered events out of order"
+    assert len(seen) == len(set(seen)), "replay delivered a duplicate"

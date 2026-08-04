@@ -11,8 +11,8 @@
   "content_scripts": [
     {
       "matches": ["https://www.overleaf.com/project/*"],
-      "js": ["content.js"],
-      "css": ["content.css"],
+      "js": ["vendor/katex/katex.min.js", "modelPicker.js", "content.js"],
+      "css": ["vendor/katex/katex.min.css", "lea-theme.css", "modelPicker.css", "content.css"],
       "run_at": "document_start"
     },
     {
@@ -23,7 +23,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs", "leanPaneView.mjs"],
+      "resources": ["pageBridge.js", "targetParserCore.mjs", "zipTex.mjs", "leanPaneView.mjs", "leanPaneMath.mjs", "blueprintLayout.mjs", "blueprintPaneView.mjs", "editorHookWatchdog.mjs", "eventsClient.mjs", "vendor/katex/fonts/*"],
       "matches": ["https://www.overleaf.com/*"]
     }
   ],

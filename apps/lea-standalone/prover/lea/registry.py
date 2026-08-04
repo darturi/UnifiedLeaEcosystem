@@ -47,7 +47,7 @@ class Tool:
 
 # The GLOBAL base layer: name -> Tool, plus registration order so an unfiltered
 # toolset is deterministic (and reproduces today's TOOLS_SCHEMA order for the
-# built-ins). Everything registered at *import time* — the six built-ins, user
+# built-ins). Everything registered at *import time* — the built-ins, user
 # `tool_modules` — lives here and is shared, immutable, and process-wide.
 REGISTRY: dict[str, Tool] = {}
 _ORDER: list[str] = []

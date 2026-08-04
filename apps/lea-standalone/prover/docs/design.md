@@ -56,7 +56,7 @@ The `max_turns` guard at the top of the loop short-circuits to a
 | `prompt.py` | System-prompt variants (`default`/`sketch`/`fill`/`reflect`) + optional `lea.md` append. |
 | `providers.py` | `stream()` over `litellm.completion`; streaming/blocking paths; neutral→OpenAI message + tool conversion; LiteLLM cost. |
 | `agent.py` | `run_events()` generator core; `run()` backward-compat wrapper; session persistence. |
-| `tools.py` | The six tools + `TOOL_HANDLERS` dispatch. |
+| `tools.py` | The built-in tools + `TOOL_HANDLERS` dispatch. |
 | `events.py` | The frozen event dataclasses (the contract). |
 | `render.py` | `render_to_stdout(events)` — default CLI consumer; per-turn cost; returns `(text, transcript)`. |
 | `cli.py` | Arg parsing, `--config`, CLI overrides; drives `run_events` → `render_to_stdout`. |

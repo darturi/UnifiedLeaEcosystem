@@ -38,6 +38,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+from .imports import direct_imports
+
 PROVER_ROOT = Path(__file__).resolve().parent.parent
 SAFE_VERIFY_DIR = PROVER_ROOT / "third_party" / "SafeVerify"
 WORKSPACE = PROVER_ROOT / "workspace"
@@ -109,7 +111,7 @@ _THM_BLOCK_RE = re.compile(
 )
 
 
-def sorry_target(code: str) -> str:
+def sorry_target(code: str, *, imports: bool = True) -> str:
     """Turn a full proof file into a SafeVerify **target**: the same file with every
     top-level ``theorem``/``lemma`` proof body replaced by ``:= by sorry``, and
     everything else — imports, ``open``s, namespaces, and ``def`` bodies — kept
@@ -132,6 +134,13 @@ def sorry_target(code: str) -> str:
     the target is structurally identical to the submission apart from theorem bodies, so
     any auto-generated names line up between the two compiles.
 
+    ``imports=False`` drops the submission's own ``import`` lines, so the caller can
+    supply a **trusted** prelude instead (:func:`trusted_target_import_prelude`). That
+    matters: copying the submission's imports verbatim would let an untrusted module
+    establish the meaning of names appearing in the target's signatures — the target is
+    supposed to be the part we trust. A def whose dependencies were dropped this way
+    fails to compile, which surfaces as a target-compile error, never a false pass.
+
     Limitation (shared with :func:`theorem_signature`): the body delimiter is the first
     ``:=`` in a declaration, so a theorem whose *type* contains ``:=`` (e.g. a ``let`` in
     the type) is split wrong and the target won't compile — reported as a target-compile
@@ -147,6 +156,8 @@ def sorry_target(code: str) -> str:
     out: list[str] = []
     for s, e in spans:
         block = code[s:e]
+        if not imports and block.lstrip().startswith("import "):
+            continue
         if _THM_BLOCK_RE.match(block):
             idx = block.find(":=")
             if idx != -1:
@@ -171,6 +182,36 @@ def namespace_context(code: str) -> tuple[str, str]:
     open_block = "".join(f"namespace {n}\n" for n in names) + "\n"
     close_block = "\n" + "".join(f"end {n}\n" for n in reversed(names))
     return open_block, close_block
+
+
+# A target may import only immutable dependencies plus already-built Lea project
+# siblings. Copying an arbitrary model-authored module into the trusted target
+# would defeat SafeVerify's import-superset defense against type redefinitions.
+_TRUSTED_TARGET_IMPORT_ROOTS = frozenset(
+    {"Init", "Lean", "Std", "Batteries", "Mathlib", "Lea"}
+)
+
+
+def trusted_target_import_prelude(code: str) -> str:
+    """Direct imports safe to reproduce in a target derived from ``code``.
+
+    The previous target always used ``import Mathlib``. Because SafeVerify
+    requires the submission's transitive imports to cover the target's closure,
+    that accidentally made every targeted submission unverifiable. Reusing only
+    trusted direct imports keeps the same superset check, but makes its baseline
+    the proof's actual dependency closure rather than the Mathlib barrel.
+
+    `Lea.*` modules are the project's already-built sibling artifacts. The replay
+    path already exposes exactly that build directory through `_replay_env`; they
+    are needed when a project theorem's *statement* mentions a sibling definition.
+    Unknown package roots are deliberately omitted, so they cannot establish the
+    trusted meaning of names in the target signature.
+    """
+    imports: list[str] = []
+    for module in direct_imports(code):
+        if module.split(".", 1)[0] in _TRUSTED_TARGET_IMPORT_ROOTS:
+            imports.append(module)
+    return "".join(f"import {module}\n" for module in imports)
 
 
 # --- the grader (recovered from eval/utils/verify.py) -----------------------

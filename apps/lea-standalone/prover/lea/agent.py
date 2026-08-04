@@ -516,6 +516,10 @@ def _fallback_tool_narration(tool_name: str, args: dict) -> str:
         if isinstance(query, str) and query:
             return f"I will search Mathlib for lemmas related to `{query}` so the next proof step can use existing results."
         return "I will search Mathlib for a relevant lemma before continuing the proof."
+    if tool_name == "suggest_imports":
+        if isinstance(path, str) and path:
+            return f"I will analyze `{path}` and replace broad or redundant imports with targeted modules."
+        return "I will analyze the proof's imports and identify a targeted replacement block."
     return f"I will use `{tool_name}` for the next proof step and then use its result to continue."
 
 
@@ -760,6 +764,7 @@ def _run_events_inner(
         assistant_parts = []
         current_text = ""
         tool_calls = []
+        reasoning_items = []
         forced_narration_emitted = False
 
         for event in stream(model, system, messages, tools_schema, config.model_kwargs, streaming=config.stream):
@@ -804,6 +809,7 @@ def _run_events_inner(
                 if tool_calls:
                     tool_calls[-1]["id"] = event.tool_use_id
             elif isinstance(event, Done):
+                reasoning_items = event.reasoning_items
                 total_usage.input_tokens += event.usage.input_tokens
                 total_usage.output_tokens += event.usage.output_tokens
                 total_cost += event.cost
@@ -813,6 +819,10 @@ def _run_events_inner(
 
         if current_text:
             assistant_parts.append({"type": "text", "text": current_text})
+        if reasoning_items:
+            # Internal continuation state for the Responses API.  It is persisted
+            # with this exact assistant turn but never rendered as user-facing text.
+            assistant_parts.append({"type": "reasoning", "items": reasoning_items})
         for tc in tool_calls:
             assistant_parts.append({
                 "type": "tool_call",

@@ -34,8 +34,16 @@ from app.config import LeaConfig
 
 
 def _ok_recheck(monkeypatch):
-    """Stub the canonical-path re-verification so promotion tests need no Lean env."""
+    """Stub the canonical-path re-verification so promotion tests need no Lean env.
+
+    BOTH gates, not just the compile. Promotion now also runs SafeVerify (AUDIT C5),
+    and stubbing only `_lean_check_file` left the real auditor in the path: on a
+    machine where SafeVerify is actually built, `_safeverify_file` shells out for two
+    Lean compiles plus a kernel replay, and the suite appears to hang rather than
+    fail. It passes wherever SafeVerify is absent, which is what hid it — a test whose
+    isolation depends on a tool NOT being installed."""
     monkeypatch.setattr(bridge, "_lean_check_file", lambda path: CheckResult(path, "ok", None))
+    monkeypatch.setattr(bridge, "_safeverify_file", lambda path: "ok")
 
 
 def _drain(q: Queue) -> list[dict]:
@@ -84,8 +92,12 @@ def test_with_subagents_adds_spawn_to_default_toolset():
     assert "spawn_subagent" in out.tools
     # the coordinator also gets the opt-in SafeVerify tool to audit a finished proof
     assert "safe_verify" in out.tools
-    # the six built-ins are still there, with the two opt-in tools appended
-    assert {"read_file", "write_file", "edit_file", "lean_check", "bash", "search_mathlib"} <= set(out.tools)
+    # the built-ins are still there (including upstream's suggest_imports), with the
+    # two opt-in tools appended.
+    assert {
+        "read_file", "write_file", "edit_file", "lean_check", "bash",
+        "search_mathlib", "suggest_imports",
+    } <= set(out.tools)
     assert out.tools[-2:] == ["spawn_subagent", "safe_verify"]
     # nothing else about the config changed
     assert out.model == cfg.model and out.max_turns == cfg.max_turns

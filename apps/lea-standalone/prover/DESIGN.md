@@ -18,7 +18,7 @@ Lea follows Pi's ethos of radical minimalism: if we don't need it, we don't buil
 User task (CLI) → agent loop → tool calls → Lean compilation → repeat until proof compiles
 ```
 
-### Tools (6)
+### Built-in tools
 
 | Tool | Purpose |
 |------|---------|
@@ -27,6 +27,7 @@ User task (CLI) → agent loop → tool calls → Lean compilation → repeat un
 | `edit_file` | Replace an exact substring in a file |
 | `lean_check` | Compile a `.lean` file via `lake env lean`, return diagnostics |
 | `search_mathlib` | Grep Mathlib source for lemma names / type patterns |
+| `suggest_imports` | Suggest a targeted import block with Mathlib's min-imports linter |
 | `bash` | Run a shell command (for `exact?`, `apply?`, `lake build`, etc.) |
 
 ### Implemented features

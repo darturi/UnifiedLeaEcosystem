@@ -22,7 +22,7 @@ Exits 0 if every check passes, 1 otherwise.
 import sys
 import threading
 
-import lea.tools  # noqa: F401 — registers the six built-ins into the global
+import lea.tools  # noqa: F401 — registers the built-ins into the global
 from lea.registry import (
     REGISTRY,
     Tool,

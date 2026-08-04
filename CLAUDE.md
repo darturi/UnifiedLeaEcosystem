@@ -57,14 +57,13 @@ sprinkled through the adapter source, documented in `docs/`):
 `autonomous` runs (the Overleaf path, `D19`) disable the per-tool approval gate and
 use the non-interactive prompt variant; interactive UI runs keep the approval gate.
 
-### ⚠️ Stale docs to ignore
+### Doc pointers
 
-The root `README.md` and `apps/lea-standalone/README.md` predate the in-process
-refactor. Treat as **wrong**: references to `apps/lea-ui/`, a `vendor/lea-prover`
-git submodule, an `npm run dev:lea` script, and a "bundled Lea API on :8000". The
-prover is vendored at `apps/lea-standalone/prover/` and runs in-process; there is
-no :8000 service. Trust `scripts/setup.mjs`, `package.json`, and the adapter source
-over the prose READMEs.
+The root `README.md` and `apps/lea-standalone/README.md` were rewritten for the
+in-process architecture and are current (verified 2026-07-10). For a deeper map
+see `docs/SYSTEM-REPORT-overleaf-architecture.md`; per-feature design docs are
+the `FEATURE-`/`PLAN-` files in `docs/`. When prose and code disagree, trust
+`scripts/setup.mjs`, `package.json`, and the adapter source.
 
 ## Ports
 
@@ -91,8 +90,8 @@ npm run start:adapter         # start ONLY the shared FastAPI backend (:8001)
 npm run dev:ui                # adapter (:8001) + Vite (:5173) — the standalone UI
 npm run dev:overleaf          # Overleaf companion (:31245); expects the adapter running
 
-./start-dev.sh                # start the whole stack (UI + overleaf); clears session data first
-./start-dev.sh --keep-data    # ...without wiping previous sessions/proofs/logs
+./start-dev.sh                # start the whole stack (UI + overleaf); keeps previous session data
+./start-dev.sh --fresh        # ...clearing previous sessions/proofs/logs first
 
 npm run doctor                # health-check both apps
 npm run reset:local           # clear local run state (proofs, logs, SQLite); keeps Lea deps
@@ -149,9 +148,15 @@ apps/lea-standalone/
   prover/             vendored Lea prover (its own lea/ package + workspace/ Lake project)
   scripts/            dev.mjs (launcher), doctor.mjs, setup-api.mjs, reset-local-state.mjs
 apps/overleaf-extension/
-  extension/          Chrome extension (manifest.json, content.js, background.js, options.*)
-  companion/          Node companion server (server.mjs, leaApiClient.mjs, config.mjs, doctor.mjs)
-  shared/             theoremParser.mjs, leanStub.mjs (label/theorem parsing, path generation)
+  extension/          Chrome MV3 extension: content.js (badges/popovers/Lean pane, IIFE),
+                      pageBridge.js (in-page CodeMirror plugin), uiBridge.js (Lea UI tab),
+                      background.js, options.*, and lazily-imported .mjs modules
+                      (targetParserCore, leanPaneView, zipTex, editorHookWatchdog)
+  companion/          Node companion server: server.mjs (routes+orchestration),
+                      leaApiClient.mjs (adapter client), jobStore.mjs, config.mjs,
+                      chatPrompt.mjs, cascadeVerify.mjs, leanDependencyGraph.mjs,
+                      leanSignatureDiff.mjs, doctor.mjs
+  shared/             theoremParser.mjs, leanStub.mjs, leanPaneManifest.mjs
 packages/lea-model-catalog/   models.json + index.mjs (shared model list)
 scripts/              monorepo setup.mjs, env.mjs (.env read/patch), reset-local-state.mjs
 ```

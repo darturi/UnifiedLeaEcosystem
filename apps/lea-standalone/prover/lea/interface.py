@@ -154,16 +154,29 @@ def verify(path: str) -> VerifyResult:
     sv_root = workspace / ".sv_scratch"
     sv_root.mkdir(parents=True, exist_ok=True)
     stem = p.stem or "proof"
+    # Only TRUSTED direct imports go into the target. `import Mathlib` used to be
+    # hardcoded here, and because SafeVerify requires the submission's transitive
+    # imports to cover the target's closure, that made every targeted submission
+    # unverifiable. An untrusted module must also never establish the meaning of a
+    # name in the target's signatures — the target is the part we trust.
+    import_prelude = safeverify.trusted_target_import_prelude(code)
 
     with tempfile.TemporaryDirectory(dir=sv_root, prefix=f"{stem}_") as td:
         scratch = Path(td)
         target = scratch / f"{stem}_sv_target.lean"
         submission = scratch / f"{stem}_sv_submission.lean"
-        # The target is the WHOLE file with every theorem/lemma proof `sorry`-ed and
-        # its imports + defs kept — so it compiles (a bare signature lost the file's
-        # own definitions) and SafeVerify audits every theorem's type, not just the
-        # last one. The namespace + fully-qualified names travel with it automatically.
-        target.write_text(safeverify.sorry_target(code))
+        # The two halves of the target, composed (merge of two independent fixes):
+        #   * a TRUSTED import prelude (above), not the submission's own imports and
+        #     not the Mathlib barrel;
+        #   * the WHOLE file with every theorem/lemma body `sorry`-ed and its `def`s
+        #     kept — a bare signature target lost the file's own definitions and
+        #     failed to compile for any project file, and audited only the LAST
+        #     theorem where SafeVerify happily checks them all in one pass.
+        # The namespace and fully-qualified names travel with the file, so no separate
+        # namespace reconstruction is needed.
+        target.write_text(
+            import_prelude + "\n" + safeverify.sorry_target(code, imports=False)
+        )
         submission.write_text(code if code.endswith("\n") else code + "\n")
         try:
             # Thread the per-call dir down to the olean/report scratch too — the

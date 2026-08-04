@@ -32,10 +32,12 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from queue import Queue
-from threading import Event
+from queue import Empty, Queue
+from threading import Event, Lock, Thread
 from typing import Any
 
 from uuid import uuid4
@@ -57,25 +59,50 @@ from lea.interface import (
     TurnStarted,
     UsageUpdated,
     check as _lean_check_file,
+    verify as _safe_verify_file,
     request_child_stop,
     run_events,
 )
 
-from .artifacts import classify_lean_artifact
-from .config import LeaConfig
+from .artifacts import classify_lean_artifact, declaration_present, extract_declaration_name
+from .config import LeaConfig, configured_provider_keys, load_config
 from .diagnostics import analyze_exception, resolve as resolve_diagnostic
 from .gitstore import GitStore, GitStoreError
-from . import collation, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
+from . import collation, formalizations as formalization_service, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
+_FORMALIZATION_CONTEXT_MARKER = "<!-- lea:formalization-context -->"
+_CREDENTIAL_LIKE = re.compile(
+    r"(?:sk-(?:ant-)?[A-Za-z0-9_./+\-=]{8,}|AIza[A-Za-z0-9_-]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})"
+)
 
-# Admission — which run may start and whether there's room — now lives in
-# `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim,
-# decided at the SSE endpoint *before* this module's run thread is spawned. That
-# replaces the old split where the endpoint peeked an `_active_run_id` scalar while
-# the real claim happened later here (an `active_run_lock.acquire` inside the thread)
-# — a TOCTOU where two attaches both peeked None and both spawned. run_lea no longer
-# holds a single-slot lock or a scalar; it releases its admitted slot in the finally.
+
+def _redact(text: str) -> str:
+    """Strip configured provider keys and credential-shaped strings from `text`.
+
+    Split out of `_public_error_detail` so every user-facing path can reuse it — a
+    diagnostic is persisted AND rendered, so it needs the same treatment as the run's
+    stored error. Providers quote the credential back at you: the live DeepSeek
+    failure read "Your api key: ... is invalid"."""
+    try:
+        for secret in configured_provider_keys().values():
+            if len(secret) >= 8:
+                text = text.replace(secret, "[redacted]")
+    except Exception:  # noqa: BLE001 — redaction is best-effort on an error path
+        pass
+    return _CREDENTIAL_LIKE.sub("[redacted]", text)[:2000]
+
+
+def _public_error_detail(exc: Exception) -> str:
+    """A useful persisted/provider error with credentials removed and bounded size."""
+    return _redact(f"{type(exc).__name__}: {exc}")
+
+# Admission — which run may start and whether there's room — lives in
+# `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim.
+# The FIFO dispatcher claims the slot before spawning the run thread, avoiding
+# the old endpoint-peek/thread-claim TOCTOU. ``run_lea`` releases that slot in
+# its ``finally`` on every exit.
 
 # Per-run cooperative stop flags (D18). The run registers its Event when it starts
 # and the interrupt endpoint sets it; the agent checks it at each turn boundary and
@@ -108,6 +135,194 @@ def request_subagent_stop(child_session_id: str) -> bool:
     return request_child_stop(result_id)
 
 
+# --- Capacity-aware FIFO dispatcher (integrates v2.3 + hardening Phase 2) -----
+# POST /api/runs enqueues immediately and GET /events only observes. A single
+# dispatcher preserves FIFO admission order, while the v2.3 registry still allows
+# up to LEA_MAX_CONCURRENT_RUNS admitted drivers at once. Each admitted run gets
+# the existing rejoinable RunBroker, so reconnect/cursor semantics and concurrent
+# sub-agent work remain intact. This replaces gen_repair's single-run event hub;
+# the broker is the one event source for both interactive and Overleaf clients.
+_run_queue: "Queue[str]" = Queue()
+_worker_guard = Lock()
+_worker_thread: Thread | None = None
+
+
+def _resolve_task(run: dict[str, Any]) -> str | None:
+    session = store.session_detail(run["session_id"])
+    if not session or not session.get("messages"):
+        return None
+    return next(
+        (m["content"] for m in reversed(session["messages"])
+         if m["run_id"] == run["id"] and m["role"] == "user"),
+        None,
+    )
+
+
+# One dispatch attempt's outcome. `DEFER` is the only one that keeps a run waiting.
+_SETTLED, _DISPATCHED, _DEFER = "settled", "dispatched", "defer"
+
+# How long the dispatcher waits between retries when every waiting run is blocked on
+# capacity or on its own session. Only reached when nothing else is arriving.
+_DISPATCH_RETRY_SECONDS = 0.1
+
+
+def _try_dispatch(run_id: str, superseded: dict[str, str]) -> str:
+    """Attempt to admit and start one run. Never blocks.
+
+    Returns `_SETTLED` (nothing more to do — terminal, missing, or already driven),
+    `_DISPATCHED` (a driver thread is running it), or `_DEFER` (not admissible *yet*).
+    """
+    run = store.get_run(run_id)
+    if not run or run["status"] != "pending":
+        if run:
+            publish_terminal_from_row(run_id)
+            runbroker.drop(run_id)
+        return _SETTLED
+
+    task = _resolve_task(run)
+    if task is None:
+        store.update_run(run_id, "failed", result_kind="failed",
+                         result_detail="Run task not found.")
+        publish_terminal_from_row(run_id)
+        runbroker.drop(run_id)
+        return _SETTLED
+
+    admission = runregistry.registry.try_admit(run_id, run["session_id"])
+    if admission.outcome == runregistry.ADMITTED:
+        superseded.pop(run_id, None)
+        broker = runbroker.get(run_id) or runbroker.create(run_id)
+        # Run creation snapshots the selected model. Reload every other
+        # live setting at admission time, but never let a later settings
+        # or environment change switch a queued run to another model.
+        config = load_config()
+        if run.get("model"):
+            config = replace(config, model=run["model"])
+        context = RunnerContext(
+            session_id=run["session_id"],
+            run_id=run_id,
+            task=task,
+            config=config,
+            events=broker,
+            autonomous=bool(run.get("autonomous")),
+        )
+        try:
+            Thread(target=run_lea, args=(context,), daemon=True,
+                   name=f"lea-run-{run_id[:8]}").start()
+        except BaseException:
+            runregistry.registry.release(run_id)
+            store.update_run(run_id, "failed", result_kind="failed",
+                             result_detail="Could not start the run worker.")
+            publish_terminal_from_row(run_id)
+            runbroker.drop(run_id)
+            raise
+        return _DISPATCHED
+
+    if admission.outcome == runregistry.ALREADY_ACTIVE:
+        # A duplicate enqueue/recovery entry; the admitted driver owns it.
+        return _SETTLED
+    if admission.outcome == runregistry.SESSION_BUSY and admission.incumbent_run_id:
+        # Preserve main's per-session supersede behavior without letting two turns
+        # mutate the same session concurrently. Asked ONCE per incumbent: the flag is
+        # an Event, so repeating is harmless, but the old loop re-issued it on every
+        # 100 ms poll for as long as the incumbent took to wind down.
+        if superseded.get(run_id) != admission.incumbent_run_id:
+            superseded[run_id] = admission.incumbent_run_id
+            request_stop(admission.incumbent_run_id)
+    return _DEFER
+
+
+def _worker_loop() -> None:
+    """Dispatch queued runs, never letting one that cannot start hold up one that can.
+
+    The previous shape spun in an inner loop on the run at the head of the queue until
+    it was admissible (AUDIT-2026-07-24 X1). That is fine when the blocker is capacity
+    — nothing else could start either — but `SESSION_BUSY` blocks on a *different*
+    session's incumbent winding down, which can take a whole model call, or up to the
+    900-second approval timeout if that incumbent is parked on an unanswered gate.
+    Runs for unrelated sessions sat behind it with slots free, so
+    `LEA_MAX_CONCURRENT_RUNS=4` did not deliver four in the multi-chat case Phase 6
+    raised the default for.
+
+    Now a run that cannot be admitted is set aside and retried on the next pass while
+    the dispatcher keeps draining the queue. `deferred` preserves the relative order of
+    the runs waiting, and is retried before newly arrived ones, so FIFO among the
+    blocked set is unchanged — what is gone is one blocked run's claim on everyone
+    else's turn.
+
+    The queue is polled only while something is deferred; with nothing waiting the
+    dispatcher blocks on `get()` as before and costs nothing when idle.
+    """
+    deferred: list[str] = []
+    # run_id -> the incumbent we have already asked to stop for it, so a supersede is
+    # requested once rather than on every retry.
+    superseded: dict[str, str] = {}
+    while True:
+        try:
+            arrived = _run_queue.get(timeout=_DISPATCH_RETRY_SECONDS if deferred else None)
+        except Empty:
+            arrived = None
+
+        # Deferred first: they have been waiting longest.
+        batch, deferred = deferred, []
+        if arrived is not None:
+            batch.append(arrived)
+
+        for run_id in batch:
+            try:
+                if _try_dispatch(run_id, superseded) == _DEFER:
+                    deferred.append(run_id)
+                else:
+                    superseded.pop(run_id, None)
+            except Exception:  # noqa: BLE001 — the worker must survive any single run
+                logger.exception("Run worker failed while driving run %s", run_id)
+                superseded.pop(run_id, None)
+                try:
+                    current = store.get_run(run_id)
+                    if current and current["status"] in {"pending", "running"}:
+                        store.update_run(run_id, "failed")
+                except Exception:
+                    logger.exception("Failed to mark run %s failed", run_id)
+                publish_terminal_from_row(run_id)
+                runbroker.drop(run_id)
+
+
+def enqueue_run(run_id: str) -> None:
+    """FIFO-enqueue a created run for capacity-aware background admission."""
+    global _worker_thread
+    if runbroker.get(run_id) is None:
+        runbroker.create(run_id)
+    with _worker_guard:
+        if _worker_thread is None or not _worker_thread.is_alive():
+            _worker_thread = Thread(target=_worker_loop, daemon=True, name="lea-run-dispatcher")
+            _worker_thread.start()
+    _run_queue.put(run_id)
+
+
+def recover_runs_at_startup() -> None:
+    """Re-enqueue pending rows after stale running rows are reaped on startup."""
+    for run in store.list_runs_by_status("pending"):
+        enqueue_run(run["id"])
+
+
+def publish_terminal_from_row(run_id: str) -> None:
+    """Publish a terminal frame for a run finalized without ``run_lea``.
+
+    Late observers can synthesize the same frame from the persisted row after
+    the broker is dropped; observers already attached to this broker receive it
+    live, which prevents an interrupted queued run from hanging.
+    """
+    run = store.get_run(run_id)
+    broker = runbroker.get(run_id)
+    if not run or broker is None:
+        return
+    payload: dict[str, Any] = {"status": run["status"]}
+    if run.get("result_kind"):
+        payload["result_kind"] = run["result_kind"]
+    if run.get("result_detail"):
+        payload["result_detail"] = run["result_detail"]
+    broker.put({"type": "done", "payload": payload})
+
+
 # --- Per-tool approval gate (D19) ------------------------------------------
 # Impactful tools prompt the human for allow/deny/always-session before running;
 # read-only tools + lean_check are auto-allowed (never gated). "Always allow this
@@ -124,9 +339,13 @@ _APPROVAL_DECISIONS = {"allow", "deny", "always_session"}
 # made, and nothing said the Stop had done anything at all.
 _APPROVAL_CANCELLED = "cancelled"
 
+# A run parked on an unanswered approval holds a bounded concurrency slot; after this
+# it falls through to the safe `deny` so queued work can proceed.
+APPROVAL_DECISION_TIMEOUT_SECONDS = 900
+
 _session_allowlists: dict[str, set[str]] = {}
-# One in-flight approval per active run (one run at a time): run_id -> the pending
-# decision rendezvous between the run thread (waiting) and the endpoint (resolving).
+# One in-flight approval per active run: run_id -> the pending decision rendezvous
+# between that run thread (waiting) and the endpoint (resolving).
 _pending_approvals: dict[str, dict[str, Any]] = {}
 
 
@@ -158,11 +377,6 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
     `always_session` allowlist entry, emits `approval_resolved`, and returns
     `allow | deny | always_session`. Anything unexpected → `deny` (safe default)."""
     approval_id = uuid4().hex
-    _pending_approvals[run_id] = {"approval_id": approval_id, "event": Event(), "decision": None}
-    emit(events, "approval_requested", {
-        "approval_id": approval_id, "run_id": run_id, "session_id": session_id,
-        "tool_name": ev.tool_name, "args": ev.args,
-    })
     # Persist the pending approval onto the run row so it survives a stream drop,
     # a reconnect, or a session switch: `session_detail` re-surfaces
     # `active_run.pending_approval` and the UI rebuilds the same card. Without this
@@ -173,11 +387,29 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
     store.set_run_pending_approval(run_id, {
         "approval_id": approval_id, "tool_name": ev.tool_name, "args": ev.args,
     })
+    # Only expose the in-memory rendezvous after the durable reconnect state is
+    # present; then publish the event. A resolver can never observe the card before
+    # its decision target exists, and a reconnect can never observe the target
+    # before the persisted card exists.
+    _pending_approvals[run_id] = {
+        "approval_id": approval_id, "event": Event(), "decision": None,
+    }
+    emit(events, "approval_requested", {
+        "approval_id": approval_id, "run_id": run_id, "session_id": session_id,
+        "tool_name": ev.tool_name, "args": ev.args,
+    })
     pending = _pending_approvals[run_id]
     cancelled = False
+    # A run parked forever on an unanswered approval consumes one bounded
+    # concurrency slot indefinitely. Time out to the safe `deny` so queued work
+    # can continue even if its original observer disappeared.
+    waited = 0.0
     while not pending["event"].wait(timeout=0.5):
         if stop_event.is_set():
             cancelled = True
+            break
+        waited += 0.5
+        if waited >= APPROVAL_DECISION_TIMEOUT_SECONDS:
             break
     _pending_approvals.pop(run_id, None)
 
@@ -271,6 +503,62 @@ def diagnose(
     return row
 
 
+# How long a run may hold streamed text before publishing it, and the largest single
+# frame it will build. The interval matches the subscriber poll in
+# `routes/runs._subscribe` — text produced between two polls is delivered together no
+# matter how many frames it arrived in, so a finer granularity than this is invisible.
+_DELTA_FLUSH_SECONDS = 0.08
+_DELTA_FLUSH_CHARS = 512
+
+
+class _DeltaStream:
+    """Coalesce per-token ``assistant_delta`` frames into roughly one frame per poll.
+
+    The prover yields one ``AssistantTextDelta`` per token and the adapter published
+    one SSE frame for each. Nobody could see that granularity — the browser renders
+    whatever accumulated since its last 80 ms poll — but every frame cost a dict and a
+    list slot retained in the broker for the run's whole life, and made each poll walk
+    further (AUDIT-2026-07-24 P1). A long run buffered tens of thousands of frames to
+    deliver text a fraction of that size.
+
+    Frames are merged **before** publication, never after. An event already in the
+    broker carries a ``seq`` some subscriber may have consumed, so appending to it in
+    place would silently lose text for any client whose cursor is already past it —
+    which is why this batches upstream instead of compacting the buffer.
+
+    A slow stream is not delayed: the deadline is checked on arrival, so when tokens
+    come in slower than the interval each one flushes immediately.
+    """
+
+    def __init__(self, events: "runbroker.RunBroker | Queue[dict[str, Any]]") -> None:
+        self._events = events
+        self._parts: list[str] = []
+        self._length = 0
+        self._deadline: float | None = None
+
+    def add(self, text: str) -> None:
+        if not text:
+            return
+        self._parts.append(text)
+        self._length += len(text)
+        now = time.monotonic()
+        if self._deadline is None:
+            self._deadline = now + _DELTA_FLUSH_SECONDS
+        if self._length >= _DELTA_FLUSH_CHARS or now >= self._deadline:
+            self.flush()
+
+    def flush(self) -> None:
+        """Publish whatever is buffered. Must run before ANY other event is emitted, so
+        streamed text can never appear after the step it preceded."""
+        if not self._parts:
+            return
+        text = "".join(self._parts)
+        self._parts.clear()
+        self._length = 0
+        self._deadline = None
+        emit(self._events, "assistant_delta", {"text": text})
+
+
 # A run's final status. "proved" / "disproved" / "needs_review" are terminal
 # checked-artifact outcomes. "answered" is a chat / QA / sketch-pause turn that
 # finished cleanly but proved nothing, so the UI never marks a conversational turn
@@ -282,6 +570,63 @@ _FINISH_STATUS = {
 }
 
 _COMPLETED_RESULTS = {"proved", "disproved", "needs_review"}
+
+# Shown as result_detail when the bridge's own spend-cap stop ended the run, so
+# clients can tell a cap stop (result_kind="max_spend") from a user cancel. The
+# persisted run *status* stays "cancelled" — the status vocabulary is unchanged.
+_MAX_SPEND_DETAIL = "Max spend limit reached; the run was stopped at a turn boundary."
+
+# Usage is persisted only when a run finishes. While several admitted runs are
+# live, their in-flight cost would otherwise be invisible to each other's global
+# cap checks. This process-local overlay makes the check persisted-global plus
+# every active run's observed ``UsageUpdated`` total.
+_live_spend_lock = Lock()
+_live_run_costs: dict[str, float] = {}
+
+
+# Persisted spend changes only when a run *finishes* (`update_run` writes its
+# cost_usd), but the cap is re-checked on every `UsageUpdated` and every turn — so the
+# unmemoized read meant several DB aggregates per second per active run, against the
+# same single-writer SQLite the runs are writing to (AUDIT-2026-07-24 P2). A short TTL
+# removes that without weakening the cap: the term that moves continuously *within* a
+# run is the in-memory `_live_run_costs` overlay, which is always exact, and the
+# staleness this admits is bounded by one other run finishing inside the window.
+_PERSISTED_SPEND_TTL_SECONDS = 2.0
+_persisted_spend_lock = Lock()
+# (database path, monotonic_at, usd). The path is part of the key because the total is
+# a property of ONE database: production never repoints `db.DB_PATH`, but tests do, and
+# a cache that ignored which database it measured would hand one test's total to the
+# next. Same hazard `backup.py` documents for the path it copies.
+_persisted_spend_cache: tuple[Path, float, float] | None = None
+
+
+def _persisted_spend_usd() -> float:
+    """Total spend on finished runs, cached for `_PERSISTED_SPEND_TTL_SECONDS`."""
+    global _persisted_spend_cache
+    from . import db
+
+    path, now = db.DB_PATH, time.monotonic()
+    with _persisted_spend_lock:
+        cached = _persisted_spend_cache
+        if (
+            cached is not None
+            and cached[0] == path
+            and now - cached[1] < _PERSISTED_SPEND_TTL_SECONDS
+        ):
+            return cached[2]
+    value = store.total_spend_usd()
+    with _persisted_spend_lock:
+        _persisted_spend_cache = (path, now, value)
+    return value
+
+
+def reset_persisted_spend_cache() -> None:
+    """Drop the cached total. For tests, and for any caller that has just persisted a
+    run's cost and wants the next check to see it immediately."""
+    global _persisted_spend_cache
+    with _persisted_spend_lock:
+        _persisted_spend_cache = None
+
 
 def _finished_status(ev: Finished) -> str:
     if ev.reason == "completed":
@@ -341,7 +686,12 @@ def _classify(code: str) -> str | None:
         return None
 
 
-def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | None:
+def _divergence_context(
+    session_id: str,
+    repo_key: str,
+    gs: GitStore,
+    formalization_id: str | None = None,
+) -> str | None:
     """Diff-on-divergence (D12): if the human edited the proof since the agent last
     acted, return a context block (a diff + any edit notes) to fold into the next
     run's task — so the agent sees and acknowledges the changes (D13). None when
@@ -357,7 +707,11 @@ def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | N
     version compared two git revisions, and its `before` was only as good as a
     pointer nobody verified (see 0004's backfill: one such pointer named a commit
     whose tree never contained the file)."""
-    agent_step = store.latest_agent_code_step(session_id)
+    agent_step = (
+        store.latest_agent_code_step_for_formalization(session_id, formalization_id)
+        if formalization_id
+        else store.latest_agent_code_step(session_id)
+    )
     if not agent_step or not agent_step.get("path"):
         return None
     path = agent_step["path"]
@@ -394,11 +748,205 @@ def _divergence_context(session_id: str, repo_key: str, gs: GitStore) -> str | N
     return "\n".join(parts)
 
 
+def _transcript_gap_context(session_id: str, run_id: str) -> str | None:
+    """Tell the agent when earlier turns are missing from the history it was handed
+    (AUDIT-2026-07-24 C10), or None when the replayed conversation is continuous.
+
+    A run that crashes mid-turn never reaches `Finished`, so it stores no transcript
+    and `latest_transcript_for_session` quietly falls back to an older run. The
+    conversation then looks continuous while a turn the user watched is simply absent.
+
+    Why this says "unavailable" rather than replaying the partial history: the prover
+    appends the assistant's tool_call message BEFORE the tools run and the tool_result
+    messages after, so a transcript captured at an arbitrary crash point can end on a
+    tool_call with no matching result — a shape every provider rejects. Replaying it
+    would turn a lost turn into a session that cannot start a new one. Recovering the
+    content safely means truncating to the last complete turn boundary, which the
+    prover would have to expose; until then, being honest about the hole beats
+    pretending there isn't one. The files those runs left behind are still on disk, and
+    `_divergence_context` reports them.
+    """
+    gap = store.transcript_gap_for_session(session_id, exclude_run_id=run_id)
+    if not gap:
+        return None
+    lines = [
+        f"NOTE: {len(gap)} earlier attempt(s) in this session ended without a usable "
+        "record of what they did, so the conversation above skips them:",
+    ]
+    for run in gap:
+        detail = (run.get("result_detail") or "").strip().splitlines()
+        reason = detail[0][:160] if detail else (run.get("result_kind") or run.get("status"))
+        lines.append(f"- an attempt that ended as {run.get('status')}: {reason}")
+    lines.append(
+        "Any files they wrote are still on disk and are reflected in the working copy. "
+        "Check the current state of the proof files before assuming work is undone, and "
+        "do not assume the conversation above is the whole history."
+    )
+    return "\n".join(lines)
+
+
+def _artifact_module_name(namespace: str | None, rel: str) -> str | None:
+    """Lean module for a repo-relative .lean path in a project repo (whose root
+    IS the namespace): `Lea.Project1` + `chapter/decl.lean` → `Lea.Project1.chapter.decl`.
+    None for loose sessions (no stable namespace) and non-.lean files."""
+    if not namespace or not rel.endswith(".lean"):
+        return None
+    return f"{namespace}.{rel[:-len('.lean')].replace('/', '.')}"
+
+
+def _formalization_context_message(formalization: dict | None) -> dict | None:
+    """Build the current, replaceable run-focus message for the prover."""
+    if not formalization:
+        return None
+    files = store.list_formalization_files(formalization["id"])
+    lines = [
+        _FORMALIZATION_CONTEXT_MARKER,
+        "The current run is focused on this formalization:",
+        f"- id: {formalization['id']}",
+        f"- title: {formalization['display_title']}",
+        f"- kind: {formalization['kind']}",
+    ]
+    if formalization.get("declaration_name"):
+        lines.append(f"- Lean declaration: {formalization['declaration_name']}")
+    if formalization.get("statement"):
+        lines.append(f"- statement: {formalization['statement']}")
+    if formalization.get("validity_status"):
+        lines.append(f"- current validity: {formalization['validity_status']}")
+    activity = (formalization.get("activity") or {}).get("status")
+    if activity:
+        lines.append(f"- current activity: {activity}")
+    if formalization.get("source_hash"):
+        lines.append(f"- external source hash: {formalization['source_hash']}")
+    if files:
+        lines.append("- known files:")
+        lines.extend(f"  - {item['role']}: {item['path']}" for item in files)
+    current = formalization_service.current_snapshot(formalization["id"])
+    updated_session = (current or {}).get("last_updated_session")
+    if updated_session:
+        lines.append(
+            "- current project revision last updated in conversation: "
+            f"{updated_session['title']} ({updated_session['id']})"
+        )
+    lines.append(
+        "Keep new proof writes for this target in its known primary file when one "
+        "exists. You may reference other project declarations without changing focus."
+    )
+    return {"role": "user", "content": "\n".join(lines)}
+
+
+def _is_formalization_context_message(message: dict) -> bool:
+    return _FORMALIZATION_CONTEXT_MARKER in str(message.get("content") or "")
+
+
+def _attributable_formalization(
+    path: str, focus_formalization_id: str | None
+) -> str | None:
+    """Attribute proof files, but never scratch or adapter-support output."""
+    normalized = path.replace("\\", "/")
+    lowered = normalized.lower()
+    if (
+        not focus_formalization_id
+        or not normalized.endswith(".lean")
+        or "scratch" in lowered
+        or normalized.startswith(".lea/")
+    ):
+        return None
+    return focus_formalization_id
+
+
+def _record_run_artifacts(
+    session_id,
+    run_id,
+    project,
+    namespace,
+    steps_by_path,
+    *,
+    focus_formalization_id: str | None = None,
+    source_hash: str | None = None,
+) -> None:
+    """Write the structured artifact index rows for this run's checked files
+    (PLAN-system-hardening 4.1). Only files whose latest step verdict is ok
+    are recorded — a broken write is not an artifact. Best-effort by design:
+    the index is a convenience the companion falls back gracefully without,
+    so failures log rather than fail the run."""
+    for rel, step_id in steps_by_path.items():
+        try:
+            step = store.latest_code_step_for_path(session_id, rel)
+            if (
+                not step
+                or step.get("id") != str(step_id)
+                or step.get("check_status") != "ok"
+            ):
+                continue
+            # SQL owns proof content on main (timeline -> artifact_blobs), so use
+            # the exact bytes carried by this run's checked code step. Reading a
+            # git commit_sha here would resurrect the stale dual-store design.
+            code = step.get("code") or ""
+            focused = (
+                store.get_formalization(focus_formalization_id)
+                if focus_formalization_id else None
+            )
+            focused_declaration = (
+                focused.get("declaration_name") if focused else None
+            )
+            if focused_declaration and not declaration_present(
+                code, focused_declaration
+            ):
+                store.link_formalization_file(
+                    focus_formalization_id, rel, "support"
+                )
+                continue
+            declaration = focused_declaration or extract_declaration_name(code)
+            if not declaration:
+                continue
+            formalization = focused
+            if (
+                formalization is not None
+                and not formalization.get("declaration_name")
+            ):
+                formalization = store.update_formalization(
+                    formalization["id"], declaration_name=declaration
+                )
+            if formalization is None:
+                formalization = store.find_formalization_by_declaration(
+                    project_id=project["id"] if project else None,
+                    loose_session_id=None if project else session_id,
+                    declaration_name=declaration,
+                )
+                if formalization is None:
+                    formalization = store.create_formalization(
+                        project_id=project["id"] if project else None,
+                        loose_session_id=None if project else session_id,
+                        display_title=declaration,
+                        declaration_name=declaration,
+                        kind=step.get("artifact_kind") or classify_lean_artifact(code),
+                        origin="legacy-run",
+                    )
+            formalization_id = formalization["id"]
+            store.link_session_formalization(session_id, formalization_id)
+            store.link_formalization_file(formalization_id, rel, "primary")
+            store.upsert_artifact(
+                project_id=project["id"] if project else None,
+                session_id=session_id,
+                run_id=run_id,
+                declaration_name=declaration,
+                kind=step.get("artifact_kind") or classify_lean_artifact(code),
+                path=rel,
+                module_name=_artifact_module_name(namespace, rel),
+                formalization_id=formalization_id,
+                source_hash=source_hash,
+            )
+        except Exception:
+            logger.exception("Could not record artifact row for %s in run %s", rel, run_id)
+
+
 def _relativize(path: str, repo: Path) -> str:
-    """A code_step's path is relative to the session repo (so `git show <sha>:<path>`
-    resolves). The agent writes absolute paths under the per-session workspace
-    (the prompt is pointed there), so this normally just strips the repo prefix;
-    a path outside the repo (drift) falls back to its basename."""
+    """Return a code step's path relative to the session workspace.
+
+    The agent writes absolute paths under that workspace (the prompt is pointed
+    there), so this normally just strips the prefix; a path outside it (drift)
+    falls back to its basename.
+    """
     p = Path(path)
     try:
         return str(p.resolve().relative_to(repo.resolve()))
@@ -442,7 +990,7 @@ def _with_subagents(cfg: LeaConfig) -> tuple[LeaConfig, str | None]:
     `spawn_subagent` is registered `opt_in=True` in the prover, so an unfiltered toolset
     (`tools=None`) never contains it. The coordinator gets its normal default toolset —
     whatever `build_toolset(None)` resolves — PLUS spawn_subagent, named explicitly, so
-    the model can delegate. Resolving the default at call time (not hard-coding the six
+    the model can delegate. Resolving the default at call time (not hard-coding the
     built-ins) keeps this correct if the default set ever changes."""
     from lea.registry import build_toolset
 
@@ -570,11 +1118,23 @@ def _subagent_progress_payload(child_id: str, result_id: str, inner) -> dict | N
     return None
 
 
+def _child_deltas(broker, started: dict) -> "_DeltaStream":
+    """The child's own text batcher, created on first use and kept on its `started`
+    record. A child streams tokens onto its own broker exactly like the coordinator
+    does, so it needs the same coalescing (P1)."""
+    stream = started.get("deltas")
+    if stream is None:
+        stream = _DeltaStream(broker)
+        started["deltas"] = stream
+    return stream
+
+
 def _flush_child_narration(broker, started: dict) -> None:
     """Commit the child's buffered narration as ONE assistant message on its broker, then
     clear the buffer. Mirrors the coordinator's `flush_narration`: a `message` whose
     content overlaps the live bubble REPLACES it (frontend), so each turn's narration lands
     as its own message instead of every turn concatenating into one run-together blob."""
+    _child_deltas(broker, started).flush()  # P1: publish trailing streamed text first
     buf = started.get("narration") or []
     text = "".join(buf).strip()
     started["narration"] = []
@@ -601,8 +1161,12 @@ def _forward_to_child_broker(broker, inner, started: dict) -> None:
     only; the durable transcript still replays into the child session on finish."""
     if isinstance(inner, AssistantTextDelta):
         started.setdefault("narration", []).append(inner.text)
-        emit(broker, "assistant_delta", {"text": inner.text})
-    elif isinstance(inner, TurnStarted):
+        _child_deltas(broker, started).add(inner.text)
+        return
+    # Same ordering rule as the coordinator (P1): anything that is not streamed text
+    # ends the batch, so a delta can't land after the step it preceded.
+    _child_deltas(broker, started).flush()
+    if isinstance(inner, TurnStarted):
         # A new turn began → the previous turn's narration is complete; commit it.
         _flush_child_narration(broker, started)
     elif isinstance(inner, ToolCalled):
@@ -767,6 +1331,51 @@ def _materialize_subagent(
     return child
 
 
+def _safeverify_file(path: str) -> str | None:
+    """SafeVerify's verdict for a file: 'ok' | 'rejected' | 'error' | 'unavailable',
+    or None if the audit could not be run at all.
+
+    A crash here is not a rejection — it must not block a promotion, or an unbuilt
+    SafeVerify would silently disable collation entirely."""
+    try:
+        return _safe_verify_file(path).status
+    except Exception:
+        logger.exception("SafeVerify could not audit %s; treating it as not run", path)
+        return None
+
+
+# Sentinel for "there was no file here", so it is distinguishable from "there was a
+# file and it was empty" — restoring the two differently is the whole point.
+_ABSENT = object()
+
+
+def _snapshot_file(path: Path):
+    """The file's current bytes, `_ABSENT` if it doesn't exist, or None if it exists but
+    can't be read. None means "cannot restore", and callers must not delete on it."""
+    if not path.exists():
+        return _ABSENT
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError):
+        logger.warning("could not snapshot %s before overwriting it", path, exc_info=True)
+        return None
+
+
+def _restore_file(path: Path, previous) -> None:
+    """Undo an overwrite guarded by :func:`_snapshot_file`. A snapshot that failed
+    (None) leaves the file alone: we have nothing to put back, and deleting would turn
+    a bad overwrite into data loss."""
+    if previous is _ABSENT:
+        path.unlink(missing_ok=True)
+        return
+    if previous is None:
+        return
+    try:
+        path.write_text(previous)
+    except OSError:
+        logger.exception("could not restore %s after a failed promotion", path)
+
+
 def _promote_winner(
     subagent_results: list[SubagentFinished],
     *,
@@ -776,6 +1385,7 @@ def _promote_winner(
     namespace: str | None,
     turn: int,
     events,
+    formalization_id: str | None = None,
 ) -> dict | None:
     """Deterministic collation (item 25): promote the best *compiling* sub-agent candidate
     as the coordinator's proof, and record it as a code_step — the compiler decides, not
@@ -795,12 +1405,37 @@ def _promote_winner(
     if not subagent_results:
         return None
     candidates = [collation.candidate_from_event(ev, base_dir=repo) for ev in subagent_results]
-    winner = collation.select_promotable(candidates)
-    if winner is None or not winner.candidate_path:
-        return None
+    # Best-first, and try the next one if the best fails a gate (AUDIT-2026-07-24 C5).
+    # `rank` is total, so once a non-promotable candidate appears everything after it
+    # is worse; there is nothing left to try.
+    for winner in collation.rank(candidates):
+        if not winner.is_promotable or not winner.candidate_path:
+            return None
+        step = _try_promote(
+            winner, session_id=session_id, run_id=run_id, repo=repo,
+            namespace=namespace, formalization_id=formalization_id,
+            turn=turn, events=events,
+        )
+        if step is not None:
+            return step
+    return None
+
+
+def _try_promote(
+    winner, *, session_id, run_id, repo, namespace, formalization_id, turn, events
+) -> dict | None:
+    """Promote one candidate, or return None having left the tree as it was found."""
     # The session's canonical proofs dir: its namespace path (loose → Lea/Misc).
     ns_path = (namespace or "Lea.Misc").replace(".", "/")
     canonical = repo / ns_path / Path(winner.candidate_path).name
+    # Whatever stands at the canonical path right now — very possibly a VERIFIED proof
+    # from an earlier run. `promote` overwrites it, and the re-verification that decides
+    # whether the candidate is worth keeping happens afterwards, so a candidate that
+    # failed used to destroy the good proof it replaced and leave itself in its place
+    # (AUDIT-2026-07-24 C3). Nothing recorded the change, either: the code_step is only
+    # written on success, so the file on disk — which is what Lean compiles, what
+    # /export zips, and what `git push` ships — silently diverged from the timeline.
+    previous = _snapshot_file(canonical)
     try:
         collation.promote(winner, canonical)
     except ValueError as exc:
@@ -812,14 +1447,22 @@ def _promote_winner(
                  f"written to {canonical.name}: {exc}",
                  turn=turn, child_result_id=winner.result_id)
         return None
-    # Re-verify at the NEW path — the child checked a different location.
+    # Re-verify at the NEW path — the child checked a different location. Deliberately
+    # AT the canonical path rather than at a temp one: Lake resolves modules by
+    # location, so the path is part of what is being verified, and checking elsewhere
+    # would verify something other than what we are about to keep. That is why the fix
+    # for C3 is restore-on-failure rather than verify-then-move.
     verdict = _lean_check_file(str(canonical))
     if verdict.status != "ok":
         # D1: the re-verification is CORRECT and stays — recording an unchecked "ok"
         # would be worse. But it was a `logger.warning`, so the human watched N
         # children run for minutes and was shown: no proof, no promotion, no reason.
+        # Restore first (C3), then report: the file on disk and the explanation of
+        # what happened to it are two halves of the same recovery.
+        _restore_file(canonical, previous)
         logger.warning(
-            "sub-agent candidate %s did not re-verify at %s (%s); not promoting",
+            "sub-agent candidate %s did not re-verify at %s (%s); not promoting "
+            "(restored the previous file)",
             winner.result_id, canonical, verdict.detail,
         )
         diagnose(events, session_id, run_id, "step_error", "subagent.promotion_rejected",
@@ -829,12 +1472,36 @@ def _promote_winner(
                  turn=turn, path=_relativize(str(canonical), repo),
                  child_result_id=winner.result_id)
         return None
+    # SafeVerify gate (AUDIT-2026-07-24 C5). `collation` documents that a
+    # SafeVerify-REJECTED candidate must never become the proof of record — "promoting
+    # a cheat to the canonical file is exactly the failure SafeVerify exists to catch"
+    # — but its `_TIER_SV_REJECTED` was unreachable, because nothing ever populated
+    # `safeverify_status`. So the guarantee was documented and not enforced.
+    #
+    # Enforced here rather than by SafeVerifying every candidate before ranking: the
+    # audit is a kernel replay, the ranking already put the compiler's verdict first,
+    # and only the winner can become the proof of record — so one audit, at the moment
+    # it decides something, instead of N that mostly inform an ordering.
+    #
+    # ONLY 'rejected' blocks. 'unavailable' (the binary isn't built) and 'error' leave
+    # the candidate where lean_check put it, matching collation's stated degradation:
+    # missing SafeVerify must never *mis*-rank, only fail to catch a cheat.
+    audit = _safeverify_file(str(canonical))
+    if audit == "rejected":
+        _restore_file(canonical, previous)
+        logger.warning(
+            "sub-agent candidate %s compiles but SafeVerify rejected it at %s; not "
+            "promoting (restored the previous file)",
+            winner.result_id, canonical,
+        )
+        return None
     rel = _relativize(str(canonical), repo)
     step = store.add_code_step(
         session_id, run_id, rel, content=winner.text or "", author="agent", turn=turn,
         summary=f"Promoted the winning sub-agent candidate ({winner.result_id}).",
         check_status="ok", check_detail=None,
         artifact_kind=_classify(winner.text or ""),
+        formalization_id=formalization_id,
         provenance={"promoted_from": winner.result_id},
     )
     emit(events, "code_step", step)
@@ -844,6 +1511,30 @@ def _promote_winner(
         "turn": turn,
     })
     return step
+
+
+def _best_effort(what: str, run_id: str, action) -> None:
+    """Run one piece of post-outcome bookkeeping, logging rather than raising.
+
+    Used only for work that happens AFTER the run's result is durable, where failing
+    loudly would be strictly worse than failing quietly: the result is already correct,
+    and the alternative is discarding it (C6)."""
+    try:
+        action()
+    except Exception:
+        logger.exception("Could not persist the %s for run %s", what, run_id)
+
+
+def _run_is_terminal(run_id: str) -> bool:
+    """Whether the run row already holds a final status. A read failure answers False,
+    so an unreachable database falls back to the old mark-it-failed behaviour rather
+    than silently leaving a run looking live."""
+    try:
+        run = store.get_run(run_id)
+    except Exception:
+        logger.exception("Could not read run %s while handling a failure", run_id)
+        return False
+    return bool(run) and run["status"] not in {"pending", "running"}
 
 
 def run_lea(context: RunnerContext) -> None:
@@ -875,9 +1566,9 @@ def run_lea(context: RunnerContext) -> None:
     session_id = context.session_id
     run_id = context.run_id
 
-    # Admission (which run may start, and whether there's room) already happened at
-    # the endpoint (runregistry.try_admit) before this thread was spawned. run_lea no
-    # longer acquires a slot — it owns the one it was admitted into and releases it in
+    # Admission (which run may start, and whether there's room) already happened in
+    # the dispatcher before this thread was spawned. run_lea no longer acquires a
+    # slot — it owns the one it was admitted into and releases it in
     # the finally. Crucially the whole body, INCLUDING the setup that used to sit
     # outside the try, now runs inside one guarded region: a throw in setup releases
     # the slot instead of leaking it forever (v2.3 items 4/9).
@@ -891,6 +1582,9 @@ def run_lea(context: RunnerContext) -> None:
     skills_tempdir: str | None = None
 
     narration: list[str] = []
+    # Batches streamed text into ~one frame per subscriber poll (P1). `narration` still
+    # accumulates every token for persistence — this only shapes what goes on the wire.
+    deltas = _DeltaStream(events)
     current_turn = 0
     last_tool: str | None = None
     # The intent narration the model wrote just before its current tool call —
@@ -926,6 +1620,42 @@ def run_lea(context: RunnerContext) -> None:
     final_status = "failed"
     final_result_kind: str | None = None
     final_result_detail: str | None = None
+    focus_formalization_id: str | None = None
+    focus_source_hash: str | None = None
+
+    # Mid-run spend enforcement (PLAN-system-hardening 0.1): the cap used to be
+    # checked only at POST /api/runs, so one run could overshoot it by its entire
+    # cost. The active-cost overlay above keeps concurrent, not-yet-persisted run
+    # spend visible. The agent halts at the next turn boundary, so one turn may
+    # overshoot but a run can no longer run away.
+    max_spend_usd = cfg.max_spend_usd
+    spend_capped = False
+    with _live_spend_lock:
+        _live_run_costs[run_id] = 0.0
+
+    def check_spend_cap() -> None:
+        nonlocal spend_capped
+        if spend_capped or max_spend_usd is None:
+            return
+        try:
+            # A scalar aggregate over every run — NOT usage_stats()["global"], which
+            # summed a 100-session page and so under-reported the very total this cap
+            # is enforced against (AUDIT-2026-07-24 C1) — and memoized, because this
+            # runs per usage event (P2).
+            persisted = _persisted_spend_usd()
+        except Exception:
+            logger.exception("Could not read persisted spend; skipping this cap check")
+            return
+        with _live_spend_lock:
+            live = sum(_live_run_costs.values())
+        if persisted + live >= float(max_spend_usd):
+            spend_capped = True
+            stop_event.set()
+            emit(events, "status", {
+                "status": "max_spend",
+                "message": "Max spend limit reached — stopping this run.",
+                "turn": current_turn,
+            })
 
     def persist_assistant(text: str) -> None:
         nonlocal last_persisted
@@ -933,7 +1663,18 @@ def run_lea(context: RunnerContext) -> None:
         if not text or text == last_persisted:
             return
         last_persisted = text
-        emit(events, "message", store.add_message(session_id, "assistant", text, run_id, kind="assistant"))
+        emit(
+            events,
+            "message",
+            store.add_message(
+                session_id,
+                "assistant",
+                text,
+                run_id,
+                kind="assistant",
+                formalization_id=focus_formalization_id,
+            ),
+        )
 
     def flush_narration() -> str:
         text = "".join(narration)
@@ -950,6 +1691,15 @@ def run_lea(context: RunnerContext) -> None:
         # session-keyed primitive below operates on the right repo unchanged. The real
         # session_id still keys all DB rows.
         session = store.get_session(session_id)
+        run_row = store.get_run(run_id)
+        focus_formalization_id = (
+            run_row.get("focus_formalization_id") if run_row else None
+        )
+        focus_source_hash = run_row.get("focus_source_hash") if run_row else None
+        focused_formalization = (
+            formalization_service.get(focus_formalization_id)
+            if focus_formalization_id else None
+        )
         project = (
             store.get_project(session["project_id"])
             if session and session.get("project_id") else None
@@ -972,10 +1722,21 @@ def run_lea(context: RunnerContext) -> None:
             skill_paths, skills_tempdir = skills_catalog.materialize_project_skills(project["id"])
             if skill_paths:
                 cfg = replace(cfg, skills=skill_paths)
-        store.update_run(run_id, "running")
+        # Claim the row (C7). If the interrupt endpoint got here first the row is no
+        # longer pending, and starting anyway would execute — and bill — a run the
+        # client was already told was cancelled. This replaces the plain
+        # `update_run(running)`: the claim IS the transition.
+        if not store.claim_pending_run(run_id):
+            current = store.get_run(run_id)
+            final_status = (current or {}).get("status") or "cancelled"
+            final_result_kind = (current or {}).get("result_kind")
+            final_result_detail = (current or {}).get("result_detail")
+            logger.info("Run %s was finalized before it started (%s); not running it",
+                        run_id, final_status)
+            return
         if subagent_override_error:
-            # F2: reported now rather than at load time — a diagnostic needs the run
-            # row it hangs off to exist.
+            # F2: reported AFTER the claim — a diagnostic needs a live run row to hang
+            # off, and a run cancelled before it started has nothing to report against.
             diagnose(events, session_id, run_id, "degraded", "settings.overrides_unreadable",
                      f"Your sub-agent overrides could not be read ({subagent_override_error}); "
                      "every sub-agent in this run used its built-in defaults.")
@@ -988,9 +1749,18 @@ def run_lea(context: RunnerContext) -> None:
         # the agent last acted, prepend their diff (+ notes) to the task so the agent
         # works from the current canvas, not its stale memory.
         task_content = context.task
-        divergence = _divergence_context(session_id, repo_key, gs)
+        divergence = _divergence_context(
+            session_id, repo_key, gs, focus_formalization_id
+        )
         if divergence:
-            task_content = f"{divergence}\n\n{context.task}"
+            task_content = f"{divergence}\n\n{task_content}"
+        # Transcript gap (C10): `prior` is whatever run last stored a transcript, which
+        # may not be the run that actually ran last — a crash mid-turn stores none and
+        # vanishes from the replay. Say so rather than presenting a history with a
+        # silent hole in it. Prepended last so it is the first thing the model reads.
+        gap = _transcript_gap_context(session_id, run_id)
+        if gap:
+            task_content = f"{gap}\n\n{task_content}"
         # Project context (D25): prepend ONE composed message (instructions + memory +
         # blueprint + file inventory). Strip any stale copy from the replayed
         # transcript first, so exactly one — always current — leads the messages.
@@ -998,7 +1768,14 @@ def run_lea(context: RunnerContext) -> None:
         ctx = projects.compose_context_message(project, repo) if project else None
         if ctx:
             prior = [m for m in prior if not projects.is_context_message(m)]
-        messages = ([ctx] if ctx else []) + prior + [{"role": "user", "content": task_content}]
+        focus_ctx = _formalization_context_message(focused_formalization)
+        prior = [m for m in prior if not _is_formalization_context_message(m)]
+        messages = (
+            ([ctx] if ctx else [])
+            + ([focus_ctx] if focus_ctx else [])
+            + prior
+            + [{"role": "user", "content": task_content}]
+        )
 
         # Drive the generator manually (not `for`): the per-tool gate (D19) is a
         # two-way exchange — the prover yields ToolApprovalRequested and we feed the
@@ -1016,17 +1793,25 @@ def run_lea(context: RunnerContext) -> None:
                 break
             to_send = None
 
+            # Any event that is not streamed text ends the current text batch, so a
+            # buffered delta can never be published after the event it preceded (P1).
+            # One check here rather than a flush in every branch below: the ordering
+            # rule then cannot be forgotten when a new event type is added.
+            if not isinstance(ev, AssistantTextDelta):
+                deltas.flush()
+
             if isinstance(ev, ToolApprovalRequested):
                 to_send = _await_decision(run_id, session_id, ev, events, stop_event)
                 continue
 
             if isinstance(ev, AssistantTextDelta):
                 narration.append(ev.text)
-                emit(events, "assistant_delta", {"text": ev.text})
+                deltas.add(ev.text)
 
             elif isinstance(ev, TurnStarted):
                 flush_narration()
                 current_turn = ev.turn
+                check_spend_cap()
 
             elif isinstance(ev, ToolCalled):
                 intent = flush_narration()
@@ -1042,6 +1827,9 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, FileChanged):
                 rel = _relativize(ev.path, repo)
+                formalization_id = _attributable_formalization(
+                    rel, focus_formalization_id
+                )
                 # The file on disk *is* the after-state — the prover has already
                 # written it. Reading it here is what makes the stored content and
                 # the streamed snapshot the same bytes by construction, rather than
@@ -1052,7 +1840,12 @@ def run_lea(context: RunnerContext) -> None:
                     session_id, run_id, rel, content=(after or ""),
                     author="agent", turn=current_turn, summary=last_intent,
                     content_lost=after is None,
+                    formalization_id=formalization_id,
                 )
+                if formalization_id:
+                    store.link_formalization_file(
+                        formalization_id, rel, "generated"
+                    )
                 step_id_by_path[rel] = step["id"]
                 emit(events, "code_step", step)  # already carries `code`
                 if after is None:
@@ -1065,6 +1858,9 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, CheckResult):
                 rel = _relativize(ev.path, repo)
+                formalization_id = _attributable_formalization(
+                    rel, focus_formalization_id
+                )
                 step_id = step_id_by_path.get(rel)
                 if step_id is None:
                     # A file this run never wrote through write_file/edit_file — a
@@ -1080,7 +1876,12 @@ def run_lea(context: RunnerContext) -> None:
                         check_status=ev.status, check_detail=ev.detail,
                         artifact_kind=(_classify(after) if (ev.status == "ok" and after is not None) else None),
                         content_lost=after is None,
+                        formalization_id=formalization_id,
                     )
+                    if formalization_id:
+                        store.link_formalization_file(
+                            formalization_id, rel, "generated"
+                        )
                     step_id_by_path[rel] = step["id"]
                     if after is None:
                         diagnose(events, session_id, run_id, "step_error", "code.content_lost",
@@ -1111,6 +1912,11 @@ def run_lea(context: RunnerContext) -> None:
 
             elif isinstance(ev, UsageUpdated):
                 usage.add(current_turn, ev.input_tokens, ev.output_tokens, ev.cost)
+                with _live_spend_lock:
+                    _live_run_costs[run_id] = (
+                        _live_run_costs.get(run_id, 0.0) + float(ev.cost or 0.0)
+                    )
+                check_spend_cap()
 
             elif isinstance(ev, Compacted):
                 # G1: the context condenser ran this turn — the coordinator's model-facing
@@ -1131,7 +1937,11 @@ def run_lea(context: RunnerContext) -> None:
                     "referenced_files": [],
                 })
                 emit(events, "message",
-                     store.add_message(session_id, "assistant", _payload, run_id, kind="compaction"))
+                     store.add_message(
+                         session_id, "assistant", _payload, run_id,
+                         kind="compaction",
+                         formalization_id=focus_formalization_id,
+                     ))
 
             elif isinstance(ev, ToolResulted):
                 # A project asset write (D33): a non-.lean write_file/edit_file in a
@@ -1147,7 +1957,9 @@ def run_lea(context: RunnerContext) -> None:
                     and not str(last_write_path).endswith(".lean")
                 ):
                     asset_rel = _relativize(last_write_path, repo)
-                    sha = gs.commit_all(repo, f"agent {ev.name}: {asset_rel}")
+                    # Scoped to the asset this tool call wrote (X2): a concurrent run
+                    # in the same project repo must not land in this commit.
+                    sha = gs.commit_all(repo, f"agent {ev.name}: {asset_rel}", paths=[asset_rel])
                     emit(events, "project_updated", {
                         "project_id": project["id"], "path": asset_rel, "commit_sha": sha,
                     })
@@ -1347,26 +2159,50 @@ def run_lea(context: RunnerContext) -> None:
                 if not produced_clean and subagent_results:
                     promoted = _promote_winner(
                         subagent_results, session_id=session_id, run_id=run_id,
-                        repo=repo, namespace=namespace, turn=current_turn, events=events,
+                        repo=repo, namespace=namespace,
+                        formalization_id=focus_formalization_id,
+                        turn=current_turn, events=events,
                     )
                     if promoted:
                         checked_artifact_kind = promoted.get("artifact_kind") or checked_artifact_kind
+                        step_id_by_path[promoted["path"]] = promoted["id"]
                         produced_clean = True
                 final_text = _final_text_for_result(ev)
                 persist_assistant(final_text)
                 final_status, result_kind = _completed_artifact_result(ev, checked_artifact_kind)
                 final_result_kind = result_kind
                 final_result_detail = None if result_kind == "defined" else ev.result_detail
+                if spend_capped and ev.reason != "completed":
+                    # Our own cap-triggered stop, not a user cancel: label it. A
+                    # run that completed anyway (finished the proof in the same
+                    # turn the cap tripped) keeps its real result.
+                    final_result_kind = "max_spend"
+                    final_result_detail = _MAX_SPEND_DETAIL
                 store.update_run(
                     run_id, final_status, final_text=final_text,
                     input_tokens=ev.usage.input_tokens, output_tokens=ev.usage.output_tokens,
                     cost_usd=ev.cost,
-                    result_kind=result_kind, result_detail=final_result_detail,
+                    result_kind=final_result_kind, result_detail=final_result_detail,
                 )
-                store.replace_run_usage_breakdown(run_id, usage.rows())
+                # Everything past this point is BOOKKEEPING: the run's outcome is
+                # already durable above. Each piece is guarded on its own so one
+                # failure neither loses the others nor escapes to the handler below,
+                # which used to rewrite a proved run to 'failed' over a locked DB or an
+                # unserializable transcript (AUDIT-2026-07-24 C6).
+                _best_effort("usage breakdown", run_id,
+                             lambda: store.replace_run_usage_breakdown(run_id, usage.rows()))
                 # Persist the faithful conversation for the next activation to replay
                 # (multi-turn, D16). Only here, on Finished — an errored run stores none.
-                store.set_run_transcript(run_id, ev.transcript.get("messages", []))
+                _best_effort("transcript", run_id,
+                             lambda: store.set_run_transcript(run_id, ev.transcript.get("messages", [])))
+                # Structured artifact index (4.1): record which declarations this
+                # run's checked files hold, keyed to the run's own FileChanged set.
+                _best_effort("artifact index", run_id,
+                             lambda: _record_run_artifacts(
+                                 session_id, run_id, project, namespace,
+                                 dict(step_id_by_path),
+                                 focus_formalization_id=focus_formalization_id,
+                                 source_hash=focus_source_hash))
 
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)
@@ -1374,9 +2210,14 @@ def run_lea(context: RunnerContext) -> None:
         # C3/B1: this handler has always had `current_turn`, `last_tool` and
         # `step_id_by_path` in scope and used none of them — it emitted the bare
         # exception, so the user got `AuthenticationError: ...` with no indication of
-        # what the run was doing or what to do about it. Classify the exception into
-        # a coded diagnostic (the catalog supplies the remedy) and anchor it.
-        detail = f"{type(exc).__name__}: {exc}"
+        # what the run was doing or what to do about it. Classify it into a coded
+        # diagnostic (the catalog supplies the remedy) and anchor it.
+        #
+        # REDACTED, not raw. Provider errors quote the credential back at you — the
+        # live DeepSeek failure read "Your api key: ... is invalid" — and a diagnostic
+        # is persisted to the database and rendered in the UI, so classifying off the
+        # raw exception would have leaked the key into both.
+        error_detail = _public_error_detail(exc)
         # Whether a key is SAVED for this model's provider. It separates "you never
         # added a key" from "the key you added was rejected" — two different mistakes
         # that look identical in the exception. `None` when we can't tell, so the
@@ -1393,9 +2234,14 @@ def run_lea(context: RunnerContext) -> None:
         except Exception:  # noqa: BLE001 — never let the explainer break the report
             logger.debug("Could not resolve key requirements for %s", cfg.model, exc_info=True)
         analysis = analyze_exception(exc, model=cfg.model, key_configured=key_configured)
+        # The classification reads the raw exception, but nothing user-facing may carry
+        # it: re-redact whatever the analysis extracted from the provider's message.
+        analysis["message"] = _redact(analysis["message"])
+        if analysis.get("detail"):
+            analysis["detail"] = _redact(analysis["detail"])
         # `run_error` stays for the Overleaf companion, which parses this frame as the
         # failure reason (companion/leaApiClient.mjs). The diagnostic is the UI's.
-        emit(events, "run_error", {"message": detail})
+        emit(events, "run_error", {"message": error_detail})
         _crash_path = _relativize(last_write_path, repo) if (last_write_path and repo) else None
         diagnose(events, session_id, run_id, "fatal", analysis["code"], analysis["message"],
                  turn=current_turn or None, remedy=analysis["remedy"], tool=last_tool,
@@ -1403,13 +2249,34 @@ def run_lea(context: RunnerContext) -> None:
                  actions=analysis["actions"], model=cfg.model,
                  path=_crash_path,
                  step_id=step_id_by_path.get(_crash_path) if _crash_path else None)
-        try:
-            store.update_run(run_id, "failed", result_kind="failed", result_detail=detail)
-        except Exception:
-            logger.exception("Failed to mark run %s failed", run_id)
-        final_status = "failed"
-        final_result_detail = detail
+        # Never downgrade a run that already reached a terminal status (C6). The
+        # Finished handler persists the outcome before doing anything else, so a
+        # failure after that point is a bookkeeping problem, not a failed proof —
+        # marking it 'failed' here discarded a real result AND, because the derived
+        # session status reads the latest code step's run, made the session look broken
+        # too. The `done` frame keeps the real outcome for the same reason.
+        if _run_is_terminal(run_id):
+            logger.warning(
+                "Run %s already finished as %r; keeping that outcome despite the error",
+                run_id, final_status,
+            )
+        else:
+            try:
+                store.update_run(
+                    run_id,
+                    "failed",
+                    result_kind="failed",
+                    result_detail=error_detail,
+                )
+            except Exception:
+                logger.exception("Failed to mark run %s failed", run_id)
+            final_status = "failed"
+            final_result_kind = "failed"
+            final_result_detail = error_detail
     finally:
+        # Publish any trailing streamed text before the terminal `done` (P1) — a run
+        # that ends mid-batch must not drop its last words.
+        deltas.flush()
         skills_catalog.cleanup(skills_tempdir)
         # D1: retire any child whose SubagentStarted never saw its SubagentFinished —
         # the coordinator was interrupted or crashed mid-child. Left 'running', its run
@@ -1429,7 +2296,9 @@ def run_lea(context: RunnerContext) -> None:
         subagent_children.clear()
         _stop_events.pop(run_id, None)
         _pending_approvals.pop(run_id, None)
-        # Release the admission slot (paired with the endpoint's try_admit). Idempotent,
+        with _live_spend_lock:
+            _live_run_costs.pop(run_id, None)
+        # Release the admission slot (paired with the dispatcher's try_admit). Idempotent,
         # so a run that reaches here unadmitted — e.g. a direct unit-test call to
         # run_lea, which never goes through the endpoint — is a harmless no-op.
         runregistry.registry.release(run_id)
@@ -1439,8 +2308,8 @@ def run_lea(context: RunnerContext) -> None:
         if final_result_detail:
             done_payload["result_detail"] = final_result_detail
         emit(events, "done", done_payload)
-        # The run has ended: retire its broker so no new connection attaches to a
-        # finished stream (a late reconnect is caught by the endpoint's terminal-status
-        # 409). Subscribers still draining hold their own reference and exit on `done`.
-        # Idempotent, so a direct unit-test call to run_lea (no broker) is a no-op.
+        # The run has ended: retire its broker. Subscribers already draining hold
+        # their own reference and exit on `done`; a late observer gets a synthesized
+        # terminal event from the persisted run row. Idempotent, so a direct unit-test
+        # call to run_lea (no broker) is a no-op.
         runbroker.drop(run_id)

@@ -133,13 +133,17 @@ def test_write_and_check_agree_on_what_a_relative_path_means():
     with tempfile.TemporaryDirectory() as d:
         wd = str(Path(d).resolve())
         with run_context(working_dir=wd):
-            tools.write_file("candidate.lean", "import Mathlib\n")
+            # Deliberately no umbrella `import Mathlib`: that is refused by the
+            # targeted-import policy, and this test is about PATH RESOLUTION — a
+            # fixture that trips an unrelated rule would fail for the wrong reason.
+            body = "theorem t : True := by trivial\n"
+            tools.write_file("candidate.lean", body)
             # Where the write actually landed...
             written = Path(wd) / "candidate.lean"
             check("write_file resolved against the working dir", written.exists())
             # ...is where a relative read/check must look.
             check("read_file finds the file the write just made",
-                  "import Mathlib" in tools.read_file("candidate.lean"))
+                  "theorem t" in tools.read_file("candidate.lean"))
             # lean_check needs a toolchain to compile, but the resolution step happens
             # first: the old code failed here with "does not exist" before ever
             # reaching Lean, which is the failure this pins.

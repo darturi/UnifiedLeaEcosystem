@@ -19,19 +19,87 @@ indexes). Hand-writing that is high-risk here because `foreign_keys` is OFF and
 fails *silently*.
 
 Concurrency: several workers may start at once and all call `upgrade_to_head()`.
-Alembic takes SQLite's write lock for each revision, so the losers block and then
-observe the applied version — exactly-once, verified in `tests/test_migrations.py`.
+They serialize on an exclusive **file lock** held for the whole call — see
+`_migration_lock` for why SQLite's own write lock is not sufficient.
 """
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from alembic import command
 from alembic.config import Config
 
+logger = logging.getLogger("lea-interface.migrations")
+
 ADAPTER_ROOT = Path(__file__).resolve().parents[1]
 ALEMBIC_INI = ADAPTER_ROOT / "alembic.ini"
+
+
+def _lock_path() -> Path:
+    """The migration lock file, beside the database it guards.
+
+    Resolved through the `db` module on every call, never bound at import: tests
+    redirect `db.DB_PATH`, and a lock taken next to the developer's real database
+    while "running on a copy" would be the same hazard `backup.py` documents."""
+    from . import db
+
+    return db.DB_PATH.parent / f"{db.DB_PATH.name}.migrate.lock"
+
+
+@contextmanager
+def _migration_lock() -> Iterator[None]:
+    """Hold an exclusive, cross-process lock for the duration of an upgrade.
+
+    This exists because SQLite's write lock is **not** enough, which is what this
+    module used to claim (AUDIT-2026-07-24 X6). Alembic computes the upgrade plan
+    from the version it reads *before* it writes anything; the database lock
+    serializes the individual writes, not plan-then-apply. On a linear chain the
+    loser's plan happens to collapse to a no-op, so the claim held by luck. It stopped
+    holding when the graph branched: `0005_session_parent` has two children
+    (`0006_artifact_index`, `0006_timeline_compaction_kind`) merged by `0007`, so two
+    processes can legitimately be on *different* heads, and the merge revision then
+    fails with either
+
+        CommandError: Requested revision 0007_… overlaps with other requested
+                      revisions 0006_artifact_index
+
+    or an `UPDATE alembic_version` that matches zero rows. Reproduced 4 times in 10
+    parallel runs of `test_concurrent_startup_migrates_exactly_once`; the exception
+    propagates out of `main.startup()`, so the adapter fails to boot.
+
+    The lock covers the snapshot decision too, so N simultaneous workers take one
+    backup between them rather than one each.
+
+    **Blocking is safe here, and deliberate.** `flock` is released by the kernel when
+    the holding process dies, so a crashed migrator cannot leave a stale lock — the
+    only thing that can make a waiter wait a long time is another process genuinely
+    migrating, which is exactly when waiting is correct. That is why there is no
+    timeout: a timeout could only turn "someone is still working" into a spurious
+    startup failure.
+
+    Platforms without `fcntl` (Windows) fall back to no lock: single-process startup
+    there is unaffected, and degrading to the previous behaviour is better than
+    refusing to start. The supported deployment shapes (macOS dev, Linux/Docker) all
+    have it."""
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - POSIX-only lock; see docstring
+        logger.warning("fcntl unavailable: migrating without a cross-process lock")
+        yield
+        return
+
+    path = _lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _config() -> Config:
@@ -60,14 +128,22 @@ def upgrade_to_head() -> None:
     Now that SQL owns proof content, a bad revision is the event most likely to
     destroy the user's work, and it is the one moment we always see coming. If the
     snapshot fails the migration does not run: refusing to start is recoverable,
-    migrating the only copy without a fallback is not."""
-    current = current_revision()
-    if current != head_revision():
-        from .backup import snapshot
+    migrating the only copy without a fallback is not.
 
-        snapshot(tag=current or "unstamped")  # raises BackupError -> no migration
+    The whole body runs under `_migration_lock()`. Reading the current revision,
+    deciding to snapshot, and applying the plan have to be one atomic step — Alembic
+    plans against the version it reads first, so splitting them is what let concurrent
+    workers collide (X6). A worker that waits here re-reads the version afterwards and
+    finds the work already done, which is the "exactly-once" this module always
+    claimed."""
+    with _migration_lock():
+        current = current_revision()
+        if current != head_revision():
+            from .backup import snapshot
 
-    command.upgrade(_config(), "head")
+            snapshot(tag=current or "unstamped")  # raises BackupError -> no migration
+
+        command.upgrade(_config(), "head")
 
 
 def current_revision() -> str | None:

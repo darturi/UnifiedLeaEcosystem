@@ -196,7 +196,13 @@ def build_graph(project: dict, proofs_root: Path) -> dict:
     for node in parsed["nodes"]:
         lean = node["lean"]
         file = _resolve_file(lean, fqn_to_file) if lean else None
-        steps = store.code_steps_for_project_path(project["id"], file) if file else []
+        # Only the verdict and the session attribution are read below, so skip the
+        # blob join (P3): hydrating every revision of every file to look at
+        # `check_status` was the graph's whole cost.
+        steps = (
+            store.code_steps_for_project_path(project["id"], file, include_content=False)
+            if file else []
+        )
         latest = steps[0] if steps else None
         has_sorry = _decl_has_sorry(file_to_text.get(file, ""), lean) if file else False
         status = _base_status(lean, file, latest, has_sorry)

@@ -78,6 +78,7 @@ export function ChatThread({
   onOpenSettings,
   canvasCollapsed,
   onToggleCanvas,
+  onRenameSession,
 }: {
   title: string;
   sidebarCollapsed?: boolean;
@@ -93,6 +94,7 @@ export function ChatThread({
   onOpenSettings?: () => void;
   canvasCollapsed: boolean;
   onToggleCanvas: () => void;
+  onRenameSession?: (title: string) => Promise<void> | void;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -110,6 +112,15 @@ export function ChatThread({
     },
     [onOpenSettings],
   );
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(title);
+  useEffect(() => setTitleDraft(title), [title]);
+  const commitTitle = async () => {
+    const next = titleDraft.trim();
+    if (next && next !== title) await onRenameSession?.(next);
+    else setTitleDraft(title);
+    setEditingTitle(false);
+  };
   // R4: model picker state + key-missing nudge from the model store.
   const model = useModel((s) => s.model);
   const modelCatalog = useModel((s) => s.modelCatalog);
@@ -167,6 +178,8 @@ export function ChatThread({
   const runStatus = useProofSession((s) => s.runStatus);
   const runStatusById = useProofSession((s) => s.runStatusById);
   const runResultKindById = useProofSession((s) => s.runResultKindById);
+  const runFocusById = useProofSession((s) => s.runFocusById);
+  const formalizations = useProofSession((s) => s.formalizations);
   const isRunning = useProofSession((s) => s.isRunning);
   const currentRunId = useProofSession((s) => s.currentRunId);
   const approvals = useProofSession((s) => s.approvals);
@@ -508,7 +521,30 @@ export function ChatThread({
             <PanelLeftOpen size={15} />
           </button>
         )}
-        <span className="ttl">{title}</span>
+        {editingTitle ? (
+          <input
+            className="title-edit"
+            value={titleDraft}
+            autoFocus
+            onChange={(event) => setTitleDraft(event.target.value)}
+            onBlur={() => void commitTitle()}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') void commitTitle();
+              if (event.key === 'Escape') {
+                setTitleDraft(title);
+                setEditingTitle(false);
+              }
+            }}
+          />
+        ) : (
+          <button
+            className="ttl title-button"
+            onDoubleClick={() => session && setEditingTitle(true)}
+            title={session ? 'Double-click to rename this conversation' : undefined}
+          >
+            {title}
+          </button>
+        )}
         {headChip && <span className={`chip ${headChip.cls}`}>{headChip.text}</span>}
         <OriginBadge origin={session?.origin} originUrl={session?.origin_url} />
         <span className="head-spacer" />
@@ -559,9 +595,23 @@ export function ChatThread({
             const codeStepList = codeNodes.map((n) => n.step);
             const steps = codeStepList.length;
             const resultKind = group.runId ? runResultKindById[group.runId] : undefined;
+            const focusId = group.runId ? runFocusById[group.runId] : undefined;
+            const focused = focusId
+              ? formalizations.find((item) => item.id === focusId)
+              : undefined;
             const completion = deriveRunCompletionStatus(status, codeStepList, resultKind);
             return (
               <Fragment key={group.runId ?? `g${gi}`}>
+                {group.runId && (
+                  <div className="run-episode">
+                    <span>Run {gi + 1}</span>
+                    <strong>
+                      {focused
+                        ? `Working on ${focused.declaration_name || focused.display_title}`
+                        : 'Project discussion'}
+                    </strong>
+                  </div>
+                )}
                 {coalesceUnits(group.nodes).map((unit) =>
                   unit.kind === 'spawn-group' ? (
                     <SpawnGroup
@@ -645,6 +695,7 @@ export function ChatThread({
         </div>
       ) : (
       <div className="composer">
+        <FormalizationScope session={session} />
         {keyMissing && (
           <div className="key-nudge">
             <span>
@@ -779,6 +830,131 @@ export function ChatThread({
       )}
     </main>
   );
+}
+
+function FormalizationScope({ session }: { session?: SessionSummary }) {
+  const formalizations = useProofSession((state) => state.formalizations);
+  const scope = useProofSession((state) => state.formalizationScope);
+  const setScope = useProofSession((state) => state.setFormalizationScope);
+  const override = useProofSession((state) => state.composerScopeOverride);
+  const setOverride = useProofSession((state) => state.setComposerScopeOverride);
+  const setCanvasRevisionMode = useProofSession(
+    (state) => state.setCanvasRevisionMode,
+  );
+  const [overrideOpen, setOverrideOpen] = useState(false);
+  const projectLabel = session?.project_id ? 'Project discussion' : 'General discussion';
+  const overrideFormalization =
+    override && override !== 'project' && override !== 'new'
+      ? formalizations.find((item) => item.id === override)
+      : undefined;
+  const overrideLabel =
+    override === 'project'
+      ? projectLabel
+      : override === 'new'
+        ? 'New formalization'
+        : overrideFormalization
+          ? overrideFormalization.declaration_name || overrideFormalization.display_title
+          : null;
+  const viewScope = (nextScope: string) => {
+    setScope(nextScope);
+    setOverride(null);
+    setCanvasRevisionMode('current');
+  };
+  const manuallyTarget = (nextScope: string) => {
+    setScope(nextScope);
+    setOverride(nextScope);
+    setCanvasRevisionMode('current');
+    setOverrideOpen(false);
+  };
+
+  return (
+    <div className="form-scope">
+      <div className="form-rail" aria-label="Session formalizations">
+        <button
+          type="button"
+          className={scope === 'project' ? 'active' : ''}
+          onClick={() => viewScope('project')}
+        >
+          All work
+        </button>
+        {formalizations.map((item) => (
+          <button
+            type="button"
+            key={item.id}
+            className={scope === item.id ? 'active' : ''}
+            onClick={() => viewScope(item.id)}
+            title={item.primary_path || item.statement || item.display_title}
+          >
+            <span className={`form-dot ${formalizationStatusClass(item.validity_status, item.activity.status)}`} />
+            {item.declaration_name || item.display_title}
+            <small>{item.activity.status !== 'idle' ? item.activity.status : item.validity_status}</small>
+          </button>
+        ))}
+        <button
+          type="button"
+          className={scope === 'new' ? 'active new' : 'new'}
+          onClick={() => manuallyTarget('new')}
+        >
+          + New formalization
+        </button>
+      </div>
+      <div className="scope-override">
+        <button
+          type="button"
+          className={`scope-chip ${override ? 'manual' : ''}`}
+          aria-expanded={overrideOpen}
+          onClick={() => setOverrideOpen((open) => !open)}
+          title="Lea normally infers the formalization from your message and the declarations it edits."
+        >
+          <span className="scope-chip-dot" />
+          {overrideLabel ? `Next message: ${overrideLabel}` : 'Scope: automatic'}
+          <span aria-hidden="true">⌄</span>
+        </button>
+        {overrideOpen && (
+          <div className="scope-menu" role="menu" aria-label="Override composer scope">
+            <button
+              type="button"
+              className={!override ? 'active' : ''}
+              onClick={() => {
+                setOverride(null);
+                setOverrideOpen(false);
+              }}
+            >
+              <span>Automatic</span>
+              <small>Infer from your message and actual edits</small>
+            </button>
+            <button
+              type="button"
+              className={override === 'project' ? 'active' : ''}
+              onClick={() => manuallyTarget('project')}
+            >
+              <span>{projectLabel}</span>
+              <small>Do not assign the next run to one item</small>
+            </button>
+            {formalizations.map((item) => (
+              <button
+                type="button"
+                key={item.id}
+                className={override === item.id ? 'active' : ''}
+                onClick={() => manuallyTarget(item.id)}
+              >
+                <span>{item.declaration_name || item.display_title}</span>
+                <small>Manually target this formalization</small>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formalizationStatusClass(validity: string, activity: string): string {
+  if (activity !== 'idle') return 'run';
+  if (validity === 'proved' || validity === 'defined') return 'ok';
+  if (validity === 'failing') return 'fail';
+  if (validity === 'stale') return 'warn';
+  return 'idle';
 }
 
 // The spawn_subagent node in the chat timeline, interleaved at the point the

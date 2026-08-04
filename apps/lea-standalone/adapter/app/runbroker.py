@@ -22,9 +22,9 @@ Design notes
 ------------
 * **Buffer for the run's (bounded) lifetime.** Runs are minutes long; holding their
   events in memory is cheap for this local/single-tenant adapter. The broker is
-  dropped when the run ends (``bridge.run_lea``'s ``finally``); a late connection to
-  an already-finished run is caught by the endpoint's terminal-status 409 before it
-  ever looks for a broker.
+  dropped when the run ends (``bridge.run_lea``'s ``finally``); a late connection
+  to an already-finished run gets a synthesized terminal event from the persisted
+  run row.
 * **``put`` is Queue-compatible** (takes ``{"type", "payload"}``) so the runner's
   existing ``emit()`` writes to it unchanged.
 * **Cursor replay.** ``events_after(cursor)`` returns everything with ``seq >
@@ -67,9 +67,22 @@ class RunBroker:
 
     def events_after(self, cursor: int) -> list[dict[str, Any]]:
         """Every buffered event with ``seq > cursor`` (a snapshot copy, safe to iterate
-        outside the lock)."""
+        outside the lock).
+
+        An index slice, not a filter (AUDIT-2026-07-24 P1). ``seq`` is assigned as
+        ``len(self._events) + 1``, so it *is* the 1-based index and ``seq > cursor`` is
+        exactly ``self._events[cursor:]``. The filter form re-examined every event in
+        the buffer on every call — and the subscriber loop calls this every 80 ms, per
+        connection, so a long run's cost grew with the square of its own length while
+        returning nothing.
+
+        A negative or over-large cursor is clamped rather than trusted: it arrives from
+        a client-supplied ``Last-Event-ID``/``?since=`` (see ``routes/runs._request_cursor``),
+        and a raw negative index would silently re-send the tail of the buffer.
+        """
         with self._lock:
-            return [e for e in self._events if e["seq"] > cursor]
+            start = min(max(cursor, 0), len(self._events))
+            return self._events[start:]
 
     @property
     def closed(self) -> bool:
