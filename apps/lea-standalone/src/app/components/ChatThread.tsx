@@ -814,7 +814,7 @@ export function ChatThread({
             rows={1}
           />
           <div className="crow">
-            <span className="mode" title="Lea routes the request automatically">⚙ auto</span>
+            <ComposerScopeChip session={session} />
             {isRunning ? (
               <button className="send stop" onClick={onInterrupt} title="Stop the run">
                 ◼
@@ -832,29 +832,18 @@ export function ChatThread({
   );
 }
 
+// The rail: which formalization you are LOOKING AT. Purely a view filter — with one
+// exception, "+ New formalization", which also pins the composer, because "show me the
+// one that doesn't exist yet" only means anything as an intention about the next
+// message. Where the next message GOES is the composer chip's job (`ComposerScopeChip`).
 function FormalizationScope({ session }: { session?: SessionSummary }) {
   const formalizations = useProofSession((state) => state.formalizations);
   const scope = useProofSession((state) => state.formalizationScope);
   const setScope = useProofSession((state) => state.setFormalizationScope);
-  const override = useProofSession((state) => state.composerScopeOverride);
   const setOverride = useProofSession((state) => state.setComposerScopeOverride);
   const setCanvasRevisionMode = useProofSession(
     (state) => state.setCanvasRevisionMode,
   );
-  const [overrideOpen, setOverrideOpen] = useState(false);
-  const projectLabel = session?.project_id ? 'Project discussion' : 'General discussion';
-  const overrideFormalization =
-    override && override !== 'project' && override !== 'new'
-      ? formalizations.find((item) => item.id === override)
-      : undefined;
-  const overrideLabel =
-    override === 'project'
-      ? projectLabel
-      : override === 'new'
-        ? 'New formalization'
-        : overrideFormalization
-          ? overrideFormalization.declaration_name || overrideFormalization.display_title
-          : null;
   const viewScope = (nextScope: string) => {
     setScope(nextScope);
     setOverride(null);
@@ -864,7 +853,6 @@ function FormalizationScope({ session }: { session?: SessionSummary }) {
     setScope(nextScope);
     setOverride(nextScope);
     setCanvasRevisionMode('current');
-    setOverrideOpen(false);
   };
 
   return (
@@ -898,53 +886,119 @@ function FormalizationScope({ session }: { session?: SessionSummary }) {
           + New formalization
         </button>
       </div>
-      <div className="scope-override">
-        <button
-          type="button"
-          className={`scope-chip ${override ? 'manual' : ''}`}
-          aria-expanded={overrideOpen}
-          onClick={() => setOverrideOpen((open) => !open)}
-          title="Lea normally infers the formalization from your message and the declarations it edits."
-        >
-          <span className="scope-chip-dot" />
-          {overrideLabel ? `Next message: ${overrideLabel}` : 'Scope: automatic'}
-          <span aria-hidden="true">⌄</span>
-        </button>
-        {overrideOpen && (
-          <div className="scope-menu" role="menu" aria-label="Override composer scope">
+    </div>
+  );
+}
+
+/**
+ * Where the NEXT message goes — living in the composer, next to send, because that is
+ * what it is a property of.
+ *
+ * It replaces a `<span className="mode">⚙ auto</span>` that had `cursor: pointer` and
+ * no click handler: it advertised an affordance it did not have, and its tooltip was
+ * about the prover's prompt ROUTING, not formalization scope. Meanwhile the control
+ * that actually set scope sat above the composer, also reading "automatic". Two things
+ * saying "auto", the inert one in the place people would look first.
+ *
+ * `auto` is not a mode the user picks so much as the absence of an override: with no
+ * override, the backend infers the target from the message and the declarations Lea
+ * actually edits. Pinning one is the exception, so the chip states the pin when there
+ * is one and stays quiet otherwise.
+ */
+function ComposerScopeChip({ session }: { session?: SessionSummary }) {
+  const formalizations = useProofSession((state) => state.formalizations);
+  const override = useProofSession((state) => state.composerScopeOverride);
+  const setOverride = useProofSession((state) => state.setComposerScopeOverride);
+  const setScope = useProofSession((state) => state.setFormalizationScope);
+  const setCanvasRevisionMode = useProofSession((state) => state.setCanvasRevisionMode);
+  const [open, setOpen] = useState(false);
+  const projectLabel = session?.project_id ? 'Project discussion' : 'General discussion';
+  const pinned =
+    override && override !== 'project' && override !== 'new'
+      ? formalizations.find((item) => item.id === override)
+      : undefined;
+  const label =
+    override === 'project'
+      ? projectLabel
+      : override === 'new'
+        ? 'New formalization'
+        : pinned
+          ? pinned.declaration_name || pinned.display_title
+          : null;
+
+  const target = (next: string | null) => {
+    setOverride(next);
+    if (next) {
+      setScope(next);
+      setCanvasRevisionMode('current');
+    }
+    setOpen(false);
+  };
+
+  // Dismiss on Escape — the menu overlays the composer, and the keyboard is where the
+  // user already is.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
+
+  return (
+    <div className="scope-override">
+      <button
+        type="button"
+        className={`mode scope-chip ${override ? 'manual' : ''}`}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        onClick={() => setOpen((v) => !v)}
+        title={
+          label
+            ? `The next message is pinned to ${label}. Click to change.`
+            : 'Lea infers which formalization your message is about. Click to pin it.'
+        }
+      >
+        <span className="scope-chip-dot" />
+        {label ? `⚙ ${label}` : '⚙ auto'}
+        <span aria-hidden="true">⌄</span>
+      </button>
+      {open && (
+        <div className="scope-menu" role="menu" aria-label="Where the next message goes">
+          <button type="button" className={!override ? 'active' : ''} onClick={() => target(null)}>
+            <span>Automatic</span>
+            <small>Infer from your message and actual edits</small>
+          </button>
+          <button
+            type="button"
+            className={override === 'project' ? 'active' : ''}
+            onClick={() => target('project')}
+          >
+            <span>{projectLabel}</span>
+            <small>Do not assign the next run to one item</small>
+          </button>
+          <button
+            type="button"
+            className={override === 'new' ? 'active' : ''}
+            onClick={() => target('new')}
+          >
+            <span>New formalization</span>
+            <small>Start a new one rather than continuing an existing one</small>
+          </button>
+          {formalizations.map((item) => (
             <button
               type="button"
-              className={!override ? 'active' : ''}
-              onClick={() => {
-                setOverride(null);
-                setOverrideOpen(false);
-              }}
+              key={item.id}
+              className={override === item.id ? 'active' : ''}
+              onClick={() => target(item.id)}
             >
-              <span>Automatic</span>
-              <small>Infer from your message and actual edits</small>
+              <span>{item.declaration_name || item.display_title}</span>
+              <small>Manually target this formalization</small>
             </button>
-            <button
-              type="button"
-              className={override === 'project' ? 'active' : ''}
-              onClick={() => manuallyTarget('project')}
-            >
-              <span>{projectLabel}</span>
-              <small>Do not assign the next run to one item</small>
-            </button>
-            {formalizations.map((item) => (
-              <button
-                type="button"
-                key={item.id}
-                className={override === item.id ? 'active' : ''}
-                onClick={() => manuallyTarget(item.id)}
-              >
-                <span>{item.declaration_name || item.display_title}</span>
-                <small>Manually target this formalization</small>
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

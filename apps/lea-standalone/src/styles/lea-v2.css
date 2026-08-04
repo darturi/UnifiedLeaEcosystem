@@ -273,7 +273,14 @@
   border-radius: 14px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
 .composer textarea { border: none; resize: none; outline: none; font: inherit; color: var(--ink); width: 100%; min-height: 22px; max-height: 200px; overflow-y: auto; background: transparent; }
 .composer .crow { display: flex; align-items: center; gap: 8px; }
+/* The scope control, in the composer row next to send. It used to be an inert
+   `<span>` reading "auto" with `cursor: pointer` and no handler, while the real
+   control sat above the composer — two things saying "auto", the fake one where
+   people look first. Now this IS the control, so the pointer cursor is honest. */
 .composer .mode { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 7px; padding: 3px 9px; cursor: pointer; background: var(--panel); }
+.composer .mode.manual { color: var(--accent); border-color: var(--accent); }
+.composer .mode:hover, .composer .mode[aria-expanded="true"] { color: var(--ink-2); background: var(--panel-2); }
+.composer .mode.manual:hover { color: var(--accent); }
 .composer .send { margin-left: auto; width: 32px; height: 32px; border-radius: 9px; background: var(--accent); color: #fff; border: none; cursor: pointer; font-size: 15px; }
 .composer .send:disabled { opacity: .45; cursor: not-allowed; }
 .composer .send.stop { background: var(--red); }
