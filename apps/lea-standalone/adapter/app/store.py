@@ -142,7 +142,7 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                 (
                     select count(*)
                     from timeline m
-                    where m.session_id = s.id and m.kind != 'code'
+                    where m.session_id = s.id and m.kind not in ('code', 'diagnostic')
                 ) as message_count,
                 (
                     select r2.model
@@ -208,6 +208,21 @@ def _list_sessions(extra_where: str = "", params: tuple = ()) -> list[dict]:
                         limit 1
                     ) end
                 ) as final_summary,
+                -- The task the coordinator DELEGATED: a child's first user message,
+                -- recorded at spawn. Same gating and rationale as final_summary — the
+                -- spawn box can show what a child was asked to do without a second
+                -- fetch, including for a child that is still running (which has no
+                -- summary yet, and for which the task is the only judgeable content).
+                (
+                    case when s.parent_id is not null then (
+                        select tm.content
+                        from timeline tm
+                        where tm.session_id = s.id and tm.kind = 'message'
+                          and tm.author = 'user'
+                        order by tm.id asc
+                        limit 1
+                    ) end
+                ) as task,
                 max(0, cast((julianday(s.updated_at) - julianday(s.created_at)) * 86400 as integer)) as duration_seconds
             from sessions s
             left join runs r on r.session_id = s.id
@@ -1215,6 +1230,87 @@ def add_message(
     return _message_from_row(row)
 
 
+def add_diagnostic(
+    session_id: str,
+    run_id: str | None,
+    payload: dict,
+    *,
+    turn: int | None = None,
+) -> dict:
+    """Persist one diagnostic as a timeline row (v2.4).
+
+    `payload` is `diagnostics.resolve(...)` output — severity/code/title/message/
+    remedy/source/context. The human message goes in `content` (so the schema's
+    "prose rows must have prose" CHECK holds and a diagnostic is greppable in the DB
+    without JSON extraction); the structured rest goes in `data`.
+
+    Persisting is the point: the old model was a mutable client-side string, so a
+    second failure erased the first and a reload erased both. A stored row means
+    "what went wrong in yesterday's run" is answerable from the UI instead of from
+    an adapter stderr that no longer exists.
+
+    `author='environment'` — a diagnostic is neither the user's nor the agent's
+    speech; it is the system reporting on itself.
+    """
+    import json as _json
+
+    with write() as conn:
+        cur = conn.execute(
+            """
+            insert into timeline (session_id, run_id, kind, author, content, turn, data, created_at)
+            values (?, ?, 'diagnostic', 'environment', ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                run_id,
+                payload.get("message") or payload.get("title") or payload.get("code", ""),
+                turn,
+                _json.dumps(payload),
+                utc_now(),
+            ),
+        )
+        row = conn.execute("select * from timeline where id = ?", (cur.lastrowid,)).fetchone()
+    touch_session(session_id)
+    return _diagnostic_from_row(row)
+
+
+def _diagnostic_from_row(row) -> dict:
+    """A timeline diagnostic row in the shape the API returns. The stored `data` JSON
+    IS the payload that was streamed live, so a reloaded diagnostic and the one the
+    user saw in real time cannot disagree (the same invariant the code rows hold)."""
+    import json as _json
+
+    d = row_to_dict(row)
+    try:
+        payload = _json.loads(d["data"]) if d["data"] else {}
+    except (TypeError, ValueError):
+        # A row whose JSON we can't parse still describes a real failure — degrade to
+        # the prose we stored alongside it rather than dropping the row.
+        payload = {}
+    return {
+        **payload,
+        "id": str(d["id"]),
+        "session_id": d["session_id"],
+        "run_id": d["run_id"],
+        "turn": d["turn"],
+        "seq": d["id"],
+        "message": payload.get("message") or d["content"] or "",
+        "severity": payload.get("severity") or "notice",
+        "code": payload.get("code") or "unknown",
+        "context": payload.get("context") or {},
+        "created_at": d["created_at"],
+    }
+
+
+def diagnostics_for_session(session_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from timeline where session_id = ? and kind = 'diagnostic' order by id asc",
+            (session_id,),
+        ).fetchall()
+    return [_diagnostic_from_row(r) for r in rows]
+
+
 def add_code_step(
     session_id: str,
     run_id: str | None,
@@ -1228,12 +1324,21 @@ def add_code_step(
     check_detail: str | None = None,
     artifact_kind: str | None = None,
     provenance: dict | None = None,
+    content_lost: bool = False,
 ) -> dict:
     """Record a timeline step holding a file's full contents after a write.
 
     `content` is the file's bytes and is keyword-only and required — it replaces
     the old `commit_sha` pointer, so a stale caller still passing a sha fails
     loudly rather than storing a 40-char sha as if it were a proof.
+
+    `content_lost=True` (C2) records that the bytes could NOT be captured — the file
+    was unreadable when the adapter went to read its after-state. The step still
+    happened, so the row is still written; what changes is that it no longer claims
+    to know the contents. Previously the unreadable case stored `""` through the
+    normal path, which the canvas rendered as "the agent wrote an empty file" — a
+    silent, confident lie about proof content. The schema has carried the flag for
+    exactly this since 0003; nothing had ever set it.
 
     `run_id` is NULL for user edits made outside a run (D9); `turn` is NULL for
     user edits. The verdict (`check_status`/`check_detail`) is recorded here, not
@@ -1258,14 +1363,19 @@ def add_code_step(
         data_obj.update(provenance)
     data_json = json.dumps(data_obj) if data_obj else None
     with write() as conn:
-        blob_id = _put_blob(conn, content)
+        # A lost-content row points at no blob: the CHECK
+        # `kind <> 'code' or after_blob_id is not null or content_lost = 1` is what
+        # keeps "I don't have the bytes" and "the bytes are empty" distinguishable at
+        # the schema level rather than by convention.
+        blob_id = None if content_lost else _put_blob(conn, content)
         cur = conn.execute(
             """
             insert into timeline (
                 session_id, run_id, kind, author, turn, path, after_blob_id,
-                summary, check_status, check_detail, artifact_kind, data, created_at
+                summary, check_status, check_detail, artifact_kind, data, created_at,
+                content_lost
             )
-            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, 'code', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -1280,11 +1390,12 @@ def add_code_step(
                 artifact_kind if check_status == "ok" else None,
                 data_json,
                 now,
+                1 if content_lost else 0,
             ),
         )
         row = conn.execute("select * from timeline where id = ?", (cur.lastrowid,)).fetchone()
     touch_session(session_id)
-    return _code_step_from_row(row, code=content)
+    return _code_step_from_row(row, code=("" if content_lost else content))
 
 
 def has_active_run(session_id: str) -> bool:
@@ -1501,8 +1612,12 @@ def session_detail(session_id: str) -> dict | None:
     # Split back into the two lists the API exposes. Code rows carry their content
     # already — a read no longer needs a second store to be reachable, so there is
     # no separate hydrate step that can silently come back empty.
-    messages = [_message_from_row(r) for r in rows if r["kind"] != "code"]
+    # Three kinds out of one ordered read. A diagnostic must NOT fall into `messages`
+    # — it would render as assistant speech and, worse, get replayed to the model as
+    # conversation. It is the system reporting on itself (G1).
+    messages = [_message_from_row(r) for r in rows if r["kind"] not in ("code", "diagnostic")]
     code_steps = [_code_step_from_row(r) for r in rows if r["kind"] == "code"]
+    diagnostics_out = [_diagnostic_from_row(r) for r in rows if r["kind"] == "diagnostic"]
     usage = _normalize_usage_session(
         {
             **(row_to_dict(usage_row) if usage_row else {}),
@@ -1534,6 +1649,7 @@ def session_detail(session_id: str) -> dict | None:
         ),
         "messages": messages,
         "code_steps": [_normalize_code_step(step) for step in code_steps],
+        "diagnostics": diagnostics_out,
         "status_events": [row_to_dict(row) for row in status_events],
         "approval_events": approval_events_for_session(session_id),
         "usage_breakdown": usage_breakdown_for_session(session_id),

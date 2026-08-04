@@ -21,15 +21,46 @@ _OVERRIDES_PATH = ROOT / "config" / "subagent-overrides.json"
 _ALLOWED_FIELDS = ("model", "max_turns", "max_cost", "system_prompt", "tools")
 
 
-def load_overrides() -> dict[str, dict]:
-    """All stored overrides: {role_name: {field: value}}. Missing/corrupt file → {}."""
+def load_overrides_checked() -> tuple[dict[str, dict], str | None]:
+    """`(overrides, why_they_didn't_load)` — the same result as `load_overrides`, plus
+    the reason it fell back to defaults (F2).
+
+    This exists because `load_overrides` handles its own failure and returns `{}`, which
+    means a caller can NEVER detect one: wrapping it in a `try` catches nothing, because
+    nothing is raised. So a corrupt overrides file silently reverted every sub-agent to
+    its vendored defaults — after the user had deliberately configured them on the
+    Sub-agents page — and there was no channel by which anything could say so.
+
+    A file that simply doesn't exist is NOT a failure: no overrides is the default state.
+    Only an unreadable or malformed one is reported.
+    """
     try:
-        data = json.loads(_OVERRIDES_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
+        raw = _OVERRIDES_PATH.read_text()
+    except FileNotFoundError:
+        return {}, None
+    except OSError as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {}, f"the file is not valid JSON ({exc})"
     if not isinstance(data, dict):
-        return {}
-    return {k: v for k, v in data.items() if isinstance(v, dict)}
+        return {}, "the file does not contain a JSON object"
+    kept = {k: v for k, v in data.items() if isinstance(v, dict)}
+    dropped = [k for k in data if k not in kept]
+    if dropped:
+        # Partially usable: the good entries still apply, but the user must be told
+        # which roles they configured are not in effect.
+        return kept, f"these entries were not readable and were ignored: {', '.join(sorted(dropped))}"
+    return kept, None
+
+
+def load_overrides() -> dict[str, dict]:
+    """All stored overrides: {role_name: {field: value}}. Missing/corrupt file → {}.
+
+    Lossy by design for callers that only need the values (`get_override`, the settings
+    route). Anything that must REPORT a load failure wants `load_overrides_checked`."""
+    return load_overrides_checked()[0]
 
 
 def get_override(name: str) -> dict:

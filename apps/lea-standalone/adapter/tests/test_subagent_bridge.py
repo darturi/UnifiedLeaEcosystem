@@ -76,12 +76,17 @@ def _finished(candidate_path=None, check_status="ok", check_detail=None,
 
 def test_with_subagents_adds_spawn_to_default_toolset():
     cfg = LeaConfig(model="gemini/test", max_turns=3)
-    out = bridge._with_subagents(cfg)
+    # F2: also returns why the user's overrides didn't apply, if they didn't — a
+    # readable overrides file (this case) means no error.
+    out, override_error = bridge._with_subagents(cfg)
+    assert override_error is None
     assert out.tools is not None
     assert "spawn_subagent" in out.tools
-    # the six built-ins are still there, spawn_subagent appended
+    # the coordinator also gets the opt-in SafeVerify tool to audit a finished proof
+    assert "safe_verify" in out.tools
+    # the six built-ins are still there, with the two opt-in tools appended
     assert {"read_file", "write_file", "edit_file", "lean_check", "bash", "search_mathlib"} <= set(out.tools)
-    assert out.tools[-1] == "spawn_subagent"
+    assert out.tools[-2:] == ["spawn_subagent", "safe_verify"]
     # nothing else about the config changed
     assert out.model == cfg.model and out.max_turns == cfg.max_turns
 
@@ -674,12 +679,101 @@ def test_promote_winner_skips_when_reverify_fails(tmp_path, monkeypatch):
     scratch.mkdir(parents=True)
     (scratch / "Win.lean").write_text(_OK_CANDIDATE)
     ev = _finished(candidate_path=".lea/tmp/run/agent/Win.lean", check_status="ok")
+    events: Queue = Queue()
+    step = bridge._promote_winner(
+        [ev], session_id=session["id"], run_id=run["id"],
+        repo=repo, namespace=None, turn=1, events=events,
+    )
+    assert step is None
+    assert store.session_detail(session["id"])["code_steps"] == []
+    # D1 (v2.4): refusing to promote is correct — recording an unchecked "ok" would be
+    # worse — but it used to be a `logger.warning`, so the user watched N children run
+    # for minutes and was shown no proof, no promotion, and no reason. The refusal has
+    # to SAY so, and say which candidate and why.
+    diags = store.session_detail(session["id"])["diagnostics"]
+    assert [d["code"] for d in diags] == ["subagent.promotion_rejected"]
+    assert ev.result_id in diags[0]["message"]
+    assert "moved-module boom" in diags[0]["message"]
+    assert any(e["type"] == "diagnostic" for e in _drain(events))
+
+
+def test_delegated_task_is_readable_while_the_child_is_still_running(tmp_path, monkeypatch):
+    """The task has to be there at SPAWN, not at finish.
+
+    A child's transcript only replays on SubagentFinished, so a running child's session
+    was completely empty — you could watch it work for minutes with no way to see what
+    it had been asked to do, and therefore no way to judge whether the coordinator had
+    delegated the right thing while there was still time to stop it. Its title is three
+    words; the task is the only judgeable content it has.
+    """
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    parent = store.create_session("Prove sqrt2 irrational")
+    cfg = LeaConfig(model="gemini/test", max_turns=3)
+    task = ("Prove sqrt2 is irrational\n\nUse infinite descent. State the theorem exactly "
+            "as `theorem sqrt2_irrational : Irrational (Real.sqrt 2)`.")
+    ev = SubagentStarted(result_id="pc-9", subagent_type="proof-candidate",
+                         description="Prove sqrt2 is irrational", task=task)
+
+    child, _run_id = bridge._start_subagent(
+        ev, parent_session_id=parent["id"], project_id=None, turn=1, cfg=cfg)
+
+    # Readable immediately — before the child has produced anything at all.
+    detail = store.session_detail(child["id"])
+    assert [m["content"] for m in detail["messages"]] == [task]
+    assert detail["messages"][0]["role"] == "user"
+    # And on the session LIST, so the coordinator's spawn box can show it without a
+    # second fetch — including for a child that is still running.
+    row = next(s for s in store.list_child_sessions(parent["id"]) if s["id"] == child["id"])
+    assert row["task"] == task
+    assert row["final_summary"] is None  # nothing finished yet
+
+
+def test_the_delegated_task_is_not_stored_twice_on_finish(tmp_path, monkeypatch):
+    # The transcript's first user message IS the task we already recorded at spawn.
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    parent = store.create_session("root")
+    cfg = LeaConfig(model="gemini/test", max_turns=3)
+    task = "Prove it\n\nvia descent"
+    child, child_run_id = bridge._start_subagent(
+        SubagentStarted(result_id="pc-1", subagent_type="proof-candidate",
+                        description="Prove it", task=task),
+        parent_session_id=parent["id"], project_id=None, turn=1, cfg=cfg)
+
+    ev = _finished(transcript=[{"role": "user", "content": task},
+                               {"role": "assistant", "content": "done, it compiles"}])
+    bridge._finalize_started_subagent(child["id"], child_run_id, ev, turn=1, repo=tmp_path)
+
+    contents = [m["content"] for m in store.session_detail(child["id"])["messages"]]
+    assert contents.count(task) == 1, "the delegated prompt must not open the thread twice"
+    assert "done, it compiles" in contents
+
+
+def test_promote_winner_reports_a_write_failure(tmp_path, monkeypatch):
+    # D2: `collation.promote` raising was a bare `return None` with no log at all, so
+    # "could not write the winner" was indistinguishable from "no child produced one".
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    monkeypatch.setattr(
+        bridge.collation, "promote",
+        lambda winner, canonical: (_ for _ in ()).throw(ValueError("destination is a directory")),
+    )
+    session = store.create_session("root")
+    run = store.create_run(session["id"], "gemini/test", None, 3)
+    repo = tmp_path / "repo"
+    scratch = repo / ".lea" / "tmp" / "run" / "agent"
+    scratch.mkdir(parents=True)
+    (scratch / "Win.lean").write_text(_OK_CANDIDATE)
+    ev = _finished(candidate_path=".lea/tmp/run/agent/Win.lean", check_status="ok")
     step = bridge._promote_winner(
         [ev], session_id=session["id"], run_id=run["id"],
         repo=repo, namespace=None, turn=1, events=Queue(),
     )
     assert step is None
-    assert store.session_detail(session["id"])["code_steps"] == []
+    diags = store.session_detail(session["id"])["diagnostics"]
+    assert [d["code"] for d in diags] == ["subagent.promotion_failed"]
+    assert "destination is a directory" in diags[0]["message"]
 
 
 def test_run_lea_does_not_promote_over_a_clean_coordinator_proof(tmp_path, monkeypatch):

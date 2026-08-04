@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from ..config import load_config, permission_tier
 from .. import bridge
+from .. import diagnostics
 from ..bridge import RunnerContext, run_lea, request_stop, request_subagent_stop
 from .. import projects
 from .. import runbroker
@@ -118,6 +119,11 @@ def create_run(request: RunRequest) -> dict:
     # and per-document usage can be summed. Invalid slugs are ignored rather than
     # failing the run (best-effort association).
     project_id: str | None = None
+    # B2: why the project didn't attach, if it didn't. Recorded here and persisted
+    # once the session exists (below) — a run silently losing its project context,
+    # instructions, skills, and shared repo used to look identical to a run that
+    # never asked for one.
+    project_error: str | None = None
     if request.project_slug:
         # Provision identically to a UI project (D25): get-or-create the row AND seed the
         # on-disk repo's .lea/{instructions,memory,blueprint}.md if missing, so an
@@ -131,8 +137,9 @@ def create_run(request: RunRequest) -> dict:
                 namespace=request.project_namespace,
             )
             project_id = project["id"]
-        except ValueError:
+        except ValueError as exc:
             project_id = None
+            project_error = str(exc) or "the project slug was rejected"
 
     if request.session_id:
         session = store.get_session(request.session_id)
@@ -162,6 +169,17 @@ def create_run(request: RunRequest) -> dict:
     run = store.create_run(session["id"], config.model, None, config.max_turns,
                            project_id=project_id, autonomous=autonomous)
     user_message = store.add_message(session["id"], "user", message, run["id"])
+    if project_error:
+        # Persisted (not streamed): this endpoint returns before the SSE stream is
+        # attached, so there is no live channel yet. The client picks it up from
+        # `session_detail` on attach — which is also how it survives a reload.
+        store.add_diagnostic(session["id"], run["id"], diagnostics.resolve(
+            "degraded", "run.project_unavailable",
+            f"This run could not be attached to project '{request.project_slug}' "
+            f"({project_error}); it runs without project context, instructions, or skills.",
+            source="runs",
+            context={"project_slug": request.project_slug},
+        ))
     project = store.get_project(project_id) if project_id else None
     return {
         "session_id": session["id"],
