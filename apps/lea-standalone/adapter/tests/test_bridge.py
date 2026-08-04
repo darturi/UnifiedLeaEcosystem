@@ -381,7 +381,10 @@ def test_interactive_run_keeps_gate_and_config_variant(tmp_path, monkeypatch):
 def test_done_emitted_and_run_failed_on_exception(tmp_path, monkeypatch):
     ctx, queue = _context(tmp_path, monkeypatch)
 
-    def boom(config, messages, *, namespace=None, session_id=None, working_dir=None, gate=None):
+    def boom(
+        config, messages, *, namespace=None, session_id=None, working_dir=None,
+        should_stop=None, gate=None,
+    ):
         yield TurnStarted(1)
         raise RuntimeError("model exploded")
 
@@ -394,7 +397,34 @@ def test_done_emitted_and_run_failed_on_exception(tmp_path, monkeypatch):
     assert "run_error" in types
     assert types[-1] == "done"
     assert items[-1]["payload"]["status"] == "failed"
-    assert store.get_run(ctx.run_id)["status"] == "failed"
+    persisted = store.get_run(ctx.run_id)
+    assert persisted["status"] == "failed"
+    assert persisted["result_kind"] == "failed"
+    assert persisted["result_detail"] == "RuntimeError: model exploded"
+    assert items[-1]["payload"]["result_detail"] == "RuntimeError: model exploded"
+
+
+def test_exception_detail_is_redacted_before_streaming_or_persistence(tmp_path, monkeypatch):
+    ctx, queue = _context(tmp_path, monkeypatch)
+    secret = "sk-super-secret-provider-key"
+    monkeypatch.setattr(bridge, "configured_provider_keys", lambda: {"OPENAI_API_KEY": secret})
+
+    def boom(
+        config, messages, *, namespace=None, session_id=None, working_dir=None,
+        should_stop=None, gate=None,
+    ):
+        raise RuntimeError(f"provider rejected {secret}")
+        yield  # pragma: no cover — keep this a generator like run_events
+
+    monkeypatch.setattr(bridge, "run_events", boom)
+    bridge.run_lea(ctx)
+
+    items = _drain(queue)
+    run_error = next(item for item in items if item["type"] == "run_error")
+    detail = store.get_run(ctx.run_id)["result_detail"]
+    assert secret not in run_error["payload"]["message"]
+    assert secret not in detail
+    assert "[redacted]" in detail
 
 
 def _recording_fake(received: list, transcript_messages: list):

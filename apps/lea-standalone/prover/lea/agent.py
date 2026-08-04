@@ -735,6 +735,7 @@ def _run_events_inner(
         assistant_parts = []
         current_text = ""
         tool_calls = []
+        reasoning_items = []
         forced_narration_emitted = False
 
         for event in stream(model, system, messages, tools_schema, config.model_kwargs, streaming=config.stream):
@@ -779,6 +780,7 @@ def _run_events_inner(
                 if tool_calls:
                     tool_calls[-1]["id"] = event.tool_use_id
             elif isinstance(event, Done):
+                reasoning_items = event.reasoning_items
                 total_usage.input_tokens += event.usage.input_tokens
                 total_usage.output_tokens += event.usage.output_tokens
                 total_cost += event.cost
@@ -788,6 +790,10 @@ def _run_events_inner(
 
         if current_text:
             assistant_parts.append({"type": "text", "text": current_text})
+        if reasoning_items:
+            # Internal continuation state for the Responses API.  It is persisted
+            # with this exact assistant turn but never rendered as user-facing text.
+            assistant_parts.append({"type": "reasoning", "items": reasoning_items})
         for tc in tool_calls:
             assistant_parts.append({
                 "type": "tool_call",

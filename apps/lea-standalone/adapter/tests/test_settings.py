@@ -28,6 +28,9 @@ def test_settings_payload_masks_api_keys(tmp_path, monkeypatch):
     assert payload["max_spend_usd"] == 20.0
     assert payload["api_keys"]["OPENAI_API_KEY"] == {"configured": True, "last4": "1234", "label": "OpenAI"}
     assert payload["api_keys"]["ANTHROPIC_API_KEY"] == {"configured": False, "last4": None, "label": "Anthropic"}
+    assert {option["value"] for option in payload["model_options"]} >= {
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    }
 
 
 def test_update_settings_preserves_unrelated_config_and_updates_keys(tmp_path, monkeypatch):
@@ -341,6 +344,7 @@ def _blank_config(tmp_path):
 @pytest.mark.parametrize(
     "model,expected",
     [
+        ("gpt-5.6-sol", "OPENAI_API_KEY"),
         ("gpt-5.5", "OPENAI_API_KEY"),
         ("claude-opus-4-8", "ANTHROPIC_API_KEY"),
         ("gemini/gemini-3.1-pro-preview", "GEMINI_API_KEY"),
