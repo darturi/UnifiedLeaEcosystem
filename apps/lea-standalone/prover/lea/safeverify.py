@@ -6,11 +6,15 @@ whitelisted axioms — catching `sorry`, `axiom`/`opaque` smuggling,
 `native_decide`, `local notation` shadows, `abbrev` redefinitions, and
 `partial`/`unsafe` tricks that a plain compile lets through.
 
-It is *comparison-style*: it checks a *submission* file against a *target*
-signature. `interface.verify(path)` derives the target from the proof's own main
-theorem (header + `:= by sorry`), so the check is universal — it catches a
-tampered *proof*. (Catching a tampered *statement* would need a separately
-trusted target; a later follow-up.)
+It is *comparison-style*: it checks a *submission* file against a *target*. The
+target is the submission with every theorem/lemma proof body replaced by `sorry`
+and its imports + `def`s kept (`sorry_target`), so it compiles even for a project
+file with its own vocabulary, and SafeVerify audits *every* theorem's type + the
+`def` bodies in one pass — catching a tampered *proof* or a redefined supporting
+`def`. (Catching a tampered *statement* would need a separately trusted target —
+the target here is still derived from the submission, so a weakened statement is
+inherited by the target and passes; pinning a trusted statement is a human/spec
+responsibility, not something a Lean-level checker can close.)
 
 This is the low-level subsystem (parallels `lsp_daemon.py`): it returns plain
 `(ok, detail)` tuples and knows nothing about the typed events — `interface.py`
@@ -86,6 +90,70 @@ def theorem_signature(code: str) -> str | None:
 # closes it. Interactive proofs are wrapped in `namespace Lea.Misc`, so the
 # theorem's real name is `Lea.Misc.<name>`.
 _NAMESPACE_RE = re.compile(r"(?m)^[ \t]*namespace[ \t]+([\w.]+)[ \t]*$")
+
+
+# Top-level declaration boundaries — a line starting (column 0) with a Lean
+# top-level keyword or an attribute. `sorry_target` splits the file at these so it
+# can rewrite each theorem/lemma proof body while leaving everything else verbatim.
+_DECL_BOUNDARY_RE = re.compile(
+    r"(?m)^(?=@\[|attribute\b|set_option\b|import\b|open\b|namespace\b|end\b|section\b|"
+    r"variable\b|variables\b|universe\b|noncomputable\b|private\b|protected\b|scoped\b|"
+    r"local\b|theorem\b|lemma\b|def\b|abbrev\b|instance\b|structure\b|inductive\b|"
+    r"class\b|opaque\b|example\b|axiom\b)"
+)
+
+# A block that is a `theorem`/`lemma` (after optional attributes/modifiers) — only
+# these have their proof body replaced by `sorry` in the target.
+_THM_BLOCK_RE = re.compile(
+    r"(?s)^(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|scoped|local)\s+)*(?:theorem|lemma)\b"
+)
+
+
+def sorry_target(code: str) -> str:
+    """Turn a full proof file into a SafeVerify **target**: the same file with every
+    top-level ``theorem``/``lemma`` proof body replaced by ``:= by sorry``, and
+    everything else — imports, ``open``s, namespaces, and ``def`` bodies — kept
+    verbatim.
+
+    This replaces the old bare-signature target (just the last theorem's header). Two
+    bugs that fixes:
+
+      * **The target now compiles.** A structured project file defines its own
+        vocabulary (``def HasDiscrepancyBoundUpTo …``); a theorem referencing it in a
+        target that carried only ``import Mathlib`` + the lone signature failed with
+        "unknown identifier". Carrying the whole file's imports + defs fixes it.
+      * **Every theorem is audited, not just the last.** SafeVerify already iterates
+        *all* target declarations, so one properly-populated target checks every
+        theorem's type against the submission in a single compile — no per-theorem loop.
+
+    Keeping ``def`` bodies intact also lets SafeVerify enforce its "definition bodies
+    must match" rule, so the submission can't silently redefine a name the statement
+    depends on. Other declarations (instances, examples, structures) are left verbatim:
+    the target is structurally identical to the submission apart from theorem bodies, so
+    any auto-generated names line up between the two compiles.
+
+    Limitation (shared with :func:`theorem_signature`): the body delimiter is the first
+    ``:=`` in a declaration, so a theorem whose *type* contains ``:=`` (e.g. a ``let`` in
+    the type) is split wrong and the target won't compile — reported as a target-compile
+    error, never a false pass.
+    """
+    starts = [m.start() for m in _DECL_BOUNDARY_RE.finditer(code)]
+    if not starts:
+        return code
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    spans = [(starts[i], starts[i + 1] if i + 1 < len(starts) else len(code))
+             for i in range(len(starts))]
+    out: list[str] = []
+    for s, e in spans:
+        block = code[s:e]
+        if _THM_BLOCK_RE.match(block):
+            idx = block.find(":=")
+            if idx != -1:
+                out.append(block[:idx].rstrip() + " := by sorry\n\n")
+                continue
+        out.append(block)
+    return "".join(out)
 
 
 def namespace_context(code: str) -> tuple[str, str]:

@@ -624,6 +624,20 @@ def run_children_concurrently(plans, *, max_children: int = DEFAULT_MAX_CONCURRE
             result_id, render = rest
             renders[result_id] = render
             pending -= 1
+            # Report this child as FINISHED now, not when the batch is. The results
+            # used to be drained by the coordinator only after `run_children_
+            # concurrently` returned — i.e. after the SLOWEST sibling — so a child
+            # that finished in 15s stayed 'running' for another 40s: its session view
+            # showed a live "Checking with Lean…" spinner over a completed transcript,
+            # and it counted as an active run the whole time. Measured on an 8-child
+            # batch: every child retired within 30ms of the last one, ~51s after spawn.
+            #
+            # Draining here is safe because `drain_results` CLEARS what it returns, so
+            # the coordinator's post-batch drain simply finds nothing left. It may also
+            # pick up a sibling that finished microseconds earlier — reporting that one
+            # slightly early is still true, and still in completion order.
+            for result in drain_results():
+                yield result.to_event()
     for t in threads:
         t.join()
     return renders

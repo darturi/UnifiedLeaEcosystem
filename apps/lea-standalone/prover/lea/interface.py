@@ -21,6 +21,7 @@ from .events import (
     AssistantTextDelta,
     CheckResult,
     Compacted,
+    Diagnostic,
     Error,
     FileChanged,
     Finished,
@@ -56,6 +57,7 @@ __all__ = [
     "CheckResult",
     "VerifyResult",
     "Error",
+    "Diagnostic",
     "SubagentStarted",
     "SubagentProgress",
     "SubagentFinished",
@@ -152,17 +154,16 @@ def verify(path: str) -> VerifyResult:
     sv_root = workspace / ".sv_scratch"
     sv_root.mkdir(parents=True, exist_ok=True)
     stem = p.stem or "proof"
-    # Reproduce the submission's namespace so the target's declaration shares the
-    # submission's fully-qualified name (e.g. `Lea.Misc.div_6`). Without this the
-    # target declares a root-level `div_6`, which SafeVerify can't find in the
-    # namespaced submission and rejects a valid proof.
-    ns_open, ns_close = safeverify.namespace_context(code)
 
     with tempfile.TemporaryDirectory(dir=sv_root, prefix=f"{stem}_") as td:
         scratch = Path(td)
         target = scratch / f"{stem}_sv_target.lean"
         submission = scratch / f"{stem}_sv_submission.lean"
-        target.write_text("import Mathlib\n\n" + ns_open + signature + " := by\n  sorry\n" + ns_close)
+        # The target is the WHOLE file with every theorem/lemma proof `sorry`-ed and
+        # its imports + defs kept — so it compiles (a bare signature lost the file's
+        # own definitions) and SafeVerify audits every theorem's type, not just the
+        # last one. The namespace + fully-qualified names travel with it automatically.
+        target.write_text(safeverify.sorry_target(code))
         submission.write_text(code if code.endswith("\n") else code + "\n")
         try:
             # Thread the per-call dir down to the olean/report scratch too — the

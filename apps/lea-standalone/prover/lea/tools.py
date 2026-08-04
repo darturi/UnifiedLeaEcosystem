@@ -140,8 +140,35 @@ def _find_lake_root(path: str) -> str | None:
     return None
 
 
-def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+def _run_relative_path(path: str) -> Path:
+    """Resolve a model-supplied READ path against this activation's working dir.
+
+    The mirror of `_sandboxed_write_path` for the non-mutating tools — minus the
+    confinement, since only writes are restricted. It exists because the two halves
+    disagreed: `write_file` resolved relative paths against `current_working_dir()`
+    while `lean_check`/`read_file` resolved them against the PROCESS cwd. So a
+    sub-agent that wrote `candidate.lean` (landing in its scratch dir) and then
+    checked `candidate.lean` was told the file did not exist, pointing at the
+    adapter's own directory. Observed live: a child recovered by retrying with an
+    absolute path, but its result envelope came back empty and a correct, compiling
+    proof was silently discarded.
+
+    Gated on the working dir being SET, not on depth. At depth 0 the process cwd is
+    the adapter's own directory, where no proof ever lives — so relative paths were
+    already broken there too, just less visibly, because the main agent is handed
+    absolute paths. Where there is genuinely no activation (the CLI, eval,
+    `interface.check`, unit tests) `current_working_dir()` is None and behaviour is
+    unchanged — that, not depth, is the real safety boundary.
+    """
     p = Path(path).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    wd = current_working_dir()
+    return ((Path(wd).expanduser() / p) if wd else p).resolve()
+
+
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+    p = _run_relative_path(path)
     if not p.exists():
         return f"Error: {p} does not exist."
     text = p.read_text()
@@ -226,7 +253,7 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
 
 
 def lean_check(path: str, *, use_lsp: bool = True) -> str:
-    p = Path(path).resolve()
+    p = _run_relative_path(path)
     if not p.exists():
         return f"Error: {p} does not exist."
 
@@ -256,8 +283,19 @@ def lean_check(path: str, *, use_lsp: bool = True) -> str:
         try:
             from lea.lsp_daemon import check_via_lsp
             return check_via_lsp(str(p), p.read_text(), lake_root)
-        except Exception:
-            pass  # fall through to subprocess
+        except Exception as exc:  # noqa: BLE001 — fall through to subprocess
+            # C4: the fallback is CORRECT but ~440x slower (~0.2s -> ~88s per check,
+            # a cold Mathlib elaboration). Silently, this looked like the agent
+            # thinking for a minute and a half, repeatedly, with no way for the user
+            # to know the fast path was gone. `once=True`: the daemon being down is
+            # one ongoing condition, not one fact per check.
+            from lea import diagnostics
+            diagnostics.report(
+                "degraded", "lean.lsp_cold_fallback",
+                f"The Lean language-server daemon is unavailable ({type(exc).__name__}); "
+                "falling back to full compiles.",
+                source="lean_check", once=True, path=str(p),
+            )
 
     if lake_root:
         cmd = ["lake", "env", "lean", str(p)]
@@ -315,7 +353,7 @@ def rebuild_module(path: str) -> str:
     Unlike `lean_check`, this always shells out -- there is no fast path for
     "make the compiled artifact on disk match the source," only a real one.
     """
-    p = Path(path).resolve()
+    p = _run_relative_path(path)
     if not p.exists():
         return f"Error: {p} does not exist."
 
@@ -534,10 +572,57 @@ TOOL_HANDLERS = {
 # Register the built-ins with the shared registry, in TOOLS_SCHEMA order. The
 # loop selects from the registry (build_toolset); these globals remain the
 # human-readable source of truth for the built-in tools and stay importable.
-from .registry import Tool, register  # noqa: E402
+from .registry import Tool, register, tool  # noqa: E402
 
 for _schema in TOOLS_SCHEMA:
     register(Tool(name=_schema["name"], schema=_schema, handler=TOOL_HANDLERS[_schema["name"]]))
+
+
+# Opt-in SafeVerify tool: a kernel-level anti-cheat audit the interactive coordinator can
+# run on a finished proof file. Registered `opt_in=True` (like `spawn_subagent`) so it stays
+# off every default/eval run and a sub-agent's `tools=None` can never include it; the adapter
+# composes it onto interactive coordinator runs. The handler LAZILY imports `interface.verify`
+# so this module (imported by agent.py) doesn't form the tools ← agent ← interface cycle.
+_SAFE_VERIFY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "description": "Path to the .lean proof file to audit."},
+    },
+    "required": ["path"],
+}
+
+
+@tool(
+    name="safe_verify",
+    description=(
+        "Kernel-level anti-cheat audit of a finished Lean proof FILE via SafeVerify. "
+        "Stronger than lean_check: it replays the proof through the Lean kernel and rejects "
+        "sorry, extra axioms, native_decide, partial/unsafe, and environment manipulation "
+        "that a plain compile lets through. Audits EVERY theorem/lemma in the file in one "
+        "pass. Run it to confirm a proof is genuinely complete before you finish. Note: it "
+        "checks the PROOF against the file's own statements; it does not certify that the "
+        "statements themselves are the intended ones."
+    ),
+    input_schema=_SAFE_VERIFY_SCHEMA,
+    opt_in=True,
+)
+def safe_verify(args: dict) -> str:
+    from .interface import verify as _verify  # lazy: avoid tools <- agent <- interface cycle
+
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return "Error: safe_verify requires a 'path' to the .lean file."
+    result = _verify(path)
+    detail = (result.detail or "").strip()
+    if result.status == "ok":
+        return ("SafeVerify: OK — the proof passed the kernel audit (no sorry / extra axiom / "
+                "native_decide / partial), and every theorem in the file verified.")
+    if result.status == "rejected":
+        return f"SafeVerify: REJECTED — a cheat or type mismatch was caught.\n{detail}"
+    if result.status == "unavailable":
+        return ("SafeVerify: UNAVAILABLE — the SafeVerify binary is not built on this server, "
+                f"so this proof could not be audited. {detail}").strip()
+    return f"SafeVerify: ERROR — could not run the audit (this is not a pass).\n{detail}"
 
 # Register the opt-in `spawn_subagent` tool (item 18). Imported here so it lands in
 # the registry alongside the built-ins whenever tools are loaded, but it is

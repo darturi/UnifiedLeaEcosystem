@@ -73,12 +73,18 @@ def test_prepare_returns_a_plan_for_a_valid_call():
         with run_context(depth=0, config=_cfg(), working_dir=wd, run_key="sess"):
             plan = prepare_spawn({"description": "find sum lemma", "prompt": "search",
                                   "subagent_type": "generalist"})
+        # This one has to run INSIDE the TemporaryDirectory block: the scratch dir
+        # lives under `wd`, and leaving the block deletes that whole tree — so
+        # asserting it afterwards was checking for a directory Python had just
+        # thrown away, and failed no matter what prepare_spawn did.
+        check("plan scratch dir was created", plan.candidate_dir.exists())
+    # The rest are assertions about the returned plan object, which outlives the
+    # temp dir, so they are fine here.
     check("a valid call yields a SpawnPlan", isinstance(plan, SpawnPlan))
     check("plan child depth is parent+1", plan.child_depth == 1)
     check("plan carries a result id", bool(plan.result_id))
     check("plan label prefers the description", plan.description == "find sum lemma")
     check("plan scratch dir is under the run's .lea/tmp", ".lea/tmp" in str(plan.candidate_dir))
-    check("plan scratch dir was created", plan.candidate_dir.exists())
 
 
 def test_prepare_refuses_with_a_string_and_no_plan():
