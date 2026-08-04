@@ -40,10 +40,20 @@ export function ProjectWindow({
   const [tab, setTab] = useState<Tab>('overview');
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
-  const sessions = project.sessions ?? [];
+  const allSessions = project.sessions ?? [];
+  // ROOTS only. A sub-agent is a session row (`parent_id` = the coordinator that
+  // spawned it), and the project payload returns children alongside roots so callers
+  // can split them — the sidebar already does. This list did not, so a project's
+  // Sessions read as a mix of work you started and internal children the coordinator
+  // spawned ("certificate c2" sitting next to the formalization you actually asked
+  // for). A child is reachable from its coordinator's thread, which is the only place
+  // it means anything.
+  const sessions = allSessions.filter((s) => !s.parent_id);
   // Memory is agent-written: a run advances its session's `updated_at`, so when the
   // project detail is re-fetched the Memory card re-loads memory.md (F4/D39).
-  const docSignal = sessions.reduce((max, s) => Math.max(max, Date.parse(s.updated_at) || 0), 0);
+  // Deliberately over ALL sessions, children included: a child's run advances the
+  // project too, and missing that would leave the Memory card stale.
+  const docSignal = allSessions.reduce((max, s) => Math.max(max, Date.parse(s.updated_at) || 0), 0);
 
   const submit = async () => {
     const message = draft.trim();
