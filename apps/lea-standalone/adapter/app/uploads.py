@@ -21,12 +21,16 @@ testable against a scratch dir; it never imports config itself.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from pathlib import Path
 
+from . import diagnostics
 from . import store
 from .gitstore import GitStore
 from .projects import project_repo_dir
+
+logger = logging.getLogger("lea-interface.uploads")
 
 
 class UploadError(ValueError):
@@ -127,18 +131,38 @@ def _extract_docx(path: Path) -> str:
     return "\n".join(p.text for p in document.paragraphs)
 
 
-def extract_text(stored: Path, ext: str) -> Path | None:
+def extract_text(stored: Path, ext: str, warnings: list | None = None) -> Path | None:
     """Tier-2 extraction: for ``.pdf/.docx`` write a ``<name>.txt`` sidecar next to the
     stored file and return its path; for Tier-1/3 return None (nothing to extract).
-    A failed extraction (corrupt/encrypted PDF) is swallowed — the upload still
-    succeeds, just without a sidecar."""
+
+    A failed extraction does NOT fail the upload — the file is still stored. But F1:
+    it used to be swallowed entirely, so a user uploading a scanned or encrypted PDF
+    got a successful upload whose contents the agent could never read, with nothing
+    saying so. The failure is appended to `warnings` for the response instead."""
     if ext not in _EXTRACTABLE:
         return None
     try:
         text = _extract_pdf(stored) if ext == ".pdf" else _extract_docx(stored)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — extraction is best-effort by design
+        logger.warning("Text extraction failed for %s", stored.name, exc_info=True)
+        if warnings is not None:
+            warnings.append(diagnostics.resolve(
+                "notice", "asset.read_failed",
+                f"No text could be extracted from {stored.name} "
+                f"({type(exc).__name__}: {exc}); Lea can't read its contents.",
+                source="upload", remedy="Upload a text-based version if Lea needs to read it.",
+                context={"path": stored.name},
+            ))
         return None
     if not text.strip():
+        if warnings is not None:
+            warnings.append(diagnostics.resolve(
+                "notice", "asset.read_failed",
+                f"{stored.name} contains no extractable text (it may be a scan); "
+                "Lea can't read its contents.",
+                source="upload", remedy="Upload a text-based version if Lea needs to read it.",
+                context={"path": stored.name},
+            ))
         return None
     sidecar = stored.with_name(stored.name + ".txt")
     sidecar.write_text(text)
@@ -166,14 +190,15 @@ def save_upload(
     stored = target_dir / name
     stored.write_bytes(data)
 
-    sidecar = extract_text(stored, ext)
+    warnings: list[dict] = []
+    sidecar = extract_text(stored, ext, warnings)
 
     repo = project_repo_dir(project, proofs_root)
     GitStore(proofs_root).commit_all(repo, f"upload .lea/files/{name}")
 
     rel_stored = f".lea/files/{name}"
     rel_extracted = f".lea/files/{sidecar.name}" if sidecar else None
-    return store.create_project_file(
+    row = store.create_project_file(
         project["id"],
         filename=name,
         stored_path=rel_stored,
@@ -181,6 +206,9 @@ def save_upload(
         kind="upload",
         extracted_path=rel_extracted,
     )
+    # F1: the row plus anything that silently didn't work about it. Empty on the
+    # happy path, so the response shape is unchanged for every existing consumer.
+    return {**row, "warnings": warnings}
 
 
 def file_disk_path(project: dict, proofs_root: Path, file_row: dict) -> Path:
@@ -305,6 +333,11 @@ def _current_mirror(project: dict, proofs_root: Path) -> dict[str, str]:
                 try:
                     out[p.relative_to(base).as_posix()] = p.read_text()
                 except OSError:
+                    # F1: an unreadable mirrored .tex is omitted from the "current"
+                    # state, so the next sync sees it as absent and rewrites it. Not
+                    # data loss (the incoming copy is authoritative), but it must be
+                    # visible in the log rather than a silent `continue`.
+                    logger.warning("Overleaf mirror: could not read %s", p, exc_info=True)
                     continue
     return out
 
@@ -408,7 +441,10 @@ def sync_overleaf_tex(
                 p.unlink()
                 pruned += 1
             except OSError:
-                pass
+                # F1: a build artifact we failed to remove stays in the repo and gets
+                # committed on the next write. Logged rather than silently passed so
+                # a mirror that never gets clean is diagnosable.
+                logger.warning("Overleaf mirror: could not prune %s", p, exc_info=True)
     _prune_empty_dirs(base)
 
     # Drop index rows for .tex no longer present.

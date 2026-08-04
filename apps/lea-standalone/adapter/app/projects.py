@@ -14,12 +14,16 @@ service is testable against a scratch dir — it never imports config itself.
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from pathlib import Path
 
+from . import diagnostics
 from . import store
 from .gitstore import GitStore
+
+logger = logging.getLogger("lea-interface.projects")
 
 
 class ProjectIdentityError(ValueError):
@@ -473,7 +477,13 @@ def refresh_project_title_docs(project: dict, proofs_root: Path, title: str) -> 
         path = repo / ".lea" / name
         try:
             original = path.read_text()
+        except FileNotFoundError:
+            continue  # a doc that was never created is not a failure
         except OSError:
+            # F1: an existing doc we can't read keeps the OLD title in the project
+            # context the agent is fed, so a renamed project silently keeps
+            # introducing itself by its old name.
+            logger.warning("Could not refresh title in %s", path, exc_info=True)
             continue
         updated = _rewrite_project_doc_title(original, old_title, new_title)
         if updated != original:
@@ -516,6 +526,11 @@ def migrate_project_namespace(
         raise ProjectIdentityError("namespace_path_exists", "The target namespace path already exists.", status=409)
 
     changed_files: list[Path] = []
+    # F1: files this rename could NOT rewrite. A skipped `.lean` keeps the OLD
+    # namespace while everything around it moves to the new one — so its `import`s
+    # and fully-qualified references break, and the rename reports success. The
+    # caller surfaces these; silently continuing was the bug.
+    skipped_files: list[dict] = []
     for path in sorted(old_repo.rglob("*")):
         if not path.is_file() or ".git" in path.parts:
             continue
@@ -523,7 +538,11 @@ def migrate_project_namespace(
             continue
         try:
             original = path.read_text()
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, OSError) as exc:
+            skipped_files.append({
+                "path": path.relative_to(old_repo).as_posix(),
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
             continue
         updated = _rewrite_namespace_text(original, old_namespace, new_namespace)
         updated = _rewrite_project_doc_title(updated, project.get("title", ""), title)
@@ -569,7 +588,21 @@ def migrate_project_namespace(
             "commitSha": commit_sha,
             "checkedFiles": checked_files,
             "failedFiles": failed_files,
+            # F1: files the rewrite could not open, so they still carry the OLD
+            # namespace. Distinct from `failedFiles` (rewritten, then failed to
+            # compile) — these were never touched at all.
+            "skippedFiles": skipped_files,
         },
+        "warnings": [
+            diagnostics.resolve(
+                "degraded", "asset.read_failed",
+                f"{item['path']} could not be read ({item['reason']}), so it still uses "
+                f"the old namespace '{old_namespace}'.",
+                source="project-rename",
+                context={"path": item["path"], "project_id": project["id"]},
+            )
+            for item in skipped_files
+        ],
     }
 
 

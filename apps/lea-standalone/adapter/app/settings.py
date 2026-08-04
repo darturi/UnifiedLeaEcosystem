@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import diagnostics
+
 from .config import (
     ROOT, LEGACY_KEY_ENV, configured_provider_keys, load_config,
     permission_tier as config_permission_tier, PERMISSION_TIERS,
@@ -151,6 +153,21 @@ def model_catalog() -> list[dict[str, str]]:
         {"value": str(o["value"]), "label": str(o["label"]), "provider": str(o["family"])}
         for o in MODEL_OPTIONS
     ]
+
+
+def model_catalog_warnings() -> list[dict]:
+    """F3: non-empty when the picker is showing the curated FALLBACK list rather
+    than the live catalog. The fallback is a handful of models against LiteLLM's
+    ~2k, and it also disables the per-model key prompt — a user hunting for a model
+    that isn't there deserves to know it's a stale list, not an exhaustive one."""
+    reason = models_catalog.unavailable_reason()
+    if not reason or models_catalog.list_chat_models():
+        return []
+    return [diagnostics.resolve(
+        "degraded", "settings.catalog_unavailable",
+        f"The full model catalog could not be loaded ({reason}); showing a built-in list.",
+        source="settings",
+    )]
 
 
 def _required_env_keys(model: str) -> list[str]:
