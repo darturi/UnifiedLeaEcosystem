@@ -493,6 +493,23 @@ export function paneItemToFormalizeTarget(item) {
   };
 }
 
+// Shape a current tagged item for the additive GitHub import flow. The stable
+// LaTeX marker label remains the identity anchor; the current Lean declaration
+// name is the exact code-match key. The companion, not the page, computes the
+// origin key so import/formalize/chat always use identical identity semantics.
+export function paneItemToGithubImportTarget(item) {
+  const targetLabel = item?.label || item?.leanDeclarationName || "";
+  const declarationName = item?.leanDeclarationName || item?.label || "";
+  return {
+    targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+    targetLabel,
+    declarationName,
+    displayTitle: declarationName || targetLabel,
+    statement: item?.naturalLanguageLatex || "",
+    sourceHash: item?.sourceHash || ""
+  };
+}
+
 // Pane statuses that correspond to a real Lea run or saved proof artifact.
 // Same rule the in-document popover applies before offering "View in Lea UI"
 // (companion statuses formalized / defined / disproved / in_progress /

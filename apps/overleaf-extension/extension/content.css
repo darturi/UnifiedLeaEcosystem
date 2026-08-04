@@ -13,6 +13,71 @@
   border: 0;
 }
 
+.ol-lean-github-import-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh 18px 28px;
+  overflow: auto;
+  background: rgba(20, 22, 27, 0.48);
+  font-family: var(--ol-sans);
+}
+
+.ol-lean-github-import-dialog {
+  width: min(700px, 96vw);
+  max-height: 84vh;
+  overflow: auto;
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-radius: 14px;
+  box-shadow: var(--ol-shadow-float);
+}
+
+.ol-lean-github-import-dialog > header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px;
+  background: var(--ol-panel);
+  border-bottom: 1px solid var(--ol-line);
+}
+
+.ol-lean-github-import-dialog header > div { flex: 1; }
+.ol-lean-github-import-dialog h2 { margin: 0; font: 700 16px/1.3 var(--ol-sans); }
+.ol-lean-github-import-dialog header p { margin: 3px 0 0; color: var(--ol-muted); font: 12px/1.4 var(--ol-sans); }
+.ol-lean-github-import-content { padding: 17px 18px; }
+.ol-lean-github-import-content > label { display: grid; gap: 6px; color: var(--ol-ink-2); font: 700 12px/1.3 var(--ol-sans); }
+.ol-lean-github-import-content input { box-sizing: border-box; width: 100%; padding: 9px 10px;
+  color: var(--ol-ink); background: var(--ol-panel-2); border: 1px solid var(--ol-line);
+  border-radius: 8px; font: 12px/1.4 var(--ol-mono); }
+.ol-lean-github-import-content input:focus { outline: 2px solid var(--ol-focus-ring); outline-offset: 1px; }
+.ol-lean-github-import-note { margin: 8px 0 0; color: var(--ol-muted); font: 11.5px/1.45 var(--ol-sans); }
+.ol-lean-github-import-summary { margin: 13px 0 8px; padding: 9px 10px; color: var(--ol-ink-2);
+  background: var(--ol-panel-2); border: 1px solid var(--ol-line); border-radius: 8px; font: 700 12px/1.4 var(--ol-sans); }
+.ol-lean-github-import-result ul { max-height: 290px; overflow: auto; list-style: none; margin: 0; padding: 0;
+  border: 1px solid var(--ol-line); border-radius: 8px; }
+.ol-lean-github-import-result li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 10px;
+  padding: 7px 9px; border-bottom: 1px solid var(--ol-line-2); }
+.ol-lean-github-import-result li:last-child { border-bottom: 0; }
+.ol-lean-github-import-result code { overflow: hidden; text-overflow: ellipsis; color: var(--ol-ink); font: 11.5px/1.35 var(--ol-mono); }
+.ol-lean-github-import-result li > span { color: var(--ol-muted); font: 700 10.5px/1.35 var(--ol-sans); }
+.ol-lean-github-import-result li > span.is-add { color: var(--ol-green); }
+.ol-lean-github-import-result li > span.is-path_conflict,
+.ol-lean-github-import-result li > span.is-declaration_conflict { color: var(--ol-red); }
+.ol-lean-github-import-result small { grid-column: 1 / -1; color: var(--ol-muted); font: 10.5px/1.35 var(--ol-sans); }
+.ol-lean-github-import-completion { margin-top: 12px; padding: 14px; color: var(--ol-ink-2);
+  background: var(--ol-panel-2); border: 1px solid var(--ol-line); border-radius: 9px; font: 12px/1.55 var(--ol-sans); }
+.ol-lean-github-import-status { min-height: 18px; margin: 10px 0 0; color: var(--ol-muted); font: 12px/1.45 var(--ol-sans); }
+.ol-lean-github-import-status.is-error { color: var(--ol-red); }
+.ol-lean-github-import-content footer { display: flex; justify-content: flex-end; gap: 7px; margin-top: 14px; }
+
 .ol-lean-theorem {
   background: rgba(28, 28, 32, 0.08);
   border-bottom: 1px solid rgba(28, 28, 32, 0.3);

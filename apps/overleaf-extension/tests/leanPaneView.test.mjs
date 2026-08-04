@@ -23,6 +23,7 @@ import {
   paneItemActions,
   paneItemToEditTarget,
   paneItemToFormalizeTarget,
+  paneItemToGithubImportTarget,
   paneProgressBucketForItem,
   paneProgressSegments,
   deriveShareControls,
@@ -231,6 +232,26 @@ test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item",
   assert.equal(theorem.targetKind, "theorem");
   assert.deepEqual(theorem.targetUses, []);
   assert.equal(theorem.targetContext, "");
+});
+
+test("paneItemToGithubImportTarget keeps the stable label and current declaration separate", () => {
+  assert.deepEqual(
+    paneItemToGithubImportTarget({
+      leanKind: "theorem",
+      label: "stable_marker",
+      leanDeclarationName: "renamed_theorem",
+      naturalLanguageLatex: "Every x has P(x).",
+      sourceHash: "source-sha",
+    }),
+    {
+      targetKind: "theorem",
+      targetLabel: "stable_marker",
+      declarationName: "renamed_theorem",
+      displayTitle: "renamed_theorem",
+      statement: "Every x has P(x).",
+      sourceHash: "source-sha",
+    },
+  );
 });
 
 test("buildLeanPaneTree groups files into a compact source tree", () => {

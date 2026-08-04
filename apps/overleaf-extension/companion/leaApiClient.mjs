@@ -299,6 +299,52 @@ export function pushProjectBySlug({ fetchImpl, baseUrl, slug }) {
   });
 }
 
+// Additive GitHub project import (inverse of Share): analyze, confirm, then poll.
+export function previewGithubImportBySlug({
+  fetchImpl,
+  baseUrl,
+  slug,
+  repositoryUrl,
+  targets = [],
+  projectName = null,
+  namespace = null,
+}) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/github-imports/preview`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      repository_url: repositoryUrl,
+      targets,
+      project_name: projectName,
+      namespace,
+    }),
+  });
+}
+
+export function confirmGithubImportBySlug({ fetchImpl, baseUrl, slug, previewId }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/github-imports`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ preview_id: previewId }),
+  });
+}
+
+export function getGithubImportBySlug({ fetchImpl, baseUrl, slug, importId }) {
+  return fetchJson(
+    fetchImpl,
+    `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/github-imports/${encodeURIComponent(importId)}`,
+    { method: "GET", headers: buildHeaders(null) }
+  );
+}
+
+export function syncProjectFormalizationTargetsBySlug({ fetchImpl, baseUrl, slug, targets = [] }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/projects/by-slug/${encodeURIComponent(slug)}/formalizations/sync`, {
+    method: "POST",
+    headers: buildHeaders(null, { "Content-Type": "application/json" }),
+    body: JSON.stringify({ targets }),
+  });
+}
+
 // Pull `filename="…"` out of a Content-Disposition header (the adapter always
 // quotes it). Exported for tests.
 export function filenameFromContentDisposition(header) {

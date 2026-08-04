@@ -254,6 +254,15 @@ def write_file_session(session_id: str, request: FileWriteRequest) -> dict:
     # backstop so a stray/racing write is refused rather than clobbering agent state.
     if store.has_active_run(session_id):
         raise HTTPException(status_code=409, detail="A run is active — editing is locked until it finishes.")
+    session = store.get_session(session_id)
+    if session and session.get("project_id") and store.project_has_active_import(session["project_id"]):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "project_busy",
+                "message": "Wait for the active GitHub import before editing project files.",
+            },
+        )
 
     resolved = projects.resolve_git(session_id, config.lea_root / "workspace" / "proofs")
     if resolved is None:

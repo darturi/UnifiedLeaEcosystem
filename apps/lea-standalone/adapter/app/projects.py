@@ -19,6 +19,7 @@ import shutil
 from pathlib import Path
 
 from . import store
+from .artifacts import scrub_lean_source
 from .gitstore import GitStore
 
 
@@ -503,9 +504,24 @@ def ensure_project(
     return project
 
 
-def _rewrite_namespace_text(text: str, old_namespace: str, new_namespace: str) -> str:
+def rewrite_namespace_text(text: str, old_namespace: str, new_namespace: str) -> str:
+    """Rewrite code-level namespace references, preserving comments and strings."""
     pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(old_namespace)}(?=\.|\b)")
-    return pattern.sub(new_namespace, text)
+    scrubbed = scrub_lean_source(text)
+    matches = list(pattern.finditer(scrubbed))
+    if not matches:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for match in matches:
+        pieces.extend((text[cursor:match.start()], new_namespace))
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+# Compatibility for older internal callers; new features use the public name.
+_rewrite_namespace_text = rewrite_namespace_text
 
 
 def _rewrite_project_doc_title(text: str, old_title: str, new_title: str) -> str:
@@ -561,7 +577,7 @@ def _project_has_active_runs(project_id: str) -> bool:
     session status is a working-copy verdict, not run lifecycle (D14). So the one
     case the interlock exists for — an agent mid-run in an established session — was
     exactly the case it missed (AUDIT-2026-07-24 C2)."""
-    return store.project_has_active_run(project_id)
+    return store.project_has_active_run(project_id) or store.project_has_active_import(project_id)
 
 
 def migrate_project_namespace(

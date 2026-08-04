@@ -40,10 +40,11 @@ export function ProjectWindow({
   const [tab, setTab] = useState<Tab>('overview');
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [importSignal, setImportSignal] = useState(0);
   const sessions = project.sessions ?? [];
   // Memory is agent-written: a run advances its session's `updated_at`, so when the
   // project detail is re-fetched the Memory card re-loads memory.md (F4/D39).
-  const docSignal = sessions.reduce((max, s) => Math.max(max, Date.parse(s.updated_at) || 0), 0);
+  const docSignal = sessions.reduce((max, s) => Math.max(max, Date.parse(s.updated_at) || 0), 0) + importSignal;
 
   const submit = async () => {
     const message = draft.trim();
@@ -169,7 +170,11 @@ export function ProjectWindow({
         ) : tab === 'blueprint' ? (
           <BlueprintTab projectId={project.id} onOpenSession={onOpenSession} refreshSignal={docSignal} />
         ) : (
-          <FilesystemTab projectId={project.id} refreshSignal={docSignal} />
+          <FilesystemTab
+            projectId={project.id}
+            refreshSignal={docSignal}
+            onProjectChanged={() => setImportSignal((value) => value + 1)}
+          />
         )}
       </div>
     </div>

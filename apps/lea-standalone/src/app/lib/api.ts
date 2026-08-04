@@ -24,6 +24,8 @@ import type {
   SearchResult,
   Formalization,
   FormalizationCurrentSnapshot,
+  GithubImportPreview,
+  GithubImportProgress,
 } from './types';
 
 export * from './types';
@@ -407,6 +409,75 @@ export async function putProjectFile(
     body: JSON.stringify({ path, content }),
   });
   if (!response.ok) throw new Error(await detailMessage(response, `Failed to save ${path}: ${response.statusText}`));
+  return response.json();
+}
+
+export class GithubImportApiError extends Error {
+  code?: string;
+  status: number;
+
+  constructor(message: string, status: number, code?: string) {
+    super(message);
+    this.name = 'GithubImportApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+async function throwGithubImportError(response: Response, fallback: string): Promise<never> {
+  const body = await response.json().catch(() => ({} as any));
+  const detail = body.detail ?? body;
+  const message =
+    (typeof detail === 'string' ? detail : detail?.message) || fallback;
+  throw new GithubImportApiError(message, response.status, detail?.error || detail?.code);
+}
+
+export async function previewProjectGithubImport(
+  projectId: string,
+  repositoryUrl: string,
+): Promise<GithubImportPreview> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/github-imports/preview`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repository_url: repositoryUrl }),
+    },
+  );
+  if (!response.ok) {
+    return throwGithubImportError(response, 'Failed to analyze the GitHub repository.');
+  }
+  return response.json();
+}
+
+export async function confirmProjectGithubImport(
+  projectId: string,
+  previewId: string,
+): Promise<GithubImportProgress> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/github-imports`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preview_id: previewId }),
+    },
+  );
+  if (!response.ok) {
+    return throwGithubImportError(response, 'Failed to add the Lean files.');
+  }
+  return response.json();
+}
+
+export async function getProjectGithubImport(
+  projectId: string,
+  importId: string,
+): Promise<GithubImportProgress> {
+  const response = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/github-imports/${encodeURIComponent(importId)}`,
+  );
+  if (!response.ok) {
+    return throwGithubImportError(response, 'Failed to load GitHub import progress.');
+  }
   return response.json();
 }
 

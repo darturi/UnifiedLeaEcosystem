@@ -69,6 +69,10 @@ import {
   fetchProjectArtifactsBySlug,
   fetchProjectGraphBySlug,
   generateProjectBlueprintBySlug,
+  previewGithubImportBySlug,
+  confirmGithubImportBySlug,
+  getGithubImportBySlug,
+  syncProjectFormalizationTargetsBySlug,
   fetchProjectTargetStatusBySlug,
   restoreProjectArtifactBySlug,
   retireProjectArtifactBySlug,
@@ -1002,6 +1006,88 @@ export async function handleSharePush(payload, state) {
   };
 }
 
+function normalizeGithubImportTargets(overleafProjectId, targets) {
+  return (Array.isArray(targets) ? targets : [])
+    .map((target) => {
+      const targetKind = target?.targetKind === "definition" ? "definition" : "theorem";
+      const targetLabel = String(target?.targetLabel || "").trim();
+      const declarationName = String(target?.declarationName || targetLabel).trim();
+      if (!targetLabel || !declarationName) return null;
+      return {
+        origin_key: chatTargetKey({ overleafProjectId, targetKind, targetLabel }),
+        label: targetLabel,
+        declaration_name: declarationName,
+        kind: targetKind,
+        display_title: String(target?.displayTitle || declarationName),
+        statement: String(target?.statement || "") || null,
+        source_hash: String(target?.sourceHash || "") || null,
+      };
+    })
+    .filter(Boolean);
+}
+
+export async function handleGithubImportPreview(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const repositoryUrl = String(payload.repositoryUrl || "").trim();
+  if (!repositoryUrl) return errorResponse(400, "missing_repository_url", "repositoryUrl is required.");
+  const overleafProjectId = String(payload.overleafProjectId || "");
+  const identity = await resolveRunProjectIdentity({
+    state,
+    overleafProjectId,
+    projectName: payload.projectName || "",
+    projectNamespace: payload.projectNamespace || "",
+    refresh: true,
+  });
+  const result = await previewGithubImportBySlug({
+    ...target,
+    repositoryUrl,
+    targets: normalizeGithubImportTargets(overleafProjectId, payload.targets),
+    projectName: identity.projectName,
+    namespace: identity.namespace,
+  });
+  if (!result.ok) {
+    return errorResponse(
+      result.status || 502,
+      adapterErrorCode(result, "github_import_preview_failed"),
+      adapterDetail(result, "Could not analyze the GitHub repository."),
+    );
+  }
+  return { statusCode: 200, body: { ok: true, ...result.body } };
+}
+
+export async function handleGithubImportConfirm(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const previewId = String(payload.previewId || "").trim();
+  if (!previewId) return errorResponse(400, "missing_preview_id", "previewId is required.");
+  const result = await confirmGithubImportBySlug({ ...target, previewId });
+  if (!result.ok) {
+    return errorResponse(
+      result.status || 502,
+      adapterErrorCode(result, "github_import_confirm_failed"),
+      adapterDetail(result, "Could not add the Lean files."),
+    );
+  }
+  return { statusCode: result.status || 202, body: { ok: true, ...result.body } };
+}
+
+export async function handleGithubImportStatus(payload, state) {
+  const target = resolveShareTarget(payload, state);
+  if (target.error) return target.error;
+  const importId = String(payload.importId || "").trim();
+  if (!importId) return errorResponse(400, "missing_import_id", "importId is required.");
+  const result = await getGithubImportBySlug({ ...target, importId });
+  if (!result.ok) {
+    return errorResponse(
+      result.status || 502,
+      adapterErrorCode(result, "github_import_status_failed"),
+      adapterDetail(result, "Could not load import progress."),
+    );
+  }
+  return { statusCode: 200, body: { ok: true, ...result.body } };
+}
+
 // Zip download. Success returns `{ statusCode: 200, zip: { bytes, filename, contentType } }`
 // (routeRequest streams it); failure returns the usual `{ statusCode, body }`.
 export async function handleProjectExport(payload, state) {
@@ -1083,6 +1169,27 @@ export async function handleLeanPaneManifest(payload, state) {
     overleafProjectId,
     refresh: true
   });
+  let targetSyncWarning = null;
+  if (identity.exists !== false && manifest.items.length) {
+    const target = resolveShareTarget({ overleafProjectId }, state);
+    if (!target.error) {
+      const sync = await syncProjectFormalizationTargetsBySlug({
+        ...target,
+        targets: normalizeGithubImportTargets(
+          overleafProjectId,
+          manifest.items.map((item) => ({
+            targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+            targetLabel: item?.label || item?.leanDeclarationName || "",
+            declarationName: item?.leanDeclarationName || item?.label || "",
+            displayTitle: item?.leanDeclarationName || item?.label || "",
+            statement: item?.naturalLanguageLatex || "",
+            sourceHash: item?.sourceHash || "",
+          })),
+        ),
+      });
+      if (!sync.ok) targetSyncWarning = adapterDetail(sync, "Imported declarations could not be synchronized.");
+    }
+  }
   const approvalContext = await loadFormalizationApprovalContext({
     state,
     overleafProjectId,
@@ -1105,6 +1212,9 @@ export async function handleLeanPaneManifest(payload, state) {
     statusCode: 200,
     body: {
       ...manifest,
+      diagnostics: targetSyncWarning
+        ? [...manifest.diagnostics, { code: "target_sync_failed", message: targetSyncWarning }]
+        : manifest.diagnostics,
       items
     }
   };
@@ -3692,6 +3802,27 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "POST" && url.pathname === "/share/github/push") {
     const result = await handleSharePush(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/project/github-import/preview") {
+    const result = await handleGithubImportPreview(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/project/github-import/confirm") {
+    const result = await handleGithubImportConfirm(await readBodyJson(request), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/project/github-import/status") {
+    const result = await handleGithubImportStatus({
+      overleafProjectId: url.searchParams.get("overleafProjectId") || "",
+      importId: url.searchParams.get("importId") || "",
+    }, state);
     sendJson(response, result.statusCode, result.body);
     return;
   }

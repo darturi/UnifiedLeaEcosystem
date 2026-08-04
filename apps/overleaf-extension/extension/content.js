@@ -657,6 +657,7 @@
       </div>
       <div class="ol-lean-share-actions">
         <button type="button" class="ol-lean-provider-key-button" data-role="share-export" title="Download the Lean project as a zip">Download .zip</button>
+        <button type="button" class="ol-lean-provider-key-button" data-role="github-import" title="Add non-conflicting Lean files from GitHub">Add Lean files from GitHub</button>
       </div>
       <p class="ol-lean-share-hint" data-role="share-hint" hidden></p>
       <p class="ol-lean-share-status" role="status" data-role="share-status">Loading share status...</p>
@@ -675,6 +676,9 @@
     const exportButton = panel.querySelector("[data-role='share-export']");
     exportButton?.addEventListener("click", () => {
       exportLeanProject(exportButton).catch((error) => setShareStatus(errorText(error)));
+    });
+    panel.querySelector("[data-role='github-import']")?.addEventListener("click", () => {
+      openGithubImportDialog().catch((error) => setShareStatus(errorText(error)));
     });
 
     try {
@@ -795,6 +799,159 @@
 
   function errorText(error) {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  async function openGithubImportDialog() {
+    await ensureLeanPaneView();
+    await refreshLeanPaneNow({ forceFetch: true, background: true });
+    const projectId = extractOverleafProjectId();
+    const baseUrl = await chatCompanionBaseUrl();
+    const targets = (lastLeanPaneManifest?.items || []).map((item) =>
+      leanPaneView.paneItemToGithubImportTarget(item)
+    );
+    let preview = null;
+    let closed = false;
+
+    const overlay = document.createElement("div");
+    overlay.className = "ol-lean-github-import-overlay";
+    overlay.innerHTML = `
+      <section class="ol-lean-github-import-dialog" role="dialog" aria-modal="true" aria-labelledby="ol-lean-github-import-title">
+        <header>
+          <div><h2 id="ol-lean-github-import-title">Add Lean files from GitHub</h2><p>Existing project files are never overwritten.</p></div>
+          <button type="button" class="ol-lean-icon-button" data-role="close" aria-label="Close">x</button>
+        </header>
+        <div class="ol-lean-github-import-content">
+          <label>GitHub repository<input type="url" autocomplete="off" spellcheck="false" placeholder="https://github.com/owner/repository" data-role="url"></label>
+          <p class="ol-lean-github-import-note">Only tracked .lean files are considered. Conflicting files are skipped independently.</p>
+          <div class="ol-lean-github-import-result" data-role="result"></div>
+          <p class="ol-lean-github-import-status" data-role="status" role="status"></p>
+          <footer>
+            <button type="button" class="ol-lean-provider-key-button" data-role="cancel">Cancel</button>
+            <button type="button" class="ol-lean-save-button" data-role="analyze">Analyze</button>
+            <button type="button" class="ol-lean-save-button" data-role="confirm" hidden>Add Lean files</button>
+          </footer>
+        </div>
+      </section>
+    `;
+    document.body.appendChild(overlay);
+    const urlInput = overlay.querySelector("[data-role='url']");
+    const resultNode = overlay.querySelector("[data-role='result']");
+    const statusNode = overlay.querySelector("[data-role='status']");
+    const analyzeButton = overlay.querySelector("[data-role='analyze']");
+    const confirmButton = overlay.querySelector("[data-role='confirm']");
+
+    const close = () => {
+      closed = true;
+      overlay.remove();
+    };
+    overlay.querySelector("[data-role='close']")?.addEventListener("click", close);
+    overlay.querySelector("[data-role='cancel']")?.addEventListener("click", close);
+    overlay.addEventListener("mousedown", (event) => {
+      if (event.target === overlay) close();
+    });
+
+    const setStatus = (text, error = false) => {
+      statusNode.textContent = text || "";
+      statusNode.classList.toggle("is-error", error);
+    };
+
+    const renderPlan = (payload) => {
+      const plan = payload?.plan || {};
+      const counts = plan.counts || {};
+      resultNode.replaceChildren();
+      const summary = document.createElement("div");
+      summary.className = "ol-lean-github-import-summary";
+      summary.textContent = `${counts.add || 0} to add · ${counts.already_present || 0} already present · ${(counts.path_conflict || 0) + (counts.declaration_conflict || 0)} conflicts · ${plan.reusable_declarations || 0} reusable`;
+      resultNode.appendChild(summary);
+      const list = document.createElement("ul");
+      for (const file of plan.files || []) {
+        const row = document.createElement("li");
+        const path = document.createElement("code");
+        path.textContent = file.destination_path || file.source_path;
+        const disposition = document.createElement("span");
+        disposition.textContent = file.disposition.replaceAll("_", " ");
+        disposition.className = `is-${file.disposition}`;
+        const reason = document.createElement("small");
+        reason.textContent = file.reason || "";
+        row.append(path, disposition, reason);
+        list.appendChild(row);
+      }
+      resultNode.appendChild(list);
+      const addCount = Number(counts.add || 0);
+      confirmButton.textContent = addCount
+        ? `Add ${addCount} Lean file${addCount === 1 ? "" : "s"}`
+        : "Reconcile existing files";
+      confirmButton.hidden = false;
+      confirmButton.disabled = Boolean(plan.blocking_error);
+      analyzeButton.hidden = true;
+      urlInput.disabled = true;
+      if (plan.blocking_error) setStatus(plan.blocking_error.message || "This repository cannot be imported.", true);
+    };
+
+    analyzeButton.addEventListener("click", async () => {
+      const repositoryUrl = String(urlInput.value || "").trim();
+      if (!repositoryUrl) return;
+      analyzeButton.disabled = true;
+      setStatus("Analyzing repository...");
+      try {
+        const response = await fetch(`${baseUrl}/project/github-import/preview`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overleafProjectId: projectId, repositoryUrl, targets })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw companionRequestError(response, body);
+        preview = body;
+        renderPlan(body);
+        setStatus("Review the additive file plan before confirming.");
+      } catch (error) {
+        setStatus(errorText(error), true);
+      } finally {
+        analyzeButton.disabled = false;
+      }
+    });
+
+    confirmButton.addEventListener("click", async () => {
+      if (!preview?.preview_id) return;
+      confirmButton.disabled = true;
+      setStatus("Adding files and starting local checks...");
+      try {
+        const response = await fetch(`${baseUrl}/project/github-import/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overleafProjectId: projectId, previewId: preview.preview_id })
+        });
+        let progress = await response.json().catch(() => ({}));
+        if (!response.ok) throw companionRequestError(response, progress);
+        resultNode.replaceChildren();
+        while (!closed && ["applying", "checking"].includes(progress.status)) {
+          const checks = progress.counts?.checks || {};
+          setStatus(`Checking Lean files: ${checks.ok || 0} passed · ${checks.error || 0} failed · ${checks.pending || 0} pending`);
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          if (closed) return;
+          const poll = await fetch(
+            `${baseUrl}/project/github-import/status?overleafProjectId=${encodeURIComponent(projectId)}&importId=${encodeURIComponent(progress.id)}`
+          );
+          progress = await poll.json().catch(() => ({}));
+          if (!poll.ok) throw companionRequestError(poll, progress);
+        }
+        if (closed) return;
+        const dispositions = progress.counts?.dispositions || {};
+        const completion = document.createElement("div");
+        completion.className = "ol-lean-github-import-completion";
+        completion.textContent = `${progress.reused ? "Already imported · " : ""}${dispositions.add || 0} added · ${dispositions.already_present || 0} already present · ${(dispositions.path_conflict || 0) + (dispositions.declaration_conflict || 0)} conflicts skipped · ${progress.counts?.matched_declarations || 0} formalizations populated · ${progress.counts?.reusable_declarations || 0} reusable declarations`;
+        resultNode.replaceChildren(completion);
+        setStatus(progress.status === "complete" ? "GitHub import complete." : "Import finished with issues.", progress.status !== "complete");
+        confirmButton.hidden = true;
+        overlay.querySelector("[data-role='cancel']").textContent = "Done";
+        await refreshLeanPaneNow({ forceFetch: true, background: true });
+      } catch (error) {
+        setStatus(errorText(error), true);
+        confirmButton.disabled = false;
+      }
+    });
+
+    urlInput.focus();
   }
 
   function companionRequestError(response, payload = {}) {

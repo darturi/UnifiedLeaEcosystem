@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import threading
+from collections import Counter
 from uuid import uuid4
 
 from typing import Any
@@ -1043,6 +1044,24 @@ def delete_project_cascade(project_id: str) -> bool:
     with connect() as conn:
         if not conn.execute("select 1 from projects where id = ?", (project_id,)).fetchone():
             return False
+        import_ids = [
+            row["id"] for row in conn.execute(
+                "select id from github_imports where project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if import_ids:
+            import_marks = ",".join("?" for _ in import_ids)
+            conn.execute(
+                f"delete from github_import_declarations where import_id in ({import_marks})",
+                import_ids,
+            )
+            conn.execute(
+                f"delete from github_import_files where import_id in ({import_marks})",
+                import_ids,
+            )
+            conn.execute(
+                f"delete from github_imports where id in ({import_marks})", import_ids
+            )
         session_ids = [
             r["id"] for r in conn.execute(
                 "select id from sessions where project_id = ?", (project_id,)
@@ -2262,6 +2281,329 @@ def project_has_active_run(project_id: str) -> bool:
             (project_id,),
         ).fetchone()
     return row is not None
+
+
+# --- Additive GitHub project imports ---------------------------------------
+
+GITHUB_IMPORT_STATUSES = {
+    "applying", "checking", "complete", "complete_with_issues", "failed",
+}
+GITHUB_IMPORT_DISPOSITIONS = {
+    "add", "already_present", "path_conflict", "declaration_conflict",
+    "unsupported_module_layout", "excluded",
+}
+
+
+def create_github_import(
+    *,
+    project_id: str,
+    source_url: str,
+    source_commit_sha: str,
+    destination_namespace: str,
+    source_ref: str | None = None,
+    source_namespace: str | None = None,
+    destination_snapshot: str | None = None,
+    import_id: str | None = None,
+) -> dict:
+    now = utc_now()
+    row_id = import_id or str(uuid4())
+    with write() as conn:
+        conn.execute(
+            """
+            insert or ignore into github_imports (
+                id, project_id, source_url, source_ref, source_commit_sha,
+                source_namespace, destination_namespace, status,
+                destination_snapshot, created_at, updated_at
+            ) values (?, ?, ?, ?, ?, ?, ?, 'applying', ?, ?, ?)
+            """,
+            (
+                row_id, project_id, source_url, source_ref, source_commit_sha,
+                source_namespace, destination_namespace, destination_snapshot, now, now,
+            ),
+        )
+        row = conn.execute(
+            "select * from github_imports where id = ?", (row_id,)
+        ).fetchone()
+    if row is None:
+        raise ValueError("could not create GitHub import")
+    return row_to_dict(row)
+
+
+def get_github_import(import_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "select * from github_imports where id = ?", (import_id,)
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def list_project_github_imports(project_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from github_imports where project_id = ? "
+            "order by created_at desc, id desc",
+            (project_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def set_github_import_status(
+    import_id: str,
+    status: str,
+    *,
+    session_id: str | None = None,
+    commit_sha: str | None = None,
+    error_detail: str | None = None,
+) -> dict | None:
+    if status not in GITHUB_IMPORT_STATUSES:
+        raise ValueError(f"unsupported GitHub import status: {status}")
+    with write() as conn:
+        conn.execute(
+            """
+            update github_imports
+            set status = ?, session_id = coalesce(?, session_id),
+                commit_sha = coalesce(?, commit_sha),
+                error_detail = coalesce(?, error_detail), updated_at = ?
+            where id = ?
+            """,
+            (status, session_id, commit_sha, error_detail, utc_now(), import_id),
+        )
+        row = conn.execute(
+            "select * from github_imports where id = ?", (import_id,)
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def upsert_github_import_file(
+    *,
+    import_id: str,
+    source_path: str,
+    destination_path: str | None,
+    disposition: str,
+    reason: str | None = None,
+    content_sha256: str | None = None,
+    code_step_id: int | None = None,
+    check_status: str | None = None,
+    check_detail: str | None = None,
+) -> dict:
+    if disposition not in GITHUB_IMPORT_DISPOSITIONS:
+        raise ValueError(f"unsupported GitHub import disposition: {disposition}")
+    now = utc_now()
+    with write() as conn:
+        conn.execute(
+            """
+            insert into github_import_files (
+                import_id, source_path, destination_path, disposition, reason,
+                content_sha256, code_step_id, check_status, check_detail,
+                created_at, updated_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(import_id, source_path) do update set
+                destination_path = excluded.destination_path,
+                disposition = excluded.disposition,
+                reason = excluded.reason,
+                content_sha256 = excluded.content_sha256,
+                code_step_id = coalesce(excluded.code_step_id, github_import_files.code_step_id),
+                check_status = coalesce(excluded.check_status, github_import_files.check_status),
+                check_detail = coalesce(excluded.check_detail, github_import_files.check_detail),
+                updated_at = excluded.updated_at
+            """,
+            (
+                import_id, source_path, destination_path, disposition, reason,
+                content_sha256, code_step_id, check_status, check_detail, now, now,
+            ),
+        )
+        row = conn.execute(
+            "select * from github_import_files where import_id = ? and source_path = ?",
+            (import_id, source_path),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def set_github_import_file_check(
+    import_id: str,
+    source_path: str,
+    check_status: str,
+    check_detail: str | None = None,
+) -> dict | None:
+    if check_status not in {"pending", "ok", "error"}:
+        raise ValueError(f"unsupported GitHub import check status: {check_status}")
+    with write() as conn:
+        conn.execute(
+            """
+            update github_import_files
+            set check_status = ?, check_detail = ?, updated_at = ?
+            where import_id = ? and source_path = ?
+            """,
+            (check_status, check_detail, utc_now(), import_id, source_path),
+        )
+        row = conn.execute(
+            "select * from github_import_files where import_id = ? and source_path = ?",
+            (import_id, source_path),
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def list_github_import_files(import_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from github_import_files where import_id = ? order by source_path",
+            (import_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def upsert_github_import_declaration(
+    *,
+    import_id: str,
+    project_id: str,
+    destination_path: str,
+    declaration_name: str,
+    full_name: str,
+    kind: str,
+    module_name: str,
+    formalization_id: str | None = None,
+    source_hash_at_match: str | None = None,
+) -> dict:
+    now = utc_now()
+    with write() as conn:
+        existing = conn.execute(
+            """
+            select id from github_import_declarations
+            where project_id = ? and destination_path = ? and declaration_name = ?
+            """,
+            (project_id, destination_path, declaration_name),
+        ).fetchone()
+        declaration_id = existing["id"] if existing else str(uuid4())
+        if existing:
+            conn.execute(
+                """
+                update github_import_declarations
+                set import_id = ?, full_name = ?, kind = ?, module_name = ?,
+                    formalization_id = coalesce(?, formalization_id),
+                    source_hash_at_match = coalesce(?, source_hash_at_match), updated_at = ?
+                where id = ?
+                """,
+                (
+                    import_id, full_name, kind, module_name, formalization_id,
+                    source_hash_at_match, now, declaration_id,
+                ),
+            )
+        else:
+            conn.execute(
+                """
+                insert into github_import_declarations (
+                    id, import_id, project_id, destination_path, declaration_name,
+                    full_name, kind, module_name, formalization_id,
+                    source_hash_at_match, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    declaration_id, import_id, project_id, destination_path,
+                    declaration_name, full_name, kind, module_name, formalization_id,
+                    source_hash_at_match, now, now,
+                ),
+            )
+        row = conn.execute(
+            "select * from github_import_declarations where id = ?", (declaration_id,)
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def bind_github_import_declaration(
+    declaration_id: str, formalization_id: str, source_hash: str | None
+) -> dict | None:
+    with write() as conn:
+        conn.execute(
+            """
+            update github_import_declarations
+            set formalization_id = ?, source_hash_at_match = ?, updated_at = ?
+            where id = ?
+            """,
+            (formalization_id, source_hash, utc_now(), declaration_id),
+        )
+        row = conn.execute(
+            "select * from github_import_declarations where id = ?", (declaration_id,)
+        ).fetchone()
+    return row_to_dict(row) if row else None
+
+
+def find_unbound_imported_declarations(
+    project_id: str, declaration_name: str
+) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            select d.*, i.session_id, f.code_step_id, f.check_status
+            from github_import_declarations d
+            join github_imports i on i.id = d.import_id
+            join github_import_files f
+              on f.import_id = d.import_id and f.destination_path = d.destination_path
+            where d.project_id = ? and d.formalization_id is null
+              and (d.declaration_name = ? or d.full_name = ?)
+            order by d.updated_at desc, d.id desc
+            """,
+            (project_id, declaration_name, declaration_name),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_github_import_declarations(import_id: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from github_import_declarations where import_id = ? "
+            "order by destination_path, full_name",
+            (import_id,),
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def list_recoverable_github_imports() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "select * from github_imports where status in ('applying', 'checking') "
+            "order by created_at, id"
+        ).fetchall()
+    return [row_to_dict(row) for row in rows]
+
+
+def project_has_active_import(project_id: str, *, exclude_import_id: str | None = None) -> bool:
+    query = (
+        "select 1 from github_imports where project_id = ? "
+        "and status in ('applying', 'checking')"
+    )
+    params: list[Any] = [project_id]
+    if exclude_import_id:
+        query += " and id != ?"
+        params.append(exclude_import_id)
+    query += " limit 1"
+    with connect() as conn:
+        row = conn.execute(query, params).fetchone()
+    return row is not None
+
+
+def github_import_progress(import_id: str) -> dict | None:
+    imported = get_github_import(import_id)
+    if not imported:
+        return None
+    files = list_github_import_files(import_id)
+    declarations = list_github_import_declarations(import_id)
+    disposition_counts = Counter(row["disposition"] for row in files)
+    check_counts = Counter(row["check_status"] or "unstarted" for row in files)
+    return {
+        **imported,
+        "files": files,
+        "declarations": declarations,
+        "counts": {
+            "dispositions": dict(disposition_counts),
+            "checks": dict(check_counts),
+            "matched_declarations": sum(
+                1 for row in declarations if row.get("formalization_id")
+            ),
+            "reusable_declarations": sum(
+                1 for row in declarations if not row.get("formalization_id")
+            ),
+        },
+    }
 
 
 def has_active_run(session_id: str) -> bool:
