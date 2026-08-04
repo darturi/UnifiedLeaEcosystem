@@ -114,6 +114,24 @@ export function fetchAdapterSettings({ fetchImpl, baseUrl }) {
   });
 }
 
+export function fetchAdapterModelCatalog({ fetchImpl, baseUrl }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/models`, {
+    method: "GET",
+    headers: buildHeaders(null),
+  });
+}
+
+export function fetchAdapterModelRequirements({ fetchImpl, baseUrl, model }) {
+  return fetchJson(
+    fetchImpl,
+    `${baseUrl}/api/models/requirements?model=${encodeURIComponent(String(model || ""))}`,
+    {
+      method: "GET",
+      headers: buildHeaders(null),
+    }
+  );
+}
+
 export function putAdapterSettings({ fetchImpl, baseUrl, body }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/settings`, {
     method: "PUT",

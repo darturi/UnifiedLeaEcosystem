@@ -1,9 +1,9 @@
 (function () {
   const DEFAULT_COMPANION_URL = "http://127.0.0.1:31245";
   const DEFAULT_LEA_UI_BASE_URL = "http://localhost:5173";
-  // Placeholder only, used before the first successful /settings fetch; the
-  // companion (backed by packages/lea-model-catalog) is authoritative and may
-  // re-map it. Keep in sync with the catalog default and options.js (AUDIT L9).
+  // Placeholder only, used before the first successful companion fetch. The
+  // adapter's LiteLLM catalog is authoritative; the shared package supplies the
+  // offline featured fallback. Keep the default in sync with options.js (AUDIT L9).
   const DEFAULT_LEA_MODEL = "o4-mini";
   const DEFAULT_LEA_MAX_TURNS = 20;
   const DEFAULT_LEA_TEX_MIRROR_ENABLED = true;
@@ -12,6 +12,8 @@
   const TEX_MIRROR_FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;
   const TARGET_CONTEXT_RADIUS_LINES = 24;
   const TARGET_CONTEXT_MAX_CHARS = 12000;
+  const MAX_SPEND_ERROR_CODE = "max_spend_reached";
+  const MAX_SPEND_PANE_MESSAGE = "Lea could not complete this formalization because the configured maximum spend has been reached. Increase or clear the cap in Lea settings, then try again.";
   const LEAN_PANE_REFRESH_DELAY_MS = 1500;
   const LEAN_PANE_POLL_DELAY_MS = 4000;
   const LEAN_PANE_WIDTH_STORAGE_KEY = "leanPaneWidthPx";
@@ -92,6 +94,13 @@
   let leanPaneSharePanel = null;
   let leanPaneShareState = null;
   let leanPaneShareBusy = false;
+  // Project identity editing stays inside Lea's visual language instead of
+  // falling through to the browser's unstyleable prompt/confirm pair. The
+  // dialog owns its async namespace preview so stale responses cannot repaint
+  // a newer draft.
+  let projectIdentityDialog = null;
+  let projectIdentityEditorState = null;
+  let projectIdentityPreviewTimer = null;
   // Lean-pane chat mirror: a compact view of the same adapter session the full
   // Lea UI uses. One panel at a time; `leanPaneChatToken` invalidates stale
   // fetch/poll callbacks when the user switches items or closes the panel.
@@ -146,13 +155,19 @@
   // "batch" (PLAN-self-repair-stale-offers Fix 4 -- a global string rendered
   // under every broken item was itself a member of the stale-copy class).
   let leanPaneRepairError = null;
+  // Formalize/stub dispatch errors belong to the item that launched them. The
+  // pane body is replaced on every manifest refresh, so DOM-only feedback (or
+  // the shared inventory status line) disappears almost immediately. Keep the
+  // latest error per item in module state and render it with the item detail.
+  let leanPaneActionErrors = new Map();
+  // Error messages reported by the manifest can be re-created on every
+  // background refresh. Keep exact dismissed-message fingerprints for the
+  // lifetime of the open pane so a dismissal remains respected until the
+  // error changes or the user explicitly retries the action.
+  let dismissedLeanPaneErrorKeys = new Set();
   // At most one item-card overflow ("More actions") menu is open at a time;
   // the same global click/Escape listeners that dismiss popovers close it.
   let activeOverflowMenu = null;
-  let costCapNotice = null;
-  let dismissedCostCapNoticeKeys = new Set();
-  let activeCostCapNoticeKeys = new Set();
-  let costCapUsageLimitReached = false;
   // Editor-hook watchdog (PLAN-system-hardening 0.4): warns when the editor is
   // visible but the page bridge never hooked Overleaf's UNSTABLE_ editor event
   // — i.e. Overleaf changed and the integration is silently dead.
@@ -221,6 +236,10 @@
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (projectIdentityDialog) {
+      closeProjectIdentityEditor();
+      return;
+    }
     if (activeOverflowMenu) {
       closeActiveOverflowMenu();
       return;
@@ -378,7 +397,7 @@
     renameButton.title = "Edit project name";
     renameButton.textContent = "Rename";
     renameButton.addEventListener("click", () => {
-      openProjectIdentityEditor({ source: "lean-pane" }).catch(renderLeanPaneError);
+      openProjectIdentityEditor({ source: "lean-pane", trigger: renameButton }).catch(renderLeanPaneError);
     });
     const refresh = document.createElement("button");
     refresh.type = "button";
@@ -423,6 +442,9 @@
   }
 
   function closeLeanPane() {
+    if (projectIdentityEditorState?.source === "lean-pane") {
+      closeProjectIdentityEditor({ restoreFocus: false });
+    }
     clearTimeout(leanPaneRefreshTimer);
     leanPaneRefreshTimer = null;
     clearTimeout(leanPanePollTimer);
@@ -435,6 +457,8 @@
     leanPaneSharePanel = null;
     leanPaneShareState = null;
     leanPaneShareBusy = false;
+    leanPaneActionErrors = new Map();
+    dismissedLeanPaneErrorKeys = new Set();
     if (!leanPane) return;
     leanPane.remove();
     leanPane = null;
@@ -773,6 +797,14 @@
     return error instanceof Error ? error.message : String(error);
   }
 
+  function companionRequestError(response, payload = {}) {
+    const error = new Error(payload?.message || `Companion returned HTTP ${response?.status}.`);
+    error.name = "CompanionRequestError";
+    error.code = String(payload?.error || "");
+    error.status = Number(response?.status) || 0;
+    return error;
+  }
+
   // Load the pure pane helpers once. The pane is only built on user click (well
   // after startup), so a lazy import here always resolves before any render runs.
   async function ensureLeanPaneView() {
@@ -1016,7 +1048,13 @@
     const line = document.createElement("p");
     line.textContent = text;
     wrap.appendChild(line);
-    return wrap;
+    return kind === "error"
+      ? makeLeanPaneErrorDismissible(wrap, {
+          onDismiss: () => {
+            if (leanPaneStatus) leanPaneStatus.textContent = "Blueprint error dismissed. Refresh to try again.";
+          }
+        })
+      : wrap;
   }
 
   // Edits to the open document re-render the pane from the cached file set with the
@@ -1121,6 +1159,7 @@
     const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
     const tree = leanPaneView.buildLeanPaneTree(items);
+    const useRelationships = leanPaneView.buildPaneUseRelationships(items);
     const fileCount = tree.files.length;
     lastLeanPaneManifest = manifest || null;
     prepareLeanPaneTreeExpansion(manifest, tree);
@@ -1130,14 +1169,24 @@
       : "No labeled theorem, lemma, proposition, corollary, or definition environments found.";
 
     if (Array.isArray(manifest?.diagnostics) && manifest.diagnostics.length > 0) {
+      const visibleDiagnostics = manifest.diagnostics.slice(0, 4);
+      const dismissKey = leanPaneErrorKey(
+        "diagnostics",
+        ...visibleDiagnostics.map((diagnostic) => diagnostic.message || diagnostic.code || "Lean pane diagnostic")
+      );
       const diagnostics = document.createElement("div");
       diagnostics.className = "ol-lean-project-pane-diagnostics";
-      for (const diagnostic of manifest.diagnostics.slice(0, 4)) {
+      for (const diagnostic of visibleDiagnostics) {
         const line = document.createElement("p");
         line.textContent = diagnostic.message || diagnostic.code || "Lean pane diagnostic";
         diagnostics.appendChild(line);
       }
-      leanPaneBody.appendChild(diagnostics);
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        leanPaneBody.appendChild(makeLeanPaneErrorDismissible(diagnostics, {
+          errorKey: dismissKey,
+          label: "Dismiss Lean pane diagnostics"
+        }));
+      }
     }
 
     const repairBatchPanel = renderLeanPaneRepairBatchPanel();
@@ -1150,7 +1199,7 @@
       const treeElement = document.createElement("div");
       treeElement.className = "ol-lean-project-tree";
       for (const node of tree.children) {
-        treeElement.appendChild(renderLeanPaneTreeNode(node, 0, manifest));
+        treeElement.appendChild(renderLeanPaneTreeNode(node, 0, manifest, useRelationships));
       }
       leanPaneBody.appendChild(treeElement);
     }
@@ -1215,74 +1264,407 @@
     }
   }
 
-  async function openProjectIdentityEditor({ source = "lean-pane", popover = null } = {}) {
+  function createProjectIdentityElement(tagName, className = "", text = "") {
+    const element = document.createElement(tagName);
+    if (className) element.className = className;
+    if (text) element.textContent = text;
+    return element;
+  }
+
+  function closeProjectIdentityEditor({ restoreFocus = true } = {}) {
+    clearTimeout(projectIdentityPreviewTimer);
+    projectIdentityPreviewTimer = null;
+    const trigger = projectIdentityEditorState?.trigger;
+    projectIdentityDialog?.remove();
+    projectIdentityDialog = null;
+    projectIdentityEditorState = null;
+    if (restoreFocus && trigger?.isConnected) trigger.focus({ preventScroll: true });
+  }
+
+  function buildProjectIdentityEditor({ source, popover, trigger, baseUrl, projectId, identity }) {
+    closeProjectIdentityEditor({ restoreFocus: false });
+
+    const currentName = String(identity?.projectName || guessProjectName(lastLeanPaneFiles || [])).trim();
+    const currentNamespace = String(identity?.namespace || "").trim();
+    const shell = createProjectIdentityElement("div", "ol-lean-project-identity-backdrop");
+    const dialog = createProjectIdentityElement("section", "ol-lean-project-identity-dialog");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    dialog.setAttribute("aria-labelledby", "ol-lean-project-identity-title");
+    dialog.setAttribute("aria-describedby", "ol-lean-project-identity-description");
+
+    const header = createProjectIdentityElement("header", "ol-lean-project-identity-header");
+    const mark = createProjectIdentityElement("span", "ol-lean-project-identity-mark", "∑");
+    mark.setAttribute("aria-hidden", "true");
+    const heading = createProjectIdentityElement("div", "ol-lean-project-identity-heading");
+    heading.appendChild(createProjectIdentityElement("p", "ol-lean-project-identity-kicker", "Project identity"));
+    const title = createProjectIdentityElement("h2", "", "Rename project");
+    title.id = "ol-lean-project-identity-title";
+    const description = createProjectIdentityElement(
+      "p",
+      "ol-lean-project-identity-description",
+      "Choose the name shown in Lea and preview how it maps to your Lean namespace."
+    );
+    description.id = "ol-lean-project-identity-description";
+    heading.appendChild(title);
+    heading.appendChild(description);
+    const close = createProjectIdentityElement("button", "ol-lean-icon-button ol-lean-project-identity-close", "×");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close project rename dialog");
+    header.appendChild(mark);
+    header.appendChild(heading);
+    header.appendChild(close);
+
+    const form = createProjectIdentityElement("form", "ol-lean-project-identity-form");
+    const field = createProjectIdentityElement("label", "ol-lean-project-identity-field");
+    const fieldLabel = createProjectIdentityElement("span", "ol-lean-project-identity-label", "Project name");
+    const input = createProjectIdentityElement("input", "ol-lean-project-identity-input");
+    input.type = "text";
+    input.value = currentName;
+    input.autocomplete = "off";
+    input.spellcheck = true;
+    input.maxLength = 160;
+    input.setAttribute("aria-describedby", "ol-lean-project-identity-status");
+    field.appendChild(fieldLabel);
+    field.appendChild(input);
+
+    const previewCard = createProjectIdentityElement("section", "ol-lean-project-identity-preview");
+    previewCard.setAttribute("aria-label", "Project identity preview");
+    previewCard.appendChild(createProjectIdentityElement("p", "ol-lean-project-identity-preview-title", "Preview"));
+
+    const nameRow = createProjectIdentityElement("div", "ol-lean-project-identity-preview-row");
+    nameRow.appendChild(createProjectIdentityElement("span", "", "Display name"));
+    const nameValue = createProjectIdentityElement("strong", "ol-lean-project-identity-name-value", currentName);
+    nameRow.appendChild(nameValue);
+    previewCard.appendChild(nameRow);
+
+    const namespaceRow = createProjectIdentityElement("div", "ol-lean-project-identity-preview-row");
+    namespaceRow.appendChild(createProjectIdentityElement("span", "", "Lean namespace"));
+    const namespaceValue = createProjectIdentityElement("code", "ol-lean-project-identity-namespace-value", currentNamespace || "—");
+    namespaceRow.appendChild(namespaceValue);
+    previewCard.appendChild(namespaceRow);
+
+    const sync = createProjectIdentityElement("label", "ol-lean-project-identity-sync");
+    const syncCheckbox = createProjectIdentityElement("input", "ol-lean-project-identity-sync-input");
+    syncCheckbox.type = "checkbox";
+    syncCheckbox.checked = true;
+    const syncTrack = createProjectIdentityElement("span", "ol-lean-project-identity-sync-track");
+    syncTrack.setAttribute("aria-hidden", "true");
+    const syncCopy = createProjectIdentityElement("span", "ol-lean-project-identity-sync-copy");
+    syncCopy.appendChild(createProjectIdentityElement("strong", "", "Keep Lean namespace in sync"));
+    const syncDetail = createProjectIdentityElement("small", "", "Lea will update the namespace to match the new name.");
+    syncCopy.appendChild(syncDetail);
+    sync.appendChild(syncCheckbox);
+    sync.appendChild(syncTrack);
+    sync.appendChild(syncCopy);
+    previewCard.appendChild(sync);
+
+    const impact = createProjectIdentityElement("p", "ol-lean-project-identity-impact");
+    previewCard.appendChild(impact);
+    const suggestions = createProjectIdentityElement("div", "ol-lean-project-identity-suggestions");
+    suggestions.hidden = true;
+    previewCard.appendChild(suggestions);
+
+    const status = createProjectIdentityElement("p", "ol-lean-project-identity-status");
+    status.id = "ol-lean-project-identity-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+
+    const actions = createProjectIdentityElement("footer", "ol-lean-project-identity-actions");
+    const cancel = createProjectIdentityElement("button", "ol-lean-secondary-button", "Cancel");
+    cancel.type = "button";
+    const save = createProjectIdentityElement("button", "ol-lean-primary-button ol-lean-project-identity-save", "Save changes");
+    save.type = "submit";
+    save.disabled = true;
+    actions.appendChild(cancel);
+    actions.appendChild(save);
+
+    form.appendChild(field);
+    form.appendChild(previewCard);
+    form.appendChild(status);
+    form.appendChild(actions);
+    dialog.appendChild(header);
+    dialog.appendChild(form);
+    shell.appendChild(dialog);
+    document.body.appendChild(shell);
+
+    const state = {
+      source,
+      popover,
+      trigger,
+      baseUrl,
+      projectId,
+      identity,
+      currentName,
+      currentNamespace,
+      shell,
+      dialog,
+      input,
+      nameValue,
+      namespaceValue,
+      sync,
+      syncCheckbox,
+      syncDetail,
+      impact,
+      suggestions,
+      status,
+      cancel,
+      save,
+      preview: null,
+      previewError: "",
+      requestedNamespace: "",
+      previewRequest: 0,
+      saving: false
+    };
+    projectIdentityDialog = shell;
+    projectIdentityEditorState = state;
+
+    const closeEditor = () => closeProjectIdentityEditor();
+    close.addEventListener("click", closeEditor);
+    cancel.addEventListener("click", closeEditor);
+    shell.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (event.target === shell) closeEditor();
+    });
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeEditor();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [input, syncCheckbox, cancel, save, close].filter((element) => !element.disabled && !element.hidden);
+      if (focusable.length === 0) return;
+      const index = focusable.indexOf(document.activeElement);
+      if (event.shiftKey && index <= 0) {
+        event.preventDefault();
+        focusable[focusable.length - 1].focus();
+      } else if (!event.shiftKey && index === focusable.length - 1) {
+        event.preventDefault();
+        focusable[0].focus();
+      }
+    });
+    input.addEventListener("input", () => scheduleProjectIdentityPreview(state));
+    syncCheckbox.addEventListener("change", () => renderProjectIdentityEditor(state));
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      saveProjectIdentityEditor(state).catch(() => {});
+    });
+    // The direct listener keeps the lightweight DOM test harness faithful; in
+    // Chrome the form submit listener above is the normal path.
+    save.addEventListener("click", (event) => {
+      event.preventDefault();
+      saveProjectIdentityEditor(state).catch(() => {});
+    });
+
+    renderProjectIdentityEditor(state);
+    input.focus({ preventScroll: true });
+    input.select?.();
+  }
+
+  function scheduleProjectIdentityPreview(state) {
+    if (state !== projectIdentityEditorState) return;
+    clearTimeout(projectIdentityPreviewTimer);
+    projectIdentityPreviewTimer = null;
+    state.preview = null;
+    state.previewError = "";
+    state.requestedNamespace = "";
+    state.previewRequest += 1;
+    renderProjectIdentityEditor(state);
+    const name = String(state.input.value || "").trim();
+    if (!name || name === state.currentName) return;
+    projectIdentityPreviewTimer = setTimeout(() => {
+      projectIdentityPreviewTimer = null;
+      refreshProjectIdentityPreview(state).catch(() => {});
+    }, 220);
+  }
+
+  async function refreshProjectIdentityPreview(state) {
+    if (state !== projectIdentityEditorState) return;
+    const name = String(state.input.value || "").trim();
+    if (!name || name === state.currentName) return;
+    const request = ++state.previewRequest;
+    state.preview = null;
+    state.previewError = "";
+    renderProjectIdentityEditor(state);
+    try {
+      const preview = await previewProjectIdentity({
+        baseUrl: state.baseUrl,
+        projectId: state.projectId,
+        projectName: name,
+        namespace: state.requestedNamespace,
+        excludeProjectId: state.identity?.projectId || ""
+      });
+      if (state !== projectIdentityEditorState || request !== state.previewRequest) return;
+      state.preview = preview;
+    } catch (error) {
+      if (state !== projectIdentityEditorState || request !== state.previewRequest) return;
+      state.previewError = normalizeErrorMessage(error);
+    }
+    renderProjectIdentityEditor(state);
+  }
+
+  function chooseProjectIdentityNamespace(state, namespace) {
+    if (state !== projectIdentityEditorState) return;
+    state.requestedNamespace = String(namespace || "");
+    state.preview = null;
+    state.previewError = "";
+    refreshProjectIdentityPreview(state).catch(() => {});
+  }
+
+  function renderProjectIdentityEditor(state) {
+    if (state !== projectIdentityEditorState) return;
+    const name = String(state.input.value || "").trim();
+    const changed = Boolean(name && name !== state.currentName);
+    const preview = state.preview;
+    const previewNamespace = String(preview?.namespace || "");
+    const namespace = previewNamespace || (changed ? "" : state.currentNamespace);
+    const namespaceChanges = Boolean(namespace && namespace !== state.currentNamespace);
+    const projectExists = Boolean(state.identity?.exists);
+    const checking = changed && !preview && !state.previewError;
+
+    state.nameValue.textContent = name || "Untitled project";
+    state.namespaceValue.textContent = namespace || (checking ? "Checking…" : state.currentNamespace || "—");
+    state.namespaceValue.dataset.loading = checking ? "true" : "false";
+    state.sync.hidden = !changed;
+    state.syncCheckbox.disabled = !projectExists;
+    if (!projectExists) state.syncCheckbox.checked = true;
+
+    if (!changed) {
+      state.syncDetail.textContent = "Lea will update the namespace to match the new name.";
+      state.impact.textContent = "Enter a new project name to see its Lean namespace.";
+    } else if (!state.syncCheckbox.checked) {
+      state.syncDetail.textContent = `Lean files will stay in ${state.currentNamespace || "their current namespace"}.`;
+      state.impact.textContent = "Only the display name will change; proof paths and imports are untouched.";
+    } else if (checking) {
+      state.syncDetail.textContent = "Lea is checking the matching namespace.";
+      state.impact.textContent = "Previewing the project identity…";
+    } else if (namespaceChanges && state.identity?.hasRecordedProofs) {
+      state.syncDetail.textContent = `${state.currentNamespace || "Current namespace"} → ${namespace}`;
+      state.impact.textContent = "Lea will migrate recorded proof files and keep their history attached to this project.";
+    } else if (namespaceChanges) {
+      state.syncDetail.textContent = `${state.currentNamespace || "Current namespace"} → ${namespace}`;
+      state.impact.textContent = "New Lean artifacts will use the previewed namespace.";
+    } else {
+      state.syncDetail.textContent = namespace ? `Lean files will remain in ${namespace}.` : "Lea will keep the current namespace.";
+      state.impact.textContent = "The display name changes without moving Lean files.";
+    }
+
+    state.suggestions.replaceChildren();
+    const suggestionValues = preview?.available === false ? (preview.suggestions || []).slice(0, 3) : [];
+    state.suggestions.hidden = suggestionValues.length === 0 || !state.syncCheckbox.checked;
+    if (!state.suggestions.hidden) {
+      state.suggestions.appendChild(createProjectIdentityElement("span", "", "Available alternatives"));
+      for (const suggestion of suggestionValues) {
+        const button = createProjectIdentityElement("button", "ol-lean-project-identity-suggestion", suggestion);
+        button.type = "button";
+        button.addEventListener("click", () => chooseProjectIdentityNamespace(state, suggestion));
+        state.suggestions.appendChild(button);
+      }
+    }
+
+    let message = "";
+    let kind = "";
+    if (!name) {
+      message = "Project name is required.";
+      kind = "error";
+    } else if (state.previewError && state.syncCheckbox.checked) {
+      message = state.previewError;
+      kind = "error";
+    } else if (preview?.available === false && state.syncCheckbox.checked) {
+      message = `${previewNamespace || "That namespace"} is already in use. Choose an alternative or turn off namespace sync.`;
+      kind = "error";
+    } else if (state.previewError && !state.syncCheckbox.checked) {
+      message = "Namespace preview is unavailable, but you can still save the display name only.";
+      kind = "info";
+    } else if (!changed) {
+      message = "Enter a different name to save changes.";
+      kind = "info";
+    } else if (checking) {
+      message = "Checking namespace availability…";
+      kind = "info";
+    }
+    state.status.textContent = message;
+    state.status.dataset.kind = kind;
+
+    const namespaceReady = !state.syncCheckbox.checked || Boolean(preview?.available);
+    state.save.disabled = state.saving || !changed || !name || !namespaceReady;
+    state.input.disabled = state.saving;
+    state.syncCheckbox.disabled = state.saving || !projectExists;
+    state.cancel.disabled = state.saving;
+    state.save.textContent = state.saving ? "Saving…" : "Save changes";
+  }
+
+  async function saveProjectIdentityEditor(state) {
+    if (state !== projectIdentityEditorState || state.saving || state.save.disabled) return false;
+    const projectName = String(state.input.value || "").trim();
+    const preview = state.preview;
+    const migrate = Boolean(
+      state.syncCheckbox.checked &&
+      preview?.available &&
+      preview.namespace &&
+      preview.namespace !== state.currentNamespace
+    );
+    state.saving = true;
+    state.previewError = "";
+    renderProjectIdentityEditor(state);
+    let result;
+    try {
+      result = await saveProjectIdentity({
+        baseUrl: state.baseUrl,
+        projectId: state.projectId,
+        projectName,
+        mode: migrate ? "rename-namespace" : "display-only",
+        namespace: migrate ? preview.namespace : "",
+        expectedNamespace: state.currentNamespace,
+        createIfMissing: true
+      });
+    } catch (error) {
+      if (state !== projectIdentityEditorState) return false;
+      state.saving = false;
+      state.previewError = normalizeErrorMessage(error);
+      renderProjectIdentityEditor(state);
+      return false;
+    }
+    if (state !== projectIdentityEditorState) return false;
+    lastProjectIdentity = result.identity || null;
+    renderLeanPaneProjectIdentity(lastProjectIdentity);
+    if (state.popover) renderProjectSettingsSection(state.popover, lastProjectIdentity);
+    const savedNamespace = result.identity?.namespace || state.currentNamespace || preview?.namespace || "";
+    let message = !migrate && savedNamespace
+      ? `Project name saved. Lean files still use namespace ${savedNamespace}.`
+      : "Project name and Lean namespace saved.";
+    let feedbackKind = "success";
+    if (migrate && leanPane) {
+      try {
+        // The rename endpoint migrates the files synchronously. Re-fetch the
+        // manifest before dismissing the dialog so already-rendered code uses
+        // those rewritten working files immediately.
+        if (leanPaneMainView === "blueprint") {
+          // No Lean source is visible in Blueprint, but its cached Items view
+          // would otherwise resurrect the pre-rename manifest when selected.
+          lastLeanPaneManifest = null;
+        } else {
+          await refreshLeanPaneNow({ background: true });
+        }
+      } catch (error) {
+        message += ` The Lean pane could not refresh: ${normalizeErrorMessage(error)}`;
+        feedbackKind = "error";
+      }
+    }
+    const { source, popover } = state;
+    closeProjectIdentityEditor();
+    renderProjectIdentityFeedback({ source, popover, message, kind: feedbackKind });
+    return true;
+  }
+
+  async function openProjectIdentityEditor({ source = "lean-pane", popover = null, trigger = null } = {}) {
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     const projectId = extractOverleafProjectId();
     const identity = lastProjectIdentity || await loadProjectIdentity({ baseUrl, projectId });
-    const projectName = window.prompt("Project name", identity?.projectName || guessProjectName(lastLeanPaneFiles || []));
-    if (projectName === null) {
-      renderProjectIdentityFeedback({ source, popover });
-      return false;
-    }
-    const trimmed = projectName.trim();
-    if (!trimmed) {
-      renderProjectIdentityFeedback({ source, popover, message: "Project name is required.", kind: "error" });
-      return false;
-    }
-    let preview;
-    try {
-      preview = await previewProjectIdentity({
-        baseUrl,
-        projectId,
-        projectName: trimmed,
-        excludeProjectId: identity?.projectId || ""
-      });
-    } catch (error) {
-      renderProjectIdentityFeedback({ source, popover, message: normalizeErrorMessage(error), kind: "error" });
-      return false;
-    }
-    if (preview.available === false) {
-      renderProjectIdentityFeedback({
-        source,
-        popover,
-        message: `That namespace is already in use. Try ${preview.suggestions?.[0] || "another name"}.`,
-        kind: "error"
-      });
-      return false;
-    }
-    const existingWithProofs = Boolean(identity?.exists && identity?.hasRecordedProofs);
-    const migrate = !existingWithProofs && preview.namespace !== identity?.namespace
-      ? true
-      : window.confirm(`Change Lean namespace to ${preview.namespace}? Choose Cancel to rename the display name only.`);
-    const mode = migrate ? "rename-namespace" : "display-only";
-    let result;
-    try {
-      result = await saveProjectIdentity({
-        baseUrl,
-        projectId,
-        projectName: trimmed,
-        mode,
-        namespace: migrate ? preview.namespace : "",
-        expectedNamespace: identity?.namespace || "",
-        createIfMissing: true
-      });
-    } catch (error) {
-      renderProjectIdentityFeedback({ source, popover, message: normalizeErrorMessage(error), kind: "error" });
-      return false;
-    }
-    lastProjectIdentity = result.identity || null;
-    renderLeanPaneProjectIdentity(lastProjectIdentity);
-    if (popover) renderProjectSettingsSection(popover, lastProjectIdentity);
-    const savedNamespace = result.identity?.namespace || identity?.namespace || preview.namespace || "";
-    renderProjectIdentityFeedback({
-      source,
-      popover,
-      message: mode === "display-only" && savedNamespace
-        ? `Project name saved. Lean files still use namespace ${savedNamespace}.`
-        : "Project name and Lean namespace saved.",
-      kind: "success"
-    });
+    buildProjectIdentityEditor({ source, popover, trigger, baseUrl, projectId, identity });
     return true;
   }
 
@@ -1314,7 +1696,7 @@
     }
   }
 
-  function renderLeanPaneTreeNode(node, depth, manifest) {
+  function renderLeanPaneTreeNode(node, depth, manifest, useRelationships) {
     const expanded = leanPaneExpandedTreeNodeIds.has(node.id);
     const section = document.createElement("section");
     section.className = `ol-lean-project-tree-node ol-lean-project-tree-node-${node.type}`;
@@ -1328,7 +1710,7 @@
     row.setAttribute("aria-label", `${expanded ? "Collapse" : "Expand"} ${node.type === "folder" ? "folder" : "file"} ${node.path || node.name}`);
     row.addEventListener("click", () => {
       toggleLeanPaneTreeNode(node.id);
-      section.replaceWith(renderLeanPaneTreeNode(node, depth, manifest));
+      section.replaceWith(renderLeanPaneTreeNode(node, depth, manifest, useRelationships));
     });
 
     const disclosure = document.createElement("span");
@@ -1361,12 +1743,12 @@
       children.className = "ol-lean-project-tree-children";
       if (node.type === "folder") {
         for (const child of node.children) {
-          children.appendChild(renderLeanPaneTreeNode(child, depth + 1, manifest));
+          children.appendChild(renderLeanPaneTreeNode(child, depth + 1, manifest, useRelationships));
         }
       } else {
         children.className = "ol-lean-project-tree-items";
         for (const item of node.items) {
-          children.appendChild(renderLeanPaneItem(item));
+          children.appendChild(renderLeanPaneItem(item, useRelationships));
         }
       }
       section.appendChild(children);
@@ -1402,7 +1784,7 @@
     }
   }
 
-  function renderLeanPaneItem(item) {
+  function renderLeanPaneItem(item, useRelationships) {
     const expanded = leanPaneExpandedItemIds.has(item.id);
     const card = document.createElement("section");
     card.className = `ol-lean-project-item ol-lean-project-item-${item.status || "unknown"}`;
@@ -1420,7 +1802,7 @@
       } else {
         leanPaneExpandedItemIds.add(item.id);
       }
-      card.replaceWith(renderLeanPaneItem(item));
+      card.replaceWith(renderLeanPaneItem(item, useRelationships));
     });
 
     const text = document.createElement("span");
@@ -1455,6 +1837,9 @@
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
 
+    const relationships = renderLeanPaneUseRelationships(item, useRelationships);
+    if (relationships) card.appendChild(relationships);
+
     if (item.status === "stale") {
       const staleNote = document.createElement("p");
       staleNote.className = "ol-lean-project-stale-note";
@@ -1484,6 +1869,88 @@
       card.appendChild(renderLeanPaneItemDetail(item));
     }
     return card;
+  }
+
+  function renderLeanPaneUseRelationships(item, useRelationships) {
+    const uses = useRelationships?.usesByItem?.get(item) || [];
+    const usedBy = useRelationships?.usedByItem?.get(item) || [];
+    if (uses.length === 0 && usedBy.length === 0) return null;
+
+    const container = document.createElement("div");
+    container.className = "ol-lean-project-relationships";
+    container.setAttribute("role", "group");
+    container.setAttribute("aria-label", `Relationships for ${item.label || item.leanDeclarationName || "this item"}`);
+    if (uses.length > 0) {
+      container.appendChild(renderLeanPaneUseRelationshipRow("Uses", "→", "uses", uses));
+    }
+    if (usedBy.length > 0) {
+      container.appendChild(renderLeanPaneUseRelationshipRow("Used by", "←", "used-by", usedBy));
+    }
+    return container;
+  }
+
+  function renderLeanPaneUseRelationshipRow(label, arrow, direction, relationships) {
+    const row = document.createElement("div");
+    row.className = "ol-lean-project-relationship-row";
+
+    const heading = document.createElement("span");
+    heading.className = "ol-lean-project-relationship-label";
+    heading.textContent = label;
+    row.appendChild(heading);
+
+    const arrowElement = document.createElement("span");
+    arrowElement.className = "ol-lean-project-relationship-arrow";
+    arrowElement.setAttribute("aria-hidden", "true");
+    arrowElement.textContent = arrow;
+    row.appendChild(arrowElement);
+
+    const list = document.createElement("div");
+    list.className = "ol-lean-project-relationship-list";
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", label);
+    for (const relationship of relationships) {
+      list.appendChild(renderLeanPaneUseRelationshipChip(relationship, direction));
+    }
+    row.appendChild(list);
+    return row;
+  }
+
+  function renderLeanPaneUseRelationshipChip(relationship, direction) {
+    const navigable = Boolean(relationship?.item);
+    const element = document.createElement(navigable ? "button" : "span");
+    if (navigable) element.type = "button";
+    const status = String(relationship?.status || "unknown").toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+    element.className = [
+      "ol-lean-project-relationship-chip",
+      `ol-lean-project-relationship-chip-${status}`,
+      navigable ? "is-navigable" : "is-unavailable",
+      relationship?.resolution === "ambiguous" ? "is-ambiguous" : ""
+    ].filter(Boolean).join(" ");
+    element.dataset.relationshipDirection = direction;
+    element.dataset.targetLabel = relationship?.label || "";
+    element.textContent = relationship?.label || "";
+
+    if (navigable) {
+      const role = direction === "uses" ? "dependency" : "dependent";
+      const state = leanPaneView.formatPaneStatus(relationship.status || "unknown");
+      const accessibleLabel = `Open ${role} ${relationship.label}, currently ${state}`;
+      element.setAttribute("aria-label", accessibleLabel);
+      element.title = accessibleLabel;
+      element.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        revealLeanPaneItem(relationship.item);
+      });
+    } else {
+      const ambiguous = relationship?.resolution === "ambiguous";
+      const message = ambiguous
+        ? `${relationship.label} matches more than one item in the Lean-pane inventory.`
+        : `${relationship.label} is not present in the current Lean-pane inventory.`;
+      element.setAttribute("aria-label", message);
+      element.setAttribute("aria-disabled", "true");
+      element.title = message;
+    }
+    return element;
   }
 
   function renderLeanPaneItemDetail(item) {
@@ -1518,6 +1985,9 @@
     actions.appendChild(railElement);
     detail.appendChild(actions);
 
+    const actionError = renderLeanPaneActionError(item);
+    if (actionError) detail.appendChild(actionError);
+
     if (item.breakage) {
       detail.appendChild(renderLeanPaneBreakage(item));
     }
@@ -1548,6 +2018,141 @@
     return detail;
   }
 
+  function leanPaneErrorKey(...parts) {
+    return parts.map((part) => String(part ?? "")).join("\u001f");
+  }
+
+  function clearDismissedLeanPaneErrors(prefix) {
+    const prefixWithSeparator = `${prefix}\u001f`;
+    for (const key of dismissedLeanPaneErrorKeys) {
+      if (key === prefix || key.startsWith(prefixWithSeparator)) {
+        dismissedLeanPaneErrorKeys.delete(key);
+      }
+    }
+  }
+
+  function makeLeanPaneErrorDismissible(element, {
+    errorKey = "",
+    label = "Dismiss error message",
+    onDismiss = null,
+    removeOnDismiss = true
+  } = {}) {
+    if (!element) return element;
+    element.classList.add("ol-lean-dismissible-error");
+    const dismiss = document.createElement("button");
+    dismiss.type = "button";
+    dismiss.className = "ol-lean-error-dismiss";
+    dismiss.setAttribute("aria-label", label);
+    dismiss.title = "Dismiss";
+    dismiss.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (errorKey) dismissedLeanPaneErrorKeys.add(errorKey);
+      onDismiss?.();
+      if (removeOnDismiss) element.remove();
+    });
+    element.appendChild(dismiss);
+    return element;
+  }
+
+  function leanPaneActionErrorKey(item) {
+    return String(item?.id || `${item?.leanKind || "theorem"}:${item?.label || item?.leanDeclarationName || ""}`);
+  }
+
+  function clearLeanPaneActionError(item) {
+    const itemKey = leanPaneActionErrorKey(item);
+    leanPaneActionErrors.delete(itemKey);
+    clearDismissedLeanPaneErrors(leanPaneErrorKey("action", itemKey));
+  }
+
+  function rememberLeanPaneActionError(item, error, operation = "formalize") {
+    const maxSpend = isMaxSpendError(error);
+    leanPaneActionErrors.set(leanPaneActionErrorKey(item), {
+      code: maxSpend ? MAX_SPEND_ERROR_CODE : String(error?.code || ""),
+      message: normalizeErrorMessage(error),
+      operation
+    });
+  }
+
+  function isUnresolvedUsesError(error) {
+    return String(error?.code || "") === "unresolved_uses";
+  }
+
+  function actionFailureMessage(error) {
+    const message = typeof error?.message === "string"
+      ? error.message
+      : normalizeErrorMessage(error);
+    return isUnresolvedUsesError(error)
+      ? `${message} No Lea run was started.`
+      : message;
+  }
+
+  function leanPaneActionErrorForItem(item) {
+    const local = leanPaneActionErrors.get(leanPaneActionErrorKey(item));
+    if (local) return local;
+    if (item?.failureCode === MAX_SPEND_ERROR_CODE || item?.finalStatus === "max_spend") {
+      return {
+        code: MAX_SPEND_ERROR_CODE,
+        message: item?.failureMessage || item?.message || "Max spend limit has been reached.",
+        operation: "formalize"
+      };
+    }
+    return null;
+  }
+
+  function renderLeanPaneActionError(item) {
+    const error = leanPaneActionErrorForItem(item);
+    if (!error) return null;
+    const itemKey = leanPaneActionErrorKey(item);
+    const dismissKey = leanPaneErrorKey(
+      "action",
+      itemKey,
+      error.code,
+      error.operation,
+      error.message
+    );
+    if (dismissedLeanPaneErrorKeys.has(dismissKey)) return null;
+    const maxSpend = error.code === MAX_SPEND_ERROR_CODE;
+    const dependencyBlocked = isUnresolvedUsesError(error);
+    const alert = document.createElement("div");
+    alert.className = "ol-lean-project-action-error";
+    alert.setAttribute("role", "alert");
+    alert.setAttribute("aria-live", "assertive");
+
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = maxSpend
+      ? "Cost cap reached"
+      : dependencyBlocked
+        ? "Dependency must be formalized first"
+        : error.operation === "stub"
+          ? "Could not create Lean stub"
+          : "Could not start formalization";
+    const message = document.createElement("p");
+    message.textContent = maxSpend ? MAX_SPEND_PANE_MESSAGE : actionFailureMessage(error);
+    copy.appendChild(title);
+    copy.appendChild(message);
+    alert.appendChild(copy);
+
+    if (maxSpend) {
+      const settings = document.createElement("button");
+      settings.type = "button";
+      settings.className = "ol-lean-secondary-button ol-lean-project-action-error-settings";
+      settings.textContent = "Open settings";
+      settings.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        showSettingsPopover();
+        activePopover?.querySelector("[data-role='max-spend']")?.focus({ preventScroll: true });
+      });
+      alert.appendChild(settings);
+    }
+    return makeLeanPaneErrorDismissible(alert, {
+      errorKey: dismissKey,
+      onDismiss: () => leanPaneActionErrors.delete(itemKey)
+    });
+  }
+
   // --- Self-repair actions (docs/FEATURE-overleaf-self-repair.md, Phase 5) ---
 
   function renderRepairButton(item) {
@@ -1575,6 +2180,7 @@
     const attribution = document.createElement("p");
     attribution.textContent = leanPaneView.formatBreakageAttribution(item.breakage);
     container.appendChild(attribution);
+    const itemKey = item.leanDeclarationName || item.label || "";
     const repair = item.breakage.repair;
     if (repair?.state === "running") {
       const line = document.createElement("p");
@@ -1582,17 +2188,26 @@
       line.textContent = "A repair run is in progress for this item...";
       container.appendChild(line);
     } else if (repair?.state === "failed") {
+      const reason = repair.failureReason || "the repaired file still does not compile.";
+      const dismissKey = leanPaneErrorKey("repair-result", itemKey, reason);
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
-      line.textContent = `Repair failed: ${repair.failureReason || "the repaired file still does not compile."}`;
-      container.appendChild(line);
+      line.textContent = `Repair failed: ${reason}`;
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        container.appendChild(makeLeanPaneErrorDismissible(line, { errorKey: dismissKey }));
+      }
     }
-    const itemKey = item.leanDeclarationName || item.label || "";
     if (leanPaneRepairError && leanPaneRepairError.itemKey === itemKey) {
+      const dismissKey = leanPaneErrorKey("repair-dispatch", itemKey, leanPaneRepairError.message);
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
       line.textContent = leanPaneRepairError.message;
-      container.appendChild(line);
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        container.appendChild(makeLeanPaneErrorDismissible(line, {
+          errorKey: dismissKey,
+          onDismiss: () => { leanPaneRepairError = null; }
+        }));
+      }
     }
     return container;
   }
@@ -1602,6 +2217,10 @@
   async function requestRepair({ overleafProjectId, items }) {
     leanPaneRepairError = null;
     const errorKey = items.length === 1 ? items[0].targetLabel : "batch";
+    clearDismissedLeanPaneErrors(leanPaneErrorKey("repair-dispatch", errorKey));
+    for (const item of items) {
+      clearDismissedLeanPaneErrors(leanPaneErrorKey("repair-result", item.targetLabel));
+    }
     try {
       const baseUrl = await chatCompanionBaseUrl();
       if (items.length === 1) {
@@ -1977,10 +2596,16 @@
     }
 
     if (leanPaneRepairError && leanPaneRepairError.itemKey === "batch") {
+      const dismissKey = leanPaneErrorKey("repair-dispatch", "batch", leanPaneRepairError.message);
       const line = document.createElement("p");
       line.className = "ol-lean-project-breakage-failed";
       line.textContent = leanPaneRepairError.message;
-      panel.appendChild(line);
+      if (!dismissedLeanPaneErrorKeys.has(dismissKey)) {
+        panel.appendChild(makeLeanPaneErrorDismissible(line, {
+          errorKey: dismissKey,
+          onDismiss: () => { leanPaneRepairError = null; }
+        }));
+      }
     }
     const controls = document.createElement("div");
     controls.className = "ol-lean-project-detail-actions";
@@ -2124,6 +2749,25 @@
     renderLeanPaneManifest(lastLeanPaneManifest);
   }
 
+  function renderLeanPaneEditErrorLine(errorLine) {
+    errorLine.replaceChildren();
+    errorLine.classList.remove("ol-lean-dismissible-error");
+    errorLine.hidden = !leanPaneEditError;
+    if (!leanPaneEditError) return;
+    const message = document.createElement("span");
+    message.textContent = leanPaneEditError;
+    errorLine.appendChild(message);
+    makeLeanPaneErrorDismissible(errorLine, {
+      removeOnDismiss: false,
+      onDismiss: () => {
+        leanPaneEditError = "";
+        errorLine.hidden = true;
+        errorLine.replaceChildren();
+        errorLine.classList.remove("ol-lean-dismissible-error");
+      }
+    });
+  }
+
   function renderLeanPaneEditControls(item) {
     const container = document.createElement("div");
     container.className = "ol-lean-project-edit";
@@ -2168,8 +2812,7 @@
 
     const errorLine = document.createElement("p");
     errorLine.className = "ol-lean-project-edit-error";
-    errorLine.hidden = !leanPaneEditError;
-    errorLine.textContent = leanPaneEditError || "";
+    renderLeanPaneEditErrorLine(errorLine);
     container.appendChild(errorLine);
 
     const actions = document.createElement("div");
@@ -2225,8 +2868,7 @@
         cancelButton.disabled = false;
         textarea.disabled = false;
         saveButton.textContent = "Save";
-        errorLine.hidden = false;
-        errorLine.textContent = leanPaneEditError;
+        renderLeanPaneEditErrorLine(errorLine);
       }
     });
 
@@ -2461,19 +3103,20 @@
     button.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
+      clearLeanPaneActionError(item);
       button.disabled = true;
       button.textContent = "Starting…";
       try {
         await formalize(leanPaneView.paneItemToFormalizeTarget(item));
+        clearLeanPaneActionError(item);
         await refreshLeanPaneNow({ background: true });
       } catch (error) {
-        button.disabled = false;
         // Startup can be rejected before Lea creates a run (for example when a
         // declared upstream theorem has not been formalized yet). Keep the
         // action consistent with the manifest state rather than implying an
         // initial formalization effort occurred.
-        button.textContent = idleLabel;
-        if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+        rememberLeanPaneActionError(item, error, "formalize");
+        renderLeanPaneManifest(lastLeanPaneManifest);
       }
     });
     return button;
@@ -2594,6 +3237,7 @@
       return;
     }
     if (action.id !== "formalize" && action.id !== "stub") return;
+    clearLeanPaneActionError(item);
     if (leanPaneStatus) {
       leanPaneStatus.textContent = action.id === "stub"
         ? "Creating Lean stub..."
@@ -2602,9 +3246,11 @@
     try {
       const target = leanPaneView.paneItemToFormalizeTarget(item);
       await (action.id === "stub" ? stubTheorem(target) : formalize(target));
+      clearLeanPaneActionError(item);
       await refreshLeanPaneNow({ background: true });
     } catch (error) {
-      if (leanPaneStatus) leanPaneStatus.textContent = normalizeErrorMessage(error);
+      rememberLeanPaneActionError(item, error, action.id);
+      renderLeanPaneManifest(lastLeanPaneManifest);
     }
   }
 
@@ -2958,7 +3604,12 @@
       const error = document.createElement("p");
       error.className = "ol-lean-chat-error";
       error.textContent = normalizeErrorMessage(leanPaneChatError);
-      panel.appendChild(error);
+      panel.appendChild(makeLeanPaneErrorDismissible(error, {
+        onDismiss: () => {
+          leanPaneChatError = null;
+          renderChatPanel();
+        }
+      }));
     }
 
     // Composer
@@ -3135,7 +3786,17 @@
     const message = document.createElement("p");
     message.className = "ol-lean-project-pane-error";
     message.textContent = normalizeErrorMessage(error);
-    leanPaneBody.appendChild(message);
+    leanPaneBody.appendChild(makeLeanPaneErrorDismissible(message, {
+      onDismiss: () => {
+        if (leanPaneMainView === "blueprint" && leanPaneBlueprintGraph) {
+          renderBlueprintBody(leanPaneBlueprintGraph);
+        } else if (leanPaneMainView === "items" && lastLeanPaneManifest) {
+          renderLeanPaneManifest(lastLeanPaneManifest);
+        } else if (leanPaneStatus) {
+          leanPaneStatus.textContent = "Error dismissed. Refresh to try again.";
+        }
+      }
+    }));
   }
 
   function showTargetPopover(clientX, clientY, target) {
@@ -3229,17 +3890,17 @@
         for (const actionButton of actions.querySelectorAll("button")) {
           actionButton.disabled = true;
         }
-        status.textContent = spec.pendingText;
+        renderPopoverActionStatus(status, spec.pendingText);
         try {
           const result = await spec.run(target);
-          status.textContent = `${formatStatus(result.status, result)}${result.relativePath ? ` at ${result.relativePath}` : ""}`;
+          renderPopoverActionStatus(
+            status,
+            `${formatStatus(result.status, result)}${result.relativePath ? ` at ${result.relativePath}` : ""}`
+          );
           renderLeanStatement(leanStatement, result.leanStatement || latestStatuses[targetKey(target)]?.leanStatement || "");
           await refreshStatusesNow();
         } catch (error) {
-          status.textContent = error instanceof Error ? error.message : String(error);
-          if (isMaxSpendError(error)) {
-            showCostCapNotice(null, { force: true, noticeKey: `error:${Date.now()}` });
-          }
+          renderPopoverActionError(status, error);
           const latestStatus = latestStatuses[targetKey(target)] || { status: currentStatus };
           renderTargetActions(actions, target, latestStatus.status || currentStatus, status, leanStatement, getActionStatus(latestStatus));
         }
@@ -3298,6 +3959,31 @@
     actions.appendChild(closeButton);
   }
 
+  function renderPopoverActionStatus(status, message) {
+    status.classList.remove("ol-lean-popover-status-error");
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    status.textContent = message;
+  }
+
+  function renderPopoverActionError(status, error) {
+    const dependencyBlocked = isUnresolvedUsesError(error);
+    status.classList.add("ol-lean-popover-status-error");
+    status.setAttribute("role", "alert");
+    status.setAttribute("aria-live", "assertive");
+    status.textContent = "";
+    status.replaceChildren();
+
+    const title = document.createElement("strong");
+    title.textContent = dependencyBlocked
+      ? "Formalization blocked"
+      : "Action failed";
+    const message = document.createElement("span");
+    message.textContent = actionFailureMessage(error);
+    status.appendChild(title);
+    status.appendChild(message);
+  }
+
   async function showTargetInLeanPane(target) {
     if (!leanPane) {
       showLeanPane({ deferRefresh: true, preservePopover: true });
@@ -3310,13 +3996,19 @@
     if (!item) {
       throw new Error(`Could not find ${target.targetLabel || "this item"} in the Lean pane.`);
     }
+    revealLeanPaneItem(item);
+    return item;
+  }
+
+  function revealLeanPaneItem(item) {
+    if (!item || !lastLeanPaneManifest) return false;
     for (const id of leanPaneView.treeAncestorIdsForFile(item.sourceFile || "")) {
       leanPaneExpandedTreeNodeIds.add(id);
     }
     leanPaneExpandedItemIds.add(item.id);
     renderLeanPaneManifest(lastLeanPaneManifest);
     highlightLeanPaneItem(item.id);
-    return item;
+    return true;
   }
 
   function findLeanPaneItemForTarget(items, target) {
@@ -3505,10 +4197,12 @@
           </div>
         </section>
         <section class="ol-lean-settings-panel">
-          <label>
+          <div class="ol-lean-model-field">
             <span>Model</span>
-            <select data-role="model"></select>
-          </label>
+            <div data-role="model"></div>
+          </div>
+          <p class="lea-model-requirement-note" data-role="model-catalog-status"></p>
+          <div class="lea-model-requirements" data-role="model-requirements" aria-live="polite"></div>
           <label>
             <span>Max turns</span>
             <input type="number" min="1" max="200" data-role="max-turns">
@@ -3536,7 +4230,10 @@
     const saveButton = popover.querySelector("[data-role='save-settings']");
 
     closeButton.addEventListener("click", closePopover);
-    modelSelect.addEventListener("change", markSettingsDirty);
+    modelSelect.addEventListener("change", () => {
+      markSettingsDirty();
+      void loadPopoverModelRequirements(popover, modelSelect.value);
+    });
     maxTurnsInput.addEventListener("input", markSettingsDirty);
     maxSpendInput.addEventListener("input", markSettingsDirty);
     texMirrorInput.addEventListener("change", markSettingsDirty);
@@ -3550,7 +4247,7 @@
     }
     for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
       input.addEventListener("input", () => {
-        refreshModelAvailability(popover);
+        updatePopoverRequirementSummary(popover);
         markSettingsDirty();
       });
     }
@@ -3598,11 +4295,11 @@
         githubClear.disabled = false;
       }
     });
-    popover.querySelector("[data-role='edit-project-name']").addEventListener("click", async () => {
-      status.textContent = "Updating project name...";
+    const editProjectName = popover.querySelector("[data-role='edit-project-name']");
+    editProjectName.addEventListener("click", async () => {
+      status.textContent = "";
       try {
-        const saved = await openProjectIdentityEditor({ source: "settings", popover });
-        if (!saved) status.textContent = "";
+        await openProjectIdentityEditor({ source: "settings", popover, trigger: editProjectName });
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
       }
@@ -3616,9 +4313,11 @@
         popover.dataset.savedMaxTurns = String(settings.leaMaxTurns);
         popover.dataset.savedMaxSpend = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
         popover.dataset.savedTexMirror = String(settings.leaTexMirrorEnabled !== false);
+        popover.leaApiKeys = settings.leaApiKeys || popover.leaApiKeys || {};
         renderProviderKeys(popover, settings.leaProviderKeys || {});
         clearProviderKeyInputs(popover);
-        refreshModelAvailability(popover);
+        clearDynamicApiKeyInputs(popover);
+        renderPopoverModelRequirements(popover, settings.leaModelRequirements || null);
         markSettingsDirty();
         scheduleTexMirrorSync();
         status.textContent = "Settings saved.";
@@ -3631,7 +4330,6 @@
     document.body.appendChild(popover);
     positionSettingsPopover(popover);
     activePopover = popover;
-    positionCostCapNotice(popover);
     loadPopoverSettings(popover).catch((error) => {
       status.textContent = error instanceof Error ? error.message : String(error);
     });
@@ -3641,17 +4339,12 @@
     scheduleUsageRefresh(popover);
 
     function markSettingsDirty() {
-      const family = getModelFamily(
-        getStoredModelOptions(popover),
-        modelSelect.value || popover.dataset.savedModel || DEFAULT_LEA_MODEL
-      );
-      const selectedFamilyConfigured = Boolean(getEffectiveProviderKeyStatus(popover)[family]?.configured);
       const dirty = modelSelect.value !== popover.dataset.savedModel ||
         String(Number.parseInt(maxTurnsInput.value, 10) || DEFAULT_LEA_MAX_TURNS) !== popover.dataset.savedMaxTurns ||
         normalizeMaxSpendInput(maxSpendInput.value) !== (popover.dataset.savedMaxSpend || "") ||
         String(texMirrorInput.checked) !== (popover.dataset.savedTexMirror || "true") ||
         hasProviderKeyInput(popover);
-      saveButton.disabled = !dirty || !selectedFamilyConfigured;
+      saveButton.disabled = !dirty;
     }
   }
 
@@ -3659,10 +4352,10 @@
     clearTimeout(usageRefreshTimer);
     usageRefreshTimer = null;
     if (activePopover) {
+      activePopover.querySelector("[data-role='model']")?.leaModelPicker?.destroy();
       activePopover.remove();
       activePopover = null;
     }
-    positionCostCapNotice();
   }
 
   function positionPopover(popover, clientX, clientY) {
@@ -3794,7 +4487,7 @@
 
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      throw companionRequestError(response, payload);
     }
     return payload;
   }
@@ -3828,7 +4521,7 @@
 
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
+      throw companionRequestError(response, payload);
     }
     return payload;
   }
@@ -4266,10 +4959,6 @@
 
   function postStatuses(statuses) {
     latestStatuses = statuses || {};
-    const noticeKey = maxSpendNoticeKeyFromStatuses(latestStatuses);
-    if (noticeKey) {
-      showCostCapNotice(null, { noticeKey });
-    }
     renderStatusBadges();
   }
 
@@ -4607,6 +5296,14 @@
       if (!response.ok) {
         throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
       }
+      let catalogPayload = {};
+      try {
+        const catalogResponse = await fetch(`${baseUrl}/settings/models`);
+        catalogPayload = await catalogResponse.json().catch(() => ({}));
+        if (!catalogResponse.ok) catalogPayload = {};
+      } catch {
+        catalogPayload = {};
+      }
       const settings = {
         companionUrl: baseUrl,
         leaRepoPath: payload.leaRepoPath || stored.leaRepoPath || "",
@@ -4618,7 +5315,14 @@
         leaCurrentSpendUsd: payload.leaCurrentSpendUsd ?? 0,
         leaTexMirrorEnabled: payload.leaTexMirrorEnabled ?? stored.leaTexMirrorEnabled ?? DEFAULT_LEA_TEX_MIRROR_ENABLED,
         leaModelOptions: payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
-        leaProviderKeys: payload.leaProviderKeys || {}
+        leaModelCatalog: Array.isArray(catalogPayload.models) && catalogPayload.models.length > 0
+          ? catalogPayload.models
+          : payload.leaModelOptions || DEFAULT_MODEL_OPTIONS,
+        leaModelCatalogDegraded: catalogPayload.degraded !== false,
+        leaProviderKeys: payload.leaProviderKeys || {},
+        leaApiKeys: payload.leaApiKeys || {},
+        leaModelRequirements: payload.leaModelRequirements || null,
+        githubTokenConfigured: Boolean(payload.githubTokenConfigured)
       };
       await chrome.storage.sync.set({
         companionUrl: settings.companionUrl,
@@ -4636,7 +5340,11 @@
         ...stored,
         companionUrl: baseUrl,
         leaModelOptions: DEFAULT_MODEL_OPTIONS,
-        leaProviderKeys: {}
+        leaModelCatalog: DEFAULT_MODEL_OPTIONS,
+        leaModelCatalogDegraded: true,
+        leaProviderKeys: {},
+        leaApiKeys: {},
+        leaModelRequirements: null
       };
     }
   }
@@ -4648,13 +5356,22 @@
     const maxSpendInput = popover.querySelector("[data-role='max-spend']");
     const texMirrorInput = popover.querySelector("[data-role='tex-mirror']");
     popover.dataset.modelOptions = JSON.stringify(settings.leaModelOptions || DEFAULT_MODEL_OPTIONS);
+    popover.leaModelCatalog = settings.leaModelCatalog || settings.leaModelOptions || DEFAULT_MODEL_OPTIONS;
+    popover.leaApiKeys = settings.leaApiKeys || {};
     renderProviderKeys(popover, settings.leaProviderKeys || {});
     renderModelOptions(
       modelSelect,
+      popover.leaModelCatalog,
       settings.leaModelOptions || DEFAULT_MODEL_OPTIONS,
-      settings.leaModel || DEFAULT_LEA_MODEL,
-      getEffectiveProviderKeyStatus(popover)
+      settings.leaModel || DEFAULT_LEA_MODEL
     );
+    const catalogStatus = popover.querySelector("[data-role='model-catalog-status']");
+    if (catalogStatus) {
+      catalogStatus.textContent = settings.leaModelCatalogDegraded
+        ? "Adapter catalog unavailable — using the offline fallback."
+        : `${popover.leaModelCatalog.length.toLocaleString()} models available; search by ID or provider.`;
+    }
+    renderPopoverModelRequirements(popover, settings.leaModelRequirements);
     maxTurnsInput.value = String(settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS);
     maxSpendInput.value = settings.leaMaxSpendUsd == null ? "" : String(settings.leaMaxSpendUsd);
     texMirrorInput.checked = settings.leaTexMirrorEnabled !== false;
@@ -4717,33 +5434,13 @@
     return body;
   }
 
-  function renderModelOptions(select, options, selectedModel, providerKeys = {}) {
-    select.replaceChildren();
-    const byFamily = new Map();
-    for (const model of options) {
-      const family = normalizeFamily(model.family || "openai");
-      if (!byFamily.has(family)) {
-        byFamily.set(family, []);
-      }
-      byFamily.get(family).push(model);
-    }
-
-    for (const [family, models] of byFamily) {
-      const group = document.createElement("optgroup");
-      group.label = MODEL_FAMILY_LABELS[family] || family;
-      const familyConfigured = Boolean(providerKeys[family]?.configured);
-      for (const model of models) {
-        const option = document.createElement("option");
-        option.value = model.value || model.id;
-        option.textContent = model.tag ? `${model.label} - ${model.tag}` : model.label;
-        option.disabled = !familyConfigured && option.value !== selectedModel;
-        group.appendChild(option);
-      }
-      select.appendChild(group);
-    }
-    select.value = [...select.options].some((option) => option.value === selectedModel)
-      ? selectedModel
-      : DEFAULT_LEA_MODEL;
+  function renderModelOptions(select, catalog, featured, selectedModel) {
+    globalThis.LeaModelPicker.createModelPicker({
+      root: select,
+      value: selectedModel,
+      catalog,
+      featured
+    });
   }
 
   function renderProviderKeys(popover, providerKeys) {
@@ -4760,47 +5457,94 @@
     }
   }
 
-  function refreshModelAvailability(popover) {
-    const modelSelect = popover.querySelector("[data-role='model']");
-    const selected = modelSelect.value || popover.dataset.savedModel || DEFAULT_LEA_MODEL;
-    renderModelOptions(modelSelect, getStoredModelOptions(popover), selected, getEffectiveProviderKeyStatus(popover));
-  }
-
-  function getStoredModelOptions(popover) {
+  async function loadPopoverModelRequirements(popover, model) {
+    const settings = await getSettings();
+    const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
     try {
-      const options = JSON.parse(popover.dataset.modelOptions || "[]");
-      return Array.isArray(options) && options.length > 0 ? options : DEFAULT_MODEL_OPTIONS;
+      const response = await fetch(
+        `${baseUrl}/settings/models/requirements?model=${encodeURIComponent(model)}`
+      );
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
+      renderPopoverModelRequirements(popover, payload);
     } catch {
-      return DEFAULT_MODEL_OPTIONS;
+      renderPopoverModelRequirements(popover, null);
     }
   }
 
-  function getSavedProviderKeyStatus(popover) {
-    try {
-      return JSON.parse(popover.dataset.providerKeys || "{}") || {};
-    } catch {
-      return {};
+  function staticProviderInputForEnv(popover, env) {
+    const family = env === "OPENAI_API_KEY"
+      ? "openai"
+      : env === "GOOGLE_API_KEY" || env === "GEMINI_API_KEY"
+        ? "google"
+        : env === "ANTHROPIC_API_KEY" || env === "ANTHROPIC_AUTH_TOKEN"
+          ? "anthropic"
+          : "";
+    return family ? popover.querySelector(`[data-role='provider-key-input'][data-family='${family}']`) : null;
+  }
+
+  function popoverRequirementConfigured(popover, requirement) {
+    if (requirement?.configured || popover.leaApiKeys?.[requirement?.env]?.configured) return true;
+    const staticInput = staticProviderInputForEnv(popover, requirement?.env);
+    if (staticInput?.value.trim()) return true;
+    return [...popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")]
+      .some((input) => input.dataset.env === requirement?.env && Boolean(input.value.trim()));
+  }
+
+  function updatePopoverRequirementSummary(popover) {
+    const container = popover.querySelector("[data-role='model-requirements']");
+    const requirements = container?.leaRequirements;
+    const note = container?.querySelector(".lea-model-requirement-note");
+    if (!requirements || !note) return;
+    const required = Array.isArray(requirements.required_keys) ? requirements.required_keys : [];
+    const satisfied = required.length === 0 || required.some((key) => popoverRequirementConfigured(popover, key));
+    note.dataset.satisfied = satisfied ? "true" : "false";
+    if (required.length === 0) {
+      note.textContent = requirements.degraded
+        ? "Provider requirements are unavailable while the adapter is offline."
+        : "This model does not require a single API-key credential.";
+    } else if (satisfied) {
+      note.textContent = `${requirements.provider || "Model"} credentials are configured.`;
+    } else {
+      note.textContent = `Add one of: ${required.map((key) => key.env).join(" or ")}.`;
     }
   }
 
-  function getEffectiveProviderKeyStatus(popover) {
-    const status = { ...getSavedProviderKeyStatus(popover) };
-    for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
-      if (!input.value.trim()) continue;
-      status[input.dataset.family] = {
-        ...(status[input.dataset.family] || {}),
-        configured: true
-      };
+  function renderPopoverModelRequirements(popover, requirements) {
+    const container = popover.querySelector("[data-role='model-requirements']");
+    if (!container) return;
+    container.replaceChildren();
+    container.leaRequirements = requirements;
+    if (!requirements) {
+      const note = document.createElement("p");
+      note.className = "lea-model-requirement-note";
+      note.textContent = "Model credential requirements are currently unavailable.";
+      container.appendChild(note);
+      return;
     }
-    return status;
-  }
-
-  function getModelFamily(options, modelId) {
-    return normalizeFamily(options.find((model) => (model.value || model.id) === modelId)?.family || "openai");
-  }
-
-  function normalizeFamily(family) {
-    return family === "gemini" ? "google" : family;
+    const note = document.createElement("p");
+    note.className = "lea-model-requirement-note";
+    container.appendChild(note);
+    for (const requirement of requirements.required_keys || []) {
+      if (staticProviderInputForEnv(popover, requirement.env)) continue;
+      const label = document.createElement("label");
+      label.className = "lea-model-requirement-field";
+      label.textContent = requirement.label || requirement.env;
+      const input = document.createElement("input");
+      input.type = "password";
+      input.autocomplete = "off";
+      input.dataset.env = requirement.env;
+      input.placeholder = requirement.configured || popover.leaApiKeys?.[requirement.env]?.configured
+        ? "Configured — leave blank to keep"
+        : requirement.env;
+      input.addEventListener("input", () => {
+        updatePopoverRequirementSummary(popover);
+        popover.querySelector("[data-role='save-settings']").disabled = false;
+      });
+      label.appendChild(input);
+      container.appendChild(label);
+    }
+    updatePopoverRequirementSummary(popover);
   }
 
   function collectProviderApiKeyPatch(popover) {
@@ -4812,8 +5556,17 @@
     return patch;
   }
 
+  function collectDynamicApiKeyPatch(popover) {
+    const patch = {};
+    for (const input of popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")) {
+      const value = input.value.trim();
+      if (value) patch[input.dataset.env] = value;
+    }
+    return patch;
+  }
+
   function hasProviderKeyInput(popover) {
-    return [...popover.querySelectorAll("[data-role='provider-key-input']")]
+    return [...popover.querySelectorAll("[data-role='provider-key-input'], [data-role='model-requirements'] input[data-env]")]
       .some((input) => Boolean(input.value.trim()));
   }
 
@@ -4821,6 +5574,12 @@
     for (const input of popover.querySelectorAll("[data-role='provider-key-input']")) {
       input.value = "";
       input.hidden = true;
+    }
+  }
+
+  function clearDynamicApiKeyInputs(popover) {
+    for (const input of popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")) {
+      input.value = "";
     }
   }
 
@@ -4841,7 +5600,8 @@
         leaMaxTurns,
         leaMaxSpendUsd,
         leaTexMirrorEnabled,
-        leaProviderApiKeys: collectProviderApiKeyPatch(popover)
+        leaProviderApiKeys: collectProviderApiKeyPatch(popover),
+        leaApiKeys: collectDynamicApiKeyPatch(popover)
       })
     });
     const payload = await response.json().catch(() => ({}));
@@ -4909,8 +5669,6 @@
     if (maxSpend === null || maxSpend === undefined || maxSpend === "") {
       summary.hidden = true;
       summary.textContent = "";
-      costCapUsageLimitReached = false;
-      removeCostCapNotice();
       return;
     }
     const current = payload?.leaCurrentSpendUsd ?? payload?.allTime?.costUsd ?? 0;
@@ -4918,114 +5676,11 @@
     summary.textContent = `Cost cap: ${formatCost(current)} / ${formatCost(maxSpend)}`;
     const reached = Boolean(payload?.leaSpendLimitReached);
     summary.dataset.reached = reached ? "true" : "false";
-    if (reached) {
-      showCostCapNotice(popover, {
-        force: !costCapUsageLimitReached,
-        noticeKey: `usage:${maxSpend}:${current}`
-      });
-    } else {
-      removeCostCapNotice();
-    }
-    costCapUsageLimitReached = reached;
-  }
-
-  function showCostCapNotice(anchor = null, { force = false, noticeKey = "global" } = {}) {
-    if (force) {
-      dismissedCostCapNoticeKeys = new Set();
-    }
-    if (dismissedCostCapNoticeKeys.has(noticeKey)) return;
-    activeCostCapNoticeKeys.add(noticeKey);
-    if (!costCapNotice) {
-      costCapNotice = document.createElement("div");
-      costCapNotice.className = "ol-lean-cost-cap-notice";
-      costCapNotice.setAttribute("role", "alert");
-      costCapNotice.addEventListener("click", (event) => {
-        event.stopPropagation();
-      });
-      costCapNotice.innerHTML = `
-        <div>
-          <strong>Cost cap reached</strong>
-          <span>Lea stopped because the configured spend limit was reached.</span>
-        </div>
-        <button type="button" aria-label="Dismiss cost cap notice">x</button>
-      `;
-      costCapNotice.querySelector("button").addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        for (const key of activeCostCapNoticeKeys) {
-          dismissedCostCapNoticeKeys.add(key);
-        }
-        dismissedCostCapNoticeKeys.add(maxSpendNoticeKeyFromStatuses(latestStatuses));
-        removeCostCapNotice();
-      });
-      document.body.appendChild(costCapNotice);
-    }
-    positionCostCapNotice(anchor);
-  }
-
-  function positionCostCapNotice(anchor = null) {
-    if (!costCapNotice) return;
-    const settingsPopover = activePopover?.classList?.contains("ol-lean-settings-popover")
-      ? activePopover
-      : null;
-    const target = anchor?.isConnected
-      ? anchor
-      : settingsPopover?.isConnected
-        ? settingsPopover
-        : settingsButton?.isConnected
-          ? settingsButton
-          : null;
-    const noticeRect = costCapNotice.getBoundingClientRect();
-    const gap = 10;
-    if (!target) {
-      costCapNotice.dataset.position = "floating";
-      costCapNotice.style.left = `${Math.max(12, window.innerWidth - noticeRect.width - 20)}px`;
-      costCapNotice.style.top = `${Math.max(12, window.innerHeight - noticeRect.height - 20)}px`;
-      return;
-    }
-    const targetRect = target.getBoundingClientRect();
-    const belowTop = targetRect.bottom + gap;
-    const fitsBelow = belowTop + noticeRect.height <= window.innerHeight - 12;
-    const top = fitsBelow
-      ? belowTop
-      : Math.max(12, targetRect.top - noticeRect.height - gap);
-    const left = Math.min(
-      Math.max(12, targetRect.right - noticeRect.width),
-      window.innerWidth - noticeRect.width - 12
-    );
-    costCapNotice.dataset.position = fitsBelow ? "below" : "above";
-    costCapNotice.style.left = `${left}px`;
-    costCapNotice.style.top = `${top}px`;
-  }
-
-  function removeCostCapNotice() {
-    if (!costCapNotice) return;
-    costCapNotice.remove();
-    costCapNotice = null;
-    activeCostCapNoticeKeys = new Set();
-  }
-
-  function isMaxSpendStatus(statusInfo) {
-    return String(statusInfo?.message || "").includes("Max spend limit") ||
-      String(statusInfo?.finalStatus || "").toLowerCase() === "max_spend";
-  }
-
-  function maxSpendNoticeKeyFromStatuses(statuses) {
-    const parts = [];
-    for (const [statusKey, statusInfo] of Object.entries(statuses || {})) {
-      if (!isMaxSpendStatus(statusInfo)) continue;
-      parts.push([
-        statusKey,
-        statusInfo.jobId || "",
-        statusInfo.finishedAt || "",
-        statusInfo.message || ""
-      ].join(":"));
-    }
-    return parts.sort().join("|");
   }
 
   function isMaxSpendError(error) {
-    return String(error instanceof Error ? error.message : error).includes("Max spend limit");
+    return error?.code === MAX_SPEND_ERROR_CODE ||
+      String(error instanceof Error ? error.message : error).includes("Max spend limit");
   }
 
   function normalizeMaxSpendInput(value) {

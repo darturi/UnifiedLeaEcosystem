@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   aggregatePaneStatus,
+  buildPaneUseRelationships,
   buildLeanPaneTree,
   canEditPaneItem,
   canFormalizePaneItem,
@@ -255,6 +256,73 @@ test("buildLeanPaneTree omits files with no manifest items and preserves item or
 
   assert.equal(tree.files.length, 1);
   assert.deepEqual(tree.files[0].items.map((item) => item.id), ["a", "b"]);
+});
+
+test("buildPaneUseRelationships resolves ordered uses and derives reverse edges by stable marker label", () => {
+  const base = {
+    id: "theorem:base:0",
+    label: "base",
+    leanDeclarationName: "base_after_manual_rename",
+    status: "valid",
+    targetUses: []
+  };
+  const middle = {
+    id: "theorem:middle:1",
+    label: "middle",
+    status: "stub-generated",
+    targetUses: ["base"]
+  };
+  const result = {
+    id: "theorem:result:2",
+    label: "result",
+    status: "invalid",
+    targetUses: ["middle", "outside_inventory"]
+  };
+
+  const relationships = buildPaneUseRelationships([base, middle, result]);
+  assert.deepEqual(
+    relationships.usesByItem.get(result).map((relationship) => ({
+      label: relationship.label,
+      itemId: relationship.item?.id || null,
+      status: relationship.status,
+      resolution: relationship.resolution
+    })),
+    [
+      { label: "middle", itemId: middle.id, status: "stub-generated", resolution: "resolved" },
+      { label: "outside_inventory", itemId: null, status: "unknown", resolution: "not-in-inventory" }
+    ]
+  );
+  assert.deepEqual(
+    relationships.usedByItem.get(base).map((relationship) => relationship.label),
+    ["middle"]
+  );
+  assert.deepEqual(
+    relationships.usedByItem.get(middle).map((relationship) => relationship.label),
+    ["result"]
+  );
+});
+
+test("buildPaneUseRelationships leaves duplicate labels ambiguous and handles cycles without traversal", () => {
+  const duplicateA = { id: "a", label: "duplicate", status: "valid", targetUses: [] };
+  const duplicateB = { id: "b", label: "duplicate", status: "invalid", targetUses: [] };
+  const source = { id: "source", label: "source", status: "valid", targetUses: ["duplicate"] };
+  const cycleA = { id: "cycle-a", label: "cycle_a", status: "valid", targetUses: ["cycle_b"] };
+  const cycleB = { id: "cycle-b", label: "cycle_b", status: "valid", targetUses: ["cycle_a", "cycle_b"] };
+
+  const relationships = buildPaneUseRelationships([duplicateA, duplicateB, source, cycleA, cycleB]);
+  const ambiguous = relationships.usesByItem.get(source)[0];
+  assert.equal(ambiguous.resolution, "ambiguous");
+  assert.equal(ambiguous.item, null);
+  assert.deepEqual(relationships.usedByItem.get(duplicateA), []);
+  assert.deepEqual(relationships.usedByItem.get(duplicateB), []);
+  assert.deepEqual(
+    relationships.usesByItem.get(cycleB).map((relationship) => relationship.item.id),
+    ["cycle-a", "cycle-b"]
+  );
+  assert.deepEqual(
+    relationships.usedByItem.get(cycleB).map((relationship) => relationship.item.id),
+    ["cycle-a", "cycle-b"]
+  );
 });
 
 test("aggregatePaneStatus applies file status precedence", () => {

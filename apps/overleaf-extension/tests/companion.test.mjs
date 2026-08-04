@@ -15,6 +15,8 @@ import {
   handleChatPoll,
   handleChatSession,
   handleFormalize,
+  handleGetModelCatalog,
+  handleGetModelRequirements,
   handleGetStatuses,
   handleGetUsage,
   handleGithubTokenUpdate,
@@ -187,6 +189,73 @@ test("project identity endpoints proxy adapter state without creating on missing
   assert.equal(calls.find((call) => call.options.method === "PUT").body.create_if_missing, true);
 });
 
+test("namespace migration rebases cached job artifact pointers without rewriting history", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: async (url, options = {}) => {
+      if (String(url).endsWith("/api/projects/by-slug/project-1/identity") && options.method === "PUT") {
+        return jsonResponse(200, {
+          identity: {
+            projectId: "p1",
+            slug: "project-1",
+            projectName: "Fourier Notes",
+            namespace: "Lea.FourierNotes",
+            namespaceEditable: true,
+            repoPath: "proofs/Lea/FourierNotes",
+            hasRecordedProofs: true,
+            exists: true
+          },
+          migration: {
+            oldNamespace: "Lea.OldName",
+            newNamespace: "Lea.FourierNotes"
+          }
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }
+  });
+  const oldAbsolute = path.join(leaRepo, "workspace", "proofs", "Lea", "OldName", "proof.lean");
+  state.jobs.old = {
+    jobId: "old",
+    jobKey: "project-1:theorem:proof",
+    overleafProjectId: "project-1",
+    projectSlug: "project-1",
+    projectName: "Old Name",
+    projectNamespace: "Lea.OldName",
+    moduleName: "Lea.OldName.proof",
+    recordedProofPath: "workspace/proofs/Lea/OldName/proof.lean",
+    absolutePath: oldAbsolute,
+    stubbedTheoremUses: [{
+      moduleName: "Lea.OldName.helper",
+      relativePath: "workspace/proofs/Lea/OldName/helper.lean",
+      absolutePath: path.join(leaRepo, "workspace", "proofs", "Lea", "OldName", "helper.lean")
+    }]
+  };
+
+  const update = await handleProjectIdentityUpdate({
+    overleafProjectId: "project-1",
+    projectName: "Fourier Notes",
+    mode: "rename-namespace",
+    namespace: "Lea.FourierNotes",
+    expectedNamespace: "Lea.OldName"
+  }, state);
+
+  assert.equal(update.statusCode, 200);
+  assert.equal(state.jobs.old.projectNamespace, "Lea.FourierNotes");
+  assert.equal(state.jobs.old.moduleName, "Lea.FourierNotes.proof");
+  assert.equal(state.jobs.old.recordedProofPath, "workspace/proofs/Lea/FourierNotes/proof.lean");
+  assert.equal(
+    state.jobs.old.absolutePath,
+    path.join(leaRepo, "workspace", "proofs", "Lea", "FourierNotes", "proof.lean")
+  );
+  assert.equal(state.jobs.old.stubbedTheoremUses[0].moduleName, "Lea.FourierNotes.helper");
+  assert.equal(
+    state.jobs.old.stubbedTheoremUses[0].relativePath,
+    "workspace/proofs/Lea/FourierNotes/helper.lean"
+  );
+});
+
 test("settings response includes model families and key status", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({
@@ -210,6 +279,9 @@ test("settings response includes model families and key status", async () => {
     "gpt-5.4-mini",
     "gpt-5.4",
     "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-4o",
     "gemini/gemini-3.1-pro-preview",
     "gemini/gemini-2.5-pro",
@@ -246,27 +318,114 @@ test("settings response reloads model selection from env file", async () => {
   assert.equal(response.leaProvider, "anthropic");
 });
 
-test("settings reject unsupported models and missing family keys", async () => {
+test("model catalog and requirements proxy the adapter's exhaustive source", async () => {
   const leaRepo = await makeLeaRepo();
-  const state = await makeState({ leaRepoPath: leaRepo, env: {} });
+  const calls = [];
+  const adapter = makeAdapterStore({
+    models: [
+      { value: "mistral/mistral-large-latest", label: "mistral/mistral-large-latest", provider: "mistral" },
+      { value: "ollama/llama3", label: "ollama/llama3", provider: "ollama" }
+    ]
+  });
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    fetchImpl: makeAdapterFetch(adapter, calls)
+  });
 
-  const badModel = await handleUpdateLeaSettings({
+  const catalog = await handleGetModelCatalog(state);
+  const requirements = await handleGetModelRequirements("mistral/mistral-large-latest", state);
+
+  assert.equal(catalog.statusCode, 200);
+  assert.equal(catalog.body.source, "adapter");
+  assert.deepEqual(catalog.body.models.map((model) => model.value), [
+    "mistral/mistral-large-latest",
+    "ollama/llama3"
+  ]);
+  assert.equal(requirements.body.provider, "mistral");
+  assert.equal(requirements.body.required_keys[0].env, "MISTRAL_API_KEY");
+  assert.ok(calls.some((call) => call.url.endsWith("/api/models")));
+  assert.ok(calls.some((call) => call.url.includes("/api/models/requirements")));
+});
+
+test("model catalog fallback preserves a configured custom model", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaModel: "custom/acme-proof-model",
+    fetchImpl: async () => { throw new Error("adapter offline"); }
+  });
+
+  const catalog = await handleGetModelCatalog(state);
+
+  assert.equal(catalog.body.degraded, true);
+  assert.equal(catalog.body.models[0].value, "custom/acme-proof-model");
+});
+
+test("settings forward dynamically required provider keys by environment name", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const adapter = makeAdapterStore();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: {},
+    fetchImpl: makeAdapterFetch(adapter, calls)
+  });
+
+  const result = await handleUpdateLeaSettings({
+    leaRepoPath: leaRepo,
+    leaApiBaseUrl: "http://127.0.0.1:8001",
+    leaModel: "mistral/mistral-large-latest",
+    leaMaxTurns: 20,
+    leaApiKeys: { MISTRAL_API_KEY: "mistral-secret" }
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  assert.equal(result.body.leaModel, "mistral/mistral-large-latest");
+  const put = calls.find((call) => call.method === "PUT");
+  assert.deepEqual(put.body.api_keys.MISTRAL_API_KEY, { value: "mistral-secret" });
+  assert.equal(state.env.MISTRAL_API_KEY, "mistral-secret");
+});
+
+test("settings accept custom model ids and surface adapter credential errors", async () => {
+  const leaRepo = await makeLeaRepo();
+  const customAdapter = makeAdapterStore({
+    api_keys: { ANTHROPIC_API_KEY: keyStatus("akey") }
+  });
+  const customState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { ANTHROPIC_API_KEY: "anthropic-key" },
+    fetchImpl: makeAdapterFetch(customAdapter)
+  });
+
+  const customModel = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
     leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "anthropic/claude-does-not-exist",
     leaMaxTurns: 20
-  }, state);
+  }, customState);
+  const rejectingAdapter = makeAdapterStore({
+    reject: {
+      message: "An API key (Google) is required before saving this model.",
+      field: "api_keys.GOOGLE_API_KEY"
+    }
+  });
+  const missingKeyState = await makeState({
+    leaRepoPath: leaRepo,
+    env: {},
+    fetchImpl: makeAdapterFetch(rejectingAdapter)
+  });
   const missingGeminiKey = await handleUpdateLeaSettings({
     leaRepoPath: leaRepo,
     leaApiBaseUrl: "http://127.0.0.1:8001",
     leaModel: "gemini/gemini-2.5-pro",
     leaMaxTurns: 20
-  }, state);
+  }, missingKeyState);
 
-  assert.equal(badModel.statusCode, 400);
-  assert.equal(badModel.body.error, "invalid_lea_model");
-  assert.equal(missingGeminiKey.statusCode, 400);
-  assert.equal(missingGeminiKey.body.error, "missing_google_key");
+  assert.equal(customModel.statusCode, 200);
+  assert.equal(customModel.body.leaModel, "anthropic/claude-does-not-exist");
+  assert.equal(missingGeminiKey.statusCode, 422);
+  assert.equal(missingGeminiKey.body.error, "adapter_settings_rejected");
+  assert.equal(missingGeminiKey.body.field, "api_keys.GOOGLE_API_KEY");
 });
 
 test("settings save supported models when their family key is configured", async () => {
@@ -412,6 +571,27 @@ test("formalize refuses a source version that the mirror did not acknowledge", a
   assert.deepEqual(state.jobs, {});
 });
 
+test("formalize returns a structured error when the spend cap is already reached", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    leaMaxSpendUsd: 0,
+    env: { OPENAI_API_KEY: "test-key" }
+  });
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "capped_theorem",
+    targetText: "A theorem that cannot start."
+  }, state);
+
+  assert.equal(result.statusCode, 402);
+  assert.equal(result.body.error, "max_spend_reached");
+  assert.equal(result.body.message, "Max spend limit has been reached.");
+  assert.deepEqual(state.jobs, {});
+});
+
 test("lean pane manifest returns missing-stub items without artifacts", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -437,6 +617,45 @@ test("lean pane manifest returns missing-stub items without artifacts", async ()
   assert.equal(res.body.items[0].latexLabel, "thm:compactness");
   assert.equal(res.body.items[0].status, "missing-stub");
   assert.equal(res.body.items[0].leanDeclarationName, "compactness_criterion");
+});
+
+test("lean pane manifest preserves a terminal max-spend failure for item-level feedback", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  state.jobs.capped = {
+    jobId: "capped",
+    jobKey: "project-1:theorem:capped_theorem",
+    status: "failed",
+    finalStatus: "max_spend",
+    error: "Max spend limit reached. Lea run was cancelled.",
+    targetKind: "theorem",
+    targetLabel: "capped_theorem",
+    declarationName: "capped_theorem",
+    targetTextHash: "",
+    leaRepoPath: leaRepo,
+    leaUiBaseUrl: "http://localhost:5173",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const res = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{
+      path: "main.tex",
+      content: [
+        "\\begin{theorem}\\label{thm:capped}",
+        "% lea: formalize label=capped_theorem",
+        "A theorem whose run reached the cap.",
+        "\\end{theorem}"
+      ].join("\n")
+    }]
+  }, state);
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.items[0].status, "invalid");
+  assert.equal(res.body.items[0].finalStatus, "max_spend");
+  assert.equal(res.body.items[0].failureCode, "max_spend_reached");
+  assert.equal(res.body.items[0].failureMessage, "Max spend limit reached. Lea run was cancelled.");
 });
 
 test("lean pane manifest surfaces sorry stubs and valid artifacts", async () => {
@@ -1644,7 +1863,7 @@ test("adapter settings read overlays shared values and key status", async () => 
   const leaRepo = await makeLeaRepo();
   const calls = [];
   const adapter = makeAdapterStore({
-    model: "anthropic/claude-sonnet-4-6",
+    model: "claude-sonnet-4-6",
     max_turns: 55,
     max_spend_usd: 7.5,
     api_keys: { ANTHROPIC_API_KEY: keyStatus("dcba") }
@@ -1659,7 +1878,7 @@ test("adapter settings read overlays shared values and key status", async () => 
   const response = await buildSettingsResponse(state);
 
   // The adapter (single source of truth) wins for the shared scalars...
-  assert.equal(response.leaModel, "anthropic/claude-sonnet-4-6");
+  assert.equal(response.leaModel, "claude-sonnet-4-6");
   assert.equal(response.leaMaxTurns, 55);
   assert.equal(response.leaMaxSpendUsd, 7.5);
   // ...and a key configured only in the adapter (lea-standalone UI) reads as configured.
@@ -3694,6 +3913,11 @@ function makeAdapterStore(overrides = {}) {
       api_keys: overrides.api_keys || {},
       model_options: []
     },
+    models: overrides.models || [
+      { value: "o4-mini", label: "o4-mini", provider: "openai" },
+      { value: "mistral/mistral-large-latest", label: "mistral/mistral-large-latest", provider: "mistral" }
+    ],
+    requirements: overrides.requirements || null,
     reject: overrides.reject || null
   };
 }
@@ -3704,6 +3928,36 @@ function makeAdapterStore(overrides = {}) {
 function makeAdapterFetch(adapter, calls = []) {
   return async (url, requestOptions = {}) => {
     const u = String(url);
+    if (u.includes("/api/models/requirements")) {
+      const model = new URL(u).searchParams.get("model") || "";
+      calls.push({ method: "GET", url: u, model });
+      if (adapter.requirements) return jsonResponse(200, adapter.requirements(model, adapter.settings));
+      const provider = model.startsWith("anthropic/") || model.startsWith("claude-")
+        ? "anthropic"
+        : model.startsWith("gemini/")
+          ? "gemini"
+          : model.startsWith("mistral/")
+            ? "mistral"
+            : "openai";
+      const env = provider === "anthropic"
+        ? "ANTHROPIC_API_KEY"
+        : provider === "gemini"
+          ? "GOOGLE_API_KEY"
+          : provider === "mistral"
+            ? "MISTRAL_API_KEY"
+            : "OPENAI_API_KEY";
+      const configured = Boolean(adapter.settings.api_keys?.[env]?.configured);
+      return jsonResponse(200, {
+        model,
+        provider,
+        required_keys: [{ env, label: provider, configured }],
+        satisfied: configured
+      });
+    }
+    if (u.endsWith("/api/models")) {
+      calls.push({ method: "GET", url: u });
+      return jsonResponse(200, { models: adapter.models });
+    }
     if (u.endsWith("/api/settings")) {
       const method = requestOptions.method || "GET";
       if (method === "GET") {

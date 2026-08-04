@@ -264,6 +264,64 @@ export function buildLeanPaneTree(items) {
   return { children: root.children, files: [...files.values()] };
 }
 
+// Build the source-declared dependency edges (`uses=`) and their inverse for
+// Lean-pane display. The marker label is the stable source-side identity: a
+// manual Lean rename may change leanDeclarationName, but it must not retarget
+// the relationship recorded in LaTeX. Missing labels are not errors here -- a
+// dependency may be a valid recorded artifact that simply is not marked in the
+// current project inventory.
+export function buildPaneUseRelationships(items) {
+  const list = Array.isArray(items) ? items : [];
+  const itemsByLabel = new Map();
+  const usesByItem = new Map();
+  const usedByItem = new Map();
+
+  for (const item of list) {
+    usesByItem.set(item, []);
+    usedByItem.set(item, []);
+    const label = String(item?.label || "").trim();
+    if (!label) continue;
+    const matches = itemsByLabel.get(label) || [];
+    matches.push(item);
+    itemsByLabel.set(label, matches);
+  }
+
+  for (const sourceItem of list) {
+    const uses = (Array.isArray(sourceItem?.targetUses) ? sourceItem.targetUses : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+    const relationships = [];
+
+    for (const label of uses) {
+      const matches = itemsByLabel.get(label) || [];
+      const targetItem = matches.length === 1 ? matches[0] : null;
+      const resolution = matches.length === 1
+        ? "resolved"
+        : matches.length > 1
+          ? "ambiguous"
+          : "not-in-inventory";
+      relationships.push({
+        label,
+        item: targetItem,
+        status: targetItem?.status || "unknown",
+        resolution
+      });
+
+      if (targetItem) {
+        usedByItem.get(targetItem).push({
+          label: String(sourceItem?.label || sourceItem?.leanDeclarationName || "").trim(),
+          item: sourceItem,
+          status: sourceItem?.status || "unknown",
+          resolution: "resolved"
+        });
+      }
+    }
+    usesByItem.set(sourceItem, relationships);
+  }
+
+  return { usesByItem, usedByItem };
+}
+
 export function aggregatePaneStatus(items) {
   const statuses = (Array.isArray(items) ? items : [])
     .map((item) => String(item?.status || "unknown"))

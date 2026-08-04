@@ -209,6 +209,88 @@ test("edit start resolves the session's current content and pre-save dependents"
   assert.deepEqual(res.body.dependents.map((d) => d.targetLabel), ["compactness_corollary"]);
 });
 
+test("project namespace rename makes the pane and editor read the migrated working file", async () => {
+  const leaRepo = await makeLeaRepo();
+  const oldContent = "namespace Lea.Project1\n\ntheorem compactness_criterion : True := by\n  sorry\n\nend Lea.Project1\n";
+  const newContent = "namespace Lea.RenamedProject\n\ntheorem compactness_criterion : True := by\n  trivial\n\nend Lea.RenamedProject\n";
+  await writeProof(leaRepo, "Lea/RenamedProject/compactness_criterion.lean", newContent);
+  const state = makeState({
+    leaRepo,
+    jobs: {
+      a: editedJob({
+        declarationName: "compactness_criterion",
+        projectNamespace: "Lea.Project1",
+        recordedProofPath: "workspace/proofs/Lea/Project1/compactness_criterion.lean",
+        moduleName: "Lea.Project1.compactness_criterion",
+        finishedAt: "2026-08-01T00:00:00.000Z"
+      })
+    },
+    fetchImpl: async (url) => {
+      const value = String(url);
+      if (value.endsWith("/api/projects/by-slug/project-1/identity")) {
+        return jsonResponse(200, {
+          projectId: "adapter-project-1",
+          slug: "project-1",
+          projectName: "Renamed Project",
+          namespace: "Lea.RenamedProject",
+          repoPath: "proofs/Lea/RenamedProject",
+          exists: true
+        });
+      }
+      if (value.includes("/api/projects/by-slug/project-1/target-status")) {
+        return jsonResponse(200, {
+          project_id: "adapter-project-1",
+          slug: "project-1",
+          targets: [{
+            declaration_name: "compactness_criterion",
+            recorded: true,
+            path: "compactness_criterion.lean",
+            module_name: "Lea.RenamedProject.compactness_criterion",
+            kind: "proof",
+            exists: true,
+            declaration_present: true,
+            has_sorry: false,
+            check_status: "ok",
+            content: newContent
+          }]
+        });
+      }
+      if (value.endsWith("/api/sessions/sess-a")) {
+        return jsonResponse(200, {
+          project_namespace: "Lea.RenamedProject",
+          code_steps: [{ path: "compactness_criterion.lean", seq: 1, code: oldContent }]
+        });
+      }
+      return jsonResponse(404, { detail: "unmapped url" });
+    }
+  });
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}\\label{thm:x}",
+      "% lea: formalize label=compactness_criterion",
+      "Every open cover has a finite subcover.",
+      "\\end{theorem}"
+    ].join("\n")
+  }];
+
+  const manifest = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  assert.equal(manifest.statusCode, 200);
+  assert.equal(manifest.body.items[0].leanArtifactContent, newContent);
+  assert.equal(
+    manifest.body.items[0].leanArtifactPath,
+    "workspace/proofs/Lea/RenamedProject/compactness_criterion.lean"
+  );
+  assert.doesNotMatch(manifest.body.items[0].leanArtifactContent, /namespace Lea\.Project1/);
+
+  const edit = await handleLeanPaneEditStart(
+    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "compactness_criterion" },
+    state
+  );
+  assert.equal(edit.statusCode, 200);
+  assert.equal(edit.body.content, newContent);
+});
+
 test("edit save: a proof-body-only edit never triggers a cascade re-check", async () => {
   const leaRepo = await makeLeaRepo();
   await writeProof(

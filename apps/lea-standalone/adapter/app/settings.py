@@ -47,6 +47,9 @@ PERMISSION_TIER_DETAILS = {
 # is a searchable combobox that also accepts any custom model ID (provider is
 # inferred from the ID prefix), so models not listed here can still be typed in.
 MODEL_OPTIONS = [
+    {"value": "gpt-5.6-sol", "label": "GPT-5.6 Sol", "family": "openai"},
+    {"value": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "family": "openai"},
+    {"value": "gpt-5.6-luna", "label": "GPT-5.6 Luna", "family": "openai"},
     {"value": "gpt-5.5", "label": "GPT-5.5", "family": "openai"},
     {"value": "gpt-5.5-mini", "label": "GPT-5.5 Mini", "family": "openai"},
     {"value": "claude-opus-4-8", "label": "Claude Opus 4.8", "family": "anthropic"},

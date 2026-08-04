@@ -61,6 +61,8 @@ import {
 import { createEventBus, publishEvent } from "./eventBus.mjs";
 import {
   exportProjectZipBySlug,
+  fetchAdapterModelCatalog,
+  fetchAdapterModelRequirements,
   fetchAdapterSettings,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
@@ -128,12 +130,7 @@ export { LEA_MODEL_OPTIONS };
 const LEA_MODEL_BY_ID = LEA_MODEL_BY_VALUE;
 const LEGACY_LEA_MODEL_ALIASES = new Map([
   ["anthropic/claude-opus-4-20250514", "anthropic/claude-opus-4-8"],
-  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"],
-  // The lea-standalone adapter stores bare Anthropic IDs (no provider prefix);
-  // map them back to the companion catalog's prefixed form when reading shared
-  // settings so the model round-trips between the two settings UIs.
-  ["claude-opus-4-8", "anthropic/claude-opus-4-8"],
-  ["claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"]
+  ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-sonnet-4-6"]
 ]);
 
 // The settings whose single source of truth is the lea-standalone adapter's
@@ -773,6 +770,74 @@ async function resolveRunProjectIdentity({ state, overleafProjectId, projectSlug
   return fallbackRunProjectIdentity({ overleafProjectId, projectSlug: slug, projectName, projectNamespace });
 }
 
+function rebaseNamespaceQualifiedValue(value, oldNamespace, newNamespace) {
+  const current = String(value || "");
+  if (current === oldNamespace) return newNamespace;
+  return current.startsWith(`${oldNamespace}.`)
+    ? `${newNamespace}${current.slice(oldNamespace.length)}`
+    : current;
+}
+
+function rebaseNamespaceProofPath(value, oldNamespace, newNamespace) {
+  let current = String(value || "");
+  for (const separator of ["/", "\\"]) {
+    const oldPath = oldNamespace.split(".").join(separator);
+    const newPath = newNamespace.split(".").join(separator);
+    const marker = `workspace${separator}proofs${separator}${oldPath}`;
+    const index = current.indexOf(marker);
+    if (index < 0) continue;
+    if (index > 0 && current[index - 1] !== separator) continue;
+    const boundary = index + marker.length;
+    if (boundary !== current.length && current[boundary] !== separator) continue;
+    current = `${current.slice(0, index)}workspace${separator}proofs${separator}${newPath}${current.slice(boundary)}`;
+  }
+  return current;
+}
+
+// jobs.json is a companion-side cache, not proof history. When the adapter
+// migrates the project, keep every cached path/module pointer aligned with the
+// new working tree. Historical adapter code_steps remain untouched and are
+// still available as provenance snapshots.
+function rebaseJobProjectIdentity(job, { oldNamespace, newNamespace, projectName }) {
+  let changed = false;
+  const setIfChanged = (key, next) => {
+    if (job[key] !== next) {
+      job[key] = next;
+      changed = true;
+    }
+  };
+  setIfChanged("projectName", projectName);
+  setIfChanged("projectNamespace", newNamespace);
+  for (const key of ["moduleName"]) {
+    if (job[key]) setIfChanged(key, rebaseNamespaceQualifiedValue(job[key], oldNamespace, newNamespace));
+  }
+  for (const key of ["recordedProofPath", "relativePath", "absolutePath"]) {
+    if (job[key]) setIfChanged(key, rebaseNamespaceProofPath(job[key], oldNamespace, newNamespace));
+  }
+  if (Array.isArray(job.stubbedTheoremUses)) {
+    for (const use of job.stubbedTheoremUses) {
+      if (!use || typeof use !== "object") continue;
+      for (const key of ["moduleName"]) {
+        if (!use[key]) continue;
+        const next = rebaseNamespaceQualifiedValue(use[key], oldNamespace, newNamespace);
+        if (use[key] !== next) {
+          use[key] = next;
+          changed = true;
+        }
+      }
+      for (const key of ["relativePath", "absolutePath"]) {
+        if (!use[key]) continue;
+        const next = rebaseNamespaceProofPath(use[key], oldNamespace, newNamespace);
+        if (use[key] !== next) {
+          use[key] = next;
+          changed = true;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
 export async function handleProjectIdentityPreview(payload, state) {
   const target = resolveShareTarget(payload, state);
   if (target.error) return target.error;
@@ -808,23 +873,26 @@ export async function handleProjectIdentityUpdate(payload, state) {
     return errorResponse(result.status || 502, adapterErrorCode(result, "project_identity_update_failed"), adapterDetail(result, "Could not update project identity."));
   }
   const identity = normalizeCompanionIdentity(result.body?.identity, overleafProjectId);
+  const migration = result.body?.migration || null;
   state.projectIdentities ||= {};
   state.projectIdentities[identity.slug] = identity;
   let jobsChanged = false;
   for (const job of Object.values(state.jobs || {})) {
     if (job?.overleafProjectId === overleafProjectId || job?.projectSlug === target.slug) {
-      if (job.projectName !== identity.projectName) {
+      if (migration?.oldNamespace && migration?.newNamespace) {
+        jobsChanged = rebaseJobProjectIdentity(job, {
+          oldNamespace: migration.oldNamespace,
+          newNamespace: migration.newNamespace,
+          projectName: identity.projectName
+        }) || jobsChanged;
+      } else if (job.projectName !== identity.projectName) {
         job.projectName = identity.projectName;
-        jobsChanged = true;
-      }
-      if (result.body?.migration && job.projectNamespace !== identity.namespace) {
-        job.projectNamespace = identity.namespace;
         jobsChanged = true;
       }
     }
   }
   if (jobsChanged) await persistJobs(state);
-  return { statusCode: 200, body: { ok: true, identity, migration: result.body?.migration || null } };
+  return { statusCode: 200, body: { ok: true, identity, migration } };
 }
 
 async function resolveProjectNamespace({ state, overleafProjectId, projectSlug = "" }) {
@@ -1010,9 +1078,15 @@ export async function handleLeanPaneManifest(payload, state) {
   }
 
   const overleafProjectId = payload.overleafProjectId || "unknown";
+  const identity = await resolveRunProjectIdentity({
+    state,
+    overleafProjectId,
+    refresh: true
+  });
   const approvalContext = await loadFormalizationApprovalContext({
     state,
-    overleafProjectId
+    overleafProjectId,
+    projectNamespace: identity.namespace
   });
   const items = await mapWithConcurrency(
     manifest.items,
@@ -1021,6 +1095,8 @@ export async function handleLeanPaneManifest(payload, state) {
       item,
       state,
       overleafProjectId,
+      projectName: identity.projectName,
+      projectNamespace: identity.namespace,
       approvalContext
     })
   );
@@ -1567,10 +1643,19 @@ async function loadEditableSessionFile({ state, leaSessionId, overleafProjectId,
   const namespace = detail.body.project_namespace
     || linkedJob?.projectNamespace
     || projectNamespaceFromSlug(linkedJob?.projectSlug || slugProjectId(overleafProjectId));
+  const current = await readLeanPaneArtifact({
+    leaRepoPath: state.settings.leaRepoPath,
+    statusInfo: {
+      recordedProofPath: proofPathFromProjectStep({ namespace, stepPath: step.path })
+    }
+  });
   return {
     ok: true,
     path: step.path,
-    content: String(step.code || ""),
+    // A session code_step is an immutable historical snapshot. The working
+    // file may have been namespace-rewritten since that step was recorded, so
+    // edit from disk whenever the current project path exists.
+    content: current.exists ? current.content : String(step.code || ""),
     namespace,
     moduleName: moduleNameFromProjectStep({ namespace, stepPath: step.path })
   };
@@ -2055,7 +2140,7 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
   const logPath = path.join(JOB_LOG_DIR, `${jobId}.log`);
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
-  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL)) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+  const modelInfo = configuredModelMetadata(state);
 
   return {
     jobId,
@@ -2103,10 +2188,10 @@ async function createRepairJob({ state, target, linkedJob, breakage, leaSessionI
     leaSessionId,
     formalizationId: linkedJob?.formalizationId || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
-    leaProvider: modelInfo.family,
-    leaProviderFamily: modelInfo.family,
-    leaModel: modelInfo.value,
+    leaApiKeyConfigured: modelInfo.apiKeyConfigured,
+    leaProvider: modelInfo.provider,
+    leaProviderFamily: modelInfo.provider,
+    leaModel: modelInfo.model,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaCurrentTurn: null,
@@ -3115,6 +3200,92 @@ async function finishChatRunCascade({ state, target, preRunSnapshot, leaSessionI
   await persistChatSessions(state);
 }
 
+function fallbackModelCatalog(selectedModel = "") {
+  const models = LEA_MODEL_OPTIONS.map((model) => ({
+    value: String(model.value),
+    label: String(model.label || model.value),
+    provider: normalizeProviderFamilyId(model.family || ""),
+    ...(model.tag ? { tag: String(model.tag) } : {})
+  }));
+  const selected = String(selectedModel || "").trim();
+  if (selected && !models.some((model) => model.value === selected)) {
+    models.unshift({ value: selected, label: selected, provider: "", current: true });
+  }
+  return models;
+}
+
+function normalizeAdapterCatalog(models) {
+  if (!Array.isArray(models)) return [];
+  return models
+    .map((model) => ({
+      value: String(model?.value || "").trim(),
+      label: String(model?.label || model?.value || "").trim(),
+      provider: normalizeProviderFamilyId(model?.provider || model?.family || "")
+    }))
+    .filter((model) => model.value);
+}
+
+export async function handleGetModelCatalog(state) {
+  const selectedModel = normalizeLeaModelId(state.settings?.leaModel || DEFAULT_LEA_MODEL);
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return {
+      statusCode: 200,
+      body: { models: fallbackModelCatalog(selectedModel), source: "fallback", degraded: true }
+    };
+  }
+  const result = await fetchAdapterModelCatalog({ fetchImpl: state.fetchImpl || fetch, baseUrl });
+  const models = normalizeAdapterCatalog(result.body?.models);
+  if (!result.ok || models.length === 0) {
+    return {
+      statusCode: 200,
+      body: { models: fallbackModelCatalog(selectedModel), source: "fallback", degraded: true }
+    };
+  }
+  return { statusCode: 200, body: { models, source: "adapter", degraded: false } };
+}
+
+function fallbackModelRequirements(model, state) {
+  const info = LEA_MODEL_BY_ID.get(normalizeLeaModelId(model));
+  const family = info ? LEA_MODEL_FAMILY_BY_ID.get(normalizeProviderFamilyId(info.family)) : null;
+  const requiredKeys = (family?.envVars || []).map((env) => ({
+    env,
+    label: family.label,
+    configured: Boolean(state.adapterSettings?.api_keys?.[env]?.configured || state.env?.[env])
+  }));
+  return {
+    model,
+    provider: family?.id || null,
+    required_keys: requiredKeys,
+    satisfied: requiredKeys.length === 0 || requiredKeys.some((key) => key.configured),
+    degraded: true
+  };
+}
+
+export async function handleGetModelRequirements(model, state) {
+  const normalized = normalizeLeaModelId(String(model || "").trim());
+  if (!normalized) {
+    return errorResponse(400, "invalid_lea_model", "Lea model must not be empty.");
+  }
+  let baseUrl;
+  try {
+    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
+  } catch {
+    return { statusCode: 200, body: fallbackModelRequirements(normalized, state) };
+  }
+  const result = await fetchAdapterModelRequirements({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl,
+    model: normalized
+  });
+  if (!result.ok || !result.body || typeof result.body !== "object") {
+    return { statusCode: 200, body: fallbackModelRequirements(normalized, state) };
+  }
+  return { statusCode: 200, body: { ...result.body, model: normalized, degraded: false } };
+}
+
 export async function handleUpdateLeaSettings(payload, state) {
   const leaRepoPath = String(payload.leaRepoPath || "").trim();
   const validation = await validateLeaRepo(leaRepoPath);
@@ -3126,12 +3297,6 @@ export async function handleUpdateLeaSettings(payload, state) {
   // key configured only in the lea-standalone UI.
   await syncSharedSettingsFromAdapter(state);
 
-  const model = normalizeLeaModelId(payload.leaModel || DEFAULT_LEA_MODEL);
-  const modelInfo = LEA_MODEL_BY_ID.get(model);
-  if (!modelInfo) {
-    return errorResponse(400, "invalid_lea_model", "Lea model must be one of the supported models.");
-  }
-
   let leaApiBaseUrl;
   try {
     leaApiBaseUrl = normalizeLeaApiBaseUrl(
@@ -3141,7 +3306,25 @@ export async function handleUpdateLeaSettings(payload, state) {
     return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
   }
 
-  const providerEnvPatch = buildProviderEnvPatch(payload.leaProviderApiKeys);
+  const model = normalizeLeaModelId(String(payload.leaModel || "").trim());
+  if (!model) {
+    return errorResponse(400, "invalid_lea_model", "Lea model must not be empty.");
+  }
+  const requirementsResult = await fetchAdapterModelRequirements({
+    fetchImpl: state.fetchImpl || fetch,
+    baseUrl: leaApiBaseUrl,
+    model
+  });
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  const selectedProvider = normalizeProviderFamilyId(
+    requirementsResult.ok && requirementsResult.body?.provider
+      ? requirementsResult.body.provider
+      : modelInfo?.family || model.split("/")[0]
+  );
+  const providerEnvPatch = {
+    ...buildProviderEnvPatch(payload.leaProviderApiKeys),
+    ...buildDirectApiKeyEnvPatch(payload.leaApiKeys)
+  };
   let leaMaxSpendUsd;
   try {
     leaMaxSpendUsd = normalizeLeaMaxSpendUsd(
@@ -3160,7 +3343,7 @@ export async function handleUpdateLeaSettings(payload, state) {
     leaRepoPath: path.resolve(leaRepoPath),
     leaWorkspacePath: validation.leaWorkspacePath,
     leaApiBaseUrl,
-    leaProvider: modelInfo.family,
+    leaProvider: selectedProvider,
     leaModel: model,
     leaMaxTurns: normalizeLeaMaxTurns(payload.leaMaxTurns || DEFAULT_LEA_MAX_TURNS),
     leaMaxSpendUsd,
@@ -3171,17 +3354,10 @@ export async function handleUpdateLeaSettings(payload, state) {
     )
   };
   const nextState = { ...state, settings: nextSettings, env: { ...(state.env || {}), ...providerEnvPatch } };
-  if (!isProviderKeyConfigured(nextState, modelInfo.family)) {
-    return errorResponse(
-      400,
-      `missing_${modelInfo.family}_key`,
-      `${LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family)?.label || modelInfo.family} API key must be set in the lea-standalone settings, .env, or the companion process environment before selecting this model.`
-    );
-  }
   const keyValidation = await validateProviderApiKeys({
     fetchImpl: state.fetchImpl || fetch,
     providerEnvPatch,
-    selectedFamilyId: modelInfo.family,
+    selectedFamilyId: selectedProvider,
     state: nextState
   });
   if (!keyValidation.ok) {
@@ -3192,7 +3368,12 @@ export async function handleUpdateLeaSettings(payload, state) {
     max_turns: nextSettings.leaMaxTurns,
     max_spend_usd: nextSettings.leaMaxSpendUsd
   };
-  const apiKeyPatch = buildAdapterApiKeyPatch(payload.leaProviderApiKeys, nextState, modelInfo.family);
+  const apiKeyPatch = buildAdapterApiKeyPatch(
+    payload.leaProviderApiKeys,
+    payload.leaApiKeys,
+    nextState,
+    selectedProvider
+  );
   if (Object.keys(apiKeyPatch).length > 0) adapterBody.api_keys = apiKeyPatch;
   const pushed = await putAdapterSettings({
     fetchImpl: state.fetchImpl || fetch,
@@ -3403,6 +3584,18 @@ async function routeRequest(request, response, state) {
 
   if (request.method === "GET" && url.pathname === "/settings") {
     sendJson(response, 200, await buildSettingsResponse(state));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/settings/models") {
+    const result = await handleGetModelCatalog(state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/settings/models/requirements") {
+    const result = await handleGetModelRequirements(url.searchParams.get("model") || "", state);
+    sendJson(response, result.statusCode, result.body);
     return;
   }
 
@@ -3628,18 +3821,26 @@ export async function buildSettingsResponse(state) {
   await syncSharedSettingsFromAdapter(state);
   const leaRepoPath = state.settings.leaRepoPath || "";
   const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL);
-  const modelInfo = LEA_MODEL_BY_ID.get(model) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+  const requirements = (await handleGetModelRequirements(model, state)).body;
+  state.adapterModelRequirements = requirements;
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  const provider = normalizeProviderFamilyId(requirements?.provider || modelInfo?.family || model.split("/")[0]);
   return {
     ok: true,
     leaRepoPath,
     leaWorkspacePath: leaRepoPath ? buildLeaWorkspacePath(leaRepoPath) : "",
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: isProviderKeyConfigured(state, modelInfo.family),
-    leaProvider: modelInfo.family,
-    leaProviderFamily: modelInfo.family,
+    leaApiKeyConfigured: requirements?.satisfied !== false,
+    leaProvider: provider,
+    leaProviderFamily: provider,
     leaProviderKeys: buildProviderKeyStatus(state),
-    leaModel: modelInfo.value,
+    leaApiKeys: state.adapterSettings?.api_keys || {},
+    leaModelRequirements: requirements,
+    leaModel: model,
+    // Featured/offline fallback only. The exhaustive catalog lives at
+    // GET /settings/models and is intentionally not duplicated in every
+    // settings response.
     leaModelOptions: LEA_MODEL_OPTIONS,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
@@ -3653,6 +3854,22 @@ export async function buildSettingsResponse(state) {
     // adapter's lea.local.toml and is set via POST /settings/github-token (D34).
     githubTokenConfigured: Boolean(state.adapterSettings?.github_token?.configured)
   };
+}
+
+function configuredModelMetadata(state) {
+  const model = normalizeLeaModelId(state.settings?.leaModel || DEFAULT_LEA_MODEL);
+  const info = LEA_MODEL_BY_ID.get(model);
+  const provider = normalizeProviderFamilyId(
+    state.adapterModelRequirements?.model === model
+      ? state.adapterModelRequirements.provider
+      : state.settings?.leaProvider || info?.family || model.split("/")[0]
+  );
+  const apiKeyConfigured = state.adapterModelRequirements?.model === model
+    ? state.adapterModelRequirements.satisfied !== false
+    : info
+      ? isProviderKeyConfigured(state, info.family)
+      : true;
+  return { model, provider, apiKeyConfigured };
 }
 
 function buildProviderKeyStatus(state) {
@@ -3708,11 +3925,10 @@ async function syncSharedSettingsFromAdapter(state) {
   }
   if (adapter.model) {
     const mapped = normalizeLeaModelId(String(adapter.model));
-    // Only adopt the adapter's model if it maps to a model the companion knows,
-    // so we never overlay an ID the run preflight would reject as unsupported.
-    if (LEA_MODEL_BY_ID.has(mapped)) {
-      state.settings.leaModel = mapped;
-    }
+    // The adapter owns the model catalog and accepts custom model IDs. Mirroring
+    // its current value must therefore never be gated by the companion fallback
+    // shortlist.
+    if (mapped) state.settings.leaModel = mapped;
   }
   return adapter;
 }
@@ -3836,7 +4052,7 @@ const ADAPTER_KEY_ENV_BY_FAMILY = {
 // user just entered in the Overleaf options form, plus (if available) the raw key
 // for the selected model's family — so the adapter, the single source of truth,
 // always ends up holding the key the selected model needs.
-function buildAdapterApiKeyPatch(patchKeys, state, selectedFamilyId) {
+function buildAdapterApiKeyPatch(patchKeys, directKeys, state, selectedFamilyId) {
   const patch = {};
   if (patchKeys && typeof patchKeys === "object" && !Array.isArray(patchKeys)) {
     for (const [rawFamilyId, rawValue] of Object.entries(patchKeys)) {
@@ -3846,11 +4062,31 @@ function buildAdapterApiKeyPatch(patchKeys, state, selectedFamilyId) {
       if (env && value) patch[env] = { value };
     }
   }
+  for (const [env, value] of Object.entries(buildDirectApiKeyEnvPatch(directKeys))) {
+    patch[env] = { value };
+  }
   const selected = normalizeProviderFamilyId(selectedFamilyId);
   const selectedEnv = ADAPTER_KEY_ENV_BY_FAMILY[selected];
   if (selectedEnv && !patch[selectedEnv]) {
     const value = getProviderApiKey(state, selected);
     if (value) patch[selectedEnv] = { value };
+  }
+  return patch;
+}
+
+function buildDirectApiKeyEnvPatch(patchKeys) {
+  const patch = {};
+  if (!patchKeys || typeof patchKeys !== "object" || Array.isArray(patchKeys)) {
+    return patch;
+  }
+  for (const [rawEnv, rawValue] of Object.entries(patchKeys)) {
+    const env = String(rawEnv || "").trim();
+    const value = String(rawValue || "").trim();
+    // The adapter accepts dynamic provider credentials under conventional
+    // *_API_KEY names. Restrict the root .env mirror to the same narrow class
+    // rather than turning this local endpoint into an arbitrary env writer.
+    if (!/^[A-Z][A-Z0-9_]*_API_KEY$/.test(env) || !value) continue;
+    patch[env] = value;
   }
   return patch;
 }
@@ -4285,11 +4521,12 @@ function validateLeaRuntime(state, { requireApiKey }) {
   } catch {
     return { ok: false, error: "invalid_lea_api_url", message: "Lea API base URL must be an absolute http(s) URL." };
   }
-  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL));
-  if (!modelInfo) {
-    return { ok: false, error: "invalid_lea_model", message: "Lea model must be one of the supported models." };
+  const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL).trim();
+  if (!model) {
+    return { ok: false, error: "invalid_lea_model", message: "Lea model must not be empty." };
   }
-  if (requireApiKey && !isProviderKeyConfigured(state, modelInfo.family)) {
+  const modelInfo = LEA_MODEL_BY_ID.get(model);
+  if (requireApiKey && modelInfo && !isProviderKeyConfigured(state, modelInfo.family)) {
     const family = LEA_MODEL_FAMILY_BY_ID.get(modelInfo.family);
     const envList = family?.envVars?.join(" or ") || "provider API key";
     return {
@@ -4322,7 +4559,7 @@ async function createLeaJob({
 
   await fs.mkdir(path.dirname(logPath), { recursive: true });
   await fs.writeFile(logPath, "", "utf8");
-  const modelInfo = LEA_MODEL_BY_ID.get(normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL)) || LEA_MODEL_BY_ID.get(DEFAULT_LEA_MODEL);
+  const modelInfo = configuredModelMetadata(state);
 
   return {
     jobId,
@@ -4378,10 +4615,10 @@ async function createLeaJob({
       || previousFormalizationJob?.formalizationId
       || null,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
-    leaApiKeyConfigured: Boolean(getProviderApiKey(state, modelInfo.family)),
-    leaProvider: modelInfo.family,
-    leaProviderFamily: modelInfo.family,
-    leaModel: modelInfo.value,
+    leaApiKeyConfigured: modelInfo.apiKeyConfigured,
+    leaProvider: modelInfo.provider,
+    leaProviderFamily: modelInfo.provider,
+    leaModel: modelInfo.model,
     leaMaxTurns: state.settings.leaMaxTurns || DEFAULT_LEA_MAX_TURNS,
     leaNarrateToolSteps: state.settings.leaNarrateToolSteps !== false,
     leaCurrentTurn: null,
@@ -5845,6 +6082,7 @@ function buildJobResponse({ job, status, target }) {
         : ""),
     resultKind: job.resultKind || (status === "disproved" ? "disproved" : status === "needs_review" ? "needs_review" : status === "formalized" ? (target.targetKind === "definition" ? "defined" : "proved") : null),
     resultDetail: job.resultDetail || null,
+    finalStatus: job.finalStatus || null,
     leaSessionId,
     leaSessionUrl: leaSessionId
       ? buildLeaSessionUrl(job.leaUiBaseUrl, leaSessionId, job.formalizationId)
@@ -6078,9 +6316,10 @@ async function attachTransitiveStubbedUpstream({ state, leaRepoPath, overleafPro
   return addStubbedTheoremUses(status, merged);
 }
 
-async function loadFormalizationApprovalContext({ state, overleafProjectId }) {
+async function loadFormalizationApprovalContext({ state, overleafProjectId, projectNamespace = "" }) {
   try {
-    const namespace = await resolveProjectNamespace({ state, overleafProjectId });
+    const namespace = String(projectNamespace || "").trim()
+      || await resolveProjectNamespace({ state, overleafProjectId });
     const files = await listProjectProofFiles({
       leaRepoPath: state.settings.leaRepoPath,
       namespace
@@ -6145,7 +6384,14 @@ function buildFormalizationApprovalMetadata({
   };
 }
 
-async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalContext }) {
+async function enrichLeanPaneItem({
+  item,
+  state,
+  overleafProjectId,
+  projectName = "",
+  projectNamespace = "",
+  approvalContext
+}) {
   const targetKind = item.leanKind === "def" ? "definition" : "theorem";
   const targetLabel = String(item.leanDeclarationName || "").trim();
   if (!isValidLeanIdentifier(targetLabel)) {
@@ -6160,7 +6406,9 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     leaRepoPath: state.settings.leaRepoPath,
     overleafProjectId,
     targetKind,
-    targetLabel
+    targetLabel,
+    projectName,
+    projectNamespace
   });
   const latestJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
 
@@ -6170,6 +6418,8 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
       state,
       leaRepoPath: state.settings.leaRepoPath,
       overleafProjectId,
+      projectName,
+      projectNamespace,
       targetKind,
       targetLabel,
       jobs: state.jobs || {}
@@ -6184,6 +6434,15 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
 
   const paneStatus = mapLeanPaneStatus(statusInfo, item);
   const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
+  // A failed retry may restore the previous verified artifact. In that case
+  // artifact truth correctly keeps the item valid, but the newest attempt's
+  // max-spend failure still needs to reach the pane so the user's click does
+  // not look like a no-op. Suppress the old failure while a newer run is live.
+  const maxSpendFailure = !inProgress && latestJob?.finalStatus === "max_spend"
+    ? latestJob
+    : !inProgress && statusInfo?.finalStatus === "max_spend"
+      ? statusInfo
+      : null;
   const currentInputHash = hashFormalizationInput({
     targetKind,
     targetText: item.naturalLanguageLatex,
@@ -6208,14 +6467,27 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     statusInfo
   });
   const leanDeclarationName = statusInfo?.declarationName || item.leanDeclarationName;
-  const sessionArtifact = artifact.content
+  const ledgerArtifact = statusInfo?.artifactExists
+    ? {
+        relativePath: statusInfo?.recordedProofPath || statusInfo?.relativePath || "",
+        content: typeof statusInfo?.artifactContent === "string" ? statusInfo.artifactContent : "",
+        exists: true
+      }
+    : { relativePath: "", content: "", exists: false };
+  const hasAuthoritativeArtifactEvidence = Boolean(statusInfo?.artifactRecorded);
+  const sessionArtifact = artifact.exists || ledgerArtifact.exists || hasAuthoritativeArtifactEvidence
     ? { relativePath: "", content: "" }
     : await readLeanPaneArtifactFromSession({
         state,
         job: latestJob,
-        declarationName: leanDeclarationName
+        declarationName: leanDeclarationName,
+        projectNamespace
       });
-  const effectiveArtifact = artifact.content ? artifact : sessionArtifact;
+  const effectiveArtifact = artifact.exists
+    ? artifact
+    : ledgerArtifact.exists
+      ? ledgerArtifact
+      : sessionArtifact;
   const leanStub = statusInfo?.leanStatement || (
     effectiveArtifact.content && leanDeclarationName
       ? extractLeanStatement(effectiveArtifact.content, leanDeclarationName)
@@ -6239,6 +6511,11 @@ async function enrichLeanPaneItem({ item, state, overleafProjectId, approvalCont
     // Let the batch queue show the active Lea turn even when the target lives
     // in a different project file and therefore has no in-document badge.
     turnProgress: inProgress && !stale ? statusInfo?.turnProgress : undefined,
+    finalStatus: statusInfo?.finalStatus || undefined,
+    failureCode: maxSpendFailure ? "max_spend_reached" : undefined,
+    failureMessage: maxSpendFailure
+      ? maxSpendFailure.error || maxSpendFailure.message || MAX_SPEND_MESSAGE
+      : undefined,
     sourceFreshness: freshness.sourceFreshness,
     generatedFromSourceHash: freshness.generatedFromSourceHash || undefined,
     lastGeneratedAt: freshness.generatedAt || latestJob?.finishedAt || latestJob?.startedAt || undefined,
@@ -6322,7 +6599,7 @@ function mapLeanPaneStatus(statusInfo, item) {
   return "unknown";
 }
 
-async function readLeanPaneArtifactFromSession({ state, job, declarationName }) {
+async function readLeanPaneArtifactFromSession({ state, job, declarationName, projectNamespace = "" }) {
   const sessionId = job?.leaSessionId || job?.recorderSessionId || "";
   if (!sessionId || !declarationName) {
     return { relativePath: "", content: "" };
@@ -6346,11 +6623,23 @@ async function readLeanPaneArtifactFromSession({ state, job, declarationName }) 
   if (!step) {
     return { relativePath: "", content: "" };
   }
-  const namespace = detail.body.project_namespace || job.projectNamespace || projectNamespaceFromSlug(job.projectSlug);
-  return {
-    relativePath: proofPathFromProjectStep({ namespace, stepPath: step.path }),
-    content: String(step.code || "")
-  };
+  const namespace = String(projectNamespace || "").trim()
+    || detail.body.project_namespace
+    || job.projectNamespace
+    || projectNamespaceFromSlug(job.projectSlug);
+  const current = await readLeanPaneArtifact({
+    leaRepoPath: state.settings.leaRepoPath,
+    statusInfo: {
+      recordedProofPath: proofPathFromProjectStep({ namespace, stepPath: step.path })
+    }
+  });
+  return current.exists
+    ? current
+    : {
+        relativePath: proofPathFromProjectStep({ namespace, stepPath: step.path }),
+        content: String(step.code || ""),
+        exists: false
+      };
 }
 
 async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
@@ -6367,15 +6656,16 @@ async function readLeanPaneArtifact({ leaRepoPath, statusInfo }) {
     }
   }
   if (!absolutePath || !existsSync(absolutePath)) {
-    return { relativePath, content: "" };
+    return { relativePath, content: "", exists: false };
   }
   try {
     return {
       relativePath: relativePath || relativeToLeaRepo({ leaRepoPath, absolutePath }),
-      content: await fs.readFile(absolutePath, "utf8")
+      content: await fs.readFile(absolutePath, "utf8"),
+      exists: true
     };
   } catch {
-    return { relativePath, content: "" };
+    return { relativePath, content: "", exists: false };
   }
 }
 
@@ -6496,6 +6786,12 @@ async function getTheoremStatus({
   ].filter(Boolean))];
   const ledger = await fetchTargetStatusFromAdapter({ state, target, declarations: candidates });
   const evidence = candidates.map((name) => ledger?.[name]).find((entry) => entry?.recorded) || null;
+  const artifactEvidence = evidence
+    ? {
+        artifactRecorded: true,
+        artifactExists: Boolean(evidence.exists)
+      }
+    : {};
 
   // Edit-broken knowledge the ADAPTER cannot have: the cascade's import-graph
   // propagation overrules a spuriously-passing rebuild of a transitive
@@ -6520,16 +6816,27 @@ async function getTheoremStatus({
       // change must surface as broken — with its repair offer — not as a
       // plain stub (the legacy engine's override had the same precedence).
       if (linkedJob) {
-        return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
+        return withLeaSession({
+          ...buildEditBrokenTheoremStatus({ linkedJob, target }),
+          ...base,
+          ...artifactEvidence
+        });
       }
-      return { status: "failed", ...base, effectiveStatus: "unformalized", message: evidence.check_detail || "This item no longer compiles." };
+      return {
+        status: "failed",
+        ...base,
+        ...artifactEvidence,
+        effectiveStatus: "unformalized",
+        message: evidence.check_detail || "This item no longer compiles."
+      };
     }
     if (evidence.has_sorry) {
-      return withLeaSession({ status: "sorry_stub", ...base, leanStatement });
+      return withLeaSession({ status: "sorry_stub", ...base, ...artifactEvidence, leanStatement });
     }
     const status = {
       status: "formalized",
       ...base,
+      ...artifactEvidence,
       resultKind: target.targetKind === "definition" ? "defined" : "proved",
       leanStatement
     };
@@ -6539,7 +6846,10 @@ async function getTheoremStatus({
   if (editBroken) {
     // No file evidence, but the overlay knows the item's newest real compile
     // failed (manual edit / cascade on a pre-index artifact).
-    return withLeaSession(buildEditBrokenTheoremStatus({ linkedJob, target }));
+    return withLeaSession({
+      ...buildEditBrokenTheoremStatus({ linkedJob, target }),
+      ...artifactEvidence
+    });
   }
 
   // No usable file evidence: the overlay's newest terminal run decides. An
@@ -6565,15 +6875,21 @@ async function getTheoremStatus({
 
   if (newest?.status === "failed") {
     const logTail = await readLogTail(newest.job.logPath);
-    return withLeaSession(buildFailedTheoremStatus({
-      failedJob: newest.job,
-      target,
-      equivalentStatus: getEquivalentTheoremStatus({ status: "unformalized" }),
-      logTail
-    }));
+    return withLeaSession({
+      ...buildFailedTheoremStatus({
+        failedJob: newest.job,
+        target,
+        equivalentStatus: getEquivalentTheoremStatus({ status: "unformalized" }),
+        logTail
+      }),
+      ...artifactEvidence
+    });
   }
   if (newest) {
-    return withLeaSession(buildJobResponse({ job: newest.job, status: newest.status, target }));
+    return withLeaSession({
+      ...buildJobResponse({ job: newest.job, status: newest.status, target }),
+      ...artifactEvidence
+    });
   }
 
   return {
@@ -6586,7 +6902,8 @@ async function getTheoremStatus({
     absolutePath: target.absolutePath,
     projectId: target.projectId,
     projectSlug: target.projectSlug,
-    projectMarkdownPath: target.projectMarkdownPath
+    projectMarkdownPath: target.projectMarkdownPath,
+    ...artifactEvidence
   };
 }
 

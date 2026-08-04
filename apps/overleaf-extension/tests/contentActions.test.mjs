@@ -261,6 +261,143 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /missing stub/);
 });
 
+test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
+  const manifest = (calls) => {
+    const renamed = calls.some((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
+    const namespace = renamed ? "Lea.FourierNotes" : "Lea.TestProject";
+    return {
+      ok: true,
+      rootFile: "main.tex",
+      items: [{
+        id: "theorem:demo_theorem:0",
+        kind: "theorem",
+        label: "demo_theorem",
+        title: "Demo theorem",
+        status: "valid",
+        sourceFile: "main.tex",
+        sourceStartLine: 1,
+        sourceEndLine: 4,
+        documentOrder: 0,
+        naturalLanguageLatex: "A theorem.",
+        leanKind: "theorem",
+        leanDeclarationName: "demo_theorem",
+        leanArtifactContent: `namespace ${namespace}\n\ntheorem demo_theorem : True := by trivial\n\nend ${namespace}`
+      }],
+      diagnostics: []
+    };
+  };
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      // The harness uses the active buffer directly for the synthetic
+      // "unknown" project, avoiding an unrelated Overleaf ZIP fixture.
+      locationPath: "/project/unknown",
+      manifest,
+      projectIdentity: {
+        projectId: "adapter-project-unknown",
+        overleafProjectId: "unknown",
+        slug: "unknown",
+        projectName: "Test Project",
+        namespace: "Lea.TestProject",
+        exists: true,
+        hasRecordedProofs: true
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  harness.clickButtonText("Rename");
+  await flushPromises();
+
+  assert.deepEqual(harness.projectIdentityDialog(), {
+    role: "dialog",
+    modal: "true",
+    label: "ol-lean-project-identity-title"
+  });
+  assert.match(harness.bodyText(), /Rename project/);
+  assert.match(harness.bodyText(), /Display nameTest Project/);
+  assert.match(harness.bodyText(), /Lean namespaceLea\.TestProject/);
+  assert.equal(harness.promptCalls.length, 0);
+  assert.equal(harness.confirmCalls.length, 0);
+
+  harness.setProjectIdentityName("Fourier Notes");
+  await harness.runScheduledTimers();
+
+  assert.equal(harness.projectIdentityNamespace(), "Lea.FourierNotes");
+  assert.match(harness.bodyText(), /Lea\.TestProject → Lea\.FourierNotes/);
+  assert.match(harness.bodyText(), /migrate recorded proof files/);
+
+  harness.clickButtonText("Save changes");
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
+  assert.ok(saveCall, "expected project identity PUT");
+  assert.deepEqual(JSON.parse(saveCall.options.body), {
+    overleafProjectId: "unknown",
+    projectName: "Fourier Notes",
+    mode: "rename-namespace",
+    namespace: "Lea.FourierNotes",
+    expectedNamespace: "Lea.TestProject",
+    createIfMissing: true
+  });
+  assert.equal(harness.projectIdentityDialog(), null);
+  assert.match(harness.bodyText(), /Fourier Notes/);
+  assert.match(harness.bodyText(), /Project name and Lean namespace saved/);
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  assert.match(harness.bodyText(), /namespace Lea\.FourierNotes/);
+  assert.doesNotMatch(harness.bodyText(), /namespace Lea\.TestProject/);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/lean-pane/manifest")).length,
+    2,
+    "rename should refresh the open Lean pane manifest"
+  );
+});
+
+test("project rename can keep the existing namespace when the suggested namespace is occupied", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/project-1",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      projectPreview: {
+        project_name: "Shared Notes",
+        namespace: "Lea.SharedNotes",
+        available: false,
+        suggestions: ["Lea.SharedNotes2", "Lea.SharedNotes2026"]
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Rename");
+  await flushPromises();
+
+  harness.setProjectIdentityName("Shared Notes");
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /Lea\.SharedNotes is already in use/);
+  assert.equal(harness.hasButtonText("Lea.SharedNotes2"), true);
+  harness.setProjectIdentitySync(false);
+  assert.match(harness.bodyText(), /Only the display name will change/);
+
+  harness.clickButtonText("Save changes");
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
+  assert.ok(saveCall, "expected project identity PUT");
+  const body = JSON.parse(saveCall.options.body);
+  assert.equal(body.mode, "display-only");
+  assert.equal(body.namespace, "");
+  assert.equal(harness.promptCalls.length, 0);
+  assert.equal(harness.confirmCalls.length, 0);
+});
+
 test("Lean pane renders a persisted drag resize handle", async () => {
   const harness = createContentHarness({ status: "unformalized" });
   await harness.loadVisibleTheorems();
@@ -559,6 +696,152 @@ test("Lean pane expanded detail shows copy actions only for generated content", 
   assert.equal(harness.hasButtonLabel("Copy stub"), true);
   assert.equal(harness.hasButtonLabel("Copy artifact"), true);
   assert.match(harness.bodyText(), /workspace\/proofs\/Main\.lean/);
+});
+
+test("Lean pane shows navigable uses and used-by relationships across project files", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        items: [
+          {
+            id: "theorem:support:0",
+            kind: "theorem",
+            label: "support",
+            status: "valid",
+            sourceFile: "foundations/base.tex",
+            documentOrder: 0,
+            naturalLanguageLatex: "A supporting theorem.",
+            leanKind: "theorem",
+            targetUses: []
+          },
+          {
+            id: "theorem:isolated:1",
+            kind: "theorem",
+            label: "isolated",
+            status: "valid",
+            sourceFile: "main.tex",
+            documentOrder: 1,
+            naturalLanguageLatex: "An unrelated theorem.",
+            leanKind: "theorem",
+            targetUses: []
+          },
+          {
+            id: "theorem:result:2",
+            kind: "theorem",
+            label: "result",
+            status: "invalid",
+            sourceFile: "sections/result.tex",
+            documentOrder: 2,
+            naturalLanguageLatex: "The main result.",
+            leanKind: "theorem",
+            targetUses: ["support", "outside_inventory"]
+          }
+        ],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("sections/");
+  harness.clickPaneTreeRowText("result.tex");
+
+  assert.equal(harness.countSelector(".ol-lean-project-relationships"), 1);
+  assert.deepEqual(
+    harness.relationshipChips().map((chip) => ({
+      text: chip.text,
+      direction: chip.direction,
+      navigable: chip.navigable,
+      unavailable: chip.unavailable
+    })),
+    [
+      { text: "support", direction: "uses", navigable: true, unavailable: false },
+      { text: "outside_inventory", direction: "uses", navigable: false, unavailable: true }
+    ]
+  );
+  const supportChip = harness.relationshipChips()[0];
+  assert.match(supportChip.className, /ol-lean-project-relationship-chip-valid/);
+  assert.match(supportChip.ariaLabel, /Open dependency support, currently valid/);
+  const outsideChip = harness.relationshipChips()[1];
+  assert.equal(outsideChip.ariaDisabled, "true");
+  assert.match(outsideChip.title, /not present in the current Lean-pane inventory/);
+
+  harness.clickRelationshipChip("support");
+  assert.equal(harness.focusedPaneItemId(), "theorem:support:0");
+  assert.equal(harness.firstFocusedPaneItemScrolled(), true);
+  assert.ok(harness.paneTreeRowTexts().some((text) => text.includes("base.tex")));
+  assert.ok(harness.relationshipChips().some((chip) => (
+    chip.text === "result"
+    && chip.direction === "used-by"
+    && chip.navigable
+    && /currently invalid/.test(chip.ariaLabel)
+  )));
+
+  harness.clickRelationshipChip("result", "used-by");
+  assert.equal(harness.focusedPaneItemId(), "theorem:result:2");
+});
+
+test("Lean pane relationship chips survive polling and reflect refreshed target status", async () => {
+  let manifestCalls = 0;
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: () => {
+        const first = manifestCalls === 0;
+        manifestCalls += 1;
+        return {
+          ok: true,
+          items: [
+            {
+              id: "theorem:support:0",
+              kind: "theorem",
+              label: "support",
+              status: first ? "valid" : "invalid",
+              sourceFile: "main.tex",
+              documentOrder: 0,
+              naturalLanguageLatex: "Support.",
+              leanKind: "theorem",
+              targetUses: []
+            },
+            {
+              id: "theorem:result:1",
+              kind: "theorem",
+              label: "result",
+              status: first ? "in-progress" : "valid",
+              inProgress: first,
+              sourceFile: "main.tex",
+              documentOrder: 1,
+              naturalLanguageLatex: "Result.",
+              leanKind: "theorem",
+              targetUses: ["support"]
+            }
+          ],
+          diagnostics: []
+        };
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+
+  assert.ok(harness.relationshipChips().some((chip) => (
+    chip.text === "support" && /relationship-chip-valid/.test(chip.className)
+  )));
+
+  await harness.runScheduledTimers();
+
+  assert.ok(harness.relationshipChips().some((chip) => (
+    chip.text === "support" && /relationship-chip-invalid/.test(chip.className)
+  )));
 });
 
 test("Lean pane renders lightweight math and highlighted Lean code", async () => {
@@ -960,7 +1243,167 @@ test("Lean pane keeps Formalize after an upstream dependency blocks startup", as
 
   assert.equal(harness.hasButtonText("Formalize"), true);
   assert.equal(harness.hasButtonText("Retry formalize"), false);
-  assert.match(harness.bodyText(), /Formalize referenced theorem first: helper_lemma\./);
+  assert.deepEqual(harness.paneActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Dependency must be formalized firstFormalize referenced theorem first: helper_lemma. No Lea run was started."
+  });
+  assert.equal(harness.hasButtonLabel("Dismiss error message"), true);
+  harness.clickButtonLabel("Dismiss error message");
+  assert.equal(harness.paneActionError(), null);
+});
+
+test("source popover explains when an upstream dependency blocks formalization startup", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    { targetUses: ["helper_lemma"] },
+    {
+      locationPath: "/project/unknown",
+      formalizeError: "Formalize referenced theorem first: helper_lemma."
+    }
+  );
+  await harness.loadStatusForVisibleTheorem();
+  harness.openTargetPopover();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.popoverActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Formalization blockedFormalize referenced theorem first: helper_lemma. No Lea run was started."
+  });
+  assert.equal(harness.hasButtonText("Formalize"), true);
+});
+
+test("source popover reports a cost cap inline without a separate floating notice", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeFailure: {
+        status: 402,
+        error: "max_spend_reached",
+        message: "Max spend limit has been reached."
+      }
+    }
+  );
+  await harness.loadStatusForVisibleTheorem();
+  harness.openTargetPopover();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.popoverActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Action failedMax spend limit has been reached."
+  });
+  assert.equal(harness.countSelector(".ol-lean-cost-cap-notice"), 0);
+});
+
+test("Lean pane cost-cap dismissal survives refresh and clears for a retry", async () => {
+  const item = {
+    id: "theorem:main_theorem:0",
+    kind: "theorem",
+    label: "main_theorem",
+    status: "missing-stub",
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    formalizable: true
+  };
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeFailure: (calls) => calls.filter((call) => call.url.endsWith("/formalize")).length === 1
+        ? {
+            status: 402,
+            error: "max_spend_reached",
+            message: "Max spend limit has been reached."
+          }
+        : null,
+      manifest: { ok: true, rootFile: "main.tex", items: [item], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.paneActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "Cost cap reachedLea could not complete this formalization because the configured maximum spend has been reached. Increase or clear the cap in Lea settings, then try again.Open settings"
+  });
+  assert.equal(harness.countSelector(".ol-lean-cost-cap-notice"), 0);
+  assert.equal(harness.hasButtonText("Formalize"), true);
+  assert.equal(harness.hasButtonLabel("Dismiss error message"), true);
+
+  harness.clickButtonLabel("Dismiss error message");
+  assert.equal(harness.paneActionError(), null);
+
+  harness.clickButtonLabel("Refresh Lean pane");
+  await flushPromises();
+  assert.equal(harness.paneActionError(), null);
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+  assert.equal(harness.paneActionError(), null);
+});
+
+test("Lean pane explains a max-spend failure reported after a run started", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:main_theorem:0",
+          kind: "theorem",
+          label: "main_theorem",
+          status: "invalid",
+          finalStatus: "max_spend",
+          failureCode: "max_spend_reached",
+          failureMessage: "Max spend limit reached. Lea run was cancelled.",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem",
+          formalizable: true
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+
+  assert.match(harness.paneActionError()?.text || "", /Cost cap reached/);
+  assert.match(harness.paneActionError()?.text || "", /Increase or clear the cap in Lea settings/);
+  assert.equal(harness.countSelector(".ol-lean-cost-cap-notice"), 0);
+  harness.clickButtonLabel("Dismiss error message");
+  assert.equal(harness.paneActionError(), null);
+
+  harness.clickButtonLabel("Refresh Lean pane");
+  await flushPromises();
+  assert.equal(harness.paneActionError(), null);
 });
 
 test("Formalize all renders an accessible, collapsible queue with active turn progress", async () => {
@@ -1279,17 +1722,31 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const timers = [];
   const fetchCalls = [];
   const postedMessages = [];
+  const promptCalls = [];
   const confirmCalls = [];
   const storageSetCalls = [];
   const storageState = { ...(options.storage || {}) };
   const localStorageState = { ...(options.localStorage || {}) };
   const storageChangeListeners = [];
+  let currentProjectIdentity = options.projectIdentity || {
+    projectId: "adapter-project-1",
+    overleafProjectId: "project-1",
+    slug: "project-1",
+    projectName: "Test Project",
+    namespace: "Lea.TestProject",
+    exists: true,
+    hasRecordedProofs: true
+  };
   let nextTimerId = 1;
 
   const window = {
     innerWidth: 1024,
     innerHeight: 768,
     location: { pathname: options.locationPath || "/project/project-1" },
+    prompt(text, value) {
+      promptCalls.push({ text: String(text), value: String(value || "") });
+      return options.promptResponse ?? value ?? null;
+    },
     confirm(text) {
       confirmCalls.push(String(text));
       return options.confirmResponse !== false;
@@ -1351,29 +1808,58 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
       const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
-      const failingFormalize = Boolean(options.formalizeError) && String(url).endsWith("/formalize");
+      const formalizeRequest = String(url).endsWith("/formalize");
+      const formalizeFailure = formalizeRequest
+        ? typeof options.formalizeFailure === "function"
+          ? options.formalizeFailure(fetchCalls)
+          : options.formalizeFailure || (options.formalizeError
+            ? { status: 400, error: "unresolved_uses", message: options.formalizeError }
+            : null)
+        : null;
+      const failingFormalize = Boolean(formalizeFailure);
       return {
         ok: !failingRepairStart && !failingFormalize,
-        status: failingRepairStart || failingFormalize ? 400 : 200,
+        status: failingRepairStart ? 400 : failingFormalize ? formalizeFailure.status || 400 : 200,
         async json() {
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
           }
           if (failingFormalize) {
-            return { ok: false, error: "unresolved_uses", message: options.formalizeError };
+            return { ok: false, ...formalizeFailure };
+          }
+          if (String(url).includes("/project/identity/preview")) {
+            const request = JSON.parse(fetchOptions?.body || "{}");
+            const preview = typeof options.projectPreview === "function"
+              ? options.projectPreview(request, fetchCalls)
+              : options.projectPreview;
+            return preview || {
+              ok: true,
+              project_name: request.projectName,
+              namespace: request.namespace || `Lea.${String(request.projectName || "Project").replace(/[^A-Za-z0-9]+/g, "")}`,
+              available: true,
+              suggestions: []
+            };
+          }
+          if (String(url).endsWith("/project/identity") && fetchOptions?.method === "PUT") {
+            const request = JSON.parse(fetchOptions?.body || "{}");
+            const update = typeof options.projectIdentityUpdate === "function"
+              ? options.projectIdentityUpdate(request, fetchCalls)
+              : options.projectIdentityUpdate;
+            const response = update || {
+              ok: true,
+              identity: {
+                ...currentProjectIdentity,
+                projectName: request.projectName,
+                namespace: request.mode === "rename-namespace" ? request.namespace : currentProjectIdentity.namespace
+              }
+            };
+            if (response?.identity) currentProjectIdentity = response.identity;
+            return response;
           }
           if (String(url).includes("/project/identity?")) {
             return {
               ok: true,
-              identity: options.projectIdentity || {
-                projectId: "adapter-project-1",
-                overleafProjectId: "project-1",
-                slug: "project-1",
-                projectName: "Test Project",
-                namespace: "Lea.TestProject",
-                exists: true,
-                hasRecordedProofs: true
-              }
+              identity: currentProjectIdentity
             };
           }
           if (String(url).includes("/lean-pane/manifest")) {
@@ -1594,6 +2080,29 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     editTextarea() {
       return document.body.querySelector(".ol-lean-project-edit-textarea");
     },
+    setProjectIdentityName(value) {
+      const input = document.body.querySelector(".ol-lean-project-identity-input");
+      assert.ok(input, "expected project identity input");
+      input.value = value;
+      input.dispatchEvent({ type: "input" });
+    },
+    setProjectIdentitySync(checked) {
+      const input = document.body.querySelector(".ol-lean-project-identity-sync-input");
+      assert.ok(input, "expected project identity sync input");
+      input.checked = Boolean(checked);
+      input.dispatchEvent({ type: "change" });
+    },
+    projectIdentityDialog() {
+      const dialog = document.body.querySelector(".ol-lean-project-identity-dialog");
+      return dialog ? {
+        role: dialog.attributes.role,
+        modal: dialog.attributes["aria-modal"],
+        label: dialog.attributes["aria-labelledby"]
+      } : null;
+    },
+    projectIdentityNamespace() {
+      return document.body.querySelector(".ol-lean-project-identity-namespace-value")?.textContent || "";
+    },
     setEditTextareaValue(value) {
       const textarea = this.editTextarea();
       assert.ok(textarea, "expected the edit textarea to be present");
@@ -1636,6 +2145,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       await flushPromises();
     },
     fetchCalls,
+    promptCalls,
     confirmCalls,
     storageSetCalls,
     storageState,
@@ -1650,10 +2160,52 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
     },
+    paneActionError() {
+      const alert = document.body.querySelector(".ol-lean-project-action-error");
+      return alert ? {
+        role: alert.attributes.role,
+        live: alert.attributes["aria-live"],
+        text: alert.textContent
+      } : null;
+    },
+    popoverActionError() {
+      const alert = document.body.querySelector(".ol-lean-popover-status-error");
+      return alert ? {
+        role: alert.attributes.role,
+        live: alert.attributes["aria-live"],
+        text: alert.textContent
+      } : null;
+    },
     paneTreeRowTexts() {
       return document.body
         .querySelectorAll(".ol-lean-project-tree-row")
         .map((row) => row.textContent);
+    },
+    relationshipChips() {
+      return document.body
+        .querySelectorAll(".ol-lean-project-relationship-chip")
+        .map((chip) => ({
+          text: chip.textContent,
+          direction: chip.dataset.relationshipDirection,
+          targetLabel: chip.dataset.targetLabel,
+          ariaLabel: chip.attributes["aria-label"],
+          ariaDisabled: chip.attributes["aria-disabled"],
+          navigable: chip.classList.contains("is-navigable"),
+          unavailable: chip.classList.contains("is-unavailable"),
+          className: chip.className,
+          title: chip.title
+        }));
+    },
+    clickRelationshipChip(text, direction = "uses") {
+      const chip = document.body
+        .querySelectorAll(".ol-lean-project-relationship-chip")
+        .find((candidate) => (
+          candidate.textContent === text
+          && candidate.dataset.relationshipDirection === direction
+          && candidate.classList.contains("is-navigable")
+        ));
+      assert.ok(chip, `expected navigable ${direction} relationship chip "${text}"`);
+      chip.click();
     },
     paneProgresses() {
       return document.body
@@ -1698,6 +2250,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     firstFocusedPaneItemScrolled() {
       const item = document.body.querySelector(".ol-lean-project-item-focus");
       return Boolean(item?.scrollIntoViewOptions);
+    },
+    focusedPaneItemId() {
+      return document.body.querySelector(".ol-lean-project-item-focus")?.dataset.itemId || "";
     }
   };
 }
@@ -1852,6 +2407,7 @@ class FakeElement {
       const mark = this.appendChild(new FakeElement("span"));
       mark.className = "ol-lean-trigger-mark";
       mark.textContent = "L";
+      return;
     }
   }
 

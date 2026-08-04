@@ -32,6 +32,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -63,12 +64,28 @@ from lea.interface import (
 )
 
 from .artifacts import classify_lean_artifact, declaration_present, extract_declaration_name
-from .config import LeaConfig, load_config
+from .config import LeaConfig, configured_provider_keys, load_config
 from .gitstore import GitStore, GitStoreError
 from . import collation, formalizations as formalization_service, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 _FORMALIZATION_CONTEXT_MARKER = "<!-- lea:formalization-context -->"
+_CREDENTIAL_LIKE = re.compile(
+    r"(?:sk-(?:ant-)?[A-Za-z0-9_./+\-=]{8,}|AIza[A-Za-z0-9_-]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,})"
+)
+
+
+def _public_error_detail(exc: Exception) -> str:
+    """A useful persisted/provider error with credentials removed and bounded size."""
+    detail = f"{type(exc).__name__}: {exc}"
+    try:
+        for secret in configured_provider_keys().values():
+            if len(secret) >= 8:
+                detail = detail.replace(secret, "[redacted]")
+    except Exception:  # noqa: BLE001 — redaction is best-effort on an error path
+        pass
+    return _CREDENTIAL_LIKE.sub("[redacted]", detail)[:2000]
 
 # Admission — which run may start and whether there's room — lives in
 # `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim.
@@ -1897,7 +1914,8 @@ def run_lea(context: RunnerContext) -> None:
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)
         flush_narration()
-        emit(events, "run_error", {"message": f"{type(exc).__name__}: {exc}"})
+        error_detail = _public_error_detail(exc)
+        emit(events, "run_error", {"message": error_detail})
         # Never downgrade a run that already reached a terminal status (C6). The
         # Finished handler persists the outcome before doing anything else, so a
         # failure after that point is a bookkeeping problem, not a failed proof —
@@ -1911,12 +1929,17 @@ def run_lea(context: RunnerContext) -> None:
             )
         else:
             try:
-                store.update_run(run_id, "failed")
+                store.update_run(
+                    run_id,
+                    "failed",
+                    result_kind="failed",
+                    result_detail=error_detail,
+                )
             except Exception:
                 logger.exception("Failed to mark run %s failed", run_id)
             final_status = "failed"
-            final_result_kind = None
-            final_result_detail = None
+            final_result_kind = "failed"
+            final_result_detail = error_detail
     finally:
         # Publish any trailing streamed text before the terminal `done` (P1) — a run
         # that ends mid-batch must not drop its last words.

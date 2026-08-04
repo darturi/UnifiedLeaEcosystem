@@ -231,13 +231,45 @@ def test_migration_proceeds_once_no_run_is_active(tmp_path, monkeypatch):
     _init_db(tmp_path, monkeypatch)
     proofs = tmp_path / "proofs"
     project = projects.provision_project("Demo", proofs)
-    _, run = _project_session_with_active_run(project, with_code=True)
+    session, run = _project_session_with_active_run(project, with_code=True)
     store.update_run(run["id"], "proved")
+    repo = projects.project_repo_dir(project, proofs)
+    (repo / "p.lean").write_text(
+        "namespace Lea.Demo\n\ntheorem t : True := by trivial\n\nend Lea.Demo\n"
+    )
+    store.upsert_artifact(
+        project_id=project["id"],
+        session_id=session["id"],
+        run_id=run["id"],
+        declaration_name="t",
+        kind="proof",
+        path="p.lean",
+        module_name="Lea.Demo.p",
+    )
+    # Prefixes without a dot boundary belong to a different namespace and
+    # must never be rewritten by the migration.
+    store.upsert_artifact(
+        project_id=project["id"],
+        session_id=session["id"],
+        run_id=run["id"],
+        declaration_name="other",
+        kind="proof",
+        path="other.lean",
+        module_name="Lea.Demonstration.other",
+    )
 
     result = projects.migrate_project_namespace(
         project, proofs, title="Renamed", namespace="Lea.Renamed",
     )
 
     assert result["project"]["namespace"] == "Lea.Renamed"
+    assert result["migration"]["rebasedArtifactModules"] == 1
     assert (proofs / "Lea" / "Renamed").is_dir()
     assert not (proofs / "Lea" / "Demo").exists()
+    artifacts = {
+        row["declaration_name"]: row
+        for row in store.list_artifacts_for_scope(project["id"])
+    }
+    assert artifacts["t"]["module_name"] == "Lea.Renamed.p"
+    assert artifacts["other"]["module_name"] == "Lea.Demonstration.other"
+    assert "namespace Lea.Renamed" in (proofs / "Lea" / "Renamed" / "p.lean").read_text()

@@ -1857,6 +1857,47 @@ def list_artifacts_for_scope(scope: str) -> list[dict]:
     return [row_to_dict(row) for row in rows]
 
 
+def rebase_project_artifact_modules(
+    project_id: str,
+    *,
+    old_namespace: str,
+    new_namespace: str,
+) -> int:
+    """Rebase cached artifact module names after an explicit project rename.
+
+    Artifact ``path`` values are relative to the project repo and therefore do
+    not change when the repo moves. ``module_name`` is namespace-qualified,
+    however, and is returned by the target-status ledger to the Overleaf pane.
+    Only exact namespace matches (or dot-delimited descendants) are rewritten
+    so similarly-prefixed namespaces cannot be changed accidentally.
+    """
+    old_ns = validate_project_namespace(old_namespace)
+    new_ns = validate_project_namespace(new_namespace)
+    if old_ns == new_ns:
+        return 0
+    now = utc_now()
+    changed = 0
+    with write() as conn:
+        rows = conn.execute(
+            "select id, module_name from artifacts where project_id = ?",
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            module_name = str(row["module_name"] or "")
+            if module_name == old_ns:
+                rebased = new_ns
+            elif module_name.startswith(f"{old_ns}."):
+                rebased = f"{new_ns}{module_name[len(old_ns):]}"
+            else:
+                continue
+            conn.execute(
+                "update artifacts set module_name = ?, updated_at = ? where id = ?",
+                (rebased, now, row["id"]),
+            )
+            changed += 1
+    return changed
+
+
 def queue_position(run_id: str) -> int | None:
     """How many pending runs precede this pending run (0 = next up). None when
     the run is not pending. Derived, never stored — invariant 2."""
