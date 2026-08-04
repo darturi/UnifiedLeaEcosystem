@@ -6,6 +6,8 @@ import type {
   ApprovalRecord,
   ChatMessage,
   CodeStep,
+  Diagnostic,
+  DiagnosticAction,
   PendingApproval,
   SessionSummary,
   StatusEvent,
@@ -30,7 +32,11 @@ type MergedNode =
   | { kind: 'message'; key: string; runId: string | null; seqKey: number; message: ChatMessage }
   | { kind: 'code'; key: string; runId: string | null; seqKey: number; step: CodeStep; codeIndex: number }
   | { kind: 'approval'; key: string; runId: string | null; seqKey: number; approval: ApprovalRecord }
-  | { kind: 'spawn'; key: string; runId: string | null; seqKey: number; child: SessionSummary };
+  | { kind: 'spawn'; key: string; runId: string | null; seqKey: number; child: SessionSummary }
+  // v2.4: a failure, placed in the thread at the point it happened. Its `seq` is the
+  // timeline id, so it lands next to the step that produced it — which is most of
+  // what "anchored" buys over a banner floating at the bottom of the page.
+  | { kind: 'diagnostic'; key: string; runId: string | null; seqKey: number; diagnostic: Diagnostic };
 
 // A run's nodes with consecutive spawn nodes coalesced into one box, so N sub-agents
 // spawned back-to-back render as a single group at their shared point in the thread.
@@ -91,6 +97,19 @@ export function ChatThread({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [autoScroll, setAutoScroll] = useState(true);
+  // v2.4: bumped to open the model picker from a diagnostic's "Change model" button.
+  // A counter, not a flag, so pressing it twice re-opens the picker.
+  const [modelPickerSignal, setModelPickerSignal] = useState(0);
+  // Route a diagnostic's action to the thing that can actually fix it: "Change model"
+  // opens the model picker itself; anything else goes to Settings. Sending both to
+  // Settings made the user go and hunt for the picker they'd just asked for.
+  const runDiagnosticAction = useCallback(
+    (action: DiagnosticAction) => {
+      if (action.focus === 'model') setModelPickerSignal((n) => n + 1);
+      else onOpenSettings?.();
+    },
+    [onOpenSettings],
+  );
   // R4: model picker state + key-missing nudge from the model store.
   const model = useModel((s) => s.model);
   const modelCatalog = useModel((s) => s.modelCatalog);
@@ -170,6 +189,35 @@ export function ChatThread({
     () => (buildTimeline as any)({ messages, codeSteps }) as { items: TimelineItem[] },
     [messages, codeSteps],
   );
+
+  // v2.4 · every failure the backend reported, live + replayed on load. Split by
+  // where each one BELONGS, so nothing is shown twice and nothing is dropped:
+  //   degraded → the header strip (an ongoing condition, deduped by code)
+  //   child_id → the sub-agent row that owns it (rendered by SpawnGroup)
+  //   the rest → inline in the thread at its own seq
+  const diagnostics = useProofSession((s) => s.diagnostics);
+  const degradedDiagnostics = useMemo(() => {
+    const byCode = new Map<string, Diagnostic>();
+    for (const d of diagnostics) {
+      // Keep the LATEST of each code: a condition reported repeatedly is one
+      // condition, and its most recent description is the current one.
+      if (d.severity === 'degraded') byCode.set(d.code, d);
+    }
+    return [...byCode.values()];
+  }, [diagnostics]);
+  const threadDiagnostics = useMemo(
+    () => diagnostics.filter((d) => d.severity !== 'degraded' && !d.context?.child_id),
+    [diagnostics],
+  );
+  const childDiagnostics = useMemo(() => {
+    const byChild = new Map<string, Diagnostic[]>();
+    for (const d of diagnostics) {
+      const childId = d.context?.child_id;
+      if (!childId) continue;
+      byChild.set(childId, [...(byChild.get(childId) ?? []), d]);
+    }
+    return byChild;
+  }, [diagnostics]);
 
   // M8: grow the composer with its content up to a cap, then scroll inside.
   useEffect(() => {
@@ -287,6 +335,20 @@ export function ChatThread({
         child,
       });
     });
+    // v2.4: diagnostics ride the same seq ordering as everything else, so a failure
+    // renders where it happened rather than in a banner detached from its cause.
+    // Two exceptions are rendered by their owner instead of inline, to avoid saying
+    // the same thing twice: `child_id` ones belong on the sub-agent row, and
+    // `degraded` ones are ongoing conditions shown once in the header strip.
+    for (const d of threadDiagnostics) {
+      nodes.push({
+        kind: 'diagnostic',
+        key: `dg:${d.id ?? `${d.code}-${d.seq ?? ''}`}`,
+        runId: d.run_id ?? null,
+        seqKey: typeof d.seq === 'number' ? d.seq : Number.MAX_SAFE_INTEGER,
+        diagnostic: d,
+      });
+    }
     nodes.sort((x, y) => x.seqKey - y.seqKey || x.key.localeCompare(y.key));
     const groups: { runId: string | null; nodes: MergedNode[] }[] = [];
     for (const node of nodes) {
@@ -295,7 +357,7 @@ export function ChatThread({
       else groups.push({ runId: node.runId, nodes: [node] });
     }
     return groups;
-  }, [items, approvals, childSessions]);
+  }, [items, approvals, childSessions, threadDiagnostics]);
 
   const latestProofStatus = useMemo(
     () => deriveCodeStepProofStatus(latestCodeStep(codeSteps)),
@@ -366,6 +428,11 @@ export function ChatThread({
   const renderNode = (node: MergedNode) => {
     // Spawn nodes are rendered by coalesceUnits → <SpawnGroup>, never here.
     if (node.kind === 'spawn') return null;
+    if (node.kind === 'diagnostic') {
+      return (
+        <DiagnosticCard key={node.key} diagnostic={node.diagnostic} onAction={runDiagnosticAction} />
+      );
+    }
     if (node.kind === 'approval') {
       return (
         <ApprovalCard
@@ -463,6 +530,7 @@ export function ChatThread({
           onChange={onModelChange}
           catalog={modelCatalog}
           featured={modelFeatured}
+          openSignal={modelPickerSignal}
         />
         {/* Only a "Show canvas" affordance when the canvas is hidden — when it's
             open the Canvas's own × closes it, so a second toggle here is redundant. */}
@@ -500,18 +568,21 @@ export function ChatThread({
                       key={unit.key}
                       children={unit.children}
                       onSelectSession={onSelectSession}
+                      diagnosticsByChild={childDiagnostics}
                     />
                   ) : (
                     renderNode(unit.node)
                   ),
                 )}
-                {finished && completion === 'proved' && <ProvedCard steps={steps} session={session} />}
+                {/* The 'proved' and 'failed/max_turns' banners are gone: both restated
+                    what the header chip already says (✓ proved / ✕ unproved), so the
+                    common outcomes ended every run with a badge saying what you could
+                    already see. The remaining cards are kept because each carries
+                    something the chip does NOT: a definition rather than a proof, a
+                    counterexample, or a proof that compiles but still has a `sorry`. */}
                 {finished && completion === 'defined' && <DefinedCard steps={steps} session={session} />}
                 {finished && completion === 'disproved' && <DisprovedCard steps={steps} session={session} />}
                 {finished && completion === 'stubbed' && <StubCard steps={steps} session={session} />}
-                {finished && (completion === 'failed' || completion === 'max_turns') && (
-                  <FailedCard status={completion} />
-                )}
                 {finished && resultKind === 'needs_review' && <ReviewNote />}
               </Fragment>
             );
@@ -535,6 +606,16 @@ export function ChatThread({
               {reconnecting}
             </div>
           )}
+          {/* Degraded capabilities are pinned at the foot of the thread, not
+              interleaved: they describe a condition that is STILL TRUE, so they
+              belong where they stay visible rather than scrolling away like an
+              event. One row per code — a fallback reported forty times is one fact. */}
+          {degradedDiagnostics.map((d) => (
+            <DiagnosticCard key={`deg:${d.code}`} diagnostic={d} onAction={runDiagnosticAction} />
+          ))}
+          {/* The banner survives, narrowed (v2.4) to client-side action failures —
+              a fetch that didn't land, a button that failed. Everything the run
+              reports is a Diagnostic with a place to live. */}
           {error && <div className="err-banner">{error}</div>}
         </div>
       </div>
@@ -707,9 +788,11 @@ export function ChatThread({
 function SpawnGroup({
   children,
   onSelectSession,
+  diagnosticsByChild,
 }: {
   children: SessionSummary[];
   onSelectSession?: (id: string) => void;
+  diagnosticsByChild?: Map<string, Diagnostic[]>;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [stopping, setStopping] = useState<Set<string>>(new Set());
@@ -718,6 +801,11 @@ function SpawnGroup({
   // Sub-agents that could not run (API/config error, crash) → the real error message,
   // surfaced as a red "failed" child instead of hidden behind the coordinator.
   const errors = useProofSession((s) => s.subagentErrors);
+  // D4: spawned but still waiting for a concurrency slot — not yet exploring.
+  const queued = useProofSession((s) => s.subagentQueued);
+  // D3: ran, but stopped short (budget / stopped / no candidate). Distinct from
+  // `errors`, which means it never ran at all.
+  const stopNotices = useProofSession((s) => s.subagentStopNotices);
   const toggle = (id: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -739,10 +827,21 @@ function SpawnGroup({
       <div className="kids">
         {children.map((child) => {
           const error = errors[child.id];
+          const stopNotice = stopNotices[child.id];
+          const isQueued = Boolean(queued[child.id]);
+          const childDiags = diagnosticsByChild?.get(child.id) ?? [];
           // A failed child (couldn't run) is a red "failed" — surfaced, not hidden.
-          const badge = error ? { dot: 'fail', cls: 'err', text: 'failed' } : subagentBadge(child);
+          // D4: one that hasn't cleared the concurrency semaphore is 'queued', not
+          // 'exploring' — it is doing nothing at all yet.
+          const badge = error
+            ? { dot: 'fail', cls: 'err', text: 'failed' }
+            // A muted dot, not the amber 'running' one: queued means nothing is
+            // happening yet, and the pulse would say otherwise.
+            : isQueued
+            ? { dot: 'idle', cls: 'wait', text: 'queued' }
+            : subagentBadge(child);
           const isOpen = expanded.has(child.id);
-          const running = !error && badge.dot === 'run';
+          const running = !error && !isQueued && badge.dot === 'run';
           const live = progress[child.id];
           // While running, the live feed IS the preview: the current tool, else the
           // streaming narration, else the plain 'exploring…'. A failed child shows its
@@ -750,7 +849,17 @@ function SpawnGroup({
           const liveLine = running
             ? (live?.tool ? `running ${live.tool}…` : firstLine(live?.text) || 'exploring…')
             : '';
-          const preview = running ? liveLine : error ? firstLine(error) : firstLine(child.final_summary);
+          const preview = isQueued
+            ? 'waiting for a free slot…'
+            : running
+            ? liveLine
+            : error
+            ? firstLine(error)
+            // D3: a child that stopped short leads with WHY, not with a summary that
+            // makes a truncated run look like a considered conclusion.
+            : stopNotice
+            ? `Stopped — ${stopNotice}`
+            : firstLine(child.final_summary);
           return (
             <div
               className={`kid ${isOpen ? 'open' : ''} ${running ? 'running' : ''} ${error ? 'errored' : ''}`}
@@ -781,16 +890,52 @@ function SpawnGroup({
               )}
               {isOpen && (
                 <div className="kid-body">
+                  {/* What the coordinator asked for. First, and shown for a RUNNING
+                      child too — a child with no output yet is only judgeable by its
+                      task, and "was this delegated correctly?" is a question worth
+                      answering while there is still time to stop it. */}
+                  {child.task && (
+                    <div className="kid-task">
+                      <div className="kid-task-label">Delegated task</div>
+                      <pre className="kid-task-text">{child.task}</pre>
+                    </div>
+                  )}
                   {error ? (
                     <div className="kid-error">
                       <div className="kid-error-title">This sub-agent could not run</div>
                       <pre className="kid-error-msg">{error}</pre>
                     </div>
-                  ) : child.final_summary ? (
-                    <MarkdownMessage content={child.final_summary} />
                   ) : (
-                    <p className="kid-empty">This sub-agent produced no final output.</p>
+                    <>
+                      {/* D3: why it stopped, ABOVE its output — the summary of a
+                          child that ran out of budget reads like a conclusion
+                          unless you know it was cut off. */}
+                      {stopNotice && (
+                        <div className="kid-stopped">This sub-agent {stopNotice}.</div>
+                      )}
+                      {child.final_summary ? (
+                        <MarkdownMessage content={child.final_summary} />
+                      ) : isQueued ? (
+                        <p className="kid-empty">Waiting for a free slot — not started yet.</p>
+                      ) : running ? (
+                        // "produced no final output" is a verdict, and it was wrong for
+                        // a child that simply hasn't finished. An unfinished run has no
+                        // output YET; saying it produced none reads as a result.
+                        <p className="kid-empty">Still working — no output yet.</p>
+                      ) : (
+                        <p className="kid-empty">This sub-agent produced no final output.</p>
+                      )}
+                    </>
                   )}
+                  {/* Failures the child itself reported (a tool that raised inside
+                      it, a degraded capability). They are persisted against the
+                      child's own session; shown here so a failure inside a child
+                      isn't only discoverable by opening it. */}
+                  {childDiags.map((d) => (
+                    // No settings jump on a child's card: the child session is
+                    // read-only, and its failures are the coordinator's to act on.
+                    <DiagnosticCard key={`kd:${d.id ?? d.code}`} diagnostic={d} />
+                  ))}
                   <button className="kid-open" onClick={() => onSelectSession?.(child.id)}>
                     Open full session →
                   </button>
@@ -805,6 +950,76 @@ function SpawnGroup({
 }
 
 // First non-empty line of a child's final output, trimmed for the collapsed preview.
+// v2.4 · one failure, rendered where it happened.
+//
+// The shape is deliberately uniform across every severity and every source (prover,
+// adapter, sub-agent): a user learning to read one of these has learned to read all
+// of them. `title` and `remedy` come from the adapter's code catalog, so the copy is
+// not whatever an exception happened to stringify to — and `remedy` is simply absent
+// when there is no honest advice to give, rather than padded with a guess.
+const DIAGNOSTIC_LABEL: Record<string, string> = {
+  fatal: 'Run failed',
+  step_error: 'Step failed',
+  degraded: 'Reduced capability',
+  notice: 'Notice',
+};
+
+function DiagnosticCard({
+  diagnostic,
+  onAction,
+}: {
+  diagnostic: Diagnostic;
+  // One handler for every offer on the card; the card doesn't decide where an action
+  // goes, it just reports which one was pressed.
+  onAction?: (action: DiagnosticAction) => void;
+}) {
+  const { severity, title, message, detail, remedy, actions, context, code } = diagnostic;
+  const anchor = context?.path || context?.tool;
+  return (
+    <div className={`diag diag-${severity}`} data-code={code}>
+      <div className="diag-head">
+        <span className="diag-sev">{DIAGNOSTIC_LABEL[severity] ?? 'Notice'}</span>
+        <span className="diag-title">{title}</span>
+        {anchor && <span className="diag-anchor">{anchor}</span>}
+      </div>
+      {message && message !== title && <pre className="diag-msg">{message}</pre>}
+      {/* The raw exception, folded away. Present for anyone who needs it, never the
+          first thing read — `BadRequestError: litellm.BadRequestError: …{json}` is
+          noise when the provider already said "your api key is invalid". */}
+      {detail && (
+        <details className="diag-detail">
+          <summary>Technical detail</summary>
+          <pre>{detail}</pre>
+        </details>
+      )}
+      {remedy && <div className="diag-remedy">{remedy}</div>}
+      {/* Where a failure has more than one plausible cause, offer every route rather
+          than picking one — an auth rejection cannot tell a wrong key from a model
+          belonging to another provider, and guessing sends people to fix the wrong
+          thing. */}
+      {actions && actions.length > 0 && onAction && (
+        <div className="diag-actions">
+          {actions.map((a) => (
+            <button
+              key={`${a.action}:${a.focus ?? ''}`}
+              className="diag-action"
+              onClick={() => onAction(a)}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
+      )}
+      {diagnostic.persisted === false && (
+        // Honesty about our own failure: this one is on screen but was not written,
+        // so it will not survive a reload. Better to say so than to let someone
+        // trust a record that isn't there.
+        <div className="diag-unsaved">Not saved — this notice will disappear on reload.</div>
+      )}
+    </div>
+  );
+}
+
 function firstLine(text?: string | null): string {
   if (!text) return '';
   for (const line of text.split('\n')) {
@@ -924,24 +1139,6 @@ function ToolChip({ event }: { event: StatusEvent }) {
   );
 }
 
-// The "proof is done" milestone — keyed on the run's 'proved' outcome, not on a
-// message. Shows once, after the run that completed the proof.
-function ProvedCard({ steps, session }: { steps: number; session?: SessionSummary }) {
-  return (
-    <div className="final">
-      <div className="fhead">✓ Proved — 0 errors, 0 sorry</div>
-      {session && (
-        <div className="meta">
-          <span>{steps} steps</span>
-          {session.total_tokens ? <span>{formatTokens(session.total_tokens)} tokens</span> : null}
-          {session.cost_usd ? <span>${session.cost_usd.toFixed(3)}</span> : null}
-          {session.duration_seconds ? <span>{session.duration_seconds}s</span> : null}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function DefinedCard({ steps, session }: { steps: number; session?: SessionSummary }) {
   return (
     <div className="final">
@@ -994,16 +1191,6 @@ function StubCard({ steps, session }: { steps: number; session?: SessionSummary 
           {session.duration_seconds ? <span>{session.duration_seconds}s</span> : null}
         </div>
       )}
-    </div>
-  );
-}
-
-function FailedCard({ status }: { status: string }) {
-  const label =
-    status === 'max_turns' ? 'Stopped — hit the turn limit without finishing' : 'Did not complete';
-  return (
-    <div className="final bad">
-      <div className="fhead">✕ {label}</div>
     </div>
   );
 }

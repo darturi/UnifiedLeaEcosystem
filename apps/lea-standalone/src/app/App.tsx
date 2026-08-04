@@ -261,23 +261,14 @@ export default function App() {
   const resetForNewSession = () => {
     closeStream();
     setSelectedSessionId(undefined);
-    setMessages([]);
-    setCodeSteps([]);
-    setStatusEvents([]);
-    setCodeIndex(0);
-    setIsRunning(false);
-    setCurrentRunId(undefined);
-    setRunStatus(undefined);
-    setRunStatusById({});
-    setRunResultKindById({});
-    setApprovals([]);
-    setApprovalBusy(false);
-    setError(undefined);
+    // One call, not a hand-maintained list of setters. The list version silently
+    // rotted: every slice added to the store had to be remembered here too, and the
+    // ones that weren't stayed glued to the screen across "New session" — a
+    // `step_error` card from the previous session survived until a manual refresh,
+    // and the sub-agent maps had the same hole. `resetSessionScoped` is defined next
+    // to the state it clears, so adding a slice without clearing it is far harder.
+    useProofSession.getState().resetSessionScoped();
     setDraft('');
-    setEditedPath(undefined);
-    setSafeVerify(null);
-    setVerifySurface(null);
-    setGoalSurface(null);
     window.localStorage.removeItem(SELECTED_SESSION_KEY);
   };
 

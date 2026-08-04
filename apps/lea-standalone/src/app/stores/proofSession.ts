@@ -3,6 +3,7 @@ import type {
   ApprovalRecord,
   ChatMessage,
   CodeStep,
+  Diagnostic,
   RunStatus,
   SafeVerifyResult,
   StatusEvent,
@@ -60,10 +61,23 @@ interface ProofSessionState {
   editedPath?: string;
   setEditedPath: (path?: string) => void;
 
-  // Error banner shown in the chat thread (run errors, lost connection, failed
-  // actions). Cleared at the start of each session/run.
+  // Error banner shown in the chat thread. NARROWED in v2.4 to what it is actually
+  // good at: transient, client-side, action-scoped failures (a fetch that didn't
+  // land, a failed button press). Everything the RUN reports now goes to
+  // `diagnostics` instead — a single mutable string could only ever hold one
+  // failure, so a second one erased the first and a reload erased both.
   error?: string;
   setError: (error?: string) => void;
+
+  // Every failure the backend reported for this session (v2.4), live + replayed
+  // from `session_detail` on load, deduped by id. Anchored via `context` — rendered
+  // on the code card / sub-agent row / tool step it names, and in the run-level
+  // block when it names nothing. Append-only within a session: a diagnostic is
+  // history, so a later one never overwrites an earlier one.
+  diagnostics: Diagnostic[];
+  setDiagnostics: (update: Updater<Diagnostic[]>) => void;
+  /** Merge one in, ignoring a duplicate id (SSE replay after a reconnect). */
+  addDiagnostic: (diagnostic: Diagnostic) => void;
 
   // Transient reconnect notice (v2.3 item 14): set while the run EventSource is
   // backing off between reattach attempts (a dropped stream, or a 409 the browser
@@ -135,14 +149,71 @@ interface ProofSessionState {
   // of being hidden behind the coordinator's fallback narration.
   subagentErrors: Record<string, string>;
   setSubagentErrors: (update: Updater<Record<string, string>>) => void;
+
+  // D4: child session ids that are SPAWNED BUT NOT YET RUNNING. Every spawn in a
+  // turn is announced at once, but the prover queues them behind a concurrency
+  // semaphore (5) — so children beyond the cap were shown as "exploring" while
+  // actually waiting. A child is removed from here on its first real event.
+  subagentQueued: Record<string, true>;
+  setSubagentQueued: (update: Updater<Record<string, true>>) => void;
+
+  // D3: child session id -> why it stopped short (turn/cost budget, stopped, no
+  // candidate). Distinct from `subagentErrors`, which means the child never ran at
+  // all: "hit its budget" and "found nothing" call for different next moves.
+  subagentStopNotices: Record<string, string>;
+  setSubagentStopNotices: (update: Updater<Record<string, string>>) => void;
+
+  /**
+   * Clear everything scoped to ONE session, in one call.
+   *
+   * This exists because the alternative — a hand-written list of setters at each
+   * switch point — silently rots: every slice added to this store has to be
+   * remembered at every reset site, and one that isn't stays glued to the screen
+   * across a session switch. That is exactly how a `step_error` card from the
+   * previous session survived "New session" until a manual refresh.
+   *
+   * Anything session-scoped added below MUST be reset here. Non-session state (the
+   * model, the session list) deliberately survives.
+   */
+  resetSessionScoped: () => void;
 }
 
-export const useProofSession = create<ProofSessionState>((set) => ({
+/** The session-scoped slice defaults — the single definition `resetSessionScoped`
+ *  and the store's initial state both use, so they can never disagree. */
+const SESSION_SCOPED = {
   editedPath: undefined,
+  diagnostics: [] as Diagnostic[],
+  codeSteps: [] as CodeStep[],
+  messages: [] as ChatMessage[],
+  statusEvents: [] as StatusEvent[],
+  runStatusById: {} as Record<string, string>,
+  runResultKindById: {} as Record<string, string | null | undefined>,
+  approvals: [] as ApprovalRecord[],
+  subagentProgress: {} as Record<string, SubagentLive>,
+  subagentErrors: {} as Record<string, string>,
+  subagentQueued: {} as Record<string, true>,
+  subagentStopNotices: {} as Record<string, string>,
+};
+
+export const useProofSession = create<ProofSessionState>((set) => ({
+  ...SESSION_SCOPED,
   setEditedPath: (editedPath) => set({ editedPath }),
 
   error: undefined,
   setError: (error) => set({ error }),
+
+  setDiagnostics: (update) => set((s) => ({ diagnostics: apply(update, s.diagnostics) })),
+  addDiagnostic: (diagnostic) =>
+    set((s) => {
+      // A reconnect replays the broker from the client's cursor, so the same
+      // diagnostic can arrive twice. Dedupe by id; an unsaved one (no durable id)
+      // falls back to code+message+turn, which is stable for the same failure.
+      const key = (d: Diagnostic) =>
+        d.id && !d.id.startsWith('unsaved-') ? d.id : `${d.code}|${d.message}|${d.turn ?? ''}`;
+      const incoming = key(diagnostic);
+      if (s.diagnostics.some((d) => key(d) === incoming)) return s;
+      return { diagnostics: [...s.diagnostics, diagnostic] };
+    }),
 
   reconnecting: undefined,
   setReconnecting: (reconnecting) => set({ reconnecting }),
@@ -156,14 +227,11 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   goalSurface: null,
   setGoalSurface: (goalSurface) => set({ goalSurface }),
 
-  codeSteps: [],
   setCodeSteps: (codeSteps) => set({ codeSteps }),
   codeIndex: 0,
   setCodeIndex: (codeIndex) => set({ codeIndex }),
 
-  messages: [],
   setMessages: (update) => set((s) => ({ messages: apply(update, s.messages) })),
-  statusEvents: [],
   setStatusEvents: (update) => set((s) => ({ statusEvents: apply(update, s.statusEvents) })),
 
   isRunning: false,
@@ -172,21 +240,24 @@ export const useProofSession = create<ProofSessionState>((set) => ({
   setCurrentRunId: (currentRunId) => set({ currentRunId }),
   runStatus: undefined,
   setRunStatus: (runStatus) => set({ runStatus }),
-  runStatusById: {},
   setRunStatusById: (update) => set((s) => ({ runStatusById: apply(update, s.runStatusById) })),
-  runResultKindById: {},
   setRunResultKindById: (update) => set((s) => ({ runResultKindById: apply(update, s.runResultKindById) })),
 
-  approvals: [],
   setApprovals: (update) => set((s) => ({ approvals: apply(update, s.approvals) })),
   approvalBusy: false,
   setApprovalBusy: (approvalBusy) => set({ approvalBusy }),
 
-  subagentProgress: {},
   setSubagentProgress: (update) =>
     set((s) => ({ subagentProgress: apply(update, s.subagentProgress) })),
 
-  subagentErrors: {},
   setSubagentErrors: (update) =>
     set((s) => ({ subagentErrors: apply(update, s.subagentErrors) })),
+
+  setSubagentQueued: (update) =>
+    set((s) => ({ subagentQueued: apply(update, s.subagentQueued) })),
+
+  setSubagentStopNotices: (update) =>
+    set((s) => ({ subagentStopNotices: apply(update, s.subagentStopNotices) })),
+
+  resetSessionScoped: () => set({ ...SESSION_SCOPED }),
 }));

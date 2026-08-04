@@ -3,6 +3,7 @@ import {
   getSession,
   type ChatMessage,
   type CodeStep,
+  type Diagnostic,
   type PendingApproval,
   type RunStatus,
   type SessionDetail,
@@ -97,12 +98,11 @@ export function useProofStream() {
       setSafeVerify,
       setVerifySurface,
       setGoalSurface,
-      setSubagentProgress,
-      setSubagentErrors,
     } = useProofSession.getState();
-    // Fresh session context → drop any sub-agent live/error state from the previous one.
-    setSubagentProgress({});
-    setSubagentErrors({});
+    // Fresh session context → drop EVERYTHING scoped to the previous session, through
+    // the same one call "New session" uses. Clearing a hand-picked subset here is what
+    // let stale state leak across a switch; every field is re-set from `detail` below.
+    useProofSession.getState().resetSessionScoped();
     useSessions.getState().setSelectedSessionId(detail.id);
     setMessages(detail.messages);
     setCodeSteps(detail.code_steps);
@@ -119,6 +119,11 @@ export function useProofStream() {
       ...detail.code_steps.map((c) => c.seq ?? 0),
     );
     setError(undefined);
+    // G1: replay this session's persisted failures. `setDiagnostics` (not merge) —
+    // the DB is authoritative on load, and a live diagnostic that arrives after
+    // this is added by `addDiagnostic`, which dedupes by id. This is what makes a
+    // reloaded thread show the same failures, in the same places, as the live one.
+    useProofSession.getState().setDiagnostics(detail.diagnostics || []);
     const active = detail.active_run;
     setCurrentRunId(active?.id);
     setIsRunning(Boolean(active));
@@ -197,7 +202,18 @@ export function useProofStream() {
       setError('Lost connection to the Lea backend.');
       return;
     }
-    setReconnecting(`Reconnecting to the live run… (attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS})`);
+    // B3: a browser EventSource cannot read an HTTP status, so the adapter's honest
+    // capacity 409 ("Lea is at capacity, try again shortly") reaches us as a bare
+    // `onerror` — indistinguishable from a dropped connection. But the run row tells
+    // us which it is: a run still `pending` was never admitted, so it is queued for a
+    // slot, not disconnected. Saying "Reconnecting…" for a queue wait is a wrong
+    // explanation of a working system, which is worse than a vague one.
+    const queued = useProofSession.getState().runStatus === 'pending';
+    setReconnecting(
+      queued
+        ? `Waiting for a free run slot… (attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS})`
+        : `Reconnecting to the live run… (attempt ${attempt}/${RECONNECT_MAX_ATTEMPTS})`,
+    );
     reconnectTimerRef.current = setTimeout(() => {
       reconnectTimerRef.current = null;
       getSession(sessionId)
@@ -350,12 +366,26 @@ export function useProofStream() {
       setApprovalBusy(false);
     });
 
-    source.addEventListener('subagent_started', () => {
+    source.addEventListener('subagent_started', (event) => {
       // D1: a child sub-agent was just spawned and the adapter has persisted it as a
       // RUNNING child session (a running run row → derived status 'running'). Refresh so
       // it lands in the store: the sidebar's Sub-agents block and the parent thread's
       // spawn node render it live as 'exploring…' instead of nothing until it finishes.
       // Same session-list-is-the-source-of-truth path as subagent_finished.
+      const data = (event as MessageEvent).data;
+      if (data) {
+        try {
+          // D4: spawned ⇒ queued until its own first event proves it is running.
+          const p = JSON.parse(data) as { child_id?: string; state?: string };
+          if (p.child_id && p.state === 'queued') {
+            useProofSession.getState().setSubagentQueued(
+              (prev) => ({ ...prev, [p.child_id as string]: true }),
+            );
+          }
+        } catch {
+          /* ignore a malformed payload — the refresh below still runs */
+        }
+      }
       useSessions.getState().refreshSessions().catch(() => {});
     });
 
@@ -395,11 +425,21 @@ export function useProofStream() {
       const data = (event as MessageEvent).data;
       if (data) {
         try {
-          const p = JSON.parse(data) as { child_id?: string; error?: string | null };
+          const p = JSON.parse(data) as {
+            child_id?: string; error?: string | null; stop_notice?: string | null;
+          };
           const childId = p.child_id;
           if (childId) {
             useProofSession.getState().setSubagentProgress((prev) => {
               if (!(childId in prev)) return prev;
+              const next = { ...prev };
+              delete next[childId];
+              return next;
+            });
+            // D4: finished ⇒ definitively not queued (covers a child that was
+            // stopped or failed while still waiting for a slot).
+            useProofSession.getState().setSubagentQueued((prev) => {
+              if (!prev[childId]) return prev;
               const next = { ...prev };
               delete next[childId];
               return next;
@@ -409,6 +449,14 @@ export function useProofStream() {
             if (p.error) {
               useProofSession.getState().setSubagentErrors((prev) => ({ ...prev, [childId]: p.error as string }));
             }
+            // D3: it DID run but stopped short (budget, stopped, no candidate).
+            // Not a failure, so not `subagentErrors` — but not the clean finish it
+            // used to render as either.
+            if (p.stop_notice) {
+              useProofSession.getState().setSubagentStopNotices(
+                (prev) => ({ ...prev, [childId]: p.stop_notice as string }),
+              );
+            }
           }
         } catch {
           /* ignore a malformed payload — the refresh below still runs */
@@ -417,11 +465,43 @@ export function useProofStream() {
       useSessions.getState().refreshSessions().catch(() => {});
     });
 
-    source.addEventListener('run_error', (event) => {
+    // v2.4: every backend failure arrives here — anchored, coded, and already
+    // persisted server-side, so this listener only has to merge it in.
+    source.addEventListener('diagnostic', (event) => {
       const data = (event as MessageEvent).data;
       if (!data) return;
-      const payload = JSON.parse(data) as { message?: string };
-      setError(payload.message || 'Lea reported an error.');
+      try {
+        const payload = JSON.parse(data) as Diagnostic;
+        if (typeof payload.seq === 'number') {
+          lastSeqRef.current = Math.max(lastSeqRef.current, payload.seq);
+        }
+        useProofSession.getState().addDiagnostic(payload);
+      } catch {
+        /* a malformed diagnostic must not take down the stream */
+      }
+    });
+
+    // `run_error` still rides the wire for the Overleaf companion, which parses it
+    // as a run's failure reason. In THIS client it is now redundant: the same
+    // failure arrives as a fatal `diagnostic` with a code, a remedy, and an anchor.
+    // Handling both would render every crash twice.
+
+    // D4: a spawned child cleared the concurrency semaphore and actually started.
+    // Until this arrives the child is queued, not running.
+    source.addEventListener('subagent_running', (event) => {
+      const data = (event as MessageEvent).data;
+      if (!data) return;
+      try {
+        const { child_id } = JSON.parse(data) as { child_id: string };
+        useProofSession.getState().setSubagentQueued((prev) => {
+          if (!prev[child_id]) return prev;
+          const next = { ...prev };
+          delete next[child_id];
+          return next;
+        });
+      } catch {
+        /* ignore a malformed payload */
+      }
     });
 
     source.addEventListener('done', (event) => {
