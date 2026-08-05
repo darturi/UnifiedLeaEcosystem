@@ -261,6 +261,31 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /missing stub/);
 });
 
+test("settings open over the Lean pane and closing them preserves the pane", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.countSelector(".ol-lean-settings-popover"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+
+  harness.clickButtonLabel("Close Lea popover");
+  assert.equal(harness.countSelector(".ol-lean-settings-popover"), 0);
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+});
+
 test("GitHub import refreshes a Share panel that was opened before the project existed", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -421,6 +446,64 @@ test("GitHub import closes after confirmation and locks matched theorems while c
     harness.fetchCalls.some((call) => call.url.includes("/project/github-import/status")),
     "the background tracker should poll independently of the closed dialog"
   );
+});
+
+test("GitHub push uses a Lea confirmation dialog instead of the browser confirm", async () => {
+  const remoteUrl = "https://github.com/example/formalizations";
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      shareStatus: { ok: true, exists: true, remoteUrl, tokenConfigured: true }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Share");
+  await flushPromises();
+
+  harness.clickButtonText("Push to GitHub");
+  await flushPromises();
+
+  assert.deepEqual(harness.githubPushDialog(), {
+    role: "dialog",
+    modal: "true",
+    label: "ol-lean-github-push-title"
+  });
+  assert.match(harness.bodyText(), /Push project\?/);
+  assert.match(harness.bodyText(), /Repositoryhttps:\/\/github\.com\/example\/formalizations/);
+  assert.match(harness.bodyText(), /Branchmain/);
+  assert.equal(harness.confirmCalls.length, 0);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github/push")).length,
+    0,
+    "opening the dialog must not start a push"
+  );
+
+  harness.clickButtonText("Cancel");
+  await flushPromises();
+  assert.equal(harness.githubPushDialog(), null);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github/push")).length,
+    0,
+    "canceling the dialog must not start a push"
+  );
+
+  harness.clickButtonText("Push to GitHub");
+  await flushPromises();
+  harness.clickButtonRole("confirm-push");
+  await flushPromises();
+
+  assert.equal(harness.githubPushDialog(), null);
+  assert.equal(harness.confirmCalls.length, 0);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github/push")).length,
+    1
+  );
+  assert.match(harness.bodyText(), /Pushed to https:\/\/github\.com\/example\/formalizations\./);
 });
 
 test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
@@ -2266,6 +2349,11 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(button, `expected a button labeled "${text}"`);
       button.click();
     },
+    clickButtonRole(role) {
+      const button = document.body.querySelector(`[data-role='${role}']`);
+      assert.ok(button, `expected a button with role "${role}"`);
+      button.click();
+    },
     editTextarea() {
       return document.body.querySelector(".ol-lean-project-edit-textarea");
     },
@@ -2288,6 +2376,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     projectIdentityDialog() {
       const dialog = document.body.querySelector(".ol-lean-project-identity-dialog");
+      return dialog ? {
+        role: dialog.attributes.role,
+        modal: dialog.attributes["aria-modal"],
+        label: dialog.attributes["aria-labelledby"]
+      } : null;
+    },
+    githubPushDialog() {
+      const dialog = document.body.querySelector(".ol-lean-github-push-dialog");
       return dialog ? {
         role: dialog.attributes.role,
         modal: dialog.attributes["aria-modal"],
@@ -2624,6 +2720,34 @@ class FakeElement {
       confirm.dataset.role = "confirm";
       confirm.textContent = "Add Lean files";
       confirm.hidden = true;
+      return;
+    }
+    if (html.includes("Extension Settings")) {
+      const close = this.appendChild(new FakeElement("button"));
+      close.dataset.role = "close";
+      close.setAttribute("aria-label", "Close Lea popover");
+      const status = this.appendChild(new FakeElement("p"));
+      status.className = "ol-lean-popover-status";
+      const model = this.appendChild(new FakeElement("div"));
+      model.dataset.role = "model";
+      const maxTurns = this.appendChild(new FakeElement("input"));
+      maxTurns.dataset.role = "max-turns";
+      const maxSpend = this.appendChild(new FakeElement("input"));
+      maxSpend.dataset.role = "max-spend";
+      const texMirror = this.appendChild(new FakeElement("input"));
+      texMirror.dataset.role = "tex-mirror";
+      const save = this.appendChild(new FakeElement("button"));
+      save.dataset.role = "save-settings";
+      const githubToggle = this.appendChild(new FakeElement("button"));
+      githubToggle.dataset.role = "github-token-toggle";
+      const githubClear = this.appendChild(new FakeElement("button"));
+      githubClear.dataset.role = "github-token-clear";
+      const githubInput = this.appendChild(new FakeElement("input"));
+      githubInput.dataset.role = "github-token-input";
+      const githubSave = this.appendChild(new FakeElement("button"));
+      githubSave.dataset.role = "github-token-save";
+      const editProjectName = this.appendChild(new FakeElement("button"));
+      editProjectName.dataset.role = "edit-project-name";
       return;
     }
     if (html.includes("ol-lean-popover-title")) {

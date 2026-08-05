@@ -103,6 +103,9 @@
   let leanPaneSharePanel = null;
   let leanPaneShareState = null;
   let leanPaneShareBusy = false;
+  // GitHub pushes use a Lea-owned confirmation surface. Browser-native confirm
+  // dialogs cannot inherit the extension's typography, spacing, or theme.
+  let githubPushDialogState = null;
   // Project identity editing stays inside Lea's visual language instead of
   // falling through to the browser's unstyleable prompt/confirm pair. The
   // dialog owns its async namespace preview so stale responses cannot repaint
@@ -245,6 +248,10 @@
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (githubPushDialogState) {
+      closeGithubPushConfirmation();
+      return;
+    }
     if (projectIdentityDialog) {
       closeProjectIdentityEditor();
       return;
@@ -451,6 +458,7 @@
   }
 
   function closeLeanPane() {
+    closeGithubPushConfirmation({ restoreFocus: false });
     if (projectIdentityEditorState?.source === "lean-pane") {
       closeProjectIdentityEditor({ restoreFocus: false });
     }
@@ -679,8 +687,8 @@
     panel.querySelector("[data-role='share-save']").addEventListener("click", () => {
       saveShareRemote().catch((error) => setShareStatus(errorText(error)));
     });
-    panel.querySelector("[data-role='share-push']").addEventListener("click", () => {
-      pushShareRemote().catch((error) => setShareStatus(errorText(error)));
+    panel.querySelector("[data-role='share-push']").addEventListener("click", (event) => {
+      pushShareRemote(event.currentTarget).catch((error) => setShareStatus(errorText(error)));
     });
     const exportButton = panel.querySelector("[data-role='share-export']");
     exportButton?.addEventListener("click", () => {
@@ -791,12 +799,157 @@
     }
   }
 
-  async function pushShareRemote() {
+  function closeGithubPushConfirmation({ confirmed = false, restoreFocus = true } = {}) {
+    const state = githubPushDialogState;
+    if (!state) return;
+    githubPushDialogState = null;
+    state.shell.remove();
+    if (restoreFocus && state.trigger?.isConnected) {
+      state.trigger.focus({ preventScroll: true });
+    }
+    state.resolve(Boolean(confirmed));
+  }
+
+  function requestGithubPushConfirmation(remote, trigger = null) {
+    closeGithubPushConfirmation({ restoreFocus: false });
+    return new Promise((resolve) => {
+      const shell = createProjectIdentityElement(
+        "div",
+        "ol-lean-project-identity-backdrop ol-lean-github-push-backdrop"
+      );
+      const dialog = createProjectIdentityElement(
+        "section",
+        "ol-lean-project-identity-dialog ol-lean-github-push-dialog"
+      );
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-labelledby", "ol-lean-github-push-title");
+      dialog.setAttribute("aria-describedby", "ol-lean-github-push-description");
+
+      const header = createProjectIdentityElement(
+        "header",
+        "ol-lean-project-identity-header ol-lean-github-push-header"
+      );
+      const mark = createProjectIdentityElement(
+        "span",
+        "ol-lean-project-identity-mark ol-lean-github-push-mark",
+        "↗"
+      );
+      mark.setAttribute("aria-hidden", "true");
+      const heading = createProjectIdentityElement("div", "ol-lean-project-identity-heading");
+      heading.appendChild(createProjectIdentityElement(
+        "p",
+        "ol-lean-project-identity-kicker",
+        "GitHub repository"
+      ));
+      const title = createProjectIdentityElement("h2", "", "Push project?");
+      title.id = "ol-lean-github-push-title";
+      const description = createProjectIdentityElement(
+        "p",
+        "ol-lean-project-identity-description",
+        "Review the destination before sending this Lea project's commits."
+      );
+      description.id = "ol-lean-github-push-description";
+      heading.appendChild(title);
+      heading.appendChild(description);
+      const close = createProjectIdentityElement(
+        "button",
+        "ol-lean-icon-button ol-lean-project-identity-close",
+        "×"
+      );
+      close.type = "button";
+      close.setAttribute("aria-label", "Close GitHub push confirmation");
+      header.appendChild(mark);
+      header.appendChild(heading);
+      header.appendChild(close);
+
+      const content = createProjectIdentityElement("div", "ol-lean-github-push-content");
+      const review = createProjectIdentityElement("section", "ol-lean-github-push-review");
+      review.setAttribute("aria-label", "GitHub push destination");
+      review.appendChild(createProjectIdentityElement(
+        "p",
+        "ol-lean-project-identity-preview-title",
+        "Destination"
+      ));
+
+      const remoteRow = createProjectIdentityElement("div", "ol-lean-github-push-review-row");
+      remoteRow.appendChild(createProjectIdentityElement("span", "", "Repository"));
+      remoteRow.appendChild(createProjectIdentityElement("code", "", remote));
+      review.appendChild(remoteRow);
+
+      const branchRow = createProjectIdentityElement("div", "ol-lean-github-push-review-row");
+      branchRow.appendChild(createProjectIdentityElement("span", "", "Branch"));
+      branchRow.appendChild(createProjectIdentityElement("code", "", "main"));
+      review.appendChild(branchRow);
+      content.appendChild(review);
+
+      const note = createProjectIdentityElement(
+        "p",
+        "ol-lean-github-push-note",
+        "Lea will update the remote main branch with its committed proof files. If the repository has newer commits, the push will stop so you can reconcile them first."
+      );
+      content.appendChild(note);
+
+      const actions = createProjectIdentityElement(
+        "footer",
+        "ol-lean-project-identity-actions ol-lean-github-push-actions"
+      );
+      const cancel = createProjectIdentityElement("button", "ol-lean-secondary-button", "Cancel");
+      cancel.type = "button";
+      const confirm = createProjectIdentityElement(
+        "button",
+        "ol-lean-primary-button ol-lean-github-push-confirm",
+        "Push to GitHub"
+      );
+      confirm.type = "button";
+      confirm.dataset.role = "confirm-push";
+      actions.appendChild(cancel);
+      actions.appendChild(confirm);
+      content.appendChild(actions);
+
+      dialog.appendChild(header);
+      dialog.appendChild(content);
+      shell.appendChild(dialog);
+      document.body.appendChild(shell);
+      githubPushDialogState = { shell, dialog, trigger, resolve };
+
+      const cancelPush = () => closeGithubPushConfirmation();
+      close.addEventListener("click", cancelPush);
+      cancel.addEventListener("click", cancelPush);
+      confirm.addEventListener("click", () => {
+        closeGithubPushConfirmation({ confirmed: true });
+      });
+      shell.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (event.target === shell) cancelPush();
+      });
+      dialog.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          cancelPush();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = [close, cancel, confirm].filter((element) => !element.disabled && !element.hidden);
+        const index = focusable.indexOf(document.activeElement);
+        if (event.shiftKey && index <= 0) {
+          event.preventDefault();
+          focusable[focusable.length - 1].focus();
+        } else if (!event.shiftKey && index === focusable.length - 1) {
+          event.preventDefault();
+          focusable[0].focus();
+        }
+      });
+      confirm.focus({ preventScroll: true });
+    });
+  }
+
+  async function pushShareRemote(trigger = null) {
     const remote = leanPaneShareState?.remoteUrl;
     if (!remote) return;
-    if (!window.confirm(`Push this project to ${remote}?\n\nThis pushes the Lea project's commits to the repo's main branch.`)) {
-      return;
-    }
+    const confirmed = await requestGithubPushConfirmation(remote, trigger);
+    if (!confirmed) return;
     const projectId = extractOverleafProjectId();
     const baseUrl = await chatCompanionBaseUrl();
     leanPaneShareBusy = true;

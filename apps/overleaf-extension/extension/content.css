@@ -287,7 +287,8 @@
   position: fixed;
   right: 20px;
   bottom: 20px;
-  z-index: 2147483646;
+  /* Keep settings reachable while the full-height Lean pane is open. */
+  z-index: 2147483647;
   display: grid;
   place-items: center;
   width: 38px;
@@ -845,6 +846,93 @@ body.ol-lean-pane-resizing {
 }
 
 .ol-lean-project-identity-save {
+  min-width: 142px !important;
+}
+
+/* Push confirmation deliberately shares the project-identity dialog shell so
+   both sensitive project operations feel like one Lea workflow. */
+.ol-lean-github-push-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.ol-lean-github-push-mark {
+  font-family: var(--ol-sans);
+  font-size: 18px;
+}
+
+.ol-lean-github-push-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+}
+
+.ol-lean-github-push-review {
+  padding: 12px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-github-push-review .ol-lean-project-identity-preview-title {
+  margin: 0 0 11px;
+}
+
+.ol-lean-github-push-review-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  color: var(--ol-muted);
+  font-size: 11px;
+}
+
+.ol-lean-github-push-review-row code {
+  justify-self: end;
+  max-width: 100%;
+  padding: 3px 7px;
+  overflow: hidden;
+  border-radius: 6px;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  font: 500 11px/1.35 var(--ol-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ol-lean-github-push-note {
+  position: relative;
+  margin: 0;
+  padding: 0 2px 0 17px;
+  color: var(--ol-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ol-lean-github-push-note::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--ol-accent);
+}
+
+.ol-lean-github-push-actions {
+  padding-top: 0;
+}
+
+.ol-lean-github-push-actions .ol-lean-primary-button,
+.ol-lean-github-push-actions .ol-lean-secondary-button {
+  flex: 0 0 auto;
+  min-width: 110px;
+  padding: 0 13px;
+}
+
+.ol-lean-github-push-confirm {
   min-width: 142px !important;
 }
 
