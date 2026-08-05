@@ -21,6 +21,7 @@ from .events import (
     AssistantTextDelta,
     CheckResult,
     Compacted,
+    Diagnostic,
     Error,
     FileChanged,
     Finished,
@@ -56,6 +57,7 @@ __all__ = [
     "CheckResult",
     "VerifyResult",
     "Error",
+    "Diagnostic",
     "SubagentStarted",
     "SubagentProgress",
     "SubagentFinished",
@@ -152,19 +154,28 @@ def verify(path: str) -> VerifyResult:
     sv_root = workspace / ".sv_scratch"
     sv_root.mkdir(parents=True, exist_ok=True)
     stem = p.stem or "proof"
-    # Reproduce the submission's namespace so the target's declaration shares the
-    # submission's fully-qualified name (e.g. `Lea.Misc.div_6`). Without this the
-    # target declares a root-level `div_6`, which SafeVerify can't find in the
-    # namespaced submission and rejects a valid proof.
-    ns_open, ns_close = safeverify.namespace_context(code)
+    # Only TRUSTED direct imports go into the target. `import Mathlib` used to be
+    # hardcoded here, and because SafeVerify requires the submission's transitive
+    # imports to cover the target's closure, that made every targeted submission
+    # unverifiable. An untrusted module must also never establish the meaning of a
+    # name in the target's signatures — the target is the part we trust.
     import_prelude = safeverify.trusted_target_import_prelude(code)
 
     with tempfile.TemporaryDirectory(dir=sv_root, prefix=f"{stem}_") as td:
         scratch = Path(td)
         target = scratch / f"{stem}_sv_target.lean"
         submission = scratch / f"{stem}_sv_submission.lean"
+        # The two halves of the target, composed (merge of two independent fixes):
+        #   * a TRUSTED import prelude (above), not the submission's own imports and
+        #     not the Mathlib barrel;
+        #   * the WHOLE file with every theorem/lemma body `sorry`-ed and its `def`s
+        #     kept — a bare signature target lost the file's own definitions and
+        #     failed to compile for any project file, and audited only the LAST
+        #     theorem where SafeVerify happily checks them all in one pass.
+        # The namespace and fully-qualified names travel with the file, so no separate
+        # namespace reconstruction is needed.
         target.write_text(
-            import_prelude + "\n" + ns_open + signature + " := by\n  sorry\n" + ns_close
+            import_prelude + "\n" + safeverify.sorry_target(code, imports=False)
         )
         submission.write_text(code if code.endswith("\n") else code + "\n")
         try:

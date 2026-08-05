@@ -86,6 +86,9 @@ export interface SessionSummary {
   // A child's final output (its last agent message) — populated only for children, so
   // the coordinator's spawn box can show a collapsed preview with expand/collapse.
   final_summary?: string | null;
+  /** Child sessions only: the task the coordinator delegated, recorded at spawn — so a
+   *  RUNNING child is judgeable (it has no summary yet, and its title is three words). */
+  task?: string | null;
 }
 
 // ── Projects (v2.1) ───────────────────────────────────────────────────────────
@@ -417,9 +420,72 @@ export interface ActiveRun {
   focus_source_hash?: string | null;
 }
 
+/**
+ * A failure surfaced to the human (v2.4). The one shape for every error channel:
+ * streamed live as a `diagnostic` SSE, persisted on the timeline so it survives a
+ * reload, and returned in a `warnings: Diagnostic[]` array by request/response
+ * endpoints that can't stream (the graph, a rename, an upload, the model catalog).
+ *
+ * `severity` picks the SURFACE, not just the color:
+ *   fatal      — the run ended here; shown as the run's outcome
+ *   step_error — one step failed, run continued; renders on that step
+ *   degraded   — a capability is reduced and STILL IS; a persistent indicator
+ *   notice     — something silently didn't apply
+ *
+ * `context` is what anchors it. A diagnostic naming a `path`/`step_id` renders on
+ * that code card, one naming a `child_id` on that sub-agent row, one naming a
+ * `tool` on that tool step. With no anchor it falls back to the run-level block —
+ * never dropped, which is what the old single `error` string did to every failure
+ * after the first.
+ */
+export type DiagnosticSeverity = 'fatal' | 'step_error' | 'degraded' | 'notice';
+
+/** An offer rendered as a button on a diagnostic card. A remedy tells you what to do;
+ *  an action takes you there. */
+export interface DiagnosticAction {
+  label: string;
+  action: 'open-settings';
+  focus?: 'api-keys' | 'model' | string;
+}
+
+export interface Diagnostic {
+  id?: string;
+  session_id?: string;
+  run_id?: string | null;
+  severity: DiagnosticSeverity;
+  code: string;
+  title: string;
+  message: string;
+  /** The raw exception, when a friendlier provider message is leading. Shown
+   *  collapsed — kept so nothing is hidden, demoted so it isn't read first. */
+  detail?: string | null;
+  remedy?: string | null;
+  actions?: DiagnosticAction[];
+  source?: string;
+  turn?: number | null;
+  seq?: number;
+  created_at?: string;
+  /** False when the row could not be written — shown, but not durable. */
+  persisted?: boolean;
+  context: {
+    turn?: number | null;
+    tool?: string;
+    path?: string;
+    step_id?: string;
+    child_id?: string;
+    child_result_id?: string;
+    approval_id?: string;
+    project_id?: string;
+    project_slug?: string;
+    [key: string]: unknown;
+  };
+}
+
 export interface SessionDetail extends SessionSummary {
   messages: ChatMessage[];
   code_steps: CodeStep[];
+  /** Persisted failures for this session, in timeline order (G1). */
+  diagnostics?: Diagnostic[];
   status_events: StatusEvent[];
   approval_events: ApprovalEvent[];
   usage_breakdown: UsageBreakdownRow[];

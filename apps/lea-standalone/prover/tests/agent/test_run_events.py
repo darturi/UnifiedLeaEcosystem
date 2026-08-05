@@ -132,6 +132,17 @@ def install_final_gate_fake(*, check_outputs, final_texts=None):
     return calls, proof_path
 
 
+def _res(path: str) -> str:
+    """The resolved form of a path, which is what the loop now records.
+
+    `_meaning_events` and `ProofVerificationState` report the path the TOOL resolved,
+    not the string the model typed — without that, a relative name crossing into the
+    adapter resolved against a different directory and a sub-agent's compiling proof
+    was silently dropped. On macOS a tempdir's `/var/...` normalises to
+    `/private/var/...`, so these comparisons have to resolve too."""
+    return str(Path(path).resolve())
+
+
 def install_final_gate_repair_fake():
     calls = {"n": 0, "messages": [], "checks": [], "tmpdir": tempfile.TemporaryDirectory()}
     proof_path = str(Path(calls["tmpdir"].name) / "Repair.lean")
@@ -395,7 +406,7 @@ def test_final_gate_failed_check_resumes_loop():
     events = list(agent.run_events(cfg(max_turns=4), msgs("prove it")))
     fin = events[-1]
     check("failed final gate eventually completes", isinstance(fin, Finished) and fin.reason == "completed")
-    check("final gate checked before and after repair", calls["checks"] == [proof_path, proof_path])
+    check("final gate checked before and after repair", calls["checks"] == [_res(proof_path), _res(proof_path)])
     check("failed gate resumed the model loop", calls["n"] == 4)
     saw_failure_prompt = any(
         isinstance(message.get("content"), str)
@@ -411,6 +422,7 @@ def test_no_proof_artifact_resumes_loop():
     events = list(agent.run_events(cfg(max_turns=3), msgs("prove it")))
     fin = events[-1]
     check("no-artifact run eventually completes", isinstance(fin, Finished) and fin.reason == "completed")
+    # model-invoked → the stub sees the raw args path
     check("no-artifact recovery used lean_check", calls["checks"] == [proof_path])
     check("no-artifact recovery resumed the model loop", calls["n"] == 3)
     saw_no_artifact_prompt = any(
@@ -434,7 +446,7 @@ def test_failed_final_gate_respects_max_turns():
     # The gate loop stops at max_turns (2 model turns); then exactly ONE tool-less summary
     # turn runs on the max_turns branch (item: summarize-on-cap). No runaway beyond that.
     check("gate loop stops at max_turns, plus one summary turn", calls["n"] == 3)
-    check("failed final gate checked once with max_turns", calls["checks"] == [proof_path])
+    check("failed final gate checked once with max_turns", calls["checks"] == [_res(proof_path)])
 
 
 def test_final_gate_success_allows_completion():
@@ -442,7 +454,7 @@ def test_final_gate_success_allows_completion():
     events = list(agent.run_events(cfg(), msgs("prove it")))
     fin = events[-1]
     check("passing final gate completes", isinstance(fin, Finished) and fin.reason == "completed")
-    check("passing final gate checked latest proof", calls["checks"] == [proof_path])
+    check("passing final gate checked latest proof", calls["checks"] == [_res(proof_path)])
 
 
 def test_successful_explicit_check_skips_duplicate_final_gate():
@@ -450,6 +462,7 @@ def test_successful_explicit_check_skips_duplicate_final_gate():
     events = list(agent.run_events(cfg(), msgs("prove it")))
     fin = events[-1]
     check("explicit check completes", isinstance(fin, Finished) and fin.reason == "completed")
+    # model-invoked only; the gate must NOT add a second check
     check("explicit successful check not duplicated", calls["checks"] == [proof_path])
 
 
@@ -458,7 +471,9 @@ def test_edit_after_successful_check_rechecks_final_gate():
     events = list(agent.run_events(cfg(), msgs("prove it")))
     fin = events[-1]
     check("edit after check completes", isinstance(fin, Finished) and fin.reason == "completed")
-    check("edit after check rechecked", calls["checks"] == [proof_path, proof_path])
+    # the model checked (raw path), then edited, so the gate re-checks — and the gate
+    # passes `latest_proof_path`, which is resolved.
+    check("edit after check rechecked", calls["checks"] == [proof_path, _res(proof_path)])
 
 
 def install_result_classifier_fake(classifier_text):

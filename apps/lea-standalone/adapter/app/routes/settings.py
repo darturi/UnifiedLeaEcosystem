@@ -36,8 +36,15 @@ def get_settings() -> dict:
 
 @router.get("/api/models")
 def models() -> dict:
-    """Full LiteLLM chat-model catalog for the searchable model picker."""
-    return {"models": settings_service.model_catalog()}
+    """Full LiteLLM chat-model catalog for the searchable model picker.
+
+    `warnings` (F3) is non-empty when this is the curated FALLBACK list rather than
+    the live catalog — so the picker can say so instead of presenting a handful of
+    models as the whole world."""
+    return {
+        "models": settings_service.model_catalog(),
+        "warnings": settings_service.model_catalog_warnings(),
+    }
 
 
 @router.get("/api/models/requirements")

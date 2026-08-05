@@ -46,6 +46,7 @@ from lea.interface import (
     AssistantTextDelta,
     CheckResult,
     Compacted,
+    Diagnostic,
     Error,
     FileChanged,
     Finished,
@@ -65,6 +66,7 @@ from lea.interface import (
 
 from .artifacts import classify_lean_artifact, declaration_present, extract_declaration_name
 from .config import LeaConfig, configured_provider_keys, load_config
+from .diagnostics import analyze_exception, resolve as resolve_diagnostic
 from .gitstore import GitStore, GitStoreError
 from . import collation, formalizations as formalization_service, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
 
@@ -76,16 +78,25 @@ _CREDENTIAL_LIKE = re.compile(
 )
 
 
-def _public_error_detail(exc: Exception) -> str:
-    """A useful persisted/provider error with credentials removed and bounded size."""
-    detail = f"{type(exc).__name__}: {exc}"
+def _redact(text: str) -> str:
+    """Strip configured provider keys and credential-shaped strings from `text`.
+
+    Split out of `_public_error_detail` so every user-facing path can reuse it — a
+    diagnostic is persisted AND rendered, so it needs the same treatment as the run's
+    stored error. Providers quote the credential back at you: the live DeepSeek
+    failure read "Your api key: ... is invalid"."""
     try:
         for secret in configured_provider_keys().values():
             if len(secret) >= 8:
-                detail = detail.replace(secret, "[redacted]")
+                text = text.replace(secret, "[redacted]")
     except Exception:  # noqa: BLE001 — redaction is best-effort on an error path
         pass
-    return _CREDENTIAL_LIKE.sub("[redacted]", detail)[:2000]
+    return _CREDENTIAL_LIKE.sub("[redacted]", text)[:2000]
+
+
+def _public_error_detail(exc: Exception) -> str:
+    """A useful persisted/provider error with credentials removed and bounded size."""
+    return _redact(f"{type(exc).__name__}: {exc}")
 
 # Admission — which run may start and whether there's room — lives in
 # `runregistry` (v2.3 items 9/10): one lock, an atomic check-that-is-the-claim.
@@ -320,6 +331,16 @@ def publish_terminal_from_row(run_id: str) -> None:
 # hook (A8); the adapter owns the policy + the human relay.
 GATED_TOOLS = {"bash", "write_file", "edit_file"}
 _APPROVAL_DECISIONS = {"allow", "deny", "always_session"}
+# E1: not a decision the human can send — the run synthesizes it when a Stop arrives
+# while a gate is pending. The tool still does not run (same safe outcome as a deny),
+# but the model is told the call was CANCELLED rather than declined, and the human is
+# told their Stop is what ended it. Previously both facts were lost: the decision fell
+# through to "deny", so the agent narrated its way around a refusal the user never
+# made, and nothing said the Stop had done anything at all.
+_APPROVAL_CANCELLED = "cancelled"
+
+# A run parked on an unanswered approval holds a bounded concurrency slot; after this
+# it falls through to the safe `deny` so queued work can proceed.
 APPROVAL_DECISION_TIMEOUT_SECONDS = 900
 
 _session_allowlists: dict[str, set[str]] = {}
@@ -378,12 +399,14 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
         "tool_name": ev.tool_name, "args": ev.args,
     })
     pending = _pending_approvals[run_id]
+    cancelled = False
     # A run parked forever on an unanswered approval consumes one bounded
     # concurrency slot indefinitely. Time out to the safe `deny` so queued work
     # can continue even if its original observer disappeared.
     waited = 0.0
     while not pending["event"].wait(timeout=0.5):
         if stop_event.is_set():
+            cancelled = True
             break
         waited += 0.5
         if waited >= APPROVAL_DECISION_TIMEOUT_SECONDS:
@@ -391,7 +414,13 @@ def _await_decision(run_id, session_id, ev, events, stop_event) -> str:
     _pending_approvals.pop(run_id, None)
 
     decision = pending["decision"]
-    if decision not in _APPROVAL_DECISIONS:
+    if cancelled and decision is None:
+        # E1: the Stop ended the wait, not the human's judgement of this tool call.
+        decision = _APPROVAL_CANCELLED
+        diagnose(events, session_id, run_id, "notice", "approval.cancelled",
+                 f"Stop cancelled the pending approval for {ev.tool_name}.",
+                 tool=ev.tool_name, approval_id=approval_id)
+    elif decision not in _APPROVAL_DECISIONS:
         decision = "deny"
     if decision == "always_session":
         _session_allowlists.setdefault(session_id, set()).add(ev.tool_name)
@@ -422,6 +451,56 @@ class RunnerContext:
 def emit(events: "runbroker.RunBroker | Queue[dict[str, Any]]",
          event_type: str, payload: dict[str, Any]) -> None:
     events.put({"type": event_type, "payload": payload})
+
+
+def diagnose(
+    events,
+    session_id: str,
+    run_id: str | None,
+    severity: str,
+    code: str,
+    message: str,
+    *,
+    turn: int | None = None,
+    source: str = "adapter",
+    remedy: str | None = None,
+    title: str | None = None,
+    detail: str | None = None,
+    actions: list[dict] | None = None,
+    **context,
+) -> dict:
+    """Persist one diagnostic and stream it (v2.4, A2) — the single way a failure
+    reaches the human.
+
+    Store-then-emit, with the SAME payload on both sides, so a reload can't disagree
+    with what was on screen (the invariant the code rows already hold, and the one
+    the old client-side error string broke by construction).
+
+    A failure to STORE a diagnostic must never suppress it: the persistence is a
+    bonus, the visibility is the point. So a store error is logged and the diagnostic
+    is streamed anyway, marked as unsaved.
+    """
+    payload = resolve_diagnostic(
+        severity, code, message, source=source, remedy=remedy,
+        title=title, detail=detail, actions=actions,
+        context={**context, "turn": turn},
+    )
+    row: dict
+    try:
+        row = store.add_diagnostic(session_id, run_id, payload, turn=turn)
+    except Exception:  # noqa: BLE001 — see docstring: never swallow the diagnostic
+        logger.exception("Could not persist diagnostic %s for run %s", code, run_id)
+        row = {
+            **payload,
+            "id": f"unsaved-{uuid4().hex[:8]}",
+            "session_id": session_id,
+            "run_id": run_id,
+            "turn": turn,
+            "persisted": False,
+            "created_at": store.utc_now(),
+        }
+    emit(events, "diagnostic", row)
+    return row
 
 
 # How long a run may hold streamed text before publishing it, and the largest single
@@ -581,16 +660,22 @@ def _final_text_for_result(ev: Finished) -> str:
     return f"{prefix}\n\n{text}".strip()
 
 
-def _read_after(path: str) -> str:
-    """The file's contents after a write. Unreadable (deleted, binary, races with a
-    later write) yields "" rather than raising: a code step whose content we failed
-    to capture is still a step that happened, and the schema records that honestly
-    via `content_lost` rather than losing the row."""
+def _read_after(path: str) -> str | None:
+    """The file's contents after a write, or **None** if it could not be read
+    (deleted, binary, or racing a later write).
+
+    C2: this used to return `""` on failure, and every caller stored that as the
+    file's contents — so an unreadable file was recorded, and rendered on the canvas,
+    as a file the agent had written empty. That is a confident false claim about
+    proof content. `None` forces each caller to say what it actually knows: the code
+    path sets `content_lost` (the flag the schema has carried since 0003 and nothing
+    ever set), and the divergence path declines to diff rather than reporting the
+    whole file as deleted by the human."""
     try:
         return Path(path).read_text()
     except (OSError, UnicodeDecodeError):
         logger.debug("Could not read after-state of %s", path, exc_info=True)
-        return ""
+        return None
 
 
 def _classify(code: str) -> str | None:
@@ -633,6 +718,11 @@ def _divergence_context(
     repo = gs.init_session(repo_key)
     before = agent_step.get("code") or ""
     after = _read_after(str(repo / path))
+    if after is None:
+        # Unreadable now. Previously this compared against `""` and produced a diff
+        # showing the entire proof deleted — telling the agent the human had wiped
+        # its work. Not knowing the current bytes is not evidence of an edit.
+        return None
     if before == after:
         return None
     diff = "".join(
@@ -894,7 +984,7 @@ class _UsageByTurn:
         return [self._rows[k] for k in sorted(self._rows)]
 
 
-def _with_subagents(cfg: LeaConfig) -> LeaConfig:
+def _with_subagents(cfg: LeaConfig) -> tuple[LeaConfig, str | None]:
     """Return `cfg` with `spawn_subagent` added to the coordinator's toolset (item 24).
 
     `spawn_subagent` is registered `opt_in=True` in the prover, so an unfiltered toolset
@@ -909,11 +999,29 @@ def _with_subagents(cfg: LeaConfig) -> LeaConfig:
     # config so the prover's `_child_config` merges them over each role's YAML defaults at
     # spawn — model / max_turns / max_cost / system_prompt / tools, retuned without touching
     # the vendored profile. Best-effort: a missing/corrupt overrides file → no overrides.
+    # F2: a malformed overrides file used to revert every child to its vendored
+    # defaults silently. The user configured those models, turn caps, and prompts on
+    # the Sub-agents page and had no way to know none of it applied. Returned to the
+    # caller (this helper has no event channel) so run_lea can report it.
+    # `load_overrides_checked` — NOT `load_overrides`, which handles its own failure and
+    # returns {}, so a `try` around it catches nothing and this diagnostic could never
+    # fire. The reason travels back as a value because that is the only way it survives.
     try:
-        overrides = subagent_overrides.load_overrides()
-    except Exception:
-        overrides = {}
-    return replace(cfg, tools=[*default_tools, "spawn_subagent"], subagent_overrides=overrides)
+        overrides, override_error = subagent_overrides.load_overrides_checked()
+    except Exception as exc:  # noqa: BLE001 — a bad overrides file must not fail the run
+        logger.exception("Could not load sub-agent overrides")
+        overrides, override_error = {}, f"{type(exc).__name__}: {exc}"
+    if override_error:
+        logger.warning("Sub-agent overrides did not load: %s", override_error)
+    # Also give the coordinator `safe_verify` (opt-in in the prover registry) so it can run
+    # a kernel-level anti-cheat audit on a finished proof before declaring it done — the
+    # coordinator delegates proving, then verifies the assembled result. Read-only, so it's
+    # not gated, and harmless if a child inherits it via the ⊆-parent tool composition.
+    return (
+        replace(cfg, tools=[*default_tools, "spawn_subagent", "safe_verify"],
+                subagent_overrides=overrides),
+        override_error,
+    )
 
 
 def _text_from_content(content: Any) -> str:
@@ -978,6 +1086,15 @@ def _start_subagent(
     )
     child_run = store.create_run(child["id"], cfg.model, None, cfg.max_turns, project_id=project_id)
     store.update_run(child_run["id"], "running")
+    # Record the delegated task as the child's first message NOW, not when it finishes.
+    # The child's transcript only replays on SubagentFinished, so until then its session
+    # was completely empty: you could watch a child work for minutes with no way to see
+    # what it had been asked to do — and therefore no way to judge whether the
+    # coordinator had delegated the right thing while there was still time to stop it.
+    # It is the same text the transcript will carry, so `_populate_subagent` skips the
+    # leading user message on this path rather than storing it twice.
+    if (ev.task or "").strip():
+        store.add_message(child["id"], "user", ev.task.strip())
     return child, child_run["id"]
 
 
@@ -1078,6 +1195,54 @@ def _subagent_error(ev: SubagentFinished) -> str | None:
     return msg or "The sub-agent failed before returning a result."
 
 
+# D3: a child's terminal reason, for the reasons that are NOT an outright failure but
+# are also not a clean finish. `_subagent_error` covers 'error' (the child never ran);
+# these are children that ran and stopped short — and until now they rendered as a
+# child that finished fine and happened to produce nothing. "Stopped: turn budget" and
+# "explored and found nothing" call for completely different next moves by the user.
+_SUBAGENT_STOP_NOTICES = {
+    "max_turns": (
+        "hit its turn or cost budget before finishing",
+        "Raise this role's max turns or max cost on the Sub-agents page, or narrow the "
+        "task you delegate to it.",
+    ),
+    "interrupted": ("was stopped before finishing", None),
+}
+
+# The 'assistant' terminal reason means the child's last turn was prose rather than a
+# verified proof. That is NOT the same as "it produced nothing" — and saying so was
+# wrong in the worst way: a child reported "ended without producing a candidate"
+# directly above its own message describing the candidate it had just compiled cleanly.
+#
+# Two corrections. First, consult the RESULT: a child that handed back a candidate gets
+# no notice at all. Second, when there is no candidate, describe what we RECORDED, not
+# what the child did — "no candidate was recorded" is checkable; "it produced none" is
+# a claim about someone else's work that we cannot actually make, and which was false
+# here (the child wrote its proof outside its scratch dir, so the envelope lost it).
+_NO_CANDIDATE_NOTICE = (
+    "finished without a candidate being recorded — its own notes may still describe one",
+    "Open the sub-agent to read what it did. If it reports a proof that was not "
+    "captured, it wrote outside its scratch directory and the result could not be "
+    "collected.",
+)
+
+
+def _subagent_stop_notice(ev: SubagentFinished) -> tuple[str, str | None] | None:
+    """`(description, remedy)` when a child stopped short, else None.
+
+    Never contradicts the envelope: a child that returned a candidate is not described
+    as having produced nothing, whatever its terminal reason."""
+    produced_candidate = bool(ev.candidate_path)
+    if ev.stop_reason == "assistant":
+        # Ending on prose is unremarkable when it delivered something.
+        return None if produced_candidate else _NO_CANDIDATE_NOTICE
+    notice = _SUBAGENT_STOP_NOTICES.get(ev.stop_reason)
+    if notice and not produced_candidate and ev.stop_reason == "max_turns":
+        # Both facts matter: it ran out of budget AND came back empty-handed.
+        return (f"{notice[0]}, and no candidate was recorded", notice[1])
+    return notice
+
+
 def _populate_subagent(
     child_id: str,
     child_run_id: str | None,
@@ -1085,6 +1250,7 @@ def _populate_subagent(
     *,
     turn: int,
     repo: Path,
+    task_already_recorded: bool = False,
 ) -> None:
     """Fill a child session with the finished run's transcript + candidate (item 24).
 
@@ -1093,7 +1259,13 @@ def _populate_subagent(
     scratch dir under the run's working tree — is stored as a code_step, so the child's
     *derived* status IS its lean_check verdict. The child transcript is NOT written onto
     the parent's timeline (it is the child's, not a coordinator code_step)."""
-    for msg in ev.transcript or []:
+    pending = list(ev.transcript or [])
+    # The delegated task is the transcript's FIRST user message. When the spawn path
+    # already stored it (so a running child was readable), drop it here — otherwise the
+    # child's thread opens with the same prompt twice.
+    if task_already_recorded and pending and pending[0].get("role") == "user":
+        pending = pending[1:]
+    for msg in pending:
         text = _text_from_content(msg.get("content"))
         if text.strip():
             role = "user" if msg.get("role") == "user" else "assistant"
@@ -1130,7 +1302,9 @@ def _finalize_started_subagent(
 ) -> None:
     """D1 finish path: fill in a child created by `_start_subagent` and RETIRE its run
     row so its derived status flips from 'running' to the candidate's verdict."""
-    _populate_subagent(child_id, child_run_id, ev, turn=turn, repo=repo)
+    # This path always went through `_start_subagent`, which recorded the delegated task.
+    _populate_subagent(child_id, child_run_id, ev, turn=turn, repo=repo,
+                       task_already_recorded=True)
     store.update_run(child_run_id, "error" if ev.stop_reason == "error" else "completed")
 
 
@@ -1264,7 +1438,14 @@ def _try_promote(
     previous = _snapshot_file(canonical)
     try:
         collation.promote(winner, canonical)
-    except ValueError:
+    except ValueError as exc:
+        # D2: this was a bare `return None` with no log at all, so a promotion that
+        # could not even be attempted was indistinguishable from "no child produced
+        # anything" — two very different facts for the user's next move.
+        diagnose(events, session_id, run_id, "step_error", "subagent.promotion_failed",
+                 f"The winning sub-agent candidate ({winner.result_id}) could not be "
+                 f"written to {canonical.name}: {exc}",
+                 turn=turn, child_result_id=winner.result_id)
         return None
     # Re-verify at the NEW path — the child checked a different location. Deliberately
     # AT the canonical path rather than at a temp one: Lake resolves modules by
@@ -1273,12 +1454,23 @@ def _try_promote(
     # for C3 is restore-on-failure rather than verify-then-move.
     verdict = _lean_check_file(str(canonical))
     if verdict.status != "ok":
+        # D1: the re-verification is CORRECT and stays — recording an unchecked "ok"
+        # would be worse. But it was a `logger.warning`, so the human watched N
+        # children run for minutes and was shown: no proof, no promotion, no reason.
+        # Restore first (C3), then report: the file on disk and the explanation of
+        # what happened to it are two halves of the same recovery.
         _restore_file(canonical, previous)
         logger.warning(
             "sub-agent candidate %s did not re-verify at %s (%s); not promoting "
             "(restored the previous file)",
             winner.result_id, canonical, verdict.detail,
         )
+        diagnose(events, session_id, run_id, "step_error", "subagent.promotion_rejected",
+                 f"The best sub-agent candidate ({winner.result_id}) compiled in its own "
+                 f"scratch directory but not at {canonical.name}: "
+                 f"{verdict.detail or 'lean_check reported errors'}",
+                 turn=turn, path=_relativize(str(canonical), repo),
+                 child_result_id=winner.result_id)
         return None
     # SafeVerify gate (AUDIT-2026-07-24 C5). `collation` documents that a
     # SafeVerify-REJECTED candidate must never become the proof of record — "promoting
@@ -1353,6 +1545,9 @@ def run_lea(context: RunnerContext) -> None:
     """
     events = context.events
     cfg = context.config
+    # F2: set when the Sub-agents page's overrides could not be read, so the run can
+    # report it once it has begun (reporting needs the run row to exist).
+    subagent_override_error: str | None = None
     if context.autonomous:
         # Autonomous (D19): swap the interactive collaborator prompt for the
         # `default` autoformalizer so the run never pauses to present a plan and
@@ -1367,7 +1562,7 @@ def run_lea(context: RunnerContext) -> None:
         # spawn_subagent, named explicitly. The model decides when to spawn; children
         # can't recurse (prover depth + toolset guards). Autonomous/Overleaf runs stay
         # single-agent for now.
-        cfg = _with_subagents(cfg)
+        cfg, subagent_override_error = _with_subagents(cfg)
     session_id = context.session_id
     run_id = context.run_id
 
@@ -1416,6 +1611,10 @@ def run_lea(context: RunnerContext) -> None:
     # candidate is promoted to fill the gap (item 25).
     produced_clean = False
     last_persisted: str | None = None
+    # Declared before the try so the crash handler can reference it even when setup
+    # threw before the session's repo was resolved (a NameError inside the `except`
+    # would replace the real failure with a spurious one).
+    repo: Path | None = None
     # Declared before the try so the finally's `done` event always has them, even if
     # setup throws before the run reaches its Finished handler.
     final_status = "failed"
@@ -1525,7 +1724,8 @@ def run_lea(context: RunnerContext) -> None:
                 cfg = replace(cfg, skills=skill_paths)
         # Claim the row (C7). If the interrupt endpoint got here first the row is no
         # longer pending, and starting anyway would execute — and bill — a run the
-        # client was already told was cancelled.
+        # client was already told was cancelled. This replaces the plain
+        # `update_run(running)`: the claim IS the transition.
         if not store.claim_pending_run(run_id):
             current = store.get_run(run_id)
             final_status = (current or {}).get("status") or "cancelled"
@@ -1534,6 +1734,12 @@ def run_lea(context: RunnerContext) -> None:
             logger.info("Run %s was finalized before it started (%s); not running it",
                         run_id, final_status)
             return
+        if subagent_override_error:
+            # F2: reported AFTER the claim — a diagnostic needs a live run row to hang
+            # off, and a run cancelled before it started has nothing to report against.
+            diagnose(events, session_id, run_id, "degraded", "settings.overrides_unreadable",
+                     f"Your sub-agent overrides could not be read ({subagent_override_error}); "
+                     "every sub-agent in this run used its built-in defaults.")
         # Multi-turn (D16): replay the session's prior conversation so a follow-up
         # continues with full context — the prover is stateless, so the adapter
         # feeds it the faithful transcript (tool_call/tool_result parts intact) of
@@ -1629,9 +1835,11 @@ def run_lea(context: RunnerContext) -> None:
                 # the streamed snapshot the same bytes by construction, rather than
                 # two derivations of it that can disagree (the old path committed to
                 # git, then asked git what it had committed).
+                after = _read_after(ev.path)
                 step = store.add_code_step(
-                    session_id, run_id, rel, content=_read_after(ev.path),
+                    session_id, run_id, rel, content=(after or ""),
                     author="agent", turn=current_turn, summary=last_intent,
+                    content_lost=after is None,
                     formalization_id=formalization_id,
                 )
                 if formalization_id:
@@ -1640,6 +1848,13 @@ def run_lea(context: RunnerContext) -> None:
                     )
                 step_id_by_path[rel] = step["id"]
                 emit(events, "code_step", step)  # already carries `code`
+                if after is None:
+                    # C2: the write happened but we could not capture what was
+                    # written. Say so — the canvas would otherwise show an empty file
+                    # with no indication that it is missing rather than empty.
+                    diagnose(events, session_id, run_id, "step_error", "code.content_lost",
+                             f"Lea wrote {rel}, but the file could not be read back to store it.",
+                             turn=current_turn, path=rel, step_id=step["id"])
 
             elif isinstance(ev, CheckResult):
                 rel = _relativize(ev.path, repo)
@@ -1654,11 +1869,13 @@ def run_lea(context: RunnerContext) -> None:
                     # nowhere to go and was dropped. Record the check against the
                     # file's current content instead: a verdict with no step is a
                     # result the user never sees.
+                    after = _read_after(ev.path)
                     step = store.add_code_step(
-                        session_id, run_id, rel, content=_read_after(ev.path),
+                        session_id, run_id, rel, content=(after or ""),
                         author="agent", turn=current_turn, summary=last_intent,
                         check_status=ev.status, check_detail=ev.detail,
-                        artifact_kind=_classify(_read_after(ev.path)) if ev.status == "ok" else None,
+                        artifact_kind=(_classify(after) if (ev.status == "ok" and after is not None) else None),
+                        content_lost=after is None,
                         formalization_id=formalization_id,
                     )
                     if formalization_id:
@@ -1666,6 +1883,10 @@ def run_lea(context: RunnerContext) -> None:
                             formalization_id, rel, "generated"
                         )
                     step_id_by_path[rel] = step["id"]
+                    if after is None:
+                        diagnose(events, session_id, run_id, "step_error", "code.content_lost",
+                                 f"lean_check ran on {rel}, but the file could not be read back to store it.",
+                                 turn=current_turn, path=rel, step_id=step["id"])
                     if ev.status == "ok":
                         checked_artifact_kind = step.get("artifact_kind")
                         if "scratch" not in rel.lower():
@@ -1760,6 +1981,14 @@ def run_lea(context: RunnerContext) -> None:
                 )
                 subagent_children[ev.result_id] = {
                     "child_id": child["id"], "run_id": child_run_id, "title": child["title"],
+                    # D4: every spawn in a turn is announced here, but the prover then
+                    # queues them behind a semaphore (DEFAULT_MAX_CONCURRENT_CHILDREN,
+                    # 5) — so children 6+ were displayed as "running" while actually
+                    # waiting for a slot. A child that has emitted no event of its own
+                    # has provably not started; its first SubagentProgress flips this.
+                    # Deriving it from real events rather than mirroring the prover's
+                    # cap means the two can't drift if that cap changes.
+                    "started": False,
                 }
                 # E1 first-class child run: give the child run its OWN broker, keyed by its
                 # run_id. The child's session view attaches to /api/runs/<child_run_id>/events
@@ -1778,6 +2007,11 @@ def run_lea(context: RunnerContext) -> None:
                     "role": ev.subagent_type,
                     "turn": current_turn,
                     "title": child["title"],
+                    # D4: spawned, not yet executing. Flipped by `subagent_running`.
+                    "state": "queued",
+                    # What the coordinator actually asked for, live — the spawn box can
+                    # show it immediately instead of a three-word title.
+                    "task": ev.task or "",
                 })
 
             elif isinstance(ev, SubagentProgress):
@@ -1788,6 +2022,33 @@ def run_lea(context: RunnerContext) -> None:
                 # progress for a child we never saw start (defensive).
                 started = subagent_children.get(ev.result_id)
                 if started:
+                    # D4: first event from this child ⇒ it cleared the concurrency
+                    # semaphore and is genuinely running now.
+                    if not started.get("started"):
+                        started["started"] = True
+                        emit(events, "subagent_running", {
+                            "child_id": started["child_id"],
+                            "result_id": ev.result_id,
+                            "run_id": run_id,
+                        })
+                    # A child's own diagnostic belongs to the CHILD's session — that is
+                    # where its transcript lives and where someone debugging it will
+                    # look. Persisted there, and mirrored onto the coordinator's stream
+                    # so a failure inside a child isn't only discoverable by opening it.
+                    if isinstance(ev.event, Diagnostic):
+                        _c = dict(ev.event.context or {})
+                        _c.pop("turn", None)
+                        _c["child_id"] = started["child_id"]
+                        _c["child_result_id"] = ev.result_id
+                        _row = diagnose(
+                            events, started["child_id"], started["run_id"],
+                            ev.event.severity, ev.event.code, ev.event.message,
+                            source=ev.event.source, remedy=ev.event.remedy, **_c,
+                        )
+                        child_broker = runbroker.get(started["run_id"])
+                        if child_broker is not None:
+                            emit(child_broker, "diagnostic", _row)
+                        continue
                     # (a) the coordinator's spawn box (a compact live line per child)
                     payload = _subagent_progress_payload(started["child_id"], ev.result_id, ev.event)
                     if payload:
@@ -1834,6 +2095,16 @@ def run_lea(context: RunnerContext) -> None:
                         repo=repo,
                     )
                     child_id, child_title = child["id"], child["title"]
+                # D3: a child that ran but stopped short (turn/cost budget, stopped by
+                # the user, ended without a candidate). Not an error — but not the
+                # clean finish the UI used to render it as either.
+                _stop = _subagent_stop_notice(ev)
+                if _stop:
+                    _desc, _remedy = _stop
+                    diagnose(events, session_id, run_id, "notice", "subagent.stopped_early",
+                             f"Sub-agent '{ev.subagent_type}' {_desc}.",
+                             turn=current_turn, remedy=_remedy,
+                             child_id=child_id, child_result_id=ev.result_id)
                 emit(events, "subagent_finished", {
                     "child_id": child_id,
                     "parent_id": session_id,
@@ -1846,6 +2117,10 @@ def run_lea(context: RunnerContext) -> None:
                     "check_status": ev.check_status,
                     "check_detail": ev.check_detail,
                     "stop_reason": ev.stop_reason,
+                    # D3: the human reading of `stop_reason` for a child that stopped
+                    # short, so the child row can say so without the frontend
+                    # re-deriving it. None for a clean completion or an outright error.
+                    "stop_notice": (_stop[0] if _stop else None),
                     "summary": ev.summary,
                     "candidate_path": ev.candidate_path,
                     # The failure to surface (E1): non-null when the child could not run at
@@ -1853,8 +2128,26 @@ def run_lea(context: RunnerContext) -> None:
                     "error": _subagent_error(ev),
                 })
 
+            elif isinstance(ev, Diagnostic):
+                # A2: the prover reported a human-facing failure (a tool that raised,
+                # a degraded capability). Its `context` already names the anchor —
+                # tool, path, turn — so the UI renders it on that step rather than in
+                # a banner. `turn` from the event's own context wins over the
+                # adapter's counter: a diagnostic from a concurrent E3 worker knows
+                # which turn it belongs to better than the loop does.
+                _ctx = dict(ev.context or {})
+                _turn = _ctx.pop("turn", None)
+                _step = step_id_by_path.get(_relativize(_ctx["path"], repo)) if _ctx.get("path") else None
+                if _ctx.get("path"):
+                    _ctx["path"] = _relativize(_ctx["path"], repo)
+                diagnose(events, session_id, run_id, ev.severity, ev.code, ev.message,
+                         turn=_turn if _turn is not None else current_turn,
+                         source=ev.source, remedy=ev.remedy, step_id=_step, **_ctx)
+
             elif isinstance(ev, Error):
                 emit(events, "run_error", {"message": ev.message})
+                diagnose(events, session_id, run_id, "fatal", "run.crashed", ev.message,
+                         turn=current_turn, source="prover")
 
             elif isinstance(ev, Finished):
                 flush_narration()
@@ -1914,8 +2207,48 @@ def run_lea(context: RunnerContext) -> None:
     except Exception as exc:  # noqa: BLE001 — surface any failure as an error event, never hang the stream
         logger.exception("Lea run %s failed", run_id)
         flush_narration()
+        # C3/B1: this handler has always had `current_turn`, `last_tool` and
+        # `step_id_by_path` in scope and used none of them — it emitted the bare
+        # exception, so the user got `AuthenticationError: ...` with no indication of
+        # what the run was doing or what to do about it. Classify it into a coded
+        # diagnostic (the catalog supplies the remedy) and anchor it.
+        #
+        # REDACTED, not raw. Provider errors quote the credential back at you — the
+        # live DeepSeek failure read "Your api key: ... is invalid" — and a diagnostic
+        # is persisted to the database and rendered in the UI, so classifying off the
+        # raw exception would have leaked the key into both.
         error_detail = _public_error_detail(exc)
+        # Whether a key is SAVED for this model's provider. It separates "you never
+        # added a key" from "the key you added was rejected" — two different mistakes
+        # that look identical in the exception. `None` when we can't tell, so the
+        # message doesn't claim either: a key may also come from the environment,
+        # which `configured_provider_keys` deliberately cannot see.
+        key_configured: bool | None = None
+        try:
+            from . import settings as settings_service
+
+            requirements = settings_service.model_requirements(cfg.model)
+            required = requirements.get("required_keys") or []
+            if required:
+                key_configured = any(k.get("configured") for k in required)
+        except Exception:  # noqa: BLE001 — never let the explainer break the report
+            logger.debug("Could not resolve key requirements for %s", cfg.model, exc_info=True)
+        analysis = analyze_exception(exc, model=cfg.model, key_configured=key_configured)
+        # The classification reads the raw exception, but nothing user-facing may carry
+        # it: re-redact whatever the analysis extracted from the provider's message.
+        analysis["message"] = _redact(analysis["message"])
+        if analysis.get("detail"):
+            analysis["detail"] = _redact(analysis["detail"])
+        # `run_error` stays for the Overleaf companion, which parses this frame as the
+        # failure reason (companion/leaApiClient.mjs). The diagnostic is the UI's.
         emit(events, "run_error", {"message": error_detail})
+        _crash_path = _relativize(last_write_path, repo) if (last_write_path and repo) else None
+        diagnose(events, session_id, run_id, "fatal", analysis["code"], analysis["message"],
+                 turn=current_turn or None, remedy=analysis["remedy"], tool=last_tool,
+                 title=analysis["title"], detail=analysis["detail"],
+                 actions=analysis["actions"], model=cfg.model,
+                 path=_crash_path,
+                 step_id=step_id_by_path.get(_crash_path) if _crash_path else None)
         # Never downgrade a run that already reached a terminal status (C6). The
         # Finished handler persists the outcome before doing anything else, so a
         # failure after that point is a bookkeeping problem, not a failed proof —

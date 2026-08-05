@@ -113,12 +113,57 @@ def test_context_isolation_across_threads() -> None:
     check("a peer thread never sees this thread's working_dir", other_saw == [None])
 
 
+def test_write_and_check_agree_on_what_a_relative_path_means():
+    """The bug that silently discarded a correct proof.
+
+    `write_file` resolved relative paths against `current_working_dir()`; `lean_check`
+    and `read_file` resolved them against the PROCESS cwd. So a sub-agent that wrote
+    `candidate.lean` into its scratch dir and then checked `candidate.lean` was told
+    the file did not exist — pointing at the adapter's own directory. Observed live:
+    the child recovered with an absolute path, but its result envelope came back empty
+    and a compiling proof was never collected.
+
+    The tools must agree. Asserted through the real handlers, not by reimplementing
+    the resolution rule here — a test that recomputes the logic it is checking would
+    have passed against the bug.
+    """
+    import tempfile
+    from lea import tools
+
+    with tempfile.TemporaryDirectory() as d:
+        wd = str(Path(d).resolve())
+        with run_context(working_dir=wd):
+            # Deliberately no umbrella `import Mathlib`: that is refused by the
+            # targeted-import policy, and this test is about PATH RESOLUTION — a
+            # fixture that trips an unrelated rule would fail for the wrong reason.
+            body = "theorem t : True := by trivial\n"
+            tools.write_file("candidate.lean", body)
+            # Where the write actually landed...
+            written = Path(wd) / "candidate.lean"
+            check("write_file resolved against the working dir", written.exists())
+            # ...is where a relative read/check must look.
+            check("read_file finds the file the write just made",
+                  "theorem t" in tools.read_file("candidate.lean"))
+            # lean_check needs a toolchain to compile, but the resolution step happens
+            # first: the old code failed here with "does not exist" before ever
+            # reaching Lean, which is the failure this pins.
+            out = tools.lean_check("candidate.lean")
+            check("lean_check no longer reports the file missing",
+                  "does not exist" not in out)
+
+    # Outside an activation nothing changes — the CLI, eval and interface.check()
+    # resolve against the process cwd exactly as before.
+    missing = tools.read_file("almost-certainly-not-here-9e3f.lean")
+    check("no run context → unchanged behaviour", "does not exist" in missing)
+
+
 def main() -> None:
     print("Run-context + bash cwd tests (item 8):")
     test_defaults_are_none_outside_any_context()
     test_context_sets_and_resets()
     test_bash_runs_in_the_contexts_working_dir_concurrently()
     test_context_isolation_across_threads()
+    test_write_and_check_agree_on_what_a_relative_path_means()
     print()
     if _FAILURES:
         print(f"FAILED ({len(_FAILURES)}): {', '.join(_FAILURES)}")

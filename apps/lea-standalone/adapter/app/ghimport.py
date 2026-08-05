@@ -22,6 +22,7 @@ repos and scrubbed from any error — public repos need none.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .gitstore import _inject_token, _scrub
+
+logger = logging.getLogger("lea-interface.ghimport")
 
 # Guards (D56): a shallow clone shouldn't hang or drag in a giant file.
 CLONE_TIMEOUT_SECONDS = 60
@@ -238,5 +241,9 @@ def _head_sha(dest: Path) -> str | None:
             capture_output=True, text=True, timeout=10,
         )
     except subprocess.SubprocessError:
+        # F1: the import still succeeded — this is only the provenance sha recorded
+        # against it. Logged rather than silently None so "imported from an unknown
+        # commit" is diagnosable instead of looking like it was never recorded.
+        logger.warning("Could not read HEAD sha of %s", dest, exc_info=True)
         return None
     return proc.stdout.strip() or None if proc.returncode == 0 else None

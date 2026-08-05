@@ -15,13 +15,17 @@ from pathlib import Path
 
 from .config import LeaConfig
 from . import condenser
+from . import diagnostics
 from .runctx import run_context
 from .prompt import compose_role_prompt, domain_cascade_hint, load_system_prompt
 from .providers import stream, TextDelta, ToolCall, Done, _ToolMeta, Usage
 from . import safeverify
 from . import subagents  # subagent-result collector (item 22); also registers spawn_subagent via tools
 from . import tools as _tools  # noqa: F401 — importing registers the built-in tools
-from .tools import _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok
+from .tools import (
+    _lean_check_has_error, _lean_check_has_sorry, _first_error_line, _tool_result_ok,
+    _run_relative_path,
+)
 from .registry import build_toolset, import_tool_modules, pop_scope, push_scope
 from .events import (
     TurnStarted,
@@ -31,6 +35,7 @@ from .events import (
     ToolApprovalRequested,
     FileChanged,
     CheckResult,
+    Diagnostic,
     UsageUpdated,
     Compacted,
     SubagentStarted,
@@ -340,9 +345,21 @@ def _meaning_events(tool_name: str, args: dict, result: str) -> list:
     Scope (A2): FileChanged (on .lean writes) + CheckResult (on lean_check).
     VerifyResult arrives with the verify capability (A6); Error with the bridge.
     """
-    path = args.get("path")
-    if not isinstance(path, str) or not path:
+    raw = args.get("path")
+    if not isinstance(raw, str) or not raw:
         return []
+    # Report the path the tool ACTUALLY used, not the string the model typed. These
+    # events cross a boundary: the adapter reads the file back from `FileChanged`, and
+    # a subagent's candidate is collated from `CheckResult.path` — both of which run
+    # elsewhere, where a bare "candidate.lean" resolves against the process cwd (the
+    # adapter's own directory) and finds nothing.
+    #
+    # That is exactly how a compiling sub-agent proof was silently discarded: the child
+    # wrote and checked `candidate.lean` correctly inside its scratch dir, but the event
+    # carried the unresolved name, `_relativize` could not place it under the parent's
+    # working dir, and the adapter looked for it in the session root. No candidate, no
+    # code step, no error — just a child that appeared to have produced nothing.
+    path = str(_run_relative_path(raw))
     if tool_name in {"write_file", "edit_file"}:
         if path.endswith(".lean") and _tool_result_ok(result):
             return [FileChanged(path)]
@@ -365,9 +382,16 @@ class ProofVerificationState:
         self.latest_check_passed: bool | None = None
 
     def note_tool_result(self, tool_name: str, args: dict, result: str) -> None:
-        path = args.get("path")
-        if not isinstance(path, str) or not path:
+        raw = args.get("path")
+        if not isinstance(raw, str) or not raw:
             return
+        # Resolved, for the same reason `_meaning_events` resolves: `latest_proof_path`
+        # is later fed back to `lean_check` by the final gate and to
+        # `_theorem_signature`, and the `path == self.latest_proof_path` comparison
+        # below silently fails when the model writes `candidate.lean` and then checks
+        # `./candidate.lean` — two spellings of one file, so a checked proof reads as
+        # an unchecked write.
+        path = str(_run_relative_path(raw))
         if tool_name in {"write_file", "edit_file"}:
             if _tool_result_ok(result) and path.endswith(".lean"):
                 self.latest_proof_path = path
@@ -565,12 +589,17 @@ def run_events(
             # records here, the inner loop drains into SubagentFinished events. Scoped so
             # results can't leak across runs; a child opens its own empty scope.
             results_token = subagents.begin_results_scope()
+            # v2.4: the same scoping for human-facing diagnostics — any tool can
+            # `diagnostics.report(...)` and the loop drains it into Diagnostic events.
+            # Per-activation so a child's degraded-capability notices are its own.
+            diag_token = diagnostics.begin_scope()
             try:
                 yield from _run_events_inner(
                     config, messages, namespace=namespace, session_id=session_id,
                     working_dir=working_dir, should_stop=should_stop, gate=gate,
                 )
             finally:
+                diagnostics.end_scope(diag_token)
                 subagents.end_results_scope(results_token)
     finally:
         if mcp_manager is not None:
@@ -836,12 +865,28 @@ def _run_events_inner(
                         result = handler(check_args)
                     except Exception as e:
                         result = f"Error: tool 'lean_check' raised {type(e).__name__}: {e}"
+                        diagnostics.report(
+                            "step_error", "tool.raised",
+                            f"The final verification check failed to run: {type(e).__name__}: {e}",
+                            tool="lean_check", turn=turn, path=check_path,
+                        )
                 else:
                     result = "Error: unknown tool 'lean_check'"
+                    diagnostics.report(
+                        "step_error", "tool.unknown",
+                        "The final verification check could not run: lean_check is not "
+                        "in this run's toolset.",
+                        tool="lean_check", turn=turn, path=check_path,
+                    )
                 preview = result[:200] + "..." if len(result) > 200 else result
                 yield ToolResulted("lean_check", result, preview)
                 for ev in _meaning_events("lean_check", check_args, result):
                     yield ev
+                # The final gate runs AFTER Phase 4's drain, so anything it reported
+                # would otherwise sit in the collector until the next turn — and on the
+                # last turn, be dropped entirely.
+                for diag in diagnostics.drain():
+                    yield diag
                 proof_state.note_tool_result("lean_check", check_args, result)
 
                 tool_result = {"type": "tool_result", "tool_name": "lean_check", "content": result}
@@ -889,15 +934,35 @@ def _run_events_inner(
 
         def _exec_tool(tc):
             """Run one NON-spawn tool and return its result string. Pure (no yields), so
-            it can run inline or on an E3 worker thread."""
+            it can run inline or on an E3 worker thread.
+
+            C1: a failure is reported on BOTH channels. The returned string is what the
+            MODEL reads (it needs it to recover) — but that string is invisible to the
+            human, who saw only a "Running <tool>" chip while the agent quietly worked
+            around a broken tool. `diagnostics.report` is the human's copy; the loop
+            drains it in Phase 4. Reporting (not yielding) is what lets this stay a
+            plain function callable from an E3 worker thread."""
             handler = tool_handlers.get(tc["name"])
             if handler:
                 try:
                     r = handler(tc["args"])
                 except Exception as e:  # noqa: BLE001 — a tool error is a result, not a crash
                     r = f"Error: tool '{tc['name']}' raised {type(e).__name__}: {e}"
+                    diagnostics.report(
+                        "step_error", "tool.raised",
+                        f"{tc['name']} failed: {type(e).__name__}: {e}",
+                        tool=tc["name"], turn=turn, path=(tc.get("args") or {}).get("path"),
+                    )
             else:
                 r = f"Error: unknown tool '{tc['name']}'"
+                # A toolset misconfiguration (a profile naming a tool that isn't
+                # registered, an MCP server that didn't come up). Today this failed
+                # completely silently — the model saw the string and moved on.
+                diagnostics.report(
+                    "step_error", "tool.unknown",
+                    f"The model called '{tc['name']}', which is not a registered tool.",
+                    tool=tc["name"], turn=turn,
+                )
             # Item 26: on a model-invoked lean_check, append the domain-scoped tactic
             # cascade for the mathematics in the checked file — once per domain per run.
             if tc["name"] == "lean_check":
@@ -913,6 +978,15 @@ def _run_events_inner(
         results_by_idx: dict[int, str] = {}
         spawn_specs = []      # (idx, tc, plan) — approved spawns with a real plan
         serial_calls = []     # (idx, tc) — approved non-spawn tools to execute
+        # Calls that never ran because the human denied or cancelled the gate. Tracked
+        # because `_meaning_events` decides "did this write succeed?" by sniffing the
+        # result STRING (`_tool_result_ok` = non-empty and not starting with "error:")
+        # — and the decline notice satisfies that, so a denied `write_file` emitted a
+        # FileChanged for a write that never happened. The adapter then read the path
+        # and recorded a code_step, attributing to the agent a write the user had just
+        # refused. A refusal is knowledge the loop HAS; it must not be re-derived from
+        # prose. (Pinned by tests/agent/test_gate.py, which this fixes.)
+        refused_idx: set[int] = set()
 
         # Phase 1 — gate every call (D19; a two-way approval must run on the generator),
         # prepare + announce spawns, and bucket the rest for execution.
@@ -922,24 +996,49 @@ def _run_events_inner(
                 decision = yield ToolApprovalRequested(tc["name"], tc["args"])
                 approved = decision in ("allow", "always_session")
             if not approved:
-                results_by_idx[idx] = (
-                    f"The user declined to run this {tc['name']} call. Treat this as a redirect, "
-                    "not a failure. Do NOT silently retry or jump to a different step. In your next "
-                    "message, explain to the user what you were about to do and why, then ask how "
-                    "they'd like to proceed — and wait for their reply before acting."
-                )
+                refused_idx.add(idx)
+                # E1: a CANCELLED gate (the human hit Stop while it was pending) is not
+                # a declined one. Telling the model "the user declined" for a Stop made
+                # it narrate around a judgement the user never expressed. Both outcomes
+                # leave the tool unrun; only the explanation differs.
+                if decision == "cancelled":
+                    results_by_idx[idx] = (
+                        f"This {tc['name']} call was cancelled because the user stopped the run "
+                        "while the approval was pending. They did not decline the call itself. "
+                        "The run is ending — summarize where you got to; do not start new work."
+                    )
+                else:
+                    results_by_idx[idx] = (
+                        f"The user declined to run this {tc['name']} call. Treat this as a redirect, "
+                        "not a failure. Do NOT silently retry or jump to a different step. In your next "
+                        "message, explain to the user what you were about to do and why, then ask how "
+                        "they'd like to proceed — and wait for their reply before acting."
+                    )
             elif tc["name"] == "spawn_subagent":
                 try:
                     plan = subagents.prepare_spawn(tc["args"])
                 except Exception as e:  # noqa: BLE001
                     results_by_idx[idx] = f"Error: tool 'spawn_subagent' raised {type(e).__name__}: {e}"
+                    # No SubagentStarted is emitted on this path, so without a
+                    # diagnostic a spawn that blew up leaves no trace at all — the UI
+                    # shows a turn where the coordinator simply decided not to delegate.
+                    diagnostics.report(
+                        "step_error", "subagent.spawn_failed",
+                        f"A sub-agent could not be started: {type(e).__name__}: {e}",
+                        tool="spawn_subagent", turn=turn,
+                    )
                     continue
                 if isinstance(plan, str):
                     results_by_idx[idx] = plan  # refused → no child, no started event
                 else:
                     # D1: announce every spawn as running BEFORE launching, so the UI shows
                     # the whole batch live from the outset.
-                    yield SubagentStarted(plan.result_id, plan.subagent_type, plan.description)
+                    # The full delegated task travels with the start event — the child's
+                    # transcript (which holds it as the first user message) is not
+                    # available until the child finishes.
+                    _task = plan.child_messages[0]["content"] if plan.child_messages else ""
+                    yield SubagentStarted(plan.result_id, plan.subagent_type,
+                                          plan.description, _task)
                     spawn_specs.append((idx, tc, plan))
             else:
                 serial_calls.append((idx, tc))
@@ -975,14 +1074,26 @@ def _run_events_inner(
                 )
 
         # Phase 4 — emit each tool's downstream events + assemble tool_results IN ORDER.
+        # First surface anything the tools reported for the HUMAN (C1/C4). Drained here,
+        # once, rather than per call: a diagnostic carries its own anchor (`tool`,
+        # `turn`, `path`), so the adapter places it — its position in the raw stream is
+        # cosmetic. Emitted BEFORE the tool_results so a failure reads ahead of the
+        # model's reaction to it.
+        for diag in diagnostics.drain():
+            yield diag
+
         tool_results = []
         for idx, tc in enumerate(tool_calls):
             result = results_by_idx.get(idx, f"Error: tool '{tc['name']}' produced no result")
             preview = result[:200] + "..." if len(result) > 200 else result
             yield ToolResulted(tc["name"], result, preview)
-            for ev in _meaning_events(tc["name"], tc["args"], result):
-                yield ev
-            proof_state.note_tool_result(tc["name"], tc["args"], result)
+            # A refused call had no effect, so it has no meaning events and must not
+            # move the proof state — otherwise a denied write marks the proof as
+            # freshly written and due a check.
+            if idx not in refused_idx:
+                for ev in _meaning_events(tc["name"], tc["args"], result):
+                    yield ev
+                proof_state.note_tool_result(tc["name"], tc["args"], result)
             tool_result = {"type": "tool_result", "tool_name": tc["name"], "content": result}
             if tc["id"]:
                 tool_result["tool_use_id"] = tc["id"]
@@ -990,8 +1101,14 @@ def _run_events_inner(
             tool_results.append(tool_result)
 
         # Each spawn produced a typed result the tool_result string can't carry (the child
-        # transcript, the result id). Drain them AFTER the batch and surface each as a
-        # SubagentFinished so the adapter stores the transcript + keeps the audit link.
+        # transcript, the result id), surfaced as a SubagentFinished so the adapter stores
+        # the transcript + keeps the audit link.
+        #
+        # Concurrent spawns now emit theirs as each child finishes (inside
+        # `run_children_concurrently`), so this normally finds an empty collector. It
+        # stays as the sweep for the paths that do NOT go through that helper — a
+        # `spawn_subagent` called directly via the registered tool — and for any result
+        # recorded after the last child's completion message was processed.
         if spawn_specs:
             for child_result in subagents.drain_results():
                 yield child_result.to_event()

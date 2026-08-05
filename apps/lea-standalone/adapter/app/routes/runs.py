@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from ..config import load_config, permission_tier
 from .. import bridge
+from .. import diagnostics
 from .. import formalizations as formalization_service
 from ..bridge import request_stop, request_subagent_stop
 from .. import projects
@@ -151,6 +152,11 @@ def create_run(request: RunRequest) -> dict:
             ) from exc
 
     project_id: str | None = None
+    # B2: why the project didn't attach, if it didn't. Recorded here and persisted
+    # once the session exists (below) — a run silently losing its project context,
+    # instructions, skills, and shared repo used to look identical to a run that
+    # never asked for one.
+    project_error: str | None = None
     if request.project_slug:
         proofs_root = (config.lea_root / "workspace" / "proofs") if config.lea_root else None
         try:
@@ -161,8 +167,9 @@ def create_run(request: RunRequest) -> dict:
                 namespace=request.project_namespace,
             )
             project_id = project["id"]
-        except ValueError:
+        except ValueError as exc:
             project_id = None
+            project_error = str(exc) or "the project slug was rejected"
 
     autonomous = request.autonomous or (permission_tier() == "none")
     new_formalization = (
@@ -195,6 +202,19 @@ def create_run(request: RunRequest) -> dict:
     run = bundle["run"]
     user_message = bundle["message"]
     project_id = session.get("project_id")
+    if project_error:
+        # B2: persisted, not streamed — this endpoint returns before any SSE stream is
+        # attached, so there is no live channel yet. The client picks it up from
+        # `session_detail` on attach, which is also how it survives a reload. Recorded
+        # here rather than at the failure site because it needs the run row the bundle
+        # just created.
+        store.add_diagnostic(session["id"], run["id"], diagnostics.resolve(
+            "degraded", "run.project_unavailable",
+            f"This run could not be attached to project '{request.project_slug}' "
+            f"({project_error}); it runs without project context, instructions, or skills.",
+            source="runs",
+            context={"project_slug": request.project_slug},
+        ))
     bridge.enqueue_run(run["id"])
     raw_formalization = bundle.get("formalization")
     formalization = (

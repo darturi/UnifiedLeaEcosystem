@@ -268,3 +268,35 @@ def test_shared_file_change_controls_current_validity(tmp_path, monkeypatch):
         formalization_id=other["id"],
     )
     assert formalizations.get(theorem["id"])["validity_status"] == "failing"
+
+
+def test_a_formalizations_sessions_exclude_subagent_children(tmp_path, monkeypatch):
+    """A sub-agent must never appear as one of a formalization's sessions.
+
+    A child IS a session row (`parent_id` = the coordinator that spawned it), and the
+    UI uses `sessions[0]` as the row's click target — while a child session opens
+    READ-ONLY behind a provenance bar. So a formalization could send you into an
+    internal child instead of the conversation you actually had, and a project's
+    session list read as a mix of work you started and machinery the coordinator
+    spawned. A child stays reachable from its coordinator's thread, where it means
+    something.
+    """
+    _fresh(tmp_path, monkeypatch)
+    project = _project()
+    parent = store.create_session("Formalize the discrepancy bound", project_id=project["id"])
+    child = store.create_session(
+        "certificate c2", project_id=project["id"],
+        parent_id=parent["id"], role="proof-candidate", spawned_at_turn=3,
+    )
+    item = store.create_formalization(
+        project_id=project["id"], loose_session_id=None,
+        display_title="The bound", declaration_name="discrepancy_bound",
+    )
+    # Both are linked — the child genuinely worked on it. Only the root is offered.
+    store.link_session_formalization(parent["id"], item["id"])
+    store.link_session_formalization(child["id"], item["id"])
+
+    decorated = formalizations.decorate([store.get_formalization(item["id"])])[0]
+    ids = [s["id"] for s in decorated["sessions"]]
+    assert parent["id"] in ids
+    assert child["id"] not in ids, "a sub-agent is not a session you can open"

@@ -195,6 +195,13 @@ def decorate(rows: list[dict]) -> list[dict]:
             from session_formalizations sf
             join sessions s on s.id = sf.session_id
             where sf.formalization_id in ({marks})
+              -- ROOTS only. A sub-agent is a session row whose `parent_id` is the
+              -- coordinator that spawned it. The UI uses `sessions[0]` as the row's
+              -- click target, and a child session opens READ-ONLY with a provenance
+              -- bar — so a formalization could send you to an internal child instead
+              -- of the conversation you actually had. A child is meaningful only from
+              -- inside its coordinator's thread, which is where it stays reachable.
+              and s.parent_id is null
             order by s.updated_at desc
             """,
             ids,

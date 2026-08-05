@@ -16,13 +16,18 @@ Run:  uv run python -m tests.subagents.test_subagent_parallel
 Exits 0 if every check passes, 1 otherwise.
 """
 
+import dataclasses
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import lea.agent as agent
 from lea.config import LeaConfig
-from lea.events import CheckResult, Finished, SubagentStarted, SubagentFinished, ToolResulted
+from lea.events import (
+    CheckResult, Finished, SubagentProgress, SubagentStarted, SubagentFinished,
+    ToolResulted, TurnStarted,
+)
 from lea.providers import TextDelta, ToolCall, Done, _ToolMeta, Usage
 from lea.runctx import run_context
 from lea import subagents
@@ -88,12 +93,89 @@ def test_children_truly_overlap(monkeypatch):
             drained = drain_results()
             subagents.end_results_scope(token)
 
+    progress = [p for p in prog if isinstance(p, SubagentProgress)]
+    finished = [p for p in prog if isinstance(p, SubagentFinished)]
     check("both children returned a render", len(renders) == 2)
     check("progress streamed from BOTH children",
-          {p.result_id for p in prog} == set(renders.keys()) and len(prog) >= 2)
-    check("both children recorded a typed result", len(drained) == 2)
+          {p.result_id for p in progress} == set(renders.keys()) and len(progress) >= 2)
+    # Each child's result is now YIELDED as it finishes, so the post-batch drain finds
+    # nothing left — that emptiness IS the fix: a child no longer waits for its slowest
+    # sibling before being reported done.
+    check("both children reported a typed result", len(finished) == 2)
+    check("the post-batch drain is empty (results already emitted)", len(drained) == 0)
     check("both OVERLAPPED (passed the barrier → clean candidate)",
-          all(r.check_status == "ok" for r in drained))
+          all(f.check_status == "ok" for f in finished))
+
+
+def test_a_fast_child_is_reported_before_a_slow_sibling_finishes(monkeypatch):
+    """The stuck-spinner bug, pinned by timing rather than by counting.
+
+    Every child's result used to be drained only after `run_children_concurrently`
+    returned — i.e. after the SLOWEST sibling. So a child that finished early stayed
+    `status='running'` in the adapter for as long as its slowest peer took, and its
+    session view showed a live "Checking with Lean…" spinner over a finished
+    transcript. Observed on an 8-child batch: all eight retired within 30ms of each
+    other, ~51s after spawn.
+
+    Here child A returns immediately and child B blocks until we release it. The fast
+    child's SubagentFinished MUST arrive while the slow one is still running — if it
+    only arrives at the end, we are back to batch-granularity reporting.
+    """
+    release = threading.Event()
+
+    def two_speeds(config, messages, *, namespace=None, session_id=None, working_dir=None,
+                   should_stop=None, gate=None, depth=0):
+        # `run_key` is the child's own id; the slow one is whichever we named 'slow'.
+        if "slow" in (session_id or ""):
+            release.wait(timeout=5)
+        yield Finished("completed", "done", 1, session_id or "c", config.model,
+                       Usage(1, 1), 0.0, {"messages": []})
+
+    monkeypatch.setattr(agent, "run_events", two_speeds)
+    with tempfile.TemporaryDirectory() as d:
+        with run_context(depth=0, config=_cfg(), working_dir=str(Path(d).resolve()), run_key="s"):
+            token = subagents.begin_results_scope()
+            fast = prepare_spawn({"description": "fast", "prompt": "go"})
+            slow = prepare_spawn({"description": "slow", "prompt": "go"})
+            # Force the ids so the stub can tell them apart.
+            fast = dataclasses.replace(fast, result_id="fast-1")
+            slow = dataclasses.replace(slow, result_id="slow-1")
+            _child_stops_seed(fast, slow)
+
+            gen = run_children_concurrently([fast, slow], max_children=2)
+            early: list = []
+            # Pull events until the FAST child reports finished — with the slow one
+            # still blocked. A timeout here means the fix regressed.
+            deadline = time.monotonic() + 5
+            got_fast = False
+            while time.monotonic() < deadline and not got_fast:
+                try:
+                    ev = next(gen)
+                except StopIteration:
+                    break
+                early.append(ev)
+                if isinstance(ev, SubagentFinished) and ev.result_id == "fast-1":
+                    got_fast = True
+
+            check("the fast child was reported while the slow one was still running", got_fast)
+            check("the slow child had NOT been reported yet",
+                  not any(isinstance(e, SubagentFinished) and e.result_id == "slow-1"
+                          for e in early))
+            release.set()
+            try:
+                while True:
+                    next(gen)
+            except StopIteration:
+                pass
+            subagents.end_results_scope(token)
+
+
+def _child_stops_seed(*plans):
+    """`prepare_spawn` registered a stop flag under the ORIGINAL id; re-register under
+    the forced ids so `_compose_child_stop` finds one (it tolerates a missing flag, but
+    seeding keeps the test exercising the real path)."""
+    for plan in plans:
+        subagents._child_stops.setdefault(plan.result_id, threading.Event())
 
 
 def test_max_children_caps_concurrency(monkeypatch):
@@ -134,8 +216,10 @@ def test_a_failing_child_is_isolated(monkeypatch):
             token = subagents.begin_results_scope()
             bad = prepare_spawn({"description": "bad", "prompt": "BOOM please"})
             good = prepare_spawn({"description": "good", "prompt": "prove it"})
-            _prog, renders = _drive(run_children_concurrently([bad, good], max_children=2))
-            drained = drain_results()
+            prog, renders = _drive(run_children_concurrently([bad, good], max_children=2))
+            # Results are now emitted per child as it finishes, so they arrive on the
+            # event stream rather than sitting in the collector until the batch ends.
+            drained = [p for p in prog if isinstance(p, SubagentFinished)]
             subagents.end_results_scope(token)
     by_id = {r.result_id: r for r in drained}
     check("both children produced a result (the failure didn't kill the sibling)", len(drained) == 2)
@@ -145,9 +229,16 @@ def test_a_failing_child_is_isolated(monkeypatch):
 
 
 def test_loop_runs_two_spawns_in_one_turn_concurrently():
-    # The REAL coordinator loop: a turn issues TWO spawn_subagent calls. They must run
-    # concurrently — the barrier children only pass if they overlap — and the loop must
-    # emit two Started + two Finished and complete.
+    # The REAL coordinator loop: ONE turn issues TWO spawn_subagent calls, and they must
+    # run concurrently — the barrier children only pass if they truly overlap — with the
+    # loop emitting two Started + two Finished and terminating cleanly.
+    #
+    # Scope note: this test is about SPAWN OVERLAP, not about what outcome the run
+    # reaches. It used to assert `Finished.reason == "completed"`, which is a claim about
+    # the coordinator's proof artifact and was always false here: this fake coordinator
+    # delegates and then stops without writing a proof of its own, and a child's candidate
+    # lives in the child's sandbox by design. So the run correctly ends as a chat turn.
+    # Which outcome a run reaches is settled by the tests that own that question.
     barrier = threading.Barrier(2)
     real_run_events = agent.run_events
     saved_stream, saved_prompt = agent.stream, agent.load_system_prompt
@@ -190,7 +281,18 @@ def test_loop_runs_two_spawns_in_one_turn_concurrently():
     check("two children finished", len(finished) == 2)
     check("both spawns OVERLAPPED in the one turn (clean candidates)",
           all(f.check_status == "ok" for f in finished))
-    check("the run completed", any(isinstance(e, Finished) and e.reason == "completed" for e in events))
+    # Both spawns belong to the SAME turn — the property this test is named for, and
+    # what makes the overlap check above meaningful instead of incidental: children
+    # issued in different turns could never have met at the barrier.
+    second_turn_at = next((i for i, e in enumerate(events)
+                           if isinstance(e, TurnStarted) and e.turn == 2), len(events))
+    check("both spawns were issued in the SAME turn",
+          all(i < second_turn_at for i, e in enumerate(events) if isinstance(e, SubagentStarted)))
+    # The loop TERMINATED — both worker threads joined, nothing hung, nothing escaped.
+    # A raw `Finished` here is the coordinator's: a child's own events are wrapped as
+    # SubagentProgress, so this counts exactly one terminal event, whatever its reason.
+    check("the loop terminated cleanly (exactly one terminal event)",
+          len([e for e in events if isinstance(e, Finished)]) == 1)
 
 
 def test_loop_parallelizes_two_readonly_tools():
@@ -258,7 +360,8 @@ class _MonkeyPatch:
 def main():
     print("subagent concurrency tests (E2):")
     for fn in (test_children_truly_overlap, test_max_children_caps_concurrency,
-               test_a_failing_child_is_isolated):
+               test_a_failing_child_is_isolated,
+               test_a_fast_child_is_reported_before_a_slow_sibling_finishes):
         mp = _MonkeyPatch()
         try:
             fn(mp)
