@@ -2134,6 +2134,7 @@ button.ol-lean-project-relationship-chip {
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
+  width: min(360px, calc(100vw - 24px));
   max-height: calc(100vh - 24px);
   max-height: calc(100dvh - 24px);
 }
@@ -2594,6 +2595,194 @@ button.ol-lean-project-relationship-chip {
 .ol-lean-provider-key-controls input {
   flex: 1;
   min-width: 0;
+}
+
+.ol-lean-github-token-panel {
+  gap: 10px;
+}
+
+.ol-lean-github-token-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--ol-line);
+  border-radius: 8px;
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-github-token-card[data-configured="true"] {
+  border-color: var(--ol-accent);
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-github-token-summary {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.ol-lean-github-token-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  font: 700 10px/1 var(--ol-mono);
+  letter-spacing: -0.02em;
+}
+
+.ol-lean-github-token-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ol-lean-github-token-copy strong {
+  color: var(--ol-ink-2);
+  font-size: 12px;
+}
+
+.ol-lean-github-token-copy span {
+  color: var(--ol-muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.ol-lean-github-token-status {
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+  font: 700 9px/1 var(--ol-mono);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ol-lean-github-token-card[data-configured="true"] .ol-lean-github-token-status {
+  color: var(--ol-accent-ink);
+  background: var(--ol-panel);
+}
+
+.ol-lean-github-token-storage-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: var(--ol-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.ol-lean-github-token-lock {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+}
+
+.ol-lean-github-token-actions,
+.ol-lean-github-token-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.ol-lean-provider-key-button[data-variant="primary"] {
+  border-color: var(--ol-accent);
+  color: #ffffff;
+  background: var(--ol-accent);
+}
+
+.ol-lean-provider-key-button[data-variant="primary"]:hover {
+  border-color: var(--ol-accent-ink);
+  color: #ffffff;
+  background: var(--ol-accent-ink);
+}
+
+.ol-lean-provider-key-button[data-variant="danger"] {
+  color: var(--ol-red);
+  background: transparent;
+}
+
+.ol-lean-provider-key-button[data-variant="danger"]:hover {
+  border-color: var(--ol-red);
+  color: var(--ol-red);
+}
+
+.ol-lean-github-token-editor {
+  padding-top: 11px;
+  border-top: 1px solid var(--ol-line);
+}
+
+.ol-lean-github-token-editor form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ol-lean-github-token-label {
+  color: var(--ol-ink-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ol-lean-github-token-field {
+  display: flex;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel);
+}
+
+.ol-lean-github-token-field:focus-within {
+  border-color: var(--ol-accent);
+  box-shadow: 0 0 0 2px var(--ol-accent-soft);
+}
+
+.ol-lean-github-token-field input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 0;
+  outline: 0;
+  color: var(--ol-ink);
+  background: transparent;
+  font: 11px/1.3 var(--ol-mono);
+}
+
+.ol-lean-github-token-field button {
+  flex: 0 0 auto;
+  min-width: 46px;
+  padding: 0 9px;
+  border: 0;
+  border-left: 1px solid var(--ol-line);
+  color: var(--ol-muted);
+  background: var(--ol-panel-2);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.ol-lean-github-token-field button:hover {
+  color: var(--ol-accent-ink);
+}
+
+.ol-lean-github-token-editor .ol-lean-provider-note {
+  font-size: 10px;
 }
 
 .ol-lean-settings-panel {

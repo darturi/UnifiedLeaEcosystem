@@ -7,6 +7,12 @@ import vm from "node:vm";
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
 const contentScriptPath = path.join(repoRoot, "apps/overleaf-extension/extension/content.js");
 const contentScript = fs.readFileSync(contentScriptPath, "utf8");
+const modelPickerScriptPath = path.join(repoRoot, "apps/overleaf-extension/extension/modelPicker.js");
+const modelPickerScript = fs.readFileSync(modelPickerScriptPath, "utf8");
+const contentStyles = fs.readFileSync(
+  path.join(repoRoot, "apps/overleaf-extension/extension/content.css"),
+  "utf8"
+);
 
 const CASES = [
   ["unformalized", { status: "unformalized", leaSessionId: "stale-session" }, false],
@@ -348,6 +354,79 @@ test("settings open over the Lean pane and closing them preserves the pane", asy
   harness.clickButtonLabel("Close Lea popover");
   assert.equal(harness.countSelector(".ol-lean-settings-popover"), 0);
   assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+});
+
+test("GitHub token settings use a full-width editor with cancel, reveal, save, and remove states", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      companionSettings: { githubTokenConfigured: false },
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+
+  assert.deepEqual(harness.githubTokenState(), {
+    configured: "false",
+    status: "Not set",
+    description: "Add a token to push Lean projects to GitHub.",
+    toggle: "Add GitHub token",
+    clearHidden: true,
+    summaryHidden: false,
+    editorHidden: true,
+    inputType: "password",
+    inputValue: "",
+    visibility: "Show"
+  });
+  assert.match(
+    contentStyles,
+    /\.ol-lean-github-token-field\s*\{[^}]*width:\s*100%/s,
+    "the credential field should occupy the full card width"
+  );
+
+  harness.clickButtonRole("github-token-toggle");
+  assert.equal(harness.githubTokenState().summaryHidden, true);
+  assert.equal(harness.githubTokenState().editorHidden, false);
+
+  harness.setGithubTokenValue("ghp_test-token");
+  harness.clickButtonRole("github-token-visibility");
+  assert.equal(harness.githubTokenState().inputType, "text");
+  assert.equal(harness.githubTokenState().visibility, "Hide");
+
+  harness.clickButtonRole("github-token-cancel");
+  assert.equal(harness.githubTokenState().editorHidden, true);
+  assert.equal(harness.githubTokenState().inputType, "password");
+  assert.equal(harness.githubTokenState().inputValue, "");
+
+  harness.clickButtonRole("github-token-toggle");
+  harness.setGithubTokenValue("ghp_saved-token");
+  harness.submitGithubToken();
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => (
+    call.url.endsWith("/settings/github-token")
+    && JSON.parse(call.options?.body || "{}").value
+  ));
+  assert.deepEqual(JSON.parse(saveCall?.options?.body || "{}"), { value: "ghp_saved-token" });
+  assert.equal(harness.githubTokenState().configured, "true");
+  assert.equal(harness.githubTokenState().status, "Saved");
+  assert.equal(harness.githubTokenState().editorHidden, true);
+  assert.equal(harness.githubTokenState().clearHidden, false);
+
+  harness.clickButtonRole("github-token-clear");
+  await flushPromises();
+  const removeCall = harness.fetchCalls.find((call) => (
+    call.url.endsWith("/settings/github-token")
+    && JSON.parse(call.options?.body || "{}").clear
+  ));
+  assert.deepEqual(JSON.parse(removeCall?.options?.body || "{}"), { clear: true });
+  assert.equal(harness.githubTokenState().configured, "false");
+  assert.equal(harness.githubTokenState().status, "Not set");
 });
 
 test("GitHub import refreshes a Share panel that was opened before the project existed", async () => {
@@ -2263,6 +2342,12 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               identity: currentProjectIdentity
             };
           }
+          if (String(url).endsWith("/settings") && options.companionSettings) {
+            return options.companionSettings;
+          }
+          if (String(url).endsWith("/settings/github-token")) {
+            return options.githubTokenUpdate || { ok: true };
+          }
           if (String(url).includes("/share/github?")) {
             return typeof options.shareStatus === "function"
               ? options.shareStatus(fetchCalls)
@@ -2405,6 +2490,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   context.self = window;
   context.location = window.location;
 
+  vm.runInNewContext(modelPickerScript, context, { filename: modelPickerScriptPath });
   vm.runInNewContext(contentScript, context, {
     filename: contentScriptPath,
     // content.js loads web-accessible-resource modules via
@@ -2528,6 +2614,16 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(input, `expected GitHub import URL input; body was: ${document.body.textContent}`);
       input.value = value;
     },
+    setGithubTokenValue(value) {
+      const input = document.body.querySelector("[data-role='github-token-input']");
+      assert.ok(input, "expected GitHub token input");
+      input.value = value;
+    },
+    submitGithubToken() {
+      const form = document.body.querySelector("[data-role='github-token-form']");
+      assert.ok(form, "expected GitHub token form");
+      form.dispatchEvent({ type: "submit" });
+    },
     setProjectIdentitySync(checked) {
       const input = document.body.querySelector(".ol-lean-project-identity-sync-input");
       assert.ok(input, "expected project identity sync input");
@@ -2609,6 +2705,29 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
+    },
+    githubTokenState() {
+      const card = document.body.querySelector(".ol-lean-github-token-card");
+      const status = document.body.querySelector("[data-role='github-token-status']");
+      const description = document.body.querySelector("[data-role='github-token-description']");
+      const toggle = document.body.querySelector("[data-role='github-token-toggle']");
+      const clear = document.body.querySelector("[data-role='github-token-clear']");
+      const summary = document.body.querySelector("[data-role='github-token-summary-actions']");
+      const editor = document.body.querySelector("[data-role='github-token-editor']");
+      const input = document.body.querySelector("[data-role='github-token-input']");
+      const visibility = document.body.querySelector("[data-role='github-token-visibility']");
+      return {
+        configured: card?.dataset.configured || "",
+        status: status?.textContent || "",
+        description: description?.textContent || "",
+        toggle: toggle?.textContent || "",
+        clearHidden: Boolean(clear?.hidden),
+        summaryHidden: Boolean(summary?.hidden),
+        editorHidden: Boolean(editor?.hidden),
+        inputType: input?.type || "",
+        inputValue: input?.value || "",
+        visibility: visibility?.textContent || ""
+      };
     },
     githubImportQueue() {
       const list = document.body.querySelector(".ol-lean-github-import-queue");
@@ -2899,6 +3018,25 @@ class FakeElement {
       confirm.hidden = true;
       return;
     }
+    if (html.includes("lea-model-picker-trigger")) {
+      const trigger = this.appendChild(new FakeElement("button"));
+      trigger.className = "lea-model-picker-trigger";
+      trigger.setAttribute("role", "combobox");
+      trigger.setAttribute("aria-expanded", "false");
+      const value = trigger.appendChild(new FakeElement("span"));
+      value.dataset.role = "model-picker-value";
+      const popover = this.appendChild(new FakeElement("div"));
+      popover.className = "lea-model-picker-popover";
+      popover.hidden = true;
+      const search = popover.appendChild(new FakeElement("input"));
+      search.className = "lea-model-picker-search";
+      search.value = "";
+      const heading = popover.appendChild(new FakeElement("div"));
+      heading.className = "lea-model-picker-heading";
+      const results = popover.appendChild(new FakeElement("div"));
+      results.className = "lea-model-picker-results";
+      return;
+    }
     if (html.includes("Extension Settings")) {
       const close = this.appendChild(new FakeElement("button"));
       close.dataset.role = "close";
@@ -2915,14 +3053,38 @@ class FakeElement {
       texMirror.dataset.role = "tex-mirror";
       const save = this.appendChild(new FakeElement("button"));
       save.dataset.role = "save-settings";
-      const githubToggle = this.appendChild(new FakeElement("button"));
+      const githubPanel = this.appendChild(new FakeElement("section"));
+      githubPanel.dataset.role = "github-token-panel";
+      const githubCard = githubPanel.appendChild(new FakeElement("div"));
+      githubCard.className = "ol-lean-github-token-card";
+      const githubDescription = githubCard.appendChild(new FakeElement("span"));
+      githubDescription.dataset.role = "github-token-description";
+      const githubStatus = githubCard.appendChild(new FakeElement("strong"));
+      githubStatus.dataset.role = "github-token-status";
+      const githubSummary = githubCard.appendChild(new FakeElement("div"));
+      githubSummary.dataset.role = "github-token-summary-actions";
+      const githubToggle = githubSummary.appendChild(new FakeElement("button"));
       githubToggle.dataset.role = "github-token-toggle";
-      const githubClear = this.appendChild(new FakeElement("button"));
+      const githubClear = githubSummary.appendChild(new FakeElement("button"));
       githubClear.dataset.role = "github-token-clear";
-      const githubInput = this.appendChild(new FakeElement("input"));
+      githubClear.hidden = true;
+      const githubEditor = githubCard.appendChild(new FakeElement("div"));
+      githubEditor.dataset.role = "github-token-editor";
+      githubEditor.hidden = true;
+      const githubForm = githubEditor.appendChild(new FakeElement("form"));
+      githubForm.dataset.role = "github-token-form";
+      const githubInput = githubForm.appendChild(new FakeElement("input"));
       githubInput.dataset.role = "github-token-input";
-      const githubSave = this.appendChild(new FakeElement("button"));
+      githubInput.type = "password";
+      const githubVisibility = githubForm.appendChild(new FakeElement("button"));
+      githubVisibility.dataset.role = "github-token-visibility";
+      githubVisibility.textContent = "Show";
+      const githubCancel = githubForm.appendChild(new FakeElement("button"));
+      githubCancel.dataset.role = "github-token-cancel";
+      githubCancel.textContent = "Cancel";
+      const githubSave = githubForm.appendChild(new FakeElement("button"));
       githubSave.dataset.role = "github-token-save";
+      githubSave.textContent = "Save token";
       const editProjectName = this.appendChild(new FakeElement("button"));
       editProjectName.dataset.role = "edit-project-name";
       return;

@@ -4977,19 +4977,41 @@
             </div>
           `).join("")}
         </section>
-        <section class="ol-lean-provider-panel" data-role="github-token-panel">
+        <section class="ol-lean-provider-panel ol-lean-github-token-panel" data-role="github-token-panel">
           <div class="ol-lean-provider-title">GitHub sharing</div>
-          <p class="ol-lean-provider-note">The push token is stored by Lea (lea.local.toml) — never in Chrome. It enables Push in the Lean pane's Share panel.</p>
-          <div class="ol-lean-provider-row">
-            <div class="ol-lean-provider-row-head">
-              <span>Push token</span>
-              <strong data-role="github-token-status">Missing</strong>
+          <div class="ol-lean-github-token-card">
+            <div class="ol-lean-github-token-summary">
+              <span class="ol-lean-github-token-mark" aria-hidden="true">GH</span>
+              <div class="ol-lean-github-token-copy">
+                <strong>Repository access</strong>
+                <span data-role="github-token-description">Add a token to push Lean projects to GitHub.</span>
+              </div>
+              <strong class="ol-lean-github-token-status" data-role="github-token-status" aria-live="polite">Not set</strong>
             </div>
-            <div class="ol-lean-provider-key-controls">
-              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-toggle">Add token</button>
-              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-clear" hidden>Remove</button>
-              <input type="password" autocomplete="off" spellcheck="false" data-role="github-token-input" placeholder="GitHub token (repo scope)" hidden>
-              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-save" hidden>Save token</button>
+            <p class="ol-lean-github-token-storage-note">
+              <svg class="ol-lean-github-token-lock" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                <rect x="3" y="7" width="10" height="7" rx="2"></rect>
+                <path d="M5.25 7V5.25a2.75 2.75 0 0 1 5.5 0V7"></path>
+              </svg>
+              <span>Stored locally by Lea, never in Chrome. It is used only when you choose <strong>Push to GitHub</strong>.</span>
+            </p>
+            <div class="ol-lean-github-token-actions" data-role="github-token-summary-actions">
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-clear" data-variant="danger" hidden>Remove token</button>
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-toggle" data-variant="primary">Add GitHub token</button>
+            </div>
+            <div class="ol-lean-github-token-editor" data-role="github-token-editor" hidden>
+              <form data-role="github-token-form">
+                <label class="ol-lean-github-token-label" for="ol-lean-github-token-input">Personal access token</label>
+                <div class="ol-lean-github-token-field">
+                  <input id="ol-lean-github-token-input" type="password" autocomplete="off" spellcheck="false" data-role="github-token-input" placeholder="github_pat_... or ghp_..." aria-describedby="ol-lean-github-token-help" required>
+                  <button type="button" data-role="github-token-visibility" aria-label="Show GitHub token" aria-pressed="false">Show</button>
+                </div>
+                <p id="ol-lean-github-token-help" class="ol-lean-provider-note">Use a personal access token with permission to write to the repository. For security, the saved value cannot be shown again.</p>
+                <div class="ol-lean-github-token-form-actions">
+                  <button type="button" class="ol-lean-provider-key-button" data-role="github-token-cancel">Cancel</button>
+                  <button type="submit" class="ol-lean-provider-key-button" data-role="github-token-save" data-variant="primary">Save token</button>
+                </div>
+              </form>
             </div>
           </div>
         </section>
@@ -5054,29 +5076,65 @@
     // "Save changes" flow. Presence-only display; the raw token is never read back.
     const githubToggle = popover.querySelector("[data-role='github-token-toggle']");
     const githubClear = popover.querySelector("[data-role='github-token-clear']");
+    const githubSummaryActions = popover.querySelector("[data-role='github-token-summary-actions']");
+    const githubEditor = popover.querySelector("[data-role='github-token-editor']");
+    const githubForm = popover.querySelector("[data-role='github-token-form']");
     const githubInput = popover.querySelector("[data-role='github-token-input']");
     const githubSave = popover.querySelector("[data-role='github-token-save']");
+    const githubCancel = popover.querySelector("[data-role='github-token-cancel']");
+    const githubVisibility = popover.querySelector("[data-role='github-token-visibility']");
+
+    const closeGithubTokenEditor = () => {
+      githubInput.value = "";
+      githubInput.type = "password";
+      githubVisibility.textContent = "Show";
+      githubVisibility.setAttribute("aria-label", "Show GitHub token");
+      githubVisibility.setAttribute("aria-pressed", "false");
+      githubEditor.hidden = true;
+      githubSummaryActions.hidden = false;
+    };
+
     githubToggle.addEventListener("click", () => {
-      githubInput.hidden = false;
-      githubSave.hidden = false;
+      githubSummaryActions.hidden = true;
+      githubEditor.hidden = false;
+      status.textContent = "";
       githubInput.focus();
     });
-    githubSave.addEventListener("click", async () => {
+    githubCancel.addEventListener("click", () => {
+      closeGithubTokenEditor();
+      githubToggle.focus();
+    });
+    githubVisibility.addEventListener("click", () => {
+      const reveal = githubInput.type === "password";
+      githubInput.type = reveal ? "text" : "password";
+      githubVisibility.textContent = reveal ? "Hide" : "Show";
+      githubVisibility.setAttribute("aria-label", `${reveal ? "Hide" : "Show"} GitHub token`);
+      githubVisibility.setAttribute("aria-pressed", reveal ? "true" : "false");
+      githubInput.focus();
+    });
+    githubForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
       const value = githubInput.value.trim();
-      if (!value) return;
+      if (!value) {
+        status.textContent = "Enter a GitHub personal access token.";
+        githubInput.focus();
+        return;
+      }
       githubSave.disabled = true;
+      githubCancel.disabled = true;
+      githubVisibility.disabled = true;
       status.textContent = "Saving GitHub token...";
       try {
         await updateGithubToken({ value });
-        githubInput.value = "";
-        githubInput.hidden = true;
-        githubSave.hidden = true;
+        closeGithubTokenEditor();
         renderGithubTokenStatus(popover, true);
-        status.textContent = "GitHub token saved.";
+        status.textContent = "GitHub token saved. Push to GitHub is ready.";
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
       } finally {
         githubSave.disabled = false;
+        githubCancel.disabled = false;
+        githubVisibility.disabled = false;
       }
     });
     githubClear.addEventListener("click", async () => {
@@ -5084,8 +5142,9 @@
       status.textContent = "Removing GitHub token...";
       try {
         await updateGithubToken({ clear: true });
+        closeGithubTokenEditor();
         renderGithubTokenStatus(popover, false);
-        status.textContent = "GitHub token removed.";
+        status.textContent = "GitHub token removed. GitHub pushes are disabled.";
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
       } finally {
@@ -6224,14 +6283,19 @@
   function renderGithubTokenStatus(popover, configured) {
     const panel = popover.querySelector("[data-role='github-token-panel']");
     const chip = popover.querySelector("[data-role='github-token-status']");
+    const description = popover.querySelector("[data-role='github-token-description']");
     const toggle = popover.querySelector("[data-role='github-token-toggle']");
     const clear = popover.querySelector("[data-role='github-token-clear']");
     if (!chip) return;
-    // Same configured-state styling hook as the provider-key rows.
-    const row = panel?.querySelector(".ol-lean-provider-row");
-    if (row) row.dataset.configured = configured ? "true" : "false";
-    chip.textContent = configured ? "Configured" : "Missing";
-    if (toggle) toggle.textContent = configured ? "Replace token" : "Add token";
+    const card = panel?.querySelector(".ol-lean-github-token-card");
+    if (card) card.dataset.configured = configured ? "true" : "false";
+    chip.textContent = configured ? "Saved" : "Not set";
+    if (description) {
+      description.textContent = configured
+        ? "A token is saved. GitHub verifies it when you push."
+        : "Add a token to push Lean projects to GitHub.";
+    }
+    if (toggle) toggle.textContent = configured ? "Replace token" : "Add GitHub token";
     if (clear) clear.hidden = !configured;
   }
 
