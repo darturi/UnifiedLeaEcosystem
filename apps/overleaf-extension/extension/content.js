@@ -38,6 +38,9 @@
   const REPAIR_BATCH_POLL_MS = 2000;
   const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
   const GITHUB_IMPORT_POLL_MS = 1000;
+  const LEAN_PANE_ARCHIVE_TIMEOUT_MS = 15000;
+  const LEAN_PANE_COMPANION_TIMEOUT_MS = 10000;
+  const LEAN_PANE_STARTUP_WATCHDOG_MS = 12000;
   const GITHUB_IMPORT_ACTIVE_STATUSES = new Set(["applying", "checking"]);
   const HUMAN_APPROVAL_STORAGE_KEY = "leaHumanApprovalsV1";
   const MODEL_FAMILY_LABELS = {
@@ -74,6 +77,7 @@
   let activeGithubImport = null;
   let githubImportNotice = null;
   let githubImportNoticeTimer = null;
+  let githubImportNoticeExpanded = false;
   let humanApprovals = {};
   let humanApprovalsLoadPromise = null;
   let humanApprovalBusyKeys = new Set();
@@ -89,15 +93,19 @@
   let leanPaneResizeState = null;
   let leanPaneRefreshTimer = null;
   let leanPanePollTimer = null;
+  let leanPaneStartupWatchdogTimer = null;
   let leanPaneView = null;
   let leanPaneExpandedTreeNodeIds = new Set();
   let leanPaneTreeDefaultsKey = "";
   let leanPaneExpandedItemIds = new Set();
   let leanPaneHighlightTimer = null;
   let lastLeanPaneManifest = null;
+  let lastLeanPaneManifestProjectId = "";
   let lastProjectIdentity = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
+  let leanPaneInventoryWarning = "";
+  let leanPaneArchiveLoad = null;
   // Share panel (D34): remote + push against the adapter's project repo, via the
   // companion's /share/github passthroughs. One panel, toggled from the header.
   let leanPaneSharePanel = null;
@@ -248,6 +256,10 @@
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (githubImportNoticeExpanded) {
+      setGithubImportNoticeExpanded(false);
+      return;
+    }
     if (githubPushDialogState) {
       closeGithubPushConfirmation();
       return;
@@ -268,6 +280,13 @@
   });
 
   document.addEventListener("click", (event) => {
+    if (
+      githubImportNoticeExpanded
+      && githubImportNotice?.isConnected
+      && !githubImportNotice.contains(event.target)
+    ) {
+      setGithubImportNoticeExpanded(false);
+    }
     if (activeOverflowMenu && !activeOverflowMenu.wrap.contains(event.target)) {
       closeActiveOverflowMenu();
     }
@@ -387,7 +406,7 @@
     namespaceLabel.className = "ol-lean-sr-only";
     namespaceLabel.textContent = "Lean namespace: ";
     leanPaneProjectNamespace = document.createElement("span");
-    leanPaneProjectNamespace.textContent = "Namespace unavailable";
+    leanPaneProjectNamespace.textContent = "Connecting…";
     namespace.appendChild(namespaceLabel);
     namespace.appendChild(leanPaneProjectNamespace);
     titleWrap.appendChild(paneLabel);
@@ -453,7 +472,20 @@
     document.body.appendChild(leanPane);
     leanPane.focus({ preventScroll: true });
     if (!deferRefresh) {
-      refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+      clearTimeout(leanPaneStartupWatchdogTimer);
+      leanPaneStartupWatchdogTimer = setTimeout(() => {
+        if (leanPane && leanPaneStatus?.textContent === "Loading project inventory...") {
+          renderLeanPaneError(new Error(
+            "Pane startup stalled before the project manifest rendered. The extension resource or browser storage request did not settle."
+          ));
+        }
+      }, LEAN_PANE_STARTUP_WATCHDOG_MS);
+      refreshLeanPaneNow({ forceFetch: true })
+        .catch(renderLeanPaneError)
+        .finally(() => {
+          clearTimeout(leanPaneStartupWatchdogTimer);
+          leanPaneStartupWatchdogTimer = null;
+        });
     }
   }
 
@@ -466,6 +498,8 @@
     leanPaneRefreshTimer = null;
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = null;
+    clearTimeout(leanPaneStartupWatchdogTimer);
+    leanPaneStartupWatchdogTimer = null;
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
     stopLeanPaneResize({ persist: false });
@@ -998,28 +1032,148 @@
     return `${progress?.reused ? "Already imported · " : ""}${Number(dispositions.add || 0)} added · ${Number(dispositions.already_present || 0)} already present · ${conflicts} conflicts skipped · ${Number(progress?.counts?.matched_declarations || 0)} formalizations populated · ${Number(progress?.counts?.reusable_declarations || 0)} reusable declarations`;
   }
 
-  function showGithubImportNotice(message, { error = false, settled = false } = {}) {
+  function githubImportFormalizationQueue(tracker) {
+    if (!tracker) return [];
+    const progress = tracker.progress || {};
+    const files = Array.isArray(progress.files) ? progress.files : [];
+    const declarations = Array.isArray(progress.declarations) ? progress.declarations : [];
+    const pendingFile = files.find((file) => file?.check_status === "pending");
+    const items = [];
+    for (const target of tracker.targetDetails || []) {
+      const declaration = declarations.find((row) => (
+        row?.declaration_name === target.declarationName
+        || row?.full_name === target.declarationName
+      ));
+      const destinationPath = String(declaration?.destination_path || target.destinationPath || "");
+      const file = files.find((row) => row?.destination_path === destinationPath);
+      if (["ok", "error"].includes(String(file?.check_status || ""))) continue;
+      const checking = progress.status === "checking" && (
+        pendingFile
+          ? pendingFile.destination_path === destinationPath
+          : items.length === 0
+      );
+      items.push({
+        key: target.key,
+        label: target.displayTitle || target.declarationName || target.targetLabel,
+        state: checking ? "checking" : "queued",
+      });
+    }
+    return items.sort((left, right) => Number(right.state === "checking") - Number(left.state === "checking"));
+  }
+
+  function githubImportNoticeText(tracker, queue = githubImportFormalizationQueue(tracker)) {
+    if (queue.length === 0) return githubImportProgressText(tracker?.progress);
+    const noun = queue.length === 1 ? "formalization" : "formalizations";
+    const current = queue.find((item) => item.state === "checking");
+    return current
+      ? `${queue.length} ${noun} remaining · Checking ${current.label}`
+      : `${queue.length} ${noun} queued for import checks`;
+  }
+
+  function setGithubImportNoticeExpanded(expanded) {
+    githubImportNoticeExpanded = Boolean(expanded);
+    if (!githubImportNotice) return;
+    const toggle = githubImportNotice.querySelector("[data-role='toggle']");
+    const details = githubImportNotice.querySelector("[data-role='details']");
+    const arrow = githubImportNotice.querySelector("[data-role='arrow']");
+    const dismiss = githubImportNotice.querySelector("[data-role='dismiss']");
+    const active = githubImportNotice.dataset.active === "true";
+    toggle?.setAttribute("aria-expanded", String(githubImportNoticeExpanded));
+    if (details) details.hidden = !githubImportNoticeExpanded;
+    if (arrow) arrow.textContent = githubImportNoticeExpanded ? "⌄" : "⌃";
+    if (dismiss) {
+      dismiss.hidden = active && !githubImportNoticeExpanded;
+      dismiss.textContent = active ? "−" : "×";
+      dismiss.setAttribute(
+        "aria-label",
+        active ? "Minimize GitHub import status" : "Dismiss GitHub import status"
+      );
+    }
+    githubImportNotice.classList.toggle("is-expanded", githubImportNoticeExpanded);
+  }
+
+  function showGithubImportNotice(message, { error = false, settled = false, queue = [] } = {}) {
+    const importId = String(activeGithubImport?.id || "");
     clearTimeout(githubImportNoticeTimer);
     githubImportNoticeTimer = null;
     if (!githubImportNotice?.isConnected) {
       githubImportNotice = document.createElement("div");
       githubImportNotice.className = "ol-lean-github-import-notice";
-      githubImportNotice.setAttribute("role", "status");
-      githubImportNotice.setAttribute("aria-live", "polite");
+      githubImportNotice.setAttribute("role", "region");
+      githubImportNotice.setAttribute("aria-label", "GitHub import progress");
+
+      const header = document.createElement("div");
+      header.className = "ol-lean-github-import-notice-header";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "ol-lean-github-import-notice-toggle";
+      toggle.dataset.role = "toggle";
+      const arrow = document.createElement("span");
+      arrow.dataset.role = "arrow";
+      arrow.setAttribute("aria-hidden", "true");
       const copy = document.createElement("span");
       copy.dataset.role = "copy";
+      copy.setAttribute("role", "status");
+      copy.setAttribute("aria-live", "polite");
+      toggle.append(arrow, copy);
+      toggle.addEventListener("click", () => {
+        setGithubImportNoticeExpanded(!githubImportNoticeExpanded);
+      });
       const dismiss = document.createElement("button");
       dismiss.type = "button";
       dismiss.className = "ol-lean-icon-button";
-      dismiss.textContent = "×";
-      dismiss.setAttribute("aria-label", "Dismiss GitHub import status");
-      dismiss.addEventListener("click", () => githubImportNotice?.remove());
-      githubImportNotice.append(copy, dismiss);
+      dismiss.dataset.role = "dismiss";
+      dismiss.addEventListener("click", () => {
+        if (githubImportNotice?.dataset.active === "true") {
+          setGithubImportNoticeExpanded(false);
+          return;
+        }
+        githubImportNotice?.remove();
+      });
+      header.append(toggle, dismiss);
+
+      const details = document.createElement("div");
+      details.className = "ol-lean-github-import-notice-details";
+      details.dataset.role = "details";
+      details.hidden = true;
+      githubImportNotice.append(header, details);
       (document.body || document.documentElement).appendChild(githubImportNotice);
     }
+    githubImportNotice.dataset.importId = importId;
+    githubImportNotice.dataset.active = String(!settled && Boolean(importId));
     githubImportNotice.querySelector("[data-role='copy']").textContent = message;
     githubImportNotice.classList.toggle("is-error", error);
     githubImportNotice.classList.toggle("is-settled", settled);
+    const toggle = githubImportNotice.querySelector("[data-role='toggle']");
+    if (toggle) {
+      toggle.disabled = queue.length === 0;
+      toggle.title = queue.length > 0 ? "Show remaining formalizations" : "";
+    }
+    const arrow = githubImportNotice.querySelector("[data-role='arrow']");
+    if (arrow) arrow.hidden = queue.length === 0;
+    const details = githubImportNotice.querySelector("[data-role='details']");
+    details?.replaceChildren();
+    if (details && queue.length > 0) {
+      const list = document.createElement("ol");
+      list.className = "ol-lean-github-import-queue";
+      for (const item of queue) {
+        const row = document.createElement("li");
+        row.className = `is-${item.state}`;
+        const marker = document.createElement("span");
+        marker.className = "ol-lean-github-import-queue-marker";
+        marker.textContent = item.state === "checking" ? "●" : "○";
+        marker.setAttribute("aria-hidden", "true");
+        const label = document.createElement("strong");
+        label.textContent = item.label;
+        const state = document.createElement("span");
+        state.textContent = item.state === "checking" ? "Checking now" : "Queued";
+        row.append(marker, label, state);
+        list.appendChild(row);
+      }
+      details.appendChild(list);
+    }
+    if (settled || queue.length === 0) githubImportNoticeExpanded = false;
+    setGithubImportNoticeExpanded(githubImportNoticeExpanded);
     if (settled) {
       githubImportNoticeTimer = setTimeout(() => githubImportNotice?.remove(), 8000);
     }
@@ -1121,7 +1275,8 @@
       if (activeGithubImport !== tracker) return;
       tracker.progress = progress;
       renderGithubImportSurfaceState();
-      showGithubImportNotice(githubImportProgressText(progress));
+      const queue = githubImportFormalizationQueue(tracker);
+      showGithubImportNotice(githubImportNoticeText(tracker, queue), { queue });
       if (!GITHUB_IMPORT_ACTIVE_STATUSES.has(progress.status)) {
         settleGithubImportTracking(tracker, progress);
         return;
@@ -1139,9 +1294,10 @@
       projectId,
       baseUrl,
       progress,
-      targetKeys: new Set(leanPaneView.githubImportMatchedTargetKeys(preview, targets)),
+      targetDetails: leanPaneView.githubImportMatchedTargets(preview, targets),
       timer: null,
     };
+    tracker.targetKeys = new Set(tracker.targetDetails.map((target) => target.key));
     if (!tracker.id || !GITHUB_IMPORT_ACTIVE_STATUSES.has(progress?.status)) {
       showGithubImportNotice(
         progress?.status === "complete"
@@ -1155,9 +1311,11 @@
       return;
     }
     if (activeGithubImport?.timer) clearTimeout(activeGithubImport.timer);
+    githubImportNoticeExpanded = false;
     activeGithubImport = tracker;
     renderGithubImportSurfaceState();
-    showGithubImportNotice(githubImportProgressText(progress));
+    const queue = githubImportFormalizationQueue(tracker);
+    showGithubImportNotice(githubImportNoticeText(tracker, queue), { queue });
     tracker.timer = setTimeout(() => pollGithubImport(tracker), GITHUB_IMPORT_POLL_MS);
   }
 
@@ -1586,15 +1744,28 @@
     }
 
     const projectId = extractOverleafProjectId();
-    const files = await getLeanPaneProjectFiles({ projectId, forceFetch });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
-    try {
-      const identity = await loadProjectIdentity({ baseUrl, projectId });
-      lastProjectIdentity = identity;
-      renderLeanPaneProjectIdentity(identity);
-    } catch {}
-    const response = await fetch(`${baseUrl}/lean-pane/manifest`, {
+
+    // Identity and the Overleaf archive are independent. Fetching them in
+    // parallel prevents a slow project download from leaving the header at its
+    // placeholder namespace, and both requests are bounded so pane startup can
+    // always settle into either content or a useful error state.
+    loadProjectIdentity({ baseUrl, projectId })
+      .then((identity) => {
+        lastProjectIdentity = identity;
+        renderLeanPaneProjectIdentity(identity);
+      })
+      .catch(() => {});
+    const files = await getLeanPaneProjectFiles({
+      projectId,
+      forceFetch,
+      // Never make the user wait for Overleaf to prepare a ZIP. The live or
+      // cached sources are enough to render useful pane content immediately;
+      // the complete inventory hydrates and re-renders in the background.
+      deferArchiveFetch: !background
+    });
+    const { response, payload } = await fetchJsonWithTimeout(`${baseUrl}/lean-pane/manifest`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1602,17 +1773,34 @@
         activePath: latestActiveTexPath || "",
         files
       })
+    }, {
+      timeoutMs: LEAN_PANE_COMPANION_TIMEOUT_MS,
+      timeoutMessage: "The Lea companion timed out while loading the project inventory."
     });
-    const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
-    await reconcileHumanApprovals(
+    // Personal-approval storage is presentation metadata, not project
+    // inventory. Chrome storage can occasionally be slow to wake after an
+    // extension reload; never hold the entire pane behind it. Reconcile and
+    // repaint when it settles.
+    reconcileHumanApprovals(
       (payload.items || []).map((item) => ({
         target: paneItemApprovalTarget(item),
         statusInfo: item
       }))
-    );
+    ).then((changed) => {
+      if (
+        changed
+        &&
+        leanPane
+        && leanPaneMainView === "items"
+        && lastLeanPaneManifest
+        && lastLeanPaneManifestProjectId === projectId
+      ) {
+        renderLeanPaneManifest(lastLeanPaneManifest);
+      }
+    }).catch(() => {});
     renderLeanPaneManifest(payload);
     scheduleLeanPanePollIfNeeded(payload);
   }
@@ -1626,8 +1814,9 @@
     }, pushConnected ? LEAN_PANE_POLL_RECONCILE_MS : LEAN_PANE_POLL_DELAY_MS);
   }
 
-  async function getLeanPaneProjectFiles({ projectId, forceFetch }) {
+  async function getLeanPaneProjectFiles({ projectId, forceFetch, deferArchiveFetch = false }) {
     if (!projectId || projectId === "unknown") {
+      leanPaneInventoryWarning = "";
       return latestActiveTexPath && typeof latestActiveTex === "string"
         ? [{ path: latestActiveTexPath, content: latestActiveTex }]
         : [];
@@ -1639,14 +1828,81 @@
       projectId
     });
     let files;
-    if (needFetch) {
-      files = await collectProjectTexFiles(projectId);
+    if (needFetch && deferArchiveFetch) {
+      files = fallbackLeanPaneProjectFiles(projectId);
+      leanPaneInventoryWarning = "Loading the full Overleaf project inventory in the background.";
+      queueLeanPaneArchiveRefresh(projectId);
+    } else if (needFetch) {
+      try {
+        files = await loadLeanPaneArchive(projectId);
+        leanPaneInventoryWarning = "";
+      } catch {
+        files = fallbackLeanPaneProjectFiles(projectId);
+        leanPaneInventoryWarning = leanPaneArchiveUnavailableMessage(files);
+      }
     } else {
       files = lastLeanPaneFiles.map((file) => ({ ...file }));
       leanPaneView.overlayActiveTex(files, latestActiveTexPath, latestActiveTex);
     }
     lastLeanPaneFiles = files.map((file) => ({ ...file }));
     lastLeanPaneProjectId = projectId;
+    return files;
+  }
+
+  function leanPaneArchiveUnavailableMessage(files) {
+    return files.length > 1
+      ? "The Overleaf archive was unavailable; showing cached and live TeX files."
+      : files.length === 1
+        ? "The Overleaf archive was unavailable; showing the open TeX file."
+        : "The Overleaf archive was unavailable. Use Refresh to try again.";
+  }
+
+  function loadLeanPaneArchive(projectId) {
+    if (leanPaneArchiveLoad?.projectId === projectId) return leanPaneArchiveLoad.promise;
+    const entry = { projectId, promise: null };
+    entry.promise = collectProjectTexFiles(projectId, { timeoutMs: LEAN_PANE_ARCHIVE_TIMEOUT_MS })
+      .finally(() => {
+        if (leanPaneArchiveLoad === entry) leanPaneArchiveLoad = null;
+      });
+    leanPaneArchiveLoad = entry;
+    return entry.promise;
+  }
+
+  function queueLeanPaneArchiveRefresh(projectId) {
+    loadLeanPaneArchive(projectId)
+      .then((files) => {
+        if (extractOverleafProjectId() !== projectId) return;
+        lastLeanPaneFiles = files.map((file) => ({ ...file }));
+        lastLeanPaneProjectId = projectId;
+        leanPaneInventoryWarning = "";
+        if (leanPane && leanPaneMainView === "items") {
+          refreshLeanPaneNow({ background: true }).catch(renderLeanPaneError);
+        }
+      })
+      .catch(() => {
+        if (extractOverleafProjectId() !== projectId || lastLeanPaneProjectId !== projectId) return;
+        leanPaneInventoryWarning = leanPaneArchiveUnavailableMessage(lastLeanPaneFiles || []);
+        if (
+          leanPane
+          && leanPaneMainView === "items"
+          && lastLeanPaneManifest
+          && lastLeanPaneManifestProjectId === projectId
+        ) {
+          renderLeanPaneManifest(lastLeanPaneManifest);
+        }
+      });
+  }
+
+  function fallbackLeanPaneProjectFiles(projectId) {
+    const files = lastLeanPaneProjectId === projectId && Array.isArray(lastLeanPaneFiles)
+      ? lastLeanPaneFiles.map((file) => ({ ...file }))
+      : [];
+    const activeBelongsToProject = !latestActiveTexProjectId || latestActiveTexProjectId === projectId;
+    const activePath = String(latestActiveTexPath || "").replace(/^\/+/, "");
+    if (!activeBelongsToProject || !activePath || typeof latestActiveTex !== "string") return files;
+    const active = files.find((file) => file.path === activePath);
+    if (active) active.content = latestActiveTex;
+    else files.push({ path: activePath, content: latestActiveTex });
     return files;
   }
 
@@ -1659,11 +1915,15 @@
     const useRelationships = leanPaneView.buildPaneUseRelationships(items);
     const fileCount = tree.files.length;
     lastLeanPaneManifest = manifest || null;
+    lastLeanPaneManifestProjectId = extractOverleafProjectId();
     prepareLeanPaneTreeExpansion(manifest, tree);
     leanPaneBody.replaceChildren();
-    leanPaneStatus.textContent = items.length
+    const inventorySummary = items.length
       ? `${items.length} labeled item${items.length === 1 ? "" : "s"} across ${fileCount} .tex file${fileCount === 1 ? "" : "s"}.`
       : "No labeled theorem, lemma, proposition, corollary, or definition environments found.";
+    leanPaneStatus.textContent = leanPaneInventoryWarning
+      ? `${inventorySummary} ${leanPaneInventoryWarning}`
+      : inventorySummary;
 
     if (Array.isArray(manifest?.diagnostics) && manifest.diagnostics.length > 0) {
       const visibleDiagnostics = manifest.diagnostics.slice(0, 4);
@@ -1708,14 +1968,37 @@
     if (!leanPaneProjectTitle || !leanPaneProjectNamespace) return;
     const fallback = guessProjectName(lastLeanPaneFiles || []);
     leanPaneProjectTitle.textContent = identity?.projectName || fallback;
-    leanPaneProjectNamespace.textContent = identity?.namespace || "Namespace unavailable";
+    leanPaneProjectNamespace.textContent = identity?.namespace || "Namespace not created yet";
   }
 
   async function loadProjectIdentity({ baseUrl, projectId }) {
-    const response = await fetch(`${baseUrl}/project/identity?overleafProjectId=${encodeURIComponent(projectId)}`);
-    const payload = await response.json().catch(() => ({}));
+    const { response, payload } = await fetchJsonWithTimeout(
+      `${baseUrl}/project/identity?overleafProjectId=${encodeURIComponent(projectId)}`,
+      {},
+      {
+        timeoutMs: LEAN_PANE_COMPANION_TIMEOUT_MS,
+        timeoutMessage: "The Lea companion timed out while loading the project identity."
+      }
+    );
     if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     return payload.identity || null;
+  }
+
+  async function fetchJsonWithTimeout(url, options = {}, { timeoutMs, timeoutMessage }) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    try {
+      const response = await fetch(url, controller ? { ...options, signal: controller.signal } : options);
+      const payload = await response.json().catch(() => ({}));
+      return { response, payload };
+    } catch (error) {
+      if (controller?.signal.aborted) throw new Error(timeoutMessage);
+      throw error;
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
+    }
   }
 
   async function previewProjectIdentity({ baseUrl, projectId, projectName, namespace = "", excludeProjectId = "" }) {
@@ -5296,14 +5579,29 @@
   // its .tex entries as [{ path, content }]. Overlays the live active-editor buffer
   // when its path is known, so the file being edited is current even if Overleaf's
   // saved copy lags. Unzipping uses the dependency-free reader in zipTex.mjs.
-  async function collectProjectTexFiles(projectId) {
-    const response = await fetch(`/project/${encodeURIComponent(projectId)}/download/zip`, {
-      credentials: "same-origin"
-    });
-    if (!response.ok) {
-      throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
+  async function collectProjectTexFiles(projectId, { timeoutMs = LEAN_PANE_ARCHIVE_TIMEOUT_MS } = {}) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    let buffer;
+    try {
+      const response = await fetch(`/project/${encodeURIComponent(projectId)}/download/zip`, {
+        credentials: "same-origin",
+        ...(controller ? { signal: controller.signal } : {})
+      });
+      if (!response.ok) {
+        throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
+      }
+      buffer = await response.arrayBuffer();
+    } catch (error) {
+      if (controller?.signal.aborted) {
+        throw new Error("Overleaf timed out while preparing the project download.");
+      }
+      throw error;
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
     }
-    const buffer = await response.arrayBuffer();
     const { extractLatexSourcesFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
     const files = await extractLatexSourcesFromZip(buffer);
 

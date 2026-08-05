@@ -17,6 +17,7 @@ import {
   formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
+  githubImportMatchedTargets,
   githubImportMatchedTargetKeys,
   hasInProgressItems,
   highlightLeanLine,
@@ -266,6 +267,7 @@ test("githubImportMatchedTargetKeys locks only matched declarations in importabl
       files: [
         {
           disposition: "add",
+          destination_path: "Stable.lean",
           declarations: [{ match: {
             origin_key: "project-1:theorem:stable_marker",
             declaration_name: "renamed_theorem",
@@ -273,6 +275,7 @@ test("githubImportMatchedTargetKeys locks only matched declarations in importabl
         },
         {
           disposition: "path_conflict",
+          destination_path: "Conflict.lean",
           declarations: [{ match: {
             origin_key: "project-1:theorem:conflict_marker",
             declaration_name: "conflict_theorem",
@@ -280,6 +283,7 @@ test("githubImportMatchedTargetKeys locks only matched declarations in importabl
         },
         {
           disposition: "already_present",
+          destination_path: "Fallback.lean",
           declarations: [{ match: {
             origin_key: null,
             declaration_name: "fallback_definition",
@@ -292,6 +296,17 @@ test("githubImportMatchedTargetKeys locks only matched declarations in importabl
   assert.deepEqual(
     githubImportMatchedTargetKeys(preview, targets).sort(),
     ["definition:fallback_marker", "theorem:stable_marker"],
+  );
+  assert.deepEqual(
+    githubImportMatchedTargets(preview, targets).map((target) => ({
+      key: target.key,
+      displayTitle: target.displayTitle,
+      destinationPath: target.destinationPath,
+    })),
+    [
+      { key: "theorem:stable_marker", displayTitle: "renamed_theorem", destinationPath: "Stable.lean" },
+      { key: "definition:fallback_marker", displayTitle: "fallback_definition", destinationPath: "Fallback.lean" },
+    ],
   );
 });
 

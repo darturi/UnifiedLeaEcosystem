@@ -516,9 +516,9 @@ export function paneItemToGithubImportTarget(item) {
 // look busy.  Prefer the stable origin key emitted by the companion, with the
 // declaration name as a compatibility fallback for older formalization rows
 // that predate origin keys.
-export function githubImportMatchedTargetKeys(preview, targets) {
+export function githubImportMatchedTargets(preview, targets) {
   const candidates = Array.isArray(targets) ? targets : [];
-  const matched = new Set();
+  const matched = new Map();
   for (const file of preview?.plan?.files || []) {
     if (!file || !["add", "already_present"].includes(file.disposition)) continue;
     for (const declaration of file.declarations || []) {
@@ -533,11 +533,27 @@ export function githubImportMatchedTargetKeys(preview, targets) {
           && originKey.endsWith(`:${kind}:${label}`);
         const declarationMatches = !originKey && declarationName
           && String(match.declaration_name || "") === declarationName;
-        if (originMatches || declarationMatches) matched.add(`${kind}:${label}`);
+        if (originMatches || declarationMatches) {
+          const key = `${kind}:${label}`;
+          if (!matched.has(key)) {
+            matched.set(key, {
+              key,
+              targetKind: kind,
+              targetLabel: label,
+              declarationName,
+              displayTitle: String(target?.displayTitle || match.display_title || declarationName || label),
+              destinationPath: String(file.destination_path || ""),
+            });
+          }
+        }
       }
     }
   }
-  return [...matched];
+  return [...matched.values()];
+}
+
+export function githubImportMatchedTargetKeys(preview, targets) {
+  return githubImportMatchedTargets(preview, targets).map((target) => target.key);
 }
 
 // Pane statuses that correspond to a real Lea run or saved proof artifact.

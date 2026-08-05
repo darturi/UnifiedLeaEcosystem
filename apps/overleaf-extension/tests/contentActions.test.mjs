@@ -261,6 +261,70 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /missing stub/);
 });
 
+test("Lean pane falls back to the live TeX file when the Overleaf archive is unavailable", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      failProjectArchive: true,
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:thm:main",
+          kind: "theorem",
+          label: "thm:main",
+          title: "Main theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 3,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.match(harness.bodyText(), /Lean namespace: Lea\.TestProject/);
+  assert.match(harness.bodyText(), /The Overleaf archive was unavailable; showing the open TeX file\./);
+  assert.doesNotMatch(harness.bodyText(), /Loading project inventory/);
+  assert.ok(
+    harness.fetchCalls.some((call) => call.url.includes("/lean-pane/manifest")),
+    "the fallback source should still be sent to the companion manifest endpoint"
+  );
+});
+
+test("Lean pane times out a hanging Overleaf archive instead of remaining on the loading screen", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      hangProjectArchive: true,
+      hangProjectIdentity: true,
+      hangHumanApprovals: true,
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  assert.match(harness.bodyText(), /Loading the full Overleaf project inventory in the background/);
+  assert.doesNotMatch(harness.bodyText(), /Loading project inventory/);
+
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /The Overleaf archive was unavailable; showing the open TeX file\./);
+  assert.doesNotMatch(harness.bodyText(), /Loading project inventory/);
+});
+
 test("settings open over the Lean pane and closing them preserves the pane", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -370,28 +434,50 @@ test("GitHub import closes after confirmation and locks matched theorems while c
     leanKind: "theorem",
     leanDeclarationName: "demo_theorem",
   };
+  const queuedManifestItem = {
+    ...manifestItem,
+    id: "theorem:queued_theorem:1",
+    label: "queued_theorem",
+    naturalLanguageRendered: "Another theorem.",
+    naturalLanguageLatex: "Another theorem.",
+    leanDeclarationName: "queued_theorem",
+  };
   const harness = createContentHarness(
     { status: "unformalized" },
     {},
     {
       locationPath: "/project/unknown",
-      manifest: { ok: true, rootFile: "main.tex", items: [manifestItem], diagnostics: [] },
+      manifest: { ok: true, rootFile: "main.tex", items: [manifestItem, queuedManifestItem], diagnostics: [] },
       githubImportPreview: {
         preview_id: "preview-queued",
         plan: {
-          counts: { add: 1 },
-          files: [{
-            source_path: "Demo.lean",
-            destination_path: "Demo.lean",
-            disposition: "add",
-            reason: "New Lean file",
-            declarations: [{
-              match: {
-                origin_key: "project-1:theorem:demo_theorem",
-                declaration_name: "demo_theorem",
-              },
-            }],
-          }],
+          counts: { add: 2 },
+          files: [
+            {
+              source_path: "Demo.lean",
+              destination_path: "Demo.lean",
+              disposition: "add",
+              reason: "New Lean file",
+              declarations: [{
+                match: {
+                  origin_key: "project-1:theorem:demo_theorem",
+                  declaration_name: "demo_theorem",
+                },
+              }],
+            },
+            {
+              source_path: "Queued.lean",
+              destination_path: "Queued.lean",
+              disposition: "add",
+              reason: "New Lean file",
+              declarations: [{
+                match: {
+                  origin_key: "project-1:theorem:queued_theorem",
+                  declaration_name: "queued_theorem",
+                },
+              }],
+            },
+          ],
           reusable_declarations: 0,
           blocking_error: null,
         },
@@ -399,21 +485,37 @@ test("GitHub import closes after confirmation and locks matched theorems while c
       githubImportConfirm: {
         id: "import-queued",
         status: "checking",
+        files: [
+          { destination_path: "Demo.lean", check_status: "pending" },
+          { destination_path: "Queued.lean", check_status: "pending" },
+        ],
+        declarations: [
+          { declaration_name: "demo_theorem", destination_path: "Demo.lean", formalization_id: "formalization-1" },
+          { declaration_name: "queued_theorem", destination_path: "Queued.lean", formalization_id: "formalization-2" },
+        ],
         counts: {
-          dispositions: { add: 1 },
-          matched_declarations: 1,
+          dispositions: { add: 2 },
+          matched_declarations: 2,
           reusable_declarations: 0,
-          checks: { pending: 1, ok: 0, error: 0 },
+          checks: { pending: 2, ok: 0, error: 0 },
         },
       },
       githubImportStatus: {
         id: "import-queued",
         status: "complete",
+        files: [
+          { destination_path: "Demo.lean", check_status: "ok" },
+          { destination_path: "Queued.lean", check_status: "ok" },
+        ],
+        declarations: [
+          { declaration_name: "demo_theorem", destination_path: "Demo.lean", formalization_id: "formalization-1" },
+          { declaration_name: "queued_theorem", destination_path: "Queued.lean", formalization_id: "formalization-2" },
+        ],
         counts: {
-          dispositions: { add: 1 },
-          matched_declarations: 1,
+          dispositions: { add: 2 },
+          matched_declarations: 2,
           reusable_declarations: 0,
-          checks: { pending: 0, ok: 1, error: 0 },
+          checks: { pending: 0, ok: 2, error: 0 },
         },
       },
     }
@@ -429,12 +531,43 @@ test("GitHub import closes after confirmation and locks matched theorems while c
   harness.setGithubImportUrl("https://github.com/example/formalizations");
   harness.clickButtonText("Analyze");
   await flushPromises();
-  harness.clickButtonText("Add 1 Lean file");
+  harness.clickButtonText("Add 2 Lean files");
   await flushPromises();
 
   assert.equal(harness.countSelector(".ol-lean-github-import-dialog"), 0);
-  assert.match(harness.bodyText(), /1 imported Lean file is queued for checking/);
-  assert.equal(harness.countSelector(".ol-lean-project-status-in-progress"), 1);
+  assert.match(harness.bodyText(), /2 formalizations remaining · Checking demo_theorem/);
+  harness.clickButtonRole("toggle");
+  assert.deepEqual(harness.githubImportQueue(), [
+    { label: "demo_theorem", state: "Checking now" },
+    { label: "queued_theorem", state: "Queued" },
+  ]);
+  assert.deepEqual(harness.githubImportNoticeState(), {
+    expanded: "true",
+    detailsHidden: false,
+    minimizeHidden: false,
+  });
+
+  harness.clickOutsideGithubImportNotice();
+  assert.deepEqual(harness.githubImportNoticeState(), {
+    expanded: "false",
+    detailsHidden: true,
+    minimizeHidden: true,
+  });
+  assert.equal(
+    harness.countSelector(".ol-lean-github-import-notice"),
+    1,
+    "clicking away should minimize the active import queue instead of dismissing it"
+  );
+
+  harness.clickButtonRole("toggle");
+  harness.clickButtonLabel("Minimize GitHub import status");
+  assert.deepEqual(harness.githubImportNoticeState(), {
+    expanded: "false",
+    detailsHidden: true,
+    minimizeHidden: true,
+  });
+  assert.equal(harness.countSelector(".ol-lean-github-import-notice"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-status-in-progress"), 2);
   harness.openTargetPopover();
   assert.equal(harness.hasButtonText("Checking import…"), true);
 
@@ -2035,6 +2168,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   };
 
   const context = {
+    AbortController,
     URL,
     TextEncoder,
     katex: options.katex,
@@ -2052,6 +2186,28 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     document,
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
+      if (options.hangProjectIdentity && String(url).includes("/project/identity?")) {
+        return new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => reject(new Error("Project identity request aborted."));
+          if (fetchOptions?.signal?.aborted) rejectOnAbort();
+          else fetchOptions?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      }
+      if (options.hangProjectArchive && String(url).includes("/download/zip")) {
+        return new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => reject(new Error("Project archive request aborted."));
+          if (fetchOptions?.signal?.aborted) rejectOnAbort();
+          else fetchOptions?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      }
+      if (options.failProjectArchive && String(url).includes("/download/zip")) {
+        return {
+          ok: false,
+          status: 503,
+          async json() { return {}; },
+          async arrayBuffer() { return new ArrayBuffer(0); }
+        };
+      }
       const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
       const formalizeRequest = String(url).endsWith("/formalize");
       const formalizeFailure = formalizeRequest
@@ -2224,6 +2380,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         },
         local: {
           async get(defaults) {
+            if (options.hangHumanApprovals) return new Promise(() => {});
             return { ...defaults, ...localStorageState };
           },
           async set(values) {
@@ -2354,6 +2511,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(button, `expected a button with role "${role}"`);
       button.click();
     },
+    clickOutsideGithubImportNotice() {
+      document.dispatchEvent({ type: "click", target: document.body });
+    },
     editTextarea() {
       return document.body.querySelector(".ol-lean-project-edit-textarea");
     },
@@ -2449,6 +2609,23 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
+    },
+    githubImportQueue() {
+      const list = document.body.querySelector(".ol-lean-github-import-queue");
+      if (!list) return [];
+      return list.children.map((row) => ({
+        label: row.children[1]?.textContent || "",
+        state: row.children[2]?.textContent || ""
+      }));
+    },
+    githubImportNoticeState() {
+      const notice = document.body.querySelector(".ol-lean-github-import-notice");
+      if (!notice) return null;
+      return {
+        expanded: notice.querySelector("[data-role='toggle']")?.attributes["aria-expanded"] || "",
+        detailsHidden: Boolean(notice.querySelector("[data-role='details']")?.hidden),
+        minimizeHidden: Boolean(notice.querySelector("[data-role='dismiss']")?.hidden),
+      };
     },
     paneActionError() {
       const alert = document.body.querySelector(".ol-lean-project-action-error");
