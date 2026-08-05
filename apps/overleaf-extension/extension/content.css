@@ -78,6 +78,36 @@
 .ol-lean-github-import-status.is-error { color: var(--ol-red); }
 .ol-lean-github-import-content footer { display: flex; justify-content: flex-end; gap: 7px; margin-top: 14px; }
 
+.ol-lean-github-import-notice {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(520px, calc(100vw - 36px));
+  padding: 11px 12px 11px 14px;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-left: 3px solid var(--ol-accent);
+  border-radius: 10px;
+  box-shadow: var(--ol-shadow-float);
+  font: 12px/1.45 var(--ol-sans);
+}
+
+.ol-lean-github-import-notice.is-settled { border-left-color: var(--ol-green); }
+.ol-lean-github-import-notice.is-error { border-left-color: var(--ol-red); }
+.ol-lean-github-import-notice > span { flex: 1; }
+.ol-lean-github-import-notice .ol-lean-icon-button { flex: 0 0 auto; }
+
+.ol-lean-project-import-state {
+  margin: 8px 0 0;
+  color: var(--ol-muted);
+  font: 11.5px/1.45 var(--ol-sans);
+}
+
 .ol-lean-theorem {
   background: rgba(28, 28, 32, 0.08);
   border-bottom: 1px solid rgba(28, 28, 32, 0.3);

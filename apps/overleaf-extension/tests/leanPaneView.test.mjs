@@ -17,6 +17,7 @@ import {
   formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
+  githubImportMatchedTargetKeys,
   hasInProgressItems,
   highlightLeanLine,
   overlayActiveTex,
@@ -251,6 +252,46 @@ test("paneItemToGithubImportTarget keeps the stable label and current declaratio
       statement: "Every x has P(x).",
       sourceHash: "source-sha",
     },
+  );
+});
+
+test("githubImportMatchedTargetKeys locks only matched declarations in importable files", () => {
+  const targets = [
+    { targetKind: "theorem", targetLabel: "stable_marker", declarationName: "renamed_theorem" },
+    { targetKind: "theorem", targetLabel: "conflict_marker", declarationName: "conflict_theorem" },
+    { targetKind: "definition", targetLabel: "fallback_marker", declarationName: "fallback_definition" },
+  ];
+  const preview = {
+    plan: {
+      files: [
+        {
+          disposition: "add",
+          declarations: [{ match: {
+            origin_key: "project-1:theorem:stable_marker",
+            declaration_name: "renamed_theorem",
+          } }],
+        },
+        {
+          disposition: "path_conflict",
+          declarations: [{ match: {
+            origin_key: "project-1:theorem:conflict_marker",
+            declaration_name: "conflict_theorem",
+          } }],
+        },
+        {
+          disposition: "already_present",
+          declarations: [{ match: {
+            origin_key: null,
+            declaration_name: "fallback_definition",
+          } }],
+        },
+      ],
+    },
+  };
+
+  assert.deepEqual(
+    githubImportMatchedTargetKeys(preview, targets).sort(),
+    ["definition:fallback_marker", "theorem:stable_marker"],
   );
 });
 

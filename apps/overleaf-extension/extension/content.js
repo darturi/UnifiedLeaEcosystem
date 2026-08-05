@@ -37,6 +37,8 @@
   const LEAN_PANE_CHAT_POLL_RECONCILE_MS = 30000;
   const REPAIR_BATCH_POLL_MS = 2000;
   const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
+  const GITHUB_IMPORT_POLL_MS = 1000;
+  const GITHUB_IMPORT_ACTIVE_STATUSES = new Set(["applying", "checking"]);
   const HUMAN_APPROVAL_STORAGE_KEY = "leaHumanApprovalsV1";
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
@@ -65,6 +67,13 @@
   // only the active buffer; the zip refresh happens on this cadence.
   let lastTexMirrorFullSyncAt = 0;
   let latestStatuses = {};
+  // Server-provided target truth is kept separately from the short-lived UI
+  // overlay used while imported proofs are being checked. This prevents an
+  // ordinary /statuses refresh from re-enabling a matched target mid-import.
+  let latestBaseStatuses = {};
+  let activeGithubImport = null;
+  let githubImportNotice = null;
+  let githubImportNoticeTimer = null;
   let humanApprovals = {};
   let humanApprovalsLoadPromise = null;
   let humanApprovalBusyKeys = new Set();
@@ -815,6 +824,190 @@
     return error instanceof Error ? error.message : String(error);
   }
 
+  function githubImportProgressText(progress) {
+    const checks = progress?.counts?.checks || {};
+    const passed = Number(checks.ok || 0);
+    const failed = Number(checks.error || 0);
+    const pending = Number(checks.pending || 0);
+    if (progress?.status === "applying") return "Adding Lean files from GitHub…";
+    if (passed === 0 && failed === 0) {
+      return pending > 0
+        ? `${pending} imported Lean file${pending === 1 ? " is" : "s are"} queued for checking.`
+        : "Imported Lean files are queued for local checks.";
+    }
+    return `Checking imported Lean files: ${passed} passed · ${failed} failed · ${pending} pending`;
+  }
+
+  function githubImportCompletionText(progress) {
+    const dispositions = progress?.counts?.dispositions || {};
+    const conflicts = Number(dispositions.path_conflict || 0)
+      + Number(dispositions.declaration_conflict || 0);
+    return `${progress?.reused ? "Already imported · " : ""}${Number(dispositions.add || 0)} added · ${Number(dispositions.already_present || 0)} already present · ${conflicts} conflicts skipped · ${Number(progress?.counts?.matched_declarations || 0)} formalizations populated · ${Number(progress?.counts?.reusable_declarations || 0)} reusable declarations`;
+  }
+
+  function showGithubImportNotice(message, { error = false, settled = false } = {}) {
+    clearTimeout(githubImportNoticeTimer);
+    githubImportNoticeTimer = null;
+    if (!githubImportNotice?.isConnected) {
+      githubImportNotice = document.createElement("div");
+      githubImportNotice.className = "ol-lean-github-import-notice";
+      githubImportNotice.setAttribute("role", "status");
+      githubImportNotice.setAttribute("aria-live", "polite");
+      const copy = document.createElement("span");
+      copy.dataset.role = "copy";
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "ol-lean-icon-button";
+      dismiss.textContent = "×";
+      dismiss.setAttribute("aria-label", "Dismiss GitHub import status");
+      dismiss.addEventListener("click", () => githubImportNotice?.remove());
+      githubImportNotice.append(copy, dismiss);
+      (document.body || document.documentElement).appendChild(githubImportNotice);
+    }
+    githubImportNotice.querySelector("[data-role='copy']").textContent = message;
+    githubImportNotice.classList.toggle("is-error", error);
+    githubImportNotice.classList.toggle("is-settled", settled);
+    if (settled) {
+      githubImportNoticeTimer = setTimeout(() => githubImportNotice?.remove(), 8000);
+    }
+  }
+
+  function githubImportStatusOverlay(statuses) {
+    const overlaid = { ...(statuses || {}) };
+    if (!activeGithubImport) return overlaid;
+    const message = githubImportProgressText(activeGithubImport.progress);
+    for (const key of activeGithubImport.targetKeys) {
+      const current = overlaid[key] || {};
+      overlaid[key] = {
+        ...current,
+        status: "in_progress",
+        effectiveStatus: current.effectiveStatus || current.status || "unformalized",
+        message,
+        githubImportPending: true,
+        githubImportId: activeGithubImport.id,
+      };
+    }
+    return overlaid;
+  }
+
+  function restoreGithubImportPaneItem(item) {
+    if (!item?.githubImportPending) return item;
+    const restored = {
+      ...item,
+      status: item.githubImportPreviousStatus,
+      inProgress: item.githubImportPreviousInProgress,
+      message: item.githubImportPreviousMessage,
+    };
+    delete restored.githubImportPending;
+    delete restored.githubImportId;
+    delete restored.githubImportPreviousStatus;
+    delete restored.githubImportPreviousInProgress;
+    delete restored.githubImportPreviousMessage;
+    return restored;
+  }
+
+  function githubImportPaneOverlay(manifest) {
+    if (!manifest || !Array.isArray(manifest.items)) return manifest;
+    const items = manifest.items.map((rawItem) => {
+      const item = restoreGithubImportPaneItem(rawItem);
+      const kind = item?.leanKind === "def" ? "definition" : "theorem";
+      const label = String(item?.label || item?.leanDeclarationName || "").trim();
+      if (!activeGithubImport?.targetKeys.has(`${kind}:${label}`)) return item;
+      return {
+        ...item,
+        status: "in-progress",
+        inProgress: true,
+        message: githubImportProgressText(activeGithubImport.progress),
+        githubImportPending: true,
+        githubImportId: activeGithubImport.id,
+        githubImportPreviousStatus: item.status,
+        githubImportPreviousInProgress: item.inProgress,
+        githubImportPreviousMessage: item.message,
+      };
+    });
+    return { ...manifest, items };
+  }
+
+  function renderGithubImportSurfaceState() {
+    latestStatuses = githubImportStatusOverlay(latestBaseStatuses);
+    renderStatusBadges();
+    if (activePopover?.dataset.targetKey) {
+      const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
+      if (target) updatePopoverStatus(activePopover, target);
+    }
+    if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
+  }
+
+  function settleGithubImportTracking(tracker, progress) {
+    if (activeGithubImport !== tracker) return;
+    activeGithubImport = null;
+    renderGithubImportSurfaceState();
+    const complete = progress?.status === "complete";
+    const detail = progress?.error_detail
+      ? ` ${String(progress.error_detail)}`
+      : "";
+    showGithubImportNotice(
+      complete
+        ? `GitHub import complete. ${githubImportCompletionText(progress)}`
+        : `GitHub import finished with issues.${detail}`,
+      { error: !complete, settled: true }
+    );
+    refreshLeanPaneNow({ forceFetch: true, background: true }).catch(() => {});
+    refreshStatusesNow().catch(() => {});
+    refreshShareStatusAfterProjectEnsure().catch(() => {});
+  }
+
+  async function pollGithubImport(tracker) {
+    if (activeGithubImport !== tracker) return;
+    try {
+      const response = await fetch(
+        `${tracker.baseUrl}/project/github-import/status?overleafProjectId=${encodeURIComponent(tracker.projectId)}&importId=${encodeURIComponent(tracker.id)}`
+      );
+      const progress = await response.json().catch(() => ({}));
+      if (!response.ok) throw companionRequestError(response, progress);
+      if (activeGithubImport !== tracker) return;
+      tracker.progress = progress;
+      renderGithubImportSurfaceState();
+      showGithubImportNotice(githubImportProgressText(progress));
+      if (!GITHUB_IMPORT_ACTIVE_STATUSES.has(progress.status)) {
+        settleGithubImportTracking(tracker, progress);
+        return;
+      }
+    } catch (error) {
+      if (activeGithubImport !== tracker) return;
+      showGithubImportNotice(`GitHub import is still running, but its status could not be refreshed. Retrying… ${errorText(error)}`, { error: true });
+    }
+    tracker.timer = setTimeout(() => pollGithubImport(tracker), GITHUB_IMPORT_POLL_MS);
+  }
+
+  function startGithubImportTracking({ progress, preview, targets, projectId, baseUrl }) {
+    const tracker = {
+      id: String(progress?.id || ""),
+      projectId,
+      baseUrl,
+      progress,
+      targetKeys: new Set(leanPaneView.githubImportMatchedTargetKeys(preview, targets)),
+      timer: null,
+    };
+    if (!tracker.id || !GITHUB_IMPORT_ACTIVE_STATUSES.has(progress?.status)) {
+      showGithubImportNotice(
+        progress?.status === "complete"
+          ? `GitHub import complete. ${githubImportCompletionText(progress)}`
+          : `GitHub import finished with issues. ${githubImportCompletionText(progress)}`,
+        { error: progress?.status !== "complete", settled: true }
+      );
+      refreshLeanPaneNow({ forceFetch: true, background: true }).catch(() => {});
+      refreshStatusesNow().catch(() => {});
+      refreshShareStatusAfterProjectEnsure().catch(() => {});
+      return;
+    }
+    if (activeGithubImport?.timer) clearTimeout(activeGithubImport.timer);
+    activeGithubImport = tracker;
+    renderGithubImportSurfaceState();
+    showGithubImportNotice(githubImportProgressText(progress));
+    tracker.timer = setTimeout(() => pollGithubImport(tracker), GITHUB_IMPORT_POLL_MS);
+  }
+
   async function openGithubImportDialog() {
     await ensureLeanPaneView();
     await refreshLeanPaneNow({ forceFetch: true, background: true });
@@ -824,7 +1017,6 @@
       leanPaneView.paneItemToGithubImportTarget(item)
     );
     let preview = null;
-    let closed = false;
 
     const overlay = document.createElement("div");
     overlay.className = "ol-lean-github-import-overlay";
@@ -855,7 +1047,6 @@
     const confirmButton = overlay.querySelector("[data-role='confirm']");
 
     const close = () => {
-      closed = true;
       overlay.remove();
     };
     overlay.querySelector("[data-role='close']")?.addEventListener("click", close);
@@ -929,38 +1120,17 @@
     confirmButton.addEventListener("click", async () => {
       if (!preview?.preview_id) return;
       confirmButton.disabled = true;
-      setStatus("Adding files and starting local checks...");
+      setStatus("Adding files and handing checks to the background...");
       try {
         const response = await fetch(`${baseUrl}/project/github-import/confirm`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ overleafProjectId: projectId, previewId: preview.preview_id })
         });
-        let progress = await response.json().catch(() => ({}));
+        const progress = await response.json().catch(() => ({}));
         if (!response.ok) throw companionRequestError(response, progress);
-        resultNode.replaceChildren();
-        while (!closed && ["applying", "checking"].includes(progress.status)) {
-          const checks = progress.counts?.checks || {};
-          setStatus(`Checking Lean files: ${checks.ok || 0} passed · ${checks.error || 0} failed · ${checks.pending || 0} pending`);
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          if (closed) return;
-          const poll = await fetch(
-            `${baseUrl}/project/github-import/status?overleafProjectId=${encodeURIComponent(projectId)}&importId=${encodeURIComponent(progress.id)}`
-          );
-          progress = await poll.json().catch(() => ({}));
-          if (!poll.ok) throw companionRequestError(poll, progress);
-        }
-        if (closed) return;
-        const dispositions = progress.counts?.dispositions || {};
-        const completion = document.createElement("div");
-        completion.className = "ol-lean-github-import-completion";
-        completion.textContent = `${progress.reused ? "Already imported · " : ""}${dispositions.add || 0} added · ${dispositions.already_present || 0} already present · ${(dispositions.path_conflict || 0) + (dispositions.declaration_conflict || 0)} conflicts skipped · ${progress.counts?.matched_declarations || 0} formalizations populated · ${progress.counts?.reusable_declarations || 0} reusable declarations`;
-        resultNode.replaceChildren(completion);
-        setStatus(progress.status === "complete" ? "GitHub import complete." : "Import finished with issues.", progress.status !== "complete");
-        confirmButton.hidden = true;
-        overlay.querySelector("[data-role='cancel']").textContent = "Done";
-        await refreshLeanPaneNow({ forceFetch: true, background: true });
-        await refreshShareStatusAfterProjectEnsure();
+        startGithubImportTracking({ progress, preview, targets, projectId, baseUrl });
+        close();
       } catch (error) {
         setStatus(errorText(error), true);
         confirmButton.disabled = false;
@@ -1329,6 +1499,7 @@
 
   function renderLeanPaneManifest(manifest) {
     if (!leanPaneBody || !leanPaneStatus) return;
+    manifest = githubImportPaneOverlay(manifest);
     const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
     const tree = leanPaneView.buildLeanPaneTree(items);
@@ -2009,6 +2180,14 @@
     natural.className = "ol-lean-project-natural";
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
+
+    if (item.githubImportPending) {
+      const importState = document.createElement("p");
+      importState.className = "ol-lean-project-import-state";
+      importState.setAttribute("role", "status");
+      importState.textContent = item.message || "Imported Lean proof is queued for checking.";
+      card.appendChild(importState);
+    }
 
     const relationships = renderLeanPaneUseRelationships(item, useRelationships);
     if (relationships) card.appendChild(relationships);
@@ -4048,6 +4227,15 @@
 
   function renderTargetActions(actions, target, currentStatus, status, leanStatement, actionStatus = currentStatus, statusInfo = {}) {
     actions.replaceChildren();
+    if (statusInfo.githubImportPending) {
+      const checking = document.createElement("button");
+      checking.type = "button";
+      checking.textContent = "Checking import…";
+      checking.disabled = true;
+      checking.title = "This item cannot be formalized again until its imported Lean proof has been checked.";
+      actions.appendChild(checking);
+      return;
+    }
     const disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
     const actionSpecs = actionSpecsForStatus(actionStatus, target);
     for (const spec of actionSpecs) {
@@ -4820,7 +5008,9 @@
       const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
       if (target) updatePopoverStatus(activePopover, target);
     }
-    if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
+    if (Object.values(latestStatuses).some((status) => (
+      status.status === "in_progress" && !status.githubImportPending
+    ))) {
       scheduleStatusRefresh(pushConnected ? STATUS_REFRESH_RECONCILE_MS : STATUS_REFRESH_IN_PROGRESS_MS);
     }
   }
@@ -5131,7 +5321,8 @@
   }
 
   function postStatuses(statuses) {
-    latestStatuses = statuses || {};
+    latestBaseStatuses = statuses || {};
+    latestStatuses = githubImportStatusOverlay(latestBaseStatuses);
     renderStatusBadges();
   }
 
@@ -5256,6 +5447,9 @@
   }
 
   function inProgressMessage(statusInfo, target = null) {
+    if (statusInfo?.githubImportPending) {
+      return statusInfo.message || `An imported Lean ${targetNoun(target)} is queued for checking.`;
+    }
     const turnProgressText = formatTurnProgress(statusInfo);
     const noun = targetNoun(target);
     return turnProgressText

@@ -330,6 +330,99 @@ test("GitHub import refreshes a Share panel that was opened before the project e
   );
 });
 
+test("GitHub import closes after confirmation and locks matched theorems while checks run", async () => {
+  const manifestItem = {
+    id: "theorem:demo_theorem:0",
+    kind: "theorem",
+    label: "demo_theorem",
+    status: "missing-stub",
+    formalizable: true,
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageRendered: "A theorem.",
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    leanDeclarationName: "demo_theorem",
+  };
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [manifestItem], diagnostics: [] },
+      githubImportPreview: {
+        preview_id: "preview-queued",
+        plan: {
+          counts: { add: 1 },
+          files: [{
+            source_path: "Demo.lean",
+            destination_path: "Demo.lean",
+            disposition: "add",
+            reason: "New Lean file",
+            declarations: [{
+              match: {
+                origin_key: "project-1:theorem:demo_theorem",
+                declaration_name: "demo_theorem",
+              },
+            }],
+          }],
+          reusable_declarations: 0,
+          blocking_error: null,
+        },
+      },
+      githubImportConfirm: {
+        id: "import-queued",
+        status: "checking",
+        counts: {
+          dispositions: { add: 1 },
+          matched_declarations: 1,
+          reusable_declarations: 0,
+          checks: { pending: 1, ok: 0, error: 0 },
+        },
+      },
+      githubImportStatus: {
+        id: "import-queued",
+        status: "complete",
+        counts: {
+          dispositions: { add: 1 },
+          matched_declarations: 1,
+          reusable_declarations: 0,
+          checks: { pending: 0, ok: 1, error: 0 },
+        },
+      },
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickButtonText("Share");
+  await flushPromises();
+  harness.clickButtonText("Add Lean files from GitHub");
+  await flushPromises();
+  harness.setGithubImportUrl("https://github.com/example/formalizations");
+  harness.clickButtonText("Analyze");
+  await flushPromises();
+  harness.clickButtonText("Add 1 Lean file");
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-github-import-dialog"), 0);
+  assert.match(harness.bodyText(), /1 imported Lean file is queued for checking/);
+  assert.equal(harness.countSelector(".ol-lean-project-status-in-progress"), 1);
+  harness.openTargetPopover();
+  assert.equal(harness.hasButtonText("Checking import…"), true);
+
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /GitHub import complete/);
+  assert.equal(harness.hasButtonText("Checking import…"), false);
+  assert.ok(
+    harness.fetchCalls.some((call) => call.url.includes("/project/github-import/status")),
+    "the background tracker should poll independently of the closed dialog"
+  );
+});
+
 test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
   const manifest = (calls) => {
     const renamed = calls.some((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
@@ -1948,6 +2041,15 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               status: "complete",
               counts: { dispositions: {}, matched_declarations: 0, reusable_declarations: 0, checks: {} }
             };
+          }
+          if (String(url).includes("/project/github-import/status")) {
+            return typeof options.githubImportStatus === "function"
+              ? options.githubImportStatus(fetchCalls)
+              : options.githubImportStatus || {
+                id: "import-1",
+                status: "complete",
+                counts: { dispositions: {}, matched_declarations: 0, reusable_declarations: 0, checks: {} }
+              };
           }
           if (String(url).includes("/lean-pane/manifest")) {
             return typeof options.manifest === "function"
