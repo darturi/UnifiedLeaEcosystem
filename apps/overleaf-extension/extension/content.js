@@ -709,6 +709,20 @@
     renderShareControls();
   }
 
+  // GitHub-import preview ensures the adapter project exists, even when the
+  // Overleaf document did not have one before. Refresh the already-open Share
+  // panel after that transition (and again after apply) so it does not retain
+  // the pre-import `exists: false` snapshot. A status-refresh failure should
+  // not turn a successful preview/import into a failed import operation.
+  async function refreshShareStatusAfterProjectEnsure() {
+    if (!leanPaneSharePanel) return;
+    try {
+      await loadShareStatus();
+    } catch (error) {
+      setShareStatus(`Could not refresh share status: ${errorText(error)}`);
+    }
+  }
+
   function renderShareControls() {
     if (!leanPaneSharePanel) return;
     const input = leanPaneSharePanel.querySelector("[data-role='share-remote']");
@@ -902,6 +916,7 @@
         const body = await response.json().catch(() => ({}));
         if (!response.ok) throw companionRequestError(response, body);
         preview = body;
+        await refreshShareStatusAfterProjectEnsure();
         renderPlan(body);
         setStatus("Review the additive file plan before confirming.");
       } catch (error) {
@@ -945,6 +960,7 @@
         confirmButton.hidden = true;
         overlay.querySelector("[data-role='cancel']").textContent = "Done";
         await refreshLeanPaneNow({ forceFetch: true, background: true });
+        await refreshShareStatusAfterProjectEnsure();
       } catch (error) {
         setStatus(errorText(error), true);
         confirmButton.disabled = false;

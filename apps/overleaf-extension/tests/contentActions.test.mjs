@@ -261,6 +261,75 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /missing stub/);
 });
 
+test("GitHub import refreshes a Share panel that was opened before the project existed", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      shareStatus(calls) {
+        const projectEnsured = calls.some((call) => call.url.includes("/project/github-import/preview"));
+        return { ok: true, exists: projectEnsured, remoteUrl: null, tokenConfigured: true };
+      },
+      githubImportPreview: {
+        preview_id: "preview-1",
+        plan: {
+          counts: { add: 1, already_present: 0, path_conflict: 0, declaration_conflict: 0 },
+          files: [{
+            source_path: "Imported.lean",
+            destination_path: "Imported.lean",
+            disposition: "add",
+            reason: "New Lean file"
+          }],
+          reusable_declarations: 1,
+          blocking_error: null
+        }
+      },
+      githubImportConfirm: {
+        id: "import-1",
+        status: "complete",
+        reused: false,
+        counts: {
+          dispositions: { add: 1, already_present: 0, path_conflict: 0, declaration_conflict: 0 },
+          matched_declarations: 0,
+          reusable_declarations: 1,
+          checks: { ok: 1, error: 0, pending: 0 }
+        }
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  harness.clickButtonText("Share");
+  await flushPromises();
+  assert.match(harness.bodyText(), /This document has no Lea project yet/);
+
+  harness.clickButtonText("Add Lean files from GitHub");
+  await flushPromises();
+  harness.setGithubImportUrl("https://github.com/example/formalizations");
+  harness.clickButtonText("Analyze");
+  await flushPromises();
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github?")).length,
+    2,
+    "preview should re-read Share state because it ensures the project"
+  );
+  assert.doesNotMatch(harness.bodyText(), /This document has no Lea project yet/);
+  assert.match(harness.bodyText(), /Save a GitHub remote/);
+
+  harness.clickButtonText("Add 1 Lean file");
+  await flushPromises();
+
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github?")).length,
+    3,
+    "completed import should refresh Share state again"
+  );
+});
+
 test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
   const manifest = (calls) => {
     const renamed = calls.some((call) => call.url.endsWith("/project/identity") && call.options?.method === "PUT");
@@ -1862,6 +1931,24 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               identity: currentProjectIdentity
             };
           }
+          if (String(url).includes("/share/github?")) {
+            return typeof options.shareStatus === "function"
+              ? options.shareStatus(fetchCalls)
+              : options.shareStatus || { ok: true, exists: true, remoteUrl: null, tokenConfigured: true };
+          }
+          if (String(url).includes("/project/github-import/preview")) {
+            return options.githubImportPreview || {
+              preview_id: "preview-1",
+              plan: { counts: {}, files: [], reusable_declarations: 0, blocking_error: null }
+            };
+          }
+          if (String(url).includes("/project/github-import/confirm")) {
+            return options.githubImportConfirm || {
+              id: "import-1",
+              status: "complete",
+              counts: { dispositions: {}, matched_declarations: 0, reusable_declarations: 0, checks: {} }
+            };
+          }
           if (String(url).includes("/lean-pane/manifest")) {
             return typeof options.manifest === "function"
               ? options.manifest(fetchCalls)
@@ -2085,6 +2172,11 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(input, "expected project identity input");
       input.value = value;
       input.dispatchEvent({ type: "input" });
+    },
+    setGithubImportUrl(value) {
+      const input = document.body.querySelector("[data-role='url']");
+      assert.ok(input, `expected GitHub import URL input; body was: ${document.body.textContent}`);
+      input.value = value;
     },
     setProjectIdentitySync(checked) {
       const input = document.body.querySelector(".ol-lean-project-identity-sync-input");
@@ -2385,6 +2477,53 @@ class FakeElement {
     this._textContent = "";
     this.children = [];
     const html = String(value || "");
+    if (html.includes('data-role="share-remote"')) {
+      const remote = this.appendChild(new FakeElement("input"));
+      remote.dataset.role = "share-remote";
+      const save = this.appendChild(new FakeElement("button"));
+      save.dataset.role = "share-save";
+      save.textContent = "Save remote";
+      const push = this.appendChild(new FakeElement("button"));
+      push.dataset.role = "share-push";
+      push.textContent = "Push to GitHub";
+      const exportButton = this.appendChild(new FakeElement("button"));
+      exportButton.dataset.role = "share-export";
+      exportButton.textContent = "Download .zip";
+      const importButton = this.appendChild(new FakeElement("button"));
+      importButton.dataset.role = "github-import";
+      importButton.textContent = "Add Lean files from GitHub";
+      const hint = this.appendChild(new FakeElement("p"));
+      hint.dataset.role = "share-hint";
+      hint.hidden = true;
+      const status = this.appendChild(new FakeElement("p"));
+      status.dataset.role = "share-status";
+      status.textContent = "Loading share status...";
+      return;
+    }
+    if (html.includes("ol-lean-github-import-dialog")) {
+      const dialog = this.appendChild(new FakeElement("section"));
+      dialog.className = "ol-lean-github-import-dialog";
+      const close = dialog.appendChild(new FakeElement("button"));
+      close.dataset.role = "close";
+      close.textContent = "x";
+      const url = dialog.appendChild(new FakeElement("input"));
+      url.dataset.role = "url";
+      const result = dialog.appendChild(new FakeElement("div"));
+      result.dataset.role = "result";
+      const status = dialog.appendChild(new FakeElement("p"));
+      status.dataset.role = "status";
+      const cancel = dialog.appendChild(new FakeElement("button"));
+      cancel.dataset.role = "cancel";
+      cancel.textContent = "Cancel";
+      const analyze = dialog.appendChild(new FakeElement("button"));
+      analyze.dataset.role = "analyze";
+      analyze.textContent = "Analyze";
+      const confirm = dialog.appendChild(new FakeElement("button"));
+      confirm.dataset.role = "confirm";
+      confirm.textContent = "Add Lean files";
+      confirm.hidden = true;
+      return;
+    }
     if (html.includes("ol-lean-popover-title")) {
       this.appendChild(new FakeElement("p")).className = "ol-lean-popover-title";
       const meta = this.appendChild(new FakeElement("p"));
@@ -2414,6 +2553,18 @@ class FakeElement {
   appendChild(child) {
     child.parentNode = this;
     this.children.push(child);
+    return child;
+  }
+
+  append(...children) {
+    for (const child of children) this.appendChild(child);
+  }
+
+  insertBefore(child, reference) {
+    child.parentNode = this;
+    const index = this.children.indexOf(reference);
+    if (index === -1) this.children.push(child);
+    else this.children.splice(index, 0, child);
     return child;
   }
 
