@@ -2134,9 +2134,48 @@ button.ol-lean-project-relationship-chip {
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  width: min(360px, calc(100vw - 24px));
+  width: min(var(--ol-lean-settings-width, 360px), calc(100vw - 24px));
+  min-width: min(360px, calc(100vw - 24px));
+  max-width: min(720px, calc(100vw - 24px));
   max-height: calc(100vh - 24px);
   max-height: calc(100dvh - 24px);
+}
+
+.ol-lean-settings-popover-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  z-index: 2;
+  width: 10px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.ol-lean-settings-popover-resizer::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 4px;
+  width: 1px;
+  border-radius: 1px;
+  background: transparent;
+}
+
+.ol-lean-settings-popover-resizer:hover::before,
+.ol-lean-settings-popover-resizer:focus-visible::before,
+.ol-lean-settings-popover-resizing .ol-lean-settings-popover-resizer::before {
+  background: var(--ol-accent);
+}
+
+body.ol-lean-settings-resizing {
+  cursor: ew-resize;
+  user-select: none;
 }
 
 .ol-lean-settings-popover .ol-lean-popover-body {

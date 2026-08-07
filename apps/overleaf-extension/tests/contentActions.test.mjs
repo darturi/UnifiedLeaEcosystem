@@ -356,6 +356,134 @@ test("settings open over the Lean pane and closing them preserves the pane", asy
   assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
 });
 
+test("settings popover renders an accessible persisted resize handle", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-settings-popover-resizer"), 1);
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+  assert.deepEqual(harness.settingsPopoverResizerValues(), {
+    orientation: "vertical",
+    min: "360",
+    max: "720",
+    now: "360"
+  });
+});
+
+test("settings popover drag resizing grows left, clamps, and persists independently", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  harness.dragSettingsPopoverResizer({ startX: 360, moves: [260] });
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "460px");
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 460 });
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+
+  harness.dragSettingsPopoverResizer({ startX: 260, moves: [1000] });
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 360 });
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+});
+
+test("settings popover applies its stored width when reopened", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { settingsPopoverWidthPx: 640 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "640px");
+
+  harness.clickButtonLabel("Close Lea popover");
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "640px");
+});
+
+test("settings popover keyboard resizing honors min and max", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  harness.keySettingsPopoverResizer("ArrowLeft");
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "384px");
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 384 });
+
+  harness.keySettingsPopoverResizer("ArrowRight", { shiftKey: true });
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+
+  harness.keySettingsPopoverResizer("End");
+  assert.equal(harness.settingsPopoverWidthStyle(), "720px");
+  assert.deepEqual(harness.settingsPopoverResizerValues(), {
+    orientation: "vertical",
+    min: "360",
+    max: "720",
+    now: "720"
+  });
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 720 });
+});
+
+test("settings popover clamps and stays bottom-right anchored when the viewport narrows", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { settingsPopoverWidthPx: 700 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "700px");
+
+  harness.window.innerWidth = 600;
+  harness.window.dispatchEvent({ type: "resize" });
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "576px");
+  assert.deepEqual(harness.settingsPopoverAnchorStyle(), {
+    right: "20px",
+    left: "auto",
+    top: "auto"
+  });
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 576 });
+});
+
+test("closing settings during a resize removes the drag lifecycle", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  harness.startSettingsPopoverResize(360);
+  assert.equal(harness.bodyHasClass("ol-lean-settings-resizing"), true);
+
+  harness.clickButtonLabel("Close Lea popover");
+  assert.equal(harness.bodyHasClass("ol-lean-settings-resizing"), false);
+  harness.moveSettingsPopoverResize(100);
+  harness.finishSettingsPopoverResize(100);
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+  assert.equal(
+    harness.storageSetCalls.some((values) => Object.prototype.hasOwnProperty.call(values, "settingsPopoverWidthPx")),
+    false
+  );
+});
+
 test("GitHub token settings use a full-width editor with cancel, reveal, save, and remove states", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -2653,6 +2781,62 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       const textarea = this.editTextarea();
       assert.ok(textarea, "expected the edit textarea to be present");
       textarea.value = value;
+    },
+    settingsPopover() {
+      return document.body.querySelector(".ol-lean-settings-popover");
+    },
+    settingsPopoverResizer() {
+      return document.body.querySelector(".ol-lean-settings-popover-resizer");
+    },
+    settingsPopoverWidthStyle() {
+      return this.settingsPopover()?.style["--ol-lean-settings-width"] || "";
+    },
+    settingsPopoverResizerValues() {
+      const resizer = this.settingsPopoverResizer();
+      return resizer ? {
+        orientation: resizer.attributes["aria-orientation"],
+        min: resizer.attributes["aria-valuemin"],
+        max: resizer.attributes["aria-valuemax"],
+        now: resizer.attributes["aria-valuenow"]
+      } : null;
+    },
+    settingsPopoverAnchorStyle() {
+      const popover = this.settingsPopover();
+      return popover ? {
+        right: popover.style.right || "",
+        left: popover.style.left || "",
+        top: popover.style.top || ""
+      } : null;
+    },
+    startSettingsPopoverResize(startX) {
+      const resizer = this.settingsPopoverResizer();
+      assert.ok(resizer, "expected settings popover resizer");
+      resizer.dispatchEvent({
+        type: "mousedown",
+        button: 0,
+        clientX: startX,
+        preventDefault() {},
+        stopPropagation() {}
+      });
+    },
+    moveSettingsPopoverResize(clientX) {
+      document.dispatchEvent({ type: "mousemove", clientX });
+    },
+    finishSettingsPopoverResize(clientX) {
+      document.dispatchEvent({ type: "mouseup", clientX });
+    },
+    dragSettingsPopoverResizer({ startX, moves }) {
+      this.startSettingsPopoverResize(startX);
+      for (const clientX of moves) this.moveSettingsPopoverResize(clientX);
+      this.finishSettingsPopoverResize(moves[moves.length - 1] ?? startX);
+    },
+    keySettingsPopoverResizer(key, patch = {}) {
+      const resizer = this.settingsPopoverResizer();
+      assert.ok(resizer, "expected settings popover resizer");
+      resizer.dispatchEvent({ type: "keydown", key, ...patch });
+    },
+    bodyHasClass(className) {
+      return document.body.classList.contains(className);
     },
     leanPane() {
       return document.body.querySelector(".ol-lean-project-pane");

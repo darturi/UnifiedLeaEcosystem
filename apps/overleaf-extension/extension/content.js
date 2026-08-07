@@ -22,6 +22,13 @@
   const LEAN_PANE_VIEWPORT_GUTTER_PX = 24;
   const LEAN_PANE_KEYBOARD_STEP_PX = 24;
   const LEAN_PANE_KEYBOARD_LARGE_STEP_PX = 80;
+  const SETTINGS_POPOVER_WIDTH_STORAGE_KEY = "settingsPopoverWidthPx";
+  const DEFAULT_SETTINGS_POPOVER_WIDTH_PX = 360;
+  const MIN_SETTINGS_POPOVER_WIDTH_PX = 360;
+  const MAX_SETTINGS_POPOVER_WIDTH_PX = 720;
+  const SETTINGS_POPOVER_VIEWPORT_GUTTER_PX = 24;
+  const SETTINGS_POPOVER_KEYBOARD_STEP_PX = 24;
+  const SETTINGS_POPOVER_KEYBOARD_LARGE_STEP_PX = 80;
   // Short debounce for an edit-triggered status refresh; a much longer cadence
   // for the in-progress self-poll so an active run doesn't hammer /statuses
   // (each hit does per-target FS scans + adapter fetches) four times a second
@@ -52,6 +59,8 @@
     { value: DEFAULT_LEA_MODEL, label: DEFAULT_LEA_MODEL, family: "openai" }
   ];
   let activePopover = null;
+  let settingsPopoverWidthPx = DEFAULT_SETTINGS_POPOVER_WIDTH_PX;
+  let settingsPopoverResizeState = null;
   let statusRefreshTimer = null;
   let usageRefreshTimer = null;
   let latestTargets = [];
@@ -248,6 +257,7 @@
   renderSettingsButton();
   renderLeanPaneButton();
   hydrateLeanPaneWidthFromStorage();
+  hydrateSettingsPopoverWidthFromStorage();
   loadHumanApprovals().then(() => {
     renderStatusBadges();
     if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
@@ -298,6 +308,7 @@
   window.addEventListener("resize", () => {
     renderStatusBadges();
     clampOpenLeanPaneToViewport();
+    clampOpenSettingsPopoverToViewport();
   });
   // Capture-phase scroll fires very frequently; coalesce to one update per
   // animation frame (AUDIT M4) instead of re-parsing the whole document and
@@ -568,6 +579,156 @@
     if (nextWidth === leanPaneWidthPx) return;
     applyLeanPaneWidth(nextWidth);
     persistLeanPaneWidth();
+  }
+
+  function hydrateSettingsPopoverWidthFromStorage() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.get({ [SETTINGS_POPOVER_WIDTH_STORAGE_KEY]: DEFAULT_SETTINGS_POPOVER_WIDTH_PX })
+      .then((settings) => {
+        settingsPopoverWidthPx = clampSettingsPopoverWidth(settings?.[SETTINGS_POPOVER_WIDTH_STORAGE_KEY]);
+        applySettingsPopoverWidth();
+      })
+      .catch(() => {
+        settingsPopoverWidthPx = clampSettingsPopoverWidth(DEFAULT_SETTINGS_POPOVER_WIDTH_PX);
+        applySettingsPopoverWidth();
+      });
+  }
+
+  function maxSettingsPopoverWidthPx() {
+    const viewportWidth = Number(window.innerWidth)
+      || DEFAULT_SETTINGS_POPOVER_WIDTH_PX + SETTINGS_POPOVER_VIEWPORT_GUTTER_PX;
+    return Math.max(
+      0,
+      Math.min(MAX_SETTINGS_POPOVER_WIDTH_PX, viewportWidth - SETTINGS_POPOVER_VIEWPORT_GUTTER_PX)
+    );
+  }
+
+  function minSettingsPopoverWidthPx() {
+    return Math.min(MIN_SETTINGS_POPOVER_WIDTH_PX, maxSettingsPopoverWidthPx());
+  }
+
+  function clampSettingsPopoverWidth(width) {
+    const numeric = Number.parseInt(String(width), 10);
+    const fallback = Number.isFinite(numeric) ? numeric : DEFAULT_SETTINGS_POPOVER_WIDTH_PX;
+    const maxWidth = maxSettingsPopoverWidthPx();
+    return Math.min(Math.max(fallback, minSettingsPopoverWidthPx()), maxWidth);
+  }
+
+  function isSettingsPopover(popover) {
+    return Boolean(popover?.classList?.contains("ol-lean-settings-popover"));
+  }
+
+  function applySettingsPopoverWidth(width = settingsPopoverWidthPx, popover = activePopover) {
+    settingsPopoverWidthPx = clampSettingsPopoverWidth(width);
+    if (isSettingsPopover(popover)) {
+      popover.style.setProperty("--ol-lean-settings-width", `${settingsPopoverWidthPx}px`);
+      const resizer = popover.querySelector(".ol-lean-settings-popover-resizer");
+      resizer?.setAttribute("aria-valuemin", String(minSettingsPopoverWidthPx()));
+      resizer?.setAttribute("aria-valuemax", String(maxSettingsPopoverWidthPx()));
+      resizer?.setAttribute("aria-valuenow", String(settingsPopoverWidthPx));
+    }
+    return settingsPopoverWidthPx;
+  }
+
+  function persistSettingsPopoverWidth() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.set({ [SETTINGS_POPOVER_WIDTH_STORAGE_KEY]: settingsPopoverWidthPx }).catch(() => {});
+  }
+
+  function clampOpenSettingsPopoverToViewport() {
+    const nextWidth = clampSettingsPopoverWidth(settingsPopoverWidthPx);
+    const widthChanged = nextWidth !== settingsPopoverWidthPx;
+    if (isSettingsPopover(activePopover)) {
+      applySettingsPopoverWidth(nextWidth, activePopover);
+      positionSettingsPopover(activePopover);
+    } else {
+      settingsPopoverWidthPx = nextWidth;
+    }
+    if (widthChanged) persistSettingsPopoverWidth();
+  }
+
+  function startSettingsPopoverResize(event) {
+    const popover = activePopover;
+    if (!isSettingsPopover(popover) || settingsPopoverResizeState) return;
+    if (event.type === "mousedown" && event.button !== undefined && event.button !== 0) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    settingsPopoverResizeState = {
+      popover,
+      startClientX: Number(event.clientX) || 0,
+      startWidth: settingsPopoverWidthPx,
+      pointerId: event.pointerId,
+      usingPointer: event.type === "pointerdown"
+    };
+    popover.classList.add("ol-lean-settings-popover-resizing");
+    document.body?.classList?.add("ol-lean-settings-resizing");
+    if (settingsPopoverResizeState.usingPointer) {
+      document.addEventListener("pointermove", handleSettingsPopoverResizeMove, true);
+      document.addEventListener("pointerup", finishSettingsPopoverResize, true);
+      document.addEventListener("pointercancel", cancelSettingsPopoverResize, true);
+    } else {
+      document.addEventListener("mousemove", handleSettingsPopoverResizeMove, true);
+      document.addEventListener("mouseup", finishSettingsPopoverResize, true);
+    }
+  }
+
+  function handleSettingsPopoverResizeMove(event) {
+    if (!settingsPopoverResizeState) return;
+    if (
+      settingsPopoverResizeState.pointerId !== undefined
+      && event.pointerId !== undefined
+      && event.pointerId !== settingsPopoverResizeState.pointerId
+    ) return;
+    event.preventDefault?.();
+    const currentClientX = Number(event.clientX) || 0;
+    const delta = settingsPopoverResizeState.startClientX - currentClientX;
+    applySettingsPopoverWidth(
+      settingsPopoverResizeState.startWidth + delta,
+      settingsPopoverResizeState.popover
+    );
+  }
+
+  function finishSettingsPopoverResize(event) {
+    event?.preventDefault?.();
+    stopSettingsPopoverResize({ persist: true });
+  }
+
+  function cancelSettingsPopoverResize(event) {
+    event?.preventDefault?.();
+    stopSettingsPopoverResize({ persist: false });
+  }
+
+  function stopSettingsPopoverResize({ persist }) {
+    if (!settingsPopoverResizeState) return;
+    const { popover, usingPointer } = settingsPopoverResizeState;
+    settingsPopoverResizeState = null;
+    if (usingPointer) {
+      document.removeEventListener?.("pointermove", handleSettingsPopoverResizeMove, true);
+      document.removeEventListener?.("pointerup", finishSettingsPopoverResize, true);
+      document.removeEventListener?.("pointercancel", cancelSettingsPopoverResize, true);
+    } else {
+      document.removeEventListener?.("mousemove", handleSettingsPopoverResizeMove, true);
+      document.removeEventListener?.("mouseup", finishSettingsPopoverResize, true);
+    }
+    popover?.classList?.remove("ol-lean-settings-popover-resizing");
+    document.body?.classList?.remove("ol-lean-settings-resizing");
+    if (persist) persistSettingsPopoverWidth();
+  }
+
+  function handleSettingsPopoverResizeKeydown(event) {
+    let nextWidth = null;
+    const step = event.shiftKey
+      ? SETTINGS_POPOVER_KEYBOARD_LARGE_STEP_PX
+      : SETTINGS_POPOVER_KEYBOARD_STEP_PX;
+    if (event.key === "ArrowLeft") nextWidth = settingsPopoverWidthPx + step;
+    else if (event.key === "ArrowRight") nextWidth = settingsPopoverWidthPx - step;
+    else if (event.key === "Home") nextWidth = minSettingsPopoverWidthPx();
+    else if (event.key === "End") nextWidth = maxSettingsPopoverWidthPx();
+    if (nextWidth === null) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    applySettingsPopoverWidth(nextWidth);
+    persistSettingsPopoverWidth();
   }
 
   function startLeanPaneResize(event) {
@@ -5040,6 +5201,19 @@
       <p class="ol-lean-popover-status" role="status"></p>
     `;
 
+    const resizer = document.createElement("button");
+    resizer.type = "button";
+    resizer.className = "ol-lean-settings-popover-resizer";
+    resizer.setAttribute("role", "separator");
+    resizer.setAttribute("aria-orientation", "vertical");
+    resizer.setAttribute("aria-label", "Resize Lea settings");
+    resizer.title = "Resize Lea settings";
+    resizer.tabIndex = 0;
+    resizer.addEventListener("pointerdown", startSettingsPopoverResize);
+    resizer.addEventListener("mousedown", startSettingsPopoverResize);
+    resizer.addEventListener("keydown", handleSettingsPopoverResizeKeydown);
+    popover.insertBefore(resizer, popover.children[0] || null);
+
     const closeButton = popover.querySelector("[data-role='close']");
     const status = popover.querySelector(".ol-lean-popover-status");
     const modelSelect = popover.querySelector("[data-role='model']");
@@ -5183,9 +5357,10 @@
       }
     });
 
+    applySettingsPopoverWidth(settingsPopoverWidthPx, popover);
     document.body.appendChild(popover);
-    positionSettingsPopover(popover);
     activePopover = popover;
+    positionSettingsPopover(popover);
     loadPopoverSettings(popover).catch((error) => {
       status.textContent = error instanceof Error ? error.message : String(error);
     });
@@ -5207,6 +5382,7 @@
   function closePopover() {
     clearTimeout(usageRefreshTimer);
     usageRefreshTimer = null;
+    stopSettingsPopoverResize({ persist: false });
     if (activePopover) {
       activePopover.querySelector("[data-role='model']")?.leaModelPicker?.destroy();
       activePopover.remove();
@@ -5224,12 +5400,16 @@
   }
 
   function positionSettingsPopover(popover) {
-    const rect = popover.getBoundingClientRect();
     const buttonRect = settingsButton?.getBoundingClientRect();
     const right = 20;
     const bottom = buttonRect ? window.innerHeight - buttonRect.top + 12 : 76;
-    popover.style.left = `${Math.max(12, window.innerWidth - rect.width - right)}px`;
-    popover.style.top = `${Math.max(12, window.innerHeight - rect.height - bottom)}px`;
+    const anchoredBottom = Math.max(12, bottom);
+    const maxHeight = Math.max(0, window.innerHeight - anchoredBottom - 12);
+    popover.style.right = `${right}px`;
+    popover.style.bottom = `${anchoredBottom}px`;
+    popover.style.left = "auto";
+    popover.style.top = "auto";
+    popover.style.maxHeight = `${maxHeight}px`;
   }
 
   function updatePopoverStatus(popover, target) {
