@@ -493,6 +493,69 @@ export function paneItemToFormalizeTarget(item) {
   };
 }
 
+// Shape a current tagged item for the additive GitHub import flow. The stable
+// LaTeX marker label remains the identity anchor; the current Lean declaration
+// name is the exact code-match key. The companion, not the page, computes the
+// origin key so import/formalize/chat always use identical identity semantics.
+export function paneItemToGithubImportTarget(item) {
+  const targetLabel = item?.label || item?.leanDeclarationName || "";
+  const declarationName = item?.leanDeclarationName || item?.label || "";
+  return {
+    targetKind: item?.leanKind === "def" ? "definition" : "theorem",
+    targetLabel,
+    declarationName,
+    displayTitle: declarationName || targetLabel,
+    statement: item?.naturalLanguageLatex || "",
+    sourceHash: item?.sourceHash || ""
+  };
+}
+
+// Return the document targets whose declarations will be populated by a
+// confirmed GitHub import.  The preview is authoritative here: files skipped
+// for either a path or declaration conflict must not make an unrelated item
+// look busy.  Prefer the stable origin key emitted by the companion, with the
+// declaration name as a compatibility fallback for older formalization rows
+// that predate origin keys.
+export function githubImportMatchedTargets(preview, targets) {
+  const candidates = Array.isArray(targets) ? targets : [];
+  const matched = new Map();
+  for (const file of preview?.plan?.files || []) {
+    if (!file || !["add", "already_present"].includes(file.disposition)) continue;
+    for (const declaration of file.declarations || []) {
+      const match = declaration?.match;
+      if (!match) continue;
+      for (const target of candidates) {
+        const kind = target?.targetKind === "definition" ? "definition" : "theorem";
+        const label = String(target?.targetLabel || "").trim();
+        const declarationName = String(target?.declarationName || label).trim();
+        const originKey = String(match.origin_key || "");
+        const originMatches = label
+          && originKey.endsWith(`:${kind}:${label}`);
+        const declarationMatches = !originKey && declarationName
+          && String(match.declaration_name || "") === declarationName;
+        if (originMatches || declarationMatches) {
+          const key = `${kind}:${label}`;
+          if (!matched.has(key)) {
+            matched.set(key, {
+              key,
+              targetKind: kind,
+              targetLabel: label,
+              declarationName,
+              displayTitle: String(target?.displayTitle || match.display_title || declarationName || label),
+              destinationPath: String(file.destination_path || ""),
+            });
+          }
+        }
+      }
+    }
+  }
+  return [...matched.values()];
+}
+
+export function githubImportMatchedTargetKeys(preview, targets) {
+  return githubImportMatchedTargets(preview, targets).map((target) => target.key);
+}
+
 // Pane statuses that correspond to a real Lea run or saved proof artifact.
 // Same rule the in-document popover applies before offering "View in Lea UI"
 // (companion statuses formalized / defined / disproved / in_progress /

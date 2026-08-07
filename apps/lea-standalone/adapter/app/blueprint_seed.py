@@ -31,6 +31,7 @@ from . import blueprint
 from . import graph
 from . import projects as project_service
 from . import store
+from .artifacts import scan_lean_declarations
 
 # Lean decl keyword → blueprint kind (definition = box, lemma/theorem = ellipse).
 _KEYWORD_KIND = {
@@ -46,6 +47,13 @@ _KEYWORD_KIND = {
 
 # Cap the auto-extracted signature used as node statement prose.
 _SIGNATURE_CAP = 240
+_SIGNATURE_DECL_RE = re.compile(
+    r"^\s*(?:@\[[^\]]*\]\s*)?"
+    r"(?:private\s+|protected\s+|noncomputable\s+|unsafe\s+|partial\s+|"
+    r"scoped\s+|local\s+)*"
+    r"(?:theorem|lemma|def|abbrev|structure|class|inductive|coinductive|instance|opaque)\s+"
+    r"[A-Za-z_][A-Za-z0-9_'.]*"
+)
 
 
 def _unique_key(base: str, taken: set[str]) -> str:
@@ -65,23 +73,10 @@ def _decl_span_and_keyword(text: str, short: str) -> tuple[str | None, str]:
     ``(None, "")`` when the decl isn't found in the text."""
     if not text:
         return None, ""
-    lines = text.splitlines()
-    start = None
-    keyword = None
-    for i, line in enumerate(lines):
-        decl = graph._DECL_RE.match(line)
-        if decl and graph._short(decl.group(2)) == short:
-            start = i
-            keyword = decl.group(1)
-            break
-    if start is None:
+    matches = [decl for decl in scan_lean_declarations(text) if decl.short_name == short]
+    if len(matches) != 1:
         return None, ""
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if graph._DECL_RE.match(lines[j]):
-            end = j
-            break
-    return keyword, "\n".join(lines[start:end])
+    return matches[0].keyword, matches[0].span
 
 
 def _signature(span_text: str) -> str:
@@ -92,7 +87,7 @@ def _signature(span_text: str) -> str:
     if not span_text:
         return ""
     head = span_text.split(":=", 1)[0]
-    decl = graph._DECL_RE.match(head)
+    decl = _SIGNATURE_DECL_RE.match(head)
     if decl:
         head = head[decl.end():]
     lines = [line.rstrip() for line in head.splitlines()]

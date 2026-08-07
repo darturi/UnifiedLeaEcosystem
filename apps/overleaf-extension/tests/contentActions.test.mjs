@@ -7,6 +7,12 @@ import vm from "node:vm";
 const repoRoot = path.resolve(import.meta.dirname, "../../..");
 const contentScriptPath = path.join(repoRoot, "apps/overleaf-extension/extension/content.js");
 const contentScript = fs.readFileSync(contentScriptPath, "utf8");
+const modelPickerScriptPath = path.join(repoRoot, "apps/overleaf-extension/extension/modelPicker.js");
+const modelPickerScript = fs.readFileSync(modelPickerScriptPath, "utf8");
+const contentStyles = fs.readFileSync(
+  path.join(repoRoot, "apps/overleaf-extension/extension/content.css"),
+  "utf8"
+);
 
 const CASES = [
   ["unformalized", { status: "unformalized", leaSessionId: "stale-session" }, false],
@@ -259,6 +265,585 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   harness.clickPaneTreeRowText("main.tex");
   assert.match(harness.bodyText(), /Main theorem/);
   assert.match(harness.bodyText(), /missing stub/);
+});
+
+test("Lean pane falls back to the live TeX file when the Overleaf archive is unavailable", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      failProjectArchive: true,
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:thm:main",
+          kind: "theorem",
+          label: "thm:main",
+          title: "Main theorem",
+          status: "missing-stub",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 3,
+          naturalLanguageRendered: "A theorem.",
+          naturalLanguageLatex: "A theorem.",
+          leanKind: "theorem"
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  assert.match(harness.bodyText(), /Lean namespace: Lea\.TestProject/);
+  assert.match(harness.bodyText(), /The Overleaf archive was unavailable; showing the open TeX file\./);
+  assert.doesNotMatch(harness.bodyText(), /Loading project inventory/);
+  assert.ok(
+    harness.fetchCalls.some((call) => call.url.includes("/lean-pane/manifest")),
+    "the fallback source should still be sent to the companion manifest endpoint"
+  );
+});
+
+test("Lean pane times out a hanging Overleaf archive instead of remaining on the loading screen", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      hangProjectArchive: true,
+      hangProjectIdentity: true,
+      hangHumanApprovals: true,
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  assert.match(harness.bodyText(), /Loading the full Overleaf project inventory in the background/);
+  assert.doesNotMatch(harness.bodyText(), /Loading project inventory/);
+
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /The Overleaf archive was unavailable; showing the open TeX file\./);
+  assert.doesNotMatch(harness.bodyText(), /Loading project inventory/);
+});
+
+test("settings open over the Lean pane and closing them preserves the pane", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.countSelector(".ol-lean-settings-popover"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+
+  harness.clickButtonLabel("Close Lea popover");
+  assert.equal(harness.countSelector(".ol-lean-settings-popover"), 0);
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+});
+
+test("settings popover renders an accessible persisted resize handle", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-settings-popover-resizer"), 1);
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+  assert.deepEqual(harness.settingsPopoverResizerValues(), {
+    orientation: "vertical",
+    min: "360",
+    max: "720",
+    now: "360"
+  });
+});
+
+test("settings popover drag resizing grows left, clamps, and persists independently", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  harness.dragSettingsPopoverResizer({ startX: 360, moves: [260] });
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "460px");
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 460 });
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+
+  harness.dragSettingsPopoverResizer({ startX: 260, moves: [1000] });
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 360 });
+  assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
+});
+
+test("settings popover applies its stored width when reopened", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { settingsPopoverWidthPx: 640 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "640px");
+
+  harness.clickButtonLabel("Close Lea popover");
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "640px");
+});
+
+test("settings popover keyboard resizing honors min and max", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  harness.keySettingsPopoverResizer("ArrowLeft");
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "384px");
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 384 });
+
+  harness.keySettingsPopoverResizer("ArrowRight", { shiftKey: true });
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+
+  harness.keySettingsPopoverResizer("End");
+  assert.equal(harness.settingsPopoverWidthStyle(), "720px");
+  assert.deepEqual(harness.settingsPopoverResizerValues(), {
+    orientation: "vertical",
+    min: "360",
+    max: "720",
+    now: "720"
+  });
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 720 });
+});
+
+test("settings popover clamps and stays bottom-right anchored when the viewport narrows", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    { storage: { settingsPopoverWidthPx: 700 } }
+  );
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "700px");
+
+  harness.window.innerWidth = 600;
+  harness.window.dispatchEvent({ type: "resize" });
+
+  assert.equal(harness.settingsPopoverWidthStyle(), "576px");
+  assert.deepEqual(harness.settingsPopoverAnchorStyle(), {
+    right: "20px",
+    left: "auto",
+    top: "auto"
+  });
+  assert.deepEqual(harness.lastStorageSet(), { settingsPopoverWidthPx: 576 });
+});
+
+test("closing settings during a resize removes the drag lifecycle", async () => {
+  const harness = createContentHarness({ status: "unformalized" });
+  await harness.loadVisibleTheorems();
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  harness.startSettingsPopoverResize(360);
+  assert.equal(harness.bodyHasClass("ol-lean-settings-resizing"), true);
+
+  harness.clickButtonLabel("Close Lea popover");
+  assert.equal(harness.bodyHasClass("ol-lean-settings-resizing"), false);
+  harness.moveSettingsPopoverResize(100);
+  harness.finishSettingsPopoverResize(100);
+
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+  assert.equal(harness.settingsPopoverWidthStyle(), "360px");
+  assert.equal(
+    harness.storageSetCalls.some((values) => Object.prototype.hasOwnProperty.call(values, "settingsPopoverWidthPx")),
+    false
+  );
+});
+
+test("GitHub token settings use a full-width editor with cancel, reveal, save, and remove states", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      companionSettings: { githubTokenConfigured: false },
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonLabel("Open Lea settings and usage");
+  await flushPromises();
+
+  assert.deepEqual(harness.githubTokenState(), {
+    configured: "false",
+    status: "Not set",
+    description: "Add a token to push Lean projects to GitHub.",
+    toggle: "Add GitHub token",
+    clearHidden: true,
+    summaryHidden: false,
+    editorHidden: true,
+    inputType: "password",
+    inputValue: "",
+    visibility: "Show"
+  });
+  assert.match(
+    contentStyles,
+    /\.ol-lean-github-token-field\s*\{[^}]*width:\s*100%/s,
+    "the credential field should occupy the full card width"
+  );
+
+  harness.clickButtonRole("github-token-toggle");
+  assert.equal(harness.githubTokenState().summaryHidden, true);
+  assert.equal(harness.githubTokenState().editorHidden, false);
+
+  harness.setGithubTokenValue("ghp_test-token");
+  harness.clickButtonRole("github-token-visibility");
+  assert.equal(harness.githubTokenState().inputType, "text");
+  assert.equal(harness.githubTokenState().visibility, "Hide");
+
+  harness.clickButtonRole("github-token-cancel");
+  assert.equal(harness.githubTokenState().editorHidden, true);
+  assert.equal(harness.githubTokenState().inputType, "password");
+  assert.equal(harness.githubTokenState().inputValue, "");
+
+  harness.clickButtonRole("github-token-toggle");
+  harness.setGithubTokenValue("ghp_saved-token");
+  harness.submitGithubToken();
+  await flushPromises();
+
+  const saveCall = harness.fetchCalls.find((call) => (
+    call.url.endsWith("/settings/github-token")
+    && JSON.parse(call.options?.body || "{}").value
+  ));
+  assert.deepEqual(JSON.parse(saveCall?.options?.body || "{}"), { value: "ghp_saved-token" });
+  assert.equal(harness.githubTokenState().configured, "true");
+  assert.equal(harness.githubTokenState().status, "Saved");
+  assert.equal(harness.githubTokenState().editorHidden, true);
+  assert.equal(harness.githubTokenState().clearHidden, false);
+
+  harness.clickButtonRole("github-token-clear");
+  await flushPromises();
+  const removeCall = harness.fetchCalls.find((call) => (
+    call.url.endsWith("/settings/github-token")
+    && JSON.parse(call.options?.body || "{}").clear
+  ));
+  assert.deepEqual(JSON.parse(removeCall?.options?.body || "{}"), { clear: true });
+  assert.equal(harness.githubTokenState().configured, "false");
+  assert.equal(harness.githubTokenState().status, "Not set");
+});
+
+test("GitHub import refreshes a Share panel that was opened before the project existed", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      shareStatus(calls) {
+        const projectEnsured = calls.some((call) => call.url.includes("/project/github-import/preview"));
+        return { ok: true, exists: projectEnsured, remoteUrl: null, tokenConfigured: true };
+      },
+      githubImportPreview: {
+        preview_id: "preview-1",
+        plan: {
+          counts: { add: 1, already_present: 0, path_conflict: 0, declaration_conflict: 0 },
+          files: [{
+            source_path: "Imported.lean",
+            destination_path: "Imported.lean",
+            disposition: "add",
+            reason: "New Lean file"
+          }],
+          reusable_declarations: 1,
+          blocking_error: null
+        }
+      },
+      githubImportConfirm: {
+        id: "import-1",
+        status: "complete",
+        reused: false,
+        counts: {
+          dispositions: { add: 1, already_present: 0, path_conflict: 0, declaration_conflict: 0 },
+          matched_declarations: 0,
+          reusable_declarations: 1,
+          checks: { ok: 1, error: 0, pending: 0 }
+        }
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+
+  harness.clickButtonText("Share");
+  await flushPromises();
+  assert.match(harness.bodyText(), /This document has no Lea project yet/);
+
+  harness.clickButtonText("Add Lean files from GitHub");
+  await flushPromises();
+  harness.setGithubImportUrl("https://github.com/example/formalizations");
+  harness.clickButtonText("Analyze");
+  await flushPromises();
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github?")).length,
+    2,
+    "preview should re-read Share state because it ensures the project"
+  );
+  assert.doesNotMatch(harness.bodyText(), /This document has no Lea project yet/);
+  assert.match(harness.bodyText(), /Save a GitHub remote/);
+
+  harness.clickButtonText("Add 1 Lean file");
+  await flushPromises();
+
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github?")).length,
+    3,
+    "completed import should refresh Share state again"
+  );
+});
+
+test("GitHub import closes after confirmation and locks matched theorems while checks run", async () => {
+  const manifestItem = {
+    id: "theorem:demo_theorem:0",
+    kind: "theorem",
+    label: "demo_theorem",
+    status: "missing-stub",
+    formalizable: true,
+    sourceFile: "main.tex",
+    sourceStartLine: 1,
+    sourceEndLine: 4,
+    naturalLanguageRendered: "A theorem.",
+    naturalLanguageLatex: "A theorem.",
+    leanKind: "theorem",
+    leanDeclarationName: "demo_theorem",
+  };
+  const queuedManifestItem = {
+    ...manifestItem,
+    id: "theorem:queued_theorem:1",
+    label: "queued_theorem",
+    naturalLanguageRendered: "Another theorem.",
+    naturalLanguageLatex: "Another theorem.",
+    leanDeclarationName: "queued_theorem",
+  };
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [manifestItem, queuedManifestItem], diagnostics: [] },
+      githubImportPreview: {
+        preview_id: "preview-queued",
+        plan: {
+          counts: { add: 2 },
+          files: [
+            {
+              source_path: "Demo.lean",
+              destination_path: "Demo.lean",
+              disposition: "add",
+              reason: "New Lean file",
+              declarations: [{
+                match: {
+                  origin_key: "project-1:theorem:demo_theorem",
+                  declaration_name: "demo_theorem",
+                },
+              }],
+            },
+            {
+              source_path: "Queued.lean",
+              destination_path: "Queued.lean",
+              disposition: "add",
+              reason: "New Lean file",
+              declarations: [{
+                match: {
+                  origin_key: "project-1:theorem:queued_theorem",
+                  declaration_name: "queued_theorem",
+                },
+              }],
+            },
+          ],
+          reusable_declarations: 0,
+          blocking_error: null,
+        },
+      },
+      githubImportConfirm: {
+        id: "import-queued",
+        status: "checking",
+        files: [
+          { destination_path: "Demo.lean", check_status: "pending" },
+          { destination_path: "Queued.lean", check_status: "pending" },
+        ],
+        declarations: [
+          { declaration_name: "demo_theorem", destination_path: "Demo.lean", formalization_id: "formalization-1" },
+          { declaration_name: "queued_theorem", destination_path: "Queued.lean", formalization_id: "formalization-2" },
+        ],
+        counts: {
+          dispositions: { add: 2 },
+          matched_declarations: 2,
+          reusable_declarations: 0,
+          checks: { pending: 2, ok: 0, error: 0 },
+        },
+      },
+      githubImportStatus: {
+        id: "import-queued",
+        status: "complete",
+        files: [
+          { destination_path: "Demo.lean", check_status: "ok" },
+          { destination_path: "Queued.lean", check_status: "ok" },
+        ],
+        declarations: [
+          { declaration_name: "demo_theorem", destination_path: "Demo.lean", formalization_id: "formalization-1" },
+          { declaration_name: "queued_theorem", destination_path: "Queued.lean", formalization_id: "formalization-2" },
+        ],
+        counts: {
+          dispositions: { add: 2 },
+          matched_declarations: 2,
+          reusable_declarations: 0,
+          checks: { pending: 0, ok: 2, error: 0 },
+        },
+      },
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickButtonText("Share");
+  await flushPromises();
+  harness.clickButtonText("Add Lean files from GitHub");
+  await flushPromises();
+  harness.setGithubImportUrl("https://github.com/example/formalizations");
+  harness.clickButtonText("Analyze");
+  await flushPromises();
+  harness.clickButtonText("Add 2 Lean files");
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-github-import-dialog"), 0);
+  assert.match(harness.bodyText(), /2 formalizations remaining · Checking demo_theorem/);
+  harness.clickButtonRole("toggle");
+  assert.deepEqual(harness.githubImportQueue(), [
+    { label: "demo_theorem", state: "Checking now" },
+    { label: "queued_theorem", state: "Queued" },
+  ]);
+  assert.deepEqual(harness.githubImportNoticeState(), {
+    expanded: "true",
+    detailsHidden: false,
+    minimizeHidden: false,
+  });
+
+  harness.clickOutsideGithubImportNotice();
+  assert.deepEqual(harness.githubImportNoticeState(), {
+    expanded: "false",
+    detailsHidden: true,
+    minimizeHidden: true,
+  });
+  assert.equal(
+    harness.countSelector(".ol-lean-github-import-notice"),
+    1,
+    "clicking away should minimize the active import queue instead of dismissing it"
+  );
+
+  harness.clickButtonRole("toggle");
+  harness.clickButtonLabel("Minimize GitHub import status");
+  assert.deepEqual(harness.githubImportNoticeState(), {
+    expanded: "false",
+    detailsHidden: true,
+    minimizeHidden: true,
+  });
+  assert.equal(harness.countSelector(".ol-lean-github-import-notice"), 1);
+  assert.equal(harness.countSelector(".ol-lean-project-status-in-progress"), 2);
+  harness.openTargetPopover();
+  assert.equal(harness.hasButtonText("Checking import…"), true);
+
+  await harness.runScheduledTimers();
+
+  assert.match(harness.bodyText(), /GitHub import complete/);
+  assert.equal(harness.hasButtonText("Checking import…"), false);
+  assert.ok(
+    harness.fetchCalls.some((call) => call.url.includes("/project/github-import/status")),
+    "the background tracker should poll independently of the closed dialog"
+  );
+});
+
+test("GitHub push uses a Lea confirmation dialog instead of the browser confirm", async () => {
+  const remoteUrl = "https://github.com/example/formalizations";
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: { ok: true, rootFile: "main.tex", items: [], diagnostics: [] },
+      shareStatus: { ok: true, exists: true, remoteUrl, tokenConfigured: true }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickButtonText("Share");
+  await flushPromises();
+
+  harness.clickButtonText("Push to GitHub");
+  await flushPromises();
+
+  assert.deepEqual(harness.githubPushDialog(), {
+    role: "dialog",
+    modal: "true",
+    label: "ol-lean-github-push-title"
+  });
+  assert.match(harness.bodyText(), /Push project\?/);
+  assert.match(harness.bodyText(), /Repositoryhttps:\/\/github\.com\/example\/formalizations/);
+  assert.match(harness.bodyText(), /Branchmain/);
+  assert.equal(harness.confirmCalls.length, 0);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github/push")).length,
+    0,
+    "opening the dialog must not start a push"
+  );
+
+  harness.clickButtonText("Cancel");
+  await flushPromises();
+  assert.equal(harness.githubPushDialog(), null);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github/push")).length,
+    0,
+    "canceling the dialog must not start a push"
+  );
+
+  harness.clickButtonText("Push to GitHub");
+  await flushPromises();
+  harness.clickButtonRole("confirm-push");
+  await flushPromises();
+
+  assert.equal(harness.githubPushDialog(), null);
+  assert.equal(harness.confirmCalls.length, 0);
+  assert.equal(
+    harness.fetchCalls.filter((call) => call.url.includes("/share/github/push")).length,
+    1
+  );
+  assert.match(harness.bodyText(), /Pushed to https:\/\/github\.com\/example\/formalizations\./);
 });
 
 test("project rename uses an accessible Lea dialog with a live namespace preview", async () => {
@@ -1790,6 +2375,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   };
 
   const context = {
+    AbortController,
     URL,
     TextEncoder,
     katex: options.katex,
@@ -1807,6 +2393,28 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     document,
     fetch: async (url, fetchOptions) => {
       fetchCalls.push({ url: String(url), options: fetchOptions });
+      if (options.hangProjectIdentity && String(url).includes("/project/identity?")) {
+        return new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => reject(new Error("Project identity request aborted."));
+          if (fetchOptions?.signal?.aborted) rejectOnAbort();
+          else fetchOptions?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      }
+      if (options.hangProjectArchive && String(url).includes("/download/zip")) {
+        return new Promise((_resolve, reject) => {
+          const rejectOnAbort = () => reject(new Error("Project archive request aborted."));
+          if (fetchOptions?.signal?.aborted) rejectOnAbort();
+          else fetchOptions?.signal?.addEventListener("abort", rejectOnAbort, { once: true });
+        });
+      }
+      if (options.failProjectArchive && String(url).includes("/download/zip")) {
+        return {
+          ok: false,
+          status: 503,
+          async json() { return {}; },
+          async arrayBuffer() { return new ArrayBuffer(0); }
+        };
+      }
       const failingRepairStart = Boolean(options.failRepairStart) && String(url).includes("/lean-pane/repair/start");
       const formalizeRequest = String(url).endsWith("/formalize");
       const formalizeFailure = formalizeRequest
@@ -1861,6 +2469,39 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
               ok: true,
               identity: currentProjectIdentity
             };
+          }
+          if (String(url).endsWith("/settings") && options.companionSettings) {
+            return options.companionSettings;
+          }
+          if (String(url).endsWith("/settings/github-token")) {
+            return options.githubTokenUpdate || { ok: true };
+          }
+          if (String(url).includes("/share/github?")) {
+            return typeof options.shareStatus === "function"
+              ? options.shareStatus(fetchCalls)
+              : options.shareStatus || { ok: true, exists: true, remoteUrl: null, tokenConfigured: true };
+          }
+          if (String(url).includes("/project/github-import/preview")) {
+            return options.githubImportPreview || {
+              preview_id: "preview-1",
+              plan: { counts: {}, files: [], reusable_declarations: 0, blocking_error: null }
+            };
+          }
+          if (String(url).includes("/project/github-import/confirm")) {
+            return options.githubImportConfirm || {
+              id: "import-1",
+              status: "complete",
+              counts: { dispositions: {}, matched_declarations: 0, reusable_declarations: 0, checks: {} }
+            };
+          }
+          if (String(url).includes("/project/github-import/status")) {
+            return typeof options.githubImportStatus === "function"
+              ? options.githubImportStatus(fetchCalls)
+              : options.githubImportStatus || {
+                id: "import-1",
+                status: "complete",
+                counts: { dispositions: {}, matched_declarations: 0, reusable_declarations: 0, checks: {} }
+              };
           }
           if (String(url).includes("/lean-pane/manifest")) {
             return typeof options.manifest === "function"
@@ -1952,6 +2593,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         },
         local: {
           async get(defaults) {
+            if (options.hangHumanApprovals) return new Promise(() => {});
             return { ...defaults, ...localStorageState };
           },
           async set(values) {
@@ -1976,6 +2618,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   context.self = window;
   context.location = window.location;
 
+  vm.runInNewContext(modelPickerScript, context, { filename: modelPickerScriptPath });
   vm.runInNewContext(contentScript, context, {
     filename: contentScriptPath,
     // content.js loads web-accessible-resource modules via
@@ -2077,6 +2720,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(button, `expected a button labeled "${text}"`);
       button.click();
     },
+    clickButtonRole(role) {
+      const button = document.body.querySelector(`[data-role='${role}']`);
+      assert.ok(button, `expected a button with role "${role}"`);
+      button.click();
+    },
+    clickOutsideGithubImportNotice() {
+      document.dispatchEvent({ type: "click", target: document.body });
+    },
     editTextarea() {
       return document.body.querySelector(".ol-lean-project-edit-textarea");
     },
@@ -2085,6 +2736,21 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       assert.ok(input, "expected project identity input");
       input.value = value;
       input.dispatchEvent({ type: "input" });
+    },
+    setGithubImportUrl(value) {
+      const input = document.body.querySelector("[data-role='url']");
+      assert.ok(input, `expected GitHub import URL input; body was: ${document.body.textContent}`);
+      input.value = value;
+    },
+    setGithubTokenValue(value) {
+      const input = document.body.querySelector("[data-role='github-token-input']");
+      assert.ok(input, "expected GitHub token input");
+      input.value = value;
+    },
+    submitGithubToken() {
+      const form = document.body.querySelector("[data-role='github-token-form']");
+      assert.ok(form, "expected GitHub token form");
+      form.dispatchEvent({ type: "submit" });
     },
     setProjectIdentitySync(checked) {
       const input = document.body.querySelector(".ol-lean-project-identity-sync-input");
@@ -2100,6 +2766,14 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         label: dialog.attributes["aria-labelledby"]
       } : null;
     },
+    githubPushDialog() {
+      const dialog = document.body.querySelector(".ol-lean-github-push-dialog");
+      return dialog ? {
+        role: dialog.attributes.role,
+        modal: dialog.attributes["aria-modal"],
+        label: dialog.attributes["aria-labelledby"]
+      } : null;
+    },
     projectIdentityNamespace() {
       return document.body.querySelector(".ol-lean-project-identity-namespace-value")?.textContent || "";
     },
@@ -2107,6 +2781,62 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
       const textarea = this.editTextarea();
       assert.ok(textarea, "expected the edit textarea to be present");
       textarea.value = value;
+    },
+    settingsPopover() {
+      return document.body.querySelector(".ol-lean-settings-popover");
+    },
+    settingsPopoverResizer() {
+      return document.body.querySelector(".ol-lean-settings-popover-resizer");
+    },
+    settingsPopoverWidthStyle() {
+      return this.settingsPopover()?.style["--ol-lean-settings-width"] || "";
+    },
+    settingsPopoverResizerValues() {
+      const resizer = this.settingsPopoverResizer();
+      return resizer ? {
+        orientation: resizer.attributes["aria-orientation"],
+        min: resizer.attributes["aria-valuemin"],
+        max: resizer.attributes["aria-valuemax"],
+        now: resizer.attributes["aria-valuenow"]
+      } : null;
+    },
+    settingsPopoverAnchorStyle() {
+      const popover = this.settingsPopover();
+      return popover ? {
+        right: popover.style.right || "",
+        left: popover.style.left || "",
+        top: popover.style.top || ""
+      } : null;
+    },
+    startSettingsPopoverResize(startX) {
+      const resizer = this.settingsPopoverResizer();
+      assert.ok(resizer, "expected settings popover resizer");
+      resizer.dispatchEvent({
+        type: "mousedown",
+        button: 0,
+        clientX: startX,
+        preventDefault() {},
+        stopPropagation() {}
+      });
+    },
+    moveSettingsPopoverResize(clientX) {
+      document.dispatchEvent({ type: "mousemove", clientX });
+    },
+    finishSettingsPopoverResize(clientX) {
+      document.dispatchEvent({ type: "mouseup", clientX });
+    },
+    dragSettingsPopoverResizer({ startX, moves }) {
+      this.startSettingsPopoverResize(startX);
+      for (const clientX of moves) this.moveSettingsPopoverResize(clientX);
+      this.finishSettingsPopoverResize(moves[moves.length - 1] ?? startX);
+    },
+    keySettingsPopoverResizer(key, patch = {}) {
+      const resizer = this.settingsPopoverResizer();
+      assert.ok(resizer, "expected settings popover resizer");
+      resizer.dispatchEvent({ type: "keydown", key, ...patch });
+    },
+    bodyHasClass(className) {
+      return document.body.classList.contains(className);
     },
     leanPane() {
       return document.body.querySelector(".ol-lean-project-pane");
@@ -2159,6 +2889,46 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     countSelector(selector) {
       return document.body.querySelectorAll(selector).length;
+    },
+    githubTokenState() {
+      const card = document.body.querySelector(".ol-lean-github-token-card");
+      const status = document.body.querySelector("[data-role='github-token-status']");
+      const description = document.body.querySelector("[data-role='github-token-description']");
+      const toggle = document.body.querySelector("[data-role='github-token-toggle']");
+      const clear = document.body.querySelector("[data-role='github-token-clear']");
+      const summary = document.body.querySelector("[data-role='github-token-summary-actions']");
+      const editor = document.body.querySelector("[data-role='github-token-editor']");
+      const input = document.body.querySelector("[data-role='github-token-input']");
+      const visibility = document.body.querySelector("[data-role='github-token-visibility']");
+      return {
+        configured: card?.dataset.configured || "",
+        status: status?.textContent || "",
+        description: description?.textContent || "",
+        toggle: toggle?.textContent || "",
+        clearHidden: Boolean(clear?.hidden),
+        summaryHidden: Boolean(summary?.hidden),
+        editorHidden: Boolean(editor?.hidden),
+        inputType: input?.type || "",
+        inputValue: input?.value || "",
+        visibility: visibility?.textContent || ""
+      };
+    },
+    githubImportQueue() {
+      const list = document.body.querySelector(".ol-lean-github-import-queue");
+      if (!list) return [];
+      return list.children.map((row) => ({
+        label: row.children[1]?.textContent || "",
+        state: row.children[2]?.textContent || ""
+      }));
+    },
+    githubImportNoticeState() {
+      const notice = document.body.querySelector(".ol-lean-github-import-notice");
+      if (!notice) return null;
+      return {
+        expanded: notice.querySelector("[data-role='toggle']")?.attributes["aria-expanded"] || "",
+        detailsHidden: Boolean(notice.querySelector("[data-role='details']")?.hidden),
+        minimizeHidden: Boolean(notice.querySelector("[data-role='dismiss']")?.hidden),
+      };
     },
     paneActionError() {
       const alert = document.body.querySelector(".ol-lean-project-action-error");
@@ -2385,6 +3155,124 @@ class FakeElement {
     this._textContent = "";
     this.children = [];
     const html = String(value || "");
+    if (html.includes('data-role="share-remote"')) {
+      const remote = this.appendChild(new FakeElement("input"));
+      remote.dataset.role = "share-remote";
+      const save = this.appendChild(new FakeElement("button"));
+      save.dataset.role = "share-save";
+      save.textContent = "Save remote";
+      const push = this.appendChild(new FakeElement("button"));
+      push.dataset.role = "share-push";
+      push.textContent = "Push to GitHub";
+      const exportButton = this.appendChild(new FakeElement("button"));
+      exportButton.dataset.role = "share-export";
+      exportButton.textContent = "Download .zip";
+      const importButton = this.appendChild(new FakeElement("button"));
+      importButton.dataset.role = "github-import";
+      importButton.textContent = "Add Lean files from GitHub";
+      const hint = this.appendChild(new FakeElement("p"));
+      hint.dataset.role = "share-hint";
+      hint.hidden = true;
+      const status = this.appendChild(new FakeElement("p"));
+      status.dataset.role = "share-status";
+      status.textContent = "Loading share status...";
+      return;
+    }
+    if (html.includes("ol-lean-github-import-dialog")) {
+      const dialog = this.appendChild(new FakeElement("section"));
+      dialog.className = "ol-lean-github-import-dialog";
+      const close = dialog.appendChild(new FakeElement("button"));
+      close.dataset.role = "close";
+      close.textContent = "x";
+      const url = dialog.appendChild(new FakeElement("input"));
+      url.dataset.role = "url";
+      const result = dialog.appendChild(new FakeElement("div"));
+      result.dataset.role = "result";
+      const status = dialog.appendChild(new FakeElement("p"));
+      status.dataset.role = "status";
+      const cancel = dialog.appendChild(new FakeElement("button"));
+      cancel.dataset.role = "cancel";
+      cancel.textContent = "Cancel";
+      const analyze = dialog.appendChild(new FakeElement("button"));
+      analyze.dataset.role = "analyze";
+      analyze.textContent = "Analyze";
+      const confirm = dialog.appendChild(new FakeElement("button"));
+      confirm.dataset.role = "confirm";
+      confirm.textContent = "Add Lean files";
+      confirm.hidden = true;
+      return;
+    }
+    if (html.includes("lea-model-picker-trigger")) {
+      const trigger = this.appendChild(new FakeElement("button"));
+      trigger.className = "lea-model-picker-trigger";
+      trigger.setAttribute("role", "combobox");
+      trigger.setAttribute("aria-expanded", "false");
+      const value = trigger.appendChild(new FakeElement("span"));
+      value.dataset.role = "model-picker-value";
+      const popover = this.appendChild(new FakeElement("div"));
+      popover.className = "lea-model-picker-popover";
+      popover.hidden = true;
+      const search = popover.appendChild(new FakeElement("input"));
+      search.className = "lea-model-picker-search";
+      search.value = "";
+      const heading = popover.appendChild(new FakeElement("div"));
+      heading.className = "lea-model-picker-heading";
+      const results = popover.appendChild(new FakeElement("div"));
+      results.className = "lea-model-picker-results";
+      return;
+    }
+    if (html.includes("Extension Settings")) {
+      const close = this.appendChild(new FakeElement("button"));
+      close.dataset.role = "close";
+      close.setAttribute("aria-label", "Close Lea popover");
+      const status = this.appendChild(new FakeElement("p"));
+      status.className = "ol-lean-popover-status";
+      const model = this.appendChild(new FakeElement("div"));
+      model.dataset.role = "model";
+      const maxTurns = this.appendChild(new FakeElement("input"));
+      maxTurns.dataset.role = "max-turns";
+      const maxSpend = this.appendChild(new FakeElement("input"));
+      maxSpend.dataset.role = "max-spend";
+      const texMirror = this.appendChild(new FakeElement("input"));
+      texMirror.dataset.role = "tex-mirror";
+      const save = this.appendChild(new FakeElement("button"));
+      save.dataset.role = "save-settings";
+      const githubPanel = this.appendChild(new FakeElement("section"));
+      githubPanel.dataset.role = "github-token-panel";
+      const githubCard = githubPanel.appendChild(new FakeElement("div"));
+      githubCard.className = "ol-lean-github-token-card";
+      const githubDescription = githubCard.appendChild(new FakeElement("span"));
+      githubDescription.dataset.role = "github-token-description";
+      const githubStatus = githubCard.appendChild(new FakeElement("strong"));
+      githubStatus.dataset.role = "github-token-status";
+      const githubSummary = githubCard.appendChild(new FakeElement("div"));
+      githubSummary.dataset.role = "github-token-summary-actions";
+      const githubToggle = githubSummary.appendChild(new FakeElement("button"));
+      githubToggle.dataset.role = "github-token-toggle";
+      const githubClear = githubSummary.appendChild(new FakeElement("button"));
+      githubClear.dataset.role = "github-token-clear";
+      githubClear.hidden = true;
+      const githubEditor = githubCard.appendChild(new FakeElement("div"));
+      githubEditor.dataset.role = "github-token-editor";
+      githubEditor.hidden = true;
+      const githubForm = githubEditor.appendChild(new FakeElement("form"));
+      githubForm.dataset.role = "github-token-form";
+      const githubInput = githubForm.appendChild(new FakeElement("input"));
+      githubInput.dataset.role = "github-token-input";
+      githubInput.type = "password";
+      const githubVisibility = githubForm.appendChild(new FakeElement("button"));
+      githubVisibility.dataset.role = "github-token-visibility";
+      githubVisibility.textContent = "Show";
+      const githubCancel = githubForm.appendChild(new FakeElement("button"));
+      githubCancel.dataset.role = "github-token-cancel";
+      githubCancel.textContent = "Cancel";
+      const githubSave = githubForm.appendChild(new FakeElement("button"));
+      githubSave.dataset.role = "github-token-save";
+      githubSave.textContent = "Save token";
+      const editProjectName = this.appendChild(new FakeElement("button"));
+      editProjectName.dataset.role = "edit-project-name";
+      return;
+    }
     if (html.includes("ol-lean-popover-title")) {
       this.appendChild(new FakeElement("p")).className = "ol-lean-popover-title";
       const meta = this.appendChild(new FakeElement("p"));
@@ -2414,6 +3302,18 @@ class FakeElement {
   appendChild(child) {
     child.parentNode = this;
     this.children.push(child);
+    return child;
+  }
+
+  append(...children) {
+    for (const child of children) this.appendChild(child);
+  }
+
+  insertBefore(child, reference) {
+    child.parentNode = this;
+    const index = this.children.indexOf(reference);
+    if (index === -1) this.children.push(child);
+    else this.children.splice(index, 0, child);
     return child;
   }
 

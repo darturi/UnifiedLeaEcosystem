@@ -13,6 +13,150 @@
   border: 0;
 }
 
+.ol-lean-github-import-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh 18px 28px;
+  overflow: auto;
+  background: rgba(20, 22, 27, 0.48);
+  font-family: var(--ol-sans);
+}
+
+.ol-lean-github-import-dialog {
+  width: min(700px, 96vw);
+  max-height: 84vh;
+  overflow: auto;
+  color: var(--ol-ink);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-radius: 14px;
+  box-shadow: var(--ol-shadow-float);
+}
+
+.ol-lean-github-import-dialog > header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px 18px;
+  background: var(--ol-panel);
+  border-bottom: 1px solid var(--ol-line);
+}
+
+.ol-lean-github-import-dialog header > div { flex: 1; }
+.ol-lean-github-import-dialog h2 { margin: 0; font: 700 16px/1.3 var(--ol-sans); }
+.ol-lean-github-import-dialog header p { margin: 3px 0 0; color: var(--ol-muted); font: 12px/1.4 var(--ol-sans); }
+.ol-lean-github-import-content { padding: 17px 18px; }
+.ol-lean-github-import-content > label { display: grid; gap: 6px; color: var(--ol-ink-2); font: 700 12px/1.3 var(--ol-sans); }
+.ol-lean-github-import-content input { box-sizing: border-box; width: 100%; padding: 9px 10px;
+  color: var(--ol-ink); background: var(--ol-panel-2); border: 1px solid var(--ol-line);
+  border-radius: 8px; font: 12px/1.4 var(--ol-mono); }
+.ol-lean-github-import-content input:focus { outline: 2px solid var(--ol-focus-ring); outline-offset: 1px; }
+.ol-lean-github-import-note { margin: 8px 0 0; color: var(--ol-muted); font: 11.5px/1.45 var(--ol-sans); }
+.ol-lean-github-import-summary { margin: 13px 0 8px; padding: 9px 10px; color: var(--ol-ink-2);
+  background: var(--ol-panel-2); border: 1px solid var(--ol-line); border-radius: 8px; font: 700 12px/1.4 var(--ol-sans); }
+.ol-lean-github-import-result ul { max-height: 290px; overflow: auto; list-style: none; margin: 0; padding: 0;
+  border: 1px solid var(--ol-line); border-radius: 8px; }
+.ol-lean-github-import-result li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 10px;
+  padding: 7px 9px; border-bottom: 1px solid var(--ol-line-2); }
+.ol-lean-github-import-result li:last-child { border-bottom: 0; }
+.ol-lean-github-import-result code { overflow: hidden; text-overflow: ellipsis; color: var(--ol-ink); font: 11.5px/1.35 var(--ol-mono); }
+.ol-lean-github-import-result li > span { color: var(--ol-muted); font: 700 10.5px/1.35 var(--ol-sans); }
+.ol-lean-github-import-result li > span.is-add { color: var(--ol-green); }
+.ol-lean-github-import-result li > span.is-path_conflict,
+.ol-lean-github-import-result li > span.is-declaration_conflict { color: var(--ol-red); }
+.ol-lean-github-import-result small { grid-column: 1 / -1; color: var(--ol-muted); font: 10.5px/1.35 var(--ol-sans); }
+.ol-lean-github-import-completion { margin-top: 12px; padding: 14px; color: var(--ol-ink-2);
+  background: var(--ol-panel-2); border: 1px solid var(--ol-line); border-radius: 9px; font: 12px/1.55 var(--ol-sans); }
+.ol-lean-github-import-status { min-height: 18px; margin: 10px 0 0; color: var(--ol-muted); font: 12px/1.45 var(--ol-sans); }
+.ol-lean-github-import-status.is-error { color: var(--ol-red); }
+.ol-lean-github-import-content footer { display: flex; justify-content: flex-end; gap: 7px; margin-top: 14px; }
+
+.ol-lean-github-import-notice {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 2147483647;
+  width: min(360px, calc(100vw - 36px));
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-left: 3px solid var(--ol-accent);
+  border-radius: 10px;
+  box-shadow: var(--ol-shadow-float);
+  font: 12px/1.45 var(--ol-sans);
+}
+
+.ol-lean-github-import-notice-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 4px 5px 4px 8px;
+}
+
+.ol-lean-github-import-notice-toggle {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 5px 4px;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  font: 700 11.5px/1.35 var(--ol-sans);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ol-lean-github-import-notice-toggle:disabled { cursor: default; }
+.ol-lean-github-import-notice-toggle [data-role="arrow"] { flex: 0 0 auto; color: var(--ol-muted); font-size: 12px; }
+.ol-lean-github-import-notice-toggle [data-role="copy"] { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ol-lean-github-import-notice.is-settled { border-left-color: var(--ol-green); }
+.ol-lean-github-import-notice.is-error { border-left-color: var(--ol-red); }
+.ol-lean-github-import-notice .ol-lean-icon-button { flex: 0 0 auto; }
+
+.ol-lean-github-import-notice-details {
+  padding: 2px 10px 9px 14px;
+  border-top: 1px solid var(--ol-line-2);
+}
+
+.ol-lean-github-import-queue {
+  display: grid;
+  gap: 5px;
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ol-lean-github-import-queue li {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.ol-lean-github-import-queue-marker { color: var(--ol-muted); font-size: 8px; }
+.ol-lean-github-import-queue li.is-checking .ol-lean-github-import-queue-marker { color: var(--ol-accent); }
+.ol-lean-github-import-queue strong { overflow: hidden; color: var(--ol-ink-2); font: 700 11px/1.3 var(--ol-mono); text-overflow: ellipsis; white-space: nowrap; }
+.ol-lean-github-import-queue li > span:last-child { color: var(--ol-muted); font: 10.5px/1.3 var(--ol-sans); }
+
+.ol-lean-project-import-state {
+  margin: 8px 0 0;
+  color: var(--ol-muted);
+  font: 11.5px/1.45 var(--ol-sans);
+}
+
 .ol-lean-theorem {
   background: rgba(28, 28, 32, 0.08);
   border-bottom: 1px solid rgba(28, 28, 32, 0.3);
@@ -192,7 +336,8 @@
   position: fixed;
   right: 20px;
   bottom: 20px;
-  z-index: 2147483646;
+  /* Keep settings reachable while the full-height Lean pane is open. */
+  z-index: 2147483647;
   display: grid;
   place-items: center;
   width: 38px;
@@ -750,6 +895,93 @@ body.ol-lean-pane-resizing {
 }
 
 .ol-lean-project-identity-save {
+  min-width: 142px !important;
+}
+
+/* Push confirmation deliberately shares the project-identity dialog shell so
+   both sensitive project operations feel like one Lea workflow. */
+.ol-lean-github-push-dialog {
+  width: min(460px, calc(100vw - 32px));
+}
+
+.ol-lean-github-push-mark {
+  font-family: var(--ol-sans);
+  font-size: 18px;
+}
+
+.ol-lean-github-push-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+}
+
+.ol-lean-github-push-review {
+  padding: 12px;
+  border: 1px solid var(--ol-line);
+  border-radius: var(--ol-radius);
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-github-push-review .ol-lean-project-identity-preview-title {
+  margin: 0 0 11px;
+}
+
+.ol-lean-github-push-review-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  color: var(--ol-muted);
+  font-size: 11px;
+}
+
+.ol-lean-github-push-review-row code {
+  justify-self: end;
+  max-width: 100%;
+  padding: 3px 7px;
+  overflow: hidden;
+  border-radius: 6px;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  font: 500 11px/1.35 var(--ol-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ol-lean-github-push-note {
+  position: relative;
+  margin: 0;
+  padding: 0 2px 0 17px;
+  color: var(--ol-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.ol-lean-github-push-note::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--ol-accent);
+}
+
+.ol-lean-github-push-actions {
+  padding-top: 0;
+}
+
+.ol-lean-github-push-actions .ol-lean-primary-button,
+.ol-lean-github-push-actions .ol-lean-secondary-button {
+  flex: 0 0 auto;
+  min-width: 110px;
+  padding: 0 13px;
+}
+
+.ol-lean-github-push-confirm {
   min-width: 142px !important;
 }
 
@@ -1902,8 +2134,48 @@ button.ol-lean-project-relationship-chip {
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
+  width: min(var(--ol-lean-settings-width, 360px), calc(100vw - 24px));
+  min-width: min(360px, calc(100vw - 24px));
+  max-width: min(720px, calc(100vw - 24px));
   max-height: calc(100vh - 24px);
   max-height: calc(100dvh - 24px);
+}
+
+.ol-lean-settings-popover-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -5px;
+  z-index: 2;
+  width: 10px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.ol-lean-settings-popover-resizer::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 4px;
+  width: 1px;
+  border-radius: 1px;
+  background: transparent;
+}
+
+.ol-lean-settings-popover-resizer:hover::before,
+.ol-lean-settings-popover-resizer:focus-visible::before,
+.ol-lean-settings-popover-resizing .ol-lean-settings-popover-resizer::before {
+  background: var(--ol-accent);
+}
+
+body.ol-lean-settings-resizing {
+  cursor: ew-resize;
+  user-select: none;
 }
 
 .ol-lean-settings-popover .ol-lean-popover-body {
@@ -2362,6 +2634,194 @@ button.ol-lean-project-relationship-chip {
 .ol-lean-provider-key-controls input {
   flex: 1;
   min-width: 0;
+}
+
+.ol-lean-github-token-panel {
+  gap: 10px;
+}
+
+.ol-lean-github-token-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--ol-line);
+  border-radius: 8px;
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-github-token-card[data-configured="true"] {
+  border-color: var(--ol-accent);
+  background: var(--ol-accent-soft);
+}
+
+.ol-lean-github-token-summary {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.ol-lean-github-token-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  font: 700 10px/1 var(--ol-mono);
+  letter-spacing: -0.02em;
+}
+
+.ol-lean-github-token-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ol-lean-github-token-copy strong {
+  color: var(--ol-ink-2);
+  font-size: 12px;
+}
+
+.ol-lean-github-token-copy span {
+  color: var(--ol-muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.ol-lean-github-token-status {
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+  font: 700 9px/1 var(--ol-mono);
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ol-lean-github-token-card[data-configured="true"] .ol-lean-github-token-status {
+  color: var(--ol-accent-ink);
+  background: var(--ol-panel);
+}
+
+.ol-lean-github-token-storage-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0;
+  color: var(--ol-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.ol-lean-github-token-lock {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+}
+
+.ol-lean-github-token-actions,
+.ol-lean-github-token-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.ol-lean-provider-key-button[data-variant="primary"] {
+  border-color: var(--ol-accent);
+  color: #ffffff;
+  background: var(--ol-accent);
+}
+
+.ol-lean-provider-key-button[data-variant="primary"]:hover {
+  border-color: var(--ol-accent-ink);
+  color: #ffffff;
+  background: var(--ol-accent-ink);
+}
+
+.ol-lean-provider-key-button[data-variant="danger"] {
+  color: var(--ol-red);
+  background: transparent;
+}
+
+.ol-lean-provider-key-button[data-variant="danger"]:hover {
+  border-color: var(--ol-red);
+  color: var(--ol-red);
+}
+
+.ol-lean-github-token-editor {
+  padding-top: 11px;
+  border-top: 1px solid var(--ol-line);
+}
+
+.ol-lean-github-token-editor form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ol-lean-github-token-label {
+  color: var(--ol-ink-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.ol-lean-github-token-field {
+  display: flex;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1px solid var(--ol-line);
+  border-radius: 7px;
+  background: var(--ol-panel);
+}
+
+.ol-lean-github-token-field:focus-within {
+  border-color: var(--ol-accent);
+  box-shadow: 0 0 0 2px var(--ol-accent-soft);
+}
+
+.ol-lean-github-token-field input {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 0;
+  outline: 0;
+  color: var(--ol-ink);
+  background: transparent;
+  font: 11px/1.3 var(--ol-mono);
+}
+
+.ol-lean-github-token-field button {
+  flex: 0 0 auto;
+  min-width: 46px;
+  padding: 0 9px;
+  border: 0;
+  border-left: 1px solid var(--ol-line);
+  color: var(--ol-muted);
+  background: var(--ol-panel-2);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.ol-lean-github-token-field button:hover {
+  color: var(--ol-accent-ink);
+}
+
+.ol-lean-github-token-editor .ol-lean-provider-note {
+  font-size: 10px;
 }
 
 .ol-lean-settings-panel {

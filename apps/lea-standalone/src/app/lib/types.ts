@@ -310,6 +310,95 @@ export interface TreeEntry {
   children?: TreeEntry[];
 }
 
+export type GithubImportDisposition =
+  | 'add'
+  | 'already_present'
+  | 'path_conflict'
+  | 'declaration_conflict'
+  | 'unsupported_module_layout'
+  | 'excluded';
+
+export interface GithubImportDeclarationMatch {
+  declaration_name: string;
+  formalization_id?: string | null;
+  origin_key?: string | null;
+  display_title: string;
+  source_hash?: string | null;
+}
+
+export interface GithubImportPlannedDeclaration {
+  short_name: string;
+  full_name: string;
+  keyword: string;
+  kind: string;
+  start_line: number;
+  end_line: number;
+  match?: GithubImportDeclarationMatch | null;
+}
+
+export interface GithubImportPlannedFile {
+  source_path: string;
+  destination_path?: string | null;
+  disposition: GithubImportDisposition;
+  reason: string;
+  content_sha256?: string | null;
+  module_name?: string | null;
+  declarations?: GithubImportPlannedDeclaration[];
+  code_step_id?: number | null;
+  check_status?: 'pending' | 'ok' | 'error' | null;
+  check_detail?: string | null;
+}
+
+export interface GithubImportPreview {
+  preview_id: string;
+  expires_in_seconds: number;
+  source: {
+    url: string;
+    owner: string;
+    repository: string;
+    ref?: string | null;
+    commit_sha: string;
+  };
+  project: { id: string; slug: string; namespace: string };
+  plan: {
+    source_namespace?: string | null;
+    destination_namespace: string;
+    destination_snapshot: string;
+    files: GithubImportPlannedFile[];
+    counts: Partial<Record<GithubImportDisposition, number>>;
+    matched_declarations: number;
+    reusable_declarations: number;
+    blocking_error?: { code: string; message: string } | null;
+  };
+}
+
+export interface GithubImportProgress {
+  id: string;
+  project_id: string;
+  source_url: string;
+  source_commit_sha: string;
+  status: 'applying' | 'checking' | 'complete' | 'complete_with_issues' | 'failed';
+  commit_sha?: string | null;
+  error_detail?: string | null;
+  reused?: boolean;
+  files: GithubImportPlannedFile[];
+  declarations: Array<{
+    id: string;
+    destination_path: string;
+    declaration_name: string;
+    full_name: string;
+    kind: string;
+    module_name: string;
+    formalization_id?: string | null;
+  }>;
+  counts: {
+    dispositions: Partial<Record<GithubImportDisposition, number>>;
+    checks: Record<string, number>;
+    matched_declarations: number;
+    reusable_declarations: number;
+  };
+}
+
 export interface ChatMessage {
   id: string;
   session_id: string;

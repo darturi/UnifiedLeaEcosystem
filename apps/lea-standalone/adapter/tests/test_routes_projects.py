@@ -596,15 +596,13 @@ def test_by_slug_share_status_export_and_remote(tmp_path, monkeypatch):
 
 
 def test_by_slug_push_functionally(tmp_path, monkeypatch):
-    """Push-by-slug lands commits on the remote, same as the by-id route."""
+    """Overleaf Share snapshots untracked changes before pushing the project."""
     import subprocess
-    from app.gitstore import GitStore
 
     proofs = _setup(tmp_path, monkeypatch)
     project = projects_route.create_project(ProjectCreate(title="Slug Push"))
     repo = projects_route.project_service.project_repo_dir(store.get_project(project["id"]), proofs)
     (repo / "hello.txt").write_text("hi")
-    GitStore(proofs).commit_all(repo, "add hello")
 
     bare = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
@@ -613,11 +611,30 @@ def test_by_slug_push_functionally(tmp_path, monkeypatch):
 
     res = projects_route.push_project_by_slug(project["slug"])
     assert res["pushed"] is True
+    assert res["commit_sha"]
     log = subprocess.run(
         ["git", "--git-dir", str(bare), "log", "--oneline", "main"],
         capture_output=True, text=True,
     )
-    assert "add hello" in log.stdout
+    assert "share: snapshot project" in log.stdout
+    exported = subprocess.run(
+        ["git", "--git-dir", str(bare), "show", "main:hello.txt"],
+        capture_output=True, text=True, check=True,
+    )
+    assert exported.stdout == "hi"
+
+    # A second Share still pushes, but a clean project does not gain an empty commit.
+    before = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    second = projects_route.push_project_by_slug(project["slug"])
+    after = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert second["commit_sha"] == res["commit_sha"]
+    assert after == before
 
 
 def test_by_slug_never_creates_a_project(tmp_path, monkeypatch):

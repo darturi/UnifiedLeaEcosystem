@@ -29,25 +29,13 @@ one-decl-per-file convention these projects use), not a Lean-aware parse.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from . import blueprint
 from . import diagnostics
 from . import store
+from .artifacts import declaration_contains_sorry, scan_lean_declarations
 from .projects import project_repo_dir
-
-# A Lean declaration header: optional attribute/modifier prefixes, then a keyword and
-# the declared name (which may itself be dotted = already fully qualified).
-_DECL_RE = re.compile(
-    r"^\s*(?:@\[[^\]]*\]\s*)?"
-    r"(?:noncomputable\s+|private\s+|protected\s+|scoped\s+|local\s+|partial\s+)*"
-    r"(theorem|lemma|def|abbrev|instance|structure|inductive|class)\s+"
-    r"([A-Za-z_][\w'.]*)"
-)
-_NAMESPACE_RE = re.compile(r"^\s*namespace\s+([A-Za-z_][\w'.]*)")
-_END_RE = re.compile(r"^\s*end\b\s*([A-Za-z_][\w'.]*)?")
-_SORRY_RE = re.compile(r"\b(sorry|admit)\b")
 
 VALID_STATUSES = ("planned", "stated", "ready", "proved", "failed")
 
@@ -88,20 +76,8 @@ def _scan_lean_decls(
             continue
         rel = path.relative_to(repo).as_posix()
         file_to_text[rel] = text
-        ns_stack: list[str] = []
-        for line in text.splitlines():
-            ns = _NAMESPACE_RE.match(line)
-            if ns:
-                ns_stack.append(ns.group(1))
-                continue
-            if _END_RE.match(line) and ns_stack:
-                ns_stack.pop()
-                continue
-            decl = _DECL_RE.match(line)
-            if decl:
-                name = decl.group(2)
-                fqn = name if "." in name else ".".join(ns_stack + [name])
-                fqn_to_file.setdefault(fqn, rel)
+        for declaration in scan_lean_declarations(text):
+            fqn_to_file.setdefault(declaration.full_name, rel)
     return fqn_to_file, file_to_text
 
 
@@ -122,23 +98,7 @@ def _decl_has_sorry(text: str, lean: str) -> bool:
     that decl's span (its header line to the next decl header or EOF)."""
     if not text:
         return False
-    target = _short(lean)
-    lines = text.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        decl = _DECL_RE.match(line)
-        if decl and _short(decl.group(2)) == target:
-            start = i
-            break
-    if start is None:
-        # Decl not pinpointed (e.g. resolved by file only) — fall back to whole file.
-        return bool(_SORRY_RE.search(text))
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        if _DECL_RE.match(lines[j]):
-            end = j
-            break
-    return bool(_SORRY_RE.search("\n".join(lines[start:end])))
+    return declaration_contains_sorry(text, lean)
 
 
 def _base_status(lean: str | None, file: str | None, latest: dict | None, has_sorry: bool) -> str:

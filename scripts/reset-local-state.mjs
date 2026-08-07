@@ -38,6 +38,7 @@ const uiDataDir = resolveMonorepoPath(
   process.env.LEA_SHARED_DATA_DIR || rootEnv.LEA_SHARED_DATA_DIR || "apps/lea-standalone/data",
 );
 const legacyUiDataDir = path.join(MONOREPO_ROOT, "apps", "lea-ui", "data");
+const githubImportsDir = path.join(uiDataDir, "github-imports");
 
 function resolveMonorepoPath(value) {
   return path.isAbsolute(value) ? value : path.resolve(MONOREPO_ROOT, value);
@@ -118,6 +119,7 @@ writeJsonFile("companion cache", companionCache, {});
 
 // Lea UI artifacts.
 removeEntries("Lea UI SQLite databases", sqliteFiles);
+removeDir("GitHub import staging", githubImportsDir);
 
 if (!dryRun) {
   mkdirSync(projectsDir, { recursive: true });

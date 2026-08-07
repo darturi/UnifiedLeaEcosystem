@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .gitstore import _inject_token, _scrub
+from .github_source import GitHubSourceError, clone_repository, head_sha
 
 logger = logging.getLogger("lea-interface.ghimport")
 
@@ -162,27 +162,16 @@ def _clone(target: ImportTarget, dest: Path, token: str | None) -> None:
     """Shallow-clone `target` into `dest`. Tries the pinned ref first (branch/tag),
     then falls back to the default branch (a commit-SHA ref can't be `--branch`ed on
     a shallow clone). The token is injected for the clone only; errors are scrubbed."""
-    clone_url = _inject_token(target.clone_url, token) if token else target.clone_url
-    attempts: list[list[str]] = []
-    if target.ref:
-        attempts.append(["clone", "--depth", "1", "--branch", target.ref, clone_url, str(dest)])
-    attempts.append(["clone", "--depth", "1", clone_url, str(dest)])
-
-    last_err = "clone failed"
-    for args in attempts:
-        # Each attempt needs an empty dest (git refuses a non-empty target).
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-        try:
-            proc = subprocess.run(
-                ["git", *args], capture_output=True, text=True, timeout=CLONE_TIMEOUT_SECONDS
-            )
-        except subprocess.TimeoutExpired:
-            raise GitHubImportError("Timed out cloning the repository.") from None
-        if proc.returncode == 0:
-            return
-        last_err = _scrub(proc.stderr.strip() or "clone failed", token)
-    raise GitHubImportError(f"Could not clone the repository: {last_err}")
+    try:
+        clone_repository(
+            target.clone_url,
+            dest,
+            ref=target.ref,
+            token=token,
+            timeout=CLONE_TIMEOUT_SECONDS,
+        )
+    except GitHubSourceError as exc:
+        raise GitHubImportError(str(exc)) from None
 
 
 def _locate_md(dest: Path, target: ImportTarget) -> Path:
@@ -236,14 +225,10 @@ def _derive_name(md_path: Path, dest: Path, target: ImportTarget) -> str:
 
 def _head_sha(dest: Path) -> str | None:
     try:
-        proc = subprocess.run(
-            ["git", "-C", str(dest), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except subprocess.SubprocessError:
+        return head_sha(dest)
+    except (subprocess.SubprocessError, GitHubSourceError):
         # F1: the import still succeeded — this is only the provenance sha recorded
         # against it. Logged rather than silently None so "imported from an unknown
         # commit" is diagnosable instead of looking like it was never recorded.
         logger.warning("Could not read HEAD sha of %s", dest, exc_info=True)
         return None
-    return proc.stdout.strip() or None if proc.returncode == 0 else None
