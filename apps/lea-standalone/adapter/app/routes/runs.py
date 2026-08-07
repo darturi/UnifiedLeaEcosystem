@@ -20,6 +20,7 @@ from ..config import load_config, permission_tier
 from .. import bridge
 from .. import diagnostics
 from .. import formalizations as formalization_service
+from .. import github_import_service
 from ..bridge import request_stop, request_subagent_stop
 from .. import projects
 from .. import runbroker
@@ -170,6 +171,17 @@ def create_run(request: RunRequest) -> dict:
         except ValueError as exc:
             project_id = None
             project_error = str(exc) or "the project slug was rejected"
+    if project_id is None and request.session_id:
+        existing_session = store.get_session(request.session_id)
+        project_id = existing_session.get("project_id") if existing_session else None
+    if project_id and store.project_has_active_import(project_id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "project_busy",
+                "message": "Wait for the active GitHub import before starting a Lea run.",
+            },
+        )
 
     autonomous = request.autonomous or (permission_tier() == "none")
     new_formalization = (
@@ -202,7 +214,7 @@ def create_run(request: RunRequest) -> dict:
     run = bundle["run"]
     user_message = bundle["message"]
     project_id = session.get("project_id")
-    if project_error:
+    if project_error and not project_id:
         # B2: persisted, not streamed — this endpoint returns before any SSE stream is
         # attached, so there is no live channel yet. The client picks it up from
         # `session_detail` on attach, which is also how it survives a reload. Recorded
@@ -215,8 +227,16 @@ def create_run(request: RunRequest) -> dict:
             source="runs",
             context={"project_slug": request.project_slug},
         ))
-    bridge.enqueue_run(run["id"])
     raw_formalization = bundle.get("formalization")
+    if raw_formalization is not None and project_id and config.lea_root:
+        project_for_adoption = store.get_project(project_id)
+        if project_for_adoption:
+            github_import_service.try_adopt_imported_declaration(
+                project_for_adoption,
+                raw_formalization,
+                config.lea_root / "workspace" / "proofs",
+            )
+    bridge.enqueue_run(run["id"])
     formalization = (
         formalization_service.decorate([raw_formalization])[0]
         if raw_formalization is not None

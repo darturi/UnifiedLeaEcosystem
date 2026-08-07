@@ -10,7 +10,7 @@ import hashlib
 import json
 from collections import Counter
 
-from .artifacts import contains_sorry_marker, declaration_present
+from .artifacts import contains_sorry_marker, declaration_contains_sorry, declaration_present
 from .db import connect, row_to_dict
 from . import store
 
@@ -36,7 +36,11 @@ def _validity(
         return "unchecked"
     if (
         latest_step.get("check_status") == "error"
-        or contains_sorry_marker(latest_step.get("blob_content"))
+        or (
+            declaration_contains_sorry(latest_step.get("blob_content"), declaration_name)
+            if declaration_name
+            else contains_sorry_marker(latest_step.get("blob_content"))
+        )
     ):
         return "failing"
     if not latest_step.get("check_status"):

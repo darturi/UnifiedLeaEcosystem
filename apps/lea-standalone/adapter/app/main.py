@@ -13,7 +13,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .db import init_db
 from .routes import formalizations, projects, runs, search, sessions, settings, skills, subagents
-from . import bridge, netguard, store
+from . import bridge, github_import_service, netguard, store
+from .config import load_config
 
 app = FastAPI(title="Lea Interface API")
 
@@ -67,6 +68,9 @@ def startup() -> None:
     # still-pending queue so a restart doesn't strand queued work (Phase 2).
     store.fail_stale_active_runs()
     bridge.recover_runs_at_startup()
+    config = load_config()
+    proofs_root = config.lea_root / "workspace" / "proofs" if config.lea_root else None
+    github_import_service.recover_github_imports_at_startup(proofs_root)
 
 
 @app.get("/api/health")

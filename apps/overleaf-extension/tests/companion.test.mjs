@@ -19,6 +19,9 @@ import {
   handleGetModelRequirements,
   handleGetStatuses,
   handleGetUsage,
+  handleGithubImportConfirm,
+  handleGithubImportPreview,
+  handleGithubImportStatus,
   handleGithubTokenUpdate,
   handleLeanPaneManifest,
   handleMirrorTex,
@@ -5281,6 +5284,66 @@ test("push forwards the adapter's user-facing detail, including the diverged-his
   const diverged = await handleSharePush({ overleafProjectId: "Doc 1" }, divergedState);
   assert.equal(diverged.statusCode, 502);
   assert.match(diverged.body.message, /reconcile/);
+});
+
+test("GitHub project import handlers preserve the Overleaf target identity through preview, confirm, and poll", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    const value = String(url);
+    const body = options.body ? JSON.parse(options.body) : null;
+    calls.push({ url: value, method: options.method || "GET", body });
+    if (value.endsWith("/identity")) {
+      return jsonResponse(200, {
+        projectId: "p1",
+        slug: "doc-1",
+        projectName: "Document One",
+        namespace: "Lea.DocumentOne",
+        exists: true,
+      });
+    }
+    if (value.endsWith("/github-imports/preview")) {
+      return jsonResponse(200, { preview_id: "preview-1", plan: { counts: { add: 1 } } });
+    }
+    if (value.endsWith("/github-imports") && options.method === "POST") {
+      return jsonResponse(202, { id: "import-1", status: "checking", counts: { checks: {} } });
+    }
+    if (value.endsWith("/github-imports/import-1")) {
+      return jsonResponse(200, { id: "import-1", status: "complete", counts: { checks: { ok: 1 } } });
+    }
+    throw new Error(`unexpected fetch: ${value}`);
+  };
+  const state = await makeState({ leaRepoPath: leaRepo, fetchImpl });
+  const target = {
+    targetKind: "theorem",
+    targetLabel: "stable-label",
+    declarationName: "current_name",
+    displayTitle: "Current theorem",
+    statement: "A theorem.",
+    sourceHash: "hash-1",
+  };
+
+  const preview = await handleGithubImportPreview({
+    overleafProjectId: "doc-1",
+    repositoryUrl: "https://github.com/owner/repo",
+    targets: [target],
+  }, state);
+  assert.equal(preview.statusCode, 200);
+  const previewCall = calls.find((call) => call.url.endsWith("/github-imports/preview"));
+  assert.equal(previewCall.body.targets[0].origin_key, "doc-1:theorem:stable-label");
+  assert.equal(previewCall.body.targets[0].declaration_name, "current_name");
+  assert.equal(previewCall.body.namespace, "Lea.DocumentOne");
+
+  const confirmed = await handleGithubImportConfirm({
+    overleafProjectId: "doc-1",
+    previewId: "preview-1",
+  }, state);
+  assert.equal(confirmed.statusCode, 202);
+  const progress = await handleGithubImportStatus({
+    overleafProjectId: "doc-1",
+    importId: "import-1",
+  }, state);
+  assert.equal(progress.body.status, "complete");
 });
 
 test("project export streams the adapter zip through and softens a 404", async () => {

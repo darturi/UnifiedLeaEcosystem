@@ -8,6 +8,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import formalizations as service
+from .. import github_import_service
+from ..config import load_config
 from .. import store
 
 
@@ -76,6 +78,13 @@ def create_project_formalization(
         )
     except (ValueError, sqlite3.IntegrityError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    config = load_config()
+    if config.lea_root:
+        project = store.get_project(project_id)
+        if project:
+            github_import_service.try_adopt_imported_declaration(
+                project, row, config.lea_root / "workspace" / "proofs"
+            )
     return service.decorate([row])[0]
 
 

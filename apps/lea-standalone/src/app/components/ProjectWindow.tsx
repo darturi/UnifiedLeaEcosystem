@@ -40,6 +40,7 @@ export function ProjectWindow({
   const [tab, setTab] = useState<Tab>('overview');
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [importSignal, setImportSignal] = useState(0);
   const allSessions = project.sessions ?? [];
   // ROOTS only. A sub-agent is a session row (`parent_id` = the coordinator that
   // spawned it), and the project payload returns children alongside roots so callers
@@ -53,7 +54,10 @@ export function ProjectWindow({
   // project detail is re-fetched the Memory card re-loads memory.md (F4/D39).
   // Deliberately over ALL sessions, children included: a child's run advances the
   // project too, and missing that would leave the Memory card stale.
-  const docSignal = allSessions.reduce((max, s) => Math.max(max, Date.parse(s.updated_at) || 0), 0);
+  const docSignal = allSessions.reduce(
+    (max, s) => Math.max(max, Date.parse(s.updated_at) || 0),
+    0,
+  ) + importSignal;
 
   const submit = async () => {
     const message = draft.trim();
@@ -179,7 +183,11 @@ export function ProjectWindow({
         ) : tab === 'blueprint' ? (
           <BlueprintTab projectId={project.id} onOpenSession={onOpenSession} refreshSignal={docSignal} />
         ) : (
-          <FilesystemTab projectId={project.id} refreshSignal={docSignal} />
+          <FilesystemTab
+            projectId={project.id}
+            refreshSignal={docSignal}
+            onProjectChanged={() => setImportSignal((value) => value + 1)}
+          />
         )}
       </div>
     </div>

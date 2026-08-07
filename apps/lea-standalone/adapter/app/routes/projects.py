@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from lea.interface import check as interface_check
 
@@ -25,6 +25,9 @@ from .. import blueprint as blueprint_doc
 from .. import blueprint_seed
 from .. import filesystem as fs_service
 from .. import graph as graph_service
+from .. import github_import_service
+from ..github_project_import import ImportPlanningError, TaggedTarget
+from ..github_source import GitHubSourceError
 from .. import projects as project_service
 from .. import store
 from .. import uploads
@@ -87,6 +90,31 @@ class RemoteUpdate(BaseModel):
     remote_url: str
 
 
+class GithubImportTarget(BaseModel):
+    origin_key: str
+    label: str
+    declaration_name: str
+    kind: str
+    display_title: str
+    statement: str | None = None
+    source_hash: str | None = None
+
+
+class GithubImportPreviewRequest(BaseModel):
+    repository_url: str
+    targets: list[GithubImportTarget] = Field(default_factory=list)
+    project_name: str | None = None
+    namespace: str | None = None
+
+
+class GithubImportConfirmRequest(BaseModel):
+    preview_id: str
+
+
+class FormalizationTargetSyncRequest(BaseModel):
+    targets: list[GithubImportTarget]
+
+
 # An https GitHub repo URL: `github.com` / owner / repo (repo may carry a `.git`).
 #
 # The host is pinned deliberately (AUDIT-2026-07-24 S2). This pattern used to be
@@ -138,6 +166,27 @@ def _proofs_root() -> Path:
 def _project_identity_error(exc: project_service.ProjectIdentityError) -> HTTPException:
     detail = {"error": exc.code, "message": str(exc), **exc.detail}
     return HTTPException(status_code=exc.status, detail=detail)
+
+
+def _import_targets(rows: list[GithubImportTarget]) -> list[TaggedTarget]:
+    return [TaggedTarget(**row.model_dump()) for row in rows]
+
+
+def _import_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, ImportPlanningError):
+        status = {
+            "import_preview_expired": 410,
+            "project_busy": 409,
+            "import_preview_mismatch": 409,
+            "repository_file_limit": 413,
+            "repository_size_limit": 413,
+        }.get(exc.code, 422)
+        return HTTPException(status_code=status, detail={"error": exc.code, "message": str(exc)})
+    if isinstance(exc, GitHubSourceError):
+        message = str(exc)
+        status = 400 if exc.code == "invalid_repository_url" else 502
+        return HTTPException(status_code=status, detail={"error": exc.code, "message": message})
+    return HTTPException(status_code=500, detail={"error": "github_import_failed", "message": str(exc)})
 
 
 @router.get("/api/projects")
@@ -317,6 +366,14 @@ def write_project_file(project_id: str, request: FilePut) -> dict:
     Editing a `.lean` returns its standalone `check` verdict so the editor can flag
     a broken proof; editing `.lea/blueprint.md` lets the next `/graph` fetch re-derive."""
     project = _require_project(project_id)
+    if store.project_has_active_import(project_id):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "project_busy",
+                "message": "Wait for the active GitHub import before editing project files.",
+            },
+        )
     proofs_root = _proofs_root()
     try:
         sha = fs_service.write_text_file(project, proofs_root, request.path, request.content)
@@ -350,11 +407,107 @@ def export_project(project_id: str) -> Response:
     return _export_project_response(_require_project(project_id))
 
 
+# ── Additive GitHub Lean-file import ────────────────────────────────────────
+
+
+def _preview_github_import(project: dict, request: GithubImportPreviewRequest) -> dict:
+    try:
+        return github_import_service.preview_import(
+            project=project,
+            proofs_root=_proofs_root(),
+            repository_url=request.repository_url,
+            targets=_import_targets(request.targets),
+        )
+    except (ImportPlanningError, GitHubSourceError) as exc:
+        raise _import_error(exc) from None
+
+
+def _confirm_github_import(project: dict, request: GithubImportConfirmRequest) -> dict:
+    try:
+        return github_import_service.confirm_import(
+            project=project,
+            proofs_root=_proofs_root(),
+            preview_id=request.preview_id,
+        )
+    except (ImportPlanningError, GitHubSourceError) as exc:
+        raise _import_error(exc) from None
+
+
+def _github_import_progress(project: dict, import_id: str) -> dict:
+    result = store.github_import_progress(import_id)
+    if result is None or result["project_id"] != project["id"]:
+        raise HTTPException(status_code=404, detail="GitHub import not found")
+    return result
+
+
+@router.post("/api/projects/{project_id}/github-imports/preview")
+def preview_project_github_import(project_id: str, request: GithubImportPreviewRequest) -> dict:
+    return _preview_github_import(_require_project(project_id), request)
+
+
+@router.post("/api/projects/{project_id}/github-imports", status_code=202)
+def confirm_project_github_import(project_id: str, request: GithubImportConfirmRequest) -> dict:
+    return _confirm_github_import(_require_project(project_id), request)
+
+
+@router.get("/api/projects/{project_id}/github-imports/{import_id}")
+def get_project_github_import(project_id: str, import_id: str) -> dict:
+    return _github_import_progress(_require_project(project_id), import_id)
+
+
+@router.post("/api/projects/by-slug/{slug}/github-imports/preview")
+def preview_project_github_import_by_slug(
+    slug: str, request: GithubImportPreviewRequest
+) -> dict:
+    try:
+        project = store.get_project_by_slug(slug)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if project is None:
+        try:
+            project = project_service.ensure_project(
+                slug,
+                _proofs_root(),
+                title=(request.project_name or slug),
+                namespace=request.namespace,
+            )
+        except (ValueError, project_service.ProjectIdentityError) as exc:
+            if isinstance(exc, project_service.ProjectIdentityError):
+                raise _project_identity_error(exc)
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _preview_github_import(project, request)
+
+
+@router.post("/api/projects/by-slug/{slug}/github-imports", status_code=202)
+def confirm_project_github_import_by_slug(
+    slug: str, request: GithubImportConfirmRequest
+) -> dict:
+    return _confirm_github_import(_require_project_by_slug(slug), request)
+
+
+@router.get("/api/projects/by-slug/{slug}/github-imports/{import_id}")
+def get_project_github_import_by_slug(slug: str, import_id: str) -> dict:
+    return _github_import_progress(_require_project_by_slug(slug), import_id)
+
+
+@router.post("/api/projects/by-slug/{slug}/formalizations/sync")
+def sync_project_formalizations_by_slug(
+    slug: str, request: FormalizationTargetSyncRequest
+) -> dict:
+    project = _require_project_by_slug(slug)
+    return github_import_service.sync_targets(
+        project,
+        _import_targets(request.targets),
+        _proofs_root(),
+    )
+
+
 # ── Git sharing: set remote + push to GitHub (6b/U3, D34) ─────────────────────────
-# A project is already a git repo, so sharing is: store a per-project remote URL and
-# push to it with the global `github_token` (Settings). Pushing is outward-facing →
-# always an explicit user action; the token is injected into the push URL only (never
-# persisted to .git/config) and scrubbed from any output.
+# A project is already a git repo, so sharing is: store a per-project remote URL,
+# snapshot the complete working tree, then push it with the global `github_token`
+# (Settings). Pushing is outward-facing → always an explicit user action; the token
+# is injected into the push URL only (never persisted to .git/config) and scrubbed
+# from any output.
 
 
 def _set_remote_on(project: dict, remote_url: str) -> dict:
@@ -371,8 +524,13 @@ def _set_remote_on(project: dict, remote_url: str) -> dict:
 
 
 def _push_project(project: dict) -> dict:
-    """Push the project repo to its configured remote with the global token —
-    shared by the by-id and by-slug routes (D34)."""
+    """Commit the current project tree, then push it to the configured remote.
+
+    The explicit snapshot is what makes Share include files written outside the
+    adapter's normal commit-on-write paths (for example, an existing Lean project
+    copied into the repo). A clean tree is a no-op, so repeated pushes do not create
+    empty commits. Shared by the by-id and by-slug routes (D34).
+    """
     remote_url = project.get("remote_url")
     if not remote_url:
         raise HTTPException(status_code=400, detail="No GitHub remote set for this project.")
@@ -392,12 +550,34 @@ def _push_project(project: dict) -> dict:
                 "GitHub token to another server. Set an https://github.com/... remote first."
             ),
         )
-    repo = project_service.project_repo_dir(project, _proofs_root())
+    if store.project_has_active_run(project["id"]) or store.project_has_active_import(project["id"]):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "project_busy",
+                "message": "Wait for the active project operation to finish before sharing.",
+            },
+        )
+    proofs_root = _proofs_root()
+    repo = project_service.project_repo_dir(project, proofs_root)
+    git = GitStore(proofs_root)
     try:
-        summary = GitStore(_proofs_root()).push_to_github(repo, remote_url, token)
+        commit_sha = git.commit_all(repo, "share: snapshot project")
+    except GitStoreError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not commit the project before push: {exc}",
+        ) from None
+    try:
+        summary = git.push_to_github(repo, remote_url, token)
     except GitStoreError as exc:
         raise HTTPException(status_code=502, detail=_push_failure_detail(str(exc))) from None
-    return {"pushed": True, "remote_url": remote_url, "detail": summary or "Pushed."}
+    return {
+        "pushed": True,
+        "remote_url": remote_url,
+        "commit_sha": commit_sha,
+        "detail": summary or "Committed current project changes and pushed.",
+    }
 
 
 @router.put("/api/projects/{project_id}/git/remote")
@@ -612,7 +792,7 @@ def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
             "kind": row["kind"],
             "exists": exists,
             "declaration_present": artifacts_service.declaration_present(content, name) if exists else False,
-            "has_sorry": artifacts_service.contains_sorry_marker(content) if exists else None,
+            "has_sorry": artifacts_service.declaration_contains_sorry(content, name) if exists else None,
             "check_status": check["check_status"] if check else None,
             "check_detail": check["check_detail"] if check else None,
             "check_author": check["author"] if check else None,
@@ -862,6 +1042,11 @@ def delete_file(project_id: str, file_id: str) -> dict:
 
 @router.delete("/api/projects/{project_id}")
 def delete_project(project_id: str) -> dict:
+    if store.project_has_active_import(project_id):
+        raise HTTPException(status_code=409, detail={
+            "error": "project_busy",
+            "message": "Wait for the active GitHub import before deleting this project.",
+        })
     if not project_service.delete_project(project_id, _proofs_root()):
         raise HTTPException(status_code=404, detail="Project not found")
     return {"deleted": True, "id": project_id}

@@ -25,6 +25,15 @@ function variables(css) {
   return result;
 }
 
+function numericProperty(css, selector, property) {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rule = css.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`));
+  assert.ok(rule, `expected a ${selector} rule`);
+  const declaration = rule[1].match(new RegExp(`${property}\\s*:\\s*(\\d+)`));
+  assert.ok(declaration, `expected ${property} in ${selector}`);
+  return Number.parseInt(declaration[1], 10);
+}
+
 test("extension core theme stays in parity with the standalone Lea palette", async () => {
   const [uiCss, extensionCss] = await Promise.all([
     readFile(UI_THEME, "utf8"),
@@ -66,6 +75,16 @@ test("extension core theme stays in parity with the standalone Lea palette", asy
       `${extensionName} must match standalone --${uiName}`,
     );
   }
+});
+
+test("settings controls and popover stack above the Lean project pane", async () => {
+  const css = await readFile(path.join(EXTENSION, "content.css"), "utf8");
+  const paneLayer = numericProperty(css, ".ol-lean-project-pane", "z-index");
+  const settingsButtonLayer = numericProperty(css, ".ol-lean-settings-trigger", "z-index");
+  const popoverLayer = numericProperty(css, ".ol-lean-popover", "z-index");
+
+  assert.ok(settingsButtonLayer > paneLayer, "settings button must remain clickable above the Lean pane");
+  assert.ok(popoverLayer > paneLayer, "settings popover must render above the Lean pane");
 });
 
 test("extension surfaces load the shared theme before component CSS", async () => {

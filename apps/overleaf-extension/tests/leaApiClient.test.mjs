@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import {
   fetchAdapterModelCatalog,
   fetchAdapterModelRequirements,
+  previewGithubImportBySlug,
+  confirmGithubImportBySlug,
+  getGithubImportBySlug,
+  syncProjectFormalizationTargetsBySlug,
   parseSseFrame,
   runApiProofJob,
 } from "../companion/leaApiClient.mjs";
@@ -70,6 +74,34 @@ test("adapter model helpers call the catalog and encoded requirements endpoints"
   assert.equal(requirements.body.required_keys[0].env, "CUSTOM_API_KEY");
   assert.equal(calls[0].url, "http://adapter/api/models");
   assert.equal(calls[1].url, "http://adapter/api/models/requirements?model=custom%2Fmodel%20id");
+});
+
+test("GitHub import helpers use by-slug adapter routes and preserve targets", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url: String(url), options, body: options.body ? JSON.parse(options.body) : null });
+    return jsonResponse({ id: "import-1", status: "checking" }, true, options.method === "POST" ? 202 : 200);
+  };
+  const context = { fetchImpl, baseUrl: "http://adapter", slug: "paper-one" };
+  const targets = [{ origin_key: "paper-one:theorem:t", declaration_name: "t" }];
+
+  await previewGithubImportBySlug({
+    ...context,
+    repositoryUrl: "https://github.com/owner/repo",
+    targets,
+    projectName: "Paper One",
+    namespace: "Lea.PaperOne",
+  });
+  await confirmGithubImportBySlug({ ...context, previewId: "preview-1" });
+  await getGithubImportBySlug({ ...context, importId: "import/1" });
+  await syncProjectFormalizationTargetsBySlug({ ...context, targets });
+
+  assert.equal(calls[0].url, "http://adapter/api/projects/by-slug/paper-one/github-imports/preview");
+  assert.equal(calls[0].body.repository_url, "https://github.com/owner/repo");
+  assert.deepEqual(calls[0].body.targets, targets);
+  assert.equal(calls[1].body.preview_id, "preview-1");
+  assert.ok(calls[2].url.endsWith("/github-imports/import%2F1"));
+  assert.ok(calls[3].url.endsWith("/formalizations/sync"));
 });
 
 test("runApiProofJob: proved done → ok with usage read back from the run row", async () => {

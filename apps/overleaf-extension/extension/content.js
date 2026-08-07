@@ -22,6 +22,13 @@
   const LEAN_PANE_VIEWPORT_GUTTER_PX = 24;
   const LEAN_PANE_KEYBOARD_STEP_PX = 24;
   const LEAN_PANE_KEYBOARD_LARGE_STEP_PX = 80;
+  const SETTINGS_POPOVER_WIDTH_STORAGE_KEY = "settingsPopoverWidthPx";
+  const DEFAULT_SETTINGS_POPOVER_WIDTH_PX = 360;
+  const MIN_SETTINGS_POPOVER_WIDTH_PX = 360;
+  const MAX_SETTINGS_POPOVER_WIDTH_PX = 720;
+  const SETTINGS_POPOVER_VIEWPORT_GUTTER_PX = 24;
+  const SETTINGS_POPOVER_KEYBOARD_STEP_PX = 24;
+  const SETTINGS_POPOVER_KEYBOARD_LARGE_STEP_PX = 80;
   // Short debounce for an edit-triggered status refresh; a much longer cadence
   // for the in-progress self-poll so an active run doesn't hammer /statuses
   // (each hit does per-target FS scans + adapter fetches) four times a second
@@ -37,6 +44,11 @@
   const LEAN_PANE_CHAT_POLL_RECONCILE_MS = 30000;
   const REPAIR_BATCH_POLL_MS = 2000;
   const REPAIR_BATCH_POLL_RECONCILE_MS = 30000;
+  const GITHUB_IMPORT_POLL_MS = 1000;
+  const LEAN_PANE_ARCHIVE_TIMEOUT_MS = 15000;
+  const LEAN_PANE_COMPANION_TIMEOUT_MS = 10000;
+  const LEAN_PANE_STARTUP_WATCHDOG_MS = 12000;
+  const GITHUB_IMPORT_ACTIVE_STATUSES = new Set(["applying", "checking"]);
   const HUMAN_APPROVAL_STORAGE_KEY = "leaHumanApprovalsV1";
   const MODEL_FAMILY_LABELS = {
     openai: "OpenAI",
@@ -47,6 +59,8 @@
     { value: DEFAULT_LEA_MODEL, label: DEFAULT_LEA_MODEL, family: "openai" }
   ];
   let activePopover = null;
+  let settingsPopoverWidthPx = DEFAULT_SETTINGS_POPOVER_WIDTH_PX;
+  let settingsPopoverResizeState = null;
   let statusRefreshTimer = null;
   let usageRefreshTimer = null;
   let latestTargets = [];
@@ -65,6 +79,14 @@
   // only the active buffer; the zip refresh happens on this cadence.
   let lastTexMirrorFullSyncAt = 0;
   let latestStatuses = {};
+  // Server-provided target truth is kept separately from the short-lived UI
+  // overlay used while imported proofs are being checked. This prevents an
+  // ordinary /statuses refresh from re-enabling a matched target mid-import.
+  let latestBaseStatuses = {};
+  let activeGithubImport = null;
+  let githubImportNotice = null;
+  let githubImportNoticeTimer = null;
+  let githubImportNoticeExpanded = false;
   let humanApprovals = {};
   let humanApprovalsLoadPromise = null;
   let humanApprovalBusyKeys = new Set();
@@ -80,20 +102,27 @@
   let leanPaneResizeState = null;
   let leanPaneRefreshTimer = null;
   let leanPanePollTimer = null;
+  let leanPaneStartupWatchdogTimer = null;
   let leanPaneView = null;
   let leanPaneExpandedTreeNodeIds = new Set();
   let leanPaneTreeDefaultsKey = "";
   let leanPaneExpandedItemIds = new Set();
   let leanPaneHighlightTimer = null;
   let lastLeanPaneManifest = null;
+  let lastLeanPaneManifestProjectId = "";
   let lastProjectIdentity = null;
   let lastLeanPaneFiles = null;
   let lastLeanPaneProjectId = "";
+  let leanPaneInventoryWarning = "";
+  let leanPaneArchiveLoad = null;
   // Share panel (D34): remote + push against the adapter's project repo, via the
   // companion's /share/github passthroughs. One panel, toggled from the header.
   let leanPaneSharePanel = null;
   let leanPaneShareState = null;
   let leanPaneShareBusy = false;
+  // GitHub pushes use a Lea-owned confirmation surface. Browser-native confirm
+  // dialogs cannot inherit the extension's typography, spacing, or theme.
+  let githubPushDialogState = null;
   // Project identity editing stays inside Lea's visual language instead of
   // falling through to the browser's unstyleable prompt/confirm pair. The
   // dialog owns its async namespace preview so stale responses cannot repaint
@@ -228,6 +257,7 @@
   renderSettingsButton();
   renderLeanPaneButton();
   hydrateLeanPaneWidthFromStorage();
+  hydrateSettingsPopoverWidthFromStorage();
   loadHumanApprovals().then(() => {
     renderStatusBadges();
     if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
@@ -236,6 +266,14 @@
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
+    if (githubImportNoticeExpanded) {
+      setGithubImportNoticeExpanded(false);
+      return;
+    }
+    if (githubPushDialogState) {
+      closeGithubPushConfirmation();
+      return;
+    }
     if (projectIdentityDialog) {
       closeProjectIdentityEditor();
       return;
@@ -252,6 +290,13 @@
   });
 
   document.addEventListener("click", (event) => {
+    if (
+      githubImportNoticeExpanded
+      && githubImportNotice?.isConnected
+      && !githubImportNotice.contains(event.target)
+    ) {
+      setGithubImportNoticeExpanded(false);
+    }
     if (activeOverflowMenu && !activeOverflowMenu.wrap.contains(event.target)) {
       closeActiveOverflowMenu();
     }
@@ -263,6 +308,7 @@
   window.addEventListener("resize", () => {
     renderStatusBadges();
     clampOpenLeanPaneToViewport();
+    clampOpenSettingsPopoverToViewport();
   });
   // Capture-phase scroll fires very frequently; coalesce to one update per
   // animation frame (AUDIT M4) instead of re-parsing the whole document and
@@ -371,7 +417,7 @@
     namespaceLabel.className = "ol-lean-sr-only";
     namespaceLabel.textContent = "Lean namespace: ";
     leanPaneProjectNamespace = document.createElement("span");
-    leanPaneProjectNamespace.textContent = "Namespace unavailable";
+    leanPaneProjectNamespace.textContent = "Connecting…";
     namespace.appendChild(namespaceLabel);
     namespace.appendChild(leanPaneProjectNamespace);
     titleWrap.appendChild(paneLabel);
@@ -437,11 +483,25 @@
     document.body.appendChild(leanPane);
     leanPane.focus({ preventScroll: true });
     if (!deferRefresh) {
-      refreshLeanPaneNow({ forceFetch: true }).catch(renderLeanPaneError);
+      clearTimeout(leanPaneStartupWatchdogTimer);
+      leanPaneStartupWatchdogTimer = setTimeout(() => {
+        if (leanPane && leanPaneStatus?.textContent === "Loading project inventory...") {
+          renderLeanPaneError(new Error(
+            "Pane startup stalled before the project manifest rendered. The extension resource or browser storage request did not settle."
+          ));
+        }
+      }, LEAN_PANE_STARTUP_WATCHDOG_MS);
+      refreshLeanPaneNow({ forceFetch: true })
+        .catch(renderLeanPaneError)
+        .finally(() => {
+          clearTimeout(leanPaneStartupWatchdogTimer);
+          leanPaneStartupWatchdogTimer = null;
+        });
     }
   }
 
   function closeLeanPane() {
+    closeGithubPushConfirmation({ restoreFocus: false });
     if (projectIdentityEditorState?.source === "lean-pane") {
       closeProjectIdentityEditor({ restoreFocus: false });
     }
@@ -449,6 +509,8 @@
     leanPaneRefreshTimer = null;
     clearTimeout(leanPanePollTimer);
     leanPanePollTimer = null;
+    clearTimeout(leanPaneStartupWatchdogTimer);
+    leanPaneStartupWatchdogTimer = null;
     clearTimeout(leanPaneHighlightTimer);
     leanPaneHighlightTimer = null;
     stopLeanPaneResize({ persist: false });
@@ -517,6 +579,156 @@
     if (nextWidth === leanPaneWidthPx) return;
     applyLeanPaneWidth(nextWidth);
     persistLeanPaneWidth();
+  }
+
+  function hydrateSettingsPopoverWidthFromStorage() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.get({ [SETTINGS_POPOVER_WIDTH_STORAGE_KEY]: DEFAULT_SETTINGS_POPOVER_WIDTH_PX })
+      .then((settings) => {
+        settingsPopoverWidthPx = clampSettingsPopoverWidth(settings?.[SETTINGS_POPOVER_WIDTH_STORAGE_KEY]);
+        applySettingsPopoverWidth();
+      })
+      .catch(() => {
+        settingsPopoverWidthPx = clampSettingsPopoverWidth(DEFAULT_SETTINGS_POPOVER_WIDTH_PX);
+        applySettingsPopoverWidth();
+      });
+  }
+
+  function maxSettingsPopoverWidthPx() {
+    const viewportWidth = Number(window.innerWidth)
+      || DEFAULT_SETTINGS_POPOVER_WIDTH_PX + SETTINGS_POPOVER_VIEWPORT_GUTTER_PX;
+    return Math.max(
+      0,
+      Math.min(MAX_SETTINGS_POPOVER_WIDTH_PX, viewportWidth - SETTINGS_POPOVER_VIEWPORT_GUTTER_PX)
+    );
+  }
+
+  function minSettingsPopoverWidthPx() {
+    return Math.min(MIN_SETTINGS_POPOVER_WIDTH_PX, maxSettingsPopoverWidthPx());
+  }
+
+  function clampSettingsPopoverWidth(width) {
+    const numeric = Number.parseInt(String(width), 10);
+    const fallback = Number.isFinite(numeric) ? numeric : DEFAULT_SETTINGS_POPOVER_WIDTH_PX;
+    const maxWidth = maxSettingsPopoverWidthPx();
+    return Math.min(Math.max(fallback, minSettingsPopoverWidthPx()), maxWidth);
+  }
+
+  function isSettingsPopover(popover) {
+    return Boolean(popover?.classList?.contains("ol-lean-settings-popover"));
+  }
+
+  function applySettingsPopoverWidth(width = settingsPopoverWidthPx, popover = activePopover) {
+    settingsPopoverWidthPx = clampSettingsPopoverWidth(width);
+    if (isSettingsPopover(popover)) {
+      popover.style.setProperty("--ol-lean-settings-width", `${settingsPopoverWidthPx}px`);
+      const resizer = popover.querySelector(".ol-lean-settings-popover-resizer");
+      resizer?.setAttribute("aria-valuemin", String(minSettingsPopoverWidthPx()));
+      resizer?.setAttribute("aria-valuemax", String(maxSettingsPopoverWidthPx()));
+      resizer?.setAttribute("aria-valuenow", String(settingsPopoverWidthPx));
+    }
+    return settingsPopoverWidthPx;
+  }
+
+  function persistSettingsPopoverWidth() {
+    if (isExtensionContextInvalidated()) return;
+    chrome.storage.sync.set({ [SETTINGS_POPOVER_WIDTH_STORAGE_KEY]: settingsPopoverWidthPx }).catch(() => {});
+  }
+
+  function clampOpenSettingsPopoverToViewport() {
+    const nextWidth = clampSettingsPopoverWidth(settingsPopoverWidthPx);
+    const widthChanged = nextWidth !== settingsPopoverWidthPx;
+    if (isSettingsPopover(activePopover)) {
+      applySettingsPopoverWidth(nextWidth, activePopover);
+      positionSettingsPopover(activePopover);
+    } else {
+      settingsPopoverWidthPx = nextWidth;
+    }
+    if (widthChanged) persistSettingsPopoverWidth();
+  }
+
+  function startSettingsPopoverResize(event) {
+    const popover = activePopover;
+    if (!isSettingsPopover(popover) || settingsPopoverResizeState) return;
+    if (event.type === "mousedown" && event.button !== undefined && event.button !== 0) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    settingsPopoverResizeState = {
+      popover,
+      startClientX: Number(event.clientX) || 0,
+      startWidth: settingsPopoverWidthPx,
+      pointerId: event.pointerId,
+      usingPointer: event.type === "pointerdown"
+    };
+    popover.classList.add("ol-lean-settings-popover-resizing");
+    document.body?.classList?.add("ol-lean-settings-resizing");
+    if (settingsPopoverResizeState.usingPointer) {
+      document.addEventListener("pointermove", handleSettingsPopoverResizeMove, true);
+      document.addEventListener("pointerup", finishSettingsPopoverResize, true);
+      document.addEventListener("pointercancel", cancelSettingsPopoverResize, true);
+    } else {
+      document.addEventListener("mousemove", handleSettingsPopoverResizeMove, true);
+      document.addEventListener("mouseup", finishSettingsPopoverResize, true);
+    }
+  }
+
+  function handleSettingsPopoverResizeMove(event) {
+    if (!settingsPopoverResizeState) return;
+    if (
+      settingsPopoverResizeState.pointerId !== undefined
+      && event.pointerId !== undefined
+      && event.pointerId !== settingsPopoverResizeState.pointerId
+    ) return;
+    event.preventDefault?.();
+    const currentClientX = Number(event.clientX) || 0;
+    const delta = settingsPopoverResizeState.startClientX - currentClientX;
+    applySettingsPopoverWidth(
+      settingsPopoverResizeState.startWidth + delta,
+      settingsPopoverResizeState.popover
+    );
+  }
+
+  function finishSettingsPopoverResize(event) {
+    event?.preventDefault?.();
+    stopSettingsPopoverResize({ persist: true });
+  }
+
+  function cancelSettingsPopoverResize(event) {
+    event?.preventDefault?.();
+    stopSettingsPopoverResize({ persist: false });
+  }
+
+  function stopSettingsPopoverResize({ persist }) {
+    if (!settingsPopoverResizeState) return;
+    const { popover, usingPointer } = settingsPopoverResizeState;
+    settingsPopoverResizeState = null;
+    if (usingPointer) {
+      document.removeEventListener?.("pointermove", handleSettingsPopoverResizeMove, true);
+      document.removeEventListener?.("pointerup", finishSettingsPopoverResize, true);
+      document.removeEventListener?.("pointercancel", cancelSettingsPopoverResize, true);
+    } else {
+      document.removeEventListener?.("mousemove", handleSettingsPopoverResizeMove, true);
+      document.removeEventListener?.("mouseup", finishSettingsPopoverResize, true);
+    }
+    popover?.classList?.remove("ol-lean-settings-popover-resizing");
+    document.body?.classList?.remove("ol-lean-settings-resizing");
+    if (persist) persistSettingsPopoverWidth();
+  }
+
+  function handleSettingsPopoverResizeKeydown(event) {
+    let nextWidth = null;
+    const step = event.shiftKey
+      ? SETTINGS_POPOVER_KEYBOARD_LARGE_STEP_PX
+      : SETTINGS_POPOVER_KEYBOARD_STEP_PX;
+    if (event.key === "ArrowLeft") nextWidth = settingsPopoverWidthPx + step;
+    else if (event.key === "ArrowRight") nextWidth = settingsPopoverWidthPx - step;
+    else if (event.key === "Home") nextWidth = minSettingsPopoverWidthPx();
+    else if (event.key === "End") nextWidth = maxSettingsPopoverWidthPx();
+    if (nextWidth === null) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    applySettingsPopoverWidth(nextWidth);
+    persistSettingsPopoverWidth();
   }
 
   function startLeanPaneResize(event) {
@@ -657,6 +869,7 @@
       </div>
       <div class="ol-lean-share-actions">
         <button type="button" class="ol-lean-provider-key-button" data-role="share-export" title="Download the Lean project as a zip">Download .zip</button>
+        <button type="button" class="ol-lean-provider-key-button" data-role="github-import" title="Add non-conflicting Lean files from GitHub">Add Lean files from GitHub</button>
       </div>
       <p class="ol-lean-share-hint" data-role="share-hint" hidden></p>
       <p class="ol-lean-share-status" role="status" data-role="share-status">Loading share status...</p>
@@ -669,12 +882,15 @@
     panel.querySelector("[data-role='share-save']").addEventListener("click", () => {
       saveShareRemote().catch((error) => setShareStatus(errorText(error)));
     });
-    panel.querySelector("[data-role='share-push']").addEventListener("click", () => {
-      pushShareRemote().catch((error) => setShareStatus(errorText(error)));
+    panel.querySelector("[data-role='share-push']").addEventListener("click", (event) => {
+      pushShareRemote(event.currentTarget).catch((error) => setShareStatus(errorText(error)));
     });
     const exportButton = panel.querySelector("[data-role='share-export']");
     exportButton?.addEventListener("click", () => {
       exportLeanProject(exportButton).catch((error) => setShareStatus(errorText(error)));
+    });
+    panel.querySelector("[data-role='github-import']")?.addEventListener("click", () => {
+      openGithubImportDialog().catch((error) => setShareStatus(errorText(error)));
     });
 
     try {
@@ -703,6 +919,20 @@
     if (input) input.value = leanPaneShareState.remoteUrl || "";
     setShareStatus("");
     renderShareControls();
+  }
+
+  // GitHub-import preview ensures the adapter project exists, even when the
+  // Overleaf document did not have one before. Refresh the already-open Share
+  // panel after that transition (and again after apply) so it does not retain
+  // the pre-import `exists: false` snapshot. A status-refresh failure should
+  // not turn a successful preview/import into a failed import operation.
+  async function refreshShareStatusAfterProjectEnsure() {
+    if (!leanPaneSharePanel) return;
+    try {
+      await loadShareStatus();
+    } catch (error) {
+      setShareStatus(`Could not refresh share status: ${errorText(error)}`);
+    }
   }
 
   function renderShareControls() {
@@ -764,12 +994,157 @@
     }
   }
 
-  async function pushShareRemote() {
+  function closeGithubPushConfirmation({ confirmed = false, restoreFocus = true } = {}) {
+    const state = githubPushDialogState;
+    if (!state) return;
+    githubPushDialogState = null;
+    state.shell.remove();
+    if (restoreFocus && state.trigger?.isConnected) {
+      state.trigger.focus({ preventScroll: true });
+    }
+    state.resolve(Boolean(confirmed));
+  }
+
+  function requestGithubPushConfirmation(remote, trigger = null) {
+    closeGithubPushConfirmation({ restoreFocus: false });
+    return new Promise((resolve) => {
+      const shell = createProjectIdentityElement(
+        "div",
+        "ol-lean-project-identity-backdrop ol-lean-github-push-backdrop"
+      );
+      const dialog = createProjectIdentityElement(
+        "section",
+        "ol-lean-project-identity-dialog ol-lean-github-push-dialog"
+      );
+      dialog.setAttribute("role", "dialog");
+      dialog.setAttribute("aria-modal", "true");
+      dialog.setAttribute("aria-labelledby", "ol-lean-github-push-title");
+      dialog.setAttribute("aria-describedby", "ol-lean-github-push-description");
+
+      const header = createProjectIdentityElement(
+        "header",
+        "ol-lean-project-identity-header ol-lean-github-push-header"
+      );
+      const mark = createProjectIdentityElement(
+        "span",
+        "ol-lean-project-identity-mark ol-lean-github-push-mark",
+        "↗"
+      );
+      mark.setAttribute("aria-hidden", "true");
+      const heading = createProjectIdentityElement("div", "ol-lean-project-identity-heading");
+      heading.appendChild(createProjectIdentityElement(
+        "p",
+        "ol-lean-project-identity-kicker",
+        "GitHub repository"
+      ));
+      const title = createProjectIdentityElement("h2", "", "Push project?");
+      title.id = "ol-lean-github-push-title";
+      const description = createProjectIdentityElement(
+        "p",
+        "ol-lean-project-identity-description",
+        "Review the destination before sending this Lea project's commits."
+      );
+      description.id = "ol-lean-github-push-description";
+      heading.appendChild(title);
+      heading.appendChild(description);
+      const close = createProjectIdentityElement(
+        "button",
+        "ol-lean-icon-button ol-lean-project-identity-close",
+        "×"
+      );
+      close.type = "button";
+      close.setAttribute("aria-label", "Close GitHub push confirmation");
+      header.appendChild(mark);
+      header.appendChild(heading);
+      header.appendChild(close);
+
+      const content = createProjectIdentityElement("div", "ol-lean-github-push-content");
+      const review = createProjectIdentityElement("section", "ol-lean-github-push-review");
+      review.setAttribute("aria-label", "GitHub push destination");
+      review.appendChild(createProjectIdentityElement(
+        "p",
+        "ol-lean-project-identity-preview-title",
+        "Destination"
+      ));
+
+      const remoteRow = createProjectIdentityElement("div", "ol-lean-github-push-review-row");
+      remoteRow.appendChild(createProjectIdentityElement("span", "", "Repository"));
+      remoteRow.appendChild(createProjectIdentityElement("code", "", remote));
+      review.appendChild(remoteRow);
+
+      const branchRow = createProjectIdentityElement("div", "ol-lean-github-push-review-row");
+      branchRow.appendChild(createProjectIdentityElement("span", "", "Branch"));
+      branchRow.appendChild(createProjectIdentityElement("code", "", "main"));
+      review.appendChild(branchRow);
+      content.appendChild(review);
+
+      const note = createProjectIdentityElement(
+        "p",
+        "ol-lean-github-push-note",
+        "Lea will update the remote main branch with its committed proof files. If the repository has newer commits, the push will stop so you can reconcile them first."
+      );
+      content.appendChild(note);
+
+      const actions = createProjectIdentityElement(
+        "footer",
+        "ol-lean-project-identity-actions ol-lean-github-push-actions"
+      );
+      const cancel = createProjectIdentityElement("button", "ol-lean-secondary-button", "Cancel");
+      cancel.type = "button";
+      const confirm = createProjectIdentityElement(
+        "button",
+        "ol-lean-primary-button ol-lean-github-push-confirm",
+        "Push to GitHub"
+      );
+      confirm.type = "button";
+      confirm.dataset.role = "confirm-push";
+      actions.appendChild(cancel);
+      actions.appendChild(confirm);
+      content.appendChild(actions);
+
+      dialog.appendChild(header);
+      dialog.appendChild(content);
+      shell.appendChild(dialog);
+      document.body.appendChild(shell);
+      githubPushDialogState = { shell, dialog, trigger, resolve };
+
+      const cancelPush = () => closeGithubPushConfirmation();
+      close.addEventListener("click", cancelPush);
+      cancel.addEventListener("click", cancelPush);
+      confirm.addEventListener("click", () => {
+        closeGithubPushConfirmation({ confirmed: true });
+      });
+      shell.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (event.target === shell) cancelPush();
+      });
+      dialog.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          event.stopPropagation();
+          cancelPush();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = [close, cancel, confirm].filter((element) => !element.disabled && !element.hidden);
+        const index = focusable.indexOf(document.activeElement);
+        if (event.shiftKey && index <= 0) {
+          event.preventDefault();
+          focusable[focusable.length - 1].focus();
+        } else if (!event.shiftKey && index === focusable.length - 1) {
+          event.preventDefault();
+          focusable[0].focus();
+        }
+      });
+      confirm.focus({ preventScroll: true });
+    });
+  }
+
+  async function pushShareRemote(trigger = null) {
     const remote = leanPaneShareState?.remoteUrl;
     if (!remote) return;
-    if (!window.confirm(`Push this project to ${remote}?\n\nThis pushes the Lea project's commits to the repo's main branch.`)) {
-      return;
-    }
+    const confirmed = await requestGithubPushConfirmation(remote, trigger);
+    if (!confirmed) return;
     const projectId = extractOverleafProjectId();
     const baseUrl = await chatCompanionBaseUrl();
     leanPaneShareBusy = true;
@@ -795,6 +1170,446 @@
 
   function errorText(error) {
     return error instanceof Error ? error.message : String(error);
+  }
+
+  function githubImportProgressText(progress) {
+    const checks = progress?.counts?.checks || {};
+    const passed = Number(checks.ok || 0);
+    const failed = Number(checks.error || 0);
+    const pending = Number(checks.pending || 0);
+    if (progress?.status === "applying") return "Adding Lean files from GitHub…";
+    if (passed === 0 && failed === 0) {
+      return pending > 0
+        ? `${pending} imported Lean file${pending === 1 ? " is" : "s are"} queued for checking.`
+        : "Imported Lean files are queued for local checks.";
+    }
+    return `Checking imported Lean files: ${passed} passed · ${failed} failed · ${pending} pending`;
+  }
+
+  function githubImportCompletionText(progress) {
+    const dispositions = progress?.counts?.dispositions || {};
+    const conflicts = Number(dispositions.path_conflict || 0)
+      + Number(dispositions.declaration_conflict || 0);
+    return `${progress?.reused ? "Already imported · " : ""}${Number(dispositions.add || 0)} added · ${Number(dispositions.already_present || 0)} already present · ${conflicts} conflicts skipped · ${Number(progress?.counts?.matched_declarations || 0)} formalizations populated · ${Number(progress?.counts?.reusable_declarations || 0)} reusable declarations`;
+  }
+
+  function githubImportFormalizationQueue(tracker) {
+    if (!tracker) return [];
+    const progress = tracker.progress || {};
+    const files = Array.isArray(progress.files) ? progress.files : [];
+    const declarations = Array.isArray(progress.declarations) ? progress.declarations : [];
+    const pendingFile = files.find((file) => file?.check_status === "pending");
+    const items = [];
+    for (const target of tracker.targetDetails || []) {
+      const declaration = declarations.find((row) => (
+        row?.declaration_name === target.declarationName
+        || row?.full_name === target.declarationName
+      ));
+      const destinationPath = String(declaration?.destination_path || target.destinationPath || "");
+      const file = files.find((row) => row?.destination_path === destinationPath);
+      if (["ok", "error"].includes(String(file?.check_status || ""))) continue;
+      const checking = progress.status === "checking" && (
+        pendingFile
+          ? pendingFile.destination_path === destinationPath
+          : items.length === 0
+      );
+      items.push({
+        key: target.key,
+        label: target.displayTitle || target.declarationName || target.targetLabel,
+        state: checking ? "checking" : "queued",
+      });
+    }
+    return items.sort((left, right) => Number(right.state === "checking") - Number(left.state === "checking"));
+  }
+
+  function githubImportNoticeText(tracker, queue = githubImportFormalizationQueue(tracker)) {
+    if (queue.length === 0) return githubImportProgressText(tracker?.progress);
+    const noun = queue.length === 1 ? "formalization" : "formalizations";
+    const current = queue.find((item) => item.state === "checking");
+    return current
+      ? `${queue.length} ${noun} remaining · Checking ${current.label}`
+      : `${queue.length} ${noun} queued for import checks`;
+  }
+
+  function setGithubImportNoticeExpanded(expanded) {
+    githubImportNoticeExpanded = Boolean(expanded);
+    if (!githubImportNotice) return;
+    const toggle = githubImportNotice.querySelector("[data-role='toggle']");
+    const details = githubImportNotice.querySelector("[data-role='details']");
+    const arrow = githubImportNotice.querySelector("[data-role='arrow']");
+    const dismiss = githubImportNotice.querySelector("[data-role='dismiss']");
+    const active = githubImportNotice.dataset.active === "true";
+    toggle?.setAttribute("aria-expanded", String(githubImportNoticeExpanded));
+    if (details) details.hidden = !githubImportNoticeExpanded;
+    if (arrow) arrow.textContent = githubImportNoticeExpanded ? "⌄" : "⌃";
+    if (dismiss) {
+      dismiss.hidden = active && !githubImportNoticeExpanded;
+      dismiss.textContent = active ? "−" : "×";
+      dismiss.setAttribute(
+        "aria-label",
+        active ? "Minimize GitHub import status" : "Dismiss GitHub import status"
+      );
+    }
+    githubImportNotice.classList.toggle("is-expanded", githubImportNoticeExpanded);
+  }
+
+  function showGithubImportNotice(message, { error = false, settled = false, queue = [] } = {}) {
+    const importId = String(activeGithubImport?.id || "");
+    clearTimeout(githubImportNoticeTimer);
+    githubImportNoticeTimer = null;
+    if (!githubImportNotice?.isConnected) {
+      githubImportNotice = document.createElement("div");
+      githubImportNotice.className = "ol-lean-github-import-notice";
+      githubImportNotice.setAttribute("role", "region");
+      githubImportNotice.setAttribute("aria-label", "GitHub import progress");
+
+      const header = document.createElement("div");
+      header.className = "ol-lean-github-import-notice-header";
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "ol-lean-github-import-notice-toggle";
+      toggle.dataset.role = "toggle";
+      const arrow = document.createElement("span");
+      arrow.dataset.role = "arrow";
+      arrow.setAttribute("aria-hidden", "true");
+      const copy = document.createElement("span");
+      copy.dataset.role = "copy";
+      copy.setAttribute("role", "status");
+      copy.setAttribute("aria-live", "polite");
+      toggle.append(arrow, copy);
+      toggle.addEventListener("click", () => {
+        setGithubImportNoticeExpanded(!githubImportNoticeExpanded);
+      });
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "ol-lean-icon-button";
+      dismiss.dataset.role = "dismiss";
+      dismiss.addEventListener("click", () => {
+        if (githubImportNotice?.dataset.active === "true") {
+          setGithubImportNoticeExpanded(false);
+          return;
+        }
+        githubImportNotice?.remove();
+      });
+      header.append(toggle, dismiss);
+
+      const details = document.createElement("div");
+      details.className = "ol-lean-github-import-notice-details";
+      details.dataset.role = "details";
+      details.hidden = true;
+      githubImportNotice.append(header, details);
+      (document.body || document.documentElement).appendChild(githubImportNotice);
+    }
+    githubImportNotice.dataset.importId = importId;
+    githubImportNotice.dataset.active = String(!settled && Boolean(importId));
+    githubImportNotice.querySelector("[data-role='copy']").textContent = message;
+    githubImportNotice.classList.toggle("is-error", error);
+    githubImportNotice.classList.toggle("is-settled", settled);
+    const toggle = githubImportNotice.querySelector("[data-role='toggle']");
+    if (toggle) {
+      toggle.disabled = queue.length === 0;
+      toggle.title = queue.length > 0 ? "Show remaining formalizations" : "";
+    }
+    const arrow = githubImportNotice.querySelector("[data-role='arrow']");
+    if (arrow) arrow.hidden = queue.length === 0;
+    const details = githubImportNotice.querySelector("[data-role='details']");
+    details?.replaceChildren();
+    if (details && queue.length > 0) {
+      const list = document.createElement("ol");
+      list.className = "ol-lean-github-import-queue";
+      for (const item of queue) {
+        const row = document.createElement("li");
+        row.className = `is-${item.state}`;
+        const marker = document.createElement("span");
+        marker.className = "ol-lean-github-import-queue-marker";
+        marker.textContent = item.state === "checking" ? "●" : "○";
+        marker.setAttribute("aria-hidden", "true");
+        const label = document.createElement("strong");
+        label.textContent = item.label;
+        const state = document.createElement("span");
+        state.textContent = item.state === "checking" ? "Checking now" : "Queued";
+        row.append(marker, label, state);
+        list.appendChild(row);
+      }
+      details.appendChild(list);
+    }
+    if (settled || queue.length === 0) githubImportNoticeExpanded = false;
+    setGithubImportNoticeExpanded(githubImportNoticeExpanded);
+    if (settled) {
+      githubImportNoticeTimer = setTimeout(() => githubImportNotice?.remove(), 8000);
+    }
+  }
+
+  function githubImportStatusOverlay(statuses) {
+    const overlaid = { ...(statuses || {}) };
+    if (!activeGithubImport) return overlaid;
+    const message = githubImportProgressText(activeGithubImport.progress);
+    for (const key of activeGithubImport.targetKeys) {
+      const current = overlaid[key] || {};
+      overlaid[key] = {
+        ...current,
+        status: "in_progress",
+        effectiveStatus: current.effectiveStatus || current.status || "unformalized",
+        message,
+        githubImportPending: true,
+        githubImportId: activeGithubImport.id,
+      };
+    }
+    return overlaid;
+  }
+
+  function restoreGithubImportPaneItem(item) {
+    if (!item?.githubImportPending) return item;
+    const restored = {
+      ...item,
+      status: item.githubImportPreviousStatus,
+      inProgress: item.githubImportPreviousInProgress,
+      message: item.githubImportPreviousMessage,
+    };
+    delete restored.githubImportPending;
+    delete restored.githubImportId;
+    delete restored.githubImportPreviousStatus;
+    delete restored.githubImportPreviousInProgress;
+    delete restored.githubImportPreviousMessage;
+    return restored;
+  }
+
+  function githubImportPaneOverlay(manifest) {
+    if (!manifest || !Array.isArray(manifest.items)) return manifest;
+    const items = manifest.items.map((rawItem) => {
+      const item = restoreGithubImportPaneItem(rawItem);
+      const kind = item?.leanKind === "def" ? "definition" : "theorem";
+      const label = String(item?.label || item?.leanDeclarationName || "").trim();
+      if (!activeGithubImport?.targetKeys.has(`${kind}:${label}`)) return item;
+      return {
+        ...item,
+        status: "in-progress",
+        inProgress: true,
+        message: githubImportProgressText(activeGithubImport.progress),
+        githubImportPending: true,
+        githubImportId: activeGithubImport.id,
+        githubImportPreviousStatus: item.status,
+        githubImportPreviousInProgress: item.inProgress,
+        githubImportPreviousMessage: item.message,
+      };
+    });
+    return { ...manifest, items };
+  }
+
+  function renderGithubImportSurfaceState() {
+    latestStatuses = githubImportStatusOverlay(latestBaseStatuses);
+    renderStatusBadges();
+    if (activePopover?.dataset.targetKey) {
+      const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
+      if (target) updatePopoverStatus(activePopover, target);
+    }
+    if (lastLeanPaneManifest) renderLeanPaneManifest(lastLeanPaneManifest);
+  }
+
+  function settleGithubImportTracking(tracker, progress) {
+    if (activeGithubImport !== tracker) return;
+    activeGithubImport = null;
+    renderGithubImportSurfaceState();
+    const complete = progress?.status === "complete";
+    const detail = progress?.error_detail
+      ? ` ${String(progress.error_detail)}`
+      : "";
+    showGithubImportNotice(
+      complete
+        ? `GitHub import complete. ${githubImportCompletionText(progress)}`
+        : `GitHub import finished with issues.${detail}`,
+      { error: !complete, settled: true }
+    );
+    refreshLeanPaneNow({ forceFetch: true, background: true }).catch(() => {});
+    refreshStatusesNow().catch(() => {});
+    refreshShareStatusAfterProjectEnsure().catch(() => {});
+  }
+
+  async function pollGithubImport(tracker) {
+    if (activeGithubImport !== tracker) return;
+    try {
+      const response = await fetch(
+        `${tracker.baseUrl}/project/github-import/status?overleafProjectId=${encodeURIComponent(tracker.projectId)}&importId=${encodeURIComponent(tracker.id)}`
+      );
+      const progress = await response.json().catch(() => ({}));
+      if (!response.ok) throw companionRequestError(response, progress);
+      if (activeGithubImport !== tracker) return;
+      tracker.progress = progress;
+      renderGithubImportSurfaceState();
+      const queue = githubImportFormalizationQueue(tracker);
+      showGithubImportNotice(githubImportNoticeText(tracker, queue), { queue });
+      if (!GITHUB_IMPORT_ACTIVE_STATUSES.has(progress.status)) {
+        settleGithubImportTracking(tracker, progress);
+        return;
+      }
+    } catch (error) {
+      if (activeGithubImport !== tracker) return;
+      showGithubImportNotice(`GitHub import is still running, but its status could not be refreshed. Retrying… ${errorText(error)}`, { error: true });
+    }
+    tracker.timer = setTimeout(() => pollGithubImport(tracker), GITHUB_IMPORT_POLL_MS);
+  }
+
+  function startGithubImportTracking({ progress, preview, targets, projectId, baseUrl }) {
+    const tracker = {
+      id: String(progress?.id || ""),
+      projectId,
+      baseUrl,
+      progress,
+      targetDetails: leanPaneView.githubImportMatchedTargets(preview, targets),
+      timer: null,
+    };
+    tracker.targetKeys = new Set(tracker.targetDetails.map((target) => target.key));
+    if (!tracker.id || !GITHUB_IMPORT_ACTIVE_STATUSES.has(progress?.status)) {
+      showGithubImportNotice(
+        progress?.status === "complete"
+          ? `GitHub import complete. ${githubImportCompletionText(progress)}`
+          : `GitHub import finished with issues. ${githubImportCompletionText(progress)}`,
+        { error: progress?.status !== "complete", settled: true }
+      );
+      refreshLeanPaneNow({ forceFetch: true, background: true }).catch(() => {});
+      refreshStatusesNow().catch(() => {});
+      refreshShareStatusAfterProjectEnsure().catch(() => {});
+      return;
+    }
+    if (activeGithubImport?.timer) clearTimeout(activeGithubImport.timer);
+    githubImportNoticeExpanded = false;
+    activeGithubImport = tracker;
+    renderGithubImportSurfaceState();
+    const queue = githubImportFormalizationQueue(tracker);
+    showGithubImportNotice(githubImportNoticeText(tracker, queue), { queue });
+    tracker.timer = setTimeout(() => pollGithubImport(tracker), GITHUB_IMPORT_POLL_MS);
+  }
+
+  async function openGithubImportDialog() {
+    await ensureLeanPaneView();
+    await refreshLeanPaneNow({ forceFetch: true, background: true });
+    const projectId = extractOverleafProjectId();
+    const baseUrl = await chatCompanionBaseUrl();
+    const targets = (lastLeanPaneManifest?.items || []).map((item) =>
+      leanPaneView.paneItemToGithubImportTarget(item)
+    );
+    let preview = null;
+
+    const overlay = document.createElement("div");
+    overlay.className = "ol-lean-github-import-overlay";
+    overlay.innerHTML = `
+      <section class="ol-lean-github-import-dialog" role="dialog" aria-modal="true" aria-labelledby="ol-lean-github-import-title">
+        <header>
+          <div><h2 id="ol-lean-github-import-title">Add Lean files from GitHub</h2><p>Existing project files are never overwritten.</p></div>
+          <button type="button" class="ol-lean-icon-button" data-role="close" aria-label="Close">x</button>
+        </header>
+        <div class="ol-lean-github-import-content">
+          <label>GitHub repository<input type="url" autocomplete="off" spellcheck="false" placeholder="https://github.com/owner/repository" data-role="url"></label>
+          <p class="ol-lean-github-import-note">Only tracked .lean files are considered. Conflicting files are skipped independently.</p>
+          <div class="ol-lean-github-import-result" data-role="result"></div>
+          <p class="ol-lean-github-import-status" data-role="status" role="status"></p>
+          <footer>
+            <button type="button" class="ol-lean-provider-key-button" data-role="cancel">Cancel</button>
+            <button type="button" class="ol-lean-save-button" data-role="analyze">Analyze</button>
+            <button type="button" class="ol-lean-save-button" data-role="confirm" hidden>Add Lean files</button>
+          </footer>
+        </div>
+      </section>
+    `;
+    document.body.appendChild(overlay);
+    const urlInput = overlay.querySelector("[data-role='url']");
+    const resultNode = overlay.querySelector("[data-role='result']");
+    const statusNode = overlay.querySelector("[data-role='status']");
+    const analyzeButton = overlay.querySelector("[data-role='analyze']");
+    const confirmButton = overlay.querySelector("[data-role='confirm']");
+
+    const close = () => {
+      overlay.remove();
+    };
+    overlay.querySelector("[data-role='close']")?.addEventListener("click", close);
+    overlay.querySelector("[data-role='cancel']")?.addEventListener("click", close);
+    overlay.addEventListener("mousedown", (event) => {
+      if (event.target === overlay) close();
+    });
+
+    const setStatus = (text, error = false) => {
+      statusNode.textContent = text || "";
+      statusNode.classList.toggle("is-error", error);
+    };
+
+    const renderPlan = (payload) => {
+      const plan = payload?.plan || {};
+      const counts = plan.counts || {};
+      resultNode.replaceChildren();
+      const summary = document.createElement("div");
+      summary.className = "ol-lean-github-import-summary";
+      summary.textContent = `${counts.add || 0} to add · ${counts.already_present || 0} already present · ${(counts.path_conflict || 0) + (counts.declaration_conflict || 0)} conflicts · ${plan.reusable_declarations || 0} reusable`;
+      resultNode.appendChild(summary);
+      const list = document.createElement("ul");
+      for (const file of plan.files || []) {
+        const row = document.createElement("li");
+        const path = document.createElement("code");
+        path.textContent = file.destination_path || file.source_path;
+        const disposition = document.createElement("span");
+        disposition.textContent = file.disposition.replaceAll("_", " ");
+        disposition.className = `is-${file.disposition}`;
+        const reason = document.createElement("small");
+        reason.textContent = file.reason || "";
+        row.append(path, disposition, reason);
+        list.appendChild(row);
+      }
+      resultNode.appendChild(list);
+      const addCount = Number(counts.add || 0);
+      confirmButton.textContent = addCount
+        ? `Add ${addCount} Lean file${addCount === 1 ? "" : "s"}`
+        : "Reconcile existing files";
+      confirmButton.hidden = false;
+      confirmButton.disabled = Boolean(plan.blocking_error);
+      analyzeButton.hidden = true;
+      urlInput.disabled = true;
+      if (plan.blocking_error) setStatus(plan.blocking_error.message || "This repository cannot be imported.", true);
+    };
+
+    analyzeButton.addEventListener("click", async () => {
+      const repositoryUrl = String(urlInput.value || "").trim();
+      if (!repositoryUrl) return;
+      analyzeButton.disabled = true;
+      setStatus("Analyzing repository...");
+      try {
+        const response = await fetch(`${baseUrl}/project/github-import/preview`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overleafProjectId: projectId, repositoryUrl, targets })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw companionRequestError(response, body);
+        preview = body;
+        await refreshShareStatusAfterProjectEnsure();
+        renderPlan(body);
+        setStatus("Review the additive file plan before confirming.");
+      } catch (error) {
+        setStatus(errorText(error), true);
+      } finally {
+        analyzeButton.disabled = false;
+      }
+    });
+
+    confirmButton.addEventListener("click", async () => {
+      if (!preview?.preview_id) return;
+      confirmButton.disabled = true;
+      setStatus("Adding files and handing checks to the background...");
+      try {
+        const response = await fetch(`${baseUrl}/project/github-import/confirm`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ overleafProjectId: projectId, previewId: preview.preview_id })
+        });
+        const progress = await response.json().catch(() => ({}));
+        if (!response.ok) throw companionRequestError(response, progress);
+        startGithubImportTracking({ progress, preview, targets, projectId, baseUrl });
+        close();
+      } catch (error) {
+        setStatus(errorText(error), true);
+        confirmButton.disabled = false;
+      }
+    });
+
+    urlInput.focus();
   }
 
   function companionRequestError(response, payload = {}) {
@@ -1090,15 +1905,28 @@
     }
 
     const projectId = extractOverleafProjectId();
-    const files = await getLeanPaneProjectFiles({ projectId, forceFetch });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
-    try {
-      const identity = await loadProjectIdentity({ baseUrl, projectId });
-      lastProjectIdentity = identity;
-      renderLeanPaneProjectIdentity(identity);
-    } catch {}
-    const response = await fetch(`${baseUrl}/lean-pane/manifest`, {
+
+    // Identity and the Overleaf archive are independent. Fetching them in
+    // parallel prevents a slow project download from leaving the header at its
+    // placeholder namespace, and both requests are bounded so pane startup can
+    // always settle into either content or a useful error state.
+    loadProjectIdentity({ baseUrl, projectId })
+      .then((identity) => {
+        lastProjectIdentity = identity;
+        renderLeanPaneProjectIdentity(identity);
+      })
+      .catch(() => {});
+    const files = await getLeanPaneProjectFiles({
+      projectId,
+      forceFetch,
+      // Never make the user wait for Overleaf to prepare a ZIP. The live or
+      // cached sources are enough to render useful pane content immediately;
+      // the complete inventory hydrates and re-renders in the background.
+      deferArchiveFetch: !background
+    });
+    const { response, payload } = await fetchJsonWithTimeout(`${baseUrl}/lean-pane/manifest`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1106,17 +1934,34 @@
         activePath: latestActiveTexPath || "",
         files
       })
+    }, {
+      timeoutMs: LEAN_PANE_COMPANION_TIMEOUT_MS,
+      timeoutMessage: "The Lea companion timed out while loading the project inventory."
     });
-    const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     }
-    await reconcileHumanApprovals(
+    // Personal-approval storage is presentation metadata, not project
+    // inventory. Chrome storage can occasionally be slow to wake after an
+    // extension reload; never hold the entire pane behind it. Reconcile and
+    // repaint when it settles.
+    reconcileHumanApprovals(
       (payload.items || []).map((item) => ({
         target: paneItemApprovalTarget(item),
         statusInfo: item
       }))
-    );
+    ).then((changed) => {
+      if (
+        changed
+        &&
+        leanPane
+        && leanPaneMainView === "items"
+        && lastLeanPaneManifest
+        && lastLeanPaneManifestProjectId === projectId
+      ) {
+        renderLeanPaneManifest(lastLeanPaneManifest);
+      }
+    }).catch(() => {});
     renderLeanPaneManifest(payload);
     scheduleLeanPanePollIfNeeded(payload);
   }
@@ -1130,8 +1975,9 @@
     }, pushConnected ? LEAN_PANE_POLL_RECONCILE_MS : LEAN_PANE_POLL_DELAY_MS);
   }
 
-  async function getLeanPaneProjectFiles({ projectId, forceFetch }) {
+  async function getLeanPaneProjectFiles({ projectId, forceFetch, deferArchiveFetch = false }) {
     if (!projectId || projectId === "unknown") {
+      leanPaneInventoryWarning = "";
       return latestActiveTexPath && typeof latestActiveTex === "string"
         ? [{ path: latestActiveTexPath, content: latestActiveTex }]
         : [];
@@ -1143,8 +1989,18 @@
       projectId
     });
     let files;
-    if (needFetch) {
-      files = await collectProjectTexFiles(projectId);
+    if (needFetch && deferArchiveFetch) {
+      files = fallbackLeanPaneProjectFiles(projectId);
+      leanPaneInventoryWarning = "Loading the full Overleaf project inventory in the background.";
+      queueLeanPaneArchiveRefresh(projectId);
+    } else if (needFetch) {
+      try {
+        files = await loadLeanPaneArchive(projectId);
+        leanPaneInventoryWarning = "";
+      } catch {
+        files = fallbackLeanPaneProjectFiles(projectId);
+        leanPaneInventoryWarning = leanPaneArchiveUnavailableMessage(files);
+      }
     } else {
       files = lastLeanPaneFiles.map((file) => ({ ...file }));
       leanPaneView.overlayActiveTex(files, latestActiveTexPath, latestActiveTex);
@@ -1154,19 +2010,81 @@
     return files;
   }
 
+  function leanPaneArchiveUnavailableMessage(files) {
+    return files.length > 1
+      ? "The Overleaf archive was unavailable; showing cached and live TeX files."
+      : files.length === 1
+        ? "The Overleaf archive was unavailable; showing the open TeX file."
+        : "The Overleaf archive was unavailable. Use Refresh to try again.";
+  }
+
+  function loadLeanPaneArchive(projectId) {
+    if (leanPaneArchiveLoad?.projectId === projectId) return leanPaneArchiveLoad.promise;
+    const entry = { projectId, promise: null };
+    entry.promise = collectProjectTexFiles(projectId, { timeoutMs: LEAN_PANE_ARCHIVE_TIMEOUT_MS })
+      .finally(() => {
+        if (leanPaneArchiveLoad === entry) leanPaneArchiveLoad = null;
+      });
+    leanPaneArchiveLoad = entry;
+    return entry.promise;
+  }
+
+  function queueLeanPaneArchiveRefresh(projectId) {
+    loadLeanPaneArchive(projectId)
+      .then((files) => {
+        if (extractOverleafProjectId() !== projectId) return;
+        lastLeanPaneFiles = files.map((file) => ({ ...file }));
+        lastLeanPaneProjectId = projectId;
+        leanPaneInventoryWarning = "";
+        if (leanPane && leanPaneMainView === "items") {
+          refreshLeanPaneNow({ background: true }).catch(renderLeanPaneError);
+        }
+      })
+      .catch(() => {
+        if (extractOverleafProjectId() !== projectId || lastLeanPaneProjectId !== projectId) return;
+        leanPaneInventoryWarning = leanPaneArchiveUnavailableMessage(lastLeanPaneFiles || []);
+        if (
+          leanPane
+          && leanPaneMainView === "items"
+          && lastLeanPaneManifest
+          && lastLeanPaneManifestProjectId === projectId
+        ) {
+          renderLeanPaneManifest(lastLeanPaneManifest);
+        }
+      });
+  }
+
+  function fallbackLeanPaneProjectFiles(projectId) {
+    const files = lastLeanPaneProjectId === projectId && Array.isArray(lastLeanPaneFiles)
+      ? lastLeanPaneFiles.map((file) => ({ ...file }))
+      : [];
+    const activeBelongsToProject = !latestActiveTexProjectId || latestActiveTexProjectId === projectId;
+    const activePath = String(latestActiveTexPath || "").replace(/^\/+/, "");
+    if (!activeBelongsToProject || !activePath || typeof latestActiveTex !== "string") return files;
+    const active = files.find((file) => file.path === activePath);
+    if (active) active.content = latestActiveTex;
+    else files.push({ path: activePath, content: latestActiveTex });
+    return files;
+  }
+
   function renderLeanPaneManifest(manifest) {
     if (!leanPaneBody || !leanPaneStatus) return;
+    manifest = githubImportPaneOverlay(manifest);
     const prevScrollTop = leanPaneBody.scrollTop;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
     const tree = leanPaneView.buildLeanPaneTree(items);
     const useRelationships = leanPaneView.buildPaneUseRelationships(items);
     const fileCount = tree.files.length;
     lastLeanPaneManifest = manifest || null;
+    lastLeanPaneManifestProjectId = extractOverleafProjectId();
     prepareLeanPaneTreeExpansion(manifest, tree);
     leanPaneBody.replaceChildren();
-    leanPaneStatus.textContent = items.length
+    const inventorySummary = items.length
       ? `${items.length} labeled item${items.length === 1 ? "" : "s"} across ${fileCount} .tex file${fileCount === 1 ? "" : "s"}.`
       : "No labeled theorem, lemma, proposition, corollary, or definition environments found.";
+    leanPaneStatus.textContent = leanPaneInventoryWarning
+      ? `${inventorySummary} ${leanPaneInventoryWarning}`
+      : inventorySummary;
 
     if (Array.isArray(manifest?.diagnostics) && manifest.diagnostics.length > 0) {
       const visibleDiagnostics = manifest.diagnostics.slice(0, 4);
@@ -1211,14 +2129,37 @@
     if (!leanPaneProjectTitle || !leanPaneProjectNamespace) return;
     const fallback = guessProjectName(lastLeanPaneFiles || []);
     leanPaneProjectTitle.textContent = identity?.projectName || fallback;
-    leanPaneProjectNamespace.textContent = identity?.namespace || "Namespace unavailable";
+    leanPaneProjectNamespace.textContent = identity?.namespace || "Namespace not created yet";
   }
 
   async function loadProjectIdentity({ baseUrl, projectId }) {
-    const response = await fetch(`${baseUrl}/project/identity?overleafProjectId=${encodeURIComponent(projectId)}`);
-    const payload = await response.json().catch(() => ({}));
+    const { response, payload } = await fetchJsonWithTimeout(
+      `${baseUrl}/project/identity?overleafProjectId=${encodeURIComponent(projectId)}`,
+      {},
+      {
+        timeoutMs: LEAN_PANE_COMPANION_TIMEOUT_MS,
+        timeoutMessage: "The Lea companion timed out while loading the project identity."
+      }
+    );
     if (!response.ok) throw new Error(payload.message || `Companion returned HTTP ${response.status}.`);
     return payload.identity || null;
+  }
+
+  async function fetchJsonWithTimeout(url, options = {}, { timeoutMs, timeoutMessage }) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    try {
+      const response = await fetch(url, controller ? { ...options, signal: controller.signal } : options);
+      const payload = await response.json().catch(() => ({}));
+      return { response, payload };
+    } catch (error) {
+      if (controller?.signal.aborted) throw new Error(timeoutMessage);
+      throw error;
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
+    }
   }
 
   async function previewProjectIdentity({ baseUrl, projectId, projectName, namespace = "", excludeProjectId = "" }) {
@@ -1836,6 +2777,14 @@
     natural.className = "ol-lean-project-natural";
     renderLeanPaneLatex(natural, item.naturalLanguageLatex || item.naturalLanguageRendered || "");
     card.appendChild(natural);
+
+    if (item.githubImportPending) {
+      const importState = document.createElement("p");
+      importState.className = "ol-lean-project-import-state";
+      importState.setAttribute("role", "status");
+      importState.textContent = item.message || "Imported Lean proof is queued for checking.";
+      card.appendChild(importState);
+    }
 
     const relationships = renderLeanPaneUseRelationships(item, useRelationships);
     if (relationships) card.appendChild(relationships);
@@ -3875,6 +4824,15 @@
 
   function renderTargetActions(actions, target, currentStatus, status, leanStatement, actionStatus = currentStatus, statusInfo = {}) {
     actions.replaceChildren();
+    if (statusInfo.githubImportPending) {
+      const checking = document.createElement("button");
+      checking.type = "button";
+      checking.textContent = "Checking import…";
+      checking.disabled = true;
+      checking.title = "This item cannot be formalized again until its imported Lean proof has been checked.";
+      actions.appendChild(checking);
+      return;
+    }
     const disabled = currentStatus === "in_progress" || isExtensionContextInvalidated();
     const actionSpecs = actionSpecsForStatus(actionStatus, target);
     for (const spec of actionSpecs) {
@@ -4180,19 +5138,41 @@
             </div>
           `).join("")}
         </section>
-        <section class="ol-lean-provider-panel" data-role="github-token-panel">
+        <section class="ol-lean-provider-panel ol-lean-github-token-panel" data-role="github-token-panel">
           <div class="ol-lean-provider-title">GitHub sharing</div>
-          <p class="ol-lean-provider-note">The push token is stored by Lea (lea.local.toml) — never in Chrome. It enables Push in the Lean pane's Share panel.</p>
-          <div class="ol-lean-provider-row">
-            <div class="ol-lean-provider-row-head">
-              <span>Push token</span>
-              <strong data-role="github-token-status">Missing</strong>
+          <div class="ol-lean-github-token-card">
+            <div class="ol-lean-github-token-summary">
+              <span class="ol-lean-github-token-mark" aria-hidden="true">GH</span>
+              <div class="ol-lean-github-token-copy">
+                <strong>Repository access</strong>
+                <span data-role="github-token-description">Add a token to push Lean projects to GitHub.</span>
+              </div>
+              <strong class="ol-lean-github-token-status" data-role="github-token-status" aria-live="polite">Not set</strong>
             </div>
-            <div class="ol-lean-provider-key-controls">
-              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-toggle">Add token</button>
-              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-clear" hidden>Remove</button>
-              <input type="password" autocomplete="off" spellcheck="false" data-role="github-token-input" placeholder="GitHub token (repo scope)" hidden>
-              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-save" hidden>Save token</button>
+            <p class="ol-lean-github-token-storage-note">
+              <svg class="ol-lean-github-token-lock" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+                <rect x="3" y="7" width="10" height="7" rx="2"></rect>
+                <path d="M5.25 7V5.25a2.75 2.75 0 0 1 5.5 0V7"></path>
+              </svg>
+              <span>Stored locally by Lea, never in Chrome. It is used only when you choose <strong>Push to GitHub</strong>.</span>
+            </p>
+            <div class="ol-lean-github-token-actions" data-role="github-token-summary-actions">
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-clear" data-variant="danger" hidden>Remove token</button>
+              <button type="button" class="ol-lean-provider-key-button" data-role="github-token-toggle" data-variant="primary">Add GitHub token</button>
+            </div>
+            <div class="ol-lean-github-token-editor" data-role="github-token-editor" hidden>
+              <form data-role="github-token-form">
+                <label class="ol-lean-github-token-label" for="ol-lean-github-token-input">Personal access token</label>
+                <div class="ol-lean-github-token-field">
+                  <input id="ol-lean-github-token-input" type="password" autocomplete="off" spellcheck="false" data-role="github-token-input" placeholder="github_pat_... or ghp_..." aria-describedby="ol-lean-github-token-help" required>
+                  <button type="button" data-role="github-token-visibility" aria-label="Show GitHub token" aria-pressed="false">Show</button>
+                </div>
+                <p id="ol-lean-github-token-help" class="ol-lean-provider-note">Use a personal access token with permission to write to the repository. For security, the saved value cannot be shown again.</p>
+                <div class="ol-lean-github-token-form-actions">
+                  <button type="button" class="ol-lean-provider-key-button" data-role="github-token-cancel">Cancel</button>
+                  <button type="submit" class="ol-lean-provider-key-button" data-role="github-token-save" data-variant="primary">Save token</button>
+                </div>
+              </form>
             </div>
           </div>
         </section>
@@ -4220,6 +5200,19 @@
       </div>
       <p class="ol-lean-popover-status" role="status"></p>
     `;
+
+    const resizer = document.createElement("button");
+    resizer.type = "button";
+    resizer.className = "ol-lean-settings-popover-resizer";
+    resizer.setAttribute("role", "separator");
+    resizer.setAttribute("aria-orientation", "vertical");
+    resizer.setAttribute("aria-label", "Resize Lea settings");
+    resizer.title = "Resize Lea settings";
+    resizer.tabIndex = 0;
+    resizer.addEventListener("pointerdown", startSettingsPopoverResize);
+    resizer.addEventListener("mousedown", startSettingsPopoverResize);
+    resizer.addEventListener("keydown", handleSettingsPopoverResizeKeydown);
+    popover.insertBefore(resizer, popover.children[0] || null);
 
     const closeButton = popover.querySelector("[data-role='close']");
     const status = popover.querySelector(".ol-lean-popover-status");
@@ -4257,29 +5250,65 @@
     // "Save changes" flow. Presence-only display; the raw token is never read back.
     const githubToggle = popover.querySelector("[data-role='github-token-toggle']");
     const githubClear = popover.querySelector("[data-role='github-token-clear']");
+    const githubSummaryActions = popover.querySelector("[data-role='github-token-summary-actions']");
+    const githubEditor = popover.querySelector("[data-role='github-token-editor']");
+    const githubForm = popover.querySelector("[data-role='github-token-form']");
     const githubInput = popover.querySelector("[data-role='github-token-input']");
     const githubSave = popover.querySelector("[data-role='github-token-save']");
+    const githubCancel = popover.querySelector("[data-role='github-token-cancel']");
+    const githubVisibility = popover.querySelector("[data-role='github-token-visibility']");
+
+    const closeGithubTokenEditor = () => {
+      githubInput.value = "";
+      githubInput.type = "password";
+      githubVisibility.textContent = "Show";
+      githubVisibility.setAttribute("aria-label", "Show GitHub token");
+      githubVisibility.setAttribute("aria-pressed", "false");
+      githubEditor.hidden = true;
+      githubSummaryActions.hidden = false;
+    };
+
     githubToggle.addEventListener("click", () => {
-      githubInput.hidden = false;
-      githubSave.hidden = false;
+      githubSummaryActions.hidden = true;
+      githubEditor.hidden = false;
+      status.textContent = "";
       githubInput.focus();
     });
-    githubSave.addEventListener("click", async () => {
+    githubCancel.addEventListener("click", () => {
+      closeGithubTokenEditor();
+      githubToggle.focus();
+    });
+    githubVisibility.addEventListener("click", () => {
+      const reveal = githubInput.type === "password";
+      githubInput.type = reveal ? "text" : "password";
+      githubVisibility.textContent = reveal ? "Hide" : "Show";
+      githubVisibility.setAttribute("aria-label", `${reveal ? "Hide" : "Show"} GitHub token`);
+      githubVisibility.setAttribute("aria-pressed", reveal ? "true" : "false");
+      githubInput.focus();
+    });
+    githubForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
       const value = githubInput.value.trim();
-      if (!value) return;
+      if (!value) {
+        status.textContent = "Enter a GitHub personal access token.";
+        githubInput.focus();
+        return;
+      }
       githubSave.disabled = true;
+      githubCancel.disabled = true;
+      githubVisibility.disabled = true;
       status.textContent = "Saving GitHub token...";
       try {
         await updateGithubToken({ value });
-        githubInput.value = "";
-        githubInput.hidden = true;
-        githubSave.hidden = true;
+        closeGithubTokenEditor();
         renderGithubTokenStatus(popover, true);
-        status.textContent = "GitHub token saved.";
+        status.textContent = "GitHub token saved. Push to GitHub is ready.";
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
       } finally {
         githubSave.disabled = false;
+        githubCancel.disabled = false;
+        githubVisibility.disabled = false;
       }
     });
     githubClear.addEventListener("click", async () => {
@@ -4287,8 +5316,9 @@
       status.textContent = "Removing GitHub token...";
       try {
         await updateGithubToken({ clear: true });
+        closeGithubTokenEditor();
         renderGithubTokenStatus(popover, false);
-        status.textContent = "GitHub token removed.";
+        status.textContent = "GitHub token removed. GitHub pushes are disabled.";
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : String(error);
       } finally {
@@ -4327,9 +5357,10 @@
       }
     });
 
+    applySettingsPopoverWidth(settingsPopoverWidthPx, popover);
     document.body.appendChild(popover);
-    positionSettingsPopover(popover);
     activePopover = popover;
+    positionSettingsPopover(popover);
     loadPopoverSettings(popover).catch((error) => {
       status.textContent = error instanceof Error ? error.message : String(error);
     });
@@ -4351,6 +5382,7 @@
   function closePopover() {
     clearTimeout(usageRefreshTimer);
     usageRefreshTimer = null;
+    stopSettingsPopoverResize({ persist: false });
     if (activePopover) {
       activePopover.querySelector("[data-role='model']")?.leaModelPicker?.destroy();
       activePopover.remove();
@@ -4368,12 +5400,16 @@
   }
 
   function positionSettingsPopover(popover) {
-    const rect = popover.getBoundingClientRect();
     const buttonRect = settingsButton?.getBoundingClientRect();
     const right = 20;
     const bottom = buttonRect ? window.innerHeight - buttonRect.top + 12 : 76;
-    popover.style.left = `${Math.max(12, window.innerWidth - rect.width - right)}px`;
-    popover.style.top = `${Math.max(12, window.innerHeight - rect.height - bottom)}px`;
+    const anchoredBottom = Math.max(12, bottom);
+    const maxHeight = Math.max(0, window.innerHeight - anchoredBottom - 12);
+    popover.style.right = `${right}px`;
+    popover.style.bottom = `${anchoredBottom}px`;
+    popover.style.left = "auto";
+    popover.style.top = "auto";
+    popover.style.maxHeight = `${maxHeight}px`;
   }
 
   function updatePopoverStatus(popover, target) {
@@ -4647,7 +5683,9 @@
       const target = latestTargets.find((item) => targetKey(item) === activePopover.dataset.targetKey);
       if (target) updatePopoverStatus(activePopover, target);
     }
-    if (Object.values(latestStatuses).some((status) => status.status === "in_progress")) {
+    if (Object.values(latestStatuses).some((status) => (
+      status.status === "in_progress" && !status.githubImportPending
+    ))) {
       scheduleStatusRefresh(pushConnected ? STATUS_REFRESH_RECONCILE_MS : STATUS_REFRESH_IN_PROGRESS_MS);
     }
   }
@@ -4780,14 +5818,29 @@
   // its .tex entries as [{ path, content }]. Overlays the live active-editor buffer
   // when its path is known, so the file being edited is current even if Overleaf's
   // saved copy lags. Unzipping uses the dependency-free reader in zipTex.mjs.
-  async function collectProjectTexFiles(projectId) {
-    const response = await fetch(`/project/${encodeURIComponent(projectId)}/download/zip`, {
-      credentials: "same-origin"
-    });
-    if (!response.ok) {
-      throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
+  async function collectProjectTexFiles(projectId, { timeoutMs = LEAN_PANE_ARCHIVE_TIMEOUT_MS } = {}) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    const timeoutId = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null;
+    let buffer;
+    try {
+      const response = await fetch(`/project/${encodeURIComponent(projectId)}/download/zip`, {
+        credentials: "same-origin",
+        ...(controller ? { signal: controller.signal } : {})
+      });
+      if (!response.ok) {
+        throw new Error(`Overleaf returned HTTP ${response.status} for the project download.`);
+      }
+      buffer = await response.arrayBuffer();
+    } catch (error) {
+      if (controller?.signal.aborted) {
+        throw new Error("Overleaf timed out while preparing the project download.");
+      }
+      throw error;
+    } finally {
+      if (timeoutId != null) clearTimeout(timeoutId);
     }
-    const buffer = await response.arrayBuffer();
     const { extractLatexSourcesFromZip } = await import(chrome.runtime.getURL("zipTex.mjs"));
     const files = await extractLatexSourcesFromZip(buffer);
 
@@ -4958,7 +6011,8 @@
   }
 
   function postStatuses(statuses) {
-    latestStatuses = statuses || {};
+    latestBaseStatuses = statuses || {};
+    latestStatuses = githubImportStatusOverlay(latestBaseStatuses);
     renderStatusBadges();
   }
 
@@ -5083,6 +6137,9 @@
   }
 
   function inProgressMessage(statusInfo, target = null) {
+    if (statusInfo?.githubImportPending) {
+      return statusInfo.message || `An imported Lean ${targetNoun(target)} is queued for checking.`;
+    }
     const turnProgressText = formatTurnProgress(statusInfo);
     const noun = targetNoun(target);
     return turnProgressText
@@ -5406,14 +6463,19 @@
   function renderGithubTokenStatus(popover, configured) {
     const panel = popover.querySelector("[data-role='github-token-panel']");
     const chip = popover.querySelector("[data-role='github-token-status']");
+    const description = popover.querySelector("[data-role='github-token-description']");
     const toggle = popover.querySelector("[data-role='github-token-toggle']");
     const clear = popover.querySelector("[data-role='github-token-clear']");
     if (!chip) return;
-    // Same configured-state styling hook as the provider-key rows.
-    const row = panel?.querySelector(".ol-lean-provider-row");
-    if (row) row.dataset.configured = configured ? "true" : "false";
-    chip.textContent = configured ? "Configured" : "Missing";
-    if (toggle) toggle.textContent = configured ? "Replace token" : "Add token";
+    const card = panel?.querySelector(".ol-lean-github-token-card");
+    if (card) card.dataset.configured = configured ? "true" : "false";
+    chip.textContent = configured ? "Saved" : "Not set";
+    if (description) {
+      description.textContent = configured
+        ? "A token is saved. GitHub verifies it when you push."
+        : "Add a token to push Lean projects to GitHub.";
+    }
+    if (toggle) toggle.textContent = configured ? "Replace token" : "Add GitHub token";
     if (clear) clear.hidden = !configured;
   }
 

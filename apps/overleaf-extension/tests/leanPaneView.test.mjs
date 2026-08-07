@@ -17,12 +17,15 @@ import {
   formatRepairOutcome,
   formatLiteMath,
   formatPaneStatus,
+  githubImportMatchedTargets,
+  githubImportMatchedTargetKeys,
   hasInProgressItems,
   highlightLeanLine,
   overlayActiveTex,
   paneItemActions,
   paneItemToEditTarget,
   paneItemToFormalizeTarget,
+  paneItemToGithubImportTarget,
   paneProgressBucketForItem,
   paneProgressSegments,
   deriveShareControls,
@@ -231,6 +234,80 @@ test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item",
   assert.equal(theorem.targetKind, "theorem");
   assert.deepEqual(theorem.targetUses, []);
   assert.equal(theorem.targetContext, "");
+});
+
+test("paneItemToGithubImportTarget keeps the stable label and current declaration separate", () => {
+  assert.deepEqual(
+    paneItemToGithubImportTarget({
+      leanKind: "theorem",
+      label: "stable_marker",
+      leanDeclarationName: "renamed_theorem",
+      naturalLanguageLatex: "Every x has P(x).",
+      sourceHash: "source-sha",
+    }),
+    {
+      targetKind: "theorem",
+      targetLabel: "stable_marker",
+      declarationName: "renamed_theorem",
+      displayTitle: "renamed_theorem",
+      statement: "Every x has P(x).",
+      sourceHash: "source-sha",
+    },
+  );
+});
+
+test("githubImportMatchedTargetKeys locks only matched declarations in importable files", () => {
+  const targets = [
+    { targetKind: "theorem", targetLabel: "stable_marker", declarationName: "renamed_theorem" },
+    { targetKind: "theorem", targetLabel: "conflict_marker", declarationName: "conflict_theorem" },
+    { targetKind: "definition", targetLabel: "fallback_marker", declarationName: "fallback_definition" },
+  ];
+  const preview = {
+    plan: {
+      files: [
+        {
+          disposition: "add",
+          destination_path: "Stable.lean",
+          declarations: [{ match: {
+            origin_key: "project-1:theorem:stable_marker",
+            declaration_name: "renamed_theorem",
+          } }],
+        },
+        {
+          disposition: "path_conflict",
+          destination_path: "Conflict.lean",
+          declarations: [{ match: {
+            origin_key: "project-1:theorem:conflict_marker",
+            declaration_name: "conflict_theorem",
+          } }],
+        },
+        {
+          disposition: "already_present",
+          destination_path: "Fallback.lean",
+          declarations: [{ match: {
+            origin_key: null,
+            declaration_name: "fallback_definition",
+          } }],
+        },
+      ],
+    },
+  };
+
+  assert.deepEqual(
+    githubImportMatchedTargetKeys(preview, targets).sort(),
+    ["definition:fallback_marker", "theorem:stable_marker"],
+  );
+  assert.deepEqual(
+    githubImportMatchedTargets(preview, targets).map((target) => ({
+      key: target.key,
+      displayTitle: target.displayTitle,
+      destinationPath: target.destinationPath,
+    })),
+    [
+      { key: "theorem:stable_marker", displayTitle: "renamed_theorem", destinationPath: "Stable.lean" },
+      { key: "definition:fallback_marker", displayTitle: "fallback_definition", destinationPath: "Fallback.lean" },
+    ],
+  );
 });
 
 test("buildLeanPaneTree groups files into a compact source tree", () => {
