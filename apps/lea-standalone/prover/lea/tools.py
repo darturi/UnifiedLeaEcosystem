@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 
 from .imports import IMPORT_COMMAND_RE, direct_imports, without_comments
-from .runctx import current_depth, current_working_dir
+from .runctx import current_config, current_depth, current_working_dir
 
 # Item 6 / D74 — bound the two fallbacks that each load their OWN full Mathlib
 # in a fresh subprocess. The warm daemon (lsp_daemon.py) is a single process and
@@ -182,6 +182,21 @@ def _readable_roots() -> list[Path] | None:
     lake_root = _find_lake_root(str(root / "_"))
     if lake_root:
         roots.append(Path(lake_root).resolve())
+    # H7: the materialized skills directory. A multi-file skill is advertised, not
+    # injected — the agent opens `references/*.md` on demand — and those reads land
+    # outside both roots above, so without this every one of them is refused.
+    #
+    # Narrow by construction: a directory Lea itself created, holding only skill files,
+    # added to the READ roots only. `_sandboxed_write_path` is untouched, so nothing here
+    # widens what a run may write. Reading it also works from a SUB-AGENT, whose
+    # working_dir is its own scratch tree — which the alternative (copying skills into the
+    # session repo) would not have.
+    config = current_config()
+    skills_root = getattr(config, "skills_root", None)
+    if skills_root:
+        path = Path(skills_root).expanduser()
+        if path.is_dir():
+            roots.append(path.resolve())
     return roots
 
 

@@ -568,11 +568,66 @@ def run_events(
     # process-global registry — two concurrent MCP-enabled runs then can't corrupt each
     # other's toolsets. Popped in the finally, dropping the run's dynamic tools with it.
     registry_scope = push_scope()
+    # F2: declared HTTP tools register into the same per-activation overlay MCP uses, so
+    # they are ordinary tools to the loop and vanish when the run ends.
+    if config.http_tools:
+        from .http_tools import register_http_tools
+
+        register_http_tools(config.http_tools)
     mcp_manager = None
     if config.mcp_servers:
-        from .mcp import MCPManager
-        mcp_manager = MCPManager(config.mcp_servers)
-        mcp_manager.start()
+        # A8: acquire a POOLED connection rather than spawning a server per run. The
+        # tools still register into THIS activation's overlay (dropped at `pop_scope`
+        # below) — only the connection is shared, so a warm Lean server survives the
+        # run boundary instead of costing ~35s again on the next message.
+        from .mcp import acquire
+        mcp_manager = acquire(config.mcp_servers)
+        if mcp_manager is not None:
+            mcp_manager.register_discovered()
+        # v2.5 A3 — a server that failed to start used to be a stderr warning only, so the
+        # run continued with zero MCP tools and the user saw a feature that silently did
+        # nothing. Yield the failures DIRECTLY rather than via `diagnostics.report`: the
+        # diagnostics scope opens later (below), and the loop's own drain runs in Phase 4
+        # after tool calls — so a reported startup error would surface late, or never on a
+        # run that makes no tool calls. `severity='degraded'` because the capability is
+        # reduced *and stays* reduced for the whole run.
+        from .mcp import summarize_stderr
+        # G3 — the positive assertion. A server that connects and lists NOTHING raises no
+        # exception, so without asking "did each configured server actually contribute?"
+        # the run proceeds with a capability the user believes is on and isn't. This is
+        # the absence-failure shape: nothing to catch, so something must check.
+        if mcp_manager.is_alive():
+            failed = {e["server"] for e in mcp_manager.startup_errors}
+            contributing = {d["server"] for d in mcp_manager._discovered}
+            for name in config.mcp_servers:
+                if name in failed or name in contributing:
+                    continue
+                yield Diagnostic(
+                    severity="degraded",
+                    code="mcp.no_tools",
+                    message=(
+                        f"MCP server {name!r} started but offered no tools, so it adds "
+                        f"nothing to this run."
+                    ),
+                    source="mcp",
+                    context={"server": name},
+                )
+        for err in mcp_manager.startup_errors:
+            # The headline is the ONE line that says what to fix; the full tail rides
+            # along in `context` for anyone who wants it. Dumping a raw traceback at
+            # the user is what this whole slice exists to stop.
+            reason = summarize_stderr(err["stderr_tail"]) or err["message"]
+            yield Diagnostic(
+                severity="degraded",
+                code="mcp.server_failed",
+                message=(
+                    f"MCP server {err['server']!r} did not start, so its tools are "
+                    f"unavailable for this run. {reason}"
+                ),
+                source="mcp",
+                context={"server": err["server"], "transport": err["transport"],
+                         "reason": reason, "detail": err["stderr_tail"] or err["message"]},
+            )
     # Establish the per-activation run context (item 8) for the whole event
     # stream: `working_dir` so filesystem tools (bash) act in this run's tree
     # instead of the process-global cwd, and `run_key` (session id) for the
@@ -602,8 +657,9 @@ def run_events(
                 diagnostics.end_scope(diag_token)
                 subagents.end_results_scope(results_token)
     finally:
-        if mcp_manager is not None:
-            mcp_manager.stop()
+        # A8: do NOT stop the manager — the pool owns its lifetime, and stopping it here
+        # is exactly what made every run pay the cold-start again. `pop_scope` drops this
+        # activation's tool registrations, which is all this run owned.
         pop_scope(registry_scope)
 
 
@@ -634,7 +690,7 @@ def _run_events_inner(
     # Resolve the active toolset once: import any user tool modules so their
     # tools register, then select per config (None → all registered tools).
     import_tool_modules(config.tool_modules)
-    tools_schema, tool_handlers = build_toolset(config.tools)
+    tools_schema, tool_handlers = build_toolset(config.tools, config.extra_tools)
 
     # Stateless (D16): the caller owns the transcript. Work on a private copy so we
     # never mutate the caller's list in place; the final state rides out via the

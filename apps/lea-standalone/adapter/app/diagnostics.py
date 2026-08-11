@@ -98,6 +98,18 @@ CATALOG: dict[str, tuple[str, str | None]] = {
         "Check the run's toolset — a sub-agent profile or MCP server may name a tool "
         "that did not load.",
     ),
+    "mcp.server_failed": (
+        "An MCP server did not start",
+        "Its tools were unavailable for this run; the proof continued without them. "
+        "The server's own error is shown below it — most often the command isn't "
+        "installed, or the Lean project path doesn't point at a folder with a "
+        "lean-toolchain and a lakefile.",
+    ),
+    "mcp.no_tools": (
+        "An MCP server offered no tools",
+        "It started but listed nothing, so it added nothing to the proof. Check that it "
+        "is pointed at the right project, or remove it under Library → MCP servers.",
+    ),
     "lean.lsp_cold_fallback": (
         "Lean checks are running cold",
         "Checks are ~440x slower until the language-server daemon comes back. "
@@ -109,6 +121,31 @@ CATALOG: dict[str, tuple[str, str | None]] = {
         "been deleted or replaced while the run was writing it.",
     ),
     # --- sub-agents (Phase D) ---
+    "tool.auth_missing": (
+        "A tool needs an API key that is not saved",
+        "The tool could not run. Add the key it names under Settings → API keys.",
+    ),
+    "tool.name_clash": (
+        "A custom tool was not loaded",
+        "Its name is already taken by a built-in or another tool, so it was skipped. "
+        "Rename it under Library → Tools.",
+    ),
+    "skill.files_incomplete": (
+        "Some of a skill's reference material is missing",
+        "The skill itself loaded, but Lea cannot open the listed files. Re-import the "
+        "skill under Library → Skills.",
+    ),
+    "subagent.role_unavailable": (
+        "A sub-agent role could not be prepared",
+        "The role exists in your Library but was not offered to the agent for this run, "
+        "so it could not be used. Re-save it under Library → Sub-agents.",
+    ),
+    "subagent.tool_dropped": (
+        "A sub-agent asked for a tool that no longer exists",
+        "It ran without that tool. The tool was probably deleted, or the MCP server "
+        "providing it is turned off — edit the role under Library → Sub-agents, or "
+        "restore the tool.",
+    ),
     "subagent.spawn_failed": ("A sub-agent could not be started", None),
     "subagent.promotion_rejected": (
         "The winning sub-agent proof did not survive re-verification",
@@ -148,6 +185,24 @@ SEVERITIES = ("fatal", "step_error", "degraded", "notice")
 # Settings" is still work for the user to go and find; an action takes them there.
 ACTION_API_KEYS = {"label": "Check API keys", "action": "open-settings", "focus": "api-keys"}
 ACTION_MODEL = {"label": "Change model", "action": "open-settings", "focus": "model"}
+# v2.5 G4: the Library destinations. A remedy that says "check it under Library → MCP
+# servers" is still work for the user to go and find; an action takes them there.
+ACTION_MCP = {"label": "Open MCP servers", "action": "open-library", "focus": "mcp"}
+ACTION_SUBAGENTS = {"label": "Open Sub-agents", "action": "open-library", "focus": "subagents"}
+ACTION_SKILLS = {"label": "Open Skills", "action": "open-library", "focus": "skills"}
+
+# code -> the buttons worth offering. Only where there IS somewhere useful to go: an
+# action that lands on a page the user can do nothing with is worse than no button.
+CODE_ACTIONS: dict[str, list[dict]] = {
+    "mcp.server_failed": [ACTION_MCP],
+    "mcp.no_tools": [ACTION_MCP],
+    "subagent.tool_dropped": [ACTION_SUBAGENTS, ACTION_MCP],
+    "subagent.role_unavailable": [ACTION_SUBAGENTS],
+    "skill.files_incomplete": [ACTION_SKILLS],
+    "tool.auth_missing": [ACTION_API_KEYS],
+    "settings.overrides_unreadable": [ACTION_SUBAGENTS],
+    "provider.auth_missing": [ACTION_API_KEYS, ACTION_MODEL],
+}
 
 # Exception-type names that identify a provider failure, mapped to a code. Matched
 # by CLASS NAME rather than by importing LiteLLM's exception types: the adapter must
@@ -415,6 +470,9 @@ def resolve(
     invisible precisely because nobody had written its copy yet, which is the bug
     this whole phase is about.
     """
+    # G4: fill in the code's buttons when the caller didn't supply any.
+    if actions is None:
+        actions = CODE_ACTIONS.get(code)
     catalog_title, catalog_remedy = CATALOG.get(
         code, (code.replace(".", " ").replace("_", " ").capitalize(), None)
     )

@@ -205,6 +205,15 @@ export interface ProjectFile {
 // prover's system prompt for the runs it resolves for. Scope (D47): `is_global`
 // → every project; else the projects in `project_ids`; loose sessions get none.
 // `source_url`/`source_ref` record GitHub provenance for an imported skill.
+// The guided authoring answers (v2.5 C1). Stored alongside the compiled text so they
+// stay editable; the server compiles them into what the model reads.
+export interface AuthoringFieldValues {
+  summary?: string;
+  when_to_use?: string;
+  when_not_to_use?: string;
+  how?: string;
+}
+
 export interface Skill {
   id: string;
   name: string;
@@ -214,8 +223,94 @@ export interface Skill {
   project_ids: string[];
   source_url?: string | null;
   source_ref?: string | null;
+  authoring?: AuthoringFieldValues;
+  // v2.5 H: a real skill is a directory. `file_paths` are its references (paths only —
+  // the contents can run to hundreds of KB). `triggers` gate when it applies.
+  description?: string | null;
+  file_paths?: string[];
+  triggers?: string[];
   created_at: string;
   updated_at: string;
+}
+
+// An MCP server the user has configured (v2.5 E0). Same library shape as Skill —
+// both are things a project selects, so they share `is_global` / `project_ids`.
+// NOTE: no field here ever holds a secret. `env` is non-secret literals; a
+// credential is NAMED in `env_from` (stdio) or `api_key_name` (remote) and its
+// value read from the environment at spawn (A7).
+// A declarative HTTP tool (v2.5 F1). `auth_key_name` NAMES a key — the value lives in
+// Settings and is read at call time, so nothing here ever holds a secret.
+export interface CustomTool {
+  id: string;
+  name: string;
+  slug: string;
+  description: string;
+  authoring?: AuthoringFieldValues;
+  method: string;
+  url: string;
+  params: Record<string, unknown>;
+  headers: Record<string, string>;
+  auth_key_name: string | null;
+  auth_header: string | null;
+  timeout: number | null;
+  enabled: boolean;
+  is_global: boolean;
+  project_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export type McpTransport = 'stdio' | 'sse' | 'http';
+
+export interface McpServer {
+  id: string;
+  name: string;
+  slug: string;
+  transport: McpTransport;
+  command: string | null;
+  args: string[];
+  env: Record<string, string>;
+  env_from: string[];
+  url: string | null;
+  api_key_name: string | null;
+  enabled: boolean;
+  is_global: boolean;
+  project_ids: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+// One row of a session's skills / MCP picker (E0e). `source` says WHERE the current
+// state comes from, which is what makes the two tiers legible: 'global'/'project' are
+// inherited, 'session'/'session-off' were toggled here. `locked` marks a global item —
+// un-ticking it would mean "stop being global", a Library-level decision.
+export interface SkillMcpItem {
+  id: string;
+  name: string;
+  slug: string;
+  kind: 'skill' | 'mcp_server';
+  on: boolean;
+  source: 'global' | 'project' | 'session' | 'session-off' | null;
+  locked: boolean;
+  enabled: boolean;
+}
+
+export interface SessionSkillsMcp {
+  session_id: string;
+  project_id: string | null;
+  skills: SkillMcpItem[];
+  mcp_servers: SkillMcpItem[];
+}
+
+// The result of dry-running a server spec (E0b). `detail` carries the child's real
+// stderr on failure — the line that actually says what is wrong.
+export interface McpTestResult {
+  ok: boolean;
+  tool_count: number;
+  tools: string[];
+  error: string | null;
+  reason: string;   // the one line that says what to fix
+  detail: string;   // the raw stderr tail, behind a disclosure
 }
 
 // ── Sub-agents (D6) ───────────────────────────────────────────────────────────
@@ -231,6 +326,11 @@ export interface SubagentSettings {
 // A role with its vendored `default`, the stored `override` (only the diff-from-default),
 // and the `effective` settings actually used at spawn (default merged with override).
 export interface SubagentProfile {
+  // v2.5 B3: built-in roles can be retuned but not deleted; user roles can be edited
+  // and removed outright. `id` is the row id for a user role, the name for a built-in.
+  origin?: 'builtin' | 'user';
+  id?: string;
+  authoring?: AuthoringFieldValues;
   name: string;
   description?: string | null;
   default: SubagentSettings;
@@ -533,8 +633,10 @@ export type DiagnosticSeverity = 'fatal' | 'step_error' | 'degraded' | 'notice';
  *  an action takes you there. */
 export interface DiagnosticAction {
   label: string;
-  action: 'open-settings';
-  focus?: 'api-keys' | 'model' | string;
+  // v2.5 G4: `open-library` points at Skills / Sub-agents / MCP servers, so a remedy
+  // about a capability can take the user to it instead of describing where it lives.
+  action: 'open-settings' | 'open-library';
+  focus?: 'api-keys' | 'model' | 'skills' | 'subagents' | 'mcp' | string;
 }
 
 export interface Diagnostic {

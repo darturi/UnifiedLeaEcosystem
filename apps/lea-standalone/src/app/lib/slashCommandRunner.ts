@@ -5,6 +5,7 @@
 // (metadata) + one handler here.
 
 import { useProofSession, type CompactionPayload } from '../stores/proofSession';
+import { useFactories } from '../stores/factories';
 import { compactSession, type ChatMessage } from './api';
 import { findSlashCommand } from './slashCommands.js';
 
@@ -32,6 +33,11 @@ type Handler = (ctx: SlashRunContext) => Promise<void>;
 // name → handler. Only 'action' commands appear here; 'prompt' commands are expanded into
 // a normal run by the caller (they have no handler).
 const HANDLERS: Record<string, Handler> = {
+  // E0e: both open the per-session picker. They need a session because an override is
+  // stored against one — before the first message there is nothing to attach it to.
+  skills: async ({ sessionId }) => openPicker('skills', sessionId),
+  mcp: async ({ sessionId }) => openPicker('mcp', sessionId),
+
   compact: async ({ sessionId }) => {
     const { setError, setMessages } = useProofSession.getState();
     if (!sessionId) {
@@ -60,6 +66,17 @@ const HANDLERS: Record<string, Handler> = {
     }
   },
 };
+
+function openPicker(kind: 'skills' | 'mcp', sessionId?: string) {
+  if (!sessionId) {
+    useProofSession.getState().setError(
+      `Send a message first — ${kind === 'skills' ? 'skills' : 'MCP servers'} are chosen per conversation. ` +
+      `Until then, set them on the project or in the Library.`,
+    );
+    return;
+  }
+  useFactories.getState().setSkillsMcpPicker(kind);
+}
 
 export interface SlashDispatch {
   handled: boolean; // false → not a known command (caller should surface an error)

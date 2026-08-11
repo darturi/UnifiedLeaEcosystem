@@ -1,13 +1,20 @@
 import { useEffect, useMemo, useState } from 'react';
-import { ChevronLeft, Bot, RotateCcw, X } from 'lucide-react';
+import { ChevronLeft, Bot, Plus, RotateCcw, Trash2, X } from 'lucide-react';
 import type { SubagentProfile, SubagentSettings } from '../lib/api';
 import { useSubagents } from '../stores/subagents';
 import { useModel } from '../stores/model';
 import { ModelPicker } from './ModelPicker';
+import { AuthoringFields, EMPTY_AUTHORING, hasAuthoring } from './AuthoringFields';
+import { createSubagentRole, deleteSubagentRole, type AuthoringFieldValues } from '../lib/api';
 
-// D6: the Sub-agents page — view/edit every built-in role's settings (like the Skills
-// page). Edits persist as per-role OVERRIDES in the adapter (never mutating the vendored
+// D6: the Sub-agents page — view/edit every role's settings (like the Skills page).
+// Edits to a BUILT-IN persist as per-role OVERRIDES (never mutating the vendored
 // lea/agents/*.yaml); the prover merges them over the role's defaults at spawn.
+//
+// v2.5 B2/B3: a user can now ADD a role too, described through the same guided questions
+// the Skill Factory uses. "When should Lea use this?" becomes the line the coordinator
+// reads while choosing whom to delegate to — so answering it well is what makes a new
+// sub-agent actually get used, rather than existing and never running.
 export function SubagentFactory({ onBack }: { onBack: () => void }) {
   const profiles = useSubagents((s) => s.profiles);
   const selectedName = useSubagents((s) => s.selectedName);
@@ -16,6 +23,7 @@ export function SubagentFactory({ onBack }: { onBack: () => void }) {
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -49,10 +57,20 @@ export function SubagentFactory({ onBack }: { onBack: () => void }) {
         <div className="pw-hero">
           <h1 className="pw-title">Sub-agents</h1>
           <p className="pw-sub">
-            The roles the coordinator delegates to. Tune each one's model, limits, and
-            instructions — saved as overrides, never touching the shipped defaults.
+            The roles the coordinator delegates to. Add your own, or tune a built-in's
+            model, limits and instructions — tuning is saved as an override, never
+            touching the shipped defaults.
           </p>
         </div>
+
+        <AddSubagent
+          open={adding}
+          setOpen={setAdding}
+          onAdded={(name) => {
+            refreshProfiles().catch(() => {});
+            setSelectedName(name);
+          }}
+        />
 
         {loadError && <div className="sf-load-err">{loadError}</div>}
 
@@ -87,6 +105,11 @@ export function SubagentFactory({ onBack }: { onBack: () => void }) {
 }
 
 function SubagentDetail({ profile }: { profile: SubagentProfile }) {
+  // Deleting a user role touches the shared list, so read the store here rather than
+  // threading two more props through the detail pane.
+  const refreshProfiles = useSubagents((st) => st.refreshProfiles);
+  const setSelectedName = useSubagents((st) => st.setSelectedName);
+
   const saveProfile = useSubagents((s) => s.saveProfile);
   const modelCatalog = useModel((s) => s.modelCatalog);
   const modelFeatured = useModel((s) => s.modelFeatured);
@@ -140,13 +163,36 @@ function SubagentDetail({ profile }: { profile: SubagentProfile }) {
         <div className="sa-head-l">
           <Bot size={16} />
           <span className="sa-name">{profile.name}</span>
+          {profile.origin === 'user' && <span className="sa-tag">yours</span>}
           {isOverridden && <span className="sa-tag">customized</span>}
         </div>
-        {isOverridden && (
+        {/* A built-in can be reset to its shipped defaults but never removed; one you
+            wrote can be deleted outright. */}
+        {profile.origin === 'user' ? (
+          <button
+            className="sf-del"
+            disabled={busy}
+            title="Delete this sub-agent"
+            onClick={async () => {
+              if (!profile.id) return;
+              if (!window.confirm(`Delete the sub-agent “${profile.name}”? This can't be undone.`)) return;
+              try {
+                await deleteSubagentRole(profile.id);
+                await refreshProfiles();
+                setSelectedName(undefined);
+              } catch (err) {
+                window.setTimeout(() => undefined, 0);
+                throw err;
+              }
+            }}
+          >
+            <Trash2 size={13} /> Delete
+          </button>
+        ) : isOverridden ? (
           <button className="sa-reset" onClick={onReset} disabled={busy} title="Reset to defaults">
             <RotateCcw size={12} /> Reset to defaults
           </button>
-        )}
+        ) : null}
       </div>
       {profile.description && <p className="sa-desc">{profile.description}</p>}
 
@@ -241,6 +287,80 @@ function SubagentDetail({ profile }: { profile: SubagentProfile }) {
           {busy ? 'Saving…' : saved ? 'Saved ✓' : 'Save changes'}
         </button>
         {saved && !busy && <span className="sa-saved-note">Applied to the next spawn.</span>}
+      </div>
+    </div>
+  );
+}
+
+
+// v2.5 B2/B3 — authoring a new sub-agent. Deliberately the same four questions the Skill
+// Factory asks: the answers compile into the role's instructions, and "when to use this"
+// becomes the description the coordinator reads when choosing a role to delegate to.
+function AddSubagent({
+  open,
+  setOpen,
+  onAdded,
+}: {
+  open: boolean;
+  setOpen: (v: boolean) => void;
+  onAdded: (name: string) => void;
+}) {
+  const [name, setName] = useState('');
+  const [fields, setFields] = useState<AuthoringFieldValues>(EMPTY_AUTHORING);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      if (!name.trim()) throw new Error('Give the sub-agent a name.');
+      if (!hasAuthoring(fields)) throw new Error('Answer at least the first question.');
+      const role = await createSubagentRole({ name: name.trim(), authoring: fields });
+      setName('');
+      setFields(EMPTY_AUTHORING);
+      setOpen(false);
+      onAdded(role.name);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <div className="sf-add">
+        <button className="sf-add-mode active" onClick={() => setOpen(true)}>
+          <Plus size={14} /> Add a sub-agent
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="sf-add">
+      <label className="mcp-field">
+        <span className="mcp-label">Name</span>
+        <input
+          className="sf-add-input"
+          value={name}
+          placeholder="Counterexample hunter"
+          onChange={(e) => setName(e.target.value)}
+          disabled={busy}
+        />
+      </label>
+
+      <AuthoringFields kind="role" value={fields} onChange={setFields} disabled={busy} />
+
+      <div className="sf-add-foot">
+        {error && <span className="sf-add-err">{error}</span>}
+        <button className="sf-cancel" onClick={() => setOpen(false)} disabled={busy}>
+          Cancel
+        </button>
+        <button className="sf-add-btn" onClick={submit} disabled={busy}>
+          {busy ? 'Adding…' : 'Add'}
+        </button>
       </div>
     </div>
   );

@@ -7,6 +7,8 @@ export type View =
   | 'project'
   | 'skills'
   | 'subagents'
+  | 'mcp'
+  | 'tools'
   | 'projects-hub';
 
 /**

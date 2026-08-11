@@ -12,7 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from .db import init_db
-from .routes import formalizations, projects, runs, search, sessions, settings, skills, subagents
+from .routes import (custom_tools, formalizations, mcp_servers, projects, runs, search,
+                     sessions, settings, skills, subagents)
 from . import bridge, github_import_service, netguard, store
 from .config import load_config
 
@@ -86,6 +87,8 @@ app.include_router(formalizations.router)
 app.include_router(search.router)
 app.include_router(skills.router)
 app.include_router(subagents.router)
+app.include_router(mcp_servers.router)
+app.include_router(custom_tools.router)
 
 
 # --- Static frontend (bundled / single-container deploy) --------------------

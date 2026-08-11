@@ -7,6 +7,10 @@ import { SettingsPage } from './components/SettingsPage';
 import { ProjectWindow } from './components/ProjectWindow';
 import { SkillFactory } from './components/SkillFactory';
 import { SubagentFactory } from './components/SubagentFactory';
+import { McpFactory } from './components/McpFactory';
+import { ToolFactory } from './components/ToolFactory';
+import { SkillsMcpPicker } from './components/SkillsMcpPicker';
+import { useFactories } from './stores/factories';
 import { ProjectsHub } from './components/ProjectsHub';
 import { NewProjectDialog } from './components/NewProjectDialog';
 import { SearchOverlay } from './components/SearchOverlay';
@@ -579,6 +583,19 @@ export default function App() {
   };
 
   // F9: the overlay rides alongside every view so ⌘K works from anywhere.
+  // E0e: `/skills` and `/mcp` open this over whatever view is showing, so it is shared
+  // alongside `searchOverlay` rather than living inside one page.
+  const skillsMcpPickerKind = useFactories((s) => s.skillsMcpPicker);
+  const setSkillsMcpPicker = useFactories((s) => s.setSkillsMcpPicker);
+  const skillsMcpPicker =
+    skillsMcpPickerKind && selectedSession?.id ? (
+      <SkillsMcpPicker
+        kind={skillsMcpPickerKind}
+        sessionId={selectedSession.id}
+        onClose={() => setSkillsMcpPicker(null)}
+      />
+    ) : null;
+
   const searchOverlay = (
     <SearchOverlay
       open={searchOpen}
@@ -603,6 +620,7 @@ export default function App() {
     return (
       <>
         {searchOverlay}
+        {skillsMcpPicker}
         <ProjectWindow
           project={currentProject}
           onBack={leaveProject}
@@ -616,6 +634,7 @@ export default function App() {
     return (
       <>
         {searchOverlay}
+        {skillsMcpPicker}
         <SkillFactory onBack={() => setView('main')} />
       </>
     );
@@ -623,13 +642,31 @@ export default function App() {
     return (
       <>
         {searchOverlay}
+        {skillsMcpPicker}
         <SubagentFactory onBack={() => setView('main')} />
+      </>
+    );
+  if (view === 'mcp')
+    return (
+      <>
+        {searchOverlay}
+        {skillsMcpPicker}
+        <McpFactory onBack={() => setView('main')} />
+      </>
+    );
+  if (view === 'tools')
+    return (
+      <>
+        {searchOverlay}
+        {skillsMcpPicker}
+        <ToolFactory onBack={() => setView('main')} />
       </>
     );
   if (view === 'projects-hub')
     return (
       <>
         {searchOverlay}
+        {skillsMcpPicker}
         {newProjectDialog}
         <ProjectsHub
           onBack={() => setView('main')}
@@ -642,6 +679,7 @@ export default function App() {
     return (
       <>
         {searchOverlay}
+        {skillsMcpPicker}
         <StatsPage onBack={() => setView('main')} />
       </>
     );
@@ -649,6 +687,7 @@ export default function App() {
     return (
       <>
         {searchOverlay}
+        {skillsMcpPicker}
         <SettingsPage
           onBack={() => {
             setView('main');
@@ -662,6 +701,7 @@ export default function App() {
   return (
     <div className="lea-app">
       {searchOverlay}
+        {skillsMcpPicker}
       {newProjectDialog}
       <div className={`app ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         <Sidebar
@@ -688,6 +728,14 @@ export default function App() {
             closeProject();
             setView('subagents');
           }}
+          onOpenMcp={() => {
+            closeProject();
+            setView('mcp');
+          }}
+          onOpenTools={() => {
+            closeProject();
+            setView('tools');
+          }}
           onOpenSearch={() => setSearchOpen(true)}
           onOpenSettings={() => setView('settings')}
           onOpenStats={() => setView('stats')}
@@ -711,6 +759,9 @@ export default function App() {
             onSelectStep={selectStep}
             onDecide={handleDecide}
             onOpenSettings={() => setView('settings')}
+            onOpenLibrary={(focus) =>
+              setView(focus === 'subagents' ? 'subagents' : focus === 'skills' ? 'skills' : 'mcp')
+            }
             draft={draft}
             onDraftChange={setDraft}
             onSubmit={handleSubmit}

@@ -746,18 +746,26 @@ def test_project_run_materializes_resolved_skills_into_cfg(tmp_path, monkeypatch
     assert config.skills == []
 
 
-def test_loose_run_resolves_no_skills(tmp_path, monkeypatch):
-    # A loose (project-less) session resolves to no skills by definition (D47), so
-    # cfg.skills stays empty even when global skills exist.
+def test_loose_run_resolves_global_skills(tmp_path, monkeypatch):
+    """v2.5 H — DELIBERATELY changed from D47's "a loose session resolves to no skills".
+
+    "Global" has to mean global, or the word is a lie: a skill marked as applying to every
+    project was silently absent from every project-less session, and there was no way to
+    opt one in. E0e added the per-session opt-in; this makes the INHERITED half consistent,
+    and matches how MCP servers already resolve for a loose session.
+
+    A non-global, project-assigned skill is still absent — that part of D47 stands."""
     ctx, _ = _context(tmp_path, monkeypatch)
     glob = store.create_skill("Ring Tactics", "use `ring`")
     store.set_skill_assignment(glob["id"], is_global=True)
+    scoped = store.create_skill("Project Only", "not for loose sessions")
 
     received: dict = {}
     monkeypatch.setattr(bridge, "run_events", _skills_recording_fake(received))
     bridge.run_lea(ctx)
 
-    assert received["skills"] == []
+    assert len(received["skills"]) == 1
+    assert received["skills"][0].endswith("ring-tactics.md")
 
 
 def test_run_lea_releases_its_admission_slot(tmp_path, monkeypatch):
@@ -1772,3 +1780,41 @@ def test_promotion_falls_through_to_the_next_candidate(tmp_path, monkeypatch):
     assert "promoted_from" not in step or step["path"].endswith("B.lean")
     assert (repo / "Lea" / "Misc" / "B.lean").exists()
     assert not (repo / "Lea" / "Misc" / "A.lean").exists(), "the cheat must leave no trace"
+
+
+def test_coordinator_toolset_does_not_freeze_out_dynamic_tools(tmp_path, monkeypatch):
+    """v2.5 regression — the bug that made every MCP and HTTP tool unreachable from the UI.
+
+    `_with_subagents` used to resolve `build_toolset(None)` in the ADAPTER and pass the
+    result as an explicit allowlist. That snapshot is taken before the run starts, so it
+    contained only the built-ins — and an explicit list then excluded every tool that
+    registers once the run begins (MCP servers, declarative HTTP tools). The server would
+    start, warm up and report 23 tools, and not one of them could ever be called.
+
+    The invariant: the coordinator must ask for "the default set PLUS these opt-ins",
+    never for a frozen list of names.
+    """
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    cfg, _ = bridge._with_subagents(
+        LeaConfig(model="gemini/test", max_turns=3, lea_root=tmp_path))
+
+    assert cfg.tools is None, "a frozen allowlist cannot contain run-time tools"
+    assert "spawn_subagent" in cfg.extra_tools
+    assert "safe_verify" in cfg.extra_tools
+
+    # And a tool registered AFTER this config was built must still reach the model.
+    import lea.tools  # noqa: F401
+    from lea.http_tools import register_http_tools
+    from lea.registry import build_toolset, pop_scope, push_scope
+
+    scope = push_scope()
+    try:
+        register_http_tools([{"name": "late_tool", "description": "d",
+                              "url": "https://api.github.com/x"}])
+        names = [s["name"] for s in build_toolset(cfg.tools, cfg.extra_tools)[0]]
+    finally:
+        pop_scope(scope)
+
+    assert "late_tool" in names, "a tool registered during the run was excluded"
+    assert "spawn_subagent" in names

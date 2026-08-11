@@ -319,6 +319,20 @@ def update_settings(values: dict[str, Any], path: Path | None = None) -> dict[st
         family = ENV_FAMILY.get(env_name)
         toml_key = API_KEY_FIELDS[family] if family else env_name
         if raw_update.get("clear"):
+            # D3: a key an MCP server declares (`env_from` / `api_key_name`) is still in
+            # use. Clearing it makes that server fail on FIRST USE with a 401 — a delayed,
+            # confusing failure far from the action that caused it. Say so while the user
+            # still holds the decision; `force` is the explicit "yes, anyway".
+            if not values.get("force_clear_keys"):
+                from . import store
+
+                users = sorted(set(store.mcp_key_requirements().get(env_name, [])))
+                if users:
+                    raise SettingsValidationError(
+                        f"{env_name} is still used by {', '.join(users)}. Remove it from "
+                        f"those servers first, or clear it anyway to disable them.",
+                        field=f"api_keys.{env_name}",
+                    )
             updates[toml_key] = None
             continue
         value = raw_update.get("value")

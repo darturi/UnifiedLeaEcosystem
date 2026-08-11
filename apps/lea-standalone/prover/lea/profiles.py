@@ -57,16 +57,54 @@ class AgentProfile:
     max_turns: int | None = None
 
 
+def _search_dirs() -> list[Path]:
+    """Where roles are looked for: the vendored dir, then any directory the RUN adds
+    (v2.5 B2).
+
+    User-authored roles are DB rows owned by the adapter, materialized to a temp dir and
+    named in ``LeaConfig.agent_dirs`` — the same shape skills already use. Reading the
+    live config here (rather than taking a new parameter) keeps every existing caller
+    unchanged, and keeps the prover ignorant of the adapter: it is handed directories, not
+    a database.
+
+    Outside a run there is no config, so only the vendored dir is searched — which is what
+    the CLI, the evals and the unit tests want.
+    """
+    dirs = [_AGENTS_DIR]
+    try:
+        from .runctx import current_config
+
+        config = current_config()
+    except Exception:  # noqa: BLE001 — discovery must never be the thing that breaks a run
+        config = None
+    for extra in getattr(config, "agent_dirs", None) or []:
+        path = Path(extra).expanduser()
+        if path.is_dir():
+            dirs.append(path)
+    return dirs
+
+
 def _profile_path(name: str) -> Path:
+    """The file backing ``name``. A user directory wins over the vendored one, so a role
+    can be corrected without editing the shipped package — the adapter refuses to create a
+    user role whose name collides with a vendored one, so in practice this only fires when
+    someone deliberately shadows."""
+    for directory in reversed(_search_dirs()):
+        candidate = directory / f"{name}.yaml"
+        if candidate.is_file():
+            return candidate
     return _AGENTS_DIR / f"{name}.yaml"
 
 
 def available_profiles() -> list[str]:
-    """Every role name discoverable in ``lea/agents/`` (sorted). Used for a helpful
-    error when a caller asks for an unknown role."""
-    if not _AGENTS_DIR.is_dir():
-        return []
-    return sorted(p.stem for p in _AGENTS_DIR.glob("*.yaml"))
+    """Every role name discoverable for this run (sorted, de-duplicated): the vendored
+    ones plus any the adapter materialized. This is what `build_spawn_schema` offers the
+    coordinator, so a role missing from here is a role that silently never runs."""
+    names: set[str] = set()
+    for directory in _search_dirs():
+        if directory.is_dir():
+            names.update(p.stem for p in directory.glob("*.yaml"))
+    return sorted(names)
 
 
 def parse_profile(name: str, raw: dict) -> AgentProfile:

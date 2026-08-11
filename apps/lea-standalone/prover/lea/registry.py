@@ -43,6 +43,13 @@ class Tool:
     schema: dict
     handler: Handler
     opt_in: bool = False
+    # A tool whose schema depends on run-time state supplies a factory instead of relying
+    # on the frozen `schema` (v2.5 B1). `spawn_subagent` is the case: the roles a
+    # coordinator may delegate to are discovered from disk (and, once user-authored roles
+    # land, from the database), so a schema fixed at import time can only ever advertise
+    # the roles that existed when the module was first imported. `schema` stays as the
+    # static fallback, so every other tool is unaffected.
+    schema_factory: Callable[[], dict] | None = None
 
 
 # The GLOBAL base layer: name -> Tool, plus registration order so an unfiltered
@@ -146,17 +153,21 @@ def unregister(name: str) -> None:
         _ORDER.remove(name)
 
 
-def tool(*, name: str, description: str, input_schema: dict, opt_in: bool = False):
+def tool(*, name: str, description: str, input_schema: dict, opt_in: bool = False,
+         schema_factory: Callable[[], dict] | None = None):
     """Decorator: register a `dict[args] -> str` function as a Tool.
 
     The function becomes the handler; the schema is assembled from the arguments.
     `opt_in=True` keeps the tool out of the default (`selected is None`) toolset.
+    `schema_factory` (B1) rebuilds the schema on every `build_toolset`, for a tool whose
+    shape depends on run-time state rather than on what existed at import.
     """
 
     schema = {"name": name, "description": description, "input_schema": input_schema}
 
     def decorator(fn: Handler) -> Handler:
-        register(Tool(name=name, schema=schema, handler=fn, opt_in=opt_in))
+        register(Tool(name=name, schema=schema, handler=fn, opt_in=opt_in,
+                      schema_factory=schema_factory))
         return fn
 
     return decorator
@@ -175,7 +186,8 @@ def import_tool_modules(modules: list[str]) -> None:
             raise ToolError(f"could not import tool module {name!r}: {e}") from e
 
 
-def build_toolset(selected: list[str] | None) -> tuple[list[dict], dict[str, Handler]]:
+def build_toolset(selected: list[str] | None,
+                  extra: list[str] | None = None) -> tuple[list[dict], dict[str, Handler]]:
     """Resolve a config selection into what the loop needs: (schemas, handlers).
 
     `selected is None` → every registered tool EXCEPT opt-in ones (item 18), in
@@ -194,6 +206,13 @@ def build_toolset(selected: list[str] | None) -> tuple[list[dict], dict[str, Han
         names = [n for n in _ORDER if not REGISTRY[n].opt_in]
         if scope:
             names += [n for n, t in scope.items() if not t.opt_in]
+        # `extra` names OPT-IN tools to add on top of the default set (v2.5). It exists so
+        # a caller can say "everything, plus spawn_subagent" WITHOUT freezing the list:
+        # the adapter used to express that by resolving `build_toolset(None)` in its own
+        # process and passing the result as an explicit allowlist — a snapshot taken
+        # before MCP and HTTP tools register inside the run, which silently excluded every
+        # one of them from every UI run.
+        names += [n for n in (extra or []) if n not in names]
     else:
         names = selected
     schemas: list[dict] = []
@@ -204,6 +223,8 @@ def build_toolset(selected: list[str] | None) -> tuple[list[dict], dict[str, Han
             raise ToolError(
                 f"unknown tool {name!r}; registered tools: {', '.join(sorted(_all_names()))}"
             )
-        schemas.append(t.schema)
+        # B1: a dynamic tool rebuilds its schema per toolset build, so what the model is
+        # offered reflects the roles that exist NOW, not at import time.
+        schemas.append(t.schema_factory() if t.schema_factory is not None else t.schema)
         handlers[name] = t.handler
     return schemas, handlers

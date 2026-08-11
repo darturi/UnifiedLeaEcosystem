@@ -17,6 +17,12 @@ import type {
   ProjectFile,
   ProjectGraph,
   Skill,
+  AuthoringFieldValues,
+  McpServer,
+  McpTransport,
+  McpTestResult,
+  CustomTool,
+  SessionSkillsMcp,
   SubagentProfile,
   SubagentSettings,
   BlueprintWarning,
@@ -520,6 +526,41 @@ export async function pushProject(
 // ── Sub-agents (D6) ───────────────────────────────────────────────────────────
 // View/edit each built-in role's settings over /api/sub-agents. Edits persist as
 // per-role overrides (not by mutating the vendored YAML) and are merged at spawn.
+export async function createSubagentRole(input: {
+  name: string;
+  authoring?: AuthoringFieldValues;
+  system_prompt?: string;
+  model?: string | null;
+  tools?: string[] | null;
+  max_turns?: number | null;
+}): Promise<SubagentProfile> {
+  const response = await fetch('/api/sub-agents/roles', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to add the sub-agent.'));
+  return response.json();
+}
+
+export async function updateSubagentRole(
+  roleId: string,
+  update: { name?: string; authoring?: AuthoringFieldValues; max_turns?: number | null },
+): Promise<SubagentProfile> {
+  const response = await fetch(`/api/sub-agents/roles/${encodeURIComponent(roleId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the sub-agent.'));
+  return response.json();
+}
+
+export async function deleteSubagentRole(roleId: string): Promise<void> {
+  const response = await fetch(`/api/sub-agents/roles/${encodeURIComponent(roleId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to delete the sub-agent.'));
+}
+
 export async function listSubagentProfiles(): Promise<SubagentProfile[]> {
   const response = await fetch('/api/sub-agents/profiles');
   if (!response.ok)
@@ -558,6 +599,7 @@ export async function listSkills(): Promise<Skill[]> {
 export async function createSkill(input: {
   name: string;
   body?: string;
+  authoring?: AuthoringFieldValues;
   is_global?: boolean;
   project_ids?: string[];
 }): Promise<Skill> {
@@ -571,11 +613,16 @@ export async function createSkill(input: {
 }
 
 // Import a skill from a GitHub link (D56) — the headline "paste a link → Add".
+export interface ImportedExtras {
+  imported_roles?: { name: string; status: string; reason?: string; unmapped_tools?: string[] }[];
+  imported_servers?: { name: string; status: string; reason?: string }[];
+}
+
 export async function importSkill(input: {
   url: string;
   is_global?: boolean;
   project_ids?: string[];
-}): Promise<Skill> {
+}): Promise<Skill & ImportedExtras> {
   const response = await fetch('/api/skills/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -587,7 +634,7 @@ export async function importSkill(input: {
 
 export async function updateSkill(
   skillId: string,
-  update: { name?: string; body?: string },
+  update: { name?: string; body?: string; authoring?: AuthoringFieldValues },
 ): Promise<Skill> {
   const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}`, {
     method: 'PUT',
@@ -614,6 +661,224 @@ export async function setSkillAssignment(
 export async function deleteSkill(skillId: string): Promise<void> {
   const response = await fetch(`/api/skills/${encodeURIComponent(skillId)}`, { method: 'DELETE' });
   if (!response.ok) throw new Error(await detailMessage(response, 'Failed to delete the skill.'));
+}
+
+// ── MCP servers (v2.5 E0) ─────────────────────────────────────────────────────
+// Deliberately mirrors the skills client above: same CRUD + assignment shape,
+// because an MCP server is the same kind of library item. `testMcpServer` has no
+// skills counterpart — it dry-runs an UNSAVED draft so the form can answer "did I
+// type this right?" before a row exists (E0b).
+export interface McpServerInput {
+  name: string;
+  transport?: McpTransport;
+  command?: string | null;
+  args?: string[];
+  env?: Record<string, string>;
+  env_from?: string[];
+  url?: string | null;
+  api_key_name?: string | null;
+  enabled?: boolean;
+  is_global?: boolean;
+  project_ids?: string[];
+}
+
+export async function listMcpServers(): Promise<McpServer[]> {
+  const response = await fetch('/api/mcp-servers');
+  if (!response.ok) throw new Error(`Failed to load MCP servers: ${response.statusText}`);
+  const data = await response.json();
+  return Array.isArray(data.servers) ? data.servers : [];
+}
+
+export async function createMcpServer(input: McpServerInput): Promise<McpServer> {
+  const response = await fetch('/api/mcp-servers', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to add the MCP server.'));
+  return response.json();
+}
+
+export async function updateMcpServer(
+  serverId: string,
+  update: Partial<McpServerInput>,
+): Promise<McpServer> {
+  const response = await fetch(`/api/mcp-servers/${encodeURIComponent(serverId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the MCP server.'));
+  return response.json();
+}
+
+export async function setMcpServerAssignment(
+  serverId: string,
+  assignment: { is_global: boolean; project_ids: string[] },
+): Promise<McpServer> {
+  const response = await fetch(`/api/mcp-servers/${encodeURIComponent(serverId)}/assignment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(assignment),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update the server scope.'));
+  return response.json();
+}
+
+export async function deleteMcpServer(serverId: string): Promise<void> {
+  const response = await fetch(`/api/mcp-servers/${encodeURIComponent(serverId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to delete the MCP server.'));
+}
+
+// ── Per-session skills / MCP (v2.5 E0e) ───────────────────────────────────────
+export async function getSessionSkillsMcp(sessionId: string): Promise<SessionSkillsMcp> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/skills-mcp`);
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to load skills and servers.'));
+  return response.json();
+}
+
+export async function setSessionSkillMcp(
+  sessionId: string,
+  toggle: { kind: 'skill' | 'mcp_server'; item_id: string; action: 'add' | 'remove' | null },
+): Promise<SessionSkillsMcp> {
+  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/skills-mcp`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(toggle),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to update skills and servers.'));
+  return response.json();
+}
+
+export async function getMcpServerDefaults(): Promise<{ lean_project_path: string | null }> {
+  const response = await fetch('/api/mcp-servers/defaults');
+  if (!response.ok) return { lean_project_path: null };
+  return response.json();
+}
+
+export async function listCustomTools(): Promise<CustomTool[]> {
+  const response = await fetch('/api/custom-tools');
+  if (!response.ok) return [];
+  const data = await response.json();
+  return Array.isArray(data.tools) ? data.tools : [];
+}
+
+export async function createCustomTool(input: {
+  name: string;
+  url: string;
+  description?: string;
+  authoring?: AuthoringFieldValues;
+  method?: string;
+  params?: Record<string, unknown>;
+  auth_key_name?: string | null;
+  is_global?: boolean;
+  project_ids?: string[];
+}): Promise<CustomTool> {
+  const response = await fetch('/api/custom-tools', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to add the tool.'));
+  return response.json();
+}
+
+export async function setCustomToolAssignment(
+  toolId: string,
+  assignment: { is_global: boolean; project_ids: string[] },
+): Promise<CustomTool> {
+  const response = await fetch(`/api/custom-tools/${encodeURIComponent(toolId)}/assignment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(assignment),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to scope the tool.'));
+  return response.json();
+}
+
+export async function deleteCustomTool(toolId: string): Promise<void> {
+  const response = await fetch(`/api/custom-tools/${encodeURIComponent(toolId)}`, { method: 'DELETE' });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Failed to delete the tool.'));
+}
+
+export interface CatalogEntry {
+  id: string;
+  title: string;
+  summary: string;
+  requires?: string;
+  installed: boolean;
+  skill_url?: string;
+  skill_note?: string;
+  recommended_tools?: string[];
+}
+
+export async function listMcpCatalog(): Promise<CatalogEntry[]> {
+  const response = await fetch('/api/mcp-servers/catalog');
+  if (!response.ok) return [];
+  const data = await response.json();
+  return Array.isArray(data.entries) ? data.entries : [];
+}
+
+export async function installMcpCatalogEntry(entryId: string): Promise<McpServer> {
+  const response = await fetch(`/api/mcp-servers/catalog/${encodeURIComponent(entryId)}`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Could not install that.'));
+  return response.json();
+}
+
+export interface ToolCatalogEntry {
+  id: string;
+  title: string;
+  summary: string;
+  requires?: string;
+  installed: boolean;
+}
+
+export async function listToolCatalog(): Promise<ToolCatalogEntry[]> {
+  const response = await fetch('/api/custom-tools/catalog');
+  if (!response.ok) return [];
+  const data = await response.json();
+  return Array.isArray(data.entries) ? data.entries : [];
+}
+
+export async function installToolCatalogEntry(entryId: string): Promise<CustomTool> {
+  const response = await fetch(`/api/custom-tools/catalog/${encodeURIComponent(entryId)}`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Could not install that.'));
+  return response.json();
+}
+
+export interface McpKeyRequirement {
+  env: string;
+  servers: string[];
+  configured: boolean;
+}
+
+export async function getMcpKeyRequirements(): Promise<McpKeyRequirement[]> {
+  const response = await fetch('/api/mcp-servers/key-requirements');
+  if (!response.ok) return [];
+  const data = await response.json();
+  return Array.isArray(data.requirements) ? data.requirements : [];
+}
+
+export async function testMcpServer(spec: {
+  transport?: McpTransport;
+  command?: string | null;
+  args?: string[];
+  env?: Record<string, string>;
+  env_from?: string[];
+  url?: string | null;
+  api_key_name?: string | null;
+}): Promise<McpTestResult> {
+  const response = await fetch('/api/mcp-servers/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(spec),
+  });
+  if (!response.ok) throw new Error(await detailMessage(response, 'Could not run the test.'));
+  return response.json();
 }
 
 // ── Global search (Slice 7, D41) ──────────────────────────────────────────────

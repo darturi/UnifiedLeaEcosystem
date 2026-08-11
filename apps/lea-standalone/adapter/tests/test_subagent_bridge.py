@@ -83,22 +83,31 @@ def _finished(candidate_path=None, check_status="ok", check_detail=None,
 # --- enablement ---------------------------------------------------------------
 
 def test_with_subagents_adds_spawn_to_default_toolset():
+    """v2.5 — DELIBERATELY changed from asserting a frozen allowlist.
+
+    This used to assert `out.tools` contained the built-ins plus the two opt-ins, which is
+    exactly what made every MCP and HTTP tool unreachable: the list was resolved in the
+    adapter, before the run, so it could not contain tools that register once the run
+    starts. The coordinator now asks for "the default set PLUS these", and the default is
+    resolved inside the run where everything has registered.
+    """
+    from lea.registry import build_toolset
+
     cfg = LeaConfig(model="gemini/test", max_turns=3)
     # F2: also returns why the user's overrides didn't apply, if they didn't — a
     # readable overrides file (this case) means no error.
     out, override_error = bridge._with_subagents(cfg)
     assert override_error is None
-    assert out.tools is not None
-    assert "spawn_subagent" in out.tools
-    # the coordinator also gets the opt-in SafeVerify tool to audit a finished proof
-    assert "safe_verify" in out.tools
-    # the built-ins are still there (including upstream's suggest_imports), with the
-    # two opt-in tools appended.
+    assert out.tools is None, "a frozen list cannot include run-time tools"
+    assert out.extra_tools == ["spawn_subagent", "safe_verify"]
+
+    # Resolved the way the run resolves it, the built-ins and both opt-ins are present.
+    names = [s["name"] for s in build_toolset(out.tools, out.extra_tools)[0]]
     assert {
         "read_file", "write_file", "edit_file", "lean_check", "bash",
         "search_mathlib", "suggest_imports",
-    } <= set(out.tools)
-    assert out.tools[-2:] == ["spawn_subagent", "safe_verify"]
+    } <= set(names)
+    assert names[-2:] == ["spawn_subagent", "safe_verify"]
     # nothing else about the config changed
     assert out.model == cfg.model and out.max_turns == cfg.max_turns
 
