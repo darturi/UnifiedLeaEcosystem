@@ -108,8 +108,12 @@ inline SVG in that same file and follows the colour theme automatically.
 ## Deploying
 
 `.github/workflows/site.yml` builds and publishes to GitHub Pages on every push to
-`main` that touches `public/`. Enable it once under **Settings → Pages → Source →
-GitHub Actions**.
+`main` that touches `public/`.
+
+**One-time setup:** a repository admin must turn Pages on under **Settings → Pages →
+Source → GitHub Actions**. Until then the workflow fails at `configure-pages` with
+*"Get Pages site failed … Not Found"*. The workflow cannot do this for you — creating
+a Pages site over the API is outside what `GITHUB_TOKEN` is permitted to do.
 
 The site is built for a project page at `/UnifiedLeaEcosystem/`. If you move it to a
 custom domain, set `origin` in `site.config.mjs` and build with `--base=/`:

@@ -40,11 +40,13 @@ jobs:
         working-directory: public
         run: node build.mjs
 
-      # enablement: true turns Pages on via the API the first time this runs,
-      # so nobody has to flip Settings → Pages by hand. Harmless afterwards.
+      # Requires Pages to be enabled once, by hand:
+      #   Settings → Pages → Source → GitHub Actions
+      # `enablement: true` cannot substitute for that — creating a Pages site
+      # over the API is not something GITHUB_TOKEN is allowed to do
+      # ("Resource not accessible by integration"), so it only replaces a clear
+      # error with a confusing one.
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:
