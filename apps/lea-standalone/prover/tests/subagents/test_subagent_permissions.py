@@ -13,7 +13,8 @@ These pin:
   * the generalist (no profile) is tightened to the parent too;
   * `spawn_subagent` (opt-in) is stripped from a child even when the parent has it
     and the child asks for it — the capability-layer twin of the depth guard;
-  * an unknown tool name is a profile typo and raises;
+  * an unknown tool name is SOFT-DROPPED with a diagnostic, not raised (B4) — deleting a
+    custom tool must not break every role that named it;
   * the invariant holds over a matrix of (parent, declared) combos: effective ⊆
     parent, and never contains spawn_subagent;
   * end to end: a write-less coordinator spawning a write-wanting role yields a
@@ -29,6 +30,7 @@ from pathlib import Path
 
 import lea.agent as agent
 from lea.config import LeaConfig
+from lea import diagnostics
 from lea.errors import ToolError
 from lea.events import CheckResult, Finished
 from lea.profiles import AgentProfile
@@ -113,9 +115,58 @@ def test_spawn_subagent_is_stripped_even_when_the_parent_has_it():
           "spawn_subagent" not in compose_child_tools(parent, None))
 
 
-def test_unknown_tool_name_is_a_profile_error():
-    check("an unknown declared tool raises",
-          _raises_toolerror(lambda: compose_child_tools(_cfg(tools=_FULL), ["read_fil"])))
+def test_unknown_tool_name_is_dropped_and_reported():
+    """v2.5 B4 — deliberately changed from raising.
+
+    Raising meant that deleting a custom tool (or turning off the MCP server that provided
+    it) silently broke every role naming it, with the error surfacing far from the cause.
+    The child now runs without it and the human is told."""
+    token = diagnostics.begin_scope()
+    try:
+        effective = compose_child_tools(_cfg(tools=_FULL), ["read_file", "read_fil"])
+        reported = diagnostics.drain()
+    finally:
+        diagnostics.end_scope(token)
+
+    check("an unknown declared tool no longer raises", effective is not None)
+    check("the unknown tool is absent from the child", "read_fil" not in effective)
+    check("the known tools survive alongside it", "read_file" in effective)
+    check("the human is told which tool went missing",
+          any(d.code == "subagent.tool_dropped" and "read_fil" in d.message for d in reported))
+
+
+def test_mcp_tools_never_reach_a_child(monkeypatch):
+    """v2.5 — the spawn-killer. A child is built with `mcp_servers={}`, so MCP tools exist
+    in the PARENT's registry and not the child's. Composing against the parent alone let
+    those names through and the child died in `build_toolset` with
+    "unknown tool 'lean_build'" — a hard failure, for a name that was valid where checked.
+
+    It hit the GENERALIST too: its wanted-set is the parent's whole live toolset. An
+    imported role naming `lean_goal` and a role naming nothing at all both broke.
+    HTTP tools are inherited and must survive.
+    """
+    from lea.http_tools import register_http_tools
+    from lea.registry import Tool, pop_scope, push_scope, register
+
+    scope = push_scope()
+    try:
+        register_http_tools([{"name": "loogle", "description": "d",
+                              "url": "https://api.github.com/x"}])
+        register(Tool(name="lean_build", schema={"name": "lean_build", "description": "",
+                                                 "input_schema": {}},
+                      handler=lambda a: ""), scoped=True)
+        parent = _cfg(tools=None, http_tools=[{"name": "loogle", "url": "https://api.github.com/x"}])
+
+        generalist = compose_child_tools(parent, None)
+        check("a generalist child gets no MCP tool", "lean_build" not in generalist)
+        check("a generalist child keeps the http tool", "loogle" in generalist)
+
+        declared = compose_child_tools(parent, ["read_file", "lean_build", "loogle"])
+        check("a role naming an MCP tool does not raise", declared is not None)
+        check("the MCP name is dropped from the child", "lean_build" not in declared)
+        check("the rest of the role's toolset survives", declared == ["read_file", "loogle"])
+    finally:
+        pop_scope(scope)
 
 
 def test_invariant_holds_over_a_matrix():
@@ -192,7 +243,8 @@ def main():
     test_declared_tools_the_parent_lacks_are_tightened_away()
     test_generalist_is_tightened_to_the_parent()
     test_spawn_subagent_is_stripped_even_when_the_parent_has_it()
-    test_unknown_tool_name_is_a_profile_error()
+    test_unknown_tool_name_is_dropped_and_reported()
+    test_mcp_tools_never_reach_a_child(None)
     test_invariant_holds_over_a_matrix()
     test_child_config_applies_the_intersection()
     mp = _MonkeyPatch()

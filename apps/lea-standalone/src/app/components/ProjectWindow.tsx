@@ -10,14 +10,16 @@ import { MarkdownDoc } from './MarkdownDoc';
 import { FilesCard } from './FilesCard';
 import { BlueprintTab } from './BlueprintTab';
 import { FilesystemTab } from './FilesystemTab';
+import { SkillsMcpTab } from './SkillsMcpTab';
 
-type Tab = 'overview' | 'formalizations' | 'blueprint' | 'filesystem';
+type Tab = 'overview' | 'formalizations' | 'blueprint' | 'filesystem' | 'skills-mcp';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'formalizations', label: 'Formalizations' },
   { id: 'blueprint', label: 'Blueprint' },
   { id: 'filesystem', label: 'Filesystem' },
+  { id: 'skills-mcp', label: 'Skills / MCP' },
 ];
 
 // The project window (v2.1 F2/F3). A full-page view — breadcrumb back to Chats, a
@@ -180,6 +182,8 @@ export function ProjectWindow({
             onOpenSession={onOpenSession}
             onStartFormalization={onStartFormalization}
           />
+        ) : tab === 'skills-mcp' ? (
+          <SkillsMcpTab projectId={project.id} />
         ) : tab === 'blueprint' ? (
           <BlueprintTab projectId={project.id} onOpenSession={onOpenSession} refreshSignal={docSignal} />
         ) : (

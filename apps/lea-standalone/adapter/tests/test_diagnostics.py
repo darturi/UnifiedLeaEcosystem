@@ -561,3 +561,48 @@ def test_no_candidate_notice_describes_what_was_recorded():
     assert "recorded" in text
     assert "produced" not in text
     assert "scratch" in (remedy or "")
+
+
+def test_every_emitted_code_is_in_the_catalog():
+    """v2.5 G1 — the audit that keeps `CATALOG` honest, as a test rather than a one-off.
+
+    A code with no catalog entry still surfaces (that is deliberate — `resolve` never
+    drops an unknown one), but it surfaces with the raw message and NO remedy. Since the
+    whole point of the code layer is that a failure explains itself, an unregistered code
+    is a half-built failure mode. This walks both the adapter and the prover.
+    """
+    import re
+    from pathlib import Path
+
+    from app.diagnostics import CATALOG
+
+    prefixes = ("mcp", "tool", "skill", "subagent", "settings", "run", "code",
+                "approval", "asset", "import", "provider", "lean")
+    pattern = re.compile(rf'"(({"|".join(prefixes)})\.[a-z_]+)"')
+    roots = [Path(__file__).parent.parent / "app",
+             Path(__file__).parent.parent.parent / "prover" / "lea"]
+
+    emitted: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.py"):
+            emitted |= {m[0] for m in pattern.findall(path.read_text())}
+
+    # `skill.md` is a FILENAME the pattern also matches; it is not a diagnostic code.
+    emitted.discard("skill.md")
+    missing = sorted(code for code in emitted if code not in CATALOG)
+    assert not missing, f"emitted but not in CATALOG: {missing}"
+
+
+def test_every_action_points_at_a_real_code():
+    """A button attached to a code nothing emits is dead weight that reads as coverage."""
+    from app.diagnostics import CATALOG, CODE_ACTIONS
+
+    assert not [c for c in CODE_ACTIONS if c not in CATALOG]
+
+
+def test_every_catalog_entry_has_a_title():
+    from app.diagnostics import CATALOG
+
+    assert not [c for c, (title, _) in CATALOG.items() if not (title or "").strip()]

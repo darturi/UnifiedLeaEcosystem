@@ -75,6 +75,7 @@ export function ChatThread({
   onDraftChange,
   onSubmit,
   onInterrupt,
+  onOpenLibrary,
   onOpenSettings,
   canvasCollapsed,
   onToggleCanvas,
@@ -92,6 +93,7 @@ export function ChatThread({
   onSubmit: () => void;
   onInterrupt: () => void;
   onOpenSettings?: () => void;
+  onOpenLibrary?: (focus?: string) => void;
   canvasCollapsed: boolean;
   onToggleCanvas: () => void;
   onRenameSession?: (title: string) => Promise<void> | void;
@@ -107,10 +109,14 @@ export function ChatThread({
   // Settings made the user go and hunt for the picker they'd just asked for.
   const runDiagnosticAction = useCallback(
     (action: DiagnosticAction) => {
-      if (action.focus === 'model') setModelPickerSignal((n) => n + 1);
+      // v2.5 G4: a diagnostic can now point at a Library page, not just Settings — a
+      // remedy that says "check it under Library → MCP servers" is still work for the
+      // user to go and find.
+      if (action.action === 'open-library') onOpenLibrary?.(action.focus);
+      else if (action.focus === 'model') setModelPickerSignal((n) => n + 1);
       else onOpenSettings?.();
     },
-    [onOpenSettings],
+    [onOpenSettings, onOpenLibrary],
   );
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(title);
@@ -874,7 +880,9 @@ function FormalizationScope({ session }: { session?: SessionSummary }) {
             title={item.primary_path || item.statement || item.display_title}
           >
             <span className={`form-dot ${formalizationStatusClass(item.validity_status, item.activity.status)}`} />
-            {item.declaration_name || item.display_title}
+            {/* Its own element so it can ellipsize: a bare text node in a flex row has no
+                box to clip, which is how a whole prompt ended up spilling across the rail. */}
+            <span className="form-label">{item.declaration_name || item.display_title}</span>
             <small>{item.activity.status !== 'idle' ? item.activity.status : item.validity_status}</small>
           </button>
         ))}

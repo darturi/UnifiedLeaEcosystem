@@ -43,6 +43,17 @@ export const SLASH_COMMANDS = [
     description: 'Compact this conversation to free up context',
     kind: 'action',
   },
+  {
+    name: 'skills',
+    description: 'Choose which skills this conversation uses',
+    kind: 'action',
+  },
+  {
+    name: 'mcp',
+    description: 'Choose which MCP servers this conversation uses',
+    kind: 'action',
+    aliases: ['servers'],
+  },
 ];
 
 /**

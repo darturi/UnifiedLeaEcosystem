@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { BarChart3, Bot, PanelLeftClose, Plus, Sparkles } from 'lucide-react';
+import { BarChart3, Bot, PanelLeftClose, Plug, Plus, Sparkles, Wrench } from 'lucide-react';
 import type { SessionSummary } from '../lib/api';
 import { useSessions } from '../stores/sessions';
 import { useProjects } from '../stores/projects';
@@ -17,6 +17,8 @@ export function Sidebar({
   onOpenProjectsHub,
   onOpenSkills,
   onOpenSubagents,
+  onOpenMcp,
+  onOpenTools,
   onOpenSearch,
   onOpenSettings,
   onOpenStats,
@@ -31,6 +33,8 @@ export function Sidebar({
   onOpenProjectsHub: () => void;
   onOpenSkills: () => void;
   onOpenSubagents: () => void;
+  onOpenMcp: () => void;
+  onOpenTools: () => void;
   onOpenSearch: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
@@ -131,6 +135,14 @@ export function Sidebar({
           <button className="row" onClick={onOpenSubagents}>
             <span className="picon"><Bot size={13} /></span>
             <span className="rtitle">Sub-agents</span>
+          </button>
+          <button className="row" onClick={onOpenMcp}>
+            <span className="picon"><Plug size={13} /></span>
+            <span className="rtitle">MCP servers</span>
+          </button>
+          <button className="row" onClick={onOpenTools}>
+            <span className="picon"><Wrench size={13} /></span>
+            <span className="rtitle">Tools</span>
           </button>
         </div>
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import json
 import dataclasses
 import queue as _queue
 import threading
@@ -33,6 +34,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import diagnostics
 from . import lsp_daemon
 from .errors import ToolError
 from .events import CheckResult, Finished, SubagentFinished, SubagentProgress
@@ -90,19 +92,65 @@ _SPAWN_SCHEMA = {
                     "to write (any path you give is ignored / redirected into its scratch)."
                 ),
             },
+            # Filled in per run by `build_spawn_schema` (B1) — see below.
             "subagent_type": {
                 "type": "string",
                 "description": (
-                    "Which role to run: one of the defined roles in lea/agents/ "
-                    "(e.g. 'premise-search' — read-only Mathlib scout; 'proof-candidate' "
-                    "— tries a candidate in a scratch file), or omit for a generalist "
-                    "with the full scoped toolset. An unknown role is refused."
+                    "Which role to run, or omit for a generalist with the full scoped "
+                    "toolset. An unknown role is refused."
                 ),
             },
         },
         "required": ["description", "prompt"],
     },
 }
+
+
+GENERALIST = "generalist"
+
+
+def build_spawn_schema() -> dict:
+    """The `spawn_subagent` schema for THIS run, with the roles that actually exist (B1).
+
+    The schema used to be frozen at import with `subagent_type` as free text and the role
+    names mentioned only in English prose. That survives two hardcoded roles and breaks
+    the moment a role is added: the model has no way to learn it exists, so it is never
+    delegated to — **and nothing errors**. The user configures a sub-agent and simply
+    nothing happens, which is the worst failure shape available, because there is no
+    symptom to search for.
+
+    So the roles are discovered per build and published two ways, because they do
+    different jobs:
+      * ``enum`` — machine-checkable. The model cannot invent a role, and a provider that
+        validates arguments rejects a typo before it reaches us.
+      * the ``description`` — how the model *chooses*. An enum of bare names says nothing
+        about when to use one, so each role's own `description` is listed beside it. This
+        is where a user-authored role's "when to use this" ends up doing real work.
+    """
+    roles = []
+    for name in available_profiles():
+        try:
+            roles.append((name, (load_profile(name).description or "").strip()))
+        except ToolError:
+            # A malformed role must not take the whole toolset down with it; it simply
+            # isn't offered. `load_profile` raises again, with detail, if it is requested.
+            continue
+
+    lines = [
+        f"- {GENERALIST}: a fresh agent with your own toolset, no specialization.",
+    ] + [f"- {name}: {desc}" if desc else f"- {name}" for name, desc in roles]
+
+    schema = json.loads(json.dumps(_SPAWN_SCHEMA))   # deep copy; never mutate the template
+    schema["input_schema"]["properties"]["subagent_type"] = {
+        "type": "string",
+        "enum": [GENERALIST] + [name for name, _ in roles],
+        "description": "Which role to run. Omit for the generalist.\n" + "\n".join(lines),
+    }
+    return {
+        "name": "spawn_subagent",
+        "description": _SPAWN_SCHEMA["description"],
+        "input_schema": schema["input_schema"],
+    }
 
 
 def _bounded_child_turns(parent_max_turns: int | None) -> int:
@@ -118,8 +166,30 @@ def _parent_tool_names(parent_config) -> set[str]:
     never exceed (item 21). Resolved through the same ``build_toolset`` the loop uses,
     so it is exactly the parent's real capability set, opt-in tools included when the
     parent explicitly selected them (a coordinator's ``spawn_subagent``)."""
-    schemas, _ = build_toolset(parent_config.tools)
+    schemas, _ = build_toolset(parent_config.tools, getattr(parent_config, 'extra_tools', None))
     return {s["name"] for s in schemas}
+
+
+def _child_available_names(parent_config) -> set[str]:
+    """The tools that will actually EXIST in a child activation.
+
+    A child is built with ``mcp_servers={}`` (children stay light — each would otherwise
+    spawn another Lean server against the same Mathlib), so MCP tools are present in the
+    PARENT's registry and absent from the child's. Composing against the parent alone
+    therefore let MCP names through, and the child then died in ``build_toolset`` with
+    "unknown tool 'lean_build'" — a hard failure at spawn, for a name that was legitimate
+    where it was checked.
+
+    This hit the GENERALIST path too, not just imported roles: a generalist's wanted-set is
+    the parent's whole live toolset, MCP tools included.
+
+    A child does inherit ``http_tools`` (they cost nothing to re-register), so those stay.
+    """
+    from .registry import REGISTRY
+
+    names = {n for n, t in REGISTRY.items() if not t.opt_in}
+    names |= {str(spec.get("name")) for spec in (getattr(parent_config, "http_tools", None) or [])}
+    return names
 
 
 def compose_child_tools(parent_config, declared: list[str] | None) -> list[str]:
@@ -129,22 +199,44 @@ def compose_child_tools(parent_config, declared: list[str] | None) -> list[str]:
 
     ``declared is None`` (the generalist) means the default toolset; either way every
     opt-in tool (``spawn_subagent``) is stripped, so a child can never spawn — the same
-    guarantee as the depth walk, now also at the capability layer. Declared order is
+    guarantee as the depth walk, now also at the capability layer. The intersection is
+    with what the CHILD will have, not merely what the parent has — see
+    ``_child_available_names``. Declared order is
     preserved (``build_toolset`` treats the list as filter+order). An unknown tool name
     is a profile typo and raises; a *known* tool the parent lacks is silently tightened
     away — that is the D79 contract, not an error.
     """
-    parent_allowed = _parent_tool_names(parent_config)
+    parent_allowed = _parent_tool_names(parent_config) & _child_available_names(parent_config)
     wanted = [s["name"] for s in build_toolset(None)[0]] if declared is None else list(declared)
     effective: list[str] = []
+    dropped: list[str] = []
     for name in wanted:
         t = get_tool(name)
         if t is None:
-            raise ToolError(f"agent profile names unknown tool {name!r}")
+            # B4: SOFT-DROP, not raise. This used to abort the spawn, which meant deleting
+            # a custom tool (or disabling the MCP server that provided it) silently broke
+            # every role that named it — a confusing failure far from its cause. Blocking
+            # the delete instead was the alternative, but that couples the Library to role
+            # internals and leaves undeletable rows. So the child runs without it and the
+            # human is told, which is the same policy a session's deleted override gets.
+            dropped.append(name)
+            continue
         if t.opt_in:
             continue  # opt-in (spawn_subagent) is never granted to a child
         if name in parent_allowed:  # else: parent lacked it → tightened away (D79)
             effective.append(name)
+    if dropped:
+        diagnostics.report(
+            "degraded",
+            "subagent.tool_dropped",
+            f"A sub-agent asked for {', '.join(repr(d) for d in dropped)}, which no longer "
+            f"exists. It ran without it.",
+            source="subagent",
+            remedy="The tool was probably deleted, or its MCP server is turned off. Edit "
+                   "the role under Library → Sub-agents, or restore the tool.",
+            once=True,
+            tools=dropped,
+        )
     return effective
 
 
@@ -398,7 +490,7 @@ def prepare_spawn(args: dict) -> "SpawnPlan | str":
     so a refused spawn never leaves a phantom running child."""
     description = (args.get("description") or "").strip()
     prompt = (args.get("prompt") or "").strip()
-    subagent_type = (args.get("subagent_type") or "generalist").strip() or "generalist"
+    subagent_type = (args.get("subagent_type") or GENERALIST).strip() or GENERALIST
     if not prompt:
         return "Error: spawn_subagent requires a non-empty 'prompt'."
 
@@ -420,7 +512,7 @@ def prepare_spawn(args: dict) -> "SpawnPlan | str":
     # behavior; any other type must name a profile in lea/agents/ or is refused —
     # never silently downgraded to a full-toolset generalist.
     profile: AgentProfile | None = None
-    if subagent_type != "generalist":
+    if subagent_type != GENERALIST:
         try:
             profile = load_profile(subagent_type)
         except ToolError as exc:
@@ -644,7 +736,8 @@ def run_children_concurrently(plans, *, max_children: int = DEFAULT_MAX_CONCURRE
 
 
 @tool(name="spawn_subagent", description=_SPAWN_SCHEMA["description"],
-      input_schema=_SPAWN_SCHEMA["input_schema"], opt_in=True)
+      input_schema=_SPAWN_SCHEMA["input_schema"], opt_in=True,
+      schema_factory=build_spawn_schema)
 def spawn_subagent(args: dict) -> str:
     """Thin wrapper preserving the registered-tool contract for direct/test callers.
     The coordinator loop (agent.py) instead calls `prepare_spawn` then streams via

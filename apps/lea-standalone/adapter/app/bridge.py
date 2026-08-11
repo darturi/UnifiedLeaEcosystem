@@ -68,7 +68,7 @@ from .artifacts import classify_lean_artifact, declaration_present, extract_decl
 from .config import LeaConfig, configured_provider_keys, load_config
 from .diagnostics import analyze_exception, resolve as resolve_diagnostic
 from .gitstore import GitStore, GitStoreError
-from . import collation, formalizations as formalization_service, projects, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
+from . import collation, formalizations as formalization_service, projects, roles_catalog, runbroker, runregistry, skills_catalog, store, subagent_overrides, uploads
 
 logger = logging.getLogger("lea-interface.bridge")
 _FORMALIZATION_CONTEXT_MARKER = "<!-- lea:formalization-context -->"
@@ -988,13 +988,17 @@ def _with_subagents(cfg: LeaConfig) -> tuple[LeaConfig, str | None]:
     """Return `cfg` with `spawn_subagent` added to the coordinator's toolset (item 24).
 
     `spawn_subagent` is registered `opt_in=True` in the prover, so an unfiltered toolset
-    (`tools=None`) never contains it. The coordinator gets its normal default toolset —
-    whatever `build_toolset(None)` resolves — PLUS spawn_subagent, named explicitly, so
-    the model can delegate. Resolving the default at call time (not hard-coding the
-    built-ins) keeps this correct if the default set ever changes."""
-    from lea.registry import build_toolset
+    (`tools=None`) never contains it. The coordinator gets its normal default toolset PLUS
+    the opt-in ones it needs.
 
-    default_tools = [schema["name"] for schema in build_toolset(None)[0]]
+    **This used to resolve `build_toolset(None)` HERE and pass the result as an explicit
+    allowlist**, which looked equivalent and was not: this runs in the adapter before the
+    run starts, so the snapshot contained only the built-ins — and the explicit list then
+    excluded every MCP and HTTP tool that registers once the run begins. The effect was
+    total and silent: no MCP tool could ever be called from the UI, while the server
+    started, warmed and reported 23 tools. `extra_tools` says "the default set, plus
+    these" and leaves resolution where it belongs — inside the run, after everything has
+    registered."""
     # D6: carry the user's per-role sub-agent overrides (Sub-agents page) onto the run's
     # config so the prover's `_child_config` merges them over each role's YAML defaults at
     # spawn — model / max_turns / max_cost / system_prompt / tools, retuned without touching
@@ -1018,7 +1022,7 @@ def _with_subagents(cfg: LeaConfig) -> tuple[LeaConfig, str | None]:
     # coordinator delegates proving, then verifies the assembled result. Read-only, so it's
     # not gated, and harmless if a child inherits it via the ⊆-parent tool composition.
     return (
-        replace(cfg, tools=[*default_tools, "spawn_subagent", "safe_verify"],
+        replace(cfg, tools=None, extra_tools=["spawn_subagent", "safe_verify"],
                 subagent_overrides=overrides),
         override_error,
     )
@@ -1580,6 +1584,7 @@ def run_lea(context: RunnerContext) -> None:
     # Per-run temp dir holding materialized skill .md files (W3/D48); None until
     # resolved inside the try. Declared before it so the `finally` can always clean up.
     skills_tempdir: str | None = None
+    roles_tempdir: str | None = None
 
     narration: list[str] = []
     # Batches streamed text into ~one frame per subscriber poll (P1). `narration` still
@@ -1718,10 +1723,60 @@ def run_lea(context: RunnerContext) -> None:
         # it (global ∪ assigned, D47), materialized to per-run temp .md files fed to the
         # prover via cfg.skills. Loose sessions resolve to none (project is None), so
         # cfg.skills stays empty — no behavior change on the loose path.
-        if project:
-            skill_paths, skills_tempdir = skills_catalog.materialize_project_skills(project["id"])
-            if skill_paths:
-                cfg = replace(cfg, skills=skill_paths)
+        # E0e: resolution is now (global ∪ project-assigned) ± this SESSION's own diff, so
+        # a loose session can use skills too — before, `project is None` meant no skills at
+        # all and there was no way to opt one in.
+        skill_paths, skills_tempdir = skills_catalog.materialize_run_skills(
+            project["id"] if project else None, session_id, context.task
+        )
+        if skill_paths:
+            # H7: the materialized tree is also a READ root, so a multi-file skill's
+            # references are openable. Without it the agent is told they exist and then
+            # refused when it tries to read one — worse than not advertising them.
+            cfg = replace(cfg, skills=skill_paths, skills_root=skills_tempdir)
+        for slug, count in skills_catalog.drain_skipped():
+            # G5: the skill still loads; some of its reference material did not. Saying
+            # so beats a `read_file` failing mid-proof for no visible reason.
+            diagnose(
+                events, session_id, run_id, "degraded", "skill.files_incomplete",
+                f"{count} reference file(s) from the “{slug}” skill could not be prepared, "
+                f"so Lea cannot open them in this run.",
+                source="skill", skill=slug,
+            )
+        # MCP resolution (v2.5 A1) — the wire that was missing: the prover has had a
+        # complete MCP implementation all along (`lea/mcp.py`, started by `agent.py`
+        # whenever `cfg.mcp_servers` is non-empty), but nothing ever SET the field, so
+        # servers were reachable only from the CLI with a hand-written YAML file.
+        #
+        # Resolution mirrors skills (global ∪ assigned, D47) with one deliberate
+        # difference: a loose session still gets the GLOBAL servers, because a
+        # machine-level tool the user switched on should work in a scratch session too.
+        # Secrets are absent by construction — a spec carries `env_from` NAMES, and
+        # `lea.mcp._child_env` reads their values at spawn (A7).
+        mcp_specs = store.mcp_server_specs(project["id"] if project else None, session_id)
+        if mcp_specs:
+            cfg = replace(cfg, mcp_servers=mcp_specs)
+        # B2: user-authored sub-agent roles, materialized to YAML the prover discovers via
+        # `agent_dirs`. Without this the coordinator is only ever offered the two vendored
+        # roles, so a role the user created would silently never run.
+        # F2: declared HTTP tools resolve exactly like MCP servers.
+        http_tools = store.custom_tool_specs(project["id"] if project else None)
+        if http_tools:
+            cfg = replace(cfg, http_tools=http_tools)
+        roles_tempdir, skipped_roles = roles_catalog.materialize_roles()
+        if roles_tempdir:
+            cfg = replace(cfg, agent_dirs=[roles_tempdir])
+        if skipped_roles:
+            # G3: a role that could not be written is a role the coordinator is never
+            # offered — an absence, with nothing raised anywhere. Discarding this signal
+            # would leave the user with a role that exists in the Library and simply
+            # never runs, which is the exact failure this phase is built to prevent.
+            diagnose(
+                events, session_id, run_id, "degraded", "subagent.role_unavailable",
+                f"{len(skipped_roles)} sub-agent role(s) could not be prepared, so they "
+                f"were not offered to the agent: {', '.join(sorted(skipped_roles))}.",
+                source="subagent", roles=sorted(skipped_roles),
+            )
         # Claim the row (C7). If the interrupt endpoint got here first the row is no
         # longer pending, and starting anyway would execute — and bill — a run the
         # client was already told was cancelled. This replaces the plain
@@ -2278,6 +2333,7 @@ def run_lea(context: RunnerContext) -> None:
         # that ends mid-batch must not drop its last words.
         deltas.flush()
         skills_catalog.cleanup(skills_tempdir)
+        roles_catalog.cleanup(roles_tempdir)
         # D1: retire any child whose SubagentStarted never saw its SubagentFinished —
         # the coordinator was interrupted or crashed mid-child. Left 'running', its run
         # row would count as an active run forever (an eternal 'exploring…' child); mark

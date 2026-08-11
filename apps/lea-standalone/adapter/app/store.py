@@ -8,6 +8,8 @@ import threading
 from collections import Counter
 from uuid import uuid4
 
+from . import authoring as _authoring
+
 from typing import Any
 
 from .db import ROOT, connect, row_to_dict, utc_now, write
@@ -400,7 +402,11 @@ def create_formalization(
 ) -> dict:
     now = utc_now()
     formalization_id = str(uuid4())
-    title = str(display_title or declaration_name or "Untitled formalization").strip()
+    # Capped at the same 160 the UPDATE path uses. A formalization created from a chat
+    # message inherits the whole message as its title, so without this a paragraph-long
+    # prompt becomes the label everywhere it is shown — and the two paths disagreeing
+    # meant the same title was legal on create and truncated on edit.
+    title = str(display_title or declaration_name or "Untitled formalization").strip()[:160]
     with write() as conn:
         conn.execute(
             """
@@ -1232,6 +1238,27 @@ def _unique_skill_slug(conn, base: str, exclude_id: str | None = None) -> str:
         suffix += 1
 
 
+def set_skill_files(skill_id: str, files: list[tuple[str, str]]) -> None:
+    """Replace a skill's reference files (H2). Wholesale, so a re-import can't leave
+    orphans from the previous version."""
+    now = utc_now()
+    with connect() as conn:
+        conn.execute("delete from skill_files where skill_id = ?", (skill_id,))
+        for path, content in files or []:
+            conn.execute(
+                "insert or replace into skill_files (skill_id, path, content, created_at) "
+                "values (?, ?, ?, ?)",
+                (skill_id, str(path), str(content), now),
+            )
+
+
+def skill_files(skill_id: str) -> list[dict]:
+    with connect() as conn:
+        return [row_to_dict(r) for r in conn.execute(
+            "select path, content from skill_files where skill_id = ? order by path",
+            (skill_id,)).fetchall()]
+
+
 def _skill_row(conn, skill_id: str) -> dict | None:
     row = conn.execute("select * from skills where id = ?", (skill_id,)).fetchone()
     if not row:
@@ -1244,6 +1271,13 @@ def _skill_row(conn, skill_id: str) -> dict | None:
             (skill_id,),
         ).fetchall()
     ]
+    # H2: paths only. The contents can be large (a real skill's references run to
+    # hundreds of KB), and no caller that lists skills wants them.
+    data["file_paths"] = [
+        r["path"] for r in conn.execute(
+            "select path from skill_files where skill_id = ? order by path", (skill_id,)
+        ).fetchall()
+    ]
     return data
 
 
@@ -1254,6 +1288,9 @@ def create_skill(
     source_url: str | None = None,
     source_ref: str | None = None,
     slug: str | None = None,
+    authoring: dict | None = None,
+    description: str | None = None,
+    triggers: list[str] | None = None,
 ) -> dict:
     """Insert a skill row (D45). `slug` defaults to a unique slugify(name); when
     given explicitly it is validated and uniquified. The created row carries its
@@ -1261,6 +1298,10 @@ def create_skill(
     clean_name = str(name or "").strip()
     if not clean_name:
         raise ValueError("Skill name is required.")
+    # C2: when the guided form was used, the compiled text IS the body — so every
+    # consumer keeps reading `body` and learns nothing new.
+    if not _authoring.is_empty(authoring):
+        body = _authoring.compile_text(authoring)
     base_slug = validate_skill_slug(slug) if slug else slugify_skill(clean_name)
     now = utc_now()
     skill_id = str(uuid4())
@@ -1269,8 +1310,9 @@ def create_skill(
         conn.execute(
             """
             insert into skills
-                (id, name, slug, body, is_global, source_url, source_ref, created_at, updated_at)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, name, slug, body, is_global, source_url, source_ref, authoring,
+                 description, triggers, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 skill_id,
@@ -1280,6 +1322,9 @@ def create_skill(
                 1 if is_global else 0,
                 source_url,
                 source_ref,
+                _authoring.dumps(authoring),
+                (description or "").strip() or None,
+                json.dumps([t.strip() for t in triggers if t.strip()]) if triggers else None,
                 now,
                 now,
             ),
@@ -1317,10 +1362,16 @@ def update_skill(
     body: str | None = None,
     source_url: str | None = None,
     source_ref: str | None = None,
+    authoring: dict | None = None,
 ) -> dict | None:
     """Update a skill's editable fields (name/body/provenance). The slug is the
     stable identifier (D45) and is NOT changed here. Pass a field as None to leave
-    it untouched. Returns the updated row, or None if the id is unknown."""
+    it untouched. Returns the updated row, or None if the id is unknown.
+
+    C2: passing `authoring` recompiles `body` from the fields, so the two can never drift
+    — the fields are the source, the body is what the model reads."""
+    if authoring is not None and not _authoring.is_empty(authoring):
+        body = _authoring.compile_text(authoring)
     now = utc_now()
     with connect() as conn:
         current = conn.execute("select * from skills where id = ?", (skill_id,)).fetchone()
@@ -1331,7 +1382,8 @@ def update_skill(
         conn.execute(
             """
             update skills
-            set name = ?, body = ?, source_url = ?, source_ref = ?, updated_at = ?
+            set name = ?, body = ?, source_url = ?, source_ref = ?, authoring = ?,
+                updated_at = ?
             where id = ?
             """,
             (
@@ -1339,6 +1391,7 @@ def update_skill(
                 cur["body"] if body is None else str(body),
                 cur["source_url"] if source_url is None else source_url,
                 cur["source_ref"] if source_ref is None else source_ref,
+                cur["authoring"] if authoring is None else _authoring.dumps(authoring),
                 now,
                 skill_id,
             ),
@@ -1391,6 +1444,7 @@ def delete_skill(skill_id: str) -> bool:
         if not conn.execute("select 1 from skills where id = ?", (skill_id,)).fetchone():
             return False
         conn.execute("delete from skill_projects where skill_id = ?", (skill_id,))
+        conn.execute("delete from skill_files where skill_id = ?", (skill_id,))
         conn.execute("delete from skills where id = ?", (skill_id,))
     return True
 
@@ -1417,7 +1471,709 @@ def skills_for_project(project_id: str) -> list[dict]:
 
 def _normalize_skill(row: dict) -> dict:
     row["is_global"] = bool(row.get("is_global"))
+    row["authoring"] = _authoring.loads(row.get("authoring"))
+    try:
+        row["triggers"] = json.loads(row.get("triggers")) if row.get("triggers") else []
+    except (TypeError, ValueError):
+        row["triggers"] = []
     return row
+
+
+# --- MCP servers (v2.5 E0) -----------------------------------------------------
+# Deliberately the same shape as skills above: same slug rules, same `is_global` ∪
+# join scoping (D47), same row helpers. An MCP server and a skill are both library
+# items a project selects, and H8 will have a skill declare its own servers — so the
+# two must not drift apart.
+#
+# SECRETS (A7): `env` holds non-secret literals only; a credential is NAMED in
+# `env_from` (stdio) or `api_key_name` (remote) and its value read from the
+# environment at spawn. No row here ever contains a secret.
+
+MCP_TRANSPORTS = ("stdio", "sse", "http")
+
+
+def _unique_mcp_slug(conn, base: str, exclude_id: str | None = None) -> str:
+    base = validate_skill_slug(base)
+    candidate, suffix = base, 2
+    while True:
+        row = conn.execute("select id from mcp_servers where slug = ?", (candidate,)).fetchone()
+        if row is None or row["id"] == exclude_id:
+            return candidate
+        candidate = validate_skill_slug(f"{base[:74]}-{suffix}")
+        suffix += 1
+
+
+def _normalize_mcp_server(row: dict) -> dict:
+    row["is_global"] = bool(row.get("is_global"))
+    row["enabled"] = bool(row.get("enabled"))
+    for key, empty in (("args", []), ("env_from", []), ("env", {})):
+        try:
+            row[key] = json.loads(row.get(key) or "null")
+        except (TypeError, ValueError):
+            row[key] = None
+        if row[key] is None:
+            row[key] = empty
+    return row
+
+
+def _mcp_server_row(conn, server_id: str) -> dict | None:
+    row = conn.execute("select * from mcp_servers where id = ?", (server_id,)).fetchone()
+    if not row:
+        return None
+    data = _normalize_mcp_server(row_to_dict(row))
+    data["project_ids"] = [
+        r["project_id"]
+        for r in conn.execute(
+            "select project_id from mcp_server_projects where mcp_server_id = ? order by project_id",
+            (server_id,),
+        ).fetchall()
+    ]
+    return data
+
+
+# A stored `env` value is persisted in plain text and travels on `LeaConfig`, which
+# promises to be "safe to log or serialize". A credential therefore belongs in
+# `env_from` (a NAME, resolved from the environment at spawn), never here.
+SECRET_ENV_NAME_RE = re.compile(r"_(API_KEY|KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS?)$", re.I)
+
+
+def _validate_mcp_env(env: dict | None) -> None:
+    """Refuse secret-shaped `env` entries at SAVE time (A7), while the user is still
+    looking at the field — rather than at run time, or never."""
+    for key in (env or {}):
+        if SECRET_ENV_NAME_RE.search(str(key)):
+            raise ValueError(
+                f"{key} looks like a credential, so it can't be stored here. "
+                f"Save the value under Settings → API keys and list the NAME "
+                f"'{key}' in 'Pass through from environment' instead."
+            )
+
+
+def _validate_mcp_fields(transport: str, command: str | None, url: str | None) -> None:
+    """Shape rules shared by create and update. Mirrors the UI's own validation so a
+    direct API call can't store a server the form would have rejected."""
+    if transport not in MCP_TRANSPORTS:
+        raise ValueError(f"Transport must be one of: {', '.join(MCP_TRANSPORTS)}.")
+    if transport == "stdio":
+        if not (command or "").strip():
+            raise ValueError("A stdio server needs a command.")
+        if " " in command.strip():
+            raise ValueError(
+                "Command must be a single executable — put parameters in Arguments."
+            )
+    elif not (url or "").strip():
+        raise ValueError(f"A {transport} server needs a URL.")
+
+
+def create_mcp_server(
+    name: str,
+    transport: str = "stdio",
+    command: str | None = None,
+    args: list[str] | None = None,
+    env: dict | None = None,
+    env_from: list[str] | None = None,
+    url: str | None = None,
+    api_key_name: str | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Insert an MCP server row. Raises ValueError on any shape problem (the route
+    turns it into a 400) — a malformed server must fail at save, while the user is
+    still looking at the field, not at run time."""
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Server name is required.")
+    _validate_mcp_fields(transport, command, url)
+    _validate_mcp_env(env)
+    now, server_id = utc_now(), str(uuid4())
+    with connect() as conn:
+        slug = _unique_mcp_slug(conn, slugify_skill(clean_name))
+        conn.execute(
+            """
+            insert into mcp_servers
+                (id, name, slug, transport, command, args, env, env_from, url,
+                 api_key_name, enabled, is_global, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (
+                server_id, clean_name, slug, transport,
+                (command or "").strip() or None,
+                json.dumps(list(args or [])),
+                json.dumps(dict(env or {})),
+                json.dumps(list(env_from or [])),
+                (url or "").strip() or None,
+                (api_key_name or "").strip() or None,
+                1 if enabled else 0,
+                now, now,
+            ),
+        )
+        return _mcp_server_row(conn, server_id)
+
+
+def get_mcp_server(server_id: str) -> dict | None:
+    with connect() as conn:
+        return _mcp_server_row(conn, server_id)
+
+
+def list_mcp_servers() -> list[dict]:
+    with connect() as conn:
+        ids = [
+            r["id"] for r in conn.execute(
+                "select id from mcp_servers order by updated_at desc, name asc"
+            ).fetchall()
+        ]
+        return [_mcp_server_row(conn, sid) for sid in ids]
+
+
+def update_mcp_server(server_id: str, **fields) -> dict | None:
+    """Update editable fields; pass a field as None to leave it untouched. The slug is
+    stable and never changes. Returns the updated row, or None if the id is unknown."""
+    with connect() as conn:
+        current = _mcp_server_row(conn, server_id)
+        if current is None:
+            return None
+        merged = {k: (fields[k] if fields.get(k) is not None else current[k])
+                  for k in ("name", "transport", "command", "args", "env", "env_from",
+                            "url", "api_key_name")}
+        enabled = fields.get("enabled")
+        merged["enabled"] = current["enabled"] if enabled is None else bool(enabled)
+        if not str(merged["name"] or "").strip():
+            raise ValueError("Server name is required.")
+        _validate_mcp_fields(merged["transport"], merged["command"], merged["url"])
+        _validate_mcp_env(merged["env"])
+        conn.execute(
+            """
+            update mcp_servers
+               set name = ?, transport = ?, command = ?, args = ?, env = ?, env_from = ?,
+                   url = ?, api_key_name = ?, enabled = ?, updated_at = ?
+             where id = ?
+            """,
+            (
+                str(merged["name"]).strip(), merged["transport"],
+                (merged["command"] or "").strip() or None,
+                json.dumps(list(merged["args"] or [])),
+                json.dumps(dict(merged["env"] or {})),
+                json.dumps(list(merged["env_from"] or [])),
+                (merged["url"] or "").strip() or None,
+                (merged["api_key_name"] or "").strip() or None,
+                1 if merged["enabled"] else 0,
+                utc_now(), server_id,
+            ),
+        )
+        return _mcp_server_row(conn, server_id)
+
+
+def set_mcp_server_assignment(
+    server_id: str, is_global: bool, project_ids: list[str] | None = None
+) -> dict | None:
+    """Set a server's scope (D47) — the exact counterpart of `set_skill_assignment`."""
+    ids = list(dict.fromkeys(project_ids or []))
+    with connect() as conn:
+        if not conn.execute("select 1 from mcp_servers where id = ?", (server_id,)).fetchone():
+            return None
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            known = {
+                r["id"] for r in conn.execute(
+                    f"select id from projects where id in ({marks})", ids
+                ).fetchall()
+            }
+            missing = [pid for pid in ids if pid not in known]
+            if missing:
+                raise ValueError(f"Unknown project id(s): {', '.join(missing)}")
+        conn.execute("delete from mcp_server_projects where mcp_server_id = ?", (server_id,))
+        for project_id in ids:
+            conn.execute(
+                "insert into mcp_server_projects (mcp_server_id, project_id) values (?, ?)",
+                (server_id, project_id),
+            )
+        conn.execute(
+            "update mcp_servers set is_global = ?, updated_at = ? where id = ?",
+            (1 if is_global else 0, utc_now(), server_id),
+        )
+        return _mcp_server_row(conn, server_id)
+
+
+def delete_mcp_server(server_id: str) -> bool:
+    with connect() as conn:
+        if not conn.execute("select 1 from mcp_servers where id = ?", (server_id,)).fetchone():
+            return False
+        conn.execute("delete from mcp_server_projects where mcp_server_id = ?", (server_id,))
+        conn.execute("delete from mcp_servers where id = ?", (server_id,))
+    return True
+
+
+def mcp_servers_for_project(project_id: str | None) -> list[dict]:
+    """The ENABLED servers that resolve for a run: global ∪ assigned (D47).
+
+    A loose (project-less) session resolves to the global ones only — deliberately
+    unlike skills, which resolve to nothing without a project. A machine-level server
+    the user turned on should work in a scratch session too; E0e's `/mcp` is what will
+    let a session refine this.
+    """
+    with connect() as conn:
+        if project_id is None:
+            rows = conn.execute(
+                "select id from mcp_servers where enabled = 1 and is_global = 1 "
+                "order by updated_at desc, name asc"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                select id from mcp_servers
+                 where enabled = 1
+                   and (is_global = 1
+                        or id in (select mcp_server_id from mcp_server_projects
+                                   where project_id = ?))
+                 order by updated_at desc, name asc
+                """,
+                (project_id,),
+            ).fetchall()
+        return [_mcp_server_row(conn, r["id"]) for r in rows]
+
+
+# --- user-authored sub-agent roles (v2.5 B2) -----------------------------------
+# The Sub-agents page could previously only retune the two roles vendored inside the
+# prover. These rows are the user's own, materialized to YAML at run start and handed
+# to the prover as a directory (`LeaConfig.agent_dirs`) — the same "rows in, files out"
+# shape skills already use, which is what keeps the prover ignorant of the database.
+#
+# Global by design: a role is a way of working, not a resource a project owns.
+
+
+def create_agent_role(
+    name: str,
+    system_prompt: str,
+    description: str | None = None,
+    model: str | None = None,
+    tools: list[str] | None = None,
+    max_turns: int | None = None,
+    reserved_names: set[str] | None = None,
+    authoring: dict | None = None,
+) -> dict:
+    """Insert a user role. `reserved_names` are the vendored role names — a collision is
+    refused rather than allowed to shadow, because two roles answering to one name makes
+    "which one ran?" unanswerable."""
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Role name is required.")
+    # C2: the guided fields compile into the role head, and `when_to_use` becomes the
+    # description B1 lists in the coordinator's enum — so writing "when to use this" and
+    # making the coordinator choose correctly are one act.
+    if not _authoring.is_empty(authoring):
+        system_prompt = _authoring.compile_text(authoring)
+        description = _authoring.short_description(authoring, description)
+    if not str(system_prompt or "").strip():
+        raise ValueError("A role needs instructions — that is what makes it a role.")
+    if max_turns is not None and (not isinstance(max_turns, int) or max_turns < 1):
+        raise ValueError("Max turns must be a positive whole number.")
+    slug = slugify_skill(clean_name)
+    if reserved_names and slug in reserved_names:
+        raise ValueError(
+            f"“{slug}” is a built-in role. Pick a different name — you can retune the "
+            f"built-in one instead."
+        )
+    now, role_id = utc_now(), str(uuid4())
+    with connect() as conn:
+        if conn.execute("select 1 from agent_roles where slug = ?", (slug,)).fetchone():
+            raise ValueError(f"A role called “{slug}” already exists.")
+        conn.execute(
+            """
+            insert into agent_roles
+                (id, name, slug, description, system_prompt, model, tools, max_turns,
+                 authoring, created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (role_id, clean_name, slug, (description or "").strip() or None,
+             str(system_prompt).strip(), (model or "").strip() or None,
+             json.dumps(list(tools)) if tools else None, max_turns,
+             _authoring.dumps(authoring), now, now),
+        )
+        return _agent_role_row(conn, role_id)
+
+
+def _agent_role_row(conn, role_id: str) -> dict | None:
+    row = conn.execute("select * from agent_roles where id = ?", (role_id,)).fetchone()
+    if not row:
+        return None
+    data = row_to_dict(row)
+    try:
+        data["tools"] = json.loads(data["tools"]) if data["tools"] else None
+    except (TypeError, ValueError):
+        data["tools"] = None
+    data["authoring_raw"] = data.get("authoring")
+    data["authoring"] = _authoring.loads(data.get("authoring"))
+    return data
+
+
+def get_agent_role(role_id: str) -> dict | None:
+    with connect() as conn:
+        return _agent_role_row(conn, role_id)
+
+
+def list_agent_roles() -> list[dict]:
+    with connect() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "select id from agent_roles order by updated_at desc, name asc").fetchall()]
+        return [_agent_role_row(conn, rid) for rid in ids]
+
+
+def update_agent_role(role_id: str, **fields) -> dict | None:
+    """Update a user role. The slug is stable — renaming the display name must not change
+    the identity the coordinator was offered mid-conversation."""
+    with connect() as conn:
+        current = _agent_role_row(conn, role_id)
+        if current is None:
+            return None
+        merged = {k: (fields[k] if fields.get(k) is not None else current[k])
+                  for k in ("name", "description", "system_prompt", "model", "tools",
+                            "max_turns")}
+        authoring = fields.get("authoring")
+        if authoring is not None and not _authoring.is_empty(authoring):
+            merged["system_prompt"] = _authoring.compile_text(authoring)
+            merged["description"] = _authoring.short_description(
+                authoring, merged.get("description"))
+        if not str(merged["name"] or "").strip():
+            raise ValueError("Role name is required.")
+        if not str(merged["system_prompt"] or "").strip():
+            raise ValueError("A role needs instructions — that is what makes it a role.")
+        mt = merged["max_turns"]
+        if mt is not None and (not isinstance(mt, int) or mt < 1):
+            raise ValueError("Max turns must be a positive whole number.")
+        conn.execute(
+            """
+            update agent_roles
+               set name = ?, description = ?, system_prompt = ?, model = ?, tools = ?,
+                   max_turns = ?, authoring = ?, updated_at = ?
+             where id = ?
+            """,
+            (str(merged["name"]).strip(), (merged["description"] or "").strip() or None,
+             str(merged["system_prompt"]).strip(), (merged["model"] or "").strip() or None,
+             json.dumps(list(merged["tools"])) if merged["tools"] else None,
+             mt,
+             current["authoring_raw"] if authoring is None else _authoring.dumps(authoring),
+             utc_now(), role_id),
+        )
+        return _agent_role_row(conn, role_id)
+
+
+def delete_agent_role(role_id: str) -> bool:
+    with connect() as conn:
+        if not conn.execute("select 1 from agent_roles where id = ?", (role_id,)).fetchone():
+            return False
+        conn.execute("delete from agent_roles where id = ?", (role_id,))
+    return True
+
+
+# --- declarative HTTP tools (v2.5 F1) ------------------------------------------
+# A REST endpoint as a tool. Same library shape as skills and MCP servers, and the same
+# secret rule: `auth_key_name` NAMES a key, the value is read at call time.
+
+CUSTOM_TOOL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+
+
+def _normalize_custom_tool(row: dict) -> dict:
+    row["is_global"] = bool(row.get("is_global"))
+    row["enabled"] = bool(row.get("enabled"))
+    row["authoring"] = _authoring.loads(row.get("authoring"))
+    for key, empty in (("params", {}), ("headers", {})):
+        try:
+            row[key] = json.loads(row.get(key) or "null") or empty
+        except (TypeError, ValueError):
+            row[key] = empty
+    return row
+
+
+def _custom_tool_row(conn, tool_id: str) -> dict | None:
+    row = conn.execute("select * from custom_tools where id = ?", (tool_id,)).fetchone()
+    if not row:
+        return None
+    data = _normalize_custom_tool(row_to_dict(row))
+    data["project_ids"] = [
+        r["project_id"] for r in conn.execute(
+            "select project_id from custom_tool_projects where custom_tool_id = ? "
+            "order by project_id", (tool_id,)).fetchall()
+    ]
+    return data
+
+
+def _validate_custom_tool(name: str, url: str, method: str) -> None:
+    """Save-time validation (G6). The URL rules mirror the prover's own `check_url`, so a
+    tool cannot be SAVED pointing somewhere it would be refused at call time — failing
+    here, while the user is looking at the field, beats failing mid-proof."""
+    if not str(name or "").strip():
+        raise ValueError("The tool needs a name.")
+    if method not in CUSTOM_TOOL_METHODS:
+        raise ValueError(f"Method must be one of: {', '.join(CUSTOM_TOOL_METHODS)}.")
+    from lea.http_tools import UrlRefused, check_url
+
+    # Placeholders are substituted at call time; check the template with them removed.
+    probe = re.sub(r"\{[^}]*\}", "x", str(url or ""))
+    try:
+        check_url(probe)
+    except UrlRefused as exc:
+        raise ValueError(str(exc)) from None
+
+
+def create_custom_tool(name: str, url: str, description: str = "", method: str = "GET",
+                       params: dict | None = None, headers: dict | None = None,
+                       auth_key_name: str | None = None, auth_header: str | None = None,
+                       timeout: int | None = None, enabled: bool = True,
+                       authoring: dict | None = None) -> dict:
+    method = str(method or "GET").upper()
+    if not _authoring.is_empty(authoring):
+        description = _authoring.compile_text(authoring)
+    _validate_custom_tool(name, url, method)
+    _validate_mcp_env(headers)          # a header must not carry a secret either
+    now, tool_id = utc_now(), str(uuid4())
+    with connect() as conn:
+        slug = slugify_skill(str(name).strip())
+        if conn.execute("select 1 from custom_tools where slug = ?", (slug,)).fetchone():
+            raise ValueError(f"A tool called “{slug}” already exists.")
+        conn.execute(
+            """
+            insert into custom_tools
+                (id, name, slug, description, authoring, method, url, params, headers,
+                 auth_key_name, auth_header, timeout, enabled, is_global,
+                 created_at, updated_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (tool_id, str(name).strip(), slug, str(description or ""),
+             _authoring.dumps(authoring), method, str(url).strip(),
+             json.dumps(params or {}), json.dumps(headers or {}),
+             (auth_key_name or "").strip() or None, (auth_header or "").strip() or None,
+             timeout, 1 if enabled else 0, now, now),
+        )
+        return _custom_tool_row(conn, tool_id)
+
+
+def list_custom_tools() -> list[dict]:
+    with connect() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "select id from custom_tools order by updated_at desc, name asc").fetchall()]
+        return [_custom_tool_row(conn, t) for t in ids]
+
+
+def get_custom_tool(tool_id: str) -> dict | None:
+    with connect() as conn:
+        return _custom_tool_row(conn, tool_id)
+
+
+def set_custom_tool_assignment(tool_id: str, is_global: bool,
+                               project_ids: list[str] | None = None) -> dict | None:
+    ids = list(dict.fromkeys(project_ids or []))
+    with connect() as conn:
+        if not conn.execute("select 1 from custom_tools where id = ?", (tool_id,)).fetchone():
+            return None
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            known = {r["id"] for r in conn.execute(
+                f"select id from projects where id in ({marks})", ids).fetchall()}
+            missing = [p for p in ids if p not in known]
+            if missing:
+                raise ValueError(f"Unknown project id(s): {', '.join(missing)}")
+        conn.execute("delete from custom_tool_projects where custom_tool_id = ?", (tool_id,))
+        for project_id in ids:
+            conn.execute("insert into custom_tool_projects (custom_tool_id, project_id) "
+                         "values (?, ?)", (tool_id, project_id))
+        conn.execute("update custom_tools set is_global = ?, updated_at = ? where id = ?",
+                     (1 if is_global else 0, utc_now(), tool_id))
+        return _custom_tool_row(conn, tool_id)
+
+
+def delete_custom_tool(tool_id: str) -> bool:
+    with connect() as conn:
+        if not conn.execute("select 1 from custom_tools where id = ?", (tool_id,)).fetchone():
+            return False
+        conn.execute("delete from custom_tool_projects where custom_tool_id = ?", (tool_id,))
+        conn.execute("delete from custom_tools where id = ?", (tool_id,))
+    return True
+
+
+def custom_tool_specs(project_id: str | None) -> list[dict]:
+    """Resolved tools as the prover's `cfg.http_tools` list. Same global ∪ assigned rule
+    as everything else; secrets absent by construction (`auth_key_name` is a NAME)."""
+    with connect() as conn:
+        if project_id is None:
+            rows = conn.execute("select id from custom_tools where enabled = 1 and "
+                                "is_global = 1 order by name").fetchall()
+        else:
+            rows = conn.execute(
+                "select id from custom_tools where enabled = 1 and (is_global = 1 or id in "
+                "(select custom_tool_id from custom_tool_projects where project_id = ?)) "
+                "order by name", (project_id,)).fetchall()
+        out = []
+        for r in rows:
+            t = _custom_tool_row(conn, r["id"])
+            out.append({
+                "name": t["slug"], "description": t["description"], "method": t["method"],
+                "url": t["url"], "input_schema": t["params"] or {"type": "object", "properties": {}},
+                "headers": t["headers"], "auth_key_name": t["auth_key_name"],
+                "auth_header": t["auth_header"], "timeout": t["timeout"],
+            })
+        return out
+
+
+# --- per-session skill / MCP overrides (v2.5 E0e) ------------------------------
+# The session tier. A project picks skills and MCP servers for all its sessions; a
+# session may then add or drop either for itself. What is STORED is the diff (`add` / `remove`), so a
+# later project-level change still reaches existing sessions — see the 0012 revision.
+
+SKILL_MCP_KINDS = ("skill", "mcp_server")
+
+
+def set_session_skill_mcp(
+    session_id: str, kind: str, item_id: str, action: str | None
+) -> None:
+    """Record (or clear) one session-level override.
+
+    `action` is 'add', 'remove', or None to delete the override entirely — which is what
+    "put it back the way the project has it" means, and why this is a diff rather than a
+    stored list.
+    """
+    if kind not in SKILL_MCP_KINDS:
+        raise ValueError(f"kind must be one of: {', '.join(SKILL_MCP_KINDS)}.")
+    if action not in ("add", "remove", None):
+        raise ValueError("action must be 'add', 'remove', or null.")
+    with connect() as conn:
+        if not conn.execute("select 1 from sessions where id = ?", (session_id,)).fetchone():
+            raise ValueError("Unknown session.")
+        conn.execute(
+            "delete from session_skill_mcp_overrides where session_id = ? and kind = ? "
+            "and item_id = ?",
+            (session_id, kind, item_id),
+        )
+        if action is not None:
+            conn.execute(
+                "insert into session_skill_mcp_overrides "
+                "(session_id, kind, item_id, action, created_at) values (?, ?, ?, ?, ?)",
+                (session_id, kind, item_id, action, utc_now()),
+            )
+
+
+def session_skill_mcp_overrides(session_id: str | None, kind: str) -> dict[str, str]:
+    """`{item_id: 'add' | 'remove'}` for one session and kind. Empty when no session."""
+    if not session_id:
+        return {}
+    with connect() as conn:
+        return {
+            r["item_id"]: r["action"]
+            for r in conn.execute(
+                "select item_id, action from session_skill_mcp_overrides "
+                "where session_id = ? and kind = ?",
+                (session_id, kind),
+            ).fetchall()
+        }
+
+
+def _apply_overrides(base: list[dict], everything: list[dict], overrides: dict[str, str]) -> list[dict]:
+    """base ± the session's diff. An override naming an item that no longer exists is
+    silently dropped (it was deleted from the library) rather than raising."""
+    by_id = {item["id"]: item for item in everything}
+    kept = [item for item in base if overrides.get(item["id"]) != "remove"]
+    have = {item["id"] for item in kept}
+    for item_id, action in overrides.items():
+        if action == "add" and item_id not in have and item_id in by_id:
+            kept.append(by_id[item_id])
+    return kept
+
+
+def _global_skills() -> list[dict]:
+    with connect() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "select id from skills where is_global = 1 order by updated_at desc, name asc"
+        ).fetchall()]
+        return [_skill_row(conn, sid) for sid in ids]
+
+
+def matches_triggers(skill: dict, text: str | None) -> bool:
+    """True when a skill should apply to a run with this message (H9).
+
+    No triggers → always on, which is every existing skill. With triggers, a whole-word
+    match against the task text. Substring matching would fire "ring" on "bringing";
+    whole-word keeps a keyword list something a mathematician can reason about.
+    """
+    triggers = skill.get("triggers") or []
+    if not triggers:
+        return True
+    haystack = (text or "").lower()
+    return any(re.search(rf"\b{re.escape(str(t).lower())}\b", haystack) for t in triggers)
+
+
+def skills_for_run(project_id: str | None, session_id: str | None = None,
+                   task: str | None = None) -> list[dict]:
+    """The skills a run actually gets: (global ∪ project-assigned) ± the session's diff.
+
+    A LOOSE session gets the GLOBAL skills — "global" has to mean global, or the word is
+    a lie. D47 originally resolved a project-less session to nothing at all, which made a
+    skill unusable outside a project and left no way to opt one in; E0e's diff added the
+    opt-in, and this makes the inherited half consistent with how MCP servers already
+    resolve.
+    """
+    base = skills_for_project(project_id) if project_id else _global_skills()
+    overrides = session_skill_mcp_overrides(session_id, "skill")
+    resolved = base if not overrides else _apply_overrides(base, list_skills(), overrides)
+    # A skill a session opted into explicitly is wanted regardless of keywords — the user
+    # asking for it is a stronger signal than any trigger list.
+    forced = {k for k, v in overrides.items() if v == "add"}
+    return [s for s in resolved if s["id"] in forced or matches_triggers(s, task)]
+
+
+def mcp_servers_for_run(project_id: str | None, session_id: str | None = None) -> list[dict]:
+    """The MCP servers a run actually gets: resolved set ± the session's diff. A session
+    can only add a server that is ENABLED — turning one off in the Library is a global
+    "stop using this", which a per-session opt-in must not quietly override."""
+    base = mcp_servers_for_project(project_id)
+    overrides = session_skill_mcp_overrides(session_id, "mcp_server")
+    if not overrides:
+        return base
+    enabled = [s for s in list_mcp_servers() if s["enabled"]]
+    return _apply_overrides(base, enabled, overrides)
+
+
+def mcp_key_requirements() -> dict[str, list[str]]:
+    """`{ENV_VAR_NAME: [server slug, ...]}` — which saved keys each server depends on
+    (v2.5 D1).
+
+    Nothing new is declared: `env_from` (stdio) and `api_key_name` (remote) already NAME
+    the credentials a server needs, precisely so the value never has to be stored. This
+    just reads that declaration back, which is what lets the UI say "this needs a key you
+    haven't saved" before enabling, and "clearing this breaks 2 servers" before deleting.
+    """
+    needs: dict[str, list[str]] = {}
+    for row in list_mcp_servers():
+        declared = list(row.get("env_from") or [])
+        if row.get("api_key_name"):
+            declared.append(row["api_key_name"])
+        for name in declared:
+            needs.setdefault(str(name), []).append(row["slug"])
+    return needs
+
+
+def mcp_server_specs(project_id: str | None, session_id: str | None = None) -> dict[str, dict]:
+    """Resolved servers as the prover's `cfg.mcp_servers` mapping (A1).
+
+    Resolution is (global ∪ project-assigned) ± the session's own diff (E0e), so this is
+    the single place the two tiers combine. Emits only what `lea.mcp` reads, keyed by slug
+    so a rename can't change a running server's identity. Secrets are absent by construction: `env` carries literals and
+    `env_from` carries NAMES whose values `_child_env` reads at spawn.
+    """
+    specs: dict[str, dict] = {}
+    for row in mcp_servers_for_run(project_id, session_id):
+        if row["transport"] == "stdio":
+            spec = {"command": row["command"], "args": row["args"]}
+            if row["env"]:
+                spec["env"] = row["env"]
+            if row["env_from"]:
+                spec["env_from"] = row["env_from"]
+        else:
+            spec = {"url": row["url"]}
+            if row["transport"] == "sse":
+                spec["transport"] = "sse"
+            if row["api_key_name"]:
+                # The NAME travels; `bridge` resolves the value into a header at spawn.
+                spec["api_key_name"] = row["api_key_name"]
+        specs[row["slug"]] = spec
+    return specs
 
 
 def update_run(
