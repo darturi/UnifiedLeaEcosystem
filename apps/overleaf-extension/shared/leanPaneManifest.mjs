@@ -8,6 +8,7 @@ import {
   skipInlineWhitespace,
   stripLeaTargetText
 } from "../extension/targetParserCore.mjs";
+import { associateProofSources, buildFormalizationSourceBundle } from "./proofSource.mjs";
 
 // Used only as a display-kind fallback (leanKindFor) when an environment has
 // no validated target -- e.g. a malformed or mismatched marker. Custom
@@ -77,12 +78,27 @@ export function buildLeanPaneManifest({
     });
   }
 
+  const proofSources = associateProofSources({ targets: items, files: normalizedFiles });
+
   return {
     ok: true,
     generatedAt: new Date().toISOString(),
     rootFile: "",
-    items,
-    diagnostics
+    items: proofSources.targets.map((item) => {
+      const sourceBundle = buildFormalizationSourceBundle(item, {
+        targetContext: item.targetContext,
+        targetUses: item.targetUses
+      });
+      return {
+        ...item,
+        sourceBundle,
+        formalizationInputHash: sourceBundle.sourceIdentityHash || sourceBundle.bundleHash
+      };
+    }),
+    diagnostics: [
+      ...diagnostics,
+      ...proofSources.diagnostics.filter((diagnostic) => diagnostic.code !== "missing_source_proof")
+    ]
   };
 }
 

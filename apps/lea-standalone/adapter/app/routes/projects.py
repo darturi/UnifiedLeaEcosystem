@@ -875,9 +875,17 @@ def retire_project_artifact_by_slug(slug: str, request: ArtifactRetireRequest) -
             status_code=422,
             detail="That path is not a recorded proof artifact for this project.",
         )
-    absolute.unlink()
+    # A code step can be SQL-owned while its materialized project file is still
+    # untracked (for example after importing legacy state or a tool that wrote
+    # outside the normal FileChanged commit path). Commit the exact bytes at this
+    # path before deleting them. This is a no-op for an already tracked, clean
+    # artifact, is path-scoped for concurrent project writers, and guarantees the
+    # following deletion has a Git object to stage and a revision to restore from.
+    gs = GitStore(repo.parent)
     try:
-        sha = GitStore(repo.parent).commit_all(repo, f"retire {rel} for retry", paths=[rel])
+        gs.commit_all(repo, f"record {rel} before retry retirement", paths=[rel])
+        absolute.unlink()
+        sha = gs.commit_all(repo, f"retire {rel} for retry", paths=[rel])
     except GitStoreError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     return {"retire_commit": sha, "path": rel}

@@ -923,6 +923,36 @@ def test_artifact_retire_and_restore_round_trip_through_git(tmp_path, monkeypatc
     assert proof.read_text().startswith("theorem cauchy_bound")
 
 
+def test_artifact_retire_first_records_an_untracked_sql_owned_file(tmp_path, monkeypatch):
+    """Retiring an indexed but untracked materialization must not unlink it and
+    then fail `git add` before a restore token can be returned."""
+    proofs = _setup(tmp_path, monkeypatch)
+    project = projects_route.create_project(ProjectCreate(title="Analysis"))
+    repo = proofs / "Lea" / "Analysis"
+    proof = repo / "untracked.lean"
+    content = "theorem untracked : True := by\n  trivial\n"
+    proof.write_text(content)
+    session = store.create_session("prove", project_id=project["id"])
+    run = store.create_run(session["id"], "m", None, 3, project_id=project["id"])
+    store.upsert_artifact(
+        project_id=project["id"], session_id=session["id"], run_id=run["id"],
+        declaration_name="untracked", kind="proof", path="untracked.lean",
+        module_name="Lea.Analysis.untracked",
+    )
+
+    retired = projects_route.retire_project_artifact_by_slug(
+        project["slug"], projects_route.ArtifactRetireRequest(path="untracked.lean")
+    )
+    assert not proof.exists()
+    restored = projects_route.restore_project_artifact_by_slug(
+        project["slug"], projects_route.ArtifactRestoreRequest(
+            path="untracked.lean", retire_commit=retired["retire_commit"],
+        ),
+    )
+    assert restored["restored"] is True
+    assert proof.read_text() == content
+
+
 def test_artifact_restore_prefers_verified_sql_snapshot(tmp_path, monkeypatch):
     """Agent proof bytes live in the timeline, even when project Git never saw
     that version. A failed retry must restore those exact verified bytes."""

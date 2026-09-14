@@ -345,6 +345,37 @@ export function syncProjectFormalizationTargetsBySlug({ fetchImpl, baseUrl, slug
   });
 }
 
+export function startAlignmentCheck({
+  fetchImpl, baseUrl, formalizationId, sourceBundle, trigger = "manual", solverRunId = null
+}) {
+  return fetchJson(
+    fetchImpl,
+    `${baseUrl}/api/formalizations/${encodeURIComponent(formalizationId)}/alignment-checks`,
+    {
+      method: "POST",
+      headers: buildHeaders(null, { "Content-Type": "application/json" }),
+      body: JSON.stringify({ source_bundle: sourceBundle, trigger, solver_run_id: solverRunId })
+    }
+  );
+}
+
+export function fetchCurrentAlignmentCheck({ fetchImpl, baseUrl, formalizationId, sourceBundleHash = "" }) {
+  const query = sourceBundleHash ? `?source_bundle_hash=${encodeURIComponent(sourceBundleHash)}` : "";
+  return fetchJson(
+    fetchImpl,
+    `${baseUrl}/api/formalizations/${encodeURIComponent(formalizationId)}/alignment-checks/current${query}`,
+    { method: "GET", headers: buildHeaders(null) }
+  );
+}
+
+export function retryAlignmentCheck({ fetchImpl, baseUrl, checkId }) {
+  return fetchJson(
+    fetchImpl,
+    `${baseUrl}/api/alignment-checks/${encodeURIComponent(checkId)}/retry`,
+    { method: "POST", headers: buildHeaders(null) }
+  );
+}
+
 // Pull `filename="…"` out of a Content-Disposition header (the adapter always
 // quotes it). Exported for tests.
 export function filenameFromContentDisposition(header) {
@@ -401,6 +432,7 @@ export async function startApiRun({
   focusFormalizationId = null,
   focusSourceHash = null,
   newFormalization = null,
+  purpose = "general",
 }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
@@ -416,7 +448,7 @@ export async function startApiRun({
   // `origin` / `originUrl` record session providence: 'overleaf' + the canonical
   // Overleaf document URL, so the Lea UI can show an origin indicator and open/focus
   // the source document. Independent of the project usage-namespace above.
-  const body = { message, autonomous };
+  const body = { message, autonomous, purpose };
   if (sessionId) body.session_id = sessionId;
   if (projectSlug) {
     body.project_slug = projectSlug;
@@ -580,6 +612,8 @@ export async function streamApiRun({
   let doneStatus = null;
   let resultKind = null;
   let resultDetail = null;
+  let stopReason = null;
+  let recoverable = false;
   let runError = null;
   let buffer = "";
 
@@ -599,6 +633,8 @@ export async function streamApiRun({
       doneStatus = String(data?.status || "").toLowerCase();
       resultKind = String(data?.result_kind || doneStatus || "").toLowerCase() || null;
       resultDetail = typeof data?.result_detail === "string" ? data.result_detail : null;
+      stopReason = typeof data?.stop_reason === "string" ? data.stop_reason : null;
+      recoverable = data?.recoverable === true;
     }
   };
 
@@ -624,6 +660,8 @@ export async function streamApiRun({
     doneStatus,
     resultKind,
     resultDetail,
+    stopReason,
+    recoverable,
     error: ok ? null : (runError || (doneStatus ? `Lea run ended with status: ${doneStatus}` : "Lea run ended without a terminal status.")),
   };
 }
@@ -708,6 +746,7 @@ export async function runApiProofJob({
   focusFormalizationId = null,
   focusSourceHash = null,
   newFormalization = null,
+  purpose = "general",
   appendLog = null,
   logPath = null,
   onEvent = null,
@@ -733,6 +772,7 @@ export async function runApiProofJob({
     focusFormalizationId,
     focusSourceHash,
     newFormalization,
+    purpose,
   });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
@@ -797,6 +837,8 @@ export async function runApiProofJob({
           doneStatus: rowStatus,
           resultKind: String(row.result_kind || rowStatus).toLowerCase() || null,
           resultDetail: typeof row.result_detail === "string" ? row.result_detail : null,
+          stopReason: typeof row.stop_reason === "string" ? row.stop_reason : null,
+          recoverable: row.recoverable === true || row.recoverable === 1,
           error: ok ? null : `Lea run ended with status: ${rowStatus}`,
         };
         break;
@@ -839,6 +881,8 @@ export async function runApiProofJob({
       doneStatus: outcome?.doneStatus || null,
       resultKind: outcome?.resultKind || null,
       resultDetail: outcome?.resultDetail || null,
+      stopReason: outcome?.stopReason || "timeout",
+      recoverable: true,
       formalizationId: start.body?.focus_formalization_id || start.body?.formalization?.id || null,
       error: "Lea adapter run timed out.",
       ...usage,
@@ -852,6 +896,8 @@ export async function runApiProofJob({
     doneStatus: outcome.doneStatus,
     resultKind: outcome.resultKind || null,
     resultDetail: outcome.resultDetail || null,
+    stopReason: outcome.stopReason || null,
+    recoverable: outcome.recoverable === true,
     formalizationId: start.body?.focus_formalization_id || start.body?.formalization?.id || null,
     error: outcome.ok ? undefined : outcome.error,
     ...usage,

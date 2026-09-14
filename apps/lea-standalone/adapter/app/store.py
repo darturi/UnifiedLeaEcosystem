@@ -343,6 +343,7 @@ def create_run(
     autonomous: bool = False,
     focus_formalization_id: str | None = None,
     focus_source_hash: str | None = None,
+    purpose: str = "general",
 ) -> dict:
     now = utc_now()
     run_id = str(uuid4())
@@ -351,14 +352,14 @@ def create_run(
             """
             insert into runs (
                 id, session_id, project_id, status, autonomous, model, provider,
-                max_turns, focus_formalization_id, focus_source_hash, created_at, updated_at
+                max_turns, focus_formalization_id, focus_source_hash, purpose, created_at, updated_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, session_id, project_id, "pending",
                 1 if autonomous else 0, model, provider, max_turns,
-                focus_formalization_id, focus_source_hash, now, now,
+                focus_formalization_id, focus_source_hash, purpose, now, now,
             ),
         )
         row = conn.execute("select * from runs where id = ?", (run_id,)).fetchone()
@@ -642,6 +643,7 @@ def create_run_bundle(
     focus_formalization_id: str | None = None,
     focus_source_hash: str | None = None,
     new_formalization: dict | None = None,
+    purpose: str = "general",
 ) -> dict:
     """Atomically create/resolve the conversation scope, run, and user message."""
     if focus_formalization_id and new_formalization:
@@ -778,14 +780,14 @@ def create_run_bundle(
             """
             insert into runs (
                 id, session_id, project_id, status, autonomous, model, provider,
-                max_turns, focus_formalization_id, focus_source_hash,
+                max_turns, focus_formalization_id, focus_source_hash, purpose,
                 created_at, updated_at
-            ) values (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
+            ) values (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id, session_id, project_id, 1 if autonomous else 0,
                 model, provider, max_turns, focus_formalization_id,
-                str(focus_source_hash or "").strip() or None, now, now,
+                str(focus_source_hash or "").strip() or None, purpose, now, now,
             ),
         )
         message_cursor = conn.execute(
@@ -1111,6 +1113,10 @@ def delete_project_cascade(project_id: str) -> bool:
             )
         if formalization_ids:
             form_marks = ",".join("?" for _ in formalization_ids)
+            conn.execute(
+                f"delete from alignment_checks where formalization_id in ({form_marks})",
+                formalization_ids,
+            )
             conn.execute(
                 f"delete from verification_events where formalization_id in ({form_marks})",
                 formalization_ids,
@@ -2185,6 +2191,8 @@ def update_run(
     cost_usd: float | None = None,
     result_kind: str | None = None,
     result_detail: str | None = None,
+    stop_reason: str | None = None,
+    recoverable: bool | None = None,
 ) -> None:
     now = utc_now()
     with connect() as conn:
@@ -2195,13 +2203,19 @@ def update_run(
                 final_text = coalesce(?, final_text),
                 result_kind = coalesce(?, result_kind),
                 result_detail = coalesce(?, result_detail),
+                stop_reason = coalesce(?, stop_reason),
+                recoverable = coalesce(?, recoverable),
                 input_tokens = coalesce(?, input_tokens),
                 output_tokens = coalesce(?, output_tokens),
                 cost_usd = coalesce(?, cost_usd),
                 updated_at = ?
             where id = ?
             """,
-            (status, final_text, result_kind, result_detail, input_tokens, output_tokens, cost_usd, now, run_id),
+            (
+                status, final_text, result_kind, result_detail, stop_reason,
+                None if recoverable is None else (1 if recoverable else 0),
+                input_tokens, output_tokens, cost_usd, now, run_id,
+            ),
         )
     _bump_sessions_changed()
 
@@ -3818,8 +3832,19 @@ def total_spend_usd() -> float:
     that through the full stats payload is both what made it wrong (above) and a
     heavy per-event query against a single-writer database."""
     with connect() as conn:
-        row = conn.execute("select coalesce(sum(cost_usd), 0) as cost_usd from runs").fetchone()
-    return float(row["cost_usd"] or 0)
+        solver = conn.execute(
+            "select coalesce(sum(cost_usd), 0) as cost_usd from runs"
+        ).fetchone()
+        has_alignment = conn.execute(
+            "select 1 from sqlite_master where type = 'table' and name = 'alignment_checks'"
+        ).fetchone()
+        evaluator_cost = 0.0
+        if has_alignment:
+            evaluator = conn.execute(
+                "select coalesce(sum(cost_usd), 0) as cost_usd from alignment_checks"
+            ).fetchone()
+            evaluator_cost = float(evaluator["cost_usd"] or 0)
+    return float(solver["cost_usd"] or 0) + evaluator_cost
 
 
 def global_usage() -> dict:
@@ -3830,10 +3855,12 @@ def global_usage() -> dict:
             select
                 (select count(*) from sessions) as session_count,
                 (select count(*) from timeline where kind != 'code') as message_count,
-                coalesce(sum(input_tokens), 0) as input_tokens,
-                coalesce(sum(output_tokens), 0) as output_tokens,
-                coalesce(sum(cost_usd), 0) as cost_usd
-            from runs
+                (select coalesce(sum(input_tokens), 0) from runs)
+                  + (select coalesce(sum(input_tokens), 0) from alignment_checks) as input_tokens,
+                (select coalesce(sum(output_tokens), 0) from runs)
+                  + (select coalesce(sum(output_tokens), 0) from alignment_checks) as output_tokens,
+                (select coalesce(sum(cost_usd), 0) from runs)
+                  + (select coalesce(sum(cost_usd), 0) from alignment_checks) as cost_usd
             """
         ).fetchone()
     data = row_to_dict(row)
@@ -3872,7 +3899,12 @@ def usage_stats() -> dict:
                 coalesce(sum(cost_usd), 0) as cost_usd,
                 count(distinct id) as run_count,
                 count(distinct session_id) as session_count
-            from runs
+            from (
+                select id, session_id, updated_at, input_tokens, output_tokens, cost_usd from runs
+                union all
+                select id, session_id, updated_at, input_tokens, output_tokens, cost_usd
+                from alignment_checks
+            ) usage_events
             group by date(updated_at)
             order by day asc
             """
@@ -3887,7 +3919,12 @@ def usage_stats() -> dict:
                 coalesce(sum(cost_usd), 0) as cost_usd,
                 count(*) as run_count,
                 count(distinct session_id) as session_count
-            from runs
+            from (
+                select id, session_id, model, input_tokens, output_tokens, cost_usd from runs
+                union all
+                select id, session_id, model, input_tokens, output_tokens, cost_usd
+                from alignment_checks
+            ) usage_events
             group by model
             order by cost_usd desc, total_tokens desc
             """
@@ -3897,8 +3934,33 @@ def usage_stats() -> dict:
         "sessions": sessions,
         "origins": _origin_rollup(),
         "global": global_usage(),
+        "alignment": alignment_usage(),
         "daily": [_normalize_usage_day(row_to_dict(row)) for row in daily_rows],
         "models": [_normalize_usage_model(row_to_dict(row)) for row in model_rows],
+    }
+
+
+def alignment_usage() -> dict:
+    """Evaluator-only usage, kept distinct while still included in global totals."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            select count(*) as run_count,
+                   coalesce(sum(input_tokens), 0) as input_tokens,
+                   coalesce(sum(output_tokens), 0) as output_tokens,
+                   coalesce(sum(cost_usd), 0) as cost_usd
+            from alignment_checks
+            """
+        ).fetchone()
+    data = row_to_dict(row)
+    input_tokens = int(data["input_tokens"] or 0)
+    output_tokens = int(data["output_tokens"] or 0)
+    return {
+        "run_count": int(data["run_count"] or 0),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cost_usd": float(data["cost_usd"] or 0),
     }
 
 
@@ -3927,14 +3989,24 @@ def _origin_rollup() -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
             """
+            with usage_events as (
+                select r.session_id, r.input_tokens, r.output_tokens, r.cost_usd
+                from runs r
+                union all
+                select coalesce(ac.session_id, sr.session_id, f.loose_session_id) as session_id,
+                       ac.input_tokens, ac.output_tokens, ac.cost_usd
+                from alignment_checks ac
+                left join runs sr on sr.id = ac.solver_run_id
+                left join formalizations f on f.id = ac.formalization_id
+            )
             select
                 coalesce(nullif(trim(s.origin), ''), 'ui') as origin,
                 count(distinct s.id) as session_count,
-                coalesce(sum(r.input_tokens), 0) as input_tokens,
-                coalesce(sum(r.output_tokens), 0) as output_tokens,
-                coalesce(sum(r.cost_usd), 0) as cost_usd
+                coalesce(sum(u.input_tokens), 0) as input_tokens,
+                coalesce(sum(u.output_tokens), 0) as output_tokens,
+                coalesce(sum(u.cost_usd), 0) as cost_usd
             from sessions s
-            left join runs r on r.session_id = s.id
+            left join usage_events u on u.session_id = s.id
             group by 1
             """
         ).fetchall()

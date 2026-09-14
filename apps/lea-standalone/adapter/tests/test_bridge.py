@@ -357,6 +357,33 @@ def test_autonomous_run_disables_gate_and_uses_default_variant(tmp_path, monkeyp
     assert bool(store.get_run(run["id"])["autonomous"]) is True
 
 
+def test_overleaf_solver_uses_faithful_variant_without_changing_general_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    db.init_db()
+    session = store.create_session("Translate the supplied proof")
+    run = store.create_run(
+        session["id"], "gemini/test", None, 3,
+        autonomous=True, purpose="overleaf_solver",
+    )
+    config = LeaConfig(
+        model="gemini/test", max_turns=3, lea_root=tmp_path,
+        prompt_variant="interactive",
+    )
+    ctx = bridge.RunnerContext(
+        session_id=session["id"], run_id=run["id"],
+        task="Translate the supplied proof", config=config, events=Queue(),
+        autonomous=True, purpose="overleaf_solver",
+    )
+
+    received: dict = {}
+    monkeypatch.setattr(bridge, "run_events", _policy_recording_fake(received))
+    bridge.run_lea(ctx)
+
+    assert received["gate"] is None
+    assert received["prompt_variant"] == "overleaf_faithful"
+    assert store.get_run(run["id"])["purpose"] == "overleaf_solver"
+
+
 def test_interactive_run_keeps_gate_and_config_variant(tmp_path, monkeypatch):
     # UI path (default): the gate is wired and the configured prompt variant is
     # left untouched — current behavior is preserved.

@@ -40,7 +40,8 @@ const ARTIFACT_JOB_STATUSES = new Set([
   "repaired",
   "needs_review",
   "disproved",
-  "sorry_stub"
+  "sorry_stub",
+  "paused"
 ]);
 
 function hasArtifactResult(job) {
@@ -100,7 +101,7 @@ export function pruneJobs(jobs, { keepPerKey = 20 } = {}) {
     const seenStatusMode = new Set();
     const seenSessionDecl = new Set();
     entries.forEach(([id, job], index) => {
-      if (index < keepPerKey || job?.status === "in_progress") {
+      if (index < keepPerKey || job?.status === "in_progress" || job?.status === "paused") {
         keepIds.add(id);
       }
       const statusMode = `${job?.status || ""}\u0000${job?.mode || ""}`;

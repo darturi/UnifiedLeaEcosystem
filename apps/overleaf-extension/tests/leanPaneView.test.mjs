@@ -48,6 +48,7 @@ test("formatPaneStatus maps known statuses and falls back to unknown", () => {
   assert.equal(formatPaneStatus("defined"), "defined");
   assert.equal(formatPaneStatus("disproved"), "counterexample");
   assert.equal(formatPaneStatus("in-progress"), "in progress");
+  assert.equal(formatPaneStatus("paused"), "paused");
   assert.equal(formatPaneStatus("stale"), "out of date");
   assert.equal(formatPaneStatus("mixed"), "mixed");
   assert.equal(formatPaneStatus("nonsense"), "unknown");
@@ -102,6 +103,7 @@ test("canFormalizePaneItem keeps reruns available for settled items and blocks a
   assert.equal(canFormalizePaneItem({ ...base, status: "valid" }), true);
   assert.equal(canFormalizePaneItem({ ...base, status: "defined" }), true);
   assert.equal(canFormalizePaneItem({ ...base, status: "disproved" }), true);
+  assert.equal(canFormalizePaneItem({ ...base, status: "paused" }), true);
   assert.equal(canFormalizePaneItem({ ...base, inProgress: true }), false);
   assert.equal(canFormalizePaneItem({ ...base, status: "in-progress" }), false);
   // A malformed marker (no valid target) is not formalizable.
@@ -133,6 +135,7 @@ test("canViewPaneItemInLeaUi requires a target identity and a real run or artifa
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stub-generated" }), true);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "stale" }), true);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "invalid" }), true);
+  assert.equal(canViewPaneItemInLeaUi({ ...base, status: "paused" }), true);
   // Never-formalized or indeterminate items must not appear viewable.
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "missing-stub" }), false);
   assert.equal(canViewPaneItemInLeaUi({ ...base, status: "unknown" }), false);

@@ -17,6 +17,7 @@ const PANE_STATUS_LABELS = {
   // not a proof of the stated theorem (FEATURE-counterexample-workflows.md).
   disproved: "counterexample",
   "in-progress": "in progress",
+  paused: "paused",
   invalid: "invalid",
   stale: "out of date",
   error: "error",
@@ -328,6 +329,7 @@ export function aggregatePaneStatus(items) {
     .filter(Boolean);
   if (statuses.length === 0) return "unknown";
   if (statuses.includes("in-progress")) return "in-progress";
+  if (statuses.includes("paused")) return "paused";
   if (statuses.includes("error")) return "error";
   if (statuses.includes("invalid")) return "invalid";
   if (statuses.includes("stale")) return "stale";
@@ -448,7 +450,7 @@ export function hasInProgressItems(items) {
 // work stays out of a batch even though its per-item Re-formalize action remains
 // available.
 const BATCH_FORMALIZABLE_PANE_STATUSES = new Set([
-  "missing-stub", "stub-generated", "stale", "invalid", "unknown", "error"
+  "missing-stub", "stub-generated", "stale", "invalid", "unknown", "error", "paused"
 ]);
 
 // Whether the pane should offer a Formalize / Re-formalize action for an item.
@@ -565,7 +567,7 @@ export function githubImportMatchedTargetKeys(preview, targets) {
 // session metadata can't make unformalized items appear viewable.
 const LEA_UI_VIEWABLE_PANE_STATUSES = new Set([
   "valid", "defined", "disproved", "in-progress",
-  "stub-generated", "stale", "invalid"
+  "stub-generated", "stale", "invalid", "paused"
 ]);
 
 // Whether the pane should offer a "View in Lea UI" action for an item. Needs a
@@ -601,7 +603,8 @@ export function paneItemToChatTarget(item, overleafProjectId) {
     targetContext: item?.targetContext || "",
     leanDeclarationName: item?.leanDeclarationName || "",
     recordedProofPath: item?.leanArtifactPath || "",
-    status: item?.status || ""
+    status: item?.status || "",
+    ...(item?.sourceBundle ? { sourceBundle: item.sourceBundle } : {})
   };
 }
 
@@ -665,7 +668,7 @@ export function paneItemActions(item, { editing = false } = {}) {
   const canFormalize = canFormalizePaneItem(item);
   const formalizeAction = {
     id: "formalize",
-    label: item?.status === "missing-stub" ? "Formalize" : "Re-formalize"
+    label: item?.status === "missing-stub" ? "Formalize" : item?.status === "paused" ? "Resume" : "Re-formalize"
   };
 
   let primary = null;
@@ -693,7 +696,13 @@ export function paneItemToEditTarget(item, overleafProjectId) {
   return {
     overleafProjectId: String(overleafProjectId || ""),
     targetKind: item?.leanKind === "def" ? "definition" : "theorem",
-    targetLabel: item?.leanDeclarationName || item?.label || ""
+    targetLabel: item?.leanDeclarationName || item?.label || "",
+    ...(item?.sourceBundle ? {
+      sourceBundle: item.sourceBundle,
+      sourceFile: item.sourceFile || "",
+      sourceStartLine: item.sourceStartLine,
+      sourceEndLine: item.sourceEndLine
+    } : {})
   };
 }
 

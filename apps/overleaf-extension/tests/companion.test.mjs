@@ -3612,7 +3612,7 @@ test("failed jobs take precedence over completed project markdown entries", asyn
   assert.match(statuses.body.statuses["theorem:failed_precedence_test"].logTail, /failed proof/);
 });
 
-test("formalize fails a Lea job that exceeds the job timeout", async () => {
+test("formalize pauses a Lea job that exceeds the job timeout", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({
     leaRepoPath: leaRepo,
@@ -3630,12 +3630,14 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
 
   assert.equal(result.statusCode, 200);
   assert.equal(result.body.status, "in_progress");
-  await waitFor(() => state.jobs[result.body.jobId]?.status === "failed");
+  await waitFor(() => state.jobs[result.body.jobId]?.status === "paused");
 
   const job = state.jobs[result.body.jobId];
   assert.equal(job.timedOut, true);
   assert.equal(job.exitCode, 1);
-  assert.match(job.error, /timed out/);
+  assert.equal(job.recoverable, true);
+  assert.equal(job.stopReason, "timeout");
+  assert.equal(job.error, undefined);
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
@@ -3643,8 +3645,8 @@ test("formalize fails a Lea job that exceeds the job timeout", async () => {
   }, state);
 
   assert.equal(statuses.statusCode, 200);
-  assert.equal(statuses.body.statuses["theorem:timeout_test"].status, "failed");
-  assert.match(statuses.body.statuses["theorem:timeout_test"].logTail, /timed out/);
+  assert.equal(statuses.body.statuses["theorem:timeout_test"].status, "paused");
+  assert.match(statuses.body.statuses["theorem:timeout_test"].message, /paused.*time limit/i);
 });
 
 test("startup recovery fails interrupted in-progress jobs", async () => {
@@ -5726,8 +5728,11 @@ test("adapter-side mid-run spend cap maps to finalStatus max_spend without an in
   await waitFor(() => state.jobs[result.body.jobId]?.finalStatus === "max_spend");
 
   const job = state.jobs[result.body.jobId];
-  assert.equal(job.status, "failed");
-  assert.equal(job.error, "Max spend limit reached. Lea run was cancelled.");
+  assert.equal(job.status, "paused");
+  assert.equal(job.recoverable, true);
+  assert.equal(job.stopReason, "global_spend_cap");
+  assert.equal(job.error, undefined);
+  assert.match(job.resultDetail, /spend limit reached/i);
   // The run is already terminal adapter-side — no interrupt round-trip.
   assert.ok(!calls.some((call) => String(call.url).endsWith("/interrupt")));
 });

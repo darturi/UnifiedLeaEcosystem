@@ -48,10 +48,10 @@ class RunRequest(BaseModel):
     # user's choice. Clients that omit it (including older Overleaf companions)
     # inherit the persisted adapter default.
     model: str | None = None
-    # Autonomous run (D19): when true the run uses no per-tool approval gate and the
-    # non-interactive `default` prompt variant, so it formalizes end-to-end with zero
-    # human interaction (the Overleaf path). Defaults false → the interactive UI
-    # behavior (gated tools + collaborator prompt) is unchanged.
+    # Autonomous run (D19): when true the run uses no per-tool approval gate. Its
+    # purpose selects the non-interactive prompt: ordinary autonomous work uses the
+    # default autoformalizer; Overleaf translation uses overleaf_faithful. Defaults
+    # false, preserving the interactive UI's gated collaborator prompt.
     autonomous: bool = False
     # Project namespace (the Overleaf document slug). When present, a new session is
     # tagged with a project of this slug (created on first use) so per-document usage
@@ -70,6 +70,7 @@ class RunRequest(BaseModel):
     focus_formalization_id: str | None = None
     focus_source_hash: str | None = None
     new_formalization: NewFormalizationRequest | None = None
+    purpose: str = "general"
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -102,6 +103,9 @@ def _done_payload(run: dict) -> dict:
         payload["result_kind"] = run["result_kind"]
     if run.get("result_detail"):
         payload["result_detail"] = run["result_detail"]
+    if run.get("stop_reason"):
+        payload["stop_reason"] = run["stop_reason"]
+    payload["recoverable"] = bool(run.get("recoverable"))
     return payload
 
 
@@ -184,6 +188,9 @@ def create_run(request: RunRequest) -> dict:
         )
 
     autonomous = request.autonomous or (permission_tier() == "none")
+    purpose = str(request.purpose or "general").strip().lower()
+    if purpose not in {"general", "overleaf_solver", "overleaf_alignment"}:
+        raise HTTPException(status_code=422, detail="Unsupported run purpose")
     new_formalization = (
         request.new_formalization.model_dump()
         if request.new_formalization is not None else None
@@ -205,6 +212,7 @@ def create_run(request: RunRequest) -> dict:
             focus_formalization_id=request.focus_formalization_id,
             focus_source_hash=focus_source_hash,
             new_formalization=new_formalization,
+            purpose=purpose,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

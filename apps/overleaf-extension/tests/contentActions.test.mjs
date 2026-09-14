@@ -264,7 +264,8 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   assert.match(harness.bodyText(), /Lean namespace: Lea\.TestProject/);
   harness.clickPaneTreeRowText("main.tex");
   assert.match(harness.bodyText(), /Main theorem/);
-  assert.match(harness.bodyText(), /missing stub/);
+  assert.match(harness.bodyText(), /Lean Check:unformalized/);
+  assert.match(harness.bodyText(), /Lea Check:N\/A/);
 });
 
 test("Lean pane falls back to the live TeX file when the Overleaf archive is unavailable", async () => {
@@ -774,7 +775,7 @@ test("GitHub import closes after confirmation and locks matched theorems while c
     minimizeHidden: true,
   });
   assert.equal(harness.countSelector(".ol-lean-github-import-notice"), 1);
-  assert.equal(harness.countSelector(".ol-lean-project-status-in-progress"), 2);
+  assert.equal(harness.countSelector(".ol-lean-project-check-chip-in-progress"), 2);
   harness.openTargetPopover();
   assert.equal(harness.hasButtonText("Checking import…"), true);
 

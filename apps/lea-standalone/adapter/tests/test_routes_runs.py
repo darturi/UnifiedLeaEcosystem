@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from fastapi import HTTPException
 
 from app import db, runbroker, runregistry, store
 from app.config import LeaConfig
@@ -87,6 +88,23 @@ def test_create_run_records_overleaf_origin(tmp_path, monkeypatch):
     session = store.get_session(result["session_id"])
     assert session["origin"] == "overleaf"
     assert session["origin_url"] == url
+
+
+def test_create_run_persists_an_overleaf_solver_purpose(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    result = runs_route.create_run(RunRequest(
+        message="translate faithfully",
+        autonomous=True,
+        purpose="overleaf_solver",
+    ))
+    assert store.get_run(result["run_id"])["purpose"] == "overleaf_solver"
+
+
+def test_create_run_rejects_an_unknown_purpose(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    with pytest.raises(HTTPException) as captured:
+        runs_route.create_run(RunRequest(message="bad purpose", purpose="mystery"))
+    assert captured.value.status_code == 422
 
 
 def test_create_run_without_origin_defaults_to_ui(tmp_path, monkeypatch):

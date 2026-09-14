@@ -1365,12 +1365,14 @@
       status: item.githubImportPreviousStatus,
       inProgress: item.githubImportPreviousInProgress,
       message: item.githubImportPreviousMessage,
+      leanCheck: item.githubImportPreviousLeanCheck,
     };
     delete restored.githubImportPending;
     delete restored.githubImportId;
     delete restored.githubImportPreviousStatus;
     delete restored.githubImportPreviousInProgress;
     delete restored.githubImportPreviousMessage;
+    delete restored.githubImportPreviousLeanCheck;
     return restored;
   }
 
@@ -1386,11 +1388,17 @@
         status: "in-progress",
         inProgress: true,
         message: githubImportProgressText(activeGithubImport.progress),
+        leanCheck: {
+          ...(item.leanCheck || {}),
+          status: "in-progress",
+          reason: "github_import_check"
+        },
         githubImportPending: true,
         githubImportId: activeGithubImport.id,
         githubImportPreviousStatus: item.status,
         githubImportPreviousInProgress: item.inProgress,
         githubImportPreviousMessage: item.message,
+        githubImportPreviousLeanCheck: item.leanCheck,
       };
     });
     return { ...manifest, items };
@@ -2752,12 +2760,13 @@
     const meta = document.createElement("span");
     meta.className = "ol-lean-project-item-meta";
     meta.textContent = item.label;
-    const chip = document.createElement("span");
-    chip.className = `ol-lean-project-status ol-lean-project-status-${item.status || "unknown"}`;
-    chip.textContent = leanPaneView.formatPaneStatus(item.status || "unknown");
     header.appendChild(text);
     header.appendChild(meta);
-    header.appendChild(chip);
+    const checks = document.createElement("span");
+    checks.className = "ol-lean-project-checks";
+    checks.appendChild(renderProjectCheckChip("Lean Check", item.leanCheck?.status || "unformalized", "lean"));
+    checks.appendChild(renderProjectCheckChip("Lea Check", item.leaCheck?.status || "N/A", "lea"));
+    header.appendChild(checks);
     // Same amber "!" the document overlay's badge shows for a proof whose
     // imports are currently sorry-stubbed -- the pane item and the doc badge
     // describe the same status object and must agree.
@@ -2818,6 +2827,20 @@
       card.appendChild(renderLeanPaneItemDetail(item));
     }
     return card;
+  }
+
+  function renderProjectCheckChip(label, status, kind) {
+    const chip = document.createElement("span");
+    const normalized = String(status || (kind === "lea" ? "N/A" : "unformalized"));
+    chip.className = `ol-lean-project-check-chip ol-lean-project-check-chip-${kind} ol-lean-project-check-chip-${normalized.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+    const name = document.createElement("span");
+    name.className = "ol-lean-project-check-chip-name";
+    name.textContent = `${label}:`;
+    const value = document.createElement("span");
+    value.textContent = normalized;
+    chip.appendChild(name);
+    chip.appendChild(value);
+    return chip;
   }
 
   function renderLeanPaneUseRelationships(item, useRelationships) {
@@ -2947,6 +2970,8 @@
       detail.appendChild(review);
     }
 
+    detail.appendChild(renderLeaCheckReport(item));
+
     if (editing) {
       detail.appendChild(renderLeanPaneEditControls(item));
     } else if (item.leanArtifactContent) {
@@ -2965,6 +2990,154 @@
       if (summary) detail.appendChild(summary);
     }
     return detail;
+  }
+
+  function renderLeaCheckReport(item) {
+    const check = item.leaCheck || { status: "N/A", reason: "not_evaluated" };
+    const container = document.createElement("details");
+    container.className = `ol-lean-lea-check-report ol-lean-lea-check-report-${String(check.status || "N/A").toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+    const heading = document.createElement("summary");
+    const reportSummary = check.report?.summary;
+    const findings = Array.isArray(check.report?.findings) ? check.report.findings : [];
+    const warningCount = Number.isFinite(check.warning_count)
+      ? check.warning_count
+      : findings.filter((finding) => finding?.severity === "warning").length;
+    const caveatCount = Number.isFinite(check.caveat_count)
+      ? check.caveat_count
+      : findings.filter((finding) => finding?.severity === "caveat").length
+        + (Array.isArray(check.report?.caveats) ? check.report.caveats.length : 0);
+    const completed = check.completed_at ? new Date(check.completed_at) : null;
+    const reportMetadata = check.report
+      ? [
+          `${warningCount} ${warningCount === 1 ? "finding" : "findings"}`,
+          `${caveatCount} ${caveatCount === 1 ? "caveat" : "caveats"}`,
+          check.current === false ? "superseded" : "current",
+          completed && !Number.isNaN(completed.valueOf()) ? completed.toLocaleString() : ""
+        ].filter(Boolean).join(" · ")
+      : "";
+    const headingSummary = reportSummary
+      ? `Lea Check report — ${check.status}: ${reportSummary}`
+      : `Lea Check report — ${check.status}`;
+    heading.textContent = reportMetadata ? `${headingSummary} · ${reportMetadata}` : headingSummary;
+    container.appendChild(heading);
+
+    const body = document.createElement("div");
+    body.className = "ol-lean-lea-check-report-body";
+    if (check.report) {
+      const metadata = document.createElement("p");
+      metadata.className = "ol-lean-lea-check-report-metadata";
+      metadata.textContent = `Scope: ${String(check.report.scope || "statement_and_proof").replaceAll("_", " ")} · Confidence: ${check.report.confidence || "medium"} · Revision: ${check.current === false ? "superseded" : "current"}`;
+      body.appendChild(metadata);
+
+      const comparison = document.createElement("p");
+      comparison.textContent = `Statement: ${String(check.report.statement_match || "uncertain").replaceAll("_", " ")} · Approach: ${String(check.report.approach_match || "insufficient_evidence").replaceAll("_", " ")}`;
+      body.appendChild(comparison);
+
+      const matches = Array.isArray(check.report.matches) ? check.report.matches : [];
+      if (matches.length) {
+        body.appendChild(renderLeaCheckList("What matched", matches.map((match) => (
+          typeof match === "string" ? match : match?.summary || "Corresponding source and Lean steps were identified."
+        ))));
+      }
+      for (const finding of findings) {
+        const section = document.createElement("section");
+        section.className = `ol-lean-lea-check-finding ol-lean-lea-check-finding-${finding.severity || "info"}`;
+        const title = document.createElement("strong");
+        title.textContent = finding.title || "Finding";
+        const detailText = document.createElement("p");
+        detailText.textContent = finding.detail || "";
+        section.appendChild(title);
+        section.appendChild(detailText);
+        for (const evidence of Array.isArray(finding.evidence) ? finding.evidence : []) {
+          const quote = document.createElement("blockquote");
+          const location = [
+            evidence.side,
+            evidence.path,
+            evidence.start_line ? `line ${evidence.start_line}${evidence.end_line && evidence.end_line !== evidence.start_line ? `–${evidence.end_line}` : ""}` : ""
+          ].filter(Boolean).join(" · ");
+          quote.textContent = `${location}${evidence.excerpt ? ` — ${evidence.excerpt}` : ""}`;
+          section.appendChild(quote);
+        }
+        body.appendChild(section);
+      }
+      if (Array.isArray(check.report.caveats) && check.report.caveats.length) {
+        body.appendChild(renderLeaCheckList("Caveats", check.report.caveats));
+      }
+      if (Array.isArray(check.report.remaining_obligations) && check.report.remaining_obligations.length) {
+        body.appendChild(renderLeaCheckList("Remaining obligations", check.report.remaining_obligations));
+      }
+      if (Array.isArray(check.report.limitations) && check.report.limitations.length) {
+        body.appendChild(renderLeaCheckList("Checker limitations", check.report.limitations));
+      }
+      if (check.report.recommended_next_action) {
+        body.appendChild(renderLeaCheckList("Recommended next action", [check.report.recommended_next_action]));
+      }
+      const revision = check.report.evaluated_revision || {};
+      const revisionValues = [
+        revision.source_hash ? `Source: ${revision.source_hash}` : "",
+        revision.artifact_commit ? `Artifact commit: ${revision.artifact_commit}` : "",
+        revision.artifact_content_hash ? `Artifact content: ${revision.artifact_content_hash}` : "",
+        revision.dependency_hash ? `Dependencies: ${revision.dependency_hash}` : ""
+      ].filter(Boolean);
+      if (revisionValues.length) body.appendChild(renderLeaCheckList("Evaluated revisions", revisionValues));
+    } else {
+      const empty = document.createElement("p");
+      empty.textContent = check.status === "in-progress"
+        ? "Lea is comparing the current Lean artifact with the associated LaTeX proof."
+        : check.reason === "superseded"
+          ? "The previous report belongs to an older source or Lean revision."
+          : check.reason === "no_artifact"
+            ? "There is no Lean artifact to assess yet."
+            : check.error || "No current semantic assessment is available.";
+      body.appendChild(empty);
+    }
+
+    if (["warning", "error", "paused"].includes(check.status) && check.id) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "ol-lean-secondary-button ol-lean-lea-check-retry";
+      retry.textContent = "Retry Lea Check";
+      retry.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        retry.disabled = true;
+        retry.textContent = "Starting…";
+        try {
+          const baseUrl = await chatCompanionBaseUrl();
+          const response = await fetch(`${baseUrl}/lean-check/retry`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ checkId: check.id })
+          });
+          const payload = await response.json().catch(() => ({}));
+          if (!response.ok) throw companionRequestError(response, payload);
+          await refreshLeanPaneNow({ background: true });
+        } catch (error) {
+          retry.disabled = false;
+          retry.textContent = "Retry Lea Check";
+          retry.title = normalizeErrorMessage(error);
+        }
+      });
+      body.appendChild(retry);
+    }
+    container.appendChild(body);
+    return container;
+  }
+
+  function renderLeaCheckList(titleText, values) {
+    const section = document.createElement("section");
+    section.className = "ol-lean-lea-check-list";
+    const title = document.createElement("strong");
+    title.textContent = titleText;
+    const list = document.createElement("ul");
+    for (const value of values) {
+      const item = document.createElement("li");
+      item.textContent = String(value);
+      list.appendChild(item);
+    }
+    section.appendChild(title);
+    section.appendChild(list);
+    return section;
   }
 
   function leanPaneErrorKey(...parts) {
@@ -3116,7 +3289,7 @@
       const target = leanPaneView.paneItemToEditTarget(item, projectId);
       requestRepair({
         overleafProjectId: projectId,
-        items: [{ targetKind: target.targetKind, targetLabel: target.targetLabel }]
+        items: [target]
       });
     });
     return button;
@@ -4047,7 +4220,9 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-formalize-button";
-    const idleLabel = item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+    const idleLabel = item.leanCheck?.status === "paused"
+      ? "Resume"
+      : item.status === "missing-stub" ? "Formalize" : "Re-formalize";
     button.textContent = idleLabel;
     button.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -4056,7 +4231,10 @@
       button.disabled = true;
       button.textContent = "Starting…";
       try {
-        await formalize(leanPaneView.paneItemToFormalizeTarget(item));
+        await formalize({
+          ...leanPaneView.paneItemToFormalizeTarget(item),
+          resume: item.leanCheck?.status === "paused"
+        });
         clearLeanPaneActionError(item);
         await refreshLeanPaneNow({ background: true });
       } catch (error) {
@@ -4370,7 +4548,8 @@
       leanPaneChatTarget = {
         ...leanPaneChatTarget,
         ...(await buildFormalizationSourceContext(leanPaneChatTarget, {
-          verifyMirror: mirrorResult?.disabled !== true
+          verifyMirror: mirrorResult?.disabled !== true,
+          mirrorSnapshot: mirrorResult
         }))
       };
       const baseUrl = await chatCompanionBaseUrl();
@@ -5452,8 +5631,13 @@
     renderTargetWarning(stubbedWarning, target, statusInfo);
   }
 
-  async function buildFormalizationSourceContext(target, { verifyMirror = true } = {}) {
-    const sourceFile = normalizeDocPath(target?.sourceFile || latestActiveTexPath);
+  async function buildFormalizationSourceContext(target, { verifyMirror = true, mirrorSnapshot = null } = {}) {
+    const manifestTarget = (lastLeanPaneManifest?.items || []).find((item) => (
+      item.label === target?.targetLabel
+      && (!target?.sourceFile || normalizeDocPath(item.sourceFile) === normalizeDocPath(target.sourceFile))
+    ));
+    const enrichedTarget = manifestTarget ? { ...manifestTarget, ...target } : target;
+    const sourceFile = normalizeDocPath(enrichedTarget?.sourceFile || latestActiveTexPath);
     const candidates = [
       ...(Array.isArray(lastMirrorFiles) ? lastMirrorFiles : []),
       ...(Array.isArray(lastLeanPaneFiles) ? lastLeanPaneFiles : [])
@@ -5464,8 +5648,8 @@
       ? { path: sourceFile, content: latestActiveTex }
       : candidates.find((file) => normalizeDocPath(file?.path) === sourceFile);
     const content = typeof source?.content === "string" ? source.content : "";
-    const sourceStartLine = Math.max(1, Number(target?.sourceStartLine) || 1);
-    const sourceEndLine = Math.max(sourceStartLine, Number(target?.sourceEndLine) || sourceStartLine);
+    const sourceStartLine = Math.max(1, Number(enrichedTarget?.sourceStartLine) || 1);
+    const sourceEndLine = Math.max(sourceStartLine, Number(enrichedTarget?.sourceEndLine) || sourceStartLine);
     const lines = content.split(/\r?\n/);
     const excerptStartLine = Math.max(1, sourceStartLine - TARGET_CONTEXT_RADIUS_LINES);
     const excerptEndLine = Math.min(lines.length, sourceEndLine + TARGET_CONTEXT_RADIUS_LINES);
@@ -5480,6 +5664,94 @@
       const normalized = normalizeDocPath(file?.path);
       if (normalized && !uniqueFiles.has(normalized)) uniqueFiles.set(normalized, String(file?.content ?? ""));
     }
+    if (sourceFile && content) uniqueFiles.set(sourceFile, content);
+    let currentTarget = enrichedTarget;
+    try {
+      const proofSource = await import(chrome.runtime.getURL("proofSourceCore.mjs"));
+      currentTarget = proofSource.associateProofSourcesCore({
+        targets: [{
+          ...enrichedTarget,
+          sourceFile,
+          sourceStartOffset: Number(target?.from ?? enrichedTarget?.sourceStartOffset ?? 0),
+          sourceEndOffset: Number(target?.to ?? enrichedTarget?.sourceEndOffset ?? 0)
+        }],
+        files: [...uniqueFiles].map(([path, fileContent]) => ({ path, content: fileContent }))
+      })[0] || enrichedTarget;
+    } catch {
+      // The manifest's association is still a safe fallback; missing proof
+      // evidence will pause rather than trigger a guessed strategy.
+    }
+    const proofAssociation = currentTarget?.proofAssociation || { status: "missing", method: "none" };
+    const sourceProof = String(currentTarget?.sourceProof || "").replace(/\r\n?/g, "\n");
+    const proofHash = sourceProof ? await sha256(sourceProof) : "";
+    const sourceBundleCore = {
+      version: 2,
+      targetKey: String(enrichedTarget?.targetLabel || enrichedTarget?.label || ""),
+      targetKind: String(enrichedTarget?.targetKind || enrichedTarget?.kind || "theorem"),
+      statement: String(enrichedTarget?.targetText || enrichedTarget?.naturalLanguageLatex || "").replace(/\r\n?/g, "\n"),
+      proof: sourceProof,
+      proofAssociation: {
+        status: String(proofAssociation.status || "missing"),
+        method: String(proofAssociation.method || "none"),
+        sourceFile: normalizeDocPath(proofAssociation.sourceFile || ""),
+        sourceStartLine: Number(proofAssociation.sourceStartLine || 0),
+        sourceEndLine: Number(proofAssociation.sourceEndLine || 0),
+        proofHash
+      },
+      statementLocation: { sourceFile, sourceStartLine, sourceEndLine },
+      uses: Array.isArray(enrichedTarget?.targetUses) ? enrichedTarget.targetUses.map(String) : [],
+      context: String(enrichedTarget?.targetContext || "").replace(/\r\n?/g, "\n"),
+      relevantSource: sourceExcerpt ? [{
+        kind: "surrounding-context",
+        path: sourceFile,
+        startLine: excerptStartLine,
+        endLine: excerptEndLine,
+        content: sourceExcerpt,
+        truncated: sourceExcerpt.endsWith("[excerpt truncated]")
+      }] : [],
+      mirror: verifyMirror && mirrorSnapshot?.mirrorRevision ? {
+        revision: String(mirrorSnapshot.mirrorRevision),
+        mirroredFileCount: Object.keys(mirrorSnapshot.mirroredFiles || {}).length,
+        verified: true
+      } : null
+    };
+    const sourceBundle = {
+      ...sourceBundleCore,
+      bundleHash: await sha256(JSON.stringify({
+        version: sourceBundleCore.version,
+        targetKey: sourceBundleCore.targetKey,
+        targetKind: sourceBundleCore.targetKind,
+        statement: sourceBundleCore.statement,
+        proof: sourceBundleCore.proof,
+        proofAssociation: {
+          status: sourceBundleCore.proofAssociation.status,
+          method: sourceBundleCore.proofAssociation.method,
+          sourceFile: sourceBundleCore.proofAssociation.sourceFile,
+          proofHash: sourceBundleCore.proofAssociation.proofHash
+        },
+        uses: sourceBundleCore.uses,
+        context: sourceBundleCore.context,
+        relevantSource: sourceBundleCore.relevantSource,
+        mirror: sourceBundleCore.mirror
+      })),
+      sourceIdentityHash: await sha256(JSON.stringify({
+        version: sourceBundleCore.version,
+        targetKey: sourceBundleCore.targetKey,
+        targetKind: sourceBundleCore.targetKind,
+        statement: sourceBundleCore.statement,
+        proof: sourceBundleCore.proof,
+        proofAssociation: {
+          status: sourceBundleCore.proofAssociation.status,
+          method: sourceBundleCore.proofAssociation.method,
+          sourceFile: sourceBundleCore.proofAssociation.sourceFile,
+          proofHash: sourceBundleCore.proofAssociation.proofHash
+        },
+        uses: sourceBundleCore.uses,
+        context: sourceBundleCore.context,
+        relevantSource: [],
+        mirror: null
+      }))
+    };
     return {
       sourceFile,
       sourceStartLine,
@@ -5491,7 +5763,8 @@
       sourceExcerptStartLine: sourceExcerpt ? excerptStartLine : null,
       sourceExcerptEndLine: sourceExcerpt ? excerptEndLine : null,
       sourceCorpusFileCount: uniqueFiles.size,
-      sourceCorpusChars: [...uniqueFiles.values()].reduce((total, text) => total + text.length, 0)
+      sourceCorpusChars: [...uniqueFiles.values()].reduce((total, text) => total + text.length, 0),
+      sourceBundle
     };
   }
 
@@ -5499,7 +5772,8 @@
     // A run must never begin against a mirror that failed to accept the live buffer.
     const mirrorResult = await syncTexMirrorNow({ force: true });
     const sourceContext = await buildFormalizationSourceContext(target, {
-      verifyMirror: mirrorResult?.disabled !== true
+      verifyMirror: mirrorResult?.disabled !== true,
+      mirrorSnapshot: mirrorResult
     });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
@@ -5517,6 +5791,7 @@
         projectName: lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []),
         projectNamespace: lastProjectIdentity?.namespace || "",
         sourceHash: await sha256(normalizeTargetText(target.targetText)),
+        resume: target.resume === true,
         ...sourceContext
       })
     });
@@ -5533,7 +5808,8 @@
     // depend on local notation/definitions in the surrounding document.
     const mirrorResult = await syncTexMirrorNow({ force: true });
     const sourceContext = await buildFormalizationSourceContext(target, {
-      verifyMirror: mirrorResult?.disabled !== true
+      verifyMirror: mirrorResult?.disabled !== true,
+      mirrorSnapshot: mirrorResult
     });
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
@@ -5564,13 +5840,13 @@
 
   // Build the full per-item payload /stub and /formalize expect (the same shape
   // the single-item formalize() sends), for every item a batch will run over.
-  async function buildBatchTargetPayloads(items, { verifyMirror = true } = {}) {
+  async function buildBatchTargetPayloads(items, { verifyMirror = true, mirrorSnapshot = null } = {}) {
     const overleafProjectId = extractOverleafProjectId();
     const projectName = lastProjectIdentity?.projectName || guessProjectName(lastLeanPaneFiles || []);
     const projectNamespace = lastProjectIdentity?.namespace || "";
     return Promise.all(items.map(async (item) => {
       const target = leanPaneView.paneItemToFormalizeTarget(item);
-      const sourceContext = await buildFormalizationSourceContext(target, { verifyMirror });
+      const sourceContext = await buildFormalizationSourceContext(target, { verifyMirror, mirrorSnapshot });
       return {
         overleafProjectId,
         targetKind: target.targetKind,
@@ -5599,7 +5875,8 @@
       const mirrorResult = await syncTexMirrorNow({ force: true });
       const baseUrl = await chatCompanionBaseUrl();
       const payloads = await buildBatchTargetPayloads(items, {
-        verifyMirror: mirrorResult?.disabled !== true
+        verifyMirror: mirrorResult?.disabled !== true,
+        mirrorSnapshot: mirrorResult
       });
       const response = await fetch(`${baseUrl}${endpoint}`, {
         method: "POST",

@@ -204,6 +204,7 @@ def _try_dispatch(run_id: str, superseded: dict[str, str]) -> str:
             config=config,
             events=broker,
             autonomous=bool(run.get("autonomous")),
+            purpose=str(run.get("purpose") or "general"),
         )
         try:
             Thread(target=run_lea, args=(context,), daemon=True,
@@ -443,9 +444,10 @@ class RunnerContext:
     # A rejoinable RunBroker in the live endpoint; a plain Queue in unit tests. Both
     # expose `.put({"type","payload"})`, which is all `emit()` needs.
     events: "runbroker.RunBroker | Queue[dict[str, Any]]"
-    # Autonomous (D19): no approval gate + the non-interactive `default` prompt
-    # variant, so the run formalizes with zero human interaction (Overleaf path).
+    # Autonomous (D19): no approval gate. `purpose` selects either the general
+    # autoformalizer or the source-faithful Overleaf translation prompt.
     autonomous: bool = False
+    purpose: str = "general"
 
 
 def emit(events: "runbroker.RunBroker | Queue[dict[str, Any]]",
@@ -566,6 +568,7 @@ class _DeltaStream:
 _FINISH_STATUS = {
     "assistant": "answered",
     "max_turns": "max_turns",
+    "max_cost": "max_turns",
     "interrupted": "cancelled",
 }
 
@@ -1557,7 +1560,14 @@ def run_lea(context: RunnerContext) -> None:
         # `default` autoformalizer so the run never pauses to present a plan and
         # wait for confirmation. LeaConfig is frozen, so build a copy. The gate is
         # disabled separately below.
-        cfg = replace(cfg, prompt_variant="default")
+        cfg = replace(
+            cfg,
+            prompt_variant=(
+                "overleaf_faithful"
+                if context.purpose == "overleaf_solver"
+                else "default"
+            ),
+        )
     else:
         # Interactive coordinator (item 24): make `spawn_subagent` available so the
         # model can delegate parallel exploration to child sub-agents. The tool is
@@ -1625,6 +1635,8 @@ def run_lea(context: RunnerContext) -> None:
     final_status = "failed"
     final_result_kind: str | None = None
     final_result_detail: str | None = None
+    final_stop_reason: str | None = None
+    final_recoverable = False
     focus_formalization_id: str | None = None
     focus_source_hash: str | None = None
 
@@ -1786,6 +1798,8 @@ def run_lea(context: RunnerContext) -> None:
             final_status = (current or {}).get("status") or "cancelled"
             final_result_kind = (current or {}).get("result_kind")
             final_result_detail = (current or {}).get("result_detail")
+            final_stop_reason = (current or {}).get("stop_reason")
+            final_recoverable = bool((current or {}).get("recoverable"))
             logger.info("Run %s was finalized before it started (%s); not running it",
                         run_id, final_status)
             return
@@ -2233,11 +2247,28 @@ def run_lea(context: RunnerContext) -> None:
                     # turn the cap tripped) keeps its real result.
                     final_result_kind = "max_spend"
                     final_result_detail = _MAX_SPEND_DETAIL
+                stop_reason = None
+                recoverable = False
+                if spend_capped and ev.reason != "completed":
+                    stop_reason = "global_spend_cap"
+                    recoverable = True
+                elif ev.reason == "max_cost":
+                    stop_reason = "cost_cap"
+                    recoverable = True
+                elif ev.reason == "max_turns":
+                    stop_reason = "turn_cap"
+                    recoverable = True
+                elif ev.reason == "interrupted":
+                    stop_reason = "user_stop"
+                    recoverable = True
+                final_stop_reason = stop_reason
+                final_recoverable = recoverable
                 store.update_run(
                     run_id, final_status, final_text=final_text,
                     input_tokens=ev.usage.input_tokens, output_tokens=ev.usage.output_tokens,
                     cost_usd=ev.cost,
                     result_kind=final_result_kind, result_detail=final_result_detail,
+                    stop_reason=stop_reason, recoverable=recoverable,
                 )
                 # Everything past this point is BOOKKEEPING: the run's outcome is
                 # already durable above. Each piece is guarded on its own so one
@@ -2363,6 +2394,9 @@ def run_lea(context: RunnerContext) -> None:
             done_payload["result_kind"] = final_result_kind
         if final_result_detail:
             done_payload["result_detail"] = final_result_detail
+        if final_stop_reason:
+            done_payload["stop_reason"] = final_stop_reason
+        done_payload["recoverable"] = final_recoverable
         emit(events, "done", done_payload)
         # The run has ended: retire its broker. Subscribers already draining hold
         # their own reference and exit on `done`; a late observer gets a synthesized

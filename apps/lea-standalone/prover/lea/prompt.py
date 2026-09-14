@@ -19,8 +19,8 @@ def load_system_prompt(
 ) -> str:
     """Build the system prompt: base variant + implicit lea.md + configured skills.
 
-    Variants: "default" (autoformalizer) and "interactive" (the chat collaborator,
-    what the UI uses). `skills` is the list of skill files from `agent.skills`,
+    Variants: "default" (autoformalizer), "interactive" (the chat collaborator),
+    and "overleaf_faithful" (source-method-preserving translation). `skills` is the list of skill files from `agent.skills`,
     appended in order after the lea.md block.
 
     `workspace` overrides where the agent is told to write its `.lean` files. The
@@ -40,6 +40,7 @@ def load_system_prompt(
     prompts = {
         "default": BASE_PROMPT,
         "interactive": INTERACTIVE_PROMPT,
+        "overleaf_faithful": OVERLEAF_FAITHFUL_PROMPT,
     }
     prompt = prompts[variant]
     target_workspace = str(workspace) if workspace is not None else str(WORKSPACE)
@@ -322,6 +323,40 @@ math statements into Lean 4 proofs that compile with zero errors and zero `sorry
 {_PHRASEBOOK}
 
 {_HARD_RULES}
+
+{_SEARCH_BUDGET}
+"""
+
+
+# ── Overleaf: faithful translation, separate from LeaChat and general search ──
+
+OVERLEAF_FAITHFUL_PROMPT = f"""\
+You are Lea's Overleaf translation agent. Translate the supplied LaTeX statement
+and its associated natural-language proof into Lean 4 while preserving the
+mathematical meaning and proof method.
+
+This is not open-ended proof search. The source proof controls the approach:
+- Preserve its assumptions, domain, quantifiers, conclusion, case structure,
+  intermediate claims, witnesses, reductions, and cited dependencies.
+- Lean-specific scaffolding and library lemmas may differ, but do not replace the
+  source argument with a materially different shortcut just because it compiles.
+- If the proof is missing, ambiguous, incomplete, inconsistent, or cannot be
+  translated faithfully, stop and explain the exact obstruction. A faithful,
+  informative partial result is better than an unrelated successful proof.
+- Never silently repair a mathematical gap. Report every source issue you detect,
+  what you changed on the Lean side, and whether that change is semantics-preserving.
+
+{_WORKSPACE}
+
+{_TOOLS}
+
+{_IMPORT_POLICY}
+
+{_TACTIC_CASCADE}
+
+{_PHRASEBOOK}
+
+{_HARD_RULES.replace("If you've failed 3+ times on the same sub-goal with the same approach, try a fundamentally different strategy. Do not keep editing the same broken proof.", "If the source approach stalls, debug its formal encoding or stop with an explicit obstruction; do not switch to a mathematically unrelated strategy.")}
 
 {_SEARCH_BUDGET}
 """

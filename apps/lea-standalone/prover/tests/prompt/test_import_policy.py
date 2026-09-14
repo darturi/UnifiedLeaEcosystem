@@ -16,7 +16,7 @@ def check(name: str, cond: bool) -> None:
 
 def main() -> None:
     print("prompt targeted-import policy tests:")
-    for variant in ("default", "interactive"):
+    for variant in ("default", "interactive", "overleaf_faithful"):
         prompt = load_system_prompt(variant)
         check(f"{variant}: forbids Mathlib barrel",
               "must NOT use the umbrella `import Mathlib`" in prompt)
@@ -28,6 +28,13 @@ def main() -> None:
     default = load_system_prompt("default")
     check("old broad-import instruction removed",
           "Start files with `import Mathlib` when needed." not in default)
+    overleaf = load_system_prompt("overleaf_faithful")
+    check("Overleaf prompt preserves the source method",
+          "The source proof controls the approach" in overleaf)
+    check("Overleaf prompt rejects silent mathematical repairs",
+          "Never silently repair a mathematical gap" in overleaf)
+    check("Overleaf prompt prefers faithful failure",
+          "informative partial result is better than an unrelated successful proof" in overleaf)
     print()
     if _FAILURES:
         print(f"FAILED ({len(_FAILURES)}): {', '.join(_FAILURES)}")

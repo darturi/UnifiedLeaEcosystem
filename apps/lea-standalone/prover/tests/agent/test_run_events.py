@@ -86,11 +86,12 @@ def install_silent_tool_fake():
     return calls
 
 
-def cfg(max_turns=None, tools=None, skills=None, narrate_tool_steps=False):
+def cfg(max_turns=None, tools=None, skills=None, narrate_tool_steps=False, max_cost_usd=None):
     return LeaConfig(model="gemini/test", model_kwargs={}, stream=True,
                      prompt_variant="default", max_turns=max_turns,
                      tools=tools, tool_modules=[], skills=skills or [],
                      narrate_tool_steps=narrate_tool_steps,
+                     max_cost_usd=max_cost_usd,
                      mcp_servers={})
 
 
@@ -339,6 +340,16 @@ def test_max_turns_hands_back_a_summary():
           any(isinstance(e, AssistantTextDelta) and "FINDINGS" in e.text for e in events))
     check("summary folded into the returned transcript",
           any("FINDINGS" in str(m.get("content")) for m in fin.transcript["messages"]))
+
+
+def test_max_cost_pauses_without_a_paid_summary_turn():
+    calls = install_fakes()
+    events = list(agent.run_events(cfg(max_cost_usd=0.001), msgs("prove it")))
+    fin = events[-1]
+    check("max_cost Finished reason", isinstance(fin, Finished) and fin.reason == "max_cost")
+    check("max_cost runs no summary request", calls["n"] == 1)
+    check("max_cost preserves incurred usage", fin.usage == Usage(100, 40))
+    check("max_cost preserves incurred cost", abs(fin.cost - 0.003) < 1e-9)
 
 
 def test_should_stop_interrupts_before_first_turn():
@@ -718,6 +729,7 @@ def main():
     test_run_events_sequence()
     test_max_turns()
     test_max_turns_hands_back_a_summary()
+    test_max_cost_pauses_without_a_paid_summary_turn()
     test_narrate_tool_steps_instruction()
     test_narrate_tool_steps_forces_text_before_silent_tool_call()
     test_final_gate_failed_check_resumes_loop()

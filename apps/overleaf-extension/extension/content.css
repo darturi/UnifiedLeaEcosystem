@@ -1281,6 +1281,118 @@ body.ol-lean-pane-resizing {
   white-space: nowrap;
 }
 
+.ol-lean-project-checks {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+}
+
+.ol-lean-project-check-chip {
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: var(--ol-muted);
+  background: var(--ol-line-2);
+  font: 700 10px/1 var(--ol-sans);
+  white-space: nowrap;
+}
+
+.ol-lean-project-check-chip-name {
+  font-weight: 550;
+}
+
+.ol-lean-project-check-chip-checked,
+.ol-lean-project-check-chip-approved {
+  color: var(--ol-green);
+  background: var(--ol-green-soft);
+}
+
+.ol-lean-project-check-chip-warning,
+.ol-lean-project-check-chip-stubbed,
+.ol-lean-project-check-chip-paused {
+  color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+}
+
+.ol-lean-project-check-chip-error {
+  color: var(--ol-red);
+  background: var(--ol-red-soft);
+}
+
+.ol-lean-lea-check-report {
+  margin-top: 12px;
+  border: 1px solid var(--ol-line);
+  border-radius: 8px;
+  background: var(--ol-panel-2);
+}
+
+.ol-lean-lea-check-report > summary {
+  padding: 9px 10px;
+  color: var(--ol-ink);
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.ol-lean-lea-check-report-warning {
+  border-color: var(--ol-amber);
+  background: var(--ol-amber-soft);
+}
+
+.ol-lean-lea-check-report-error {
+  border-color: var(--ol-red);
+  background: var(--ol-red-soft);
+}
+
+.ol-lean-lea-check-report-approved {
+  border-color: var(--ol-green);
+  background: var(--ol-green-soft);
+}
+
+.ol-lean-lea-check-report-body {
+  padding: 0 10px 10px;
+}
+
+.ol-lean-lea-check-report-metadata {
+  color: var(--ol-muted);
+  font-size: 11px;
+}
+
+.ol-lean-lea-check-finding {
+  margin-top: 9px;
+  padding: 8px;
+  border-left: 3px solid var(--ol-line);
+  border-radius: 5px;
+  background: var(--ol-panel);
+}
+
+.ol-lean-lea-check-finding-warning {
+  border-left-color: var(--ol-amber);
+}
+
+.ol-lean-lea-check-finding blockquote {
+  margin: 6px 0 0;
+  padding-left: 8px;
+  border-left: 2px solid var(--ol-line);
+  color: var(--ol-muted);
+  font: 11px/1.45 var(--ol-mono);
+}
+
+.ol-lean-lea-check-list {
+  margin-top: 9px;
+}
+
+.ol-lean-lea-check-list ul {
+  margin: 5px 0 0;
+  padding-left: 20px;
+}
+
+.ol-lean-lea-check-retry {
+  margin-top: 10px;
+}
+
 .ol-lean-project-status-valid,
 .ol-lean-project-status-defined {
   color: var(--ol-green);
