@@ -31,6 +31,7 @@ from ..github_source import GitHubSourceError
 from .. import projects as project_service
 from .. import store
 from .. import uploads
+from ..alignment_schemas import SourceBundle
 
 router = APIRouter()
 
@@ -98,6 +99,7 @@ class GithubImportTarget(BaseModel):
     display_title: str
     statement: str | None = None
     source_hash: str | None = None
+    source_bundle: SourceBundle | None = None
 
 
 class GithubImportPreviewRequest(BaseModel):
@@ -782,6 +784,26 @@ def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
             store.get_formalization(row["formalization_id"])
             if row.get("formalization_id") else None
         )
+        current_step = None
+        editing_session_id = None
+        if formalization:
+            current_step = next(
+                (
+                    step
+                    for step in store.current_code_steps_for_formalization(
+                        formalization["id"]
+                    )
+                    if step.get("path") == row["path"]
+                ),
+                None,
+            )
+            associated_sessions = store.session_ids_for_formalization(formalization["id"])
+            current_session_id = current_step.get("session_id") if current_step else None
+            editing_session_id = (
+                current_session_id
+                if current_session_id in associated_sessions
+                else (associated_sessions[0] if associated_sessions else None)
+            )
         current_source_hash = (formalization or {}).get("source_hash")
         artifact_source_hash = row.get("source_hash")
         targets.append({
@@ -797,6 +819,10 @@ def project_target_status_by_slug(slug: str, declarations: str = "") -> dict:
             "check_detail": check["check_detail"] if check else None,
             "check_author": check["author"] if check else None,
             "formalization_id": row.get("formalization_id"),
+            # The session that wrote the current artifact revision is the
+            # durable editing context. Companion jobs are only a projection
+            # and may not exist for GitHub-imported formalizations.
+            "session_id": editing_session_id,
             "current_source_hash": current_source_hash,
             "artifact_source_hash": artifact_source_hash,
             "stale": bool(

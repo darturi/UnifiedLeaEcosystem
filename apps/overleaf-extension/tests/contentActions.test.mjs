@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -72,6 +73,16 @@ test("targets without coordinates do not render floating status badges", async (
   await harness.loadStatusForVisibleTheorem();
 
   assert.equal(harness.hasButtonText("unformalized"), false);
+});
+
+test("status refresh sends the canonical version-2 source identity", async () => {
+  const harness = createContentHarness({ status: "formalized", sourceFreshness: "current" });
+  await harness.loadStatusForVisibleTheorem();
+
+  const statusCall = harness.fetchCalls.find((call) => call.url.endsWith("/statuses"));
+  assert.ok(statusCall, "expected a status request");
+  const request = JSON.parse(statusCall.options.body);
+  assert.match(request.targets[0].sourceIdentityHash, /^[a-f0-9]{64}$/);
 });
 
 test("a source-stale formalization is labeled out of date on the LaTeX badge and in its popover", async () => {
@@ -641,6 +652,7 @@ test("GitHub import closes after confirmation and locks matched theorems while c
     naturalLanguageLatex: "A theorem.",
     leanKind: "theorem",
     leanDeclarationName: "demo_theorem",
+    sourceBundle: { version: 2, targetKey: "demo_theorem", bundleHash: "bundle-demo" },
   };
   const queuedManifestItem = {
     ...manifestItem,
@@ -649,6 +661,7 @@ test("GitHub import closes after confirmation and locks matched theorems while c
     naturalLanguageRendered: "Another theorem.",
     naturalLanguageLatex: "Another theorem.",
     leanDeclarationName: "queued_theorem",
+    sourceBundle: { version: 2, targetKey: "queued_theorem", bundleHash: "bundle-queued" },
   };
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -739,6 +752,10 @@ test("GitHub import closes after confirmation and locks matched theorems while c
   harness.setGithubImportUrl("https://github.com/example/formalizations");
   harness.clickButtonText("Analyze");
   await flushPromises();
+  const previewCall = harness.fetchCalls.find((call) => call.url.includes("/project/github-import/preview"));
+  const previewRequest = JSON.parse(previewCall.options.body);
+  assert.equal(previewRequest.targets[0].sourceBundle.bundleHash, "bundle-demo");
+  assert.equal(previewRequest.targets[1].sourceBundle.bundleHash, "bundle-queued");
   harness.clickButtonText("Add 2 Lean files");
   await flushPromises();
 
@@ -2386,8 +2403,9 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
     },
     crypto: {
       subtle: {
-        async digest() {
-          return new ArrayBuffer(0);
+        async digest(_algorithm, input) {
+          const digest = createHash("sha256").update(Buffer.from(input)).digest();
+          return digest.buffer.slice(digest.byteOffset, digest.byteOffset + digest.byteLength);
         }
       }
     },

@@ -3183,6 +3183,7 @@ def create_github_import(
     source_ref: str | None = None,
     source_namespace: str | None = None,
     destination_snapshot: str | None = None,
+    targets: list[dict] | None = None,
     import_id: str | None = None,
 ) -> dict:
     now = utc_now()
@@ -3193,12 +3194,13 @@ def create_github_import(
             insert or ignore into github_imports (
                 id, project_id, source_url, source_ref, source_commit_sha,
                 source_namespace, destination_namespace, status,
-                destination_snapshot, created_at, updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, 'applying', ?, ?, ?)
+                destination_snapshot, targets_json, created_at, updated_at
+            ) values (?, ?, ?, ?, ?, ?, ?, 'applying', ?, ?, ?, ?)
             """,
             (
                 row_id, project_id, source_url, source_ref, source_commit_sha,
-                source_namespace, destination_namespace, destination_snapshot, now, now,
+                source_namespace, destination_namespace, destination_snapshot,
+                json.dumps(targets or [], ensure_ascii=False), now, now,
             ),
         )
         row = conn.execute(
@@ -3469,8 +3471,9 @@ def github_import_progress(import_id: str) -> dict | None:
     declarations = list_github_import_declarations(import_id)
     disposition_counts = Counter(row["disposition"] for row in files)
     check_counts = Counter(row["check_status"] or "unstarted" for row in files)
+    public_import = {key: value for key, value in imported.items() if key != "targets_json"}
     return {
-        **imported,
+        **public_import,
         "files": files,
         "declarations": declarations,
         "counts": {

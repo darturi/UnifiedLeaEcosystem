@@ -749,7 +749,8 @@ Start a Lea Check when:
    artifact snapshot exists;
 3. a manual Lean edit settles and the edited artifact is meaningful;
 4. a chat-mirror or repair run changes the artifact and settles;
-5. the user explicitly retries a failed or paused Lea Check.
+5. a GitHub import matches an Overleaf formalization and its file-level Lean Check settles;
+6. the user explicitly retries a failed or paused Lea Check.
 
 ### Trigger exclusions
 
@@ -1283,6 +1284,8 @@ the listed files.
 ### Adapter/companion integration tests
 
 - checked artifact triggers one idempotent Lea Check;
+- matched GitHub imports trigger one idempotent Lea Check per formalization, including
+  multiple matched declarations that share one compiler-checked Lean file;
 - paused run with an artifact triggers a Lea Check;
 - paused run without an artifact leaves Lea `N/A`;
 - manual edit, chat, repair, and re-formalization invalidate/recheck correctly;

@@ -5931,18 +5931,23 @@
 
     const settings = await getSettings();
     const baseUrl = String(settings.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+    const targets = await Promise.all(latestTargets.map(async (target) => {
+      const sourceContext = await buildFormalizationSourceContext(target, { verifyMirror: false });
+      return {
+        targetKind: target.targetKind,
+        targetLabel: target.targetLabel,
+        targetText: target.targetText,
+        targetUses: target.targetUses || [],
+        targetContext: target.targetContext || "",
+        sourceIdentityHash: sourceContext.sourceBundle?.sourceIdentityHash || ""
+      };
+    }));
     const response = await fetch(`${baseUrl}/statuses`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         overleafProjectId: extractOverleafProjectId(),
-        targets: latestTargets.map((target) => ({
-          targetKind: target.targetKind,
-          targetLabel: target.targetLabel,
-          targetText: target.targetText,
-          targetUses: target.targetUses || [],
-          targetContext: target.targetContext || ""
-        }))
+        targets
       })
     });
 

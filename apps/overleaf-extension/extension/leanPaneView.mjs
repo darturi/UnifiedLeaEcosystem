@@ -508,7 +508,10 @@ export function paneItemToGithubImportTarget(item) {
     declarationName,
     displayTitle: declarationName || targetLabel,
     statement: item?.naturalLanguageLatex || "",
-    sourceHash: item?.sourceHash || ""
+    sourceHash: item?.sourceHash || "",
+    // The adapter persists this frozen bundle with the import so its background
+    // worker can start a semantic Lea Check after the Lean file check settles.
+    sourceBundle: item?.sourceBundle || null
   };
 }
 
@@ -697,6 +700,7 @@ export function paneItemToEditTarget(item, overleafProjectId) {
     overleafProjectId: String(overleafProjectId || ""),
     targetKind: item?.leanKind === "def" ? "definition" : "theorem",
     targetLabel: item?.leanDeclarationName || item?.label || "",
+    ...(item?.sourceHash ? { sourceHash: item.sourceHash } : {}),
     ...(item?.sourceBundle ? {
       sourceBundle: item.sourceBundle,
       sourceFile: item.sourceFile || "",

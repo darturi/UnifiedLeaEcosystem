@@ -240,6 +240,7 @@ test("paneItemToFormalizeTarget shapes the /formalize payload from a pane item",
 });
 
 test("paneItemToGithubImportTarget keeps the stable label and current declaration separate", () => {
+  const sourceBundle = { version: 2, targetKey: "stable_marker", bundleHash: "bundle-sha" };
   assert.deepEqual(
     paneItemToGithubImportTarget({
       leanKind: "theorem",
@@ -247,6 +248,7 @@ test("paneItemToGithubImportTarget keeps the stable label and current declaratio
       leanDeclarationName: "renamed_theorem",
       naturalLanguageLatex: "Every x has P(x).",
       sourceHash: "source-sha",
+      sourceBundle,
     }),
     {
       targetKind: "theorem",
@@ -255,6 +257,7 @@ test("paneItemToGithubImportTarget keeps the stable label and current declaratio
       displayTitle: "renamed_theorem",
       statement: "Every x has P(x).",
       sourceHash: "source-sha",
+      sourceBundle,
     },
   );
 });
@@ -648,8 +651,17 @@ test("canEditPaneItem requires a recorded artifact", () => {
 
 test("paneItemToEditTarget shapes a theorem/definition target from a pane item", () => {
   assert.deepEqual(
-    paneItemToEditTarget({ leanKind: "theorem", leanDeclarationName: "compactness_criterion" }, "project-1"),
-    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "compactness_criterion" }
+    paneItemToEditTarget({
+      leanKind: "theorem",
+      leanDeclarationName: "compactness_criterion",
+      sourceHash: "source-sha"
+    }, "project-1"),
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "compactness_criterion",
+      sourceHash: "source-sha"
+    }
   );
   assert.deepEqual(
     paneItemToEditTarget({ leanKind: "def", label: "locally_finite_family" }, "project-1"),

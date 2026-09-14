@@ -7,14 +7,17 @@ import os
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from lea.interface import check as interface_check
 
+from . import alignment_checks as alignment_checks_service
 from . import formalizations as formalizations_service
 from . import store
+from .alignment_schemas import SourceBundle
 from .artifacts import (
     classify_lean_artifact,
     declaration_contains_sorry,
@@ -121,6 +124,34 @@ def _persist_planned_files(import_id: str, plan) -> None:
             reason=item.reason,
             content_sha256=item.content_sha256,
         )
+
+
+def _target_payload(target: TaggedTarget) -> dict:
+    payload = asdict(target)
+    bundle = payload.get("source_bundle")
+    if hasattr(bundle, "model_dump"):
+        payload["source_bundle"] = bundle.model_dump()
+    return payload
+
+
+def _stored_targets(imported: dict) -> list[TaggedTarget]:
+    try:
+        rows = json.loads(imported.get("targets_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    targets: list[TaggedTarget] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            targets.append(TaggedTarget(**row))
+        except TypeError:
+            # A malformed or future-version descriptor must not prevent recovery
+            # of the imported Lean files and their compiler verdicts.
+            continue
+    return targets
 
 
 def _upsert_target(project_id: str, target: TaggedTarget) -> tuple[dict | None, str | None]:
@@ -243,6 +274,7 @@ def confirm_import(
         source_namespace=preview.plan.source_namespace,
         destination_namespace=project["namespace"],
         destination_snapshot=preview.plan.destination_snapshot,
+        targets=[_target_payload(target) for target in preview.targets],
     )
     _persist_planned_files(import_id, preview.plan)
     try:
@@ -465,6 +497,70 @@ def enqueue_import(import_id: str, proofs_root: Path) -> None:
     _executor.submit(_check_import, import_id, Path(proofs_root))
 
 
+def _matching_import_target(
+    declaration: dict,
+    formalization: dict,
+    targets: list[TaggedTarget],
+) -> TaggedTarget | None:
+    origin_key = str(formalization.get("origin_key") or "")
+    if origin_key:
+        by_origin = [target for target in targets if target.origin_key == origin_key]
+        if len(by_origin) == 1:
+            return by_origin[0]
+    names = {
+        str(declaration.get("declaration_name") or ""),
+        str(declaration.get("full_name") or ""),
+        str(formalization.get("declaration_name") or ""),
+    }
+    names.discard("")
+    by_name = [
+        target
+        for target in targets
+        if target.declaration_name in names
+        and formalization_kind_compatible(
+            str(formalization.get("kind") or "other"),
+            str(declaration.get("kind") or "other"),
+        )
+    ]
+    return by_name[0] if len(by_name) == 1 else None
+
+
+def _start_import_alignment_checks(imported: dict, progress: dict | None) -> list[str]:
+    """Start one idempotent semantic Lea Check per matched formalization.
+
+    The source bundles live on the durable import row rather than in the preview
+    registry, so a restarted adapter can finish the same work. The alignment
+    service deduplicates the exact source/artifact/dependency revision tuple.
+    """
+    targets = _stored_targets(imported)
+    if not targets or not progress:
+        return []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for declaration in progress.get("declarations", []):
+        formalization_id = str(declaration.get("formalization_id") or "")
+        if not formalization_id or formalization_id in seen:
+            continue
+        formalization = store.get_formalization(formalization_id)
+        if not formalization:
+            continue
+        target = _matching_import_target(declaration, formalization, targets)
+        if not target or not target.source_bundle:
+            continue
+        seen.add(formalization_id)
+        try:
+            alignment_checks_service.start(
+                formalization_id,
+                SourceBundle.model_validate(target.source_bundle),
+                trigger="github_import",
+                solver_run_id=None,
+            )
+        except Exception as exc:
+            label = target.display_title or target.declaration_name or formalization_id
+            errors.append(f"{label}: {exc}")
+    return errors
+
+
 def _check_import(import_id: str, proofs_root: Path) -> None:
     try:
         imported = store.get_github_import(import_id)
@@ -517,9 +613,23 @@ def _check_import(import_id: str, proofs_root: Path) -> None:
                 continue
             if declaration_contains_sorry(content, declaration["full_name"]):
                 issues = True
+        alignment_errors = _start_import_alignment_checks(imported, progress)
+        error_detail = None
+        if alignment_errors:
+            issues = True
+            details: dict = {}
+            if imported.get("error_detail"):
+                try:
+                    parsed = json.loads(imported["error_detail"])
+                    details = parsed if isinstance(parsed, dict) else {"import_detail": parsed}
+                except (TypeError, json.JSONDecodeError):
+                    details = {"import_detail": imported["error_detail"]}
+            details["lea_check_errors"] = alignment_errors
+            error_detail = json.dumps(details, ensure_ascii=False)
         store.set_github_import_status(
             import_id,
             "complete_with_issues" if issues else "complete",
+            error_detail=error_detail,
         )
         shutil.rmtree(_staging_source(import_id).parent, ignore_errors=True)
     finally:
@@ -537,7 +647,9 @@ def recover_github_imports_at_startup(proofs_root: Path | None) -> None:
             if staging.is_dir() and project:
                 try:
                     inventory = inventory_source(staging)
-                    _apply_import(imported, project, proofs_root, inventory, [])
+                    _apply_import(
+                        imported, project, proofs_root, inventory, _stored_targets(imported)
+                    )
                 except Exception as exc:
                     store.set_github_import_status(
                         imported["id"], "failed", error_detail=f"Recovery failed: {exc}"

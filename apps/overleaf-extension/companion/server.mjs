@@ -257,12 +257,12 @@ export async function handleGetStatuses(payload, state) {
       targetLabel,
       jobs: state.jobs || {}
     });
-    const currentInputHash = hashFormalizationInput({
-      targetKind,
-      targetText,
-      targetUses,
-      targetContext
-    });
+    // Freshness for version-2 jobs is keyed by the same source identity the
+    // formalization path persisted. The browser computes it from the live
+    // statement/proof/activation metadata and sends it with the lightweight
+    // document-badge request. If it is unavailable, freshness stays unknown
+    // rather than comparing hashes from two different schemas.
+    const currentInputHash = String(rawTarget?.sourceIdentityHash || "");
     const freshness = attachSourceFreshness({
       state,
       overleafProjectId,
@@ -1039,6 +1039,9 @@ function normalizeGithubImportTargets(overleafProjectId, targets) {
         display_title: String(target?.displayTitle || declarationName),
         statement: String(target?.statement || "") || null,
         source_hash: String(target?.sourceHash || "") || null,
+        source_bundle: target?.sourceBundle && typeof target.sourceBundle === "object"
+          ? target.sourceBundle
+          : null,
       };
     })
     .filter(Boolean);
@@ -1213,6 +1216,7 @@ export async function handleLeanPaneManifest(payload, state) {
     overleafProjectId,
     projectNamespace: identity.namespace
   });
+  const jobsBeforeEnrichment = new Set(Object.keys(state.jobs || {}));
   const items = await mapWithConcurrency(
     manifest.items,
     LEAN_PANE_ENRICH_CONCURRENCY,
@@ -1225,6 +1229,10 @@ export async function handleLeanPaneManifest(payload, state) {
       approvalContext
     })
   );
+  const hydratedLedgerJob = Object.entries(state.jobs || {}).some(
+    ([jobId, job]) => !jobsBeforeEnrichment.has(jobId) && job?.ledgerHydrated === true
+  );
+  if (hydratedLedgerJob) await persistJobs(state);
 
   return {
     statusCode: 200,
@@ -1315,12 +1323,7 @@ function normalizeChatTarget(rawTarget, state) {
     naturalLanguageLatex,
     targetUses,
     targetContext,
-    formalizationInputHash: hashFormalizationInput({
-      targetKind,
-      targetText: naturalLanguageLatex,
-      targetUses,
-      targetContext
-    }),
+    formalizationInputHash: sourceContext.sourceBundle?.sourceIdentityHash || "",
     leanDeclarationName: String(rawTarget?.leanDeclarationName || "").trim(),
     recordedProofPath: String(rawTarget?.recordedProofPath || "").trim(),
     status: String(rawTarget?.status || "").trim()
@@ -1738,7 +1741,8 @@ function validateEditPayload(payload) {
     return { ok: false, error: "invalid_label", message: "Target label must be a valid Lean identifier." };
   }
   const sourceContext = payload?.sourceBundle ? normalizeSourceContext(payload) : {};
-  return { ok: true, overleafProjectId, targetKind, targetLabel, sourceContext };
+  const sourceHash = String(payload?.sourceHash || "");
+  return { ok: true, overleafProjectId, targetKind, targetLabel, sourceContext, sourceHash };
 }
 
 function validateEditSavePayload(payload) {
@@ -1945,7 +1949,7 @@ export async function handleLeanPaneEditStart(payload, state) {
 export async function handleLeanPaneEditSave(payload, state) {
   const validation = validateEditSavePayload(payload);
   if (!validation.ok) return errorResponse(400, validation.error, validation.message);
-  const { overleafProjectId, targetKind, targetLabel, content, note, sourceContext } = validation;
+  const { overleafProjectId, targetKind, targetLabel, content, note, sourceContext, sourceHash } = validation;
 
   const { leaSessionId, activeJob, linkedJob } = resolveEditSession({ state, overleafProjectId, targetKind, targetLabel });
   if (!leaSessionId) {
@@ -1958,6 +1962,8 @@ export async function handleLeanPaneEditSave(payload, state) {
     linkedJob.sourceBundle = sourceContext.sourceBundle;
     linkedJob.formalizationInputHash = sourceContext.sourceBundle.sourceIdentityHash
       || sourceContext.sourceBundle.bundleHash;
+    linkedJob.targetTextHash = sourceHash || linkedJob.targetTextHash || null;
+    linkedJob.ledgerHydrated = false;
   }
   // Same as handleLeanPaneEditStart: search, parse, and classify by the name
   // CURRENTLY in the file, so a second rename (B -> C) is classified as a
@@ -2015,7 +2021,7 @@ export async function handleLeanPaneEditSave(payload, state) {
     if (linkedJob) {
       recordEditCheckVerdict(linkedJob, { status: "error", detail });
       await persistJobs(state);
-      await scheduleAlignmentCheckForJob({ state, job: linkedJob });
+      await scheduleAlignmentCheckForJob({ state, job: linkedJob, trigger: "manual" });
     }
     return {
       statusCode: 200,
@@ -2127,7 +2133,7 @@ export async function handleLeanPaneEditSave(payload, state) {
   if (jobsChanged) {
     await persistJobs(state);
   }
-  if (linkedJob) await scheduleAlignmentCheckForJob({ state, job: linkedJob });
+  if (linkedJob) await scheduleAlignmentCheckForJob({ state, job: linkedJob, trigger: "manual" });
 
   return { statusCode: 200, body: { ok: true, unchanged: false, ownResult, dependentsImpact } };
 }
@@ -5760,12 +5766,12 @@ async function runLeaJob({
   await scheduleAlignmentCheckForJob({ state, job });
 }
 
-async function scheduleAlignmentCheckForJob({ state, job }) {
+async function scheduleAlignmentCheckForJob({ state, job, trigger = null }) {
   if (!job?.formalizationId || !job?.sourceBundle?.bundleHash) return null;
   // User Stop means stop: do not silently launch another paid operation. A
   // global cap likewise cannot authorize a new evaluator request.
   if (["user_stop", "global_spend_cap"].includes(job.stopReason)) return null;
-  const trigger = job.status === "paused" ? "solver_paused" : "solver_terminal";
+  const checkTrigger = trigger || (job.status === "paused" ? "solver_paused" : "solver_terminal");
   let baseUrl;
   try {
     baseUrl = normalizeLeaApiBaseUrl(job.leaApiBaseUrl || state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
@@ -5777,7 +5783,7 @@ async function scheduleAlignmentCheckForJob({ state, job }) {
     baseUrl,
     formalizationId: job.formalizationId,
     sourceBundle: job.sourceBundle,
-    trigger,
+    trigger: checkTrigger,
     solverRunId: job.apiRunId || null
   });
   if (result.ok) {
@@ -6635,39 +6641,18 @@ function attachSourceFreshness({
     generatedFromInputHash: generatedFromInputHash || undefined,
     generatedAt: artifactJob?.finishedAt || artifactJob?.startedAt || association?.updatedAt || undefined,
     sourceFreshnessMessage: sourceFreshness === "stale"
-      ? "The LaTeX source changed after this Lean artifact was generated. Statement and Lea activation metadata are both tracked; re-formalize to synchronize it."
+      ? "The LaTeX source changed after this Lean artifact was generated. The statement, associated proof, and Lea activation metadata are tracked; re-formalize to synchronize it."
       : ""
   };
 }
 
-// Prefer re-deriving freshness from the block-local fields. This prevents an
-// opaque fingerprint from an older implementation from making an unchanged
-// block stale merely because its document position moved. Truly incomplete
-// records fall back to their stored composite fingerprint.
+// Version-2 source identities exclude navigation-only locations, bounded
+// evaluator excerpts, and the whole-project mirror revision. Use the exact
+// identity stored with the artifact instead of rebuilding a legacy composite
+// hash from only statement/uses/context; those schemas are intentionally not
+// comparable and made every new source-bundle job immediately appear stale.
 function deriveArtifactInputHash(job) {
-  if (!job) return "";
-  const storedUses = Array.isArray(job.formalizationSourceUses)
-    ? job.formalizationSourceUses
-    : job.targetUses;
-  if (
-    job.targetTextHash
-    && Array.isArray(storedUses)
-    && Object.prototype.hasOwnProperty.call(job, "targetContext")
-  ) {
-    const targetUses = storedUses
-      .map((use) => typeof use === "string" ? use : use?.targetLabel)
-      .map((value) => String(value || "").trim())
-      .filter(Boolean);
-    return hashFormalizationInput({
-      targetKind: job.targetKind,
-      targetTextHash: job.targetTextHash,
-      targetUses,
-      targetContext: job.targetContext
-    });
-  }
-  // Repair/chat records may carry only the composite fingerprint. Use it only
-  // when the block-local components needed to re-derive freshness are absent.
-  return job.formalizationInputHash ? String(job.formalizationInputHash) : "";
+  return String(job?.sourceBundle?.sourceIdentityHash || "");
 }
 
 // Enrich a formalized status with everything TRANSITIVELY upstream of it that
@@ -6797,6 +6782,69 @@ function buildFormalizationApprovalMetadata({
   };
 }
 
+// Reconstruct the small companion-side association that mutation workflows
+// need when the artifact was created outside a prover job. GitHub imports are
+// the main case: the adapter durably owns their session/formalization linkage,
+// while jobs.json quite correctly has no solver run to point at. Hydrating a
+// ledger-linked record keeps the existing edit/chat/repair/cascade machinery
+// on one path without inventing a run or duplicating proof bytes.
+//
+// This record starts with unknown source provenance (`targetTextHash: null`).
+// The current pane bundle is safe to use for a *new* manual edit/Lea Check, but
+// it must not retroactively claim that an older imported artifact was generated
+// from source that may have changed since import.
+function ensureLedgerLinkedJob({ state, item, target, statusInfo }) {
+  const leaSessionId = String(statusInfo?.leaSessionId || "").trim();
+  const formalizationId = String(statusInfo?.formalizationId || "").trim();
+  if (!leaSessionId || !formalizationId) return null;
+
+  const existing = resolveEditSession({
+    state,
+    overleafProjectId: target.overleafProjectId,
+    targetKind: target.targetKind,
+    targetLabel: target.targetLabel
+  }).linkedJob;
+  if (existing) return existing;
+
+  const jobId = `ledger-${formalizationId}-${leaSessionId}`;
+  const now = new Date().toISOString();
+  const job = {
+    jobId,
+    jobKey: target.jobKey,
+    status: statusInfo?.status === "sorry_stub" ? "sorry_stub" : "formalized",
+    mode: "ledger",
+    ledgerHydrated: true,
+    targetKind: target.targetKind,
+    targetLabel: item?.label || target.targetLabel,
+    overleafProjectId: target.overleafProjectId,
+    projectId: target.projectId,
+    projectSlug: target.projectSlug,
+    projectName: target.projectName,
+    projectNamespace: target.projectNamespace,
+    projectMarkdownPath: target.projectMarkdownPath,
+    declarationName: statusInfo?.declarationName || target.targetLabel,
+    targetTextHash: null,
+    sourceBundle: item?.sourceBundle || null,
+    formalizationInputHash: item?.sourceBundle?.sourceIdentityHash
+      || item?.sourceBundle?.bundleHash
+      || null,
+    recordedProofPath: statusInfo?.recordedProofPath || null,
+    moduleName: statusInfo?.moduleName || null,
+    leanStatement: statusInfo?.leanStatement || "",
+    resultKind: target.targetKind === "definition" ? "defined" : "proved",
+    startedAt: now,
+    finishedAt: now,
+    leaRepoPath: state.settings.leaRepoPath,
+    leaApiBaseUrl: state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
+    leaUiBaseUrl: state.settings?.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL,
+    leaSessionId,
+    formalizationId
+  };
+  state.jobs ||= {};
+  state.jobs[jobId] = job;
+  return job;
+}
+
 async function enrichLeanPaneItem({
   item,
   state,
@@ -6823,7 +6871,7 @@ async function enrichLeanPaneItem({
     projectName,
     projectNamespace
   });
-  const latestJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
+  let latestJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
 
   let statusInfo;
   try {
@@ -6844,6 +6892,8 @@ async function enrichLeanPaneItem({
       message: error instanceof Error ? error.message : String(error)
     };
   }
+  ensureLedgerLinkedJob({ state, item, target, statusInfo });
+  latestJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
 
   const paneStatus = mapLeanPaneStatus(statusInfo, item);
   const inProgress = String(statusInfo?.status || "").toLowerCase() === "in_progress";
@@ -6856,14 +6906,13 @@ async function enrichLeanPaneItem({
     : !inProgress && (statusInfo?.stopReason === "global_spend_cap" || statusInfo?.finalStatus === "max_spend")
       ? statusInfo
       : null;
-  const currentInputHash = latestJob?.sourceBundle
-    ? (item.formalizationInputHash || item.sourceBundle?.bundleHash)
-    : hashFormalizationInput({
-        targetKind,
-        targetText: item.naturalLanguageLatex,
-        targetUses: item.targetUses,
-        targetContext: item.targetContext
-      });
+  // The manifest always builds a version-2 source bundle, so its identity is
+  // the canonical freshness input even when this target has no in-memory job.
+  // Falling back to the legacy statement-only hash here made the pane disagree
+  // with /statuses and produced a different approval revision for the same item.
+  const currentInputHash = item.formalizationInputHash
+    || item.sourceBundle?.sourceIdentityHash
+    || "";
   // The report is bound to the richer evaluator bundle (including the exact
   // bounded context and mirror snapshot). Reuse that hash only while the
   // target-level source identity still matches; otherwise ask for the current
@@ -6966,6 +7015,9 @@ async function enrichLeanPaneItem({
     sourceFreshness: freshness.sourceFreshness,
     generatedFromSourceHash: freshness.generatedFromSourceHash || undefined,
     lastGeneratedAt: freshness.generatedAt || latestJob?.finishedAt || latestJob?.startedAt || undefined,
+    formalizationId: formalizationId || undefined,
+    leaSessionId: statusInfo?.leaSessionId || latestJob?.leaSessionId || undefined,
+    leaSessionUrl: statusInfo?.leaSessionUrl || latestJob?.leaSessionUrl || undefined,
     leanDeclarationName,
     leanStub: leanStub || undefined,
     leanArtifactPath: effectiveArtifact.relativePath || artifact.relativePath || statusInfo?.recordedProofPath || statusInfo?.relativePath || undefined,
@@ -6982,7 +7034,7 @@ async function enrichLeanPaneItem({
       ? statusInfo.stubbedTheoremUses
       : undefined,
     message: stale
-      ? "Out of date — the LaTeX source changed after this Lean artifact was generated. Statement and Lea activation metadata are both tracked; re-formalize to synchronize it."
+      ? "Out of date — the LaTeX source changed after this Lean artifact was generated. The statement, associated proof, and Lea activation metadata are tracked; re-formalize to synchronize it."
       : statusInfo?.message || undefined,
     // Edit-induced breakage attribution (self-repair Phase 2): who/what broke
     // this item and whether a repair can be offered right now. Undefined for
@@ -7171,7 +7223,9 @@ function ledgerStatusBase({ leaRepoPath, target, entry }) {
     projectSlug: target.projectSlug,
     projectMarkdownPath: target.projectMarkdownPath,
     recordedProofPath: entry.proofPath,
-    moduleName: entry.moduleName || null
+    moduleName: entry.moduleName || null,
+    formalizationId: entry.formalizationId || null,
+    leaSessionId: entry.leaSessionId || null
   };
 }
 
@@ -7247,7 +7301,9 @@ async function getTheoremStatus({
       const entry = {
         name: evidence.declaration_name,
         proofPath: ledgerProofPath(target, evidence.path),
-        moduleName: evidence.module_name || null
+        moduleName: evidence.module_name || null,
+        formalizationId: evidence.formalization_id || null,
+        leaSessionId: evidence.session_id || null
       };
       return withLeaSession({
         ...paused,
@@ -7274,7 +7330,9 @@ async function getTheoremStatus({
     const entry = {
       name: evidence.declaration_name,
       proofPath: ledgerProofPath(target, evidence.path),
-      moduleName: evidence.module_name || null
+      moduleName: evidence.module_name || null,
+      formalizationId: evidence.formalization_id || null,
+      leaSessionId: evidence.session_id || null
     };
     const base = ledgerStatusBase({ leaRepoPath, target, entry });
     const leanStatement = extractLeanStatement(evidence.content || "", entry.name);
@@ -7479,16 +7537,18 @@ function addLeaSessionLink(status, job) {
   // Prefer the adapter session id (set on run start, what the Lea UI lists and
   // deep-links by) and fall back to the recorder session id. The recorder CLI is
   // a stub in many setups, so keying only off recorderSessionId left formalized
-  // theorems with no session link (and no "View in Lea UI" button).
-  const sessionId = job?.leaSessionId || job?.recorderSessionId || null;
+  // theorems with no session link (and no "View in Lea UI" button). Ledger-only
+  // artifacts such as GitHub imports carry their durable session directly on
+  // `status`; they deliberately do not need a synthetic prover run.
+  const sessionId = job?.leaSessionId || job?.recorderSessionId || status?.leaSessionId || null;
   if (!status || !sessionId) {
     return status;
   }
   status.leaSessionId = sessionId;
   status.leaSessionUrl = buildLeaSessionUrl(
-    job.leaUiBaseUrl,
+    job?.leaUiBaseUrl,
     sessionId,
-    job.formalizationId,
+    job?.formalizationId || status.formalizationId,
   );
   return status;
 }

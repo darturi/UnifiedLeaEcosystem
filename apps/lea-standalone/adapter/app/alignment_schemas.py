@@ -36,7 +36,9 @@ class SourceBundle(BaseModel):
 
 class AlignmentCheckRequest(BaseModel):
     source_bundle: SourceBundle
-    trigger: Literal["solver_terminal", "solver_paused", "manual", "retry"] = "manual"
+    trigger: Literal[
+        "solver_terminal", "solver_paused", "github_import", "manual", "retry"
+    ] = "manual"
     solver_run_id: str | None = None
 
 

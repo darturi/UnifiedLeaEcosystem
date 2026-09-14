@@ -49,7 +49,14 @@ function jsonResponse(status, body) {
 // status engine (and therefore every pane chip) reads. The maps below track
 // the same facts from the calls this stub serves, so a save that posts an
 // "error" verdict is reflected in the next manifest exactly like production.
-function makeEditFetch(calls, { sessionDetails = {}, writeResponses = {}, checkResponses = {}, rebuildResponses = {} } = {}) {
+function makeEditFetch(calls, {
+  sessionDetails = {},
+  writeResponses = {},
+  checkResponses = {},
+  rebuildResponses = {},
+  ledgerEntries = {},
+  alignmentCurrent = { lea_check: { status: "N/A", reason: "not_evaluated" } }
+} = {}) {
   const ledgerFiles = new Map(); // repo-relative path -> newest written content
   const ledgerChecks = new Map(); // repo-relative path -> { status, detail }
   const declarationPattern = (name) => new RegExp(`\\b(?:theorem|lemma|def|abbrev)\\s+${name}\\b`);
@@ -59,6 +66,18 @@ function makeEditFetch(calls, { sessionDetails = {}, writeResponses = {}, checkR
     if (String(url).includes("/target-status")) {
       const requested = decodeURIComponent(String(url).split("declarations=")[1] || "").split(",").filter(Boolean);
       const targets = requested.map((name) => {
+        const fixture = ledgerEntries[name];
+        if (fixture) {
+          const content = ledgerFiles.get(fixture.path) ?? fixture.content ?? "";
+          const check = ledgerChecks.get(fixture.path) || null;
+          return {
+            ...fixture,
+            declaration_name: name,
+            content,
+            check_status: check ? check.status : fixture.check_status,
+            check_detail: check ? check.detail : fixture.check_detail
+          };
+        }
         // A declaration's recorded file: the newest written content that
         // contains it (covers renames), else its conventional "<name>.lean"
         // when a write or verdict touched that path. Nothing known → the
@@ -90,6 +109,13 @@ function makeEditFetch(calls, { sessionDetails = {}, writeResponses = {}, checkR
         };
       });
       return jsonResponse(200, { project_id: "adapter-project-1", slug: "project-1", targets });
+    }
+    if (String(url).includes("/alignment-checks")) {
+      calls.push({ url: String(url), method, body });
+      if (method === "POST") {
+        return jsonResponse(202, { lea_check: { id: "check-manual", status: "in-progress" } });
+      }
+      return jsonResponse(200, alignmentCurrent);
     }
     calls.push({ url: String(url), method, body });
     const match = String(url).match(/\/api\/sessions\/([^/]+)(?:\/(file|lean-check|rebuild))?$/);
@@ -207,6 +233,104 @@ test("edit start resolves the session's current content and pre-save dependents"
   assert.equal(res.body.path, "compactness_criterion.lean");
   assert.match(res.body.content, /theorem compactness_criterion : True/);
   assert.deepEqual(res.body.dependents.map((d) => d.targetLabel), ["compactness_corollary"]);
+});
+
+test("a GitHub-imported ledger artifact can be edited and starts a manual Lea Check", async () => {
+  const leaRepo = await makeLeaRepo();
+  const initial = "theorem imported_proof : True := by\n  trivial\n";
+  const edited = "theorem imported_proof : True := by\n  exact True.intro\n";
+  await writeProof(leaRepo, "Lea/Project1/Imported.lean", initial);
+  const calls = [];
+  const state = makeState({
+    leaRepo,
+    fetchImpl: makeEditFetch(calls, {
+      ledgerEntries: {
+        imported_proof: {
+          recorded: true,
+          path: "Imported.lean",
+          module_name: "Lea.Project1.Imported",
+          kind: "proof",
+          exists: true,
+          declaration_present: true,
+          has_sorry: false,
+          check_status: "ok",
+          check_detail: null,
+          formalization_id: "formalization-imported",
+          session_id: "session-imported",
+          content: initial
+        }
+      },
+      sessionDetails: {
+        "session-imported": {
+          project_namespace: NAMESPACE,
+          code_steps: [{ path: "Imported.lean", seq: 1, code: initial }]
+        }
+      },
+      writeResponses: {
+        "session-imported": { unchanged: false, code_step: { id: "step-imported-2" }, note: null }
+      },
+      checkResponses: {
+        "session-imported": { path: "Imported.lean", status: "ok", detail: null }
+      },
+      alignmentCurrent: { lea_check: { id: "check-import", status: "approved", current: true } }
+    })
+  });
+  const files = [{
+    path: "main.tex",
+    content: [
+      "\\begin{theorem}",
+      "% lea: formalize label=imported_proof",
+      "A proposition imported from GitHub.",
+      "\\end{theorem}",
+      "\\begin{proof}",
+      "The proposition follows directly.",
+      "\\end{proof}"
+    ].join("\n")
+  }];
+
+  const manifest = await handleLeanPaneManifest({ overleafProjectId: "project-1", files }, state);
+  const item = manifest.body.items[0];
+  assert.equal(item.status, "valid");
+  assert.equal(item.formalizationId, "formalization-imported");
+  assert.equal(item.leaSessionId, "session-imported");
+  assert.equal(item.leaCheck.status, "approved");
+  const hydratedJobs = JSON.parse(await fs.readFile(state.jobsPath, "utf8"));
+  assert.equal(
+    hydratedJobs["ledger-formalization-imported-session-imported"].leaSessionId,
+    "session-imported"
+  );
+
+  const opened = await handleLeanPaneEditStart(
+    { overleafProjectId: "project-1", targetKind: "theorem", targetLabel: "imported_proof" },
+    state
+  );
+  assert.equal(opened.statusCode, 200);
+  assert.equal(opened.body.content, initial);
+
+  const saved = await handleLeanPaneEditSave(
+    {
+      overleafProjectId: "project-1",
+      targetKind: "theorem",
+      targetLabel: "imported_proof",
+      sourceHash: item.sourceHash,
+      sourceBundle: item.sourceBundle,
+      content: edited
+    },
+    state
+  );
+  assert.equal(saved.statusCode, 200);
+  assert.equal(saved.body.ownResult.checkStatus, "ok");
+
+  const writeCall = calls.find((call) => call.url.endsWith("/api/sessions/session-imported/file"));
+  const leanCheckCall = calls.find((call) => call.url.endsWith("/api/sessions/session-imported/lean-check"));
+  const leaCheckCall = calls.find((call) => (
+    call.method === "POST"
+    && call.url.endsWith("/api/formalizations/formalization-imported/alignment-checks")
+  ));
+  assert.equal(writeCall.body.formalization_id, "formalization-imported");
+  assert.equal(leanCheckCall.body.formalization_id, "formalization-imported");
+  assert.equal(leaCheckCall.body.trigger, "manual");
+  assert.equal(leaCheckCall.body.source_bundle.bundleHash, item.sourceBundle.bundleHash);
 });
 
 test("project namespace rename makes the pane and editor read the migrated working file", async () => {

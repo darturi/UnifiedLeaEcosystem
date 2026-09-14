@@ -47,6 +47,7 @@ import {
   slugProjectId
 } from "../shared/leanStub.mjs";
 import { hashFormalizationInput, hashTargetText } from "../shared/theoremParser.mjs";
+import { buildLeanPaneManifest } from "../shared/leanPaneManifest.mjs";
 
 test("buildOverleafDocumentUrl builds the canonical public-Overleaf URL", () => {
   assert.equal(
@@ -1182,6 +1183,16 @@ test("stubbed-upstream warnings are file-derived and transitive: every downstrea
   assert.equal(fixedByLabel.compactness_application.stubbedTheoremUses, undefined);
 });
 
+function sourceBundleItem(source, label) {
+  const manifest = buildLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{ path: "main.tex", content: source }]
+  });
+  const item = manifest.items.find((candidate) => candidate.label === label);
+  assert.ok(item, `expected source bundle item ${label}`);
+  return item;
+}
+
 test("lean pane manifest marks generated artifacts stale when source hash changes", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -1244,6 +1255,109 @@ test("lean pane manifest marks generated artifacts stale when source hash change
   assert.equal(reverted.body.statuses["theorem:compactness_criterion"].sourceFreshness, "current");
 });
 
+test("version-2 source identity keeps a newly formalized definition current on both status surfaces", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project", "fresh_definition.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "def fresh_definition : Nat := 0\n");
+  const source = [
+    "\\begin{definition}",
+    "% lea: define label=fresh_definition context={Use Nat.}",
+    "A distinguished natural number.",
+    "\\end{definition}"
+  ].join("\n");
+  const generated = sourceBundleItem(source, "fresh_definition");
+  state.jobs.freshDefinition = {
+    jobId: "fresh-definition",
+    jobKey: "project-1:definition:fresh_definition",
+    status: "formalized",
+    targetKind: "definition",
+    targetLabel: "fresh_definition",
+    declarationName: "fresh_definition",
+    recordedProofPath: proofPath,
+    targetTextHash: generated.sourceHash,
+    sourceBundle: generated.sourceBundle,
+    formalizationInputHash: generated.formalizationInputHash,
+    leaRepoPath: leaRepo,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const pane = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{ path: "main.tex", content: source }]
+  }, state);
+  assert.equal(pane.body.items[0].status, "defined");
+  assert.equal(pane.body.items[0].sourceFreshness, "current");
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{
+      targetKind: "definition",
+      targetLabel: "fresh_definition",
+      targetText: generated.naturalLanguageLatex,
+      targetUses: generated.targetUses,
+      targetContext: generated.targetContext,
+      sourceIdentityHash: generated.formalizationInputHash
+    }]
+  }, state);
+  assert.equal(statuses.body.statuses["definition:fresh_definition"].sourceFreshness, "current");
+});
+
+test("version-2 source identity marks a proof-only LaTeX change stale on both status surfaces", async () => {
+  const leaRepo = await makeLeaRepo();
+  const state = await makeState({ leaRepoPath: leaRepo });
+  const proofPath = path.join("workspace", "proofs", "Lea", "Project", "proof_sensitive.lean");
+  await writeLeaProjectProof(leaRepo, proofPath, "theorem proof_sensitive : True := by\n  trivial\n");
+  const documentWithProof = (proof) => [
+    "\\begin{theorem}",
+    "% lea: formalize label=proof_sensitive",
+    "A proposition.",
+    "\\end{theorem}",
+    "\\begin{proof}",
+    proof,
+    "\\end{proof}"
+  ].join("\n");
+  const generated = sourceBundleItem(documentWithProof("Argument A."), "proof_sensitive");
+  const currentSource = documentWithProof("Argument B.");
+  const current = sourceBundleItem(currentSource, "proof_sensitive");
+  state.jobs.proofSensitive = {
+    jobId: "proof-sensitive",
+    jobKey: "project-1:theorem:proof_sensitive",
+    status: "formalized",
+    targetKind: "theorem",
+    targetLabel: "proof_sensitive",
+    declarationName: "proof_sensitive",
+    recordedProofPath: proofPath,
+    targetTextHash: generated.sourceHash,
+    sourceBundle: generated.sourceBundle,
+    formalizationInputHash: generated.formalizationInputHash,
+    leaRepoPath: leaRepo,
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const pane = await handleLeanPaneManifest({
+    overleafProjectId: "project-1",
+    files: [{ path: "main.tex", content: currentSource }]
+  }, state);
+  assert.equal(pane.body.items[0].status, "stale");
+  assert.equal(pane.body.items[0].sourceFreshness, "stale");
+
+  const statuses = await handleGetStatuses({
+    overleafProjectId: "project-1",
+    targets: [{
+      targetKind: "theorem",
+      targetLabel: "proof_sensitive",
+      targetText: current.naturalLanguageLatex,
+      targetUses: current.targetUses,
+      targetContext: current.targetContext,
+      sourceIdentityHash: current.formalizationInputHash
+    }]
+  }, state);
+  assert.equal(statuses.body.statuses["theorem:proof_sensitive"].sourceFreshness, "stale");
+});
+
 test("source freshness follows the restored artifact rather than a newer failed retry", async () => {
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
@@ -1292,6 +1406,13 @@ test("line shifts outside a formalized block do not make either status surface s
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   const targetText = "Every open cover has a finite subcover.";
+  const source = [
+    "\\begin{theorem}",
+    "% lea: formalize label=position_independent uses={finite_subcover} context={Apply compactness first.}",
+    targetText,
+    "\\end{theorem}"
+  ].join("\n");
+  const generated = sourceBundleItem(source, "position_independent");
   state.jobs.positionIndependent = {
     jobId: "position-independent",
     jobKey: "project-1:theorem:position_independent",
@@ -1306,10 +1427,8 @@ test("line shifts outside a formalized block do not make either status surface s
       declarationName: "finite_subcover"
     }],
     targetContext: "Apply compactness first.",
-    // Simulate a fingerprint produced by an older implementation that mixed
-    // location data into the opaque hash. Structured block inputs are the
-    // authoritative fallback and prove that the block itself is unchanged.
-    formalizationInputHash: "legacy-position-dependent-fingerprint",
+    sourceBundle: generated.sourceBundle,
+    formalizationInputHash: generated.formalizationInputHash,
     leaRepoPath: leaRepo,
     startedAt: "2026-01-01T00:00:00.000Z",
     finishedAt: "2026-01-01T00:01:00.000Z"
@@ -1323,6 +1442,7 @@ test("line shifts outside a formalized block do not make either status surface s
       targetText,
       targetUses: ["finite_subcover"],
       targetContext: "Apply compactness first.",
+      sourceIdentityHash: generated.formalizationInputHash,
       sourceStartLine: 200,
       sourceEndLine: 204
     }]
@@ -1358,6 +1478,13 @@ test("changes to uses and context mark both status surfaces stale without changi
   const leaRepo = await makeLeaRepo();
   const state = await makeState({ leaRepoPath: leaRepo });
   const targetText = "Every open cover has a finite subcover.";
+  const documentFor = ({ uses = "", context = "" } = {}) => [
+    "\\begin{theorem}",
+    `% lea: formalize label=metadata_sensitive${uses ? ` uses={${uses}}` : ""}${context ? ` context={${context}}` : ""}`,
+    targetText,
+    "\\end{theorem}"
+  ].join("\n");
+  const generated = sourceBundleItem(documentFor(), "metadata_sensitive");
   state.jobs.metadata = {
     jobId: "metadata",
     jobKey: "project-1:theorem:metadata_sensitive",
@@ -1366,26 +1493,20 @@ test("changes to uses and context mark both status surfaces stale without changi
     targetLabel: "metadata_sensitive",
     declarationName: "metadata_sensitive",
     targetTextHash: hashTargetText(targetText),
-    formalizationInputHash: hashFormalizationInput({
-      targetKind: "theorem",
-      targetText,
-      targetUses: [],
-      targetContext: ""
-    }),
+    sourceBundle: generated.sourceBundle,
+    formalizationInputHash: generated.formalizationInputHash,
     leaRepoPath: leaRepo,
     startedAt: "2026-01-01T00:00:00.000Z",
     finishedAt: "2026-01-01T00:01:00.000Z"
   };
-  state.jobs.legacyMetadata = {
-    ...state.jobs.metadata,
-    jobId: "legacy-metadata",
-    jobKey: "project-1:theorem:legacy_metadata_sensitive",
-    targetLabel: "legacy_metadata_sensitive",
-    declarationName: "legacy_metadata_sensitive",
-    formalizationInputHash: undefined,
-    targetUses: [],
-    targetContext: ""
-  };
+  const changedUsesBundle = sourceBundleItem(
+    documentFor({ uses: "finite_subcover" }),
+    "metadata_sensitive"
+  );
+  const changedContextBundle = sourceBundleItem(
+    documentFor({ context: "Apply compactness first." }),
+    "metadata_sensitive"
+  );
 
   const changedUses = await handleGetStatuses({
     overleafProjectId: "project-1",
@@ -1394,7 +1515,8 @@ test("changes to uses and context mark both status surfaces stale without changi
       targetLabel: "metadata_sensitive",
       targetText,
       targetUses: ["finite_subcover"],
-      targetContext: ""
+      targetContext: "",
+      sourceIdentityHash: changedUsesBundle.formalizationInputHash
     }]
   }, state);
   assert.equal(changedUses.body.statuses["theorem:metadata_sensitive"].sourceFreshness, "stale");
@@ -1406,7 +1528,8 @@ test("changes to uses and context mark both status surfaces stale without changi
       targetLabel: "metadata_sensitive",
       targetText,
       targetUses: [],
-      targetContext: "Apply compactness first."
+      targetContext: "Apply compactness first.",
+      sourceIdentityHash: changedContextBundle.formalizationInputHash
     }]
   }, state);
   assert.equal(changedContext.body.statuses["theorem:metadata_sensitive"].sourceFreshness, "stale");
@@ -1418,40 +1541,17 @@ test("changes to uses and context mark both status surfaces stale without changi
       targetLabel: "metadata_sensitive",
       targetText,
       targetUses: [],
-      targetContext: ""
+      targetContext: "",
+      sourceIdentityHash: generated.formalizationInputHash
     }]
   }, state);
   assert.equal(unchanged.body.statuses["theorem:metadata_sensitive"].sourceFreshness, "current");
-
-  const legacyChangedUses = await handleGetStatuses({
-    overleafProjectId: "project-1",
-    targets: [{
-      targetKind: "theorem",
-      targetLabel: "legacy_metadata_sensitive",
-      targetText,
-      targetUses: ["finite_subcover"],
-      targetContext: ""
-    }]
-  }, state);
-  assert.equal(
-    legacyChangedUses.body.statuses["theorem:legacy_metadata_sensitive"].sourceFreshness,
-    "stale"
-  );
-  assert.ok(
-    legacyChangedUses.body.statuses["theorem:legacy_metadata_sensitive"].generatedFromInputHash,
-    "pre-upgrade jobs should derive a composite freshness hash from stored metadata"
-  );
 
   const pane = await handleLeanPaneManifest({
     overleafProjectId: "project-1",
     files: [{
       path: "main.tex",
-      content: [
-        "\\begin{theorem}",
-        "% lea: formalize label=metadata_sensitive uses={finite_subcover}",
-        targetText,
-        "\\end{theorem}"
-      ].join("\n")
+      content: documentFor({ uses: "finite_subcover" })
     }]
   }, state);
   assert.equal(pane.body.items[0].status, "stale");
@@ -1491,6 +1591,14 @@ test("approval revisions agree across status surfaces and change with transitive
     targetUses: ["middle"],
     targetContext: ""
   };
+  const source = [
+    "\\begin{theorem}",
+    "% lea: formalize label=result uses={middle}",
+    target.targetText,
+    "\\end{theorem}"
+  ].join("\n");
+  const current = sourceBundleItem(source, "result");
+  target.sourceIdentityHash = current.formalizationInputHash;
 
   const statuses = await handleGetStatuses({
     overleafProjectId: "project-1",
@@ -1504,12 +1612,7 @@ test("approval revisions agree across status surfaces and change with transitive
     overleafProjectId: "project-1",
     files: [{
       path: "main.tex",
-      content: [
-        "\\begin{theorem}",
-        "% lea: formalize label=result uses={middle}",
-        target.targetText,
-        "\\end{theorem}"
-      ].join("\n")
+      content: source
     }]
   }, state);
   assert.equal(pane.body.items[0].approvalEligible, true);
@@ -4921,7 +5024,18 @@ test("chat message starts a first-message session with the full context preamble
     }
   };
 
-  const res = await handleChatMessage({ target: CHAT_TARGET, message: "Why did this fail?" }, state);
+  const source = [
+    "\\begin{theorem}",
+    "% lea: formalize label=compactness_criterion",
+    CHAT_TARGET.naturalLanguageLatex,
+    "\\end{theorem}"
+  ].join("\n");
+  const current = sourceBundleItem(source, "compactness_criterion");
+
+  const res = await handleChatMessage({
+    target: { ...CHAT_TARGET, sourceBundle: current.sourceBundle },
+    message: "Why did this fail?"
+  }, state);
 
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.ok, true);
@@ -4940,12 +5054,7 @@ test("chat message starts a first-message session with the full context preamble
   assert.equal(state.chatSessions["project-1:theorem:compactness_criterion"].leaSessionId, "sess-api-1");
   assert.equal(
     state.chatSessions["project-1:theorem:compactness_criterion"].formalizationInputHash,
-    hashFormalizationInput({
-      targetKind: "theorem",
-      targetText: CHAT_TARGET.naturalLanguageLatex,
-      targetUses: [],
-      targetContext: ""
-    })
+    current.formalizationInputHash
   );
 });
 
@@ -4997,23 +5106,36 @@ test("chat message treats activation comment metadata drift as stale", async () 
     env: { OPENAI_API_KEY: "test-key" },
     fetchImpl: makeLeaApiFetch(calls)
   });
-  state.jobs.chat = finishedChatJob({
-    leaSessionId: "sess-existing",
-    targetTextHash: hashTargetText(CHAT_TARGET.naturalLanguageLatex),
-    formalizationInputHash: hashFormalizationInput({
-      targetKind: "theorem",
-      targetText: CHAT_TARGET.naturalLanguageLatex,
-      targetUses: [],
-      targetContext: ""
-    })
-  });
+  const generatedSource = [
+    "\\begin{theorem}",
+    "% lea: formalize label=compactness_criterion",
+    CHAT_TARGET.naturalLanguageLatex,
+    "\\end{theorem}"
+  ].join("\n");
+  const currentSource = [
+    "\\begin{theorem}",
+    "% lea: formalize label=compactness_criterion uses={finite_subcover}",
+    CHAT_TARGET.naturalLanguageLatex,
+    "\\end{theorem}"
+  ].join("\n");
+  const generated = sourceBundleItem(generatedSource, "compactness_criterion");
+  const current = sourceBundleItem(currentSource, "compactness_criterion");
+  state.jobs.chat = {
+    ...finishedChatJob({
+      leaSessionId: "sess-existing",
+      targetTextHash: hashTargetText(CHAT_TARGET.naturalLanguageLatex)
+    }),
+    sourceBundle: generated.sourceBundle,
+    formalizationInputHash: generated.formalizationInputHash
+  };
 
   const res = await handleChatMessage({
     target: {
       ...CHAT_TARGET,
       sourceHash: hashTargetText(CHAT_TARGET.naturalLanguageLatex),
       targetUses: ["finite_subcover"],
-      targetContext: ""
+      targetContext: "",
+      sourceBundle: current.sourceBundle
     },
     message: "Can this use the new dependency?"
   }, state);
@@ -5323,6 +5445,7 @@ test("GitHub project import handlers preserve the Overleaf target identity throu
     displayTitle: "Current theorem",
     statement: "A theorem.",
     sourceHash: "hash-1",
+    sourceBundle: { version: 2, targetKey: "stable-label", bundleHash: "bundle-1" },
   };
 
   const preview = await handleGithubImportPreview({
@@ -5334,6 +5457,7 @@ test("GitHub project import handlers preserve the Overleaf target identity throu
   const previewCall = calls.find((call) => call.url.endsWith("/github-imports/preview"));
   assert.equal(previewCall.body.targets[0].origin_key, "doc-1:theorem:stable-label");
   assert.equal(previewCall.body.targets[0].declaration_name, "current_name");
+  assert.deepEqual(previewCall.body.targets[0].source_bundle, target.sourceBundle);
   assert.equal(previewCall.body.namespace, "Lea.DocumentOne");
 
   const confirmed = await handleGithubImportConfirm({
