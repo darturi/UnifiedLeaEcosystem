@@ -368,6 +368,56 @@ test("settings open over the Lean pane and closing them preserves the pane", asy
   assert.equal(harness.countSelector(".ol-lean-project-pane"), 1);
 });
 
+test("a missing model API key shows a one-click settings nudge", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      companionSettings: {
+        leaModel: "o4-mini",
+        leaModelRequirements: {
+          model: "o4-mini",
+          provider: "OpenAI",
+          satisfied: false,
+          required_keys: [{ env: "OPENAI_API_KEY", label: "OpenAI API key", configured: false }]
+        }
+      }
+    }
+  );
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-api-key-nudge"), 1);
+  assert.equal(harness.countSelector(".ol-lean-settings-trigger-attention"), 1);
+  assert.match(harness.bodyText(), /To start proving, add an API key for your selected model/);
+  assert.equal(harness.hasButtonText("Open Settings"), true);
+
+  harness.clickButtonText("Open Settings");
+  await flushPromises();
+  assert.equal(harness.countSelector(".ol-lean-settings-popover"), 1);
+});
+
+test("the API-key nudge stays hidden when the selected model is configured", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      companionSettings: {
+        leaModel: "o4-mini",
+        leaModelRequirements: {
+          model: "o4-mini",
+          provider: "OpenAI",
+          satisfied: true,
+          required_keys: [{ env: "OPENAI_API_KEY", label: "OpenAI API key", configured: true }]
+        }
+      }
+    }
+  );
+  await flushPromises();
+
+  assert.equal(harness.countSelector(".ol-lean-api-key-nudge"), 0);
+  assert.equal(harness.countSelector(".ol-lean-settings-trigger-attention"), 0);
+});
+
 test("settings popover renders an accessible persisted resize handle", async () => {
   const harness = createContentHarness({ status: "unformalized" });
   await harness.loadVisibleTheorems();
@@ -1924,6 +1974,35 @@ test("source popover explains when an upstream dependency blocks formalization s
     text: "Formalization blockedFormalize referenced theorem first: helper_lemma. No Lea run was started."
   });
   assert.equal(harness.hasButtonText("Formalize"), true);
+});
+
+test("a missing-key formalization error links directly to credential settings", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      formalizeFailure: {
+        status: 400,
+        error: "missing_openai_key",
+        message: "OpenAI API key must be set before formalizing."
+      }
+    }
+  );
+  await harness.loadStatusForVisibleTheorem();
+  harness.openTargetPopover();
+
+  harness.clickButtonText("Formalize");
+  await flushPromises();
+
+  assert.deepEqual(harness.popoverActionError(), {
+    role: "alert",
+    live: "assertive",
+    text: "API key requiredOpenAI API key must be set before formalizing.Add API key"
+  });
+  harness.clickButtonText("Add API key");
+  await flushPromises();
+  assert.equal(harness.countSelector(".ol-lean-settings-popover"), 1);
 });
 
 test("source popover reports a cost cap inline without a separate floating notice", async () => {

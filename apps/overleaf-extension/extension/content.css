@@ -266,6 +266,7 @@
 .ol-lean-status:focus-visible,
 .ol-lean-human-approval:focus-visible,
 .ol-lean-settings-trigger:focus-visible,
+.ol-lean-api-key-nudge button:focus-visible,
 .ol-lean-pane-trigger:focus-visible,
 .ol-lean-project-tree-row:focus-visible,
 .ol-lean-project-relationship-chip.is-navigable:focus-visible,
@@ -375,6 +376,53 @@
 .ol-lean-settings-trigger:hover {
   border-color: var(--ol-accent);
   background: var(--ol-panel-2);
+}
+
+.ol-lean-settings-trigger-attention {
+  border-color: var(--ol-amber);
+  box-shadow: 0 0 0 3px var(--ol-amber-soft), var(--ol-shadow-float);
+}
+
+.ol-lean-api-key-nudge {
+  position: fixed;
+  right: 68px;
+  bottom: 20px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-sizing: border-box;
+  max-width: min(430px, calc(100vw - 92px));
+  padding: 9px 10px 9px 12px;
+  color: var(--ol-ink-2);
+  background: var(--ol-panel);
+  border: 1px solid var(--ol-line);
+  border-left: 3px solid var(--ol-amber);
+  border-radius: 10px;
+  box-shadow: var(--ol-shadow-float);
+  font: 12px/1.4 var(--ol-sans);
+}
+
+.ol-lean-api-key-nudge span {
+  flex: 1;
+  min-width: 0;
+}
+
+.ol-lean-api-key-nudge button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 10px;
+  color: #ffffff;
+  background: var(--ol-accent);
+  border: 0;
+  border-radius: 7px;
+  cursor: pointer;
+  font: 600 12px/1 var(--ol-sans);
+  white-space: nowrap;
+}
+
+.ol-lean-api-key-nudge button:hover {
+  background: var(--ol-accent-ink);
 }
 
 .ol-lean-trigger-mark {
@@ -2496,6 +2544,10 @@ body.ol-lean-settings-resizing {
 .ol-lean-popover-status-error span {
   margin-top: 3px;
   font-weight: 400;
+}
+
+.ol-lean-popover-error-settings {
+  margin-top: 9px;
 }
 
 .ol-lean-popover-lean {

@@ -92,6 +92,7 @@
   let humanApprovalBusyKeys = new Set();
   let badgeLayer = null;
   let settingsButton = null;
+  let apiKeyNudge = null;
   let leanPaneButton = null;
   let leanPane = null;
   let leanPaneBody = null;
@@ -256,6 +257,7 @@
   requestTargetsSoon();
   renderSettingsButton();
   renderLeanPaneButton();
+  refreshApiKeyNudge();
   hydrateLeanPaneWidthFromStorage();
   hydrateSettingsPopoverWidthFromStorage();
   loadHumanApprovals().then(() => {
@@ -340,6 +342,54 @@
       showSettingsPopover();
     });
     (document.body || document.documentElement).appendChild(settingsButton);
+  }
+
+  function updateApiKeyNudge(settings) {
+    const requirements = settings?.leaModelRequirements;
+    if (!requirements || typeof requirements.satisfied !== "boolean") return;
+
+    const keyMissing = requirements.satisfied === false;
+    settingsButton?.classList.toggle("ol-lean-settings-trigger-attention", keyMissing);
+    if (!keyMissing) {
+      apiKeyNudge?.remove();
+      apiKeyNudge = null;
+      return;
+    }
+    if (apiKeyNudge?.isConnected) return;
+
+    const nudge = document.createElement("div");
+    nudge.className = "ol-lean-api-key-nudge";
+    nudge.setAttribute("role", "status");
+    nudge.setAttribute("aria-live", "polite");
+
+    const copy = document.createElement("span");
+    copy.textContent = "👋 To start proving, add an API key for your selected model.";
+    const open = document.createElement("button");
+    open.type = "button";
+    open.textContent = "Open Settings";
+    open.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      showSettingsPopover({ focusMissingCredential: true });
+    });
+    nudge.appendChild(copy);
+    nudge.appendChild(open);
+    (document.body || document.documentElement).appendChild(nudge);
+    apiKeyNudge = nudge;
+  }
+
+  async function refreshApiKeyNudge() {
+    try {
+      const stored = await getSettings();
+      const baseUrl = String(stored.companionUrl || DEFAULT_COMPANION_URL).replace(/\/+$/, "");
+      const response = await fetch(`${baseUrl}/settings`);
+      if (!response.ok) return;
+      const payload = await response.json().catch(() => ({}));
+      updateApiKeyNudge({ leaModelRequirements: payload.leaModelRequirements });
+    } catch {
+      // The companion may not be running yet. Leave the ordinary Lea controls
+      // available and retry naturally the next time settings are opened.
+    }
   }
 
   function renderLeanPaneButton() {
@@ -3200,6 +3250,12 @@
     return String(error?.code || "") === "unresolved_uses";
   }
 
+  function isMissingApiKeyError(error) {
+    const code = String(error?.code || "");
+    if (/^missing_[a-z0-9_-]+_key$/i.test(code)) return true;
+    return /(?:api key|credential).*(?:required|must be set|missing)/i.test(normalizeErrorMessage(error));
+  }
+
   function actionFailureMessage(error) {
     const message = typeof error?.message === "string"
       ? error.message
@@ -3235,6 +3291,7 @@
     );
     if (dismissedLeanPaneErrorKeys.has(dismissKey)) return null;
     const maxSpend = error.code === MAX_SPEND_ERROR_CODE;
+    const missingApiKey = isMissingApiKeyError(error);
     const dependencyBlocked = isUnresolvedUsesError(error);
     const alert = document.createElement("div");
     alert.className = "ol-lean-project-action-error";
@@ -3245,27 +3302,31 @@
     const title = document.createElement("strong");
     title.textContent = maxSpend
       ? "Cost cap reached"
-      : dependencyBlocked
-        ? "Dependency must be formalized first"
-        : error.operation === "stub"
-          ? "Could not create Lean stub"
-          : "Could not start formalization";
+      : missingApiKey
+        ? "API key required"
+        : dependencyBlocked
+          ? "Dependency must be formalized first"
+          : error.operation === "stub"
+            ? "Could not create Lean stub"
+            : "Could not start formalization";
     const message = document.createElement("p");
     message.textContent = maxSpend ? MAX_SPEND_PANE_MESSAGE : actionFailureMessage(error);
     copy.appendChild(title);
     copy.appendChild(message);
     alert.appendChild(copy);
 
-    if (maxSpend) {
+    if (maxSpend || missingApiKey) {
       const settings = document.createElement("button");
       settings.type = "button";
       settings.className = "ol-lean-secondary-button ol-lean-project-action-error-settings";
-      settings.textContent = "Open settings";
+      settings.textContent = missingApiKey ? "Add API key" : "Open settings";
       settings.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
-        showSettingsPopover();
-        activePopover?.querySelector("[data-role='max-spend']")?.focus({ preventScroll: true });
+        showSettingsPopover({ focusMissingCredential: missingApiKey });
+        if (maxSpend) {
+          activePopover?.querySelector("[data-role='max-spend']")?.focus({ preventScroll: true });
+        }
       });
       alert.appendChild(settings);
     }
@@ -5111,6 +5172,7 @@
 
   function renderPopoverActionError(status, error) {
     const dependencyBlocked = isUnresolvedUsesError(error);
+    const missingApiKey = isMissingApiKeyError(error);
     status.classList.add("ol-lean-popover-status-error");
     status.setAttribute("role", "alert");
     status.setAttribute("aria-live", "assertive");
@@ -5118,13 +5180,27 @@
     status.replaceChildren();
 
     const title = document.createElement("strong");
-    title.textContent = dependencyBlocked
-      ? "Formalization blocked"
-      : "Action failed";
+    title.textContent = missingApiKey
+      ? "API key required"
+      : dependencyBlocked
+        ? "Formalization blocked"
+        : "Action failed";
     const message = document.createElement("span");
     message.textContent = actionFailureMessage(error);
     status.appendChild(title);
     status.appendChild(message);
+    if (missingApiKey) {
+      const settings = document.createElement("button");
+      settings.type = "button";
+      settings.className = "ol-lean-secondary-button ol-lean-popover-error-settings";
+      settings.textContent = "Add API key";
+      settings.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        showSettingsPopover({ focusMissingCredential: true });
+      });
+      status.appendChild(settings);
+    }
   }
 
   async function showTargetInLeanPane(target) {
@@ -5253,7 +5329,7 @@
     }];
   }
 
-  function showSettingsPopover() {
+  function showSettingsPopover({ focusMissingCredential = false } = {}) {
     closePopover();
 
     const popover = document.createElement("div");
@@ -5533,6 +5609,7 @@
         clearProviderKeyInputs(popover);
         clearDynamicApiKeyInputs(popover);
         renderPopoverModelRequirements(popover, settings.leaModelRequirements || null);
+        updateApiKeyNudge(settings);
         markSettingsDirty();
         scheduleTexMirrorSync();
         status.textContent = "Settings saved.";
@@ -5546,9 +5623,13 @@
     document.body.appendChild(popover);
     activePopover = popover;
     positionSettingsPopover(popover);
-    loadPopoverSettings(popover).catch((error) => {
-      status.textContent = error instanceof Error ? error.message : String(error);
-    });
+    loadPopoverSettings(popover)
+      .then(() => {
+        if (focusMissingCredential) focusFirstMissingCredential(popover);
+      })
+      .catch((error) => {
+        status.textContent = error instanceof Error ? error.message : String(error);
+      });
     loadUsage(popover).catch((error) => {
       status.textContent = error instanceof Error ? error.message : String(error);
     });
@@ -6670,6 +6751,7 @@
         leaModelRequirements: payload.leaModelRequirements || null,
         githubTokenConfigured: Boolean(payload.githubTokenConfigured)
       };
+      updateApiKeyNudge(settings);
       await chrome.storage.sync.set({
         companionUrl: settings.companionUrl,
         leaRepoPath: settings.leaRepoPath,
@@ -6896,6 +6978,28 @@
       container.appendChild(label);
     }
     updatePopoverRequirementSummary(popover);
+  }
+
+  function focusFirstMissingCredential(popover) {
+    const container = popover.querySelector("[data-role='model-requirements']");
+    const required = Array.isArray(container?.leaRequirements?.required_keys)
+      ? container.leaRequirements.required_keys
+      : [];
+    const missing = required.find((requirement) => !popoverRequirementConfigured(popover, requirement));
+    let input = missing ? staticProviderInputForEnv(popover, missing.env) : null;
+    if (!input && missing) {
+      input = [...popover.querySelectorAll("[data-role='model-requirements'] input[data-env]")]
+        .find((candidate) => candidate.dataset.env === missing.env) || null;
+    }
+    if (input) {
+      input.hidden = false;
+      input.scrollIntoView?.({ block: "center", behavior: "smooth" });
+      input.focus({ preventScroll: true });
+      return;
+    }
+    const firstAddKey = [...popover.querySelectorAll("[data-role='provider-key-toggle']")]
+      .find((button) => button.textContent === "Add key");
+    firstAddKey?.focus({ preventScroll: true });
   }
 
   function collectProviderApiKeyPatch(popover) {
