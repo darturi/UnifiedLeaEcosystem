@@ -644,10 +644,15 @@ def create_run_bundle(
     focus_source_hash: str | None = None,
     new_formalization: dict | None = None,
     purpose: str = "general",
+    source_bundle: dict | None = None,
 ) -> dict:
     """Atomically create/resolve the conversation scope, run, and user message."""
     if focus_formalization_id and new_formalization:
         raise ValueError("choose an existing focus or a new formalization, not both")
+    if source_bundle is not None:
+        from .source_context import validate_source
+        source_bundle = validate_source(source_bundle)
+        focus_source_hash = source_bundle["sourceIdentityHash"]
     now = utc_now()
     with write() as conn:
         if session_id:
@@ -790,6 +795,9 @@ def create_run_bundle(
                 str(focus_source_hash or "").strip() or None, purpose, now, now,
             ),
         )
+        if source_bundle is not None:
+            from .lea_status_store import admit
+            admit(conn, run_id, focus_formalization_id, session_id, project_id, purpose, source_bundle)
         message_cursor = conn.execute(
             """
             insert into timeline (
@@ -1112,6 +1120,9 @@ def delete_project_cascade(project_id: str) -> bool:
                 session_ids,
             )
         if formalization_ids:
+            status_marks = ",".join("?" for _ in formalization_ids)
+            for status_table in ("lea_status_updates", "lea_status_run_contexts"):
+                conn.execute(f"delete from {status_table} where formalization_id in ({status_marks})", formalization_ids)
             form_marks = ",".join("?" for _ in formalization_ids)
             conn.execute(
                 f"delete from alignment_checks where formalization_id in ({form_marks})",
@@ -2363,6 +2374,7 @@ def current_code_steps_for_formalization(
     formalization_id: str,
     *,
     session_id: str | None = None,
+    run_id: str | None = None,
 ) -> list[dict]:
     """Latest snapshot of every linked path for a formalization.
 
@@ -2388,6 +2400,12 @@ def current_code_steps_for_formalization(
           ))
         )
         """
+    revision_clause = ""
+    if run_id is not None:
+        # A status run can assess its own writes and the revision it started from,
+        # never a later write from another run sharing the same project file.
+        revision_clause = "and (t.run_id = ? or t.created_at <= (select created_at from runs where id = ?))"
+        params.extend([run_id, run_id])
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -2407,7 +2425,7 @@ def current_code_steps_for_formalization(
               join timeline t on t.kind = 'code' and t.path = ff.path
               join sessions s on s.id = t.session_id
               left join artifact_blobs b on b.id = t.after_blob_id
-              where ff.formalization_id = ? and {scope_clause}
+              where ff.formalization_id = ? and {scope_clause} {revision_clause}
             )
             where rn = 1
             order by case formalization_file_role

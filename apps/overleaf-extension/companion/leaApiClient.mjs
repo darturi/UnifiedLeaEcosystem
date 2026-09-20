@@ -107,6 +107,10 @@ async function fetchJson(fetchImpl, url, options) {
 // reads them here and writes them via `putAdapterSettings`, instead of keeping
 // its own divergent copies, so a change in either UI shows up in both.
 
+export function fetchAdapterHealth({ fetchImpl, baseUrl, apiKey }) {
+  return fetchJson(fetchImpl, `${baseUrl}/api/health`, { method: "GET", headers: buildHeaders(apiKey) });
+}
+
 export function fetchAdapterSettings({ fetchImpl, baseUrl }) {
   return fetchJson(fetchImpl, `${baseUrl}/api/settings`, {
     method: "GET",
@@ -345,20 +349,6 @@ export function syncProjectFormalizationTargetsBySlug({ fetchImpl, baseUrl, slug
   });
 }
 
-export function startAlignmentCheck({
-  fetchImpl, baseUrl, formalizationId, sourceBundle, trigger = "manual", solverRunId = null
-}) {
-  return fetchJson(
-    fetchImpl,
-    `${baseUrl}/api/formalizations/${encodeURIComponent(formalizationId)}/alignment-checks`,
-    {
-      method: "POST",
-      headers: buildHeaders(null, { "Content-Type": "application/json" }),
-      body: JSON.stringify({ source_bundle: sourceBundle, trigger, solver_run_id: solverRunId })
-    }
-  );
-}
-
 export function fetchCurrentAlignmentCheck({ fetchImpl, baseUrl, formalizationId, sourceBundleHash = "" }) {
   const query = sourceBundleHash ? `?source_bundle_hash=${encodeURIComponent(sourceBundleHash)}` : "";
   return fetchJson(
@@ -368,16 +358,6 @@ export function fetchCurrentAlignmentCheck({ fetchImpl, baseUrl, formalizationId
   );
 }
 
-export function retryAlignmentCheck({ fetchImpl, baseUrl, checkId }) {
-  return fetchJson(
-    fetchImpl,
-    `${baseUrl}/api/alignment-checks/${encodeURIComponent(checkId)}/retry`,
-    { method: "POST", headers: buildHeaders(null) }
-  );
-}
-
-// Pull `filename="…"` out of a Content-Disposition header (the adapter always
-// quotes it). Exported for tests.
 export function filenameFromContentDisposition(header) {
   const match = /filename="([^"]+)"/.exec(String(header || ""));
   return match ? match[1] : null;
@@ -433,6 +413,7 @@ export async function startApiRun({
   focusSourceHash = null,
   newFormalization = null,
   purpose = "general",
+  sourceBundle = null,
 }) {
   // `autonomous: true` tells the adapter to run with no per-tool approval gate and
   // the non-interactive `default` prompt variant, so the Overleaf job formalizes
@@ -448,7 +429,16 @@ export async function startApiRun({
   // `origin` / `originUrl` record session providence: 'overleaf' + the canonical
   // Overleaf document URL, so the Lea UI can show an origin indicator and open/focus
   // the source document. Independent of the project usage-namespace above.
+  if (["overleaf_solver", "overleaf_continuation"].includes(purpose)) {
+    const health = await fetchAdapterHealth({ fetchImpl, baseUrl, apiKey });
+    const capability = health.body?.capabilities?.lea_status;
+    if (!health.ok || capability?.version !== 1 || !capability.admission_enabled) {
+      return { ok: false, status: 409, error: "Update/start compatible Lea components: live Lea Status v1 is required." };
+    }
+    if (!sourceBundle?.bundleHash) return { ok: false, status: 422, error: "Current LaTeX source context is required. Refresh the Overleaf pane before continuing." };
+  }
   const body = { message, autonomous, purpose };
+  if (sourceBundle) { body.source_bundle = sourceBundle; body.lea_status_version = 1; }
   if (sessionId) body.session_id = sessionId;
   if (projectSlug) {
     body.project_slug = projectSlug;
@@ -747,6 +737,7 @@ export async function runApiProofJob({
   focusSourceHash = null,
   newFormalization = null,
   purpose = "general",
+  sourceBundle = null,
   appendLog = null,
   logPath = null,
   onEvent = null,
@@ -773,6 +764,7 @@ export async function runApiProofJob({
     focusSourceHash,
     newFormalization,
     purpose,
+    sourceBundle,
   });
   if (!start.ok) return { ok: false, timedOut: false, error: start.error };
 
@@ -902,4 +894,20 @@ export async function runApiProofJob({
     error: outcome.ok ? undefined : outcome.error,
     ...usage,
   };
+}
+
+export function fetchCurrentLeaStatus({ fetchImpl, baseUrl, apiKey, formalizationId, sourceIdentityHash, sourceBundleHash }) {
+  const query = new URLSearchParams();
+  if (sourceIdentityHash) query.set("source_identity_hash", sourceIdentityHash);
+  if (sourceBundleHash) query.set("source_bundle_hash", sourceBundleHash);
+  return fetchJson(fetchImpl, `${baseUrl}/api/formalizations/${encodeURIComponent(formalizationId)}/lea-status?${query}`, {
+    method: "GET", headers: buildHeaders(apiKey)
+  });
+}
+export function fetchLeaStatusHistory({ fetchImpl, baseUrl, apiKey, formalizationId, after }) {
+  const query = new URLSearchParams({ limit: "50" });
+  if (after) query.set("after", after);
+  return fetchJson(fetchImpl, `${baseUrl}/api/formalizations/${encodeURIComponent(formalizationId)}/lea-status/updates?${query}`, {
+    method: "GET", headers: buildHeaders(apiKey)
+  });
 }

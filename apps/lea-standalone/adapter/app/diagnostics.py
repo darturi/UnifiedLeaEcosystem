@@ -92,6 +92,8 @@ CATALOG: dict[str, tuple[str, str | None]] = {
         "the project in the Projects hub.",
     ),
     # --- tools / steps (Phase C) ---
+    "status.publish_failed": ("Lea Status could not be saved", "The last accepted assessment is retained. Restore local storage before continuing corrections."),
+    "status.reporting_incomplete": ("Lea ended without a final status update", "Inspect the last assessment and its revision before resuming."),
     "tool.raised": ("A tool failed", None),
     "tool.unknown": (
         "The model called a tool that is not registered",

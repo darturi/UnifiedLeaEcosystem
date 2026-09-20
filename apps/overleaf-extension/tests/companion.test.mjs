@@ -1732,12 +1732,7 @@ test("records targetSyntax on the job for telemetry, defaulting to comment", asy
   assert.deepEqual(defaultState.jobs[defaultResult.body.jobId].formalizationSourceUses, []);
   assert.equal(
     defaultState.jobs[defaultResult.body.jobId].formalizationInputHash,
-    hashFormalizationInput({
-      targetKind: "theorem",
-      targetText: "A theorem.",
-      targetUses: [],
-      targetContext: ""
-    })
+    defaultState.jobs[defaultResult.body.jobId].sourceBundle.sourceIdentityHash
   );
   // Snapshot NOW, at the same just-created lifecycle point the tag job will
   // be snapshotted at -- the run continues in the background and starts
@@ -1766,7 +1761,7 @@ test("records targetSyntax on the job for telemetry, defaulting to comment", asy
   // targetKind/targetLabel/targetText/targetUses/targetContext produce
   // identical jobs apart from this one telemetry field and the inputs that
   // differ by construction (jobId/timestamps/label/jobKey/hash).
-  for (const key of ["jobId", "jobKey", "targetLabel", "targetSyntax", "targetTextHash", "startedAt", "logPath", "absolutePath", "relativePath", "declarationName"]) {
+  for (const key of ["jobId", "jobKey", "targetLabel", "targetSyntax", "targetTextHash", "formalizationInputHash", "sourceBundle", "sourceContext", "startedAt", "logPath", "absolutePath", "relativePath", "declarationName"]) {
     delete defaultJob[key];
     delete tagJob[key];
   }
@@ -1789,6 +1784,9 @@ test("lean pane manifest flags in-progress items for live polling", async () => 
   }, state);
   state.jobs[started.body.jobId].leaCurrentTurn = 7;
   state.jobs[started.body.jobId].leaMaxTurns = 20;
+  // The first live Lea Status event initializes this map. Manifest enrichment
+  // must continue to work after that mid-run transition.
+  state.leaStatuses = {};
 
   const res = await handleLeanPaneManifest({
     overleafProjectId: "project-1",
@@ -3906,6 +3904,7 @@ async function fileExists(filePath) {
 function makeLeaApiFetch(calls, options = {}) {
   let eventHookHandled = false;
   return async (url, requestOptions = {}) => {
+    if (String(url).endsWith("/api/health")) return jsonResponse(200, { capabilities: { lea_status: { version: 1, admission_enabled: true, independent_checks: false } } });
     if (String(url).endsWith("/api/settings")) {
       return jsonResponse(404, { detail: "not found" });
     }
@@ -4155,6 +4154,7 @@ function adapterSseResponse(frames) {
 
 function makeAdapterApiFetch(calls, options = {}) {
   return async (url, requestOptions = {}) => {
+    if (String(url).endsWith("/api/health")) return jsonResponse(200, { capabilities: { lea_status: { version: 1, admission_enabled: true, independent_checks: false } } });
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     calls.push({ url, options: requestOptions, body });
     if (String(url).endsWith("/api/runs") && requestOptions.method === "POST") {
@@ -4247,10 +4247,79 @@ test("formalize on the /api backend posts to /api/runs and runs autonomously (no
   assert.ok(runCall.body.message.includes("Lean namespace: Lea.RenamedProject"));
   assert.ok(runCall.body.message.includes("Overleaf binding: project-1"));
   assert.ok(runCall.body.message.includes("do not derive a namespace from the display name"));
+  assert.ok(runCall.body.message.includes("A missing proof alone is not a reason to pause"));
+  assert.ok(runCall.body.message.includes("Ordinary proof gaps, Lean encoding choices, and equivalent library-lemma substitutions are non-blocking"));
+  assert.ok(runCall.body.message.includes("abandoning an explicitly supplied proof's essential approach"));
   assert.ok(!runCall.body.message.includes("in project project-1"));
   assert.equal(runCall.body.project_title, "Renamed Project");
   assert.equal(runCall.body.project_namespace, "Lea.RenamedProject");
   assert.ok(!calls.some((c) => String(c.url).includes("/v1/")));
+});
+
+test("best-effort continuation is scoped to a proofless source-obstruction pause and changes the resumed prompt", async () => {
+  const leaRepo = await makeLeaRepo();
+  const calls = [];
+  const state = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch(calls)
+  });
+  state.jobs["paused-source-obstruction"] = {
+    jobId: "paused-source-obstruction",
+    jobKey: "project-1:theorem:compactness_criterion",
+    status: "paused",
+    stopReason: "source_obstruction",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    declarationName: "compactness_criterion",
+    leaSessionId: "sess-api-1",
+    formalizationId: "formalization-1",
+    sourceBundle: { proof: "", proofAssociation: { status: "missing" } },
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:00.000Z"
+  };
+
+  const result = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "compactness_criterion",
+    targetText: "Every open cover has a finite subcover.",
+    resume: true,
+    bestEffort: true,
+    sourceBundle: {
+      version: 2,
+      targetKey: "compactness_criterion",
+      targetKind: "theorem",
+      statement: "Every open cover has a finite subcover.",
+      proof: "",
+      proofAssociation: { status: "missing", method: "none" }
+    }
+  }, state);
+
+  assert.equal(result.statusCode, 200);
+  await waitFor(() => calls.some((c) => String(c.url).endsWith("/api/runs") && c.options?.method === "POST"));
+  const runCall = calls.find((c) => String(c.url).endsWith("/api/runs"));
+  assert.ok(runCall.body.message.includes("## Author-authorized best-effort continuation"));
+  assert.ok(runCall.body.message.includes("Do not pause again merely because that missing context or proof method must be inferred"));
+  const launchedJob = Object.values(state.jobs).find((job) => job.jobId !== "paused-source-obstruction");
+  assert.equal(launchedJob.bestEffort, true);
+  assert.equal(launchedJob.resumed, true);
+
+  const ineligibleState = await makeState({
+    leaRepoPath: leaRepo,
+    env: { OPENAI_API_KEY: "test-key" },
+    fetchImpl: makeAdapterApiFetch([])
+  });
+  const rejected = await handleFormalize({
+    overleafProjectId: "project-1",
+    targetKind: "theorem",
+    targetLabel: "fresh_target",
+    targetText: "A theorem.",
+    resume: true,
+    bestEffort: true
+  }, ineligibleState);
+  assert.equal(rejected.statusCode, 409);
+  assert.equal(rejected.body.error, "best_effort_not_available");
 });
 
 test("formalize fetches adapter identity after companion restart before composing the prompt", async () => {
@@ -5542,6 +5611,7 @@ test("github token update writes through to adapter settings and reports presenc
 // per-session detail/rebuild/lean-check calls the post-run cascade makes.
 function makeCascadeRunFetch(calls, { runSessionId = "sess-api-1", sessionDetails = {}, rebuildResponses = {} } = {}) {
   return async (url, requestOptions = {}) => {
+    if (String(url).endsWith("/api/health")) return jsonResponse(200, { capabilities: { lea_status: { version: 1, admission_enabled: true, independent_checks: false } } });
     const u = String(url);
     if (u.endsWith("/api/settings")) return jsonResponse(404, { detail: "not found" });
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;

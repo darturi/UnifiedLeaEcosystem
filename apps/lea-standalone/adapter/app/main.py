@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 from .db import init_db
-from .routes import (alignment_checks, custom_tools, formalizations, mcp_servers, projects, runs, search,
+from .routes import (alignment_checks, lea_status, custom_tools, formalizations, mcp_servers, projects, runs, search,
                      sessions, settings, skills, subagents)
 from . import alignment_store, bridge, github_import_service, netguard, store
 from .config import load_config
@@ -77,7 +77,8 @@ def startup() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True}
+    from .lea_status import admission_enabled
+    return {"ok": True, "capabilities": {"lea_status": {"version": 1, "admission_enabled": admission_enabled(), "independent_checks": False}}}
 
 
 app.include_router(sessions.router)
@@ -91,6 +92,7 @@ app.include_router(subagents.router)
 app.include_router(mcp_servers.router)
 app.include_router(custom_tools.router)
 app.include_router(alignment_checks.router)
+app.include_router(lea_status.router)
 
 
 # --- Static frontend (bundled / single-container deploy) --------------------

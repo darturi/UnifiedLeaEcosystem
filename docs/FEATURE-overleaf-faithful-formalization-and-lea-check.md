@@ -1,5 +1,7 @@
 # Feature: Faithful Overleaf Formalization and Dual Lean/Lea Checks
 
+**Planned replacement:** [Live Lea Status](FEATURE-overleaf-live-lea-status.md), with its [implementation plan](PLAN-overleaf-live-lea-status.md), replaces the separate evaluator with reporting during formalization. This document remains the record of the currently implemented behavior; the replacement is not yet implemented.
+
 **Status:** V1 pilot implemented; live calibration and release review pending  
 **Target release:** Pilot / V1  
 **Last updated:** 2026-09-12  

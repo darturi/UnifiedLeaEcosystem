@@ -8,6 +8,7 @@ today's stdout from them, a UI can render them live, and eval can collect them.
 from dataclasses import dataclass, field
 
 from .providers import Usage
+from .status_reporting import LeaStatusUpdateRequested, LeaStatusUpdateAck
 
 
 @dataclass(frozen=True)
@@ -242,6 +243,7 @@ class Finished:
 # Union of everything run_events() can yield — handy for type annotations.
 AgentEvent = (
     TurnStarted
+    | LeaStatusUpdateRequested
     | AssistantTextDelta
     | ToolCalled
     | ToolResulted

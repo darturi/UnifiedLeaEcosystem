@@ -9,10 +9,12 @@ so existing callers (CLI, eval) keep working unchanged.
 import contextvars
 import json
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .status_reporting import TOOL_NAME, validate_payload, LeaStatusUpdateRequested, LeaStatusUpdateAck
 from .config import LeaConfig
 from . import condenser
 from . import diagnostics
@@ -236,7 +238,7 @@ def _content_text(content) -> str:
 
 def _latest_user_request(messages: list) -> str:
     for msg in reversed(messages):
-        if msg.get("role") != "user":
+        if msg.get("role") != "user" or msg.get("lea_status_context"):
             continue
         text = _content_text(msg.get("content")).strip()
         if text:
@@ -691,6 +693,9 @@ def _run_events_inner(
     # tools register, then select per config (None → all registered tools).
     import_tool_modules(config.tool_modules)
     tools_schema, tool_handlers = build_toolset(config.tools, config.extra_tools)
+    if config.status_reporting:
+        tools_schema = [schema for schema in tools_schema if schema["name"] != "spawn_subagent"]
+        tool_handlers.pop("spawn_subagent", None)
 
     # Stateless (D16): the caller owns the transcript. Work on a private copy so we
     # never mutate the caller's list in place; the final state rides out via the
@@ -698,6 +703,10 @@ def _run_events_inner(
     # accumulates across activations. The adapter owns session identity; we only
     # generate a label if it didn't pass one (e.g. a standalone/test call).
     messages = list(messages)
+    status_context = dict(config.status_context)
+    last_status_at = time.monotonic()
+    tools_since_status = 0
+    reporting_stop = None
     if session_id is None:
         session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     total_usage = Usage()
@@ -757,6 +766,13 @@ def _run_events_inner(
                            turn, session_id, model, total_usage, total_cost, transcript(turn))
             return
 
+        if config.status_reporting and ((config.max_turns and turn >= config.max_turns)
+                or (config.max_cost_usd is not None and total_cost >= config.max_cost_usd)):
+            reason = "max_cost" if config.max_cost_usd is not None and total_cost >= config.max_cost_usd else "max_turns"
+            yield Finished(reason, "Run budget reached; last Lea Status retained.", turn,
+                           session_id, model, total_usage, total_cost, transcript(turn))
+            return
+
         # Context compaction (G1): before spending another turn, if the last turn's real
         # input size crossed the trigger, condense the model-facing history — prune
         # superseded tool outputs, then summarize the older middle only if that's not
@@ -787,12 +803,13 @@ def _run_events_inner(
         # flows here via `max_cost_usd`); None → uncapped, so top-level runs are unaffected.
         cost_capped = config.max_cost_usd is not None and total_cost >= config.max_cost_usd
         if (config.max_turns and turn > config.max_turns) or cost_capped:
-            if cost_capped:
+            if cost_capped or config.status_reporting:
                 # A cost boundary must not trigger another paid request. Preserve the
                 # transcript and partial artifact and let the caller present Resume.
                 yield Finished(
-                    "max_cost",
-                    "Reached the run cost budget without completing the task.",
+                    "max_cost" if cost_capped else "max_turns",
+                    ("Reached the run budget; the last Lea Status and partial artifact are retained."
+                     if config.status_reporting else "Reached the run cost budget without completing the task."),
                     turn - 1,
                     session_id,
                     model,
@@ -826,6 +843,13 @@ def _run_events_inner(
                            turn - 1, session_id, model, total_usage, total_cost, transcript(turn - 1))
             return
 
+        if config.status_reporting:
+            messages = [m for m in messages if not m.get("lea_status_context")]
+            due = tools_since_status >= 5 or time.monotonic() - last_status_at >= 60
+            reminder = " Publish a useful update_lea_status at this opportunity." if due else ""
+            messages.append({"role": "user", "lea_status_context": True, "content":
+                "Retained Lea Status context (not a new mathematical request): "
+                + json.dumps(status_context, ensure_ascii=False) + reminder})
         yield TurnStarted(turn)
 
         assistant_parts = []
@@ -902,7 +926,7 @@ def _run_events_inner(
 
         if not tool_calls:
             text = "".join(p["text"] for p in assistant_parts if p["type"] == "text")
-            if assistant_mode:
+            if assistant_mode or (config.prompt_variant == "overleaf_continuation" and not proof_state.latest_proof_path):
                 # Chat/assistant turn — not a formalization run, so skip the
                 # final proof gate entirely.
                 yield Finished("assistant", text or "(no response)", turn, session_id, model,
@@ -1081,6 +1105,9 @@ def _run_events_inner(
                         "message, explain to the user what you were about to do and why, then ask how "
                         "they'd like to proceed — and wait for their reply before acting."
                     )
+            elif tc["name"] == "spawn_subagent" and config.status_reporting:
+                refused_idx.add(idx)
+                results_by_idx[idx] = "Error: delegated work is unavailable in source-bound status runs; perform the work in this run."
             elif tc["name"] == "spawn_subagent":
                 try:
                     plan = subagents.prepare_spawn(tc["args"])
@@ -1110,11 +1137,14 @@ def _run_events_inner(
             else:
                 serial_calls.append((idx, tc))
 
+        emitted_idx: set[int] = set()
+        material_publication_rejected = False
+
         # Phase 2 — non-spawn tools. E3: if a turn issues several INDEPENDENT read-only
         # tools, run them concurrently (a real win for F1's multi-modal search); otherwise
         # execute inline in order (any writer/checker/bash — a write→check pair must not
         # be reordered).
-        if len(serial_calls) > 1 and all(tc["name"] in _PARALLEL_SAFE_TOOLS for _i, tc in serial_calls):
+        if not config.status_reporting and len(serial_calls) > 1 and all(tc["name"] in _PARALLEL_SAFE_TOOLS for _i, tc in serial_calls):
             out: dict[int, str] = {}
             threads = []
             for _i, _tc in serial_calls:
@@ -1128,7 +1158,46 @@ def _run_events_inner(
             results_by_idx.update(out)
         else:
             for idx, tc in serial_calls:
-                results_by_idx[idx] = _exec_tool(tc)
+                if config.status_reporting and material_publication_rejected and tc["name"] != TOOL_NAME:
+                    refused_idx.add(idx)
+                    results_by_idx[idx] = "Error: tool deferred because the preceding material Lea Status update was rejected. Publish the finding successfully before continuing."
+                    continue
+                if config.status_reporting and (reporting_stop or (should_stop and should_stop())):
+                    reporting_stop = reporting_stop or "interrupted"
+                    refused_idx.add(idx)
+                    results_by_idx[idx] = "Error: tool canceled because the run was paused."
+                    continue
+                if tc["name"] == TOOL_NAME and config.status_reporting:
+                    try:
+                        payload = validate_payload(tc["args"])
+                        ack = yield LeaStatusUpdateRequested(payload, f"{turn}:{idx}:{tc.get('id') or ''}")
+                        if not isinstance(ack, LeaStatusUpdateAck):
+                            raise ValueError("Reporting host did not acknowledge publication")
+                        if not ack.accepted:
+                            reporting_stop = ack.stop_reason
+                            raise ValueError(ack.error or "Publication failed")
+                        result = json.dumps({"accepted": True, "update_id": ack.update_id, "sequence": ack.sequence})
+                        status_context["assessment"] = ack.assessment
+                        status_context.pop("previous_assessment", None)
+                        last_status_at = time.monotonic()
+                        tools_since_status = 0
+                        reporting_stop = ack.stop_reason
+                        material_publication_rejected = False
+                    except (ValueError, TypeError) as exc:
+                        attempted_findings = tc["args"].get("finding_updates", []) if isinstance(tc["args"], dict) else []
+                        material_publication_rejected = isinstance(attempted_findings, list) and any(
+                            isinstance(f, dict) and f.get("severity") in {"warning", "blocking"} for f in attempted_findings)
+                        result = f"Error: {exc}"
+                else:
+                    result = _exec_tool(tc)
+                    tools_since_status += 1
+                results_by_idx[idx] = result
+                if config.status_reporting:
+                    yield ToolResulted(tc["name"], result, result[:200])
+                    for ev in _meaning_events(tc["name"], tc["args"], result):
+                        yield ev
+                    proof_state.note_tool_result(tc["name"], tc["args"], result)
+                    emitted_idx.add(idx)
 
         # Phase 3 — E2: run this turn's spawns concurrently, streaming all their live
         # events up as they arrive (the coordinator's model context stays isolated —
@@ -1153,11 +1222,12 @@ def _run_events_inner(
         for idx, tc in enumerate(tool_calls):
             result = results_by_idx.get(idx, f"Error: tool '{tc['name']}' produced no result")
             preview = result[:200] + "..." if len(result) > 200 else result
-            yield ToolResulted(tc["name"], result, preview)
+            if idx not in emitted_idx:
+                yield ToolResulted(tc["name"], result, preview)
             # A refused call had no effect, so it has no meaning events and must not
             # move the proof state — otherwise a denied write marks the proof as
             # freshly written and due a check.
-            if idx not in refused_idx:
+            if idx not in refused_idx and idx not in emitted_idx:
                 for ev in _meaning_events(tc["name"], tc["args"], result):
                     yield ev
                 proof_state.note_tool_result(tc["name"], tc["args"], result)
@@ -1181,3 +1251,7 @@ def _run_events_inner(
                 yield child_result.to_event()
 
         messages.append({"role": "user", "content": tool_results})
+        if reporting_stop:
+            yield Finished(reporting_stop, "Formalization paused; inspect the latest Lea Status for details.",
+                           turn, session_id, model, total_usage, total_cost, transcript(turn))
+            return

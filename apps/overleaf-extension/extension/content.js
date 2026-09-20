@@ -2079,6 +2079,12 @@
     if (!leanPaneBody || !leanPaneStatus) return;
     manifest = githubImportPaneOverlay(manifest);
     const prevScrollTop = leanPaneBody.scrollTop;
+    const statusFocus = document.activeElement?.closest?.(".ol-lean-live-status") ? document.activeElement : null;
+    const selection = document.getSelection?.();
+    // Defer this refresh while the author is selecting status text. The next
+    // normal poll applies it after selection clears without destroying the range.
+    const selectedElement = selection?.anchorNode?.parentElement;
+    if (!selection?.isCollapsed && selectedElement?.closest?.(".ol-lean-live-status")) return;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
     const tree = leanPaneView.buildLeanPaneTree(items);
     const useRelationships = leanPaneView.buildPaneUseRelationships(items);
@@ -2130,6 +2136,7 @@
       leanPaneBody.appendChild(treeElement);
     }
 
+    if (statusFocus?.isConnected) statusFocus.focus({ preventScroll: true });
     leanPaneBody.scrollTop = prevScrollTop;
   }
 
@@ -2765,7 +2772,7 @@
     const checks = document.createElement("span");
     checks.className = "ol-lean-project-checks";
     checks.appendChild(renderProjectCheckChip("Lean Check", item.leanCheck?.status || "unformalized", "lean"));
-    checks.appendChild(renderProjectCheckChip("Lea Check", item.leaCheck?.status || "N/A", "lea"));
+    checks.appendChild(renderProjectCheckChip("Lea Status", leanPaneView.leaStatusLabel(item.leaStatus), "lea"));
     header.appendChild(checks);
     // Same amber "!" the document overlay's badge shows for a proof whose
     // imports are currently sorry-stubbed -- the pane item and the doc badge
@@ -2781,6 +2788,27 @@
       headerRow.appendChild(createHumanApprovalButton(paneItemApprovalTarget(item), item, { pane: true }));
     }
     card.appendChild(headerRow);
+    card.appendChild(leanPaneView.renderLeaStatus(item, { document,
+      loadHistory: async (target, after) => {
+        const baseUrl = await chatCompanionBaseUrl();
+        const query = new URLSearchParams({ formalizationId: target.formalizationId });
+        if (after) query.set("after", after);
+        const response = await fetch(`${baseUrl}/lean-pane/lea-status/updates?${query}`);
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.message || payload.error || "Could not load Lea Status history.");
+        return payload;
+      },
+      pause: async (target) => {
+        const baseUrl = await chatCompanionBaseUrl();
+        const response = await fetch(`${baseUrl}/lean-pane/chat/interrupt`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ runId: target.leaStatus.run_id, sessionId: target.leaSessionId })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.message || payload.error || "Could not pause this run.");
+        await refreshLeanPaneNow({ background: true });
+      }
+    }));
 
     const natural = document.createElement("p");
     natural.className = "ol-lean-project-natural";
@@ -2970,7 +2998,7 @@
       detail.appendChild(review);
     }
 
-    detail.appendChild(renderLeaCheckReport(item));
+    if (item.leaCheck?.report) detail.appendChild(renderLeaCheckReport(item));
 
     if (editing) {
       detail.appendChild(renderLeanPaneEditControls(item));
@@ -3016,8 +3044,8 @@
         ].filter(Boolean).join(" · ")
       : "";
     const headingSummary = reportSummary
-      ? `Lea Check report — ${check.status}: ${reportSummary}`
-      : `Lea Check report — ${check.status}`;
+      ? `Previous Lea Check report — ${check.status}: ${reportSummary}`
+      : `Previous Lea Check report — ${check.status}`;
     heading.textContent = reportMetadata ? `${headingSummary} · ${reportMetadata}` : headingSummary;
     container.appendChild(heading);
 
@@ -3092,34 +3120,6 @@
       body.appendChild(empty);
     }
 
-    if (["warning", "error", "paused"].includes(check.status) && check.id) {
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ol-lean-secondary-button ol-lean-lea-check-retry";
-      retry.textContent = "Retry Lea Check";
-      retry.addEventListener("click", async (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        retry.disabled = true;
-        retry.textContent = "Starting…";
-        try {
-          const baseUrl = await chatCompanionBaseUrl();
-          const response = await fetch(`${baseUrl}/lean-check/retry`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ checkId: check.id })
-          });
-          const payload = await response.json().catch(() => ({}));
-          if (!response.ok) throw companionRequestError(response, payload);
-          await refreshLeanPaneNow({ background: true });
-        } catch (error) {
-          retry.disabled = false;
-          retry.textContent = "Retry Lea Check";
-          retry.title = normalizeErrorMessage(error);
-        }
-      });
-      body.appendChild(retry);
-    }
     container.appendChild(body);
     return container;
   }
@@ -4216,13 +4216,14 @@
   // Item 12: start a formalization run for this item, reusing the same /formalize
   // path the in-document badge uses, then refresh so the pane reflects in-progress
   // (polling, from item 4, takes over until it settles).
-  function renderFormalizeButton(item) {
+  function renderFormalizeButton(item, action = { id: "formalize" }) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "ol-lean-secondary-button ol-lean-item-primary-action ol-lean-formalize-button";
-    const idleLabel = item.leanCheck?.status === "paused"
+    const bestEffort = action.id === "best-effort";
+    const idleLabel = action.label || (item.leanCheck?.status === "paused"
       ? "Resume"
-      : item.status === "missing-stub" ? "Formalize" : "Re-formalize";
+      : item.status === "missing-stub" ? "Formalize" : "Re-formalize");
     button.textContent = idleLabel;
     button.addEventListener("click", async (event) => {
       event.preventDefault();
@@ -4233,7 +4234,8 @@
       try {
         await formalize({
           ...leanPaneView.paneItemToFormalizeTarget(item),
-          resume: item.leanCheck?.status === "paused"
+          resume: item.leanCheck?.status === "paused",
+          bestEffort
         });
         clearLeanPaneActionError(item);
         await refreshLeanPaneNow({ background: true });
@@ -4242,7 +4244,7 @@
         // declared upstream theorem has not been formalized yet). Keep the
         // action consistent with the manifest state rather than implying an
         // initial formalization effort occurred.
-        rememberLeanPaneActionError(item, error, "formalize");
+        rememberLeanPaneActionError(item, error, action.id);
         renderLeanPaneManifest(lastLeanPaneManifest);
       }
     });
@@ -4263,7 +4265,7 @@
   };
 
   function renderPaneItemPrimaryAction(item, action) {
-    return action.id === "repair" ? renderRepairButton(item) : renderFormalizeButton(item);
+    return action.id === "repair" ? renderRepairButton(item) : renderFormalizeButton(item, action);
   }
 
   function renderPaneItemIconAction(item, action) {
@@ -4363,7 +4365,7 @@
       openLeanPaneEdit(item);
       return;
     }
-    if (action.id !== "formalize" && action.id !== "stub") return;
+    if (!["formalize", "best-effort", "stub"].includes(action.id)) return;
     clearLeanPaneActionError(item);
     if (leanPaneStatus) {
       leanPaneStatus.textContent = action.id === "stub"
@@ -4371,7 +4373,11 @@
         : "Starting formalization...";
     }
     try {
-      const target = leanPaneView.paneItemToFormalizeTarget(item);
+      const target = {
+        ...leanPaneView.paneItemToFormalizeTarget(item),
+        resume: item.leanCheck?.status === "paused",
+        bestEffort: action.id === "best-effort"
+      };
       await (action.id === "stub" ? stubTheorem(target) : formalize(target));
       clearLeanPaneActionError(item);
       await refreshLeanPaneNow({ background: true });
@@ -5792,6 +5798,7 @@
         projectNamespace: lastProjectIdentity?.namespace || "",
         sourceHash: await sha256(normalizeTargetText(target.targetText)),
         resume: target.resume === true,
+        bestEffort: target.bestEffort === true,
         ...sourceContext
       })
     });

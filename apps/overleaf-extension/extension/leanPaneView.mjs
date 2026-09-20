@@ -1,3 +1,4 @@
+export { renderLeaStatus, leaStatusLabel } from "./leaStatusView.mjs";
 // Pure, DOM-free helpers for the Overleaf Lean project pane.
 //
 // These live in their own module so they can be unit-tested directly: the content
@@ -461,6 +462,21 @@ export function canFormalizePaneItem(item) {
   return item.status !== "in-progress";
 }
 
+// A source-obstruction pause may be continued under an explicit, one-run
+// best-effort policy when there is no associated author proof to preserve.
+// Keep this narrow: an ambiguous proof association means there *is* source
+// proof evidence and Lea must not silently choose between competing methods.
+export function canContinueBestEffort(item) {
+  if (!canFormalizePaneItem(item) || item?.status !== "paused") return false;
+  const stopReason = item?.leanCheck?.stopReason
+    || item?.leaStatus?.activity?.stop_reason
+    || item?.stopReason;
+  if (stopReason !== "source_obstruction") return false;
+  const bundle = item?.sourceBundle;
+  if (!bundle || String(bundle.proof || "").trim()) return false;
+  return ["missing", "not_applicable"].includes(bundle.proofAssociation?.status);
+}
+
 // Whether the pane should offer a sorry-stub action for an item. Mirrors the
 // in-document popover rule: stubbing only applies to a theorem with no Lean
 // artifact yet — definitions always get a full body, and once a stub or proof
@@ -669,14 +685,22 @@ export function canEditPaneItem(item) {
 // Copy actions are absent by design: they belong on the code blocks they copy.
 export function paneItemActions(item, { editing = false } = {}) {
   const canFormalize = canFormalizePaneItem(item);
+  const canBestEffort = canContinueBestEffort(item);
   const formalizeAction = {
     id: "formalize",
-    label: item?.status === "missing-stub" ? "Formalize" : item?.status === "paused" ? "Resume" : "Re-formalize"
+    label: item?.status === "missing-stub"
+      ? "Formalize"
+      : item?.status === "paused"
+        ? canBestEffort ? "Resume faithfully" : "Resume"
+        : "Re-formalize"
   };
+  const bestEffortAction = { id: "best-effort", label: "Continue best effort" };
 
   let primary = null;
   if (!editing && canRepairPaneItem(item)) {
     primary = { id: "repair", label: "Repair with Lea" };
+  } else if (!editing && canBestEffort) {
+    primary = bestEffortAction;
   } else if (!editing && canFormalize) {
     primary = formalizeAction;
   }
@@ -686,7 +710,8 @@ export function paneItemActions(item, { editing = false } = {}) {
   if (canViewPaneItemInLeaUi(item)) rail.push({ id: "view-in-lea", label: "Open in Lea UI" });
 
   const overflow = [];
-  if (primary?.id === "repair" && canFormalize) overflow.push(formalizeAction);
+  if (primary?.id === "repair" && canBestEffort) overflow.push(bestEffortAction);
+  if (["repair", "best-effort"].includes(primary?.id) && canFormalize) overflow.push(formalizeAction);
   if (canStubPaneItem(item)) overflow.push({ id: "stub", label: "Stub" });
   if (!editing && canEditPaneItem(item)) overflow.push({ id: "edit", label: "Edit" });
 

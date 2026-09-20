@@ -3385,3 +3385,14 @@ body.ol-lean-settings-resizing {
   padding-top: 4px;
   padding-bottom: 4px;
 }
+
+/* Live assessment is distinct from the compiler result. */
+.ol-lean-live-status { padding: 8px 12px; border-top: 1px solid var(--ol-lean-border, #ddd); }
+.ol-lean-live-status p { margin: 5px 0; overflow-wrap: anywhere; }
+.ol-lean-live-status-meta { font-size: 11px; opacity: .8; }
+.ol-lean-live-status details { margin-top: 6px; }
+.ol-lean-live-status summary { cursor: pointer; }
+.ol-lean-live-status pre { font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ol-lean-lea-check-finding-blocking { border-left: 3px solid #b45309; padding-left: 8px; }
+
+.ol-lean-status-announcement { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

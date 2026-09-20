@@ -71,6 +71,8 @@ class RunRequest(BaseModel):
     focus_source_hash: str | None = None
     new_formalization: NewFormalizationRequest | None = None
     purpose: str = "general"
+    source_bundle: dict | None = None
+    lea_status_version: int | None = None
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -189,8 +191,18 @@ def create_run(request: RunRequest) -> dict:
 
     autonomous = request.autonomous or (permission_tier() == "none")
     purpose = str(request.purpose or "general").strip().lower()
-    if purpose not in {"general", "overleaf_solver", "overleaf_alignment"}:
+    if purpose not in {"general", "overleaf_solver", "overleaf_continuation"}:
         raise HTTPException(status_code=422, detail="Unsupported run purpose")
+    if request.lea_status_version is not None and request.lea_status_version != 1:
+        raise HTTPException(status_code=422, detail="Unsupported Lea Status contract")
+    if purpose in {"overleaf_solver", "overleaf_continuation"}:
+        from ..lea_status import admission_enabled
+        if not admission_enabled():
+            raise HTTPException(status_code=503, detail="Live Lea Status admissions are disabled")
+        if request.source_bundle is None or request.lea_status_version != 1:
+            raise HTTPException(status_code=422, detail="Update the Overleaf companion: this run requires a source bundle and Lea Status v1")
+    elif request.source_bundle is not None:
+        raise HTTPException(status_code=422, detail="Source reporting requires an Overleaf run purpose")
     new_formalization = (
         request.new_formalization.model_dump()
         if request.new_formalization is not None else None
@@ -213,6 +225,7 @@ def create_run(request: RunRequest) -> dict:
             focus_source_hash=focus_source_hash,
             new_formalization=new_formalization,
             purpose=purpose,
+            source_bundle=request.source_bundle,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

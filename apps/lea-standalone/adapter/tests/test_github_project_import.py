@@ -105,7 +105,7 @@ def _source_bundle(label: str) -> dict:
     return payload
 
 
-def test_import_starts_one_semantic_lea_check_per_matched_declaration(tmp_path, monkeypatch):
+def test_import_checks_lean_and_retains_source_without_independent_evaluator(tmp_path, monkeypatch):
     proofs_root = _setup(tmp_path, monkeypatch)
     project = projects.provision_project("Destination", proofs_root)
     source_repo = _git_repo(
@@ -149,18 +149,6 @@ def test_import_starts_one_semantic_lea_check_per_matched_declaration(tmp_path, 
         return SimpleNamespace(status="ok", detail="checked")
 
     monkeypatch.setattr(github_import_service, "interface_check", check)
-    monkeypatch.setattr(
-        github_import_service.alignment_checks_service,
-        "load_config",
-        lambda: SimpleNamespace(
-            model="test/model", model_kwargs={}, max_spend_usd=None
-        ),
-    )
-    monkeypatch.setattr(
-        github_import_service.alignment_checks_service._EXECUTOR,
-        "submit",
-        lambda *args, **kwargs: evaluator_submissions.append((args, kwargs)),
-    )
 
     preview = github_import_service.preview_import(
         project=project,
@@ -176,7 +164,7 @@ def test_import_starts_one_semantic_lea_check_per_matched_declaration(tmp_path, 
     github_import_service._check_import(progress["id"], proofs_root)
 
     assert len(lean_checks) == 1
-    assert len(evaluator_submissions) == 2
+    assert len(evaluator_submissions) == 0
     for name in ("first", "second"):
         formalization = store.find_formalization_by_declaration(
             project_id=project["id"],
@@ -184,9 +172,7 @@ def test_import_starts_one_semantic_lea_check_per_matched_declaration(tmp_path, 
             declaration_name=name,
         )
         history = alignment_store.history(formalization["id"])
-        assert len(history) == 1
-        assert history[0]["trigger"] == "github_import"
-        assert history[0]["source_bundle"]["targetKey"] == name
+        assert history == []
     finished = store.github_import_progress(progress["id"])
     assert finished["status"] == "complete"
     assert "targets_json" not in finished

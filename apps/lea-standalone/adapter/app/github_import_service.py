@@ -14,7 +14,6 @@ from uuid import uuid4
 
 from lea.interface import check as interface_check
 
-from . import alignment_checks as alignment_checks_service
 from . import formalizations as formalizations_service
 from . import store
 from .alignment_schemas import SourceBundle
@@ -525,42 +524,6 @@ def _matching_import_target(
     return by_name[0] if len(by_name) == 1 else None
 
 
-def _start_import_alignment_checks(imported: dict, progress: dict | None) -> list[str]:
-    """Start one idempotent semantic Lea Check per matched formalization.
-
-    The source bundles live on the durable import row rather than in the preview
-    registry, so a restarted adapter can finish the same work. The alignment
-    service deduplicates the exact source/artifact/dependency revision tuple.
-    """
-    targets = _stored_targets(imported)
-    if not targets or not progress:
-        return []
-    errors: list[str] = []
-    seen: set[str] = set()
-    for declaration in progress.get("declarations", []):
-        formalization_id = str(declaration.get("formalization_id") or "")
-        if not formalization_id or formalization_id in seen:
-            continue
-        formalization = store.get_formalization(formalization_id)
-        if not formalization:
-            continue
-        target = _matching_import_target(declaration, formalization, targets)
-        if not target or not target.source_bundle:
-            continue
-        seen.add(formalization_id)
-        try:
-            alignment_checks_service.start(
-                formalization_id,
-                SourceBundle.model_validate(target.source_bundle),
-                trigger="github_import",
-                solver_run_id=None,
-            )
-        except Exception as exc:
-            label = target.display_title or target.declaration_name or formalization_id
-            errors.append(f"{label}: {exc}")
-    return errors
-
-
 def _check_import(import_id: str, proofs_root: Path) -> None:
     try:
         imported = store.get_github_import(import_id)
@@ -613,19 +576,7 @@ def _check_import(import_id: str, proofs_root: Path) -> None:
                 continue
             if declaration_contains_sorry(content, declaration["full_name"]):
                 issues = True
-        alignment_errors = _start_import_alignment_checks(imported, progress)
         error_detail = None
-        if alignment_errors:
-            issues = True
-            details: dict = {}
-            if imported.get("error_detail"):
-                try:
-                    parsed = json.loads(imported["error_detail"])
-                    details = parsed if isinstance(parsed, dict) else {"import_detail": parsed}
-                except (TypeError, json.JSONDecodeError):
-                    details = {"import_detail": imported["error_detail"]}
-            details["lea_check_errors"] = alignment_errors
-            error_detail = json.dumps(details, ensure_ascii=False)
         store.set_github_import_status(
             import_id,
             "complete_with_issues" if issues else "complete",

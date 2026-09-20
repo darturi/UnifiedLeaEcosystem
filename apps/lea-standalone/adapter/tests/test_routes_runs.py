@@ -95,7 +95,8 @@ def test_create_run_persists_an_overleaf_solver_purpose(tmp_path, monkeypatch):
     result = runs_route.create_run(RunRequest(
         message="translate faithfully",
         autonomous=True,
-        purpose="overleaf_solver",
+        purpose="overleaf_solver", source_bundle=__import__("test_lea_status").bundle(), lea_status_version=1,
+        new_formalization=NewFormalizationRequest(display_title="target", origin="overleaf", origin_key="doc:theorem:target"),
     ))
     assert store.get_run(result["run_id"])["purpose"] == "overleaf_solver"
 

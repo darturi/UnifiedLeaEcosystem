@@ -882,3 +882,7 @@ def safe_verify(args: dict) -> str:
 # `opt_in=True`, so build_toolset(None) never includes it — existing runs are
 # byte-identical, and a subagent's own default toolset can't contain it.
 from . import subagents as _subagents  # noqa: E402,F401
+
+# Host-mediated, opt-in: unavailable to ordinary CLI/LeaChat runs.
+from .status_reporting import TOOL_SCHEMA as _STATUS_SCHEMA, unsupported_handler as _status_handler
+register(Tool(name="update_lea_status", schema=_STATUS_SCHEMA, handler=_status_handler, opt_in=True))

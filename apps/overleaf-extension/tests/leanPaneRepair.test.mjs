@@ -76,6 +76,7 @@ function makeRepairFetch(calls, { sessionDetails = {}, rebuildResponses = {}, on
   let runCounter = 0;
   return async (url, requestOptions = {}) => {
     const u = String(url);
+    if (u.endsWith("/api/health")) return jsonResponse(200, { capabilities: { lea_status: { version: 1, admission_enabled: true } } });
     if (u.endsWith("/api/settings")) return jsonResponse(404, { detail: "not found" });
     const body = requestOptions.body ? JSON.parse(requestOptions.body) : null;
     calls.push({ url: u, method: requestOptions.method || "GET", body });
@@ -139,6 +140,8 @@ const BREAKAGE = {
 // references the OLD name.
 function brokenDependentJob(overrides = {}) {
   return {
+    sourceBundle: { version: 2, targetKey: "compactness_corollary", targetKind: "theorem", statement: "True", proof: "Use the criterion.", bundleHash: "a".repeat(64), sourceIdentityHash: "b".repeat(64) },
+    formalizationId: "form-dependent",
     jobId: "job-dependent",
     jobKey: "project-1:theorem:compactness_corollary",
     status: "formalized",

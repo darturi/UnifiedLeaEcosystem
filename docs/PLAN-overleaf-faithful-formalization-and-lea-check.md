@@ -1,5 +1,7 @@
 # Implementation Plan: Faithful Overleaf Formalization and Dual Lean/Lea Checks
 
+**Planned replacement:** Follow the [Live Lea Status implementation plan](PLAN-overleaf-live-lea-status.md) for new work under the [Live Lea Status feature specification](FEATURE-overleaf-live-lea-status.md). The implementation record below describes the existing evaluator-based flow; its replacement is not yet implemented.
+
 **Status:** V1 pilot core implemented; calibration and release gates pending.
 
 **Date:** 2026-09-12

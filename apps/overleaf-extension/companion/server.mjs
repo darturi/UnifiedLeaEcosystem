@@ -1,3 +1,5 @@
+import { acceptStatusEvent } from "./leaStatus.mjs";
+import { normalizeLeaStatus } from "../shared/leaStatus.mjs";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import http from "node:http";
@@ -65,6 +67,7 @@ import {
   fetchAdapterModelCatalog,
   fetchAdapterModelRequirements,
   fetchAdapterSettings,
+  fetchAdapterHealth,
   fetchAdapterUsageStats,
   fetchApiSessionDetail,
   fetchProjectArtifactsBySlug,
@@ -88,9 +91,9 @@ import {
   runApiSessionLeanCheck,
   rebuildApiSessionModule,
   setProjectRemoteBySlug,
-  startAlignmentCheck,
+  fetchCurrentLeaStatus,
+  fetchLeaStatusHistory,
   fetchCurrentAlignmentCheck,
-  retryAlignmentCheck,
   updateProjectIdentityBySlug,
   writeApiSessionFile
 } from "./leaApiClient.mjs";
@@ -329,17 +332,6 @@ export async function handleFormalize(payload, state) {
   if (payload.sourceHash && payload.sourceHash !== expectedHash) {
     return errorResponse(400, "source_hash_mismatch", "sourceHash does not match targetText.");
   }
-  if (
-    targetKind === "theorem"
-    && sourceBundleProvided
-    && sourceContext.sourceBundle?.proofAssociation?.status !== "associated"
-  ) {
-    return errorResponse(
-      422,
-      "source_proof_required",
-      "No unambiguous LaTeX proof is associated with this theorem. Add an adjacent proof or `% lea: proof-for=<label>`; Lea will not invent an unrelated method."
-    );
-  }
   const mirrorValidation = validateMirroredSource({ state, overleafProjectId, sourceContext });
   if (!mirrorValidation.ok) {
     return errorResponse(409, mirrorValidation.error, mirrorValidation.message);
@@ -373,6 +365,22 @@ export async function handleFormalize(payload, state) {
       statusCode: 200,
       body: buildJobResponse({ job: activeJob, status: "in_progress", target })
     };
+  }
+  const resume = payload.resume === true;
+  const bestEffort = payload.bestEffort === true;
+  if (bestEffort) {
+    const pausedJob = findLatestFinishedJob(state.jobs || {}, target.jobKey);
+    const eligible = resume
+      && pausedJob?.status === "paused"
+      && pausedJob?.stopReason === "source_obstruction"
+      && sourceBundleHasNoAssociatedProof(sourceContext.sourceBundle);
+    if (!eligible) {
+      return errorResponse(
+        409,
+        "best_effort_not_available",
+        "Best-effort continuation is available only after a source-obstruction pause when no author proof is associated with the current target."
+      );
+    }
   }
 
   const usesResolution = await resolveTheoremUses({
@@ -416,7 +424,6 @@ export async function handleFormalize(payload, state) {
         jobs: state.jobs || {}
       })
     : null;
-  const resume = payload.resume === true;
   const cleanup = resume || reusableStub
     ? { removedProofPaths: [], removedProjectEntries: [] }
     : await cleanupPreviousRunArtifacts({
@@ -434,7 +441,8 @@ export async function handleFormalize(payload, state) {
     targetSyntax,
     sourceContext: { ...sourceContext, mirrorRevision: mirrorValidation.mirrorRevision || null },
     sourceUses: targetUses,
-    resolvedUses: usesResolution.resolvedUses
+    resolvedUses: usesResolution.resolvedUses,
+    bestEffort
   });
   // Only the parsed header + module identity ride on the job (persisted with
   // jobs.json); never the full file content -- see snapshotPreRunLeanState.
@@ -1247,24 +1255,16 @@ export async function handleLeanPaneManifest(payload, state) {
 }
 
 export async function handleLeaCheckRetry(payload, state) {
-  const checkId = String(payload?.checkId || "").trim();
-  if (!checkId) return errorResponse(400, "missing_check_id", "checkId is required.");
-  let baseUrl;
-  try {
-    baseUrl = normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
-  } catch {
-    return errorResponse(400, "invalid_lea_api_url", "Lea API base URL must be an absolute http(s) URL.");
-  }
-  const result = await retryAlignmentCheck({
-    fetchImpl: state.fetchImpl || fetch,
-    baseUrl,
-    checkId
-  });
-  if (!result.ok) {
-    return errorResponse(result.status || 502, "lea_check_retry_failed", adapterDetail(result, "Could not retry Lea Check."));
-  }
-  publishEvent(state, "jobs-changed", { checkId });
-  return { statusCode: 202, body: result.body };
+  return errorResponse(410, "lea_check_retired", "Lea Status is updated during formalization. Independent Lea Check is retired.");
+}
+
+export async function handleLeaStatusHistory(payload, state) {
+  const formalizationId = String(payload?.formalizationId || "");
+  if (!formalizationId) return errorResponse(400, "missing_formalization", "A formalization is required.");
+  const result = await fetchLeaStatusHistory({ fetchImpl: state.fetchImpl || fetch,
+    baseUrl: normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL),
+    apiKey: state.env?.LEA_API_KEY, formalizationId, after: payload.after });
+  return { statusCode: result.ok ? 200 : result.status || 502, body: result.body || { error: result.error } };
 }
 
 // Order-preserving bounded-concurrency map. `fn` is expected to resolve (Lean-pane
@@ -1308,7 +1308,7 @@ function normalizeChatTarget(rawTarget, state) {
     .map((value) => String(value || "").trim())
     .filter(Boolean);
   const targetContext = String(rawTarget?.targetContext || "");
-  const sourceContext = normalizeSourceContext(rawTarget || {});
+  const sourceContext = normalizeSourceContext({ ...rawTarget, targetText: naturalLanguageLatex });
   const target = {
     overleafProjectId,
     targetKind,
@@ -2021,7 +2021,6 @@ export async function handleLeanPaneEditSave(payload, state) {
     if (linkedJob) {
       recordEditCheckVerdict(linkedJob, { status: "error", detail });
       await persistJobs(state);
-      await scheduleAlignmentCheckForJob({ state, job: linkedJob, trigger: "manual" });
     }
     return {
       statusCode: 200,
@@ -2133,7 +2132,6 @@ export async function handleLeanPaneEditSave(payload, state) {
   if (jobsChanged) {
     await persistJobs(state);
   }
-  if (linkedJob) await scheduleAlignmentCheckForJob({ state, job: linkedJob, trigger: "manual" });
 
   return { statusCode: 200, body: { ok: true, unchanged: false, ownResult, dependentsImpact } };
 }
@@ -2420,7 +2418,6 @@ async function runLeaRepairJob({ state, job, target, snapshot, breakage, prompt 
     job.apiRunId = exit.apiRunId || job.apiRunId || null;
     job.finishedAt = new Date().toISOString();
     await persistJobs(state);
-    await scheduleAlignmentCheckForJob({ state, job });
     return;
   }
 
@@ -2544,7 +2541,6 @@ async function runLeaRepairJob({ state, job, target, snapshot, breakage, prompt 
   job.apiRunId = exit.apiRunId || job.apiRunId || null;
   job.finishedAt = new Date().toISOString();
   await persistJobs(state);
-  await scheduleAlignmentCheckForJob({ state, job });
 }
 
 // The user-facing explanation of a failed repair: the agent's own final
@@ -2631,7 +2627,6 @@ async function startRepairRun({ state, overleafProjectId, targetKind: requestedK
     job.finishedAt = new Date().toISOString();
     await appendLog(job.logPath, `\n[backend] ${job.error}\n`);
     await persistJobs(state);
-    await scheduleAlignmentCheckForJob({ state, job });
   });
 
   return { status: "started", job, target, runPromise };
@@ -3007,7 +3002,7 @@ async function runFormalizeBatchItem(state, entry, batch) {
     return { ok: true, state: "formalized", jobId: body.jobId };
   }
   if (status === "disproved") return { ok: true, state: "disproved", jobId: body.jobId };
-  return { ok: false, reason: finalJob?.error || finalJob?.resultDetail || "formalize_failed", jobId: body.jobId };
+  return { ok: false, reason: finalJob?.stopReason || finalJob?.error || finalJob?.resultDetail || "formalize_failed", jobId: body.jobId };
 }
 
 async function runTargetBatch(state, batch) {
@@ -3073,7 +3068,7 @@ async function runTargetBatch(state, batch) {
           }
         }
         if (batch.items.some((other) => other.state === "pending")) {
-          batch.pausedOn = { targetLabel: entry.targetLabel, reason: "run_failed" };
+          batch.pausedOn = { targetLabel: entry.targetLabel, reason: entry.reason };
         }
         break;
       }
@@ -3257,6 +3252,7 @@ function startChatRun({
   preRunSnapshot = null,
 }) {
   const { baseUrl, uiBaseUrl } = chatBaseUrls(state);
+  if (formalizationId && !target.sourceBundle) return Promise.resolve({ ok: false, error: "Refresh the Overleaf pane to supply current LaTeX before continuing this formalization." });
   let settle;
   let settled = false;
   let resolvedRunSessionId = leaSessionId || null;
@@ -3277,6 +3273,8 @@ function startChatRun({
     timeoutMs: (state.settings?.leaJobTimeoutSeconds || DEFAULT_LEA_JOB_TIMEOUT_SECONDS) * 1000,
     autoApprove: true,
     autonomous: true,
+    purpose: target.sourceBundle ? "overleaf_continuation" : "general",
+    sourceBundle: target.sourceBundle || null,
     projectSlug: target.projectSlug || null,
     projectTitle: target.projectName || target.projectSlug || null,
     projectNamespace: target.projectNamespace || null,
@@ -3318,7 +3316,8 @@ function startChatRun({
     // its next poll tick.
     onEvent: (() => {
       let lastPublishAt = 0;
-      return async (type) => {
+      return async (type, data) => {
+        if (type === "lea_status_updated") acceptStatusEvent(state, data, null, target.overleafProjectId);
         if (type !== "message" && type !== "assistant_delta" && type !== "done") return;
         const now = Date.now();
         if (type !== "done" && now - lastPublishAt < 1000) return;
@@ -3409,16 +3408,7 @@ async function finishChatRunCascade({
       linkedJob.formalizationInputHash = target.sourceBundle.sourceIdentityHash
         || target.sourceBundle.bundleHash;
     }
-    const assessmentJob = {
-      ...(linkedJob || {}),
-      formalizationId: formalizationId || linkedJob?.formalizationId,
-      sourceBundle: target.sourceBundle,
-      apiRunId: solverRunId,
-      status: exit?.recoverable ? "paused" : "completed",
-      stopReason: exit?.stopReason || null,
-      leaApiBaseUrl: linkedJob?.leaApiBaseUrl || state.settings?.leaApiBaseUrl
-    };
-    await scheduleAlignmentCheckForJob({ state, job: assessmentJob });
+
   }
 }
 
@@ -3951,6 +3941,12 @@ async function routeRequest(request, response, state) {
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/lean-pane/lea-status/updates") {
+    const result = await handleLeaStatusHistory(Object.fromEntries(url.searchParams), state);
+    sendJson(response, result.statusCode, result.body);
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/lean-check/retry") {
     const result = await handleLeaCheckRetry(await readBodyJson(request), state);
     sendJson(response, result.statusCode, result.body);
@@ -4068,6 +4064,9 @@ async function routeRequest(request, response, state) {
 export async function buildSettingsResponse(state) {
   refreshSettingsFromEnv(state);
   await syncSharedSettingsFromAdapter(state);
+  const health = await fetchAdapterHealth({ fetchImpl: state.fetchImpl || fetch,
+    baseUrl: normalizeLeaApiBaseUrl(state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL), apiKey: state.env?.LEA_API_KEY });
+  const leaStatusCapability = health.ok ? health.body?.capabilities?.lea_status || null : null;
   const leaRepoPath = state.settings.leaRepoPath || "";
   const model = normalizeLeaModelId(state.settings.leaModel || DEFAULT_LEA_MODEL);
   const requirements = (await handleGetModelRequirements(model, state)).body;
@@ -4081,6 +4080,7 @@ export async function buildSettingsResponse(state) {
     leaApiBaseUrl: state.settings.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL,
     leaUiBaseUrl: normalizeLeaUiBaseUrl(state.settings.leaUiBaseUrl || DEFAULT_LEA_UI_BASE_URL),
     leaApiKeyConfigured: requirements?.satisfied !== false,
+    leaStatusCapability,
     leaProvider: provider,
     leaProviderFamily: provider,
     leaProviderKeys: buildProviderKeyStatus(state),
@@ -4546,7 +4546,7 @@ function normalizeSourceContext(payload) {
     relevantSource,
     mirror
   };
-  const sourceBundle = Object.keys(submittedBundle).length
+  const sourceBundle = Object.keys(submittedBundle).length || String(payload.targetText || "").trim()
     ? {
         ...sourceBundleCore,
         bundleHash: hashExactText(JSON.stringify({
@@ -4609,6 +4609,11 @@ function normalizeSourceContext(payload) {
     contextAcquisitionMode,
     sourceBundle
   };
+}
+
+function sourceBundleHasNoAssociatedProof(bundle) {
+  if (!bundle || String(bundle.proof || "").trim()) return false;
+  return ["missing", "not_applicable"].includes(bundle.proofAssociation?.status);
 }
 
 function validateMirroredSource({ state, overleafProjectId, sourceContext }) {
@@ -4894,7 +4899,8 @@ async function createLeaJob({
   sourceContext = {},
   sourceUses = [],
   resolvedUses = [],
-  mode = "formalization"
+  mode = "formalization",
+  bestEffort = false
 }) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jobId = `${target.targetKind}-${target.targetLabel}-${timestamp}`;
@@ -4913,6 +4919,7 @@ async function createLeaJob({
     jobKey: target.jobKey,
     status: "in_progress",
     mode,
+    bestEffort: bestEffort === true,
     targetKind: target.targetKind,
     targetLabel: target.targetLabel,
     // Debugging/telemetry only -- see validateTargetPayload. Never read by
@@ -5243,7 +5250,8 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       origin_key: job.jobKey,
       source_hash: job.formalizationInputHash || job.targetTextHash || null
     },
-    purpose: "overleaf_solver",
+    purpose: job.mode === "stub" ? "general" : "overleaf_solver",
+    sourceBundle: job.mode === "stub" ? null : job.sourceBundle,
     appendLog,
     logPath: job.logPath,
     onRunStarted: async (apiRunId, sessionId, startBody = {}) => {
@@ -5261,7 +5269,10 @@ async function runLeaProofJobForJob({ state, job, target, prompt, onEvent = null
       if (startBody.project_slug) target.projectSlug = startBody.project_slug;
       await persistJobs(state);
     },
-    onEvent,
+    onEvent: async (type, data) => {
+      if (type === "lea_status_updated") acceptStatusEvent(state, data, job);
+      if (onEvent) await onEvent(type, data);
+    },
     onProgressUpdated: async (progress) => {
       if (!recordJobTurnProgress(job, progress)) return;
       await persistJobs(state);
@@ -5739,7 +5750,8 @@ async function runLeaJob({
     sourceBundle: sourceContext.sourceBundle,
     declarationNameHint: job.declarationNameHint || "",
     resolvedUses,
-    stubToComplete: job.stubToComplete || null
+    stubToComplete: job.stubToComplete || null,
+    bestEffort: job.bestEffort === true
   });
   const exit = await runLeaProofJobForJob({ state, job, target, prompt });
   await applyProofOutcomeToJob({ state, job, target, exit, resolvedUses });
@@ -5763,41 +5775,6 @@ async function runLeaJob({
       await appendLog(job.logPath, `\n[backend] Post-run cascade failed: ${error instanceof Error ? error.message : error}\n`);
     }
   }
-  await scheduleAlignmentCheckForJob({ state, job });
-}
-
-async function scheduleAlignmentCheckForJob({ state, job, trigger = null }) {
-  if (!job?.formalizationId || !job?.sourceBundle?.bundleHash) return null;
-  // User Stop means stop: do not silently launch another paid operation. A
-  // global cap likewise cannot authorize a new evaluator request.
-  if (["user_stop", "global_spend_cap"].includes(job.stopReason)) return null;
-  const checkTrigger = trigger || (job.status === "paused" ? "solver_paused" : "solver_terminal");
-  let baseUrl;
-  try {
-    baseUrl = normalizeLeaApiBaseUrl(job.leaApiBaseUrl || state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL);
-  } catch {
-    return null;
-  }
-  const result = await startAlignmentCheck({
-    fetchImpl: state.fetchImpl || fetch,
-    baseUrl,
-    formalizationId: job.formalizationId,
-    sourceBundle: job.sourceBundle,
-    trigger: checkTrigger,
-    solverRunId: job.apiRunId || null
-  });
-  if (result.ok) {
-    job.leaCheck = normalizeLeaCheck(result.body?.lea_check);
-  } else {
-    job.leaCheck = normalizeLeaCheck({
-      status: "error",
-      reason: "request_failed",
-      error: result.error || "Lea Check could not be started."
-    });
-  }
-  await persistJobs(state);
-  publishEvent(state, "jobs-changed", { formalizationId: job.formalizationId });
-  return job.leaCheck;
 }
 
 async function runLeaStubJob({
@@ -5930,6 +5907,17 @@ function buildProjectIdentityBlock({ projectSlug, projectName = "", projectNames
   return projectIdentityPreambleLines({ projectSlug, projectName, projectNamespace }).join("\n");
 }
 
+function buildBestEffortGuidance(enabled) {
+  if (!enabled) return "";
+  return `
+## Author-authorized best-effort continuation
+
+The author explicitly selected **Continue best effort** after this target paused with a source obstruction and no associated author proof. For this continuation, use your best mathematical judgment to choose a conventional, coherent interpretation and supply the ambient types, structures, binders, assumptions, and standard proof strategy that the abbreviated source leaves implicit. These are authorized formalization choices, not claims about what the LaTeX explicitly said: disclose every such choice through update_lea_status and retain the underlying open source gap as a non-blocking warning.
+
+Do not pause again merely because that missing context or proof method must be inferred, and reclassify prior blocking findings that are covered by this authorization to warning severity using the same finding keys and a resolution explanation. Continue through Lean representation and proof choices. Explicit source text remains authoritative: do not contradict it, alter an explicit domain or quantifier, or present inferred content as source-faithful. Pause only if there is no coherent defensible interpretation or the claim remains false under the conventional interpretation you selected.
+`;
+}
+
 function buildLatexContextBlock(sourceContext = {}) {
   const location = sourceContext.sourceFile
     ? `${sourceContext.sourceFile}${sourceContext.sourceStartLine
@@ -5960,7 +5948,7 @@ function buildLatexContextBlock(sourceContext = {}) {
   const proofAssociation = bundle.proofAssociation || {};
   const proofEvidence = bundle.proof
     ? `\n## Required source-proof method\n\nThe proof below is the author's complete associated argument. Treat it as the required method, not merely as optional inspiration.\n<overleaf-source-proof>\n${bundle.proof}\n</overleaf-source-proof>\n`
-    : `\n## Missing source-proof method\n\nNo unambiguous natural-language proof is associated with this target (association status: ${proofAssociation.status || "missing"}). Do not invent an unrelated proof strategy. Explain that method evidence is missing and stop with a partial/stub artifact if appropriate.\n`;
+    : `\n## Missing source-proof method\n\nNo unambiguous natural-language proof is associated with this target (association status: ${proofAssociation.status || "missing"}). Report that absence as a non-blocking source issue. For a theorem whose statement is mathematically precise, choose a standard meaning-preserving proof strategy and continue. For a definition, formalize its stated meaning and dependencies without inventing a proof-strategy judgment. A missing proof alone is not a reason to pause. Pause with a partial artifact only if the claim or definition itself is materially ambiguous, false as stated, or requires added assumptions or another semantic change.\n`;
 
   return `## Required LaTeX context acquisition
 
@@ -5982,7 +5970,8 @@ function buildLeaPrompt({
   sourceContext = {},
   declarationNameHint,
   resolvedUses = [],
-  stubToComplete = null
+  stubToComplete = null,
+  bestEffort = false
 }) {
   if (targetKind === "definition") {
     return buildLeaDefinitionPrompt({
@@ -5994,7 +5983,8 @@ function buildLeaPrompt({
       targetContext,
       sourceContext,
       declarationNameHint,
-      resolvedUses
+      resolvedUses,
+      bestEffort
     });
   }
   return buildLeaTheoremPrompt({
@@ -6007,7 +5997,8 @@ function buildLeaPrompt({
     sourceContext,
     declarationNameHint,
     resolvedUses,
-    stubToComplete
+    stubToComplete,
+    bestEffort
   });
 }
 
@@ -6021,7 +6012,8 @@ function buildLeaTheoremPrompt({
   sourceContext = {},
   declarationNameHint,
   resolvedUses = [],
-  stubToComplete = null
+  stubToComplete = null,
+  bestEffort = false
 }) {
   const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const latexContext = buildLatexContextBlock(sourceContext);
@@ -6046,6 +6038,7 @@ function buildLeaTheoremPrompt({
 
 Continue from this existing file and replace the sorry/admit in theorem ${stubToComplete.declarationName}. Do not delete, rename, or move the file unless Lean requires a minimal import adjustment.\n`
     : "";
+  const bestEffortGuidance = buildBestEffortGuidance(bestEffort);
 
   return `Formalize the Overleaf theorem labeled ${theoremLabel}.
 
@@ -6059,12 +6052,13 @@ ${usesGuidance}
 ${theoremText}
 ${formalizationGuidance}
 ${stubGuidance}
+${bestEffortGuidance}
 
 Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do not ask for confirmation or pose clarifying questions.
 
-This is faithful translation, not open-ended theorem proving. Preserve the source statement and the mathematical route of the associated LaTeX proof: its case split, intermediate claims, witnesses, reductions, and dependency use. Administrative Lean scaffolding may differ, but do not replace the author's argument with an unrelated shortcut merely because that shortcut compiles. If the source argument is incomplete, inconsistent, ambiguous in a way that changes the mathematics, or cannot be translated faithfully, report the issue clearly and leave the best faithful partial artifact. An informative faithful failure is preferable to an unrelated successful proof.
+This is faithful translation. Preserve the source statement and, when an associated LaTeX proof exists, its mathematical route: case split, intermediate claims, witnesses, reductions, and dependency use. When no proof is supplied but the statement is precise, disclose the missing method as non-blocking and attempt a standard meaning-preserving proof. Ordinary proof gaps, Lean encoding choices, and equivalent library-lemma substitutions are non-blocking. Administrative Lean scaffolding may differ, but do not replace an explicitly supplied argument with an unrelated shortcut merely because that shortcut compiles. Publish a blocking update_lea_status finding and pause only if continuation requires a changed claim, an additional assumption, a changed domain or quantifier, a choice between materially different meanings, or abandoning an explicitly supplied proof's essential approach. An informative faithful failure is preferable to a silently changed or unrelated successful proof.
 
-Whenever you notice and repair a source-level issue while formalizing, state the issue and the Lean-side repair explicitly in your response. Never silently strengthen assumptions, weaken the conclusion, change the domain, or substitute a different proof strategy.
+Whenever you notice and repair a source-level issue while formalizing, publish the issue and planned Lean-side repair through update_lea_status before applying it, then publish what was checked. Never silently strengthen assumptions, weaken the conclusion, change the domain, or substitute a different proof strategy.
 
 Do everything supportable by the source in this run: write the Lean file under Lea's workspace and carry the faithful proof as far as it goes.
 
@@ -6083,7 +6077,8 @@ function buildLeaDefinitionPrompt({
   targetContext = "",
   sourceContext = {},
   declarationNameHint,
-  resolvedUses = []
+  resolvedUses = [],
+  bestEffort = false
 }) {
   const projectIdentity = buildProjectIdentityBlock({ projectSlug, projectName, projectNamespace });
   const latexContext = buildLatexContextBlock(sourceContext);
@@ -6098,6 +6093,7 @@ function buildLeaDefinitionPrompt({
   const formalizationGuidance = targetContext.trim()
     ? `\nFormalization guidance:\n${targetContext.trim()}\n`
     : "";
+  const bestEffortGuidance = buildBestEffortGuidance(bestEffort);
 
   return `Formalize the Overleaf definition labeled ${targetLabel}.
 
@@ -6113,8 +6109,9 @@ If it introduces bundled data and properties, consider structure or class.
 If it introduces a shorthand, consider abbrev or notation.
 ${naming}
 ${usesGuidance}
+${bestEffortGuidance}
 
-Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a declaration for approval. If a detail is ambiguous, pick the most natural interpretation and proceed without waiting.
+Work fully autonomously and non-interactively. This run is triggered from Overleaf with no human available to reply, so do NOT ask for confirmation, do NOT pose clarifying questions, and do NOT stop to propose a declaration for approval. Disclose ambiguities through update_lea_status; choose a standard encoding and continue when the alternatives are materially equivalent, and pause only if proceeding would change the mathematical meaning.
 
 The final Lean file must compile with no sorry/admit.
 Use the exact Lean namespace shown above and in the project context for imports, declarations, and proof paths.
@@ -6975,13 +6972,23 @@ async function enrichLeanPaneItem({
       || statusInfo?.recordedProofPath || statusInfo?.relativePath,
     approvalContext
   });
-  let leaCheck = normalizeLeaCheck(latestJob?.leaCheck);
   const formalizationId = latestJob?.formalizationId || statusInfo?.formalizationId;
+  let leaCheck = normalizeLeaCheck(latestJob?.leaCheck);
+  let leaStatus = normalizeLeaStatus(state.leaStatuses?.[formalizationId] || latestJob?.leaStatus);
+  if (inProgress && latestJob?.apiRunId && (!leaStatus.run_id || leaStatus.run_id === latestJob.apiRunId)) {
+    leaStatus = { ...leaStatus, run_id: latestJob.apiRunId, activity: { status: "running" } };
+  }
   if (formalizationId) {
     try {
       const baseUrl = normalizeLeaApiBaseUrl(
         latestJob?.leaApiBaseUrl || state.settings?.leaApiBaseUrl || DEFAULT_LEA_API_BASE_URL
       );
+      const live = await fetchCurrentLeaStatus({ fetchImpl: state.fetchImpl || fetch, baseUrl,
+        apiKey: state.env?.LEA_API_KEY, formalizationId,
+        sourceIdentityHash: item.sourceBundle?.sourceIdentityHash || currentInputHash,
+        sourceBundleHash: item.sourceBundle?.bundleHash });
+      if (live.ok) leaStatus = normalizeLeaStatus(live.body?.lea_status);
+      else leaStatus = { ...leaStatus, freshness: "unknown", deliveryError: live.error || "Lea Status unavailable" };
       const result = await fetchCurrentAlignmentCheck({
         fetchImpl: state.fetchImpl || fetch,
         baseUrl,
@@ -6990,18 +6997,19 @@ async function enrichLeanPaneItem({
       });
       if (result.ok) leaCheck = normalizeLeaCheck(result.body?.lea_check);
     } catch {
-      // Keep the last durable companion projection when the adapter is offline.
+      leaStatus = { ...leaStatus, freshness: "unknown", deliveryError: "Adapter offline; showing last known assessment." };
     }
   }
   const leanCheck = projectLeanCheck({ paneStatus: stale ? "stale" : paneStatus, statusInfo });
-  const checkInProgress = leaCheck.status === "in-progress";
+  const statusRunActive = ["pending", "running"].includes(leaStatus.activity?.status);
 
   return {
     ...item,
     status: stale ? "stale" : paneStatus,
     // Drives the pane's live polling: it keeps refreshing while any item is still
     // being formalized, then stops once everything settles.
-    inProgress: (inProgress || checkInProgress) && !stale,
+    inProgress: inProgress || statusRunActive,
+    leaStatus,
     leanCheck,
     leaCheck,
     // Let the batch queue show the active Lea turn even when the target lives

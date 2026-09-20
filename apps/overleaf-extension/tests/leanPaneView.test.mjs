@@ -4,6 +4,7 @@ import {
   aggregatePaneStatus,
   buildPaneUseRelationships,
   buildLeanPaneTree,
+  canContinueBestEffort,
   canEditPaneItem,
   canFormalizePaneItem,
   canStubPaneItem,
@@ -111,6 +112,27 @@ test("canFormalizePaneItem keeps reruns available for settled items and blocks a
   assert.equal(canFormalizePaneItem(undefined), false);
 });
 
+test("canContinueBestEffort is limited to source-obstruction pauses without an associated proof", () => {
+  const eligible = {
+    formalizable: true,
+    inProgress: false,
+    status: "paused",
+    leanCheck: { status: "paused", stopReason: "source_obstruction" },
+    sourceBundle: { proof: "", proofAssociation: { status: "missing" } }
+  };
+  assert.equal(canContinueBestEffort(eligible), true);
+  assert.equal(canContinueBestEffort({ ...eligible, leanCheck: { status: "paused", stopReason: "turn_cap" } }), false);
+  assert.equal(canContinueBestEffort({
+    ...eligible,
+    sourceBundle: { proof: "Use compactness.", proofAssociation: { status: "associated" } }
+  }), false);
+  assert.equal(canContinueBestEffort({
+    ...eligible,
+    sourceBundle: { proof: "", proofAssociation: { status: "ambiguous" } }
+  }), false);
+  assert.equal(canContinueBestEffort({ ...eligible, inProgress: true }), false);
+});
+
 test("canStubPaneItem offers sorry-stubbing only for an unformalized theorem", () => {
   const base = { formalizable: true, inProgress: false, status: "missing-stub", leanKind: "theorem" };
   assert.equal(canStubPaneItem(base), true);
@@ -185,6 +207,21 @@ test("paneItemActions keeps Re-formalize primary on a settled valid item", () =>
   assert.deepEqual(actions.primary, { id: "formalize", label: "Re-formalize" });
   assert.deepEqual(actions.rail.map((action) => action.id), ["go-to-source", "chat", "view-in-lea"]);
   assert.deepEqual(actions.overflow.map((action) => action.id), ["edit"]);
+});
+
+test("paneItemActions offers best-effort continuation for an eligible source obstruction", () => {
+  const item = {
+    formalizable: true,
+    inProgress: false,
+    status: "paused",
+    leanKind: "theorem",
+    label: "compactness_criterion",
+    leanCheck: { status: "paused", stopReason: "source_obstruction" },
+    sourceBundle: { proof: "", proofAssociation: { status: "missing" } }
+  };
+  const actions = paneItemActions(item);
+  assert.deepEqual(actions.primary, { id: "best-effort", label: "Continue best effort" });
+  assert.deepEqual(actions.overflow, [{ id: "formalize", label: "Resume faithfully" }]);
 });
 
 test("paneItemActions suppresses state-changing actions while the item is being edited or running", () => {

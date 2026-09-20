@@ -235,7 +235,7 @@ test("edit start resolves the session's current content and pre-save dependents"
   assert.deepEqual(res.body.dependents.map((d) => d.targetLabel), ["compactness_corollary"]);
 });
 
-test("a GitHub-imported ledger artifact can be edited and starts a manual Lea Check", async () => {
+test("a GitHub-imported ledger artifact can be edited without starting an independent check", async () => {
   const leaRepo = await makeLeaRepo();
   const initial = "theorem imported_proof : True := by\n  trivial\n";
   const edited = "theorem imported_proof : True := by\n  exact True.intro\n";
@@ -329,8 +329,7 @@ test("a GitHub-imported ledger artifact can be edited and starts a manual Lea Ch
   ));
   assert.equal(writeCall.body.formalization_id, "formalization-imported");
   assert.equal(leanCheckCall.body.formalization_id, "formalization-imported");
-  assert.equal(leaCheckCall.body.trigger, "manual");
-  assert.equal(leaCheckCall.body.source_bundle.bundleHash, item.sourceBundle.bundleHash);
+  assert.equal(leaCheckCall, undefined);
 });
 
 test("project namespace rename makes the pane and editor read the migrated working file", async () => {

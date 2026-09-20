@@ -53,6 +53,8 @@ from lea.interface import (
     SubagentFinished,
     SubagentProgress,
     SubagentStarted,
+    LeaStatusUpdateRequested,
+    LeaStatusUpdateAck,
     ToolApprovalRequested,
     ToolCalled,
     ToolResulted,
@@ -570,6 +572,8 @@ _FINISH_STATUS = {
     "max_turns": "max_turns",
     "max_cost": "max_turns",
     "interrupted": "cancelled",
+    "source_obstruction": "cancelled",
+    "status_reporting_failed": "cancelled",
 }
 
 _COMPLETED_RESULTS = {"proved", "disproved", "needs_review"}
@@ -1851,6 +1855,16 @@ def run_lea(context: RunnerContext) -> None:
         # human's decision back via gen.send(). A plain for-loop can't send.
         # Autonomous (D19): gate=None → no tool ever pauses for human approval, so
         # the run is fully unattended. Interactive UI runs keep the per-tool gate.
+        from . import lea_status, lea_status_store
+        reporting_started = time.monotonic()
+        reporting_last_accepted = None
+        reporting_context = lea_status_store.context(run_id)
+        if reporting_context:
+            cfg = replace(cfg, status_reporting=True, status_context=lea_status.seed(run_id),
+                          narrate_tool_steps=False,
+                          prompt_variant=("overleaf_continuation" if context.purpose == "overleaf_continuation" else "overleaf_faithful"),
+                          extra_tools=list(dict.fromkeys([*cfg.extra_tools, "update_lea_status"])),
+                          tools=([*cfg.tools, "update_lea_status"] if cfg.tools is not None else None))
         gen = run_events(cfg, messages, namespace=namespace, session_id=session_id,
                          working_dir=str(repo), should_stop=stop_event.is_set,
                          gate=(None if context.autonomous else _make_gate(session_id)))
@@ -1868,6 +1882,63 @@ def run_lea(context: RunnerContext) -> None:
             # rule then cannot be forgotten when a new event type is added.
             if not isinstance(ev, AssistantTextDelta):
                 deltas.flush()
+
+            if isinstance(ev, LeaStatusUpdateRequested):
+                from lea.status_reporting import attention
+                try:
+                    # Capture shell/custom-tool changes only for files already bound to this target.
+                    from .artifact_snapshots import _snapshot
+                    captured = _snapshot(focus_formalization_id, run_id=run_id) if ev.payload.get("scope") != "source_only" else None
+                    canonical = {f["path"]: f for f in store.current_code_steps_for_formalization(focus_formalization_id)}
+                    for file in captured[1] if captured else []:
+                        winner = canonical.get(file["path"])
+                        if file.get("role") != "dependency" and winner and str(winner["id"]) != str(file["id"]):
+                            # Preserve this run's immutable revision if another session
+                            # has superseded it. Do not reattribute those bytes here.
+                            continue
+                        path = (repo / file["path"]).resolve()
+                        if not path.is_relative_to(repo.resolve()):
+                            raise ValueError("Artifact lies outside this run workspace")
+                        if not path.is_file():
+                            raise ValueError("An assessed artifact is missing from this run workspace; restore it before reporting")
+                        if path.is_file():
+                            after = path.read_text()
+                            if after != file.get("code"):
+                                step = store.add_code_step(session_id, run_id, file["path"], content=after,
+                                    author="agent", turn=current_turn, formalization_id=file.get("formalization_id") or focus_formalization_id)
+                                step_id_by_path[file["path"]] = step["id"]
+                                emit(events, "code_step", step)
+                    # Retry the same host invocation once: persistence may have committed
+                    # even if returning the acknowledgment failed. append() deduplicates it.
+                    for attempt in range(2):
+                        try:
+                            update, public = lea_status.publish(run_id, ev.invocation_key, ev.payload)
+                            break
+                        except (ValueError, TypeError):
+                            raise
+                        except Exception:
+                            if attempt:
+                                raise
+                    accepted_at = time.monotonic()
+                    logger.info("lea_status.accepted run=%s sequence=%s first=%s gap_seconds=%.3f kind=%s",
+                                run_id, update["sequence"], reporting_last_accepted is None,
+                                accepted_at - (reporting_last_accepted or reporting_started), update["kind"])
+                    reporting_last_accepted = accepted_at
+                    to_send = LeaStatusUpdateAck(True, update["id"], update["sequence"], update["assessment"],
+                        stop_reason="source_obstruction" if attention(update["assessment"]) == "needs_author_input" else None)
+                    try:
+                        emit(events, "lea_status_updated", public)
+                    except Exception:
+                        logger.exception("Status saved but live delivery failed for %s", run_id)
+                except (ValueError, TypeError) as exc:
+                    logger.warning("lea_status.rejected run=%s error=%s", run_id, _redact(str(exc)))
+                    to_send = LeaStatusUpdateAck(False, error=str(exc))
+                except Exception as exc:
+                    material = any(f.get("severity") in {"warning", "blocking"} for f in ev.payload.get("finding_updates", []))
+                    to_send = LeaStatusUpdateAck(False, error=f"Could not save Lea Status: {_public_error_detail(exc)}",
+                        stop_reason="status_reporting_failed" if material else None)
+                    diagnose(events, session_id, run_id, "step_error", "status.publish_failed", str(exc), turn=current_turn)
+                continue
 
             if isinstance(ev, ToolApprovalRequested):
                 to_send = _await_decision(run_id, session_id, ev, events, stop_event)
@@ -2258,6 +2329,9 @@ def run_lea(context: RunnerContext) -> None:
                 elif ev.reason == "max_turns":
                     stop_reason = "turn_cap"
                     recoverable = True
+                elif ev.reason in {"source_obstruction", "status_reporting_failed"}:
+                    stop_reason = ev.reason
+                    recoverable = True
                 elif ev.reason == "interrupted":
                     stop_reason = "user_stop"
                     recoverable = True
@@ -2270,6 +2344,15 @@ def run_lea(context: RunnerContext) -> None:
                     result_kind=final_result_kind, result_detail=final_result_detail,
                     stop_reason=stop_reason, recoverable=recoverable,
                 )
+                if reporting_context:
+                    def record_reporting_completion():
+                        latest_status = lea_status_store.latest(run_id)
+                        if not latest_status or latest_status["kind"] != "final":
+                            logger.info("lea_status.incomplete run=%s reason=%s missing_initial=%s", run_id, ev.reason, not latest_status)
+                            if ev.reason == "completed":
+                                diagnose(events, session_id, run_id, "step_error", "status.reporting_incomplete",
+                                         "The run completed without a final Lea Status update; the last published assessment is retained.", turn=current_turn)
+                    _best_effort("status completion", run_id, record_reporting_completion)
                 # Everything past this point is BOOKKEEPING: the run's outcome is
                 # already durable above. Each piece is guarded on its own so one
                 # failure neither loses the others nor escapes to the handler below,

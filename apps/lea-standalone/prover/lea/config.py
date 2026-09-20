@@ -31,6 +31,8 @@ class LeaConfig:
     max_turns: int | None       # None → run until the proof is done
 
     # --- agent loop knobs (defaulted; the UI omits them) ---
+    status_reporting: bool = False
+    status_context: dict = field(default_factory=dict)
     narrate_tool_steps: bool = False  # True → ask the model to summarize intent before tool calls
     prompt_variant: str = "interactive"  # the chat variant (formalization vs assistant routing)
     model_kwargs: dict = field(default_factory=dict)  # passthrough to litellm.completion

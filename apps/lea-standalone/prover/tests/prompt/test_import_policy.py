@@ -29,12 +29,25 @@ def main() -> None:
     check("old broad-import instruction removed",
           "Start files with `import Mathlib` when needed." not in default)
     overleaf = load_system_prompt("overleaf_faithful")
+    normalized_overleaf = " ".join(overleaf.split())
     check("Overleaf prompt preserves the source method",
-          "The source proof controls the approach" in overleaf)
+          "When supplied, the source proof controls the approach" in overleaf)
     check("Overleaf prompt rejects silent mathematical repairs",
           "Never silently repair a mathematical gap" in overleaf)
+    check("Overleaf prompt treats a missing proof as non-blocking",
+          "A missing proof alone is never a reason to pause" in overleaf)
+    check("Overleaf prompt reserves blocking for semantic changes",
+          "choice between materially different meanings" in overleaf
+          and "explicitly supplied proof's essential" in overleaf)
+    check("Overleaf prompt reassesses legacy missing-proof blockers",
+          "update the same finding key to a" in overleaf
+          and "omitted findings remain active" in overleaf)
+    check("Overleaf prompt honors an author-authorized best-effort continuation",
+          "Author-authorized best-effort continuation" in normalized_overleaf
+          and "do not pause again merely because those choices were absent" in normalized_overleaf)
     check("Overleaf prompt prefers faithful failure",
-          "informative partial result is better than an unrelated successful proof" in overleaf)
+          "informative partial result is better than a" in overleaf
+          and "silently changed or unrelated successful proof" in overleaf)
     print()
     if _FAILURES:
         print(f"FAILED ({len(_FAILURES)}): {', '.join(_FAILURES)}")

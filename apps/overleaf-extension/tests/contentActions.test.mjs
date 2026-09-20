@@ -276,7 +276,7 @@ test("Lean pane trigger opens a project pane and renders manifest items", async 
   harness.clickPaneTreeRowText("main.tex");
   assert.match(harness.bodyText(), /Main theorem/);
   assert.match(harness.bodyText(), /Lean Check:unformalized/);
-  assert.match(harness.bodyText(), /Lea Check:N\/A/);
+  assert.match(harness.bodyText(), /Lea Status:Not assessed/);
 });
 
 test("Lean pane falls back to the live TeX file when the Overleaf archive is unavailable", async () => {
@@ -1808,6 +1808,53 @@ test("Lean pane 'Formalize' starts a run via the /formalize endpoint", async () 
   assert.match(body.sourceExcerpt, /A theorem\./);
 });
 
+test("Lean pane 'Continue best effort' resumes an eligible source obstruction with an explicit override", async () => {
+  const harness = createContentHarness(
+    { status: "unformalized" },
+    {},
+    {
+      locationPath: "/project/unknown",
+      manifest: {
+        ok: true,
+        rootFile: "main.tex",
+        items: [{
+          id: "theorem:compactness_criterion:0",
+          kind: "theorem",
+          label: "compactness_criterion",
+          status: "paused",
+          sourceFile: "main.tex",
+          sourceStartLine: 1,
+          sourceEndLine: 4,
+          sourceStartOffset: 0,
+          sourceEndOffset: 42,
+          naturalLanguageRendered: "Every open cover has a finite subcover.",
+          naturalLanguageLatex: "Every open cover has a finite subcover.",
+          leanKind: "theorem",
+          leanDeclarationName: "compactness_criterion",
+          formalizable: true,
+          leanCheck: { status: "paused", stopReason: "source_obstruction" },
+          sourceBundle: { proof: "", proofAssociation: { status: "missing" } }
+        }],
+        diagnostics: []
+      }
+    }
+  );
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  harness.clickFirstPaneItem();
+  harness.clickButtonText("Continue best effort");
+  await flushPromises();
+
+  const call = harness.fetchCalls.find((entry) => entry.url.endsWith("/formalize"));
+  assert.ok(call, "expected a POST to /formalize");
+  const body = JSON.parse(call.options.body);
+  assert.equal(body.targetLabel, "compactness_criterion");
+  assert.equal(body.resume, true);
+  assert.equal(body.bestEffort, true);
+});
+
 test("Lean pane keeps Formalize after an upstream dependency blocks startup", async () => {
   const harness = createContentHarness(
     { status: "unformalized" },
@@ -2395,6 +2442,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
   const context = {
     AbortController,
     URL,
+    URLSearchParams,
     TextEncoder,
     katex: options.katex,
     clearTimeout(id) {
@@ -2448,6 +2496,7 @@ function createContentHarness(statusInfo, theoremPatch = {}, options = {}) {
         ok: !failingRepairStart && !failingFormalize,
         status: failingRepairStart ? 400 : failingFormalize ? formalizeFailure.status || 400 : 200,
         async json() {
+          if (String(url).includes("/lea-status/updates")) return options.leaStatusHistory || { updates: [], has_more: false };
           if (failingRepairStart) {
             return { ok: false, error: "repair_start_failed", message: options.failRepairStart };
           }
@@ -3783,4 +3832,36 @@ test("round 2: a dependent skipped as busy during the save joins 'Repair all' on
   assert.match(harness.bodyText(), /1 downstream item affected: 1 broken\./);
   assert.match(harness.bodyText(), /corollary_a: was busy during this edit's re-check -- now broken\./);
   assert.equal(harness.hasButtonText("Repair all (1)"), true);
+});
+
+
+test("live Lea Status renders ongoing findings, history and Pause even for stale source", async () => {
+  const assessment = { confidence: "high", scope: "partial_artifact", summary: "Main step checked; boundary case remains.",
+    confidence_reason: "The approach is preserved.", findings: [{ key: "boundary", severity: "warning", title: "Omitted boundary case",
+      detail: "The LaTeX omits the endpoint.", lean_resolution: "applied", source_resolution: "open", correction: "Handled the endpoint explicitly." }],
+    remaining_obligations: ["Author should update the LaTeX."] };
+  const update = { id: "status-1", created_at: new Date().toISOString(), assessment, artifact_snapshot: { revision_token: "artifact-1", files: [] } };
+  const item = { id: "status-target", formalizationId: "status-form", kind: "theorem", label: "target", title: "Target theorem", status: "stale",
+    sourceFile: "main.tex", sourceStartLine: 1, sourceEndLine: 3, naturalLanguageLatex: "True.", leanKind: "theorem",
+    leaStatus: { assessment, attention: "source_issue", freshness: "source_changed", activity: { status: "running" },
+      run_id: "active-status-run", sequence: 1, latest_update: update } };
+  const harness = createContentHarness({ status: "unformalized" }, {}, {
+    manifest: { ok: true, rootFile: "main.tex", items: [item], diagnostics: [] },
+    leaStatusHistory: { updates: [update], has_more: false, next_cursor: "next" }
+  });
+  await harness.loadVisibleTheorems();
+  harness.clickPaneTrigger();
+  await flushPromises();
+  harness.clickPaneTreeRowText("main.tex");
+  assert.match(harness.bodyText(), /High confidence · Source issue · Last assessed version/);
+  assert.match(harness.bodyText(), /Main step checked; boundary case remains/);
+  assert.match(harness.bodyText(), /Source issue: open/);
+  assert.match(harness.bodyText(), /Lean correction \(applied\): Handled the endpoint explicitly/);
+  harness.clickButtonText("Load updates");
+  await flushPromises();
+  assert.ok(harness.fetchCalls.some(call => call.url.includes("/lea-status/updates")));
+  harness.clickButtonText("Pause");
+  await flushPromises();
+  const pause = harness.fetchCalls.find(call => call.url.includes("/lean-pane/chat/interrupt"));
+  assert.equal(JSON.parse(pause.options.body).runId, "active-status-run");
 });
