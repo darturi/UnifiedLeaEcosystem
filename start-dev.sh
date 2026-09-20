@@ -41,6 +41,20 @@ for arg in "$@"; do
   esac
 done
 
+LOCAL_CONFIG="apps/lea-standalone/config/lea.local.toml"
+LOCAL_CONFIG_EXAMPLE="apps/lea-standalone/config/lea.local.example.toml"
+
+if [[ ! -e "$LOCAL_CONFIG" && ! -L "$LOCAL_CONFIG" ]]; then
+  if [[ ! -f "$LOCAL_CONFIG_EXAMPLE" ]]; then
+    echo "[start] Cannot create $LOCAL_CONFIG: example config is missing at $LOCAL_CONFIG_EXAMPLE." >&2
+    exit 1
+  fi
+
+  # The Settings UI may later store provider keys here, so create it owner-only.
+  (umask 077; cp "$LOCAL_CONFIG_EXAMPLE" "$LOCAL_CONFIG")
+  echo "[start] Created $LOCAL_CONFIG from the example config."
+fi
+
 # Reset must happen BEFORE the adapter starts — it deletes the SQLite file, and
 # the adapter recreates it (with the current schema) on startup.
 if [[ "$FRESH" -eq 1 ]]; then
