@@ -58,6 +58,15 @@ def release_data_lock() -> None:
         _lock_handle = None
 
 
+def release_workspace_lock() -> None:
+    """Only the one-shot bootstrap releases ownership before process exit."""
+    global _workspace_lock_handle,_workspace_owned
+    if _workspace_lock_handle is not None:
+        _workspace_lock_handle.close()
+        _workspace_lock_handle=None
+        _workspace_owned=None
+
+
 def set_state(state: str) -> None:
     global _state
     with _guard:
@@ -199,12 +208,21 @@ def acquire_workspace_lock(workspace):
     # Container roots differ even when their proof/project bind mounts match.
     # Compose supplies the same ownership volume to every writer of that tree.
     ownership=Path(os.environ.get('LEA_WORKSPACE_OWNERSHIP_DIR',workspace)).resolve()
+    if os.environ.get('LEA_REQUIRE_SHARED_OWNERSHIP')=='1' and (
+            not os.environ.get('LEA_WORKSPACE_OWNERSHIP_DIR') or not os.path.ismount(ownership)):
+        raise RuntimeError('Production workers and migrations require a shared Docker local ownership volume at LEA_WORKSPACE_OWNERSHIP_DIR.')
     ownership.mkdir(parents=True,exist_ok=True)
     handle=(ownership/'.lea-worker.lock').open('a+')
     try:fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
     except BlockingIOError:
         handle.close();raise RuntimeError('Another worker owns this physical workspace')
     try:
+        # Some virtualized host bind mounts silently ignore flock. A second
+        # independent open must conflict even in this same process.
+        with (ownership/'.lea-worker.lock').open('a+') as probe:
+            try:fcntl.flock(probe.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:pass
+            else:raise RuntimeError('The ownership filesystem does not enforce exclusive locks; use a Docker local ownership volume or a supported local filesystem.')
         from .config import write_private_text
         marker=ownership/'.lea-workspace-id'
         identity=marker.read_text().strip() if marker.exists() else uuid4().hex

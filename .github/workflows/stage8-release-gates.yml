@@ -54,6 +54,7 @@ jobs:
           set -o pipefail
           for role in worker api companion; do
             docker build --platform "linux/$ARCH" --target "$role" \
+              --build-arg "LEA_BUILD_SOURCE=$BASELINE_SOURCE" \
               --label "org.opencontainers.image.revision=$BASELINE_SOURCE" \
               -t "lea-stage8-baseline-$role:$ARCH" \
               -f "$RUNNER_TEMP/stage8-baseline/apps/lea-standalone/Dockerfile" "$RUNNER_TEMP/stage8-baseline" \
@@ -95,6 +96,7 @@ jobs:
           docker run --rm --pull=never -w /app/adapter \
             -v "$GITHUB_WORKSPACE/apps/lea-standalone/adapter/tests:/app/adapter/tests:ro" \
             -e LEA_MODEL_CATALOG_OFFLINE=true -e LITELLM_LOCAL_MODEL_COST_MAP=True \
+            -e LEA_REQUIRE_SHARED_OWNERSHIP=0 \
             --entrypoint bash "lea-stage8-candidate-worker:$ARCH" -c \
             'uv sync --frozen --group dev && .venv/bin/python -m pytest -p no:cacheprovider tests/test_process_boundary.py tests/test_recovery.py tests/test_process_restart.py tests/test_runtime_restart.py -q --tb=short -W error::pytest.PytestUnhandledThreadExceptionWarning' \
             2>&1 | tee validation/native-regressions.log
@@ -113,7 +115,10 @@ jobs:
             "lea-stage8-baseline-companion:$ARCH" "lea-stage8-candidate-worker:$ARCH" \
             "lea-stage8-candidate-api:$ARCH" "lea-stage8-candidate-companion:$ARCH" \
             | gzip -1 > release-binaries/strict-bundles.tar.gz
-          sha256sum release-binaries/strict-bundles.tar.gz > release-binaries/SHA256SUMS
+          git archive "$BASELINE_SOURCE" | gzip -1 > release-binaries/baseline-source.tar.gz
+          git archive "$GITHUB_SHA" | gzip -1 > release-binaries/candidate-source.tar.gz
+          (cd release-binaries && sha256sum strict-bundles.tar.gz baseline-source.tar.gz candidate-source.tar.gz > SHA256SUMS)
+          cp release-binaries/SHA256SUMS validation/binary-archive-SHA256SUMS
           cp validation/baseline.json validation/candidate.json validation/rollback.json release-binaries/
       - uses: actions/upload-artifact@v4
         if: always()

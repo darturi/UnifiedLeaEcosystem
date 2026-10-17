@@ -26,7 +26,7 @@ ALIASES={'x86_64':'amd64','aarch64':'arm64','arm64':'arm64','amd64':'amd64'}
 def docker(*args,timeout=240):
     result=subprocess.run(['docker',*map(str,args)],text=True,capture_output=True,timeout=timeout)
     if result.returncode:raise RuntimeError('Docker release probe failed: '+result.stderr+'\n'+result.stdout)
-    return result.stdout.strip()
+    return (result.stdout+result.stderr if args and args[0]=='logs' else result.stdout).strip()
 
 
 def wait(fn,timeout=120):
@@ -57,22 +57,33 @@ def images(api,worker,companion,require_native=False):
         result[role]={'image':name,'id':info['Id'],'architecture':info['Architecture'],'size_bytes':info['Size'],
             'source':(info.get('Config',{}).get('Labels') or {}).get('org.opencontainers.image.revision')}
     assert len({v['architecture'] for v in result.values()})==1
+    architecture=result['worker']['architecture']
+    binaries={}
+    for role in ('worker','companion'):
+        binaries[role+'_node']=json.loads(docker('run','--rm','--pull=never','--network','none','--entrypoint','node',
+            result[role]['id'],'--print','JSON.stringify({architecture:process.arch,version:process.version})'))
+        assert binaries[role+'_node']['architecture']=={'amd64':'x64','arm64':'arm64'}[architecture]
+    binaries['api_python']=json.loads(docker('run','--rm','--pull=never','--network','none','--entrypoint',PYTHON,
+        result['api']['id'],'-c','import json,platform,sqlite3;print(json.dumps(dict(architecture=platform.machine(),version=platform.python_version(),sqlite=sqlite3.sqlite_version)))'))
+    assert ALIASES[binaries['api_python']['architecture']]==architecture
     return {'roles':result,'host_architecture':host,'docker_architecture':daemon,
         'native':all(v['architecture']==daemon==host for v in result.values()),
-        'runner_arch':os.environ.get('RUNNER_ARCH'),'github_run_id':os.environ.get('GITHUB_RUN_ID')}
+        'runner_arch':os.environ.get('RUNNER_ARCH'),'github_run_id':os.environ.get('GITHUB_RUN_ID'),'binaries':binaries}
 
 
 class Stack:
     def __init__(self,home,bundle):
         self.home=home;self.bundle=bundle;self.created=[];self.names={};self.label='lea-release-'+uuid4().hex[:10]
-        for name in ('data','config','proofs','projects','overleaf','ownership'):(home/name).mkdir(exist_ok=True)
+        self.ownership_volume=self.label+'-ownership'
+        docker('volume','create','--label','lea.stage8.release-fixture=true',self.ownership_volume)
+        for name in ('data','config','proofs','projects','overleaf'):(home/name).mkdir(exist_ok=True)
         self.env=['-e','LEA_SHARED_DATA_DIR=/app/data','-e','LEA_MODEL_CATALOG_OFFLINE=true','-e','LITELLM_LOCAL_MODEL_COST_MAP=True',
             '-e','LEA_WORKSPACE_OWNERSHIP_DIR=/app/prover/workspace/.lea-runtime']
 
     def mounts(self,data='data'):
         return [part for source,target in [(data,'/app/data'),('config','/app/config'),('proofs','/app/prover/workspace/proofs'),
             ('projects','/app/prover/workspace/projects'),('overleaf','/app/apps/overleaf-extension/.overleaf-lean-stub'),
-            ('ownership','/app/prover/workspace/.lea-runtime')] for part in ('-v',f'{self.home/source}:{target}')]
+            ] for part in ('-v',f'{self.home/source}:{target}')]+['-v',self.ownership_volume+':/app/prover/workspace/.lea-runtime']
 
     def image(self,role):return self.bundle['roles'][role]['id']
 
@@ -89,6 +100,10 @@ class Stack:
         docker('run','--rm','--pull=never','--network','none',*self.env,*self.mounts(),
             '-v',f'{ROOT/"tests/integration/container_seed.py"}:/validation/seed.py:ro','--entrypoint',PYTHON,self.image('worker'),'/validation/seed.py',revision)
         docker('run','--rm','--pull=never','--network','none',*self.env,*self.mounts(),self.image('worker'),'migrate')
+        # Prepare the other DB while no workspace writer exists. Migrations
+        # themselves take the shared workspace ownership lock.
+        (self.home/'second-data').mkdir()
+        docker('run','--rm','--pull=never','--network','none',*self.env,*self.mounts('second-data'),self.image('worker'),'migrate')
 
     def start(self):
         api=self.label+'-api';worker=self.label+'-worker';companion=self.label+'-companion'
@@ -124,10 +139,15 @@ class Stack:
         for name in reversed(self.created):docker('rm','-f',name)
         self.created=[];self.names={};self.label='lea-release-'+uuid4().hex[:10]
 
-    def cleanup(self):
-        self.stop()
+    def restore_ownership(self):
         docker('run','--rm','--pull=never','--network','none','-v',f'{self.home}:/fixture','--entrypoint','chown',
             self.image('worker'),'-R',f'{os.getuid()}:{os.getgid()}','/fixture')
+
+    def cleanup(self):
+        try:
+            self.stop()
+            self.restore_ownership()
+        finally:docker('volume','rm',self.ownership_volume)
 
 
 @contextmanager
@@ -153,8 +173,8 @@ def qualify(bundle):
         compiler=stack.private('compiler')
         for revision in ('0019_custom_tools','0031_usage_details'):
             if scenarios:
-                stack.cleanup();stack.home=stack.home/revision;stack.home.mkdir()
-                for name in ('data','config','proofs','projects','overleaf','ownership'):(stack.home/name).mkdir()
+                stack.stop();stack.restore_ownership();stack.home=stack.home/revision;stack.home.mkdir()
+                for name in ('data','config','proofs','projects','overleaf'):(stack.home/name).mkdir()
             stack.seed(revision);stack.start()
             first=request(stack.base,'/api/health')
             if first.get('release'):
@@ -180,11 +200,24 @@ def qualify(bundle):
             wait(lambda:request(stack.base,'/api/health')['ready'])
             assert request(stack.base,'/api/health')['runtime_id']==first['runtime_id']
             assert request(stack.base,'/api/commands',body,headers)['id']==accepted['id']
+            info=wait(lambda:(v if (v:=request(stack.base,'/api/sessions/s/editor')).get('environment_revision') else None))
+            editor_owner=request(stack.base,'/api/sessions/s/editor/clients',{})
+            editor_headers={'Authorization':'Bearer '+editor_owner['credential']}
+            buffer=request(stack.base,'/api/editor/buffers',{'version':1,'path':info['path'],'content':info['content'],
+                'base_revision':info['file_revision'],'environment_revision':info['environment_revision']},editor_headers)
+            analysis=request(stack.base,'/api/editor/requests',{'version':1,'kind':'editor.analyze','buffer_id':buffer['id'],
+                'environment_revision':buffer['environment_revision'],'sequence':1,'idempotency_key':'unsupported-runtime',
+                'deadline':(datetime.now(timezone.utc)+timedelta(seconds=4.9)).isoformat()},editor_headers)
+            refused=wait(lambda:(v if (v:=request(stack.base,'/api/editor/requests/'+analysis['id'],headers=editor_headers))['state'] not in {'queued','claimed'} else None),timeout=8)
+            assert refused['error']=='confined_editor_executor_unavailable' and not refused['current'],refused
+            assert refused['result'] is None
             # Distinct DB + identical ownership mount must not create a second writer.
-            (stack.home/'second-data').mkdir()
-            docker('run','--rm','--pull=never','--network','none',*stack.env,*stack.mounts('second-data'),stack.image('worker'),'migrate')
-            duplicate=subprocess.run(['docker','run','--rm','--pull=never','--network','none',*stack.env,*stack.mounts('second-data'),stack.image('worker'),'worker'],capture_output=True,text=True,timeout=120)
-            assert duplicate.returncode!=0 and 'owns this physical workspace' in duplicate.stdout+duplicate.stderr
+            duplicate=stack.label+'-duplicate'
+            docker('run','-d','--pull=never','--name',duplicate,'--network','none',*stack.env,*stack.mounts('second-data'),stack.image('worker'),'worker')
+            stack.created.append(duplicate)
+            wait(lambda:docker('inspect','--format','{{.State.Status}}',duplicate)=='exited',timeout=25)
+            assert docker('inspect','--format','{{.State.ExitCode}}',duplicate)!='0'
+            assert 'owns this physical workspace' in docker('logs',duplicate)
             docker('kill','--signal=KILL',stack.names['worker'])
             assert request(stack.base,'/api/sessions/s')['id']=='s'
             wait(lambda:not request(stack.base,'/api/health')['ready'],timeout=22)
@@ -192,6 +225,7 @@ def qualify(bundle):
             assert request(stack.base,'/api/health')['generation']>first['generation']
             assert request(stack.base,'/api/commands/'+accepted['id'],headers=headers)['state']=='succeeded'
             after=stack.private('snapshot',running=True);preserve(before,after)
+            assert after['proof_evidence_count']==before['proof_evidence_count']
             stack.drain()
             scenarios.append({'from_revision':revision,'production_role_entrypoints':True,'read_only_api_without_workspace':True,
                 'stateless_companion':True,'retained_history':True,'independent_restarts':True,'durable_receipt_reused':True,

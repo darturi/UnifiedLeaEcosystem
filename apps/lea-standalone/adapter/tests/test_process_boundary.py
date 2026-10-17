@@ -141,6 +141,10 @@ def test_independent_restart_crash_fencing_and_durable_receipts(tmp_path,monkeyp
         api=start(tmp_path,'api',api_args,env);children.append(api)
         before=wait(lambda:request(base,'/api/health'))
         assert not before['ready'] and api.poll() is None
+        # Migration also takes workspace ownership, so prepare the second DB
+        # before the first worker starts.
+        second_env={**env,'LEA_SHARED_DATA_DIR':str(tmp_path/'second-data')}
+        subprocess.run([sys.executable,'bootstrap.py'],cwd=ADAPTER,env=second_env,check=True,capture_output=True,timeout=15)
         worker=start(tmp_path,'worker',worker_args,{**env,'LEA_TEST_OWNED_CHILD':str(tmp_path/'owned-child.json')});children.append(worker)
         wait(lambda:request(base,'/api/health')['ready'])
         wait(lambda:(tmp_path/'owned-child.json').exists())
@@ -152,9 +156,9 @@ def test_independent_restart_crash_fencing_and_durable_receipts(tmp_path,monkeyp
         # Migration is a separate supervisor phase, refused under an active owner.
         bootstrap=subprocess.run([sys.executable,'bootstrap.py'],cwd=ADAPTER,env=env,capture_output=True,text=True,timeout=10)
         assert bootstrap.returncode!=0 and 'owns data directory' in bootstrap.stderr
+        other_bootstrap=subprocess.run([sys.executable,'bootstrap.py'],cwd=ADAPTER,env=second_env,capture_output=True,text=True,timeout=10)
+        assert other_bootstrap.returncode!=0 and 'owns this physical workspace' in other_bootstrap.stderr
         # A different DB cannot create a second writer to the same physical tree.
-        second_env={**env,'LEA_SHARED_DATA_DIR':str(tmp_path/'second-data')}
-        subprocess.run([sys.executable,'bootstrap.py'],cwd=ADAPTER,env=second_env,check=True,capture_output=True,timeout=15)
         other=start(tmp_path,'workspace-duplicate',worker_args,second_env);children.append(other)
         assert other.wait(timeout=15)!=0
         assert 'owns this physical workspace' in (tmp_path/'workspace-duplicate.log').read_text()
@@ -309,6 +313,26 @@ def test_existing_path_binding_adopts_a_volume_identity_under_its_lock(tmp_path,
         saved=json.loads(binding.read_text());assert saved['version']==2
         assert saved['ownership_id']==(workspace/'.lea-workspace-id').read_text()
     finally:runtime._workspace_lock_handle.close()
+
+
+def test_non_enforcing_lock_filesystem_fails_before_binding(tmp_path,monkeypatch):
+    from app import runtime
+    environment(tmp_path,monkeypatch)
+    monkeypatch.setenv('LEA_REQUIRE_SHARED_OWNERSHIP','0')
+    monkeypatch.setattr(runtime.fcntl,'flock',lambda *args:None)
+    with pytest.raises(RuntimeError,match='does not enforce exclusive locks'):
+        runtime.acquire_workspace_lock(tmp_path/'unsupported')
+    assert not (db.DB_PATH.parent/'.lea-workspace.json').exists()
+    assert not (tmp_path/'unsupported/.lea-workspace-id').exists()
+
+
+def test_production_profile_requires_a_shared_ownership_mount(tmp_path,monkeypatch):
+    from app import runtime
+    environment(tmp_path,monkeypatch)
+    monkeypatch.setenv('LEA_REQUIRE_SHARED_OWNERSHIP','1')
+    monkeypatch.setenv('LEA_WORKSPACE_OWNERSHIP_DIR',str(tmp_path/'unmounted'))
+    with pytest.raises(RuntimeError,match='require a shared Docker local ownership volume'):
+        runtime.acquire_workspace_lock(tmp_path/'workspace')
 
 
 @pytest.mark.skipif(os.environ.get('LEA_TEST_NATIVE_EDITOR')!='1',reason='Explicit native confined Lean qualification')

@@ -18,6 +18,7 @@ from app import db
 def snapshot():
     with db.read_snapshot() as conn:
         return {'schema':conn.execute('select version_num from alembic_version').fetchone()[0],
+            'proof_evidence_count':conn.execute('select count(*) from proof_check_evidence').fetchone()[0],
             'blobs':{r['id']:hashlib.sha256(r['content'].encode()).hexdigest() for r in conn.execute('select id,content from artifact_blobs')},
             'timeline':[[r[0],r[1],r[2]] for r in conn.execute('select id,path,after_blob_id from timeline order by id')],
             'effects':{r[0]:r[1] for r in conn.execute('select id,state from workspace_effects')},

@@ -4,6 +4,7 @@
 
 # VCS + installed deps (recreated inside the image)
 .git
+.release-artifacts
 **/.git
 **/node_modules
 **/.venv

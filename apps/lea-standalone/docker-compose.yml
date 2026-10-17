@@ -10,13 +10,16 @@ x-workspace-volumes: &workspace-volumes
   - ./proofs:/app/prover/workspace/proofs
   - ./projects:/app/prover/workspace/projects
   - ./overleaf-state:/app/apps/overleaf-extension/.overleaf-lean-stub
-  - ./workspace-state:/app/prover/workspace/.lea-runtime
+  - lea-workspace-ownership:/app/prover/workspace/.lea-runtime
   - lea-mathlib-build:/app/prover/workspace/.lake/packages/mathlib/.lake/build
 
 services:
   migrate:
     <<: *image
     command: [migrate]
+    environment:
+      LEA_SHARED_DATA_DIR: /app/data
+      LEA_WORKSPACE_OWNERSHIP_DIR: /app/prover/workspace/.lea-runtime
     # Privileged one-shot bootstrap can recover old Git-backed content. No
     # HTTP/API process is started with these mounts.
     volumes: *workspace-volumes
@@ -83,3 +86,7 @@ services:
 
 volumes:
   lea-mathlib-build:
+  lea-workspace-ownership:
+    # All deployments pointing at the same physical proofs/DB must use this
+    # same local volume. Independent workspaces must choose distinct names.
+    name: ${LEA_WORKSPACE_OWNERSHIP_VOLUME:-lea-workspace-ownership}

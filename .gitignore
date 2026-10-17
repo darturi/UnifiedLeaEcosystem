@@ -49,5 +49,6 @@ CLAUDE.md
 /.agents/skills/impeccable/
 /.codex/hooks.json
 /.impeccable/
+/.release-artifacts/
 /PRODUCT.md
 /DESIGN.md

@@ -1,6 +1,7 @@
 {
   "version": 1,
-  "source": "e309da2e11391c88e5c302c207dd88b3074c8112",
+  "source": "802dbfdfaa5e23c98c48cd1227bee654a58df526",
+  "ref": "refs/tags/codex/stage8-strict-baseline-20261017",
   "schema": "0048_process_boundary",
   "boundary_version": 1,
   "description": "First strict baseline; must pass production qualification before it is eligible as a rollback target."

@@ -204,7 +204,7 @@ HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
 ENTRYPOINT ["node", "/app/apps/overleaf-extension/companion/server.mjs"]
 
 FROM runtime AS worker
-ENV LEA_PROCESS_ROLE=worker
+ENV LEA_PROCESS_ROLE=worker LEA_REQUIRE_SHARED_OWNERSHIP=1
 HEALTHCHECK --interval=10s --timeout=3s --start-period=40s --retries=3 \
   CMD /app/adapter/.venv/bin/python /app/adapter/worker_health.py || exit 1
 CMD ["worker"]
