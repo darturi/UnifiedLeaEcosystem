@@ -1,5 +1,7 @@
 """Explicit schema bootstrap. Neither serving process runs migrations."""
 import sqlite3
+import os
+from pathlib import Path
 from . import db
 SCHEMA='0048_process_boundary'
 
@@ -17,5 +19,13 @@ def migrate():
     # workspace owner, even during the one-time deployment transition.
     from . import runtime
     runtime.acquire_data_lock()
-    try:db.init_db()
-    finally:runtime.release_data_lock()
+    try:
+        from .config import ROOT,read_config_data
+        data=read_config_data(Path(os.environ.get('LEA_CONFIG_FILE',ROOT/'config/lea.local.toml')))
+        root=Path(data.get('lea_root') or 'prover')
+        if not root.is_absolute():root=ROOT/root
+        runtime.acquire_workspace_lock(root/'workspace')
+        db.init_db()
+    finally:
+        runtime.release_workspace_lock()
+        runtime.release_data_lock()

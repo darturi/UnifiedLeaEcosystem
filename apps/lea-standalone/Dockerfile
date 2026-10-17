@@ -113,6 +113,9 @@ RUN cd workspace \
 WORKDIR /app/adapter
 COPY apps/lea-standalone/adapter ./
 RUN uv sync --frozen --no-dev
+ARG LEA_BUILD_SOURCE=development
+RUN LEA_BUILD_SOURCE="$LEA_BUILD_SOURCE" .venv/bin/python -c 'import json,os; from pathlib import Path; Path("app/_release.json").write_text(json.dumps({"source":os.environ["LEA_BUILD_SOURCE"]}))'
+LABEL org.opencontainers.image.revision=$LEA_BUILD_SOURCE
 
 # --- Overleaf companion (:31245) -------------------------------------------
 # The companion has ZERO third-party npm deps (pure Node built-ins + local
@@ -170,6 +173,8 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 # Copy only Python dependencies, API sources and static assets into a clean
 # base. Workspace/compiler/config bytes are absent from every API image layer.
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS api
+ARG LEA_BUILD_SOURCE=development
+LABEL org.opencontainers.image.revision=$LEA_BUILD_SOURCE
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=runtime /app/adapter /app/adapter
@@ -184,6 +189,8 @@ ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["api"]
 
 FROM companion-node AS companion
+ARG LEA_BUILD_SOURCE=development
+LABEL org.opencontainers.image.revision=$LEA_BUILD_SOURCE
 WORKDIR /app
 COPY --from=runtime /app/apps /app/apps
 COPY --from=runtime /app/packages/lea-workspace-client /app/packages/lea-workspace-client
@@ -197,7 +204,7 @@ HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
 ENTRYPOINT ["node", "/app/apps/overleaf-extension/companion/server.mjs"]
 
 FROM runtime AS worker
-ENV LEA_PROCESS_ROLE=worker
+ENV LEA_PROCESS_ROLE=worker LEA_REQUIRE_SHARED_OWNERSHIP=1
 HEALTHCHECK --interval=10s --timeout=3s --start-period=40s --retries=3 \
   CMD /app/adapter/.venv/bin/python /app/adapter/worker_health.py || exit 1
 CMD ["worker"]
