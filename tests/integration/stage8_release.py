@@ -100,7 +100,11 @@ class Stack:
         docker('run','-d','--pull=never','--name',worker,'--network','bridge','--link',api+':api',*self.env,
             '-e','LEA_API_BASE_URL=http://api:8001',*self.mounts(),'-v',f'{FIXTURE}:/validation/release.py:ro',self.image('worker'),'worker')
         self.created.append(worker);self.names['worker']=worker
-        wait(lambda:request(self.base,'/api/health')['ready'],timeout=180)
+        def worker_ready():
+            status=docker('inspect','--format','{{.State.Status}}',worker)
+            if status=='exited':raise RuntimeError('Production worker exited before readiness:\n'+docker('logs','--tail','60',worker))
+            return request(self.base,'/api/health')['ready']
+        wait(worker_ready,timeout=180)
         docker('run','-d','--pull=never','--name',companion,'--network','bridge','--link',api+':api','--read-only',
             '--cap-drop=ALL','--security-opt=no-new-privileges:true','--tmpfs','/tmp','-e','LEA_API_BASE_URL=http://api:8001',
             '-p','127.0.0.1::31245',self.image('companion'))
