@@ -49,6 +49,7 @@ def accepting_work():return snapshot()['ready']
 
 
 def health():
+    from .release_info import identity
     with db.read_snapshot() as conn:
         row=conn.execute('select capabilities_json from worker_process where id=1').fetchone()
         value=snapshot()
@@ -56,7 +57,7 @@ def health():
     if not value['ready']:
         for kind in ('commands','reformalization','lea_status'):
             if kind in caps:caps[kind]={**caps[kind],'admission_enabled':False}
-    return {'ok':True,**value,'capabilities':{**caps,'database_boundary':BOUNDARY}}
+    return {'ok':True,**value,'release':identity(),'capabilities':{**caps,'database_boundary':BOUNDARY}}
 
 
 def capability():

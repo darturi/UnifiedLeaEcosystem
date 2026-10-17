@@ -103,8 +103,9 @@ def health() -> dict:
     from .process_state import BOUNDARY
     from .lea_status import admission_enabled
     from .reformalizations import capability
+    from .release_info import identity
     return {"ok": True, **runtime.snapshot(), "capabilities": {"lea_status": {"version": 1, "admission_enabled": admission_enabled(), "independent_checks": False, "source_pause_policy": 1}, "overleaf_source_refresh": {"version": 2,'publication_version':1,'callbacks':False}, "project_library": {"version": 1, "dependency_coordination": True}, 'reformalization': capability(),
-        'database_boundary':BOUNDARY,
+        'database_boundary':BOUNDARY,'release':identity(),
         'core_projections':{'version':1,'enrollment':'automatic','observation_lifetime_seconds':120},
         'editor':editor_service.capability(),
         'commands':commands.capability()}}

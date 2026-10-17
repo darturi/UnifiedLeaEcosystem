@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "source": "01f6a833aa64d97c202a4149f40d7bcd388b902f",
+  "schema": "0048_process_boundary",
+  "boundary_version": 1,
+  "description": "First strict baseline; must pass production qualification before it is eligible as a rollback target."
+}
