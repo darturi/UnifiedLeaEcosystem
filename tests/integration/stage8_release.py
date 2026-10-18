@@ -99,6 +99,9 @@ class Stack:
     def seed(self,revision):
         docker('run','--rm','--pull=never','--network','none',*self.env,*self.mounts(),
             '-v',f'{ROOT/"tests/integration/container_seed.py"}:/validation/seed.py:ro','--entrypoint',PYTHON,self.image('worker'),'/validation/seed.py',revision)
+        # Exercise a legacy local-user-owned DB, not just Docker-created files.
+        docker('run','--rm','--pull=never','--network','none',*self.mounts(),'--entrypoint','chown',
+            self.image('worker'),'-R',f'{os.getuid()}:{os.getgid()}','/app/data')
         docker('run','--rm','--pull=never','--network','none',*self.env,*self.mounts(),self.image('worker'),'migrate')
         # Prepare the other DB while no workspace writer exists. Migrations
         # themselves take the shared workspace ownership lock.
@@ -228,6 +231,7 @@ def qualify(bundle):
             assert after['proof_evidence_count']==before['proof_evidence_count']
             stack.drain()
             scenarios.append({'from_revision':revision,'production_role_entrypoints':True,'read_only_api_without_workspace':True,
+                'legacy_storage_permissions_prepared':True,
                 'stateless_companion':True,'retained_history':True,'independent_restarts':True,'durable_receipt_reused':True,
                 'shared_workspace_duplicate_refused':True,'unsupported_execution_fail_closed':True,'worker_drain_preserves_api':True})
     return {'compiler':compiler,'scenarios':scenarios}

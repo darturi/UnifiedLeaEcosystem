@@ -39,6 +39,13 @@ hosted version; build the checkout below for development. Open `http://localhost
 the companion is exposed on `:31245`. Runtime data and proofs persist in the
 host directories declared by `docker-compose.yml`.
 
+Keep the `lea-workspace-ownership` Docker local volume as well. Worker and
+migration share its enforced lock and persistent identity. Every deployment that
+shares a database/workspace must use the same ownership volume; independent
+workspaces can set `LEA_WORKSPACE_OWNERSHIP_VOLUME` to distinct names. Host bind
+mounts that do not enforce locks are rejected. See the
+[production qualification and rollback guide](../../docs/STAGE8-release-qualification.md).
+
 To build the same image from the checkout instead, use:
 
 ```sh

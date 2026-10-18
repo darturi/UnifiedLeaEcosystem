@@ -53,10 +53,13 @@ Bootstrap and worker retain `.lea-adapter.lock` beside the DB, including its old
 name so an earlier live owner prevents a transition. Alembic separately serializes
 migration planning and backups using its migration lock. The API takes neither
 lock. The worker additionally holds `.lea-worker.lock` in the resolved physical
-workspace, preventing another database from creating a second writer there. A
-private `.lea-workspace.json` binding beside the DB refuses silent retargeting
-of existing journals to another physical root; workspace relocation requires an
-offline migration.
+workspace for local development. Containers use the shared Docker local
+`lea-workspace-ownership` volume at `.lea-runtime` instead of their private image
+root. Both migration and worker take that ownership lock. Startup verifies that
+the filesystem enforces exclusive locks; virtualized bind mounts that silently
+ignore them are rejected. A version-2 `.lea-workspace.json` binding beside the DB
+pins the root and persistent ownership-volume identity. Root/volume relocation
+requires an offline migration. See the [production ownership contract](STAGE8-release-qualification.md).
 
 Before recording a new lifetime or recovering journals, the worker verifies and
 reaps the old data-directory child manifests and the new workspace-owned manifests.
@@ -100,7 +103,7 @@ API filesystem with the workspace, compiler, configuration and worker Node trees
 absent. Compose mounts only the DB directory into the API, drops capabilities and
 uses `no-new-privileges`. Only the worker and the privileged one-shot migration job
 mount config, proofs, project metadata, legacy import input and the Mathlib build
-volume. Bootstrap can
+volume, plus their shared ownership volume. Bootstrap can
 therefore recover historical Git-backed content before either serving process
 starts; the HTTP API never receives these mounts. The transport has no state or
 workspace mount. Credential tickets remain the explicitly allowed infrastructure

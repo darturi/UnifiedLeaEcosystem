@@ -47,6 +47,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/stage8-baseline" validation
           git archive "$baseline" | tar -x -C "$RUNNER_TEMP/stage8-baseline"
           echo "BASELINE_SOURCE=$baseline" >> "$GITHUB_ENV"
+      - name: Publication provenance guard regressions
+        run: python3 -m unittest discover -s tests/local_preparation -p test_release_bundle.py -v
       - name: Build all baseline production roles
         env:
           ARCH: ${{ matrix.arch }}
@@ -98,7 +100,7 @@ jobs:
             -e LEA_MODEL_CATALOG_OFFLINE=true -e LITELLM_LOCAL_MODEL_COST_MAP=True \
             -e LEA_REQUIRE_SHARED_OWNERSHIP=0 \
             --entrypoint bash "lea-stage8-candidate-worker:$ARCH" -c \
-            'uv sync --frozen --group dev && .venv/bin/python -m pytest -p no:cacheprovider tests/test_process_boundary.py tests/test_recovery.py tests/test_process_restart.py tests/test_runtime_restart.py -q --tb=short -W error::pytest.PytestUnhandledThreadExceptionWarning' \
+            'uv sync --frozen --group dev && .venv/bin/python -m pytest -p no:cacheprovider tests/test_process_boundary.py tests/test_recovery.py tests/test_process_restart.py tests/test_runtime_restart.py tests/test_storage_access.py -q --tb=short -W error::pytest.PytestUnhandledThreadExceptionWarning' \
             2>&1 | tee validation/native-regressions.log
       - name: Rehearse candidate to baseline binary rollback on the same data
         run: |
@@ -110,6 +112,10 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -o pipefail
+          for role in worker api companion; do
+            python3 .github/scripts/verify-release-bundle.py --directory validation \
+              --source "$GITHUB_SHA" --arch "$ARCH" --role "$role"
+          done
           mkdir -p release-binaries
           docker save "lea-stage8-baseline-worker:$ARCH" "lea-stage8-baseline-api:$ARCH" \
             "lea-stage8-baseline-companion:$ARCH" "lea-stage8-candidate-worker:$ARCH" \
@@ -124,12 +130,14 @@ jobs:
         if: always()
         with:
           name: stage8-release-evidence-${{ matrix.arch }}
+          overwrite: true
           path: validation
           if-no-files-found: error
           retention-days: 30
       - uses: actions/upload-artifact@v4
         with:
           name: stage8-qualified-binaries-${{ matrix.arch }}
+          overwrite: true
           path: release-binaries
           compression-level: 0
           if-no-files-found: error
