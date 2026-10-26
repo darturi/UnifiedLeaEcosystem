@@ -1,6 +1,8 @@
 // One process owner for the adapter, frontend, and optional companion.
 // Run: node scripts/supervisor.mjs adapter|ui|stack
 import { existsSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadRootEnv } from "./env.mjs";
@@ -32,7 +34,23 @@ try {
 }
 
 const owned = new Map();
-const owner = createProcessSupervisor({ prefix: "[supervisor]", onUnexpectedExit: () => true });
+const owner = createProcessSupervisor({
+  prefix: "[supervisor]", onUnexpectedExit: () => true,
+  onStopped: async () => {
+    console.log("[supervisor] Saving a full shutdown snapshot without credentials...");
+    // Keep the exporter outside the terminal process group so npm's forwarded
+    // Ctrl+C cannot interrupt publication after the services have stopped.
+    try {
+      const { stdout } = await promisify(execFile)(python,
+        [path.join(root, "scripts/shutdown_snapshot.py"), "--root", root, "--reason", `local-${mode}`],
+        { cwd: root, env: process.env, detached: true });
+      process.stdout.write(stdout);
+    } catch (error) {
+      if (error.stdout) process.stdout.write(error.stdout);
+      throw new Error("Shutdown snapshot failed");
+    }
+  },
+});
 const crashes = [];
 const delays = [1000, 2000, 5000];
 let stopping = false;

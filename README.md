@@ -350,6 +350,39 @@ cd apps/lea-standalone/adapter
 - Overleaf companion job logs and local settings live under
   `apps/overleaf-extension/.overleaf-lean-stub/`.
 
+### Shutdown snapshots
+
+Stopping the local stack with Ctrl+C or SIGTERM, or stopping Docker with
+`docker compose stop` / `docker compose down`, saves a new full snapshot after
+the services exit. ZIPs accumulate in
+`apps/lea-standalone/data/shutdown-archives/`, with a UTC timestamp and unique
+suffix in every filename. Docker saves them through the existing `./data`
+volume. Relocating `LEA_SHARED_DATA_DIR` also relocates this archive directory.
+Earlier archives are kept and are excluded from subsequent snapshots.
+
+Each ZIP includes persisted conversations, proof/code history, uploaded files,
+Overleaf source/context and job state, usage records, logs, and non-secret
+configuration. SQLite is exported as schema and rows in `.sqlite3.jsonl` files
+so deleted database pages cannot leak old credentials. Git history uses
+sanitized `history.fast-export` streams. TOML settings use JSON exports;
+credential-bearing PDFs use sanitized decoded-object JSON. `manifest.json`
+describes the contents and exclusions. These are data exports, not drop-in
+database backups; the original application files are never changed.
+
+Credential files are excluded. Credential fields, configured secret values,
+authentication headers, and recognizable provider tokens are redacted from
+exported content, including nested JSON, DOCX/ZIP, compressed logs, database
+backups, and Git history. Archives are owner-readable only. Dependency caches,
+symlinks, transient locks/journals, and browser-only preferences are excluded.
+No data is uploaded by this feature, and archives have no automatic expiration.
+
+The exporter publishes each ZIP atomically; a failed export prints a diagnostic
+and leaves previous archives intact. Docker allows up to five minutes for
+service drain and export. SIGKILL, a machine crash, or exceeding that deadline
+can prevent a completed snapshot. Restarting only the adapter keeps the stack
+running and does not create a shutdown snapshot. New Docker behavior requires
+an image built from this source, using the development Compose overlay above.
+
 `LEA_SHARED_DATA_DIR` can relocate the adapter data directory for local
 experiments, but the normal current setup uses the standalone app's data
 directory. The older `LEA_SHARED_STATE` recorder path is legacy-only for the

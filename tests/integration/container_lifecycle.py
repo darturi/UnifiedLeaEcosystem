@@ -111,14 +111,17 @@ ENTRYPOINT ["/app/entrypoint.sh"]
             assert before['restart_supported'] is True
             request(base, '/api/runtime/restart', {})
             after = ready(base, before['runtime_id'])
+            assert not list((data / 'shutdown-archives').glob('*.zip')), 'An adapter restart must not archive a running stack'
             request(companion_base, '/health')
             request(base, '/api/runtime/restart', {'shutdown': True})
             assert docker('wait', container) == '0'
+            assert len(list((data / 'shutdown-archives').glob('*.zip'))) == 1
             # The same volume can be owned by a subsequent adapter after shutdown.
             second, second_base = launch()
             reused = ready(second_base)
             request(second_base, '/api/runtime/restart', {'shutdown': True})
             assert docker('wait', second) == '0'
+            assert len(list((data / 'shutdown-archives').glob('*.zip'))) == 2
             failed = docker('run', '-d', '--name', 'lea-prepare-failure-' + uuid4().hex[:12],
                             '-e', 'LEA_TEST_PREPARE_EXIT=9', image)
             containers.append(failed)

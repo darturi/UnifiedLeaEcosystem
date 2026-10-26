@@ -31,6 +31,7 @@ services:
       - ./overleaf-state:/app/apps/overleaf-extension/.overleaf-lean-stub
       - lea-mathlib-build:/app/prover/workspace/.lake/packages/mathlib/.lake/build
     init: true                   # PID 1 signal handling / zombie reaping
+    stop_grace_period: 5m         # drain services, then finish the full shutdown ZIP
     restart: "no"
 
 volumes:

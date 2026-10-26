@@ -156,6 +156,8 @@ usually means `npm run setup:api` needs to finish successfully.
 
 - App database: `data/lea-interface.sqlite3`
 - Adapter event/log data: `data/`
+- Full shutdown snapshots: `data/shutdown-archives/` (one new ZIP per stack stop;
+  see the root README for credential filtering and export formats)
 - Local adapter config: `config/lea.local.toml`
 - Vendored prover: `prover/`
 - Proof repos and project repos: `prover/workspace/proofs/`

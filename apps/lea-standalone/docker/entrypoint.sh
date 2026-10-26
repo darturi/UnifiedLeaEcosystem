@@ -16,6 +16,23 @@ terminate_children() {
   done
 }
 
+finish() {
+  local status=$?
+  trap - EXIT
+  trap '' TERM INT
+  terminate_children
+  wait 2>/dev/null || true
+  # All producers have exited, including when stopped during preparation.
+  # Publish only a completed, sanitized ZIP on the persisted data volume.
+  echo "[lea] Saving a full shutdown snapshot without credentials..."
+  if ! /app/adapter/.venv/bin/python /app/scripts/shutdown_snapshot.py --root /app --reason docker; then
+    echo "[lea] Shutdown snapshot failed." >&2
+    if (( status == 0 )); then status=1; fi
+  fi
+  exit "$status"
+}
+trap finish EXIT
+
 stop() {
   STOP_REQUESTED=1
   terminate_children
@@ -55,7 +72,4 @@ else
   status=$?
   if (( STOP_REQUESTED )); then status=0; fi
 fi
-trap - TERM INT
-terminate_children
-wait 2>/dev/null || true
 exit "$status"
